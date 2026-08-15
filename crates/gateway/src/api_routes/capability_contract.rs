@@ -152,10 +152,7 @@ pub(crate) fn gateway_openapi_document_for_apps(
     app_registry: &cowd_app_host::AppRegistry,
 ) -> Value {
     let contract = gateway_capability_contract_for_apps(app_registry);
-    gateway_openapi_document_from_contract(
-        contract,
-        app_registry.openapi_components().into_iter().collect(),
-    )
+    gateway_openapi_document_from_contract(contract, Map::new())
 }
 
 fn gateway_openapi_document_from_contract(
@@ -2811,81 +2808,15 @@ mod tests {
     }
 
     #[test]
-    fn registered_app_openapi_uses_only_named_contract_components() {
+    fn dynamic_app_openapi_advertises_only_generic_gateway_paths() {
         let services = crate::services::GatewayServices::baseline();
         let document = gateway_openapi_document_for_apps(services.app_registry.as_ref());
-        let schemas = document["components"]["schemas"]
-            .as_object()
-            .expect("OpenAPI schemas");
-        let active = services
-            .app_registry
-            .route_metadata()
-            .into_iter()
-            .filter(|registered| registered.app_id.as_str() == "mfg" && registered.route.active)
-            .collect::<Vec<_>>();
-        let route_ids = active
-            .iter()
-            .map(|registered| registered.route.route_id.as_str())
-            .collect::<BTreeSet<_>>();
-        assert!(!active.is_empty());
-        assert_eq!(route_ids.len(), active.len());
-
-        for registered in active {
-            let route = registered.route;
-            let path = openapi_path(&route.path);
-            let method = route.method.to_ascii_lowercase();
-            let operation = &document["paths"][&path][&method];
-            assert!(operation.is_object(), "missing {} {}", route.method, path);
-            let response_ref = operation["responses"]["200"]["content"]["application/json"]
-                ["schema"]["$ref"]
-                .as_str()
-                .expect("MFG response must use a named schema");
-            assert_eq!(
-                response_ref,
-                format!("#/components/schemas/{}", route.response_schema)
-            );
-            assert!(
-                schemas.contains_key(&route.response_schema),
-                "missing response component {}",
-                route.response_schema
-            );
-            let response_alias = &schemas[&route.response_schema];
-            assert!(
-                response_alias.get("$ref").is_some(),
-                "response alias must not be an anonymous object: {}",
-                route.response_schema
-            );
-
-            assert!(
-                schemas.contains_key(&route.request_schema),
-                "missing request component {}",
-                route.request_schema
-            );
-            let request_alias = &schemas[&route.request_schema];
-            assert!(
-                request_alias.get("$ref").is_some(),
-                "request alias must not be an anonymous object: {}",
-                route.request_schema
-            );
-            if route.method != "GET" && route.method != "DELETE" {
-                assert_eq!(
-                    operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
-                    format!("#/components/schemas/{}", route.request_schema)
-                );
-                assert!(
-                    operation["requestBody"]["content"]
-                        .get("multipart/form-data")
-                        .is_none(),
-                    "MFG route must not advertise an unwired multipart transport"
-                );
-            }
-            for status in ["400", "401", "403", "404", "409", "429", "500"] {
-                assert_eq!(
-                    operation["responses"][status]["content"]["application/json"]["schema"]["$ref"],
-                    "#/components/schemas/MfgApiErrorV1"
-                );
-            }
-        }
+        let paths = document["paths"].as_object().expect("OpenAPI paths");
+        assert!(paths.contains_key("/api/apps"));
+        assert!(paths.contains_key("/api/apps/{app_id}"));
+        assert!(paths.contains_key("/api/apps/{app_id}/operations/{operation_id}/invoke"));
+        assert!(paths.keys().all(|path| !path.starts_with("/api/apps/mfg")));
+        assert!(document["components"]["schemas"]["MfgApiErrorV1"].is_null());
     }
 
     #[test]

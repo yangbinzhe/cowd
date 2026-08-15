@@ -232,6 +232,27 @@ struct DurableState {
     idempotency_inputs: BTreeMap<String, Sha256Digest>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EchoInputV1 {
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CounterIncrementInputV1 {
+    #[serde(default = "default_counter_delta")]
+    delta: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyInputV1 {}
+
+const fn default_counter_delta() -> u64 {
+    1
+}
+
 enum IncrementError {
     Conflict,
     Storage(WorkerError),
@@ -278,6 +299,7 @@ impl State {
     fn increment(
         &self,
         envelope: &AppInvocationEnvelopeV1,
+        delta: u64,
     ) -> Result<DurableReceiptV1, IncrementError> {
         let key = envelope.idempotency_key.as_ref().ok_or_else(|| {
             IncrementError::Storage(WorkerError::Storage("idempotency key missing".to_owned()))
@@ -305,7 +327,7 @@ impl State {
                 "receipt capacity exceeded".to_owned(),
             )));
         }
-        state.counter = state.counter.checked_add(1).ok_or_else(|| {
+        state.counter = state.counter.checked_add(delta).ok_or_else(|| {
             IncrementError::Storage(WorkerError::Storage("counter overflow".to_owned()))
         })?;
         let payload = json!({"counter": state.counter});
@@ -770,26 +792,49 @@ async fn invoke(request: Request<Incoming>, state: &State, path: &str) -> Respon
         );
     }
     match operation_id {
-        "reference-app.echo" => json_response(
-            StatusCode::OK,
-            &AppProviderResponseV1 {
-                schema_version: 1,
-                request_id: envelope.request_id,
-                output_schema_digest: descriptor.output_schema_digest,
-                revision: None,
-                payload: json!({"echo":envelope.payload}),
-            },
-        ),
-        "reference-app.counter.increment" => match state.increment(&envelope) {
-            Ok(receipt) => json_response(StatusCode::OK, &receipt),
-            Err(IncrementError::Conflict) => error(
-                AppErrorCodeV1::IdempotencyConflict,
-                "idempotency key is bound to different input",
-            ),
-            Err(IncrementError::Storage(_error)) => {
-                error(AppErrorCodeV1::InternalError, "counter persistence failed")
+        "reference-app.echo" => {
+            let input: EchoInputV1 = match serde_json::from_value::<EchoInputV1>(envelope.payload) {
+                Ok(input) if !input.message.is_empty() && input.message.len() <= 4096 => input,
+                _ => {
+                    return error(
+                        AppErrorCodeV1::InvalidRequest,
+                        "echo payload does not match its signed schema",
+                    )
+                }
+            };
+            json_response(
+                StatusCode::OK,
+                &AppProviderResponseV1 {
+                    schema_version: 1,
+                    request_id: envelope.request_id,
+                    output_schema_digest: descriptor.output_schema_digest,
+                    revision: None,
+                    payload: json!({"echo":input}),
+                },
+            )
+        }
+        "reference-app.counter.increment" => {
+            let input: CounterIncrementInputV1 =
+                match serde_json::from_value::<CounterIncrementInputV1>(envelope.payload.clone()) {
+                    Ok(input) if (1..=100).contains(&input.delta) => input,
+                    _ => {
+                        return error(
+                            AppErrorCodeV1::InvalidRequest,
+                            "counter payload does not match its signed schema",
+                        )
+                    }
+                };
+            match state.increment(&envelope, input.delta) {
+                Ok(receipt) => json_response(StatusCode::OK, &receipt),
+                Err(IncrementError::Conflict) => error(
+                    AppErrorCodeV1::IdempotencyConflict,
+                    "idempotency key is bound to different input",
+                ),
+                Err(IncrementError::Storage(_error)) => {
+                    error(AppErrorCodeV1::InternalError, "counter persistence failed")
+                }
             }
-        },
+        }
         _ => error(AppErrorCodeV1::AppNotFound, "operation not found"),
     }
 }
@@ -825,6 +870,12 @@ async fn stream(request: Request<Incoming>, state: &State, path: &str) -> Respon
         return error(
             AppErrorCodeV1::OperationNotGranted,
             "invocation validation failed",
+        );
+    }
+    if serde_json::from_value::<EmptyInputV1>(envelope.payload).is_err() {
+        return error(
+            AppErrorCodeV1::InvalidRequest,
+            "stream payload does not match its signed schema",
         );
     }
     let subscription_id = format!(

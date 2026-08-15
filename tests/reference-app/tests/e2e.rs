@@ -398,7 +398,7 @@ async fn uds_h2_worker_runs_complete_reference_lifecycle() {
         "reference-app.counter.increment",
         "request-command-conflict",
         Some("stable-key"),
-        json!({"different":true}),
+        json!({"delta":2}),
     );
     let conflict_response = client
         .send_request(channel(

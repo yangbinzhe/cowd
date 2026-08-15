@@ -1,27 +1,74 @@
 //! Immutable dynamic APP catalogue and signed static bundle delivery.
 
 use std::{
+    convert::Infallible,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
 
 use axum::{
     body::Body,
-    extract::Path as AxumPath,
-    http::{header, HeaderValue, Response, StatusCode},
-    routing::get,
+    extract::{Path as AxumPath, State as AxumState},
+    http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
+    routing::{delete, get, post},
     Extension, Json, Router,
 };
+use bytes::{Bytes, BytesMut};
+use cowd_app_host::supervisor::AppRuntimeLease;
 use cowd_app_protocol::{
-    AppCatalogV1, AppId, AppLifecycleV1, ProtocolValidate, Sha256Digest, PROTOCOL_REVISION_V1,
+    manifest_authorization_profile_digest_v1, manifest_capability_digest_v1, AppActionV1,
+    AppCatalogEntryV1, AppCatalogV1, AppHandshakeV1, AppId, AppInvocationEnvelopeV1,
+    AppLifecycleV1, AppManifestV1, AppProviderResponseV1, AppStreamAckV1, AppStreamFrameV1,
+    AppTuiViewActionResponseV1, AppTuiViewOpenRequestV1, AppTuiViewOpenResponseV1,
+    AppTuiViewStreamRequestV1, DelegationKindV1, DurableReceiptV1, ExecutionContextV1,
+    OperationDescriptorV1, OperationKindV1, PrincipalContextV1, ProtocolValidate, Sha256Digest,
+    APP_RECEIPT_PATH_V1, APP_SUBSCRIPTION_ACK_PATH_V1, APP_SUBSCRIPTION_PATH_V1,
+    HEADER_APP_GENERATION_V1, HEADER_APP_ID_V1, HEADER_AUTHORIZATION_V1, HEADER_CONTENT_TYPE_V1,
+    HEADER_CORRELATION_ID_V1, HEADER_DEADLINE_UNIX_MS_V1, HEADER_PROTOCOL_VERSION_V1,
+    HEADER_REQUEST_ID_V1, PROTOCOL_REVISION_V1, STREAM_CONTENT_TYPE_V1, UNARY_CONTENT_TYPE_V1,
 };
+use harness_contract::security::PrincipalKind;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use managed_worker_runtime::CancellationToken;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::app_platform::{GatewayAppPlatform, PROTOCOL_DIGEST_V1};
+use crate::app_platform::{
+    GatewayAppConnection, GatewayAppConnector, GatewayAppPlatform, PROTOCOL_DIGEST_V1,
+};
 
 pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::AppState>> {
     Router::new()
         .route("/api/apps", get(list_apps))
         .route("/api/apps/:app_id", get(get_app))
+        .route(
+            "/api/apps/:app_id/operations/:operation_id/invoke",
+            post(invoke_operation),
+        )
+        .route(
+            "/api/apps/:app_id/operations/:operation_id/stream",
+            post(stream_operation),
+        )
+        .route("/api/apps/:app_id/receipts/:receipt_id", get(get_receipt))
+        .route(
+            "/api/apps/:app_id/subscriptions/:subscription_id/ack",
+            post(ack_subscription),
+        )
+        .route(
+            "/api/apps/:app_id/subscriptions/:subscription_id",
+            delete(cancel_subscription),
+        )
+        .route("/api/apps/:app_id/tui/views/:view_id/open", post(tui_open))
+        .route(
+            "/api/apps/:app_id/tui/views/:view_id/actions",
+            post(tui_action),
+        )
+        .route(
+            "/api/apps/:app_id/tui/views/:view_id/stream",
+            post(tui_stream),
+        )
         .route("/apps/:app_id", get(serve_index))
         .route("/apps/:app_id/*path", get(serve_asset))
         .layer(Extension(platform))
@@ -38,15 +85,85 @@ async fn get_app(
     Extension(platform): Extension<Arc<GatewayAppPlatform>>,
     Extension(principal): Extension<super::AuthenticatedPrincipal>,
     AxumPath(app_id): AxumPath<String>,
-) -> Result<Json<cowd_app_protocol::AppCatalogEntryV1>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<GatewayAppDetailResponseV1>, (StatusCode, Json<serde_json::Value>)> {
     let app_id = AppId(app_id);
     let catalog = project_catalog(&platform, &principal).await?;
-    catalog
+    let entry = catalog
         .apps
         .into_iter()
         .find(|app| app.app_id == app_id)
-        .map(Json)
-        .ok_or_else(|| typed_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted"))
+        .ok_or_else(|| typed_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted"))?;
+    let admitted = platform
+        .catalog()
+        .get(&app_id)
+        .ok_or_else(|| typed_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted"))?;
+    let cancellation = CancellationToken::default();
+    let lease = platform
+        .supervisor()
+        .acquire(
+            &app_id,
+            &admitted.generation,
+            Duration::from_secs(15),
+            &cancellation,
+        )
+        .await
+        .map_err(platform_error)?;
+    let detail = GatewayAppDetailResponseV1 {
+        schema_version: 1,
+        entry,
+        manifest: admitted.manifest.clone(),
+        operations: lease.connection().operations().to_vec(),
+    };
+    validate_detail(&detail)
+        .map_err(|detail| typed_error(StatusCode::BAD_GATEWAY, "app_contract_invalid", &detail))?;
+    Ok(Json(detail))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayAppDetailResponseV1 {
+    schema_version: u16,
+    entry: AppCatalogEntryV1,
+    manifest: AppManifestV1,
+    operations: Vec<OperationDescriptorV1>,
+}
+
+fn validate_detail(detail: &GatewayAppDetailResponseV1) -> Result<(), String> {
+    detail.entry.validate().map_err(|error| error.to_string())?;
+    detail
+        .manifest
+        .validate()
+        .map_err(|error| error.to_string())?;
+    let digest = cowd_app_protocol::app_operation_catalog_digest_v1(
+        &detail.manifest.app_id,
+        &detail.operations,
+    )
+    .map_err(|error| error.to_string())?;
+    if detail.schema_version != 1
+        || detail.entry.app_id != detail.manifest.app_id
+        || detail.entry.artifact_version != detail.manifest.artifact_version
+        || digest != detail.manifest.operation_catalog_digest
+    {
+        return Err("APP detail identity or signed operation catalog mismatch".to_owned());
+    }
+    AppHandshakeV1 {
+        schema_version: 1,
+        protocol_revision: PROTOCOL_REVISION_V1,
+        app_id: detail.manifest.app_id.clone(),
+        generation: detail.entry.generation.clone(),
+        artifact_version: detail.manifest.artifact_version.clone(),
+        worker_pid: 1,
+        worker_nonce: "sanitized-detail-validation".to_owned(),
+        operations: detail.operations.clone(),
+        operation_catalog_digest: digest,
+        capability_digest: manifest_capability_digest_v1(&detail.manifest)
+            .map_err(|error| error.to_string())?,
+        authorization_profile_digest: manifest_authorization_profile_digest_v1(&detail.manifest)
+            .map_err(|error| error.to_string())?,
+    }
+    .validate_against_manifest(&detail.manifest)
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 async fn project_catalog(
@@ -114,6 +231,1249 @@ async fn project_catalog(
         )
     })?;
     Ok(catalog)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvokeInput {
+    #[serde(default)]
+    payload: serde_json::Value,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+    #[serde(default)]
+    expected_revision: Option<String>,
+    #[serde(default)]
+    deadline_ms: Option<u64>,
+}
+
+async fn invoke_operation(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumState(state): AxumState<Arc<super::AppState>>,
+    headers: HeaderMap,
+    AxumPath((app_id, operation_id)): AxumPath<(String, String)>,
+    Json(input): Json<InvokeInput>,
+) -> Response<Body> {
+    proxy_unary(
+        &platform,
+        &state.workspace_root,
+        &principal,
+        &headers,
+        &app_id,
+        &operation_id,
+        input,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn stream_operation(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumState(state): AxumState<Arc<super::AppState>>,
+    headers: HeaderMap,
+    AxumPath((app_id, operation_id)): AxumPath<(String, String)>,
+    Json(input): Json<InvokeInput>,
+) -> Response<Body> {
+    proxy_stream(
+        &platform,
+        &state.workspace_root,
+        &principal,
+        &headers,
+        &app_id,
+        &operation_id,
+        input,
+        None,
+        false,
+    )
+    .await
+}
+
+async fn tui_open(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumState(state): AxumState<Arc<super::AppState>>,
+    headers: HeaderMap,
+    AxumPath((app_id, view_id)): AxumPath<(String, String)>,
+    Json(payload): Json<AppTuiViewOpenRequestV1>,
+) -> Response<Body> {
+    if payload.validate().is_err() || payload.view_id != view_id {
+        return proxy_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_tui_open",
+            "view id mismatch",
+        );
+    }
+    let Some(operation_id) = tui_operation(&platform, &app_id, &view_id, "open") else {
+        return proxy_error(
+            StatusCode::NOT_FOUND,
+            "tui_view_not_found",
+            "signed TUI view not found",
+        );
+    };
+    let payload = match serde_json::to_value(payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return proxy_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_tui_open",
+                &error.to_string(),
+            )
+        }
+    };
+    proxy_unary(
+        &platform,
+        &state.workspace_root,
+        &principal,
+        &headers,
+        &app_id,
+        &operation_id,
+        InvokeInput {
+            payload,
+            idempotency_key: None,
+            expected_revision: None,
+            deadline_ms: None,
+        },
+        Some(format!("/_cowd/v1/tui/views/{}/open", encode(&view_id))),
+        Some(TuiUnaryRole::Open),
+    )
+    .await
+}
+
+async fn tui_action(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumState(state): AxumState<Arc<super::AppState>>,
+    headers: HeaderMap,
+    AxumPath((app_id, view_id)): AxumPath<(String, String)>,
+    Json(payload): Json<AppActionV1>,
+) -> Response<Body> {
+    if payload.validate().is_err() || payload.app_id.0 != app_id || payload.view_id != view_id {
+        return proxy_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_tui_action",
+            "TUI action route mismatch",
+        );
+    }
+    let Some(operation_id) = tui_operation(&platform, &app_id, &view_id, "action") else {
+        return proxy_error(
+            StatusCode::NOT_FOUND,
+            "tui_view_not_found",
+            "signed TUI view not found",
+        );
+    };
+    let action_id = payload.action_id.clone();
+    let payload = match serde_json::to_value(payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return proxy_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_tui_action",
+                &error.to_string(),
+            )
+        }
+    };
+    let claims = principal.0.claims();
+    let idempotency_key = stable_tui_action_idempotency(
+        &app_id,
+        &view_id,
+        &payload,
+        &claims.principal_id,
+        &claims.tenant_id,
+        &state.workspace_root,
+    );
+    proxy_unary(
+        &platform,
+        &state.workspace_root,
+        &principal,
+        &headers,
+        &app_id,
+        &operation_id,
+        InvokeInput {
+            payload,
+            idempotency_key: Some(idempotency_key),
+            expected_revision: None,
+            deadline_ms: None,
+        },
+        Some(format!(
+            "/_cowd/v1/tui/views/{}/actions/{}",
+            encode(&view_id),
+            encode(&action_id)
+        )),
+        Some(TuiUnaryRole::Action),
+    )
+    .await
+}
+
+async fn tui_stream(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumState(state): AxumState<Arc<super::AppState>>,
+    headers: HeaderMap,
+    AxumPath((app_id, view_id)): AxumPath<(String, String)>,
+    Json(payload): Json<AppTuiViewStreamRequestV1>,
+) -> Response<Body> {
+    if payload.validate().is_err() || payload.view_id != view_id {
+        return proxy_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_tui_stream",
+            "view id mismatch",
+        );
+    }
+    let Some(operation_id) = tui_operation(&platform, &app_id, &view_id, "stream") else {
+        return proxy_error(
+            StatusCode::NOT_FOUND,
+            "tui_view_not_found",
+            "signed TUI view not found",
+        );
+    };
+    let payload = match serde_json::to_value(payload) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return proxy_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_tui_stream",
+                &error.to_string(),
+            )
+        }
+    };
+    proxy_stream(
+        &platform,
+        &state.workspace_root,
+        &principal,
+        &headers,
+        &app_id,
+        &operation_id,
+        InvokeInput {
+            payload,
+            idempotency_key: None,
+            expected_revision: None,
+            deadline_ms: None,
+        },
+        Some(format!("/_cowd/v1/tui/views/{}/stream", encode(&view_id))),
+        true,
+    )
+    .await
+}
+
+fn tui_operation(
+    platform: &GatewayAppPlatform,
+    app_id: &str,
+    view_id: &str,
+    role: &str,
+) -> Option<String> {
+    let app = platform.catalog().get(&AppId(app_id.to_owned()))?;
+    let view = app
+        .manifest
+        .presentation
+        .as_ref()?
+        .tui_views
+        .iter()
+        .find(|view| view.view_id == view_id)?;
+    Some(
+        match role {
+            "open" => &view.open_operation_id,
+            "action" => &view.action_operation_id,
+            "stream" => &view.stream_operation_id,
+            _ => return None,
+        }
+        .clone(),
+    )
+}
+
+// The explicit arguments are the complete trust boundary; keeping them visible
+// prevents a partially initialized proxy context from acquiring a worker.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_unary(
+    platform: &GatewayAppPlatform,
+    workspace_root: &Path,
+    principal: &super::AuthenticatedPrincipal,
+    headers: &HeaderMap,
+    app_id: &str,
+    operation_id: &str,
+    input: InvokeInput,
+    worker_path: Option<String>,
+    tui_role: Option<TuiUnaryRole>,
+) -> Response<Body> {
+    let (lease, descriptor) =
+        match acquire_operation(platform, principal, app_id, operation_id).await {
+            Ok(acquired) => acquired,
+            Err(response) => return response,
+        };
+    if descriptor.streaming {
+        return proxy_error(
+            StatusCode::BAD_REQUEST,
+            "stream_required",
+            "operation requires stream route",
+        );
+    }
+    let envelope = match invocation_envelope(
+        platform,
+        workspace_root,
+        principal,
+        headers,
+        app_id,
+        &descriptor,
+        input,
+    ) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let path = worker_path
+        .unwrap_or_else(|| format!("/_cowd/v1/operations/{}/invoke", encode(operation_id)));
+    let effective_deadline = envelope.effective_deadline_unix_ms();
+    let timeout = match deadline_timeout(effective_deadline) {
+        Ok(timeout) => timeout,
+        Err(response) => return response,
+    };
+    let response = match send_worker(
+        lease.connection(),
+        lease.app_id(),
+        lease.generation().0.as_str(),
+        &envelope.request_id,
+        effective_deadline,
+        Method::POST,
+        &path,
+        Some(&envelope),
+        timeout,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    let status = response.status();
+    let bytes = match bounded_body(response.into_body(), descriptor.maximum_response_bytes).await {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
+    if !status.is_success() {
+        return response_bytes(status, bytes, UNARY_CONTENT_TYPE_V1);
+    }
+    if descriptor.kind == OperationKindV1::Command && tui_role.is_none() {
+        let receipt: DurableReceiptV1 = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(_) => {
+                return proxy_error(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_app_response",
+                    "APP returned an invalid receipt",
+                )
+            }
+        };
+        if receipt.validate().is_err()
+            || receipt.request_id != envelope.request_id
+            || envelope.idempotency_key.as_deref() != Some(receipt.idempotency_key.as_str())
+        {
+            return proxy_error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_app_response",
+                "APP receipt binding mismatch",
+            );
+        }
+        return match serde_json::to_vec(&receipt) {
+            Ok(bytes) => response_bytes(status, bytes, UNARY_CONTENT_TYPE_V1),
+            Err(error) => proxy_error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_app_response",
+                &error.to_string(),
+            ),
+        };
+    }
+    let provider: AppProviderResponseV1 = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return proxy_error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_app_response",
+                "APP returned an invalid provider response",
+            )
+        }
+    };
+    if provider.validate().is_err()
+        || provider.request_id != envelope.request_id
+        || provider.output_schema_digest != descriptor.output_schema_digest
+    {
+        return proxy_error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_app_response",
+            "APP response binding mismatch",
+        );
+    }
+    let value = match tui_role {
+        Some(TuiUnaryRole::Open) => {
+            match serde_json::from_value::<AppTuiViewOpenResponseV1>(provider.payload) {
+                Ok(value) if value.validate().is_ok() => serde_json::to_value(value),
+                _ => {
+                    return proxy_error(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid_app_response",
+                        "APP returned an invalid TUI open response",
+                    )
+                }
+            }
+        }
+        Some(TuiUnaryRole::Action) => {
+            match serde_json::from_value::<AppTuiViewActionResponseV1>(provider.payload) {
+                Ok(value) if value.validate().is_ok() => serde_json::to_value(value),
+                _ => {
+                    return proxy_error(
+                        StatusCode::BAD_GATEWAY,
+                        "invalid_app_response",
+                        "APP returned an invalid TUI action response",
+                    )
+                }
+            }
+        }
+        None => serde_json::to_value(provider),
+    };
+    match value.and_then(|value| serde_json::to_vec(&value)) {
+        Ok(body) => response_bytes(status, body, UNARY_CONTENT_TYPE_V1),
+        Err(error) => proxy_error(
+            StatusCode::BAD_GATEWAY,
+            "invalid_app_response",
+            &error.to_string(),
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TuiUnaryRole {
+    Open,
+    Action,
+}
+
+fn stable_tui_action_idempotency(
+    app_id: &str,
+    view_id: &str,
+    payload: &serde_json::Value,
+    principal_id: &str,
+    tenant_id: &str,
+    workspace_root: &Path,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cowd.gateway.tui-action-idempotency/v1\0");
+    digest.update(app_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(view_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(principal_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(tenant_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(workspace_root.to_string_lossy().as_bytes());
+    digest.update(b"\0");
+    digest.update(payload.to_string().as_bytes());
+    format!("tui-action:sha256:{:x}", digest.finalize())
+}
+
+struct ProxyStreamState {
+    body: Incoming,
+    buffer: BytesMut,
+    lease: AppRuntimeLease<GatewayAppConnector>,
+    descriptor: OperationDescriptorV1,
+    subscription_id: Option<String>,
+    expected_sequence: u64,
+    deadline_unix_ms: u64,
+    tui_sse: bool,
+    finished: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn proxy_stream(
+    platform: &GatewayAppPlatform,
+    workspace_root: &Path,
+    principal: &super::AuthenticatedPrincipal,
+    headers: &HeaderMap,
+    app_id: &str,
+    operation_id: &str,
+    input: InvokeInput,
+    worker_path: Option<String>,
+    tui_sse: bool,
+) -> Response<Body> {
+    let (lease, descriptor) =
+        match acquire_operation(platform, principal, app_id, operation_id).await {
+            Ok(value) => value,
+            Err(response) => return response,
+        };
+    if !descriptor.streaming {
+        return proxy_error(
+            StatusCode::BAD_REQUEST,
+            "unary_required",
+            "operation requires invoke route",
+        );
+    }
+    let envelope = match invocation_envelope(
+        platform,
+        workspace_root,
+        principal,
+        headers,
+        app_id,
+        &descriptor,
+        input,
+    ) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let path = worker_path
+        .unwrap_or_else(|| format!("/_cowd/v1/operations/{}/stream", encode(operation_id)));
+    let effective_deadline = envelope.effective_deadline_unix_ms();
+    let timeout = match deadline_timeout(effective_deadline) {
+        Ok(timeout) => timeout,
+        Err(response) => return response,
+    };
+    let response = match send_worker(
+        lease.connection(),
+        lease.app_id(),
+        lease.generation().0.as_str(),
+        &envelope.request_id,
+        effective_deadline,
+        Method::POST,
+        &path,
+        Some(&envelope),
+        timeout,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        return match bounded_body(response.into_body(), descriptor.maximum_response_bytes).await {
+            Ok(bytes) => response_bytes(status, bytes, UNARY_CONTENT_TYPE_V1),
+            Err(response) => response,
+        };
+    }
+    let stream_state = ProxyStreamState {
+        body: response.into_body(),
+        buffer: BytesMut::new(),
+        lease,
+        descriptor,
+        subscription_id: None,
+        expected_sequence: 0,
+        deadline_unix_ms: effective_deadline,
+        tui_sse,
+        finished: false,
+    };
+    let stream = futures::stream::unfold(stream_state, |mut state| async move {
+        match next_proxy_stream_chunk(&mut state).await {
+            Ok(Some(bytes)) => Some((Ok::<Bytes, Infallible>(bytes), state)),
+            Ok(None) => None,
+            Err(detail) => {
+                state.finished = true;
+                let payload =
+                    serde_json::json!({"error":{"code":"invalid_app_stream","detail":detail}});
+                let encoded = serde_json::to_vec(&payload).unwrap_or_else(|_| {
+                    br#"{"error":{"code":"invalid_app_stream","detail":"APP stream failed"}}"#
+                        .to_vec()
+                });
+                let bytes = if state.tui_sse {
+                    Bytes::from(format!("data: {}\n\n", String::from_utf8_lossy(&encoded)))
+                } else {
+                    let mut encoded = encoded;
+                    encoded.push(b'\n');
+                    Bytes::from(encoded)
+                };
+                Some((Ok(bytes), state))
+            }
+        }
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(if tui_sse {
+            "text/event-stream; charset=utf-8"
+        } else {
+            STREAM_CONTENT_TYPE_V1
+        }),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn next_proxy_stream_chunk(state: &mut ProxyStreamState) -> Result<Option<Bytes>, String> {
+    if state.finished {
+        return Ok(None);
+    }
+    loop {
+        if let Some(newline) = state.buffer.iter().position(|byte| *byte == b'\n') {
+            let mut line = state.buffer.split_to(newline + 1);
+            line.truncate(newline);
+            if line.last() == Some(&b'\r') {
+                line.truncate(line.len() - 1);
+            }
+            if line.is_empty() {
+                continue;
+            }
+            return validate_and_encode_stream_line(state, &line)
+                .await
+                .map(Some);
+        }
+        if state.buffer.len() as u64 > state.descriptor.maximum_frame_bytes {
+            return Err("APP stream frame exceeds the signed byte limit".to_owned());
+        }
+        let now = now_unix_ms()?;
+        let remaining = state.deadline_unix_ms.saturating_sub(now);
+        if remaining == 0 {
+            return Err("APP stream deadline exceeded".to_owned());
+        }
+        let next = tokio::time::timeout(Duration::from_millis(remaining), state.body.frame())
+            .await
+            .map_err(|_| "APP stream deadline exceeded".to_owned())?;
+        match next {
+            Some(Ok(frame)) => {
+                if let Ok(data) = frame.into_data() {
+                    state.buffer.extend_from_slice(&data);
+                }
+            }
+            Some(Err(error)) => return Err(format!("APP stream transport failed: {error}")),
+            None if state.buffer.is_empty() => {
+                if state.subscription_id.is_some() && !state.finished {
+                    return Err("APP stream ended without a terminal frame".to_owned());
+                }
+                return Ok(None);
+            }
+            None => {
+                let line = state.buffer.split().freeze();
+                return validate_and_encode_stream_line(state, &line)
+                    .await
+                    .map(Some);
+            }
+        }
+    }
+}
+
+async fn validate_and_encode_stream_line(
+    state: &mut ProxyStreamState,
+    line: &[u8],
+) -> Result<Bytes, String> {
+    if line.len() as u64 > state.descriptor.maximum_frame_bytes {
+        return Err("APP stream frame exceeds the signed byte limit".to_owned());
+    }
+    let frame: AppStreamFrameV1 =
+        serde_json::from_slice(line).map_err(|_| "APP returned invalid NDJSON".to_owned())?;
+    frame.validate().map_err(|error| error.to_string())?;
+    if frame.sequence() != state.expected_sequence {
+        return Err("APP stream sequence is not contiguous".to_owned());
+    }
+    match (&state.subscription_id, &frame) {
+        (None, AppStreamFrameV1::Open { schema_digest, .. })
+            if schema_digest == &state.descriptor.output_schema_digest =>
+        {
+            state.subscription_id = Some(frame.subscription_id().to_owned());
+        }
+        (None, _) => return Err("APP stream must begin with a schema-bound open frame".to_owned()),
+        (Some(expected), _) if expected != frame.subscription_id() => {
+            return Err("APP stream changed subscription identity".to_owned())
+        }
+        (Some(_), AppStreamFrameV1::Open { .. }) => {
+            return Err("APP stream emitted more than one open frame".to_owned())
+        }
+        _ => {}
+    }
+    state.expected_sequence = state.expected_sequence.saturating_add(1);
+    if let AppStreamFrameV1::Checkpoint {
+        subscription_id,
+        sequence,
+        cursor,
+        ..
+    } = &frame
+    {
+        let ack = AppStreamAckV1 {
+            schema_version: 1,
+            subscription_id: subscription_id.clone(),
+            maximum_contiguous_sequence: *sequence,
+            cursor: cursor.clone(),
+        };
+        let path =
+            APP_SUBSCRIPTION_ACK_PATH_V1.replace("{subscription_id}", &encode(subscription_id));
+        let ack_request_id = format!("stream-ack-{}", uuid::Uuid::new_v4());
+        let ack_now = now_unix_ms()?;
+        let ack_deadline = ack_now.saturating_add(5_000).min(state.deadline_unix_ms);
+        let ack_timeout = Duration::from_millis(ack_deadline.saturating_sub(ack_now));
+        if ack_timeout.is_zero() {
+            return Err("APP stream acknowledgement deadline exceeded".to_owned());
+        }
+        let response = send_worker(
+            state.lease.connection(),
+            state.lease.app_id(),
+            state.lease.generation().0.as_str(),
+            &ack_request_id,
+            ack_deadline,
+            Method::POST,
+            &path,
+            Some(&ack),
+            ack_timeout,
+        )
+        .await
+        .map_err(|_| "APP stream acknowledgement failed".to_owned())?;
+        if !response.status().is_success() {
+            return Err("APP rejected stream acknowledgement".to_owned());
+        }
+        bounded_body(response.into_body(), 64 * 1024)
+            .await
+            .map_err(|_| "APP stream acknowledgement response was invalid".to_owned())?;
+    }
+    if matches!(
+        frame,
+        AppStreamFrameV1::End { .. } | AppStreamFrameV1::Error { .. }
+    ) {
+        state.finished = true;
+    }
+    let encoded = serde_json::to_vec(&frame).map_err(|error| error.to_string())?;
+    if state.tui_sse {
+        Ok(Bytes::from(format!(
+            "data: {}\n\n",
+            String::from_utf8_lossy(&encoded)
+        )))
+    } else {
+        let mut encoded = encoded;
+        encoded.push(b'\n');
+        Ok(Bytes::from(encoded))
+    }
+}
+
+async fn acquire_app(
+    platform: &GatewayAppPlatform,
+    principal: &super::AuthenticatedPrincipal,
+    app_id: &str,
+) -> Result<AppRuntimeLease<GatewayAppConnector>, Response<Body>> {
+    let app_id = AppId(app_id.to_owned());
+    if principal.0.claims().app_profile(&app_id.0).is_none() {
+        return Err(proxy_error(
+            StatusCode::FORBIDDEN,
+            "app_profile_required",
+            "signed APP authorization profile is missing",
+        ));
+    }
+    let admitted = platform
+        .catalog()
+        .get(&app_id)
+        .ok_or_else(|| proxy_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted"))?;
+    platform
+        .supervisor()
+        .acquire(
+            &app_id,
+            &admitted.generation,
+            Duration::from_secs(15),
+            &CancellationToken::default(),
+        )
+        .await
+        .map_err(|error| {
+            proxy_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "app_activation_failed",
+                &error.to_string(),
+            )
+        })
+}
+
+async fn get_receipt(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumPath((app_id, receipt_id)): AxumPath<(String, String)>,
+) -> Response<Body> {
+    let lease = match acquire_app(&platform, &principal, &app_id).await {
+        Ok(lease) => lease,
+        Err(response) => return response,
+    };
+    let path = APP_RECEIPT_PATH_V1.replace("{receipt_id}", &encode(&receipt_id));
+    let request_id = format!("receipt-{}", uuid::Uuid::new_v4());
+    let deadline = match now_unix_ms() {
+        Ok(now) => now.saturating_add(10_000),
+        Err(detail) => {
+            return proxy_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "clock_unavailable",
+                &detail,
+            )
+        }
+    };
+    let response = match send_worker::<serde_json::Value>(
+        lease.connection(),
+        lease.app_id(),
+        lease.generation().0.as_str(),
+        &request_id,
+        deadline,
+        Method::GET,
+        &path,
+        None,
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    let status = response.status();
+    let bytes = match bounded_body(response.into_body(), 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
+    };
+    if status.is_success() {
+        let receipt: DurableReceiptV1 = match serde_json::from_slice(&bytes) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                return proxy_error(
+                    StatusCode::BAD_GATEWAY,
+                    "invalid_app_response",
+                    "APP returned an invalid receipt",
+                )
+            }
+        };
+        if receipt.validate().is_err() || receipt.receipt_id != receipt_id {
+            return proxy_error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_app_response",
+                "APP receipt route binding mismatch",
+            );
+        }
+    }
+    response_bytes(status, bytes, UNARY_CONTENT_TYPE_V1)
+}
+
+async fn ack_subscription(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumPath((app_id, subscription_id)): AxumPath<(String, String)>,
+    Json(ack): Json<AppStreamAckV1>,
+) -> Response<Body> {
+    if ack.validate().is_err() || ack.subscription_id != subscription_id {
+        return proxy_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_stream_ack",
+            "subscription ACK route binding mismatch",
+        );
+    }
+    let lease = match acquire_app(&platform, &principal, &app_id).await {
+        Ok(lease) => lease,
+        Err(response) => return response,
+    };
+    let path = APP_SUBSCRIPTION_ACK_PATH_V1.replace("{subscription_id}", &encode(&subscription_id));
+    relay_control(lease, Method::POST, &path, Some(&ack)).await
+}
+
+async fn cancel_subscription(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumPath((app_id, subscription_id)): AxumPath<(String, String)>,
+) -> Response<Body> {
+    let lease = match acquire_app(&platform, &principal, &app_id).await {
+        Ok(lease) => lease,
+        Err(response) => return response,
+    };
+    let path = APP_SUBSCRIPTION_PATH_V1.replace("{subscription_id}", &encode(&subscription_id));
+    relay_control::<serde_json::Value>(lease, Method::DELETE, &path, None).await
+}
+
+async fn relay_control<T: Serialize>(
+    lease: AppRuntimeLease<GatewayAppConnector>,
+    method: Method,
+    path: &str,
+    payload: Option<&T>,
+) -> Response<Body> {
+    let request_id = format!("control-{}", uuid::Uuid::new_v4());
+    let deadline = match now_unix_ms() {
+        Ok(now) => now.saturating_add(10_000),
+        Err(detail) => {
+            return proxy_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "clock_unavailable",
+                &detail,
+            )
+        }
+    };
+    let response = match send_worker(
+        lease.connection(),
+        lease.app_id(),
+        lease.generation().0.as_str(),
+        &request_id,
+        deadline,
+        method,
+        path,
+        payload,
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(response) => return response,
+    };
+    let status = response.status();
+    match bounded_body(response.into_body(), 1024 * 1024).await {
+        Ok(bytes) => response_bytes(status, bytes, UNARY_CONTENT_TYPE_V1),
+        Err(response) => response,
+    }
+}
+
+async fn acquire_operation(
+    platform: &GatewayAppPlatform,
+    principal: &super::AuthenticatedPrincipal,
+    app_id: &str,
+    operation_id: &str,
+) -> Result<(AppRuntimeLease<GatewayAppConnector>, OperationDescriptorV1), Response<Body>> {
+    let app_id = AppId(app_id.to_owned());
+    if principal.0.claims().app_profile(&app_id.0).is_none() {
+        return Err(proxy_error(
+            StatusCode::FORBIDDEN,
+            "app_profile_required",
+            "signed APP authorization profile is missing",
+        ));
+    }
+    let admitted = platform
+        .catalog()
+        .get(&app_id)
+        .ok_or_else(|| proxy_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted"))?;
+    let cancellation = CancellationToken::default();
+    let lease = platform
+        .supervisor()
+        .acquire(
+            &app_id,
+            &admitted.generation,
+            Duration::from_secs(15),
+            &cancellation,
+        )
+        .await
+        .map_err(|error| {
+            proxy_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "app_activation_failed",
+                &error.to_string(),
+            )
+        })?;
+    let descriptor = lease
+        .connection()
+        .operations()
+        .iter()
+        .find(|descriptor| descriptor.operation_id == operation_id)
+        .cloned()
+        .ok_or_else(|| {
+            proxy_error(
+                StatusCode::NOT_FOUND,
+                "operation_not_found",
+                "operation is not present in the admitted handshake catalog",
+            )
+        })?;
+    if !operation_id.starts_with(&format!("{}.", app_id.0)) || descriptor.validate().is_err() {
+        return Err(proxy_error(
+            StatusCode::BAD_GATEWAY,
+            "app_contract_invalid",
+            "operation descriptor is outside the admitted APP namespace",
+        ));
+    }
+    Ok((lease, descriptor))
+}
+
+// Callers return the terminal Axum response immediately, so boxing this local
+// error would add allocation without reducing any long-lived state.
+#[allow(clippy::result_large_err)]
+fn invocation_envelope(
+    platform: &GatewayAppPlatform,
+    workspace_root: &Path,
+    principal: &super::AuthenticatedPrincipal,
+    headers: &HeaderMap,
+    app_id: &str,
+    descriptor: &OperationDescriptorV1,
+    input: InvokeInput,
+) -> Result<AppInvocationEnvelopeV1, Response<Body>> {
+    if !descriptor.operation_id.starts_with(&format!("{app_id}.")) {
+        return Err(proxy_error(
+            StatusCode::BAD_GATEWAY,
+            "app_contract_invalid",
+            "operation namespace is invalid",
+        ));
+    }
+    let claims = principal.0.claims();
+    let profile_id = claims.app_profile(app_id).ok_or_else(|| {
+        proxy_error(
+            StatusCode::FORBIDDEN,
+            "app_profile_required",
+            "signed APP authorization profile is missing",
+        )
+    })?;
+    let admitted = platform
+        .catalog()
+        .get(&AppId(app_id.to_owned()))
+        .ok_or_else(|| proxy_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted"))?;
+    let profile = admitted
+        .manifest
+        .authorization_profiles
+        .iter()
+        .find(|profile| profile.profile_id == profile_id)
+        .ok_or_else(|| {
+            proxy_error(
+                StatusCode::FORBIDDEN,
+                "app_profile_invalid",
+                "signed APP profile is not admitted",
+            )
+        })?;
+    let mut granted_capabilities = profile
+        .capabilities
+        .iter()
+        .filter(|capability| claims.capabilities.binary_search(capability).is_ok())
+        .cloned()
+        .collect::<Vec<_>>();
+    granted_capabilities.sort();
+    granted_capabilities.dedup();
+
+    let now = now_unix_ms().map_err(|detail| {
+        proxy_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "clock_unavailable",
+            &detail,
+        )
+    })?;
+    let deadline_ms = input.deadline_ms.unwrap_or(descriptor.default_deadline_ms);
+    if deadline_ms == 0 || deadline_ms > descriptor.maximum_deadline_ms {
+        return Err(proxy_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_deadline",
+            "deadline exceeds the signed operation limit",
+        ));
+    }
+    let surface = match headers.get("x-cowd-surface-id") {
+        Some(value) => value.to_str().map_err(|_| {
+            proxy_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_surface",
+                "surface identity must be valid UTF-8",
+            )
+        })?,
+        None => "gateway",
+    }
+    .trim();
+    if surface.is_empty()
+        || surface.len() > 128
+        || !surface
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        return Err(proxy_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_surface",
+            "surface identity is invalid",
+        ));
+    }
+    let workspace_id = format!(
+        "sha256:{:x}",
+        Sha256::digest(workspace_root.to_string_lossy().as_bytes())
+    );
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let envelope = AppInvocationEnvelopeV1 {
+        schema_version: 1,
+        operation_id: descriptor.operation_id.clone(),
+        request_id: request_id.clone(),
+        correlation_id: request_id,
+        causation_id: None,
+        deadline_unix_ms: now.saturating_add(deadline_ms),
+        idempotency_key: input.idempotency_key,
+        expected_revision: input.expected_revision,
+        call_chain: vec![format!("surface:{surface}"), "core:gateway".to_owned()],
+        max_hops: 4,
+        input_schema_digest: descriptor.input_schema_digest.clone(),
+        principal: PrincipalContextV1 {
+            subject: claims.principal_id.clone(),
+            tenant_id: claims.tenant_id.clone(),
+            workspace_id,
+            delegation: if claims.kind == PrincipalKind::Human {
+                DelegationKindV1::User
+            } else {
+                DelegationKindV1::Service
+            },
+            grant_id: claims.grant_id.clone(),
+            authorization_profile_id: profile_id.to_owned(),
+            authorization_revision: claims.profile_revision,
+            granted_capabilities,
+            granted_scopes: claims.scopes.clone(),
+            credential_epoch: claims.credential_epoch,
+            expires_at_unix_ms: claims.expires_at_ms,
+        },
+        execution: ExecutionContextV1 {
+            surface: surface.to_owned(),
+            session_id: None,
+            turn_id: None,
+            task_id: None,
+        },
+        payload: input.payload,
+    };
+    envelope.validate_at(now, descriptor).map_err(|error| {
+        proxy_error(
+            StatusCode::FORBIDDEN,
+            "operation_not_granted",
+            &error.to_string(),
+        )
+    })?;
+    let size = serde_json::to_vec(&envelope)
+        .map_err(|_| {
+            proxy_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "invocation cannot be encoded",
+            )
+        })?
+        .len() as u64;
+    if size > descriptor.maximum_request_bytes {
+        return Err(proxy_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large",
+            "invocation exceeds the signed operation byte limit",
+        ));
+    }
+    Ok(envelope)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_worker<T: Serialize>(
+    connection: &GatewayAppConnection,
+    app_id: &AppId,
+    generation: &str,
+    request_id: &str,
+    deadline_unix_ms: u64,
+    method: Method,
+    path: &str,
+    payload: Option<&T>,
+    timeout: Duration,
+) -> Result<Response<Incoming>, Response<Body>> {
+    let bytes = match payload {
+        Some(payload) => serde_json::to_vec(payload).map_err(|_| {
+            proxy_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "request cannot be encoded",
+            )
+        })?,
+        None => Vec::new(),
+    };
+    let request = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(HEADER_AUTHORIZATION_V1, connection.authorization())
+        .header(HEADER_CONTENT_TYPE_V1, UNARY_CONTENT_TYPE_V1)
+        .header(HEADER_PROTOCOL_VERSION_V1, PROTOCOL_REVISION_V1)
+        .header(HEADER_APP_ID_V1, &app_id.0)
+        .header(HEADER_APP_GENERATION_V1, generation)
+        .header(HEADER_REQUEST_ID_V1, request_id)
+        .header(HEADER_CORRELATION_ID_V1, request_id)
+        .header(HEADER_DEADLINE_UNIX_MS_V1, deadline_unix_ms)
+        .body(Full::new(Bytes::from(bytes)))
+        .map_err(|_| {
+            proxy_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "proxy_request_invalid",
+                "worker request cannot be built",
+            )
+        })?;
+    let cancellation = CancellationToken::default();
+    connection
+        .send(generation, request, timeout, &cancellation)
+        .await
+        .map_err(|error| {
+            proxy_error(
+                StatusCode::BAD_GATEWAY,
+                "app_transport_failed",
+                &error.to_string(),
+            )
+        })
+}
+
+async fn bounded_body(mut body: Incoming, maximum_bytes: u64) -> Result<Vec<u8>, Response<Body>> {
+    let maximum = usize::try_from(maximum_bytes).unwrap_or(usize::MAX);
+    let mut bytes = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| {
+            proxy_error(
+                StatusCode::BAD_GATEWAY,
+                "app_transport_failed",
+                &error.to_string(),
+            )
+        })?;
+        if let Ok(data) = frame.into_data() {
+            if bytes.len().saturating_add(data.len()) > maximum {
+                return Err(proxy_error(
+                    StatusCode::BAD_GATEWAY,
+                    "app_response_too_large",
+                    "APP response exceeds the signed byte limit",
+                ));
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(bytes.to_vec())
+}
+
+fn now_unix_ms() -> Result<u64, String> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::result_large_err)]
+fn deadline_timeout(deadline_unix_ms: u64) -> Result<Duration, Response<Body>> {
+    let now = now_unix_ms().map_err(|detail| {
+        proxy_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "clock_unavailable",
+            &detail,
+        )
+    })?;
+    let remaining = deadline_unix_ms.saturating_sub(now);
+    if remaining == 0 {
+        return Err(proxy_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "deadline_exceeded",
+            "operation deadline has expired",
+        ));
+    }
+    Ok(Duration::from_millis(remaining))
+}
+
+fn encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn platform_error(
+    error: cowd_app_host::supervisor::SupervisorError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    typed_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "app_activation_failed",
+        &error.to_string(),
+    )
+}
+
+fn proxy_error(status: StatusCode, code: &str, detail: &str) -> Response<Body> {
+    let bytes = serde_json::to_vec(&serde_json::json!({"error":{"code":code,"detail":detail}}))
+        .unwrap_or_else(|_| {
+            br#"{"error":{"code":"gateway_error","detail":"response encoding failed"}}"#.to_vec()
+        });
+    response_bytes(status, bytes, UNARY_CONTENT_TYPE_V1)
+}
+
+fn response_bytes(
+    status: StatusCode,
+    bytes: Vec<u8>,
+    content_type: &'static str,
+) -> Response<Body> {
+    let mut response = Response::new(Body::from(bytes));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
 }
 
 async fn serve_index(
@@ -249,4 +1609,525 @@ fn typed_error(
         status,
         Json(serde_json::json!({"error":{"code":code,"detail":detail}})),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use cowd_app_host::catalog::{
+        AppCatalogBuilder, AppCatalogPolicy, AppTrustStore, TrustedSigningKey,
+    };
+    use cowd_app_protocol::{AppErrorCodeV1, AppErrorResponseV1};
+    use harness_contract::security::{PrincipalAssurance, PrincipalClaims};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn generic_invoke_input_rejects_gateway_owned_identity_fields() {
+        for forged in [
+            "principal",
+            "delegation",
+            "tenant_id",
+            "workspace_id",
+            "session_id",
+            "turn_id",
+            "task_id",
+            "call_chain",
+            "input_schema_digest",
+        ] {
+            let mut request = serde_json::Map::from_iter([("payload".to_owned(), json!({}))]);
+            request.insert(forged.to_owned(), json!("forged"));
+            assert!(serde_json::from_value::<InvokeInput>(request.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn tui_action_idempotency_is_stable_and_content_bound() {
+        let first = json!({
+            "schema_version": 1,
+            "app_id": "reference-app",
+            "view_id": "reference.main",
+            "document_revision": "7",
+            "component_id": "root",
+            "action_id": "refresh",
+            "selection": null,
+            "form": null,
+            "confirmed": true
+        });
+        let second = first.clone();
+        let changed = json!({
+            "schema_version": 1,
+            "app_id": "reference-app",
+            "view_id": "reference.main",
+            "document_revision": "8",
+            "component_id": "root",
+            "action_id": "refresh",
+            "selection": null,
+            "form": null,
+            "confirmed": true
+        });
+        assert_eq!(
+            stable_tui_action_idempotency(
+                "reference-app",
+                "reference.main",
+                &first,
+                "principal-a",
+                "tenant-a",
+                Path::new("/workspace-a"),
+            ),
+            stable_tui_action_idempotency(
+                "reference-app",
+                "reference.main",
+                &second,
+                "principal-a",
+                "tenant-a",
+                Path::new("/workspace-a"),
+            )
+        );
+        assert_ne!(
+            stable_tui_action_idempotency(
+                "reference-app",
+                "reference.main",
+                &first,
+                "principal-a",
+                "tenant-a",
+                Path::new("/workspace-a"),
+            ),
+            stable_tui_action_idempotency(
+                "reference-app",
+                "reference.main",
+                &changed,
+                "principal-a",
+                "tenant-a",
+                Path::new("/workspace-a"),
+            )
+        );
+        assert_ne!(
+            stable_tui_action_idempotency(
+                "reference-app",
+                "reference.main",
+                &first,
+                "principal-a",
+                "tenant-a",
+                Path::new("/workspace-a"),
+            ),
+            stable_tui_action_idempotency(
+                "reference-app",
+                "reference.main",
+                &first,
+                "principal-b",
+                "tenant-a",
+                Path::new("/workspace-a"),
+            )
+        );
+    }
+
+    #[test]
+    fn worker_path_segments_are_percent_encoded() {
+        assert_eq!(encode("reference.main"), "reference.main");
+        assert_eq!(encode("../other?x=1"), "..%2Fother%3Fx%3D1");
+    }
+
+    #[tokio::test]
+    async fn reference_bundle_gateway_proxy_e2e() {
+        let Ok(bundle) = std::env::var("COWD_REFERENCE_APP_BUNDLE") else {
+            eprintln!("COWD_REFERENCE_APP_BUNDLE is unset; external reference Bundle gate skipped");
+            return;
+        };
+        let public_key = std::env::var("COWD_REFERENCE_APP_PUBLIC_KEY_BASE64URL")
+            .expect("reference Bundle public key");
+        let public_key = URL_SAFE_NO_PAD
+            .decode(public_key)
+            .expect("reference Bundle public key encoding");
+        let bundle = PathBuf::from(bundle);
+        let apps_root = bundle
+            .parent()
+            .expect("reference Bundle parent")
+            .to_path_buf();
+        let now = now_unix_ms().expect("trusted test clock");
+        let discovered = AppCatalogBuilder::new(
+            vec![apps_root],
+            AppCatalogPolicy::default(),
+            AppTrustStore::new([TrustedSigningKey {
+                key_id: "reference-app-fixture-ed25519-v1".to_owned(),
+                public_key,
+                revoked: false,
+            }]),
+            unsafe { libc::geteuid() },
+            now,
+        )
+        .build()
+        .expect("admitted reference Bundle");
+        let admitted = discovered
+            .get(&AppId("reference-app".to_owned()))
+            .expect("reference APP admitted");
+        let profile = admitted
+            .manifest
+            .authorization_profiles
+            .iter()
+            .find(|profile| profile.is_default)
+            .expect("reference default profile");
+        let principal = super::super::AuthenticatedPrincipal(
+            runtime::VerifiedPrincipal::from_test_claims(PrincipalClaims {
+                principal_id: "reference-e2e".to_owned(),
+                tenant_id: "tenant-reference".to_owned(),
+                grant_id: "grant-reference".to_owned(),
+                kind: PrincipalKind::Human,
+                scopes: Vec::new(),
+                capabilities: profile.capabilities.clone(),
+                assurance: PrincipalAssurance::HumanInteractive,
+                issuer: "cowd.gateway".to_owned(),
+                issued_at_ms: now,
+                expires_at_ms: Some(now + 120_000),
+                credential_fingerprint: "reference-e2e".to_owned(),
+                credential_epoch: 1,
+                profile_revision: 1,
+                app_profiles: BTreeMap::from([(
+                    "reference-app".to_owned(),
+                    profile.profile_id.clone(),
+                )]),
+            }),
+        );
+        let root = tempfile::tempdir().expect("reference Gateway runtime root");
+        let platform = GatewayAppPlatform::for_test_direct_catalog(
+            discovered,
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("core-bridge.sock"),
+        );
+
+        let app_id = AppId("reference-app".to_owned());
+        assert_eq!(
+            platform
+                .supervisor()
+                .status(&app_id)
+                .await
+                .expect("mounted status")
+                .state,
+            cowd_app_protocol::AppLifecycleStateV1::Mounted
+        );
+        let catalog = project_catalog(&platform, &principal)
+            .await
+            .expect("static catalog projection");
+        assert_eq!(catalog.apps.len(), 1);
+        assert_eq!(
+            platform
+                .supervisor()
+                .status(&app_id)
+                .await
+                .expect("catalog status")
+                .state,
+            cowd_app_protocol::AppLifecycleStateV1::Mounted
+        );
+        let static_response = serve(&platform, "reference-app", "index.html").await;
+        assert_eq!(static_response.status(), StatusCode::OK);
+        assert_eq!(
+            platform
+                .supervisor()
+                .status(&app_id)
+                .await
+                .expect("static status")
+                .state,
+            cowd_app_protocol::AppLifecycleStateV1::Mounted
+        );
+        let unauthorized = super::super::AuthenticatedPrincipal(
+            runtime::VerifiedPrincipal::from_test_claims(PrincipalClaims {
+                principal_id: "reference-unauthorized".to_owned(),
+                tenant_id: "tenant-reference".to_owned(),
+                grant_id: "grant-reference-unauthorized".to_owned(),
+                kind: PrincipalKind::Human,
+                scopes: Vec::new(),
+                capabilities: Vec::new(),
+                assurance: PrincipalAssurance::HumanInteractive,
+                issuer: "cowd.gateway".to_owned(),
+                issued_at_ms: now,
+                expires_at_ms: Some(now + 120_000),
+                credential_fingerprint: "reference-unauthorized".to_owned(),
+                credential_epoch: 1,
+                profile_revision: 1,
+                app_profiles: BTreeMap::new(),
+            }),
+        );
+        let unauthorized_invoke = proxy_unary(
+            &platform,
+            root.path(),
+            &unauthorized,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.echo",
+            InvokeInput {
+                payload: json!({"message":"must not activate"}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(unauthorized_invoke.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            platform
+                .supervisor()
+                .status(&app_id)
+                .await
+                .expect("unauthorized status")
+                .state,
+            cowd_app_protocol::AppLifecycleStateV1::Mounted
+        );
+        let detail_result = get_app(
+            Extension(Arc::clone(&platform)),
+            Extension(principal.clone()),
+            AxumPath("reference-app".to_owned()),
+        )
+        .await;
+        let detail = match detail_result {
+            Ok(detail) => detail.0,
+            Err(error) => {
+                let status = platform.supervisor().status(&app_id).await;
+                let logs = platform.supervisor().logs(&app_id).await;
+                panic!(
+                    "reference APP detail failed: {error:?}; runtime status: {status:?}; logs: {logs:?}"
+                )
+            }
+        };
+        assert_eq!(detail.manifest.app_id, app_id);
+        assert!(!detail.operations.is_empty());
+
+        let workspace = root.path().join("workspace");
+        let query = proxy_unary(
+            &platform,
+            &workspace,
+            &principal,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.echo",
+            InvokeInput {
+                payload: json!({"message":"through-gateway"}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(query.status(), StatusCode::OK);
+        let query: AppProviderResponseV1 = decode_response(query).await;
+        assert_eq!(query.payload["echo"]["message"], "through-gateway");
+
+        let malformed_business_payload = proxy_unary(
+            &platform,
+            &workspace,
+            &principal,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.echo",
+            InvokeInput {
+                payload: json!({"message":7,"unsigned_extra":true}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(malformed_business_payload.status(), StatusCode::BAD_REQUEST);
+        let malformed: AppErrorResponseV1 = decode_response(malformed_business_payload).await;
+        assert_eq!(malformed.error.code, AppErrorCodeV1::InvalidRequest);
+
+        let invalid_deadline = proxy_unary(
+            &platform,
+            &workspace,
+            &principal,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.echo",
+            InvokeInput {
+                payload: json!({}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: Some(30_001),
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(invalid_deadline.status(), StatusCode::BAD_REQUEST);
+        let oversized = proxy_unary(
+            &platform,
+            &workspace,
+            &principal,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.echo",
+            InvokeInput {
+                payload: json!({"value":"x".repeat(70 * 1024)}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let invalid_query_idempotency = proxy_unary(
+            &platform,
+            &workspace,
+            &principal,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.echo",
+            InvokeInput {
+                payload: json!({}),
+                idempotency_key: Some("not-valid-for-query".to_owned()),
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(invalid_query_idempotency.status(), StatusCode::FORBIDDEN);
+
+        let command = proxy_unary(
+            &platform,
+            &workspace,
+            &principal,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.counter.increment",
+            InvokeInput {
+                payload: json!({"delta":1}),
+                idempotency_key: Some("reference-gateway-increment-1".to_owned()),
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(command.status(), StatusCode::OK);
+        let receipt: DurableReceiptV1 = decode_response(command).await;
+        let missing_command_idempotency = proxy_unary(
+            &platform,
+            &workspace,
+            &principal,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.counter.increment",
+            InvokeInput {
+                payload: json!({"delta":1}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(missing_command_idempotency.status(), StatusCode::FORBIDDEN);
+        let receipt_response = get_receipt(
+            Extension(Arc::clone(&platform)),
+            Extension(principal.clone()),
+            AxumPath(("reference-app".to_owned(), receipt.receipt_id.clone())),
+        )
+        .await;
+        assert_eq!(receipt_response.status(), StatusCode::OK);
+
+        let stream = proxy_stream(
+            &platform,
+            &workspace,
+            &principal,
+            &HeaderMap::new(),
+            "reference-app",
+            "reference-app.events",
+            InvokeInput {
+                payload: json!({}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(stream.status(), StatusCode::OK);
+        let bytes = stream
+            .into_body()
+            .collect()
+            .await
+            .expect("Gateway stream body")
+            .to_bytes();
+        let frames = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<AppStreamFrameV1>(line).expect("typed frame"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            frames.first(),
+            Some(AppStreamFrameV1::Open { .. })
+        ));
+        assert!(matches!(frames.last(), Some(AppStreamFrameV1::End { .. })));
+        let subscription_id = frames[0].subscription_id().to_owned();
+        let ack = ack_subscription(
+            Extension(Arc::clone(&platform)),
+            Extension(principal.clone()),
+            AxumPath(("reference-app".to_owned(), subscription_id.clone())),
+            Json(AppStreamAckV1 {
+                schema_version: 1,
+                subscription_id: subscription_id.clone(),
+                maximum_contiguous_sequence: frames.last().expect("terminal frame").sequence(),
+                cursor: "cursor-3".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(ack.status(), StatusCode::NO_CONTENT);
+        let cancel = cancel_subscription(
+            Extension(Arc::clone(&platform)),
+            Extension(principal.clone()),
+            AxumPath(("reference-app".to_owned(), subscription_id)),
+        )
+        .await;
+        assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
+
+        let rejected = tui_action(
+            Extension(Arc::clone(&platform)),
+            Extension(principal),
+            AxumState(Arc::new(super::super::AppState {
+                workspace_root: workspace,
+                ..Arc::try_unwrap(super::super::tests::test_state())
+                    .unwrap_or_else(|_| panic!("unique test state"))
+            })),
+            HeaderMap::new(),
+            AxumPath(("reference-app".to_owned(), "reference.main".to_owned())),
+            Json(AppActionV1 {
+                schema_version: 1,
+                app_id: AppId("reference-app".to_owned()),
+                view_id: "reference.main".to_owned(),
+                document_revision: "1".to_owned(),
+                component_id: "root".to_owned(),
+                action_id: "unsupported".to_owned(),
+                selection: serde_json::Value::Null,
+                form: serde_json::Value::Null,
+                confirmed: true,
+            }),
+        )
+        .await;
+        assert!(!rejected.status().is_success());
+        platform.shutdown().await.expect("reference APP shutdown");
+    }
+
+    async fn decode_response<T: serde::de::DeserializeOwned>(response: Response<Body>) -> T {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("Gateway response body")
+            .to_bytes();
+        serde_json::from_slice(&bytes).expect("typed Gateway response")
+    }
 }

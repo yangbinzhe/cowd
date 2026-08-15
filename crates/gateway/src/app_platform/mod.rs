@@ -15,22 +15,23 @@ use cowd_app_host::{
         EffectiveAppPolicy, TrustedSigningKey,
     },
     supervisor::{
-        AppRuntimeSupervisor, AppRuntimeSupervisorConfig, AppWorkerConnector, ConnectorFuture,
-        SupervisorError,
+        ensure_app_runtime_slot_identity, AppRuntimeSupervisor, AppRuntimeSupervisorConfig,
+        AppWorkerConnector, ConnectorFuture, SupervisorError,
     },
 };
 use cowd_app_protocol::{
     derive_channel_token_v1, format_bootstrap_authorization_v1, format_channel_authorization_v1,
     manifest_authorization_profile_digest_v1, manifest_capability_digest_v1, AppHandshakeRequestV1,
     AppHandshakeV1, AppHealthStatusV1, AppHealthV1, AppId, BootstrapSecretV1, ChannelPurposeV1,
-    ChannelTokenV1, ProtocolValidate, APP_HANDSHAKE_PATH_V1, APP_HEALTH_PATH_V1,
-    ENV_APP_CONFIG_FILE_V1, ENV_APP_CREDENTIAL_FILE_V1, ENV_APP_DATA_DIR_V1, ENV_APP_GENERATION_V1,
-    ENV_APP_ID_V1, ENV_APP_LOG_FORMAT_V1, ENV_APP_SOCKET_V1, ENV_CORE_BRIDGE_SOCKET_V1,
-    HEADER_AUTHORIZATION_V1, HEADER_CONTENT_TYPE_V1, PROTOCOL_REVISION_V1, UNARY_CONTENT_TYPE_V1,
+    ChannelTokenV1, OperationDescriptorV1, ProtocolValidate, APP_HANDSHAKE_PATH_V1,
+    APP_HEALTH_PATH_V1, ENV_APP_CONFIG_FILE_V1, ENV_APP_CREDENTIAL_FILE_V1, ENV_APP_DATA_DIR_V1,
+    ENV_APP_GENERATION_V1, ENV_APP_ID_V1, ENV_APP_LOG_FORMAT_V1, ENV_APP_SOCKET_V1,
+    ENV_CORE_BRIDGE_SOCKET_V1, HEADER_AUTHORIZATION_V1, HEADER_CONTENT_TYPE_V1,
+    PROTOCOL_REVISION_V1, UNARY_CONTENT_TYPE_V1,
 };
 use http_body_util::{BodyExt, Full};
 use managed_worker_runtime::{
-    recover_runtime_root, CancellationToken, GenerationFence, ManagedH2Channel,
+    recover_runtime_slot, CancellationToken, GenerationFence, ManagedH2Channel,
     ManagedWorkerHandle, ManagedWorkerSpec, PeerCredentialPolicy, WorkerIsolationMode,
     WorkerResourceLimits,
 };
@@ -82,7 +83,30 @@ struct TrustKeyFileV1 {
 pub(crate) struct GatewayAppConnection {
     channel: ManagedH2Channel,
     token: ChannelTokenV1,
+    operations: Arc<Vec<OperationDescriptorV1>>,
     core_bridge_registration: core_bridge::CoreBridgeRegistration,
+}
+
+impl GatewayAppConnection {
+    pub(crate) fn operations(&self) -> &[OperationDescriptorV1] {
+        &self.operations
+    }
+
+    pub(crate) async fn send(
+        &self,
+        generation: &str,
+        request: hyper::Request<Full<Bytes>>,
+        timeout: Duration,
+        cancellation: &CancellationToken,
+    ) -> managed_worker_runtime::ManagedWorkerResult<hyper::Response<hyper::body::Incoming>> {
+        self.channel
+            .send(generation, request, timeout, cancellation)
+            .await
+    }
+
+    pub(crate) fn authorization(&self) -> String {
+        format_channel_authorization_v1(&self.token)
+    }
 }
 
 #[derive(Debug)]
@@ -96,6 +120,8 @@ pub(crate) struct GatewayAppConnector {
     resources: WorkerResourceLimits,
     handshake_timeout: Duration,
     core_bridge_registry: Arc<CoreBridgeRegistry>,
+    #[cfg(test)]
+    direct_test_process: bool,
 }
 
 pub(crate) type GatewayAppSupervisor = AppRuntimeSupervisor<GatewayAppConnector>;
@@ -139,6 +165,43 @@ impl GatewayAppPlatform {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_direct_catalog(
+        catalog: AppCatalogSnapshot,
+        runtime_root: PathBuf,
+        data_root: PathBuf,
+        core_bridge_socket: PathBuf,
+    ) -> Arc<Self> {
+        let catalog = Arc::new(catalog);
+        let core_bridge_registry = Arc::new(CoreBridgeRegistry::default());
+        let connector = Arc::new(GatewayAppConnector {
+            launcher_path: PathBuf::new(),
+            launcher_sha256: String::new(),
+            gateway_instance: "test-gateway".to_owned(),
+            data_root,
+            core_bridge_socket,
+            cgroup_root: PathBuf::new(),
+            resources: WorkerResourceLimits::default(),
+            handshake_timeout: Duration::from_secs(10),
+            core_bridge_registry: Arc::clone(&core_bridge_registry),
+            direct_test_process: true,
+        });
+        let supervisor = AppRuntimeSupervisor::new(
+            Arc::clone(&catalog),
+            connector,
+            AppRuntimeSupervisorConfig {
+                runtime_root,
+                ..AppRuntimeSupervisorConfig::default()
+            },
+        )
+        .expect("direct test APP supervisor");
+        Arc::new(Self {
+            catalog,
+            supervisor,
+            core_bridge_registry,
+        })
+    }
+
     pub(crate) async fn start_resident(&self) -> Result<(), SupervisorError> {
         self.supervisor.start_resident().await
     }
@@ -169,7 +232,11 @@ impl GatewayAppPlatform {
         };
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .map_err(|error| {
+                AppPlatformError::Configuration(format!(
+                    "system clock is before the Unix epoch: {error}"
+                ))
+            })?
             .as_millis() as u64;
         let snapshot = Arc::new(
             AppCatalogBuilder::new(
@@ -229,17 +296,18 @@ impl GatewayAppPlatform {
                 expected_uid,
             )?;
         }
-        if let Ok(app_roots) = fs::read_dir(config.runtime_root()) {
-            for root in app_roots
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_dir())
-            {
-                recover_runtime_root(&root, snapshot.generation().0.as_str(), &gateway_instance)
-                    .map_err(|error| {
-                        AppPlatformError::Catalog(format!("runtime recovery failed: {error}"))
-                    })?;
-            }
+        for app in snapshot.apps() {
+            let slot = ensure_app_runtime_slot_identity(
+                config.runtime_root(),
+                &app.manifest.app_id,
+                &app.generation,
+            )?;
+            recover_runtime_slot(&slot, &app.generation.0, &gateway_instance).map_err(|error| {
+                AppPlatformError::Catalog(format!(
+                    "runtime recovery failed for {}: {error}",
+                    app.manifest.app_id
+                ))
+            })?;
         }
         let r = config.resources();
         let connector = Arc::new(GatewayAppConnector {
@@ -262,6 +330,8 @@ impl GatewayAppPlatform {
             },
             handshake_timeout: Duration::from_millis(config.supervisor().handshake_timeout_ms),
             core_bridge_registry: Arc::clone(&core_bridge_registry),
+            #[cfg(test)]
+            direct_test_process: false,
         });
         let supervisor =
             AppRuntimeSupervisor::new(snapshot.clone(), connector, supervisor_config(config))?;
@@ -289,6 +359,8 @@ impl GatewayAppConnector {
             resources: WorkerResourceLimits::default(),
             handshake_timeout: Duration::from_secs(3),
             core_bridge_registry,
+            #[cfg(test)]
+            direct_test_process: false,
         }
     }
 }
@@ -314,6 +386,20 @@ impl AppWorkerConnector for GatewayAppConnector {
         spec.isolation_mode = WorkerIsolationMode::Enforce;
         spec.resource_limits = self.resources.clone();
         spec.cgroup_root = Some(self.cgroup_root.clone());
+        #[cfg(test)]
+        if self.direct_test_process {
+            spec = spec.direct_test_process();
+            spec.env.insert(
+                ENV_APP_SOCKET_V1.to_owned(),
+                spec.runtime_dir.join("w.sock").display().to_string(),
+            );
+            spec.env.insert(
+                ENV_APP_CREDENTIAL_FILE_V1.to_owned(),
+                spec.runtime_dir.join("credential").display().to_string(),
+            );
+            spec.env
+                .insert(ENV_APP_GENERATION_V1.to_owned(), spec.generation.clone());
+        }
         spec.socket_env = Some(ENV_APP_SOCKET_V1.to_owned());
         spec.credential_env = Some(ENV_APP_CREDENTIAL_FILE_V1.to_owned());
         spec.generation_env = Some(ENV_APP_GENERATION_V1.to_owned());
@@ -419,7 +505,9 @@ impl AppWorkerConnector for GatewayAppConnector {
                 .to_bytes();
             let handshake: AppHandshakeV1 =
                 serde_json::from_slice(&body).map_err(protocol_error(app))?;
-            handshake.validate().map_err(protocol_error(app))?;
+            handshake
+                .validate_against_manifest(&app.manifest)
+                .map_err(protocol_error(app))?;
             let capability =
                 manifest_capability_digest_v1(&app.manifest).map_err(protocol_error(app))?;
             let profiles = manifest_authorization_profile_digest_v1(&app.manifest)
@@ -467,6 +555,7 @@ impl AppWorkerConnector for GatewayAppConnector {
             Ok(GatewayAppConnection {
                 channel,
                 token,
+                operations: Arc::new(handshake.operations),
                 core_bridge_registration,
             })
         })

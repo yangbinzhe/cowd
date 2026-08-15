@@ -120,6 +120,7 @@ cowd-app-host = { path = "../app-host", features = ["test-support"] }
 app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "4ee6fb9" }
 auth-broker = { path = "../auth-broker", features = ["test-support"] }
 runtime = { path = "../runtime", features = ["test-fixtures"] }
+managed-worker-runtime = { path = "../managed-worker-runtime", features = ["test-support"] }
 serde_json.workspace = true
 serial_test = "3"
 surface-postgres = { path = "../surface-postgres" }

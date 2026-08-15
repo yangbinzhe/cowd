@@ -31,5 +31,5 @@ pub use managed_worker_launcher::{
     WorkerIsolationPolicyV1 as WorkerIsolationPolicy,
 };
 pub use process::{ManagedWorkerHandle, ManagedWorkerSpec, WorkerExit};
-pub use recovery::{recover_runtime_root, RuntimeRecoveryReport};
+pub use recovery::{recover_runtime_root, recover_runtime_slot, RuntimeRecoveryReport};
 pub use runtime_dir::WorkerRuntimeDir;

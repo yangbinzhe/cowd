@@ -44,9 +44,12 @@ pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
 }
 
 pub(crate) fn gateway_route_manifest_for_apps(
-    app_registry: &cowd_app_host::AppRegistry,
+    _app_registry: &cowd_app_host::AppRegistry,
 ) -> Vec<GatewayRouteManifestEntry> {
-    gateway_route_manifest_with_apps(app_registry.route_metadata())
+    // APP discovery is dynamic. Public contracts expose only Gateway-owned
+    // generic proxy paths; product-specific legacy routers remain callable
+    // during R01 migration but are deliberately not advertised.
+    gateway_route_manifest_with_apps(Vec::new())
 }
 
 fn gateway_route_manifest_with_apps(
@@ -266,6 +269,42 @@ mod tests {
                 && entry.source == "public_routes.rs"
         }));
         assert!(generated_route_metadata().len() > 50);
+    }
+
+    #[test]
+    fn dynamic_app_manifest_exposes_the_complete_generic_proxy_surface_only() {
+        let manifest = gateway_route_manifest_for_apps(
+            crate::services::GatewayServices::baseline()
+                .app_registry
+                .as_ref(),
+        );
+        let app_routes = manifest
+            .iter()
+            .filter(|entry| entry.path.starts_with("/api/apps"))
+            .map(|entry| (entry.method.as_str(), entry.path.as_str()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            app_routes,
+            BTreeSet::from([
+                ("DELETE", "/api/apps/:app_id/subscriptions/:subscription_id"),
+                ("GET", "/api/apps"),
+                ("GET", "/api/apps/:app_id"),
+                ("GET", "/api/apps/:app_id/receipts/:receipt_id"),
+                ("POST", "/api/apps/:app_id/operations/:operation_id/invoke",),
+                ("POST", "/api/apps/:app_id/operations/:operation_id/stream",),
+                (
+                    "POST",
+                    "/api/apps/:app_id/subscriptions/:subscription_id/ack",
+                ),
+                ("POST", "/api/apps/:app_id/tui/views/:view_id/actions"),
+                ("POST", "/api/apps/:app_id/tui/views/:view_id/open"),
+                ("POST", "/api/apps/:app_id/tui/views/:view_id/stream"),
+            ])
+        );
+        assert!(manifest
+            .iter()
+            .filter(|entry| entry.path.starts_with("/api/apps"))
+            .all(|entry| entry.app.is_none()));
     }
 
     #[test]

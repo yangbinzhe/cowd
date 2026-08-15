@@ -224,6 +224,106 @@ fn app(id: &str, activation: AppActivationPolicyV1, required: bool) -> AppFixtur
     }
 }
 
+#[test]
+fn runtime_directory_key_is_stable_bounded_and_identity_bound() {
+    let app = AppId("reference-app".to_owned());
+    let generation = GenerationId(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+    );
+    let key = app_runtime_directory_key(&app, &generation);
+    assert_eq!(key.len(), RUNTIME_KEY_HEX_CHARS);
+    assert!(key
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+    assert_eq!(key, app_runtime_directory_key(&app, &generation));
+    assert_ne!(
+        key,
+        app_runtime_directory_key(&AppId("other-app".to_owned()), &generation)
+    );
+    assert_ne!(
+        key,
+        app_runtime_directory_key(
+            &app,
+            &GenerationId(
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_owned(),
+            )
+        )
+    );
+}
+
+#[test]
+fn supervisor_rejects_a_runtime_root_that_cannot_fit_unix_sockets() {
+    let root = PathBuf::from("/").join("x".repeat(80));
+    let (_fixture, snapshot, _) = fixture(&[]);
+    let result = AppRuntimeSupervisor::new(
+        snapshot,
+        Arc::new(FakeConnector::new([], Duration::ZERO)),
+        AppRuntimeSupervisorConfig {
+            runtime_root: root,
+            ..AppRuntimeSupervisorConfig::default()
+        },
+    );
+    let Err(error) = result else {
+        panic!("overlong runtime root must fail closed");
+    };
+    assert!(
+        matches!(error, SupervisorError::InvalidConfiguration(message) if message.contains("too long for Unix sockets"))
+    );
+}
+
+#[test]
+fn runtime_slot_owner_mismatch_is_preserved_and_rejected() {
+    let fixture = TempDir::new().expect("fixture root");
+    let root = fixture.path().join("runtime");
+    let app = AppId("reference-app".to_owned());
+    let generation = GenerationId("sha256:expected".to_owned());
+    let slot = ensure_app_runtime_slot_identity(&root, &app, &generation).expect("initial claim");
+    let marker = slot.join(SLOT_OWNER_FILE);
+    let foreign = RuntimeSlotOwnerV1 {
+        schema_version: 1,
+        app_id: AppId("foreign-app".to_owned()),
+        generation: GenerationId("sha256:foreign".to_owned()),
+    };
+    let bytes = serde_json::to_vec(&foreign).expect("foreign owner encode");
+    std::fs::write(&marker, &bytes).expect("foreign owner fixture");
+
+    assert!(matches!(
+        ensure_app_runtime_slot_identity(&root, &app, &generation),
+        Err(SupervisorError::InvalidConfiguration(message))
+            if message.contains("runtime slot identity mismatch")
+    ));
+    assert_eq!(std::fs::read(&marker).expect("preserved owner"), bytes);
+}
+
+#[test]
+fn concurrent_runtime_slot_claims_converge_on_one_identity() {
+    let fixture = TempDir::new().expect("fixture root");
+    let root = Arc::new(fixture.path().join("runtime"));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let root = Arc::clone(&root);
+        threads.push(std::thread::spawn(move || {
+            ensure_app_runtime_slot_identity(
+                &root,
+                &AppId("reference-app".to_owned()),
+                &GenerationId("sha256:concurrent".to_owned()),
+            )
+        }));
+    }
+    let slots = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("claim thread").expect("claim"))
+        .collect::<Vec<_>>();
+    assert!(slots.windows(2).all(|pair| pair[0] == pair[1]));
+    let owner: RuntimeSlotOwnerV1 = serde_json::from_slice(
+        &std::fs::read(slots[0].join(SLOT_OWNER_FILE)).expect("owner marker"),
+    )
+    .expect("owner decode");
+    assert_eq!(owner.app_id.0, "reference-app");
+    assert_eq!(owner.generation.0, "sha256:concurrent");
+}
+
 async fn wait_for_state<C: AppWorkerConnector>(
     supervisor: &AppRuntimeSupervisor<C>,
     app_id: &AppId,

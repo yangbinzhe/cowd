@@ -292,17 +292,13 @@ impl ManagedWorkerHandle {
         spec.validate()?;
         let generation = GenerationFence::new(spec.generation.clone())?;
         let runtime = WorkerRuntimeDir::create(&spec.runtime_dir)?;
-        runtime.cleanup_ephemeral()?;
-        #[cfg(feature = "test-support")]
-        let isolated_launch = !spec.direct_test_process;
-        #[cfg(not(feature = "test-support"))]
-        let isolated_launch = true;
-        if isolated_launch && runtime.identity_path().exists() {
+        if runtime.identity_path().exists() {
             return Err(ManagedWorkerError::InvalidSpec(
                 "worker identity already exists; runtime recovery is required before spawn"
                     .to_string(),
             ));
         }
+        runtime.cleanup_ephemeral()?;
         let mut runtime_guard = RuntimeSpawnGuard::new(runtime.clone());
         let (credential, bootstrap_secret) = CredentialLease::create(&runtime)?;
 
@@ -1098,6 +1094,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_runtime_identity_is_never_overwritten_by_spawn() {
+        let root = temp_path("identity-collision");
+        let spec = configure_test_spec(ManagedWorkerSpec::new(
+            "/bin/true",
+            &root,
+            "generation-collision",
+        ));
+        let identity = root.join("worker-identity.json");
+        let socket = root.join("w.sock");
+        fs::write(&socket, b"foreign socket").expect("foreign socket");
+        fs::write(&identity, b"foreign-identity").expect("foreign identity");
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o600))
+            .expect("foreign identity mode");
+        assert!(matches!(
+            ManagedWorkerHandle::spawn(spec).await,
+            Err(ManagedWorkerError::InvalidSpec(message))
+                if message == "worker identity already exists; runtime recovery is required before spawn"
+        ));
+        assert_eq!(
+            fs::read(&identity).expect("preserved identity"),
+            b"foreign-identity"
+        );
+        assert_eq!(
+            fs::read(&socket).expect("preserved socket"),
+            b"foreign socket"
+        );
+        fs::remove_dir_all(root).expect("cleanup collision fixture");
+    }
+
+    #[tokio::test]
     async fn spawn_crash_and_log_drain_are_observable_and_bounded() {
         let handle = ManagedWorkerHandle::spawn(shell_spec(
             "crash-log",
@@ -1167,7 +1193,7 @@ mod tests {
             ManagedWorkerHandle::spawn(spec).await,
             Err(ManagedWorkerError::DeadlineExceeded(_))
         ));
-        assert!(!root.join("worker.sock").exists());
+        assert!(!root.join("w.sock").exists());
         assert!(!root.join("credential").exists());
         fs::remove_dir_all(root).expect("cleanup");
     }

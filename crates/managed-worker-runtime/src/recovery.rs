@@ -39,42 +39,103 @@ pub fn recover_runtime_root(
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             continue;
         }
-        report.inspected += 1;
-        let runtime = WorkerRuntimeDir::create(&path)?;
-        let identity_path = runtime.identity_path();
-        let identity = match read_identity(&identity_path) {
-            Ok(identity) => identity,
-            Err(ManagedWorkerError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                runtime.cleanup_ephemeral()?;
-                report.cleaned += 1;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        if identity.generation == current_generation
-            && identity.gateway_instance == current_gateway_instance
-        {
-            continue;
-        }
-        if Path::new(&format!("/proc/{}", identity.pid)).exists() {
-            verify_live_identity(&identity)?;
-            kill_group(identity.pgid)?;
-            report.terminated += 1;
-        } else if process_group_members(identity.pgid) > 0 {
-            verify_cgroup_membership(&identity)?;
-            kill_group(identity.pgid)?;
-            report.terminated += 1;
-        }
-        runtime.cleanup_ephemeral()?;
-        remove_if_exists(&identity_path)?;
-        if let Some(cgroup) = &identity.cgroup_path {
-            let _ = fs::remove_dir(cgroup);
-        }
-        report.cleaned += 1;
+        let recovered =
+            recover_runtime_slot_inner(&path, None, current_generation, current_gateway_instance)?;
+        report.inspected += recovered.inspected;
+        report.terminated += recovered.terminated;
+        report.cleaned += recovered.cleaned;
     }
     Ok(report)
+}
+
+/// Recovers one identity-bound runtime slot without permitting a generation
+/// mismatch at the selected directory key. A mismatched identity is preserved
+/// and rejected so a hash collision or path substitution cannot be reclaimed.
+pub fn recover_runtime_slot(
+    root: impl AsRef<Path>,
+    expected_generation: &str,
+    current_gateway_instance: &str,
+) -> ManagedWorkerResult<RuntimeRecoveryReport> {
+    recover_runtime_slot_inner(
+        root.as_ref(),
+        Some(expected_generation),
+        expected_generation,
+        current_gateway_instance,
+    )
+}
+
+fn recover_runtime_slot_inner(
+    path: &Path,
+    expected_generation: Option<&str>,
+    current_generation: &str,
+    current_gateway_instance: &str,
+) -> ManagedWorkerResult<RuntimeRecoveryReport> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RuntimeRecoveryReport::default())
+        }
+        Err(error) => return Err(ManagedWorkerError::io(path, error)),
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ManagedWorkerError::RecoveryIsolation(format!(
+            "runtime slot is not a real directory: {}",
+            path.display()
+        )));
+    }
+    let runtime = WorkerRuntimeDir::create(path)?;
+    let identity_path = runtime.identity_path();
+    let identity = match read_identity(&identity_path) {
+        Ok(identity) => identity,
+        Err(ManagedWorkerError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            runtime.cleanup_ephemeral()?;
+            return Ok(RuntimeRecoveryReport {
+                inspected: 1,
+                terminated: 0,
+                cleaned: 1,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(expected) = expected_generation {
+        if identity.generation != expected {
+            return Err(ManagedWorkerError::RecoveryIsolation(format!(
+                "runtime slot generation mismatch: expected {expected}, observed {}",
+                identity.generation
+            )));
+        }
+    }
+    if identity.generation == current_generation
+        && identity.gateway_instance == current_gateway_instance
+    {
+        return Ok(RuntimeRecoveryReport {
+            inspected: 1,
+            terminated: 0,
+            cleaned: 0,
+        });
+    }
+    let mut terminated = 0;
+    if Path::new(&format!("/proc/{}", identity.pid)).exists() {
+        verify_live_identity(&identity)?;
+        kill_group(identity.pgid)?;
+        terminated = 1;
+    } else if process_group_members(identity.pgid) > 0 {
+        verify_cgroup_membership(&identity)?;
+        kill_group(identity.pgid)?;
+        terminated = 1;
+    }
+    runtime.cleanup_ephemeral()?;
+    remove_if_exists(&identity_path)?;
+    if let Some(cgroup) = &identity.cgroup_path {
+        let _ = fs::remove_dir(cgroup);
+    }
+    Ok(RuntimeRecoveryReport {
+        inspected: 1,
+        terminated,
+        cleaned: 1,
+    })
 }
 
 fn verify_cgroup_membership(identity: &WorkerIdentityV1) -> ManagedWorkerResult<()> {
@@ -295,6 +356,45 @@ mod tests {
         assert!(!runtime.identity_path().exists());
         let second = recover_runtime_root(&root, "new", "new-gateway").expect("second recovery");
         assert_eq!(second.terminated, 0);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn selected_slot_generation_mismatch_is_preserved_and_rejected() {
+        let root = temp_root("generation-mismatch");
+        let runtime = WorkerRuntimeDir::create(&root).expect("runtime");
+        fs::write(runtime.socket_path(), b"foreign socket").expect("socket fixture");
+        let target = fs::canonicalize("/bin/true").expect("target");
+        let identity = WorkerIdentityV1 {
+            schema_version: 1,
+            pid: u32::MAX,
+            pgid: u32::MAX,
+            proc_start_ticks: 1,
+            boot_id: read_boot_id().expect("boot id"),
+            target_sha256: sha256_file(&target).expect("digest"),
+            target_path: target,
+            generation: "foreign-generation".into(),
+            gateway_instance: "foreign-gateway".into(),
+            launch_id: "foreign-launch".into(),
+            launch_digest: "sha256:foreign".into(),
+            cgroup_path: None,
+        };
+        write_identity(&runtime.identity_path(), &identity);
+        let before = fs::read(runtime.identity_path()).expect("identity before recovery");
+
+        assert!(matches!(
+            recover_runtime_slot(&root, "expected-generation", "current-gateway"),
+            Err(ManagedWorkerError::RecoveryIsolation(message))
+                if message.contains("runtime slot generation mismatch")
+        ));
+        assert_eq!(
+            fs::read(runtime.identity_path()).expect("identity after rejection"),
+            before
+        );
+        assert_eq!(
+            fs::read(runtime.socket_path()).expect("socket after rejection"),
+            b"foreign socket"
+        );
         fs::remove_dir_all(root).expect("cleanup");
     }
 

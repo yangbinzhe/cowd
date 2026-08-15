@@ -59,7 +59,7 @@ impl WorkerRuntimeDir {
 
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
-        self.root.join("worker.sock")
+        self.root.join("w.sock")
     }
 
     #[must_use]
@@ -84,7 +84,7 @@ impl WorkerRuntimeDir {
 
     #[must_use]
     pub fn status_socket_path(&self) -> PathBuf {
-        self.root.join("launcher-status.sock")
+        self.root.join("l.sock")
     }
 
     pub fn cleanup_ephemeral(&self) -> ManagedWorkerResult<()> {

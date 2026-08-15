@@ -9,8 +9,15 @@ pub use types::{AppRuntimeLogs, AppRuntimeStatus, AppRuntimeSupervisorConfig, Su
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    fs,
+    io::Write,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{OpenOptionsExt, PermissionsExt},
+    },
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Weak,
     },
     time::Duration,
@@ -18,6 +25,7 @@ use std::{
 
 use cowd_app_protocol::{AppActivationPolicyV1, AppId, AppLifecycleStateV1, GenerationId};
 use managed_worker_runtime::{CancellationToken, ManagedWorkerHandle, ManagedWorkerSpec};
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore},
     time::Instant,
@@ -26,6 +34,19 @@ use tokio::{
 use crate::catalog::{AdmittedApp, AppCatalogSnapshot};
 
 const MONITOR_INTERVAL: Duration = Duration::from_millis(20);
+const RUNTIME_KEY_HEX_CHARS: usize = 32;
+const UNIX_PATH_BYTES: usize = 108;
+const LONGEST_SOCKET_NAME: &str = "l.sock";
+const SLOT_OWNER_FILE: &str = "slot-owner.json";
+static SLOT_OWNER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RuntimeSlotOwnerV1 {
+    schema_version: u32,
+    app_id: AppId,
+    generation: GenerationId,
+}
 
 pub struct AppRuntimeSupervisor<C: AppWorkerConnector> {
     inner: Arc<SupervisorInner<C>>,
@@ -158,6 +179,25 @@ impl<C: AppWorkerConnector> AppRuntimeSupervisor<C> {
         config: AppRuntimeSupervisorConfig,
     ) -> Result<Self, SupervisorError> {
         config.validate()?;
+        validate_runtime_root(&config.runtime_root)?;
+        let mut runtime_keys = BTreeMap::new();
+        for app in catalog.apps() {
+            let key = app_runtime_directory_key(&app.manifest.app_id, &app.generation);
+            if let Some((existing_app, existing_generation)) = runtime_keys.insert(
+                key.clone(),
+                (app.manifest.app_id.clone(), app.generation.clone()),
+            ) {
+                return Err(SupervisorError::InvalidConfiguration(format!(
+                    "runtime key collision `{key}` between {existing_app}@{} and {}@{}",
+                    existing_generation.0, app.manifest.app_id, app.generation.0
+                )));
+            }
+            ensure_app_runtime_slot_identity(
+                &config.runtime_root,
+                &app.manifest.app_id,
+                &app.generation,
+            )?;
+        }
         let apps = catalog
             .apps()
             .map(|app| {
@@ -618,7 +658,10 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
         let active = self
             .acquire_permit(Arc::clone(&self.active), deadline, timeout, cancellation)
             .await?;
-        let runtime_dir = self.config.runtime_root.join(&app_id.0).join(&generation.0);
+        let runtime_dir = self
+            .config
+            .runtime_root
+            .join(app_runtime_directory_key(app_id, generation));
         let mut spec =
             ManagedWorkerSpec::new(&slot.admitted.executable, runtime_dir, generation.0.clone());
         spec.startup_timeout = deadline.saturating_duration_since(Instant::now());
@@ -991,4 +1034,166 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
             Ok(())
         }
     }
+}
+
+#[must_use]
+pub fn app_runtime_directory_key(app_id: &AppId, generation: &GenerationId) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cowd.app.runtime-directory/v1\0");
+    digest.update(app_id.0.as_bytes());
+    digest.update([0]);
+    digest.update(generation.0.as_bytes());
+    let encoded = format!("{:x}", digest.finalize());
+    encoded[..RUNTIME_KEY_HEX_CHARS].to_owned()
+}
+
+/// Atomically claims a bounded runtime slot for one complete APP identity.
+/// Existing state is never adopted unless its owner marker is byte-for-byte
+/// equivalent after strict decoding.
+pub fn ensure_app_runtime_slot_identity(
+    runtime_root: &Path,
+    app_id: &AppId,
+    generation: &GenerationId,
+) -> Result<PathBuf, SupervisorError> {
+    validate_runtime_root(runtime_root)?;
+    let slot = runtime_root.join(app_runtime_directory_key(app_id, generation));
+    fs::create_dir_all(&slot).map_err(runtime_slot_error(&slot))?;
+    let metadata = fs::symlink_metadata(&slot).map_err(runtime_slot_error(&slot))?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(SupervisorError::InvalidConfiguration(format!(
+            "runtime slot is not a real directory: {}",
+            slot.display()
+        )));
+    }
+    fs::set_permissions(&slot, fs::Permissions::from_mode(0o700))
+        .map_err(runtime_slot_error(&slot))?;
+    let metadata = fs::symlink_metadata(&slot).map_err(runtime_slot_error(&slot))?;
+    if !metadata.file_type().is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o777 != 0o700
+    {
+        return Err(SupervisorError::InvalidConfiguration(format!(
+            "runtime slot is not an owner-only real directory: {}",
+            slot.display()
+        )));
+    }
+    let expected = RuntimeSlotOwnerV1 {
+        schema_version: 1,
+        app_id: app_id.clone(),
+        generation: generation.clone(),
+    };
+    let marker = slot.join(SLOT_OWNER_FILE);
+    if marker.exists() {
+        validate_runtime_slot_owner(&slot, &marker, &expected)?;
+        return Ok(slot);
+    }
+    for entry in fs::read_dir(&slot).map_err(runtime_slot_error(&slot))? {
+        let entry = entry.map_err(runtime_slot_error(&slot))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == SLOT_OWNER_FILE {
+            validate_runtime_slot_owner(&slot, &marker, &expected)?;
+            return Ok(slot);
+        }
+        if !name.starts_with("slot-owner.") || !name.ends_with(".tmp") {
+            return Err(SupervisorError::InvalidConfiguration(format!(
+                "unowned runtime slot contains state and cannot be claimed: {}",
+                slot.display()
+            )));
+        }
+    }
+    let encoded = serde_json::to_vec(&expected).map_err(|error| {
+        SupervisorError::InvalidConfiguration(format!(
+            "failed to encode runtime slot identity {}: {error}",
+            marker.display()
+        ))
+    })?;
+    let sequence = SLOT_OWNER_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = slot.join(format!("slot-owner.{}.{sequence}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(runtime_slot_error(&temporary))?;
+    file.write_all(&encoded)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
+        .map_err(runtime_slot_error(&temporary))?;
+    drop(file);
+    match fs::hard_link(&temporary, &marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(runtime_slot_error(&marker)(error));
+        }
+    }
+    fs::remove_file(&temporary).map_err(runtime_slot_error(&temporary))?;
+    validate_runtime_slot_owner(&slot, &marker, &expected)?;
+    Ok(slot)
+}
+
+fn validate_runtime_slot_owner(
+    slot: &Path,
+    marker: &Path,
+    expected: &RuntimeSlotOwnerV1,
+) -> Result<(), SupervisorError> {
+    let metadata = fs::symlink_metadata(marker).map_err(runtime_slot_error(marker))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(SupervisorError::InvalidConfiguration(format!(
+            "runtime slot identity is not a 0600 regular file: {}",
+            marker.display()
+        )));
+    }
+    let observed: RuntimeSlotOwnerV1 = serde_json::from_slice(
+        &fs::read(marker).map_err(runtime_slot_error(marker))?,
+    )
+    .map_err(|error| {
+        SupervisorError::InvalidConfiguration(format!(
+            "invalid runtime slot identity {}: {error}",
+            marker.display()
+        ))
+    })?;
+    if observed != *expected {
+        return Err(SupervisorError::InvalidConfiguration(format!(
+            "runtime slot identity mismatch at {}: expected {}@{}, observed {}@{}",
+            slot.display(),
+            expected.app_id,
+            expected.generation.0,
+            observed.app_id,
+            observed.generation.0
+        )));
+    }
+    Ok(())
+}
+
+fn runtime_slot_error(path: &Path) -> impl FnOnce(std::io::Error) -> SupervisorError + '_ {
+    move |error| {
+        SupervisorError::InvalidConfiguration(format!(
+            "runtime slot {} failed: {error}",
+            path.display()
+        ))
+    }
+}
+
+fn validate_runtime_root(runtime_root: &std::path::Path) -> Result<(), SupervisorError> {
+    if !runtime_root.is_absolute() {
+        return Err(SupervisorError::InvalidConfiguration(
+            "runtime_root must be absolute".to_owned(),
+        ));
+    }
+    let worst_socket = runtime_root
+        .join("0".repeat(RUNTIME_KEY_HEX_CHARS))
+        .join(LONGEST_SOCKET_NAME);
+    if worst_socket.as_os_str().as_bytes().len() >= UNIX_PATH_BYTES {
+        return Err(SupervisorError::InvalidConfiguration(format!(
+            "runtime_root is too long for Unix sockets: {}",
+            runtime_root.display()
+        )));
+    }
+    Ok(())
 }
