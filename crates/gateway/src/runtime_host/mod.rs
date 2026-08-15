@@ -1026,6 +1026,7 @@ struct GatewayRuntimeShutdownResources<'a> {
     cognitive: Option<&'a Arc<CognitiveContextManager>>,
     surface_host: Option<&'a Arc<crate::surface_host::SurfaceHost>>,
     app_platform: Option<&'a Arc<crate::app_platform::GatewayAppPlatform>>,
+    core_bridge: Option<&'a Arc<crate::app_platform::CoreBridgeServer>>,
     auth_broker: &'a Arc<tokio::sync::Mutex<Option<AuthBrokerProcess>>>,
 }
 
@@ -1036,6 +1037,7 @@ struct GatewayRuntimeStartupRegistry {
     cognitive: Option<Arc<CognitiveContextManager>>,
     surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
     app_platform: Option<Arc<crate::app_platform::GatewayAppPlatform>>,
+    core_bridge: Option<Arc<crate::app_platform::CoreBridgeServer>>,
     runtime_services: Option<Arc<runtime::RuntimeServices>>,
     runtime_service: Option<Arc<RuntimeService>>,
     session_activation:
@@ -1053,6 +1055,7 @@ impl GatewayRuntimeStartupRegistry {
             cognitive: None,
             surface_host: None,
             app_platform: None,
+            core_bridge: None,
             runtime_services: None,
             runtime_service: None,
             session_activation: None,
@@ -1072,6 +1075,7 @@ impl GatewayRuntimeStartupRegistry {
             cognitive: self.cognitive.as_ref(),
             surface_host: self.surface_host.as_ref(),
             app_platform: self.app_platform.as_ref(),
+            core_bridge: self.core_bridge.as_ref(),
             auth_broker: &self.auth_broker,
         }
     }
@@ -1187,6 +1191,12 @@ async fn shutdown_runtime_host_resources(
             }
 
             enter_phase("drain_apps", &failures);
+            if let Some(core_bridge) = resources.core_bridge {
+                if let Err(error) = core_bridge.shutdown().await {
+                    failures.push(format!("CoreBridge shutdown incomplete: {error}"));
+                    coordinator.publish("drain_apps", &failures);
+                }
+            }
             if let Some(platform) = resources.app_platform {
                 if let Err(error) = platform.shutdown().await {
                     failures.push(format!("APP supervisor shutdown incomplete: {error}"));
@@ -1557,6 +1567,21 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             }
         };
     startup_registry.app_platform = Some(Arc::clone(&app_platform));
+    let core_bridge = match crate::app_platform::CoreBridgeServer::start(
+        runtime_config.apps().core_bridge_socket().to_path_buf(),
+        Arc::clone(app_platform.core_bridge_registry()),
+        Arc::clone(&selected_storage.matrix_store),
+        Arc::clone(&selected_storage.runtime_event_store),
+    )
+    .await
+    {
+        Ok(server) => server,
+        Err(error) => {
+            let error = format!("failed to start CoreBridge: {error}");
+            return Err(startup_registry.rollback(error).await);
+        }
+    };
+    startup_registry.core_bridge = Some(core_bridge);
     let auth_catalog = match auth_broker::AuthorizationCatalog::from_app_manifests(
         app_platform.catalog().apps().map(|app| &app.manifest),
     ) {
@@ -1578,6 +1603,10 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     };
     *auth_broker.lock().await = started_auth_broker;
+    if let Err(error) = app_platform.start_resident().await {
+        let error = format!("failed to start resident APPs: {error}");
+        return Err(startup_registry.rollback(error).await);
+    }
     let upgrade_coordinator = Arc::new(runtime::UpgradeCoordinator::new());
     let mut runtime_bootstrap = match crate::runtime_bootstrap::assemble_runtime_state_with_loader(
         &workspace_root,
@@ -2466,6 +2495,7 @@ mod tests {
                 "stop_accepting",
                 "drain_ingress",
                 "drain_surface",
+                "drain_apps",
                 "drain_live_eval",
                 "drain_active_turns",
                 "drain_session_workers",

@@ -7,9 +7,12 @@
 use std::collections::BTreeMap;
 
 use matrix_repository::{MatrixStore, MatrixStoreError};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::de::DeserializeOwned;
 
-use super::ContextService;
+use super::{
+    core_matrix_catalog::{self, ConnectorExecuteInput, EvidenceContextInput},
+    ContextService,
+};
 
 pub(super) const MATRIX_OPERATION_INTENT_V1: &str = "cowd.reality.matrix_operation.v1";
 
@@ -34,6 +37,8 @@ pub(super) const MATRIX_APP_OPERATIONS: &[&str] = &[
     "metric.affected_by_fact_type",
     "compute_job.plan",
     "compute_job.get",
+    "compute_job.execute",
+    "metric.recompute",
     "entity.upsert_checked",
     "entity.resolve_source_key",
     "entity.propose_match",
@@ -124,6 +129,7 @@ pub(super) fn dispatch(
     operation: &str,
     input_value: &serde_json::Value,
 ) -> Result<serde_json::Value, MatrixAppRealityError> {
+    core_matrix_catalog::validate_input(operation, input_value)?;
     let value = match operation {
         "health" => serde_json::to_value(store.health()?)?,
         "data_plane.health" => serde_json::to_value(store.data_plane_health()?)?,
@@ -173,7 +179,7 @@ pub(super) fn dispatch(
             serde_json::to_value(store.plan_connector_run(&id, input(input_value, "input")?)?)?
         }
         "connector_run.execute" => {
-            let request: ConnectorRunExecuteInput = serde_json::from_value(input_value.clone())?;
+            let request: ConnectorExecuteInput = serde_json::from_value(input_value.clone())?;
             request.validate()?;
             let mut input = request.input.into_matrix_input();
             input.mode = Some("run".to_string());
@@ -231,6 +237,11 @@ pub(super) fn dispatch(
             let id: String = input(input_value, "job_id")?;
             serde_json::to_value(store.get_compute_job(&id)?)?
         }
+        "compute_job.execute" => {
+            let id: String = input(input_value, "job_id")?;
+            serde_json::to_value(store.run_compute_job(&id)?)?
+        }
+        "metric.recompute" => serde_json::to_value(store.recompute_metrics()?)?,
         "entity.upsert_checked" => {
             let entity = matrix_core::MatrixEntity::from_input(input(input_value, "entity")?);
             serde_json::to_value(
@@ -356,7 +367,7 @@ pub(super) fn dispatch(
             )?)?
         }
         "evidence.context.get" => {
-            let request: EvidenceContextGetInput = serde_json::from_value(input_value.clone())?;
+            let request: EvidenceContextInput = serde_json::from_value(input_value.clone())?;
             request.validate()?;
             let packet = store
                 .get_evidence_packet(&request.packet_id)?
@@ -439,80 +450,6 @@ pub(super) fn dispatch(
     Ok(value)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConnectorRunExecuteInput {
-    source_pack_id: String,
-    input: StrictConnectorRunInput,
-}
-
-impl ConnectorRunExecuteInput {
-    fn validate(&self) -> Result<(), MatrixAppRealityError> {
-        if self.source_pack_id.trim().is_empty()
-            || self.input.run_id.as_deref().is_some_and(str::is_empty)
-            || self.input.mode.as_deref().is_some_and(|mode| mode != "run")
-        {
-            return Err(MatrixStoreError::InvalidScenario(
-                "connector_run.execute requires a non-empty source_pack_id and optional mode=run"
-                    .to_string(),
-            )
-            .into());
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct StrictConnectorRunInput {
-    #[serde(default)]
-    run_id: Option<String>,
-    #[serde(default)]
-    mode: Option<String>,
-    #[serde(default)]
-    resource_ref: Option<String>,
-    #[serde(default)]
-    partition_ref: Option<String>,
-    #[serde(default)]
-    credential_ref: Option<String>,
-    #[serde(default)]
-    expected_rows: Option<u64>,
-    #[serde(default)]
-    checksum: Option<String>,
-}
-
-impl StrictConnectorRunInput {
-    fn into_matrix_input(self) -> matrix_core::MatrixConnectorRunInput {
-        matrix_core::MatrixConnectorRunInput {
-            run_id: self.run_id,
-            mode: self.mode,
-            resource_ref: self.resource_ref,
-            partition_ref: self.partition_ref,
-            credential_ref: self.credential_ref,
-            expected_rows: self.expected_rows,
-            checksum: self.checksum,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EvidenceContextGetInput {
-    packet_id: String,
-}
-
-impl EvidenceContextGetInput {
-    fn validate(&self) -> Result<(), MatrixAppRealityError> {
-        if self.packet_id.trim().is_empty() {
-            return Err(MatrixStoreError::InvalidScenario(
-                "evidence.context.get requires a non-empty packet_id".to_string(),
-            )
-            .into());
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,7 +476,7 @@ mod tests {
         let (_config_home, store) = fixture_store();
         assert!(supports("entity.upsert_checked"));
         assert!(!supports("sql.execute"));
-        assert_eq!(MATRIX_APP_OPERATIONS.len(), 40);
+        assert_eq!(MATRIX_APP_OPERATIONS.len(), 42);
 
         let entity = serde_json::json!({
             "entity": {
@@ -591,6 +528,62 @@ mod tests {
             &serde_json::json!({})
         )
         .is_err());
+        assert!(dispatch(
+            store.as_ref(),
+            &context(),
+            "health",
+            &serde_json::json!({"unsigned_extra": true})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn compute_execute_and_metric_recompute_use_real_matrix_state_transitions() {
+        let (_config_home, store) = fixture_store();
+        let plan = dispatch(
+            store.as_ref(),
+            &context(),
+            "compute_job.plan",
+            &serde_json::json!({
+                "job": {
+                    "job_id": "core-catalog-job",
+                    "trigger_fact_type": "fixture.metric",
+                    "metric_ids": []
+                }
+            }),
+        )
+        .expect("compute job plans");
+        assert_eq!(plan["job"]["status"], "planned");
+
+        let executed = dispatch(
+            store.as_ref(),
+            &context(),
+            "compute_job.execute",
+            &serde_json::json!({"job_id": "core-catalog-job"}),
+        )
+        .expect("compute job executes");
+        assert_eq!(executed["status"], "completed");
+        assert_eq!(executed["attempts"], 1);
+
+        let recomputed = dispatch(
+            store.as_ref(),
+            &context(),
+            "metric.recompute",
+            &serde_json::json!({}),
+        )
+        .expect("metrics recompute through repository");
+        assert!(recomputed["metric_states"].is_array());
+        assert!(recomputed["changes"].is_array());
+        assert!(recomputed["attention"].is_array());
+
+        let missing = dispatch(
+            store.as_ref(),
+            &context(),
+            "compute_job.execute",
+            &serde_json::json!({"job_id": "missing-job"}),
+        )
+        .expect_err("missing jobs are typed not_found failures");
+        assert_eq!(missing.code(), "not_found");
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod approval_service;
 mod connector_service;
 mod context;
 mod context_service;
+pub(crate) mod core_matrix_catalog;
 mod cross_plane_executor;
 mod cross_plane_service;
 mod error;

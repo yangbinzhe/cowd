@@ -38,4 +38,8 @@ pub trait AppWorkerConnector: Send + Sync + 'static {
         connection: &'a Self::Connection,
         cancellation: &'a CancellationToken,
     ) -> ConnectorFuture<'a, ()>;
+
+    /// Retires protocol-side authorization when the supervisor fences a
+    /// connection. Implementations must be generation-aware and idempotent.
+    fn disconnect(&self, _app: &AdmittedApp, _connection: &Self::Connection) {}
 }

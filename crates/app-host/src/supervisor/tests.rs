@@ -77,6 +77,7 @@ struct FakeConnector {
     failures: BTreeSet<AppId>,
     delay: Duration,
     connects: AtomicUsize,
+    disconnects: AtomicUsize,
     concurrent: AtomicUsize,
     max_concurrent: AtomicUsize,
 }
@@ -87,6 +88,7 @@ impl FakeConnector {
             failures: failures.into_iter().collect(),
             delay,
             connects: AtomicUsize::new(0),
+            disconnects: AtomicUsize::new(0),
             concurrent: AtomicUsize::new(0),
             max_concurrent: AtomicUsize::new(0),
         }
@@ -94,6 +96,10 @@ impl FakeConnector {
 
     fn connect_count(&self) -> usize {
         self.connects.load(Ordering::Acquire)
+    }
+
+    fn disconnect_count(&self) -> usize {
+        self.disconnects.load(Ordering::Acquire)
     }
 }
 
@@ -152,6 +158,10 @@ impl AppWorkerConnector for FakeConnector {
                 Ok(())
             }
         })
+    }
+
+    fn disconnect(&self, _app: &AdmittedApp, _connection: &Self::Connection) {
+        self.disconnects.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -321,6 +331,7 @@ async fn lazy_is_demand_started_while_resident_is_eager_and_none_ttl_keeps_it_lo
     assert_eq!(status.state, AppLifecycleStateV1::Idle);
     assert!(status.pid.is_some());
     supervisor.shutdown().await.expect("shutdown");
+    assert_eq!(connector.disconnect_count(), 2);
 }
 
 #[tokio::test]

@@ -118,8 +118,9 @@ impl From<MatrixSqliteRepositoryError> for MatrixStoreError {
     }
 }
 
-/// Versioned optimistic-concurrency result shared by all Matrix adapters.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// Versioned optimistic-concurrency result shared by all Matrix adapters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "Revisioned")]
 pub struct MatrixRevisioned<T> {
     pub resource: T,
     pub previous_revision: Option<u64>,
@@ -127,7 +128,8 @@ pub struct MatrixRevisioned<T> {
     pub created: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MatrixHealthSchema")]
 pub struct MatrixHealth {
     pub schema_version: i64,
     pub fact_count: u64,
@@ -154,7 +156,8 @@ pub struct MatrixHealth {
     pub scenario_result_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MetricRecomputeResultSchema")]
 pub struct MatrixMetricRecomputeResult {
     pub metric_state_count: usize,
     pub change_count: usize,

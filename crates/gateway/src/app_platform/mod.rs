@@ -38,6 +38,10 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 
+mod core_bridge;
+
+pub(crate) use core_bridge::{CoreBridgeRegistry, CoreBridgeServer};
+
 const MAX_TRUST_STORE_BYTES: u64 = 1024 * 1024;
 pub(crate) const PROTOCOL_DIGEST_V1: &str =
     "sha256:072d80864a8addaecfc4f236d077f9a5f6eaeec2e587518da515b2b7e9768769";
@@ -78,6 +82,7 @@ struct TrustKeyFileV1 {
 pub(crate) struct GatewayAppConnection {
     channel: ManagedH2Channel,
     token: ChannelTokenV1,
+    core_bridge_registration: core_bridge::CoreBridgeRegistration,
 }
 
 #[derive(Debug)]
@@ -90,6 +95,7 @@ pub(crate) struct GatewayAppConnector {
     cgroup_root: PathBuf,
     resources: WorkerResourceLimits,
     handshake_timeout: Duration,
+    core_bridge_registry: Arc<CoreBridgeRegistry>,
 }
 
 pub(crate) type GatewayAppSupervisor = AppRuntimeSupervisor<GatewayAppConnector>;
@@ -97,6 +103,7 @@ pub(crate) type GatewayAppSupervisor = AppRuntimeSupervisor<GatewayAppConnector>
 pub(crate) struct GatewayAppPlatform {
     catalog: Arc<AppCatalogSnapshot>,
     supervisor: GatewayAppSupervisor,
+    core_bridge_registry: Arc<CoreBridgeRegistry>,
 }
 
 impl GatewayAppPlatform {
@@ -105,6 +112,14 @@ impl GatewayAppPlatform {
     }
     pub(crate) fn supervisor(&self) -> &GatewayAppSupervisor {
         &self.supervisor
+    }
+
+    pub(crate) fn core_bridge_registry(&self) -> &Arc<CoreBridgeRegistry> {
+        &self.core_bridge_registry
+    }
+
+    pub(crate) async fn start_resident(&self) -> Result<(), SupervisorError> {
+        self.supervisor.start_resident().await
     }
 
     pub(crate) async fn build(config: &runtime::AppsConfig) -> Result<Arc<Self>, AppPlatformError> {
@@ -158,13 +173,18 @@ impl GatewayAppPlatform {
             }
         }
         let gateway_instance = uuid::Uuid::new_v4().to_string();
+        let core_bridge_registry = Arc::new(CoreBridgeRegistry::default());
         if snapshot.apps().len() == 0 {
-            let connector = Arc::new(GatewayAppConnector::empty(gateway_instance));
+            let connector = Arc::new(GatewayAppConnector::empty(
+                gateway_instance,
+                Arc::clone(&core_bridge_registry),
+            ));
             let supervisor =
                 AppRuntimeSupervisor::new(snapshot.clone(), connector, supervisor_config(config))?;
             return Ok(Arc::new(Self {
                 catalog: snapshot,
                 supervisor,
+                core_bridge_registry,
             }));
         }
         let launcher = config.launcher().ok_or_else(|| {
@@ -220,13 +240,14 @@ impl GatewayAppPlatform {
                 cgroup_cpu_period_us: r.cgroup_cpu_period_us,
             },
             handshake_timeout: Duration::from_millis(config.supervisor().handshake_timeout_ms),
+            core_bridge_registry: Arc::clone(&core_bridge_registry),
         });
         let supervisor =
             AppRuntimeSupervisor::new(snapshot.clone(), connector, supervisor_config(config))?;
-        supervisor.start_resident().await?;
         Ok(Arc::new(Self {
             catalog: snapshot,
             supervisor,
+            core_bridge_registry,
         }))
     }
 
@@ -236,7 +257,7 @@ impl GatewayAppPlatform {
 }
 
 impl GatewayAppConnector {
-    fn empty(gateway_instance: String) -> Self {
+    fn empty(gateway_instance: String, core_bridge_registry: Arc<CoreBridgeRegistry>) -> Self {
         Self {
             launcher_path: PathBuf::new(),
             launcher_sha256: String::new(),
@@ -246,6 +267,7 @@ impl GatewayAppConnector {
             cgroup_root: PathBuf::new(),
             resources: WorkerResourceLimits::default(),
             handshake_timeout: Duration::from_secs(3),
+            core_bridge_registry,
         }
     }
 }
@@ -403,7 +425,29 @@ impl AppWorkerConnector for GatewayAppConnector {
                 &handshake.worker_nonce,
             )
             .map_err(protocol_error(app))?;
-            Ok(GatewayAppConnection { channel, token })
+            let core_bridge_token = derive_channel_token_v1(
+                &secret,
+                ChannelPurposeV1::CoreBridge,
+                &app.manifest.app_id,
+                &app.generation,
+                worker.pid(),
+                &handshake.worker_nonce,
+            )
+            .map_err(protocol_error(app))?;
+            let peer = channel.peer_credentials();
+            let core_bridge_registration = self.core_bridge_registry.register(
+                app.manifest.app_id.clone(),
+                app.generation.clone(),
+                worker.pid(),
+                peer.uid(),
+                Arc::new(app.manifest.clone()),
+                core_bridge_token,
+            );
+            Ok(GatewayAppConnection {
+                channel,
+                token,
+                core_bridge_registration,
+            })
         })
     }
 
@@ -462,6 +506,11 @@ impl AppWorkerConnector for GatewayAppConnector {
             }
             Ok(())
         })
+    }
+
+    fn disconnect(&self, _app: &AdmittedApp, connection: &Self::Connection) {
+        self.core_bridge_registry
+            .unregister(&connection.core_bridge_registration);
     }
 }
 

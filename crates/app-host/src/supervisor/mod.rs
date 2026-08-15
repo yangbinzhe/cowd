@@ -562,6 +562,7 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
                     if accepted {
                         supervisor.spawn_monitor(Arc::clone(&slot), worker, generation.clone());
                     } else {
+                        supervisor.connector.disconnect(&slot.admitted, &connection);
                         let _ = worker.shutdown().await;
                     }
                 }
@@ -716,7 +717,7 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
             stdout: observed_worker.stdout().await,
             stderr: observed_worker.stderr().await,
         };
-        let should_restart = {
+        let (should_restart, retired_connection) = {
             let mut state = slot.state.lock().await;
             if state.worker.as_ref().map(ManagedWorkerHandle::pid) != Some(observed_worker.pid())
                 || slot.admitted.generation != generation
@@ -728,16 +729,20 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
                 return;
             }
             state.worker.take();
-            state.connection.take();
+            let connection = state.connection.take();
             state.active_permit.take();
             state.active_leases = 0;
             state.startup_cancel.take();
             state.last_logs = Some(logs);
-            matches!(
+            let restart = matches!(
                 slot.admitted.policy.activation,
                 AppActivationPolicyV1::Resident
-            ) && !self.shutting_down.load(Ordering::Acquire)
+            ) && !self.shutting_down.load(Ordering::Acquire);
+            (restart, connection)
         };
+        if let Some(connection) = retired_connection {
+            self.connector.disconnect(&slot.admitted, &connection);
+        }
         self.record_failure(&slot, reason).await;
         slot.changed.notify_waiters();
         if should_restart {
@@ -774,7 +779,7 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
         state.restart_count = state.restart_count.saturating_add(1);
         state.reason = Some(reason);
         state.worker.take();
-        state.connection.take();
+        let retired_connection = state.connection.take();
         state.active_permit.take();
         state.idle_since = None;
         state.startup_cancel.take();
@@ -791,6 +796,10 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
                 .min(self.config.restart_backoff_maximum);
             state.lifecycle = AppLifecycleStateV1::Failed;
             state.retry_at = Some(now + backoff);
+        }
+        drop(state);
+        if let Some(connection) = retired_connection {
+            self.connector.disconnect(&slot.admitted, &connection);
         }
     }
 
@@ -833,17 +842,20 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
 
     async fn stop_one(&self, app_id: &AppId) -> Result<(), SupervisorError> {
         let slot = self.slot(app_id)?;
-        let worker = {
+        let (worker, connection) = {
             let mut state = slot.state.lock().await;
             state.lifecycle = AppLifecycleStateV1::Stopping;
             state.reason = None;
             state.active_leases = 0;
-            state.connection.take();
+            let connection = state.connection.take();
             if let Some(cancellation) = state.startup_cancel.take() {
                 cancellation.cancel();
             }
-            state.worker.take()
+            (state.worker.take(), connection)
         };
+        if let Some(connection) = connection {
+            self.connector.disconnect(&slot.admitted, &connection);
+        }
         let (logs, shutdown_error) = if let Some(worker) = worker {
             let shutdown_error = worker.shutdown().await.err().map(|error| error.to_string());
             (
@@ -876,7 +888,7 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
 
     async fn stop_idle(&self, app_id: &AppId, ttl: Duration) -> Result<(), SupervisorError> {
         let slot = self.slot(app_id)?;
-        let worker = {
+        let (worker, connection) = {
             let mut state = slot.state.lock().await;
             let expired = matches!(slot.admitted.policy.activation, AppActivationPolicyV1::Lazy)
                 && state.active_leases == 0
@@ -886,9 +898,12 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
                 return Ok(());
             }
             state.lifecycle = AppLifecycleStateV1::Stopping;
-            state.connection.take();
-            state.worker.take()
+            let connection = state.connection.take();
+            (state.worker.take(), connection)
         };
+        if let Some(connection) = connection {
+            self.connector.disconnect(&slot.admitted, &connection);
+        }
         let (logs, shutdown_error) = if let Some(worker) = worker {
             let shutdown_error = worker.shutdown().await.err().map(|error| error.to_string());
             (
