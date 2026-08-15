@@ -266,6 +266,14 @@ fn spawn_gateway_process(exe: &Path) -> Result<Child, Box<dyn std::error::Error>
     let stdout = gateway_process_log_file()?;
     let stderr = stdout.try_clone()?;
     let mut command = std::process::Command::new(exe);
+    // Live-subscription baseline fanout performs large, short-lived allocations
+    // on several Tokio workers. Glibc's default per-thread arena policy retains
+    // those peaks and made repeated WebUI reconnects grow RSS by nearly 1 GiB
+    // per traversal. Preserve an operator override, but keep the managed
+    // `gateway start` path on a small, bounded arena count by default.
+    if let Some(limit) = gateway_allocator_arena_limit(std::env::var_os("MALLOC_ARENA_MAX")) {
+        command.env("MALLOC_ARENA_MAX", limit);
+    }
     command
         .arg("gateway")
         .arg("run")
@@ -279,6 +287,10 @@ fn spawn_gateway_process(exe: &Path) -> Result<Child, Box<dyn std::error::Error>
     command
         .spawn()
         .map_err(|e| format!("failed to start gateway process: {e}").into())
+}
+
+fn gateway_allocator_arena_limit(current: Option<std::ffi::OsString>) -> Option<&'static str> {
+    current.is_none().then_some("2")
 }
 
 fn wait_for_gateway_start(
@@ -3848,21 +3860,31 @@ mod tests {
         format_issue_report, format_pr_report, format_startup_banner,
         format_startup_banner_with_task, format_status_report, format_tool_call_start,
         format_tool_result, format_ultraplan_report, format_unknown_slash_command_message,
-        format_user_visible_api_error, gateway_auth_token_from_platform,
-        handoff_resume_context_packet, load_gateway_runtime_config, merge_prompt_with_stdin,
-        normalize_permission_mode, parse_args, parse_gateway_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_setup_json, render_setup_report,
-        render_terminal_help, resolve_model_alias_with_config, resolve_tui_model,
-        response_to_events, runtime_capability_context_item,
-        semantic_checkpoint_resume_context_packet, session_db_resume_context_packet,
-        slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
-        suggestions::format_unknown_slash_command, try_resolve_bare_skill_prompt, validate_no_args,
-        workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
-        GatewayAction, GatewayToolExecutor, GitWorkspaceSummary, LocalHelpTopic, StatusUsage,
-        DEFAULT_MODEL_ALIAS, LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
+        format_user_visible_api_error, gateway_allocator_arena_limit,
+        gateway_auth_token_from_platform, handoff_resume_context_packet,
+        load_gateway_runtime_config, merge_prompt_with_stdin, normalize_permission_mode,
+        parse_args, parse_gateway_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, permission_policy, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        render_setup_json, render_setup_report, render_terminal_help,
+        resolve_model_alias_with_config, resolve_tui_model, response_to_events,
+        runtime_capability_context_item, semantic_checkpoint_resume_context_packet,
+        session_db_resume_context_packet, slash_command_completion_candidates_with_sessions,
+        status_context, strip_ansi_for_tui, suggestions::format_unknown_slash_command,
+        try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction, GatewayToolExecutor,
+        GitWorkspaceSummary, LocalHelpTopic, StatusUsage, DEFAULT_MODEL_ALIAS,
+        LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
     };
+
+    #[test]
+    fn managed_gateway_bounds_glibc_arenas_without_overriding_operator_policy() {
+        assert_eq!(gateway_allocator_arena_limit(None), Some("2"));
+        assert_eq!(
+            gateway_allocator_arena_limit(Some(std::ffi::OsString::from("4"))),
+            None
+        );
+    }
     use crate::command::slash::{resume_supported_slash_commands, SlashCommand};
     use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use crate::runtime_bootstrap::GatewayToolRegistry as TestToolRegistry;

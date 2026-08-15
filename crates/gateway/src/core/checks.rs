@@ -211,20 +211,7 @@ pub(crate) fn check_install_source_health() -> DiagnosticCheck {
 pub(crate) fn check_sqlite_residuals(config: Option<&runtime::RuntimeConfig>) -> DiagnosticCheck {
     let storage_dir = runtime::cowd_dirs::config_home_dir().join("storage");
     let live_pools = memory::sqlite_pool_instance_count();
-    let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&storage_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".sqlite")
-                || name.ends_with(".sqlite3")
-                || name.ends_with("-wal")
-                || name.ends_with("-shm")
-            {
-                files.push(name);
-            }
-        }
-    }
-    files.sort();
+    let files = sqlite_residuals_below(&storage_dir);
     let postgres = config.is_some_and(|config| {
         matches!(
             config.storage().backend,
@@ -266,6 +253,46 @@ pub(crate) fn check_sqlite_residuals(config: Option<&runtime::RuntimeConfig>) ->
             ),
         )
     }
+}
+
+fn sqlite_residuals_below(storage_dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut directories = vec![storage_dir.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !name.starts_with("sqlite-residuals-trash-") {
+                    directories.push(path);
+                }
+                continue;
+            }
+            if name.ends_with(".sqlite")
+                || name.ends_with(".sqlite3")
+                || name.ends_with("-wal")
+                || name.ends_with("-shm")
+            {
+                files.push(
+                    path.strip_prefix(storage_dir)
+                        .unwrap_or(path.as_path())
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 pub(crate) fn check_workspace_health(context: &StatusContext) -> DiagnosticCheck {
@@ -655,6 +682,22 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn sqlite_residual_scan_includes_app_subdirectories_and_ignores_trash() {
+        let root = tempfile::tempdir().expect("storage root");
+        let app_dir = root.path().join("apps/mfg");
+        fs::create_dir_all(&app_dir).expect("app storage");
+        fs::write(app_dir.join("primary.sqlite"), []).expect("app residual");
+        let trash = root.path().join("sqlite-residuals-trash-1");
+        fs::create_dir_all(&trash).expect("trash storage");
+        fs::write(trash.join("memory.sqlite"), []).expect("trash residual");
+
+        assert_eq!(
+            sqlite_residuals_below(root.path()),
+            vec!["apps/mfg/primary.sqlite".to_string()]
+        );
+    }
 
     #[test]
     fn enterprise_webui_readiness_uses_the_configured_vite_bundle() {

@@ -305,37 +305,43 @@ impl CutoverContext {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |duration| duration.as_secs())
         ));
-        let mut candidates = Vec::new();
-        if let Ok(entries) = fs::read_dir(&storage_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if is_sqlite_residual_name(&name) {
-                    candidates.push(entry.path());
-                }
-            }
-        }
-        candidates.sort();
+        let candidates = collect_sqlite_residuals(&storage_dir);
         let mut moved = Vec::new();
         let mut referenced = Vec::new();
         if !candidates.is_empty() {
             fs::create_dir_all(&trash_dir).map_err(stringify)?;
             for path in candidates {
-                let name = path
+                let relative = path
+                    .strip_prefix(&storage_dir)
+                    .unwrap_or(path.as_path())
+                    .to_path_buf();
+                let display_name = relative.to_string_lossy().into_owned();
+                let basename = path
                     .file_name()
                     .map(|value| value.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                if residual_is_referenced(&name, &self.config_home, &self.workspace_root) {
-                    referenced.push(name);
+                if residual_is_referenced(&display_name, &self.config_home, &self.workspace_root)
+                    || (basename != display_name
+                        && residual_is_referenced(
+                            &basename,
+                            &self.config_home,
+                            &self.workspace_root,
+                        ))
+                {
+                    referenced.push(display_name);
                     continue;
                 }
-                let target = trash_dir.join(&name);
+                let target = trash_dir.join(&relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(stringify)?;
+                }
                 fs::rename(&path, &target).map_err(|error| {
                     format!(
                         "failed to archive sqlite residual `{}`: {error}",
                         path.display()
                     )
                 })?;
-                moved.push(name);
+                moved.push(display_name);
             }
         }
         print_json(&serde_json::json!({
@@ -940,6 +946,35 @@ fn is_sqlite_residual_name(name: &str) -> bool {
         || name.ends_with("-shm")
 }
 
+fn collect_sqlite_residuals(storage_dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut directories = vec![storage_dir.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !name.starts_with("sqlite-residuals-trash-") {
+                    directories.push(path);
+                }
+            } else if is_sqlite_residual_name(&name) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 /// Reference-aware guard: a residual file is kept when its basename appears in
 /// evidence stores, active session records, or the project `.cowd` directory.
 /// Scanning is bounded to 256 MiB of text and 8 MiB per file; on any read
@@ -1155,6 +1190,20 @@ mod tests {
             dir.path(),
             workspace.path()
         ));
+    }
+
+    #[test]
+    fn residual_collection_includes_app_storage_but_excludes_recoverable_trash() {
+        let dir = tempfile::tempdir().expect("storage dir");
+        let app_dir = dir.path().join("apps/mfg");
+        fs::create_dir_all(&app_dir).expect("app dir");
+        fs::write(app_dir.join("primary.sqlite"), []).expect("app residual");
+        let trash = dir.path().join("sqlite-residuals-trash-123");
+        fs::create_dir_all(&trash).expect("trash dir");
+        fs::write(trash.join("memory.sqlite"), []).expect("trash residual");
+
+        let residuals = collect_sqlite_residuals(dir.path());
+        assert_eq!(residuals, vec![app_dir.join("primary.sqlite")]);
     }
 }
 
