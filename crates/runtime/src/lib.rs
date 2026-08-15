@@ -18,6 +18,8 @@
 #[path = "infrastructure/cowd_dirs.rs"]
 pub mod cowd_dirs;
 pub use cowd_dirs::expand_tilde;
+#[path = "app_operation/mod.rs"]
+pub mod app_operation;
 #[path = "infrastructure/bash_validation.rs"]
 pub mod bash_validation;
 #[path = "infrastructure/bootstrap.rs"]
