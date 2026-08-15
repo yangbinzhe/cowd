@@ -4421,7 +4421,7 @@ mod tests {
         let success = execute_in_workspace(
             &root,
             "bash",
-            &json!({ "command": "printf 'hello'", "cwd": cwd, "dangerouslyDisableSandbox": true }),
+            &json!({ "command": "printf 'hello'", "cwd": cwd, "dangerouslyDisableSandbox": true, "workspaceAccess": "read_write" }),
         )
         .expect("bash should succeed");
         let success_output: serde_json::Value = serde_json::from_str(&success).expect("json");
@@ -4431,7 +4431,7 @@ mod tests {
         let failure = execute_in_workspace(
             &root,
             "bash",
-            &json!({ "command": "printf 'oops' >&2; exit 7", "cwd": cwd, "dangerouslyDisableSandbox": true }),
+            &json!({ "command": "printf 'oops' >&2; exit 7", "cwd": cwd, "dangerouslyDisableSandbox": true, "workspaceAccess": "read_write" }),
         )
         .expect("bash failure should still return structured output");
         let failure_output: serde_json::Value = serde_json::from_str(&failure).expect("json");
@@ -4444,7 +4444,7 @@ mod tests {
         let timeout = execute_in_workspace(
             &root,
             "bash",
-            &json!({ "command": "sleep 1", "cwd": cwd, "timeout": 10, "dangerouslyDisableSandbox": true }),
+            &json!({ "command": "sleep 1", "cwd": cwd, "timeout": 10, "dangerouslyDisableSandbox": true, "workspaceAccess": "read_write" }),
         )
         .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
@@ -4458,7 +4458,7 @@ mod tests {
         let background = execute_in_workspace(
             &root,
             "bash",
-            &json!({ "command": "sleep 1", "cwd": cwd, "run_in_background": true, "dangerouslyDisableSandbox": true }),
+            &json!({ "command": "sleep 1", "cwd": cwd, "run_in_background": true, "dangerouslyDisableSandbox": true, "workspaceAccess": "read_write" }),
         )
         .expect_err("PID-only background execution is not a model capability (S-03)");
         assert!(background.contains("S-03"));
