@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "owner": "core",
+  "backend": "postgres",
+  "namespace": "cowd_core",
+  "generation": "core-v1",
+  "ownership_contract_digest": "sha256:61ed3c6becf145fcf1029b4ee39b2ac4d0aa39177ae2e195fe7ec2b052f270e5",
+  "section_digest": "sha256:91d181df6e30510104ad134bb32a7b1686715e13579e47531314b705fb91a052",
+  "source_snapshot_whole_digest": "sha256:05d2d21f9909b71fe1d7a86b70f51dd3bf601b69e1b9c5b90a436fc3931a3347",
+  "source_version": "fixture-v1",
+  "source_schema_version": 1,
+  "maintenance_fence_id": "fence-v1",
+  "counts": {
+    "tables": 46,
+    "mfg_objects": 25,
+    "core_objects": 19,
+    "reconciliation": 5,
+    "excluded": 3
+  },
+  "target_checkpoint": {
+    "source_generation": "fixture-v1",
+    "imported_object_count": 19,
+    "reconciliation_count": 5,
+    "journal_digest": "sha256:bdf111c5d619f3f86e03c300adcf2a93c31d19ab8f64348fd29b064fd53c6f66"
+  },
+  "durable": true,
+  "completed_at": "2026-08-15T02:30:00Z"
+}

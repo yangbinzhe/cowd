@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "contract_id": "cowd.ownership-cutover.execution/v1",
+  "scope": "offline_pointer_publication",
+  "preconditions": [
+    "maintenance_lock_held",
+    "gateway_stopped",
+    "all_app_workers_stopped",
+    "legacy_source_readonly",
+    "core_generation_staged_invisible",
+    "mfg_generation_staged_invisible"
+  ],
+  "state_machine": {
+    "states": [
+      "staged",
+      "verified",
+      "active",
+      "rollback"
+    ],
+    "transitions": [
+      "staged->verified",
+      "verified->active",
+      "active->rollback"
+    ],
+    "durable_receipt_states": [
+      "staged",
+      "verified"
+    ],
+    "active_fact": "active.json_after_publication_directory_fsync",
+    "rollback_fact": "a_new_active.json_pointer_after_publication_directory_fsync",
+    "publication_directory_final_entries": [
+      "active.json"
+    ]
+  },
+  "durability_sequence": [
+    "validate_candidate_and_history",
+    "fsync_source_and_import_receipt_files",
+    "fsync_generation_directories",
+    "write_active_json_temporary_in_publication_directory",
+    "fsync_temporary_active_json",
+    "fsync_publication_directory",
+    "single_rename_temporary_to_active_json",
+    "fsync_publication_directory_after_rename"
+  ],
+  "atomicity": {
+    "cross_database_acid_claimed": false,
+    "visibility_unit": "one_active_json_pointer_to_exact_core_and_mfg_generation_pair",
+    "failure_before_rename": "old_active_json_remains_authoritative",
+    "failure_after_rename": "recover_by_validating_active_json_and_all_bound_receipts"
+  },
+  "crash_recovery": [
+    {
+      "point": "before_stage_complete",
+      "action": "discard_invisible_stage_and_keep_old_active"
+    },
+    {
+      "point": "after_stage_before_verify",
+      "action": "resume_verification_or_discard_invisible_stage"
+    },
+    {
+      "point": "after_verify_before_rename",
+      "action": "keep_old_active_and_replay_candidate_validation"
+    },
+    {
+      "point": "after_rename_before_directory_fsync",
+      "action": "treat_outcome_unknown_and validate_active_pointer"
+    },
+    {
+      "point": "after_directory_fsync",
+      "action": "active_pointer_is_authoritative"
+    }
+  ],
+  "rollback": {
+    "publication": "new_manifest_and_single_pointer_rename",
+    "target": "exact_historical_core_and_mfg_generation_pair",
+    "deletes_database_or_generation": false
+  }
+}

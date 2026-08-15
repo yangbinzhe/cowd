@@ -1,0 +1,365 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cowd.dev/contracts/ownership-cutover/v1/active.schema.json",
+  "title": "OwnershipCutoverManifestV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "contract_id",
+    "ownership_contract_digest",
+    "execution_contract_digest",
+    "publication_generation",
+    "activation_fence_id",
+    "source",
+    "core",
+    "mfg",
+    "execution_receipts",
+    "state_receipts",
+    "created_at",
+    "activation_kind",
+    "manifest_digest"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "contract_id": {
+      "const": "cowd.ownership-cutover/v1"
+    },
+    "ownership_contract_digest": {
+      "const": "sha256:61ed3c6becf145fcf1029b4ee39b2ac4d0aa39177ae2e195fe7ec2b052f270e5"
+    },
+    "execution_contract_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "publication_generation": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "activation_fence_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "core": {
+      "$ref": "#/$defs/target"
+    },
+    "mfg": {
+      "$ref": "#/$defs/target"
+    },
+    "execution_receipts": {
+      "$ref": "#/$defs/executionReceipts"
+    },
+    "state_receipts": {
+      "$ref": "#/$defs/stateReceipts"
+    },
+    "previous": {
+      "$ref": "#/$defs/previous"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "activation_kind": {
+      "enum": [
+        "active",
+        "rollback"
+      ]
+    },
+    "rollback_target_manifest_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "manifest_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)[^\\u0000]+$"
+    },
+    "backend": {
+      "enum": [
+        "sqlite",
+        "postgres"
+      ]
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tables",
+        "mfg_objects",
+        "core_objects",
+        "reconciliation",
+        "excluded"
+      ],
+      "properties": {
+        "tables": {
+          "const": 46
+        },
+        "mfg_objects": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "core_objects": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reconciliation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excluded": {
+          "const": 3
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "namespace",
+        "source_version",
+        "schema_version",
+        "maintenance_fence_id",
+        "snapshot_relative_path",
+        "snapshot_whole_digest",
+        "snapshot_file_digest",
+        "export_receipt_relative_path",
+        "export_receipt_digest",
+        "core_section_digest",
+        "mfg_section_digest",
+        "counts"
+      ],
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/backend"
+        },
+        "namespace": {
+          "$ref": "#/$defs/identifier"
+        },
+        "source_version": {
+          "$ref": "#/$defs/identifier"
+        },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maintenance_fence_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "snapshot_relative_path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "snapshot_whole_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "snapshot_file_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "export_receipt_relative_path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "export_receipt_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "core_section_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "mfg_section_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "counts": {
+          "$ref": "#/$defs/counts"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "namespace",
+        "generation",
+        "relative_path",
+        "section_digest",
+        "durable_import_receipt_relative_path",
+        "durable_import_receipt_digest"
+      ],
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/backend"
+        },
+        "namespace": {
+          "$ref": "#/$defs/identifier"
+        },
+        "generation": {
+          "$ref": "#/$defs/identifier"
+        },
+        "relative_path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "section_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "durable_import_receipt_relative_path": {
+          "$ref": "#/$defs/relativePath"
+        },
+        "durable_import_receipt_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "executionReceipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "maintenance_lock_receipt_digest",
+        "gateway_stopped_receipt_digest",
+        "apps_stopped_receipt_digest",
+        "legacy_readonly_receipt_digest"
+      ],
+      "properties": {
+        "maintenance_lock_receipt_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "gateway_stopped_receipt_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "apps_stopped_receipt_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "legacy_readonly_receipt_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "stateReceipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "staged_receipt_digest",
+        "verified_receipt_digest"
+      ],
+      "properties": {
+        "staged_receipt_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "verified_receipt_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "previous": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publication_generation",
+        "manifest_digest",
+        "core_generation",
+        "core_relative_path",
+        "mfg_generation",
+        "mfg_relative_path"
+      ],
+      "properties": {
+        "publication_generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "manifest_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "core_generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "core_relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)[^\\u0000]+$"
+        },
+        "mfg_generation": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "mfg_relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*\\\\)[^\\u0000]+$"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "activation_kind": {
+            "const": "active"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "rollback_target_manifest_digest"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "activation_kind": {
+            "const": "rollback"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "rollback_target_manifest_digest"
+        ]
+      }
+    }
+  ]
+}

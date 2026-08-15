@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "contract_id": "cowd.ownership-cutover/v1",
+  "ownership_contract_digest": "sha256:61ed3c6becf145fcf1029b4ee39b2ac4d0aa39177ae2e195fe7ec2b052f270e5",
+  "execution_contract_digest": "sha256:84f71d698f9cac25474ba2921b0b67a4596e6ad032f9d49bc792de1cd196a4d1",
+  "publication_generation": "publication-v0",
+  "activation_fence_id": "activation-fence-v0",
+  "source": {
+    "backend": "sqlite",
+    "namespace": "main",
+    "source_version": "fixture-1",
+    "schema_version": 1,
+    "maintenance_fence_id": "fixture-fence",
+    "snapshot_relative_path": "golden/source/v0/snapshot.json",
+    "snapshot_whole_digest": "sha256:a98287af5710acab37815a1035ea3b8847bae144dcc7cd8d71af169b0fdef883",
+    "snapshot_file_digest": "sha256:c2060e426df7df4bc5f59c91be4f8fa4885216d2901577dc92de1c65a7c2c7c9",
+    "export_receipt_relative_path": "golden/source/v0/export-receipt.json",
+    "export_receipt_digest": "sha256:42b078a0c446109732635e2782277cf05f5b53aa9f5703cc2a8e67827ec9031e",
+    "core_section_digest": "sha256:91d181df6e30510104ad134bb32a7b1686715e13579e47531314b705fb91a052",
+    "mfg_section_digest": "sha256:bce27287b40ca2e27b07f47411269e54a7e18b2533b299dc40232e021d069255",
+    "counts": {
+      "tables": 46,
+      "mfg_objects": 25,
+      "core_objects": 19,
+      "reconciliation": 5,
+      "excluded": 3
+    }
+  },
+  "core": {
+    "backend": "postgres",
+    "namespace": "cowd_core",
+    "generation": "core-v0",
+    "relative_path": "golden/generations/core-v0",
+    "section_digest": "sha256:91d181df6e30510104ad134bb32a7b1686715e13579e47531314b705fb91a052",
+    "durable_import_receipt_relative_path": "golden/tamper-assets/core-checkpoint-receipt.json",
+    "durable_import_receipt_digest": "sha256:8c5c4fdf5a5419e326f46a9d3e91812ddd8ff7876c36baf459cd9d5eb7bab157"
+  },
+  "mfg": {
+    "backend": "postgres",
+    "namespace": "cowd_mfg",
+    "generation": "mfg-v0",
+    "relative_path": "golden/generations/mfg-v0",
+    "section_digest": "sha256:bce27287b40ca2e27b07f47411269e54a7e18b2533b299dc40232e021d069255",
+    "durable_import_receipt_relative_path": "golden/generations/mfg-v0/import-receipt.json",
+    "durable_import_receipt_digest": "sha256:02f063e8311396059299d92c37d82fc26973e05f73eae81a3ab9c1a304b56bfc"
+  },
+  "execution_receipts": {
+    "maintenance_lock_receipt_digest": "sha256:75f5542c3d9ef2f64e6454fe707784bf93eebb9b1cb841ad2f60091bba51cfed",
+    "gateway_stopped_receipt_digest": "sha256:5d34f5eadebb620deac9ea51336725b8ab93f357ebffc69248da43e1a1c7070a",
+    "apps_stopped_receipt_digest": "sha256:afbefd95d9d491c86122d638191ebcc81380883cdba3b38248e4f6643fa3e22a",
+    "legacy_readonly_receipt_digest": "sha256:b32b18df3c4fc70048c26dd78b38e889ebd19c85b30de2d7e71a17f2a929af7f"
+  },
+  "state_receipts": {
+    "staged_receipt_digest": "sha256:3fc15c3f7cf9092754bb4813cc26d35da76931497a67bc46507d5d8c945052ec",
+    "verified_receipt_digest": "sha256:e505a86bff54106717d31ea6130219688f5e82d79a79ac89d57dc975d40275a9"
+  },
+  "created_at": "2026-08-15T01:00:00Z",
+  "activation_kind": "active",
+  "manifest_digest": "sha256:b1988ec97b7f078fe71c8bf6533b38d1ad7a8bb1ad4b03fddff9ad2aea48947a"
+}

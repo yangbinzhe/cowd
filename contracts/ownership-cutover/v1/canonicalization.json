@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "manifest_domain_separator": "cowd.ownership-cutover.manifest.v1\\0",
+  "execution_domain_separator": "cowd.ownership-cutover.execution.v1\\0",
+  "object_keys": "UTF-8 lexical ascending",
+  "arrays": "preserve order",
+  "whitespace": "none",
+  "manifest_excluded_fields": [
+    "manifest_digest"
+  ],
+  "digest_encoding": "sha256: followed by 64 lowercase hexadecimal digits"
+}

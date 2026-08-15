@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "contract_id": "cowd.ownership-cutover/v1",
+  "ownership_contract_digest": "sha256:61ed3c6becf145fcf1029b4ee39b2ac4d0aa39177ae2e195fe7ec2b052f270e5",
+  "execution_contract_digest": "sha256:84f71d698f9cac25474ba2921b0b67a4596e6ad032f9d49bc792de1cd196a4d1",
+  "publication_generation": "publication-v1",
+  "activation_fence_id": "activation-fence-v1",
+  "source": {
+    "backend": "sqlite",
+    "namespace": "main",
+    "source_version": "fixture-v1",
+    "schema_version": 1,
+    "maintenance_fence_id": "fence-v1",
+    "snapshot_relative_path": "golden/source/v1/snapshot.json",
+    "snapshot_whole_digest": "sha256:05d2d21f9909b71fe1d7a86b70f51dd3bf601b69e1b9c5b90a436fc3931a3347",
+    "snapshot_file_digest": "sha256:4898b404920876337f58fe57de50e13a9540624b90ebc91cd9c4452c1adaacba",
+    "export_receipt_relative_path": "golden/source/v1/export-receipt.json",
+    "export_receipt_digest": "sha256:83d7adfd47ed2c3e5e642e312ace4cbfd390b756569e7582acd991a4b5f46f45",
+    "core_section_digest": "sha256:91d181df6e30510104ad134bb32a7b1686715e13579e47531314b705fb91a052",
+    "mfg_section_digest": "sha256:bce27287b40ca2e27b07f47411269e54a7e18b2533b299dc40232e021d069255",
+    "counts": {
+      "tables": 46,
+      "mfg_objects": 25,
+      "core_objects": 19,
+      "reconciliation": 5,
+      "excluded": 3
+    }
+  },
+  "core": {
+    "backend": "postgres",
+    "namespace": "cowd_core",
+    "generation": "core-v1",
+    "relative_path": "golden/generations/core-v1",
+    "section_digest": "sha256:91d181df6e30510104ad134bb32a7b1686715e13579e47531314b705fb91a052",
+    "durable_import_receipt_relative_path": "golden/generations/core-v1/import-receipt.json",
+    "durable_import_receipt_digest": "sha256:a95fc096d1a1e2405298b3acd47443aa159b866792c7d56150b75be09d6a473b"
+  },
+  "mfg": {
+    "backend": "postgres",
+    "namespace": "cowd_mfg",
+    "generation": "mfg-v1",
+    "relative_path": "golden/generations/mfg-v1",
+    "section_digest": "sha256:bce27287b40ca2e27b07f47411269e54a7e18b2533b299dc40232e021d069255",
+    "durable_import_receipt_relative_path": "golden/generations/mfg-v1/import-receipt.json",
+    "durable_import_receipt_digest": "sha256:d6ec32690978d4f7341b2456a986c8e31939ec765beaa281a1b130b8275d0d15"
+  },
+  "execution_receipts": {
+    "maintenance_lock_receipt_digest": "sha256:75f5542c3d9ef2f64e6454fe707784bf93eebb9b1cb841ad2f60091bba51cfed",
+    "gateway_stopped_receipt_digest": "sha256:5d34f5eadebb620deac9ea51336725b8ab93f357ebffc69248da43e1a1c7070a",
+    "apps_stopped_receipt_digest": "sha256:afbefd95d9d491c86122d638191ebcc81380883cdba3b38248e4f6643fa3e22a",
+    "legacy_readonly_receipt_digest": "sha256:b32b18df3c4fc70048c26dd78b38e889ebd19c85b30de2d7e71a17f2a929af7f"
+  },
+  "state_receipts": {
+    "staged_receipt_digest": "sha256:42331eec841ab935dbc1e26d953c06b81db6f529abddbb765e0f1c7a86cdeebf",
+    "verified_receipt_digest": "sha256:da3e05054a75f685acfe2a08a0d8a1a26c2f44b29d811ccfc9e961685bfdf15c"
+  },
+  "created_at": "2026-08-15T03:00:00Z",
+  "activation_kind": "active",
+  "manifest_digest": "sha256:b2e02b2c3413c7b9dfb58a714cfda47c75aa30843a79f798bcb948fb15f961fd",
+  "previous": {
+    "publication_generation": "publication-v0",
+    "manifest_digest": "sha256:7c93751ae4594967aff9bdf77d88df68e1aa19cb9d04338b876ab4ce5936108a",
+    "core_generation": "core-v0",
+    "core_relative_path": "golden/generations/core-v0",
+    "mfg_generation": "mfg-v0",
+    "mfg_relative_path": "golden/generations/mfg-v0"
+  }
+}
