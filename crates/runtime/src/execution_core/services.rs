@@ -5809,6 +5809,13 @@ impl RuntimeServices {
                 let deadline_at_ms = now_ms().saturating_add(
                     harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS,
                 );
+                let acceptance_contract = crate::team_instantiation::team_acceptance_contract(
+                    &definition.acceptance,
+                    &definition.resource_scopes,
+                    true,
+                    false,
+                )
+                .map_err(RuntimeServicesError::Invariant)?;
                 let intent = AgentTaskIntent {
                     selected_agent_id: None,
                     definition_ref: Some(compiled.snapshot.definition_ref.clone()),
@@ -5845,6 +5852,14 @@ impl RuntimeServices {
                         ),
                         format!("managed_invocation:{}", invocation.invocation_id),
                         format!("managed_fence:{}", invocation.fence_generation),
+                        format!(
+                            "team_acceptance_contract:{}",
+                            serde_json::to_string(&acceptance_contract).map_err(|error| {
+                                RuntimeServicesError::Invariant(format!(
+                                    "serialize Managed Agent acceptance contract: {error}"
+                                ))
+                            })?
+                        ),
                     ],
                     context_refs: Vec::new(),
                     evidence_refs: Vec::new(),
@@ -6039,6 +6054,9 @@ impl RuntimeServices {
                     upstream_evidence_refs: Vec::new(),
                     upstream_artifact_refs: Vec::new(),
                 };
+                self.team_runtime
+                    .ensure_root_task(&request)
+                    .map_err(RuntimeServicesError::Mission)?;
                 let mission_id = request.mission_id.clone();
                 let team_id = request.team_id.clone();
                 let instantiated = self

@@ -1,45 +1,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use async_trait::async_trait;
-use harness_contract::agent::{
-    AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus, DefinitionScope,
-};
+use harness_contract::agent::DefinitionScope;
 use harness_contract::team::{
     TeamInstantiationRequest, TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
 };
-use runtime::{
-    AgentBackendCapabilities, AgentBackendKind, AgentModelSelection, AgentRuntimeBackend,
-    RuntimeServices,
-};
-
-fn services_with_provider() -> Arc<RuntimeServices> {
-    let root = tempfile::tempdir().expect("runtime root").keep();
-    let workspace = root.join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    let providers = model_protocol::provider_config::ProvidersConfig {
-        providers: HashMap::from([(
-            "test".to_string(),
-            model_protocol::provider_config::ProviderConfig {
-                name: "test".to_string(),
-                base_url: "https://example.test/v1".to_string(),
-                api_key: "test".to_string(),
-                models: vec!["default".to_string()],
-                protocol: Some("responses".to_string()),
-                parallel_tool_calls: Default::default(),
-                early_tool_start: Default::default(),
-            },
-        )]),
-    };
-    RuntimeServices::builder(&root, &workspace)
-        .provider_registry(Arc::new(
-            runtime::ProviderRegistry::new(providers).expect("provider"),
-        ))
-        .build()
-        .expect("runtime")
-}
+#[path = "support/canonical_agent_fixture.rs"]
+mod canonical_agent_fixture;
 
 fn request(mission_id: &str) -> TeamInstantiationRequest {
     TeamInstantiationRequest {
@@ -70,7 +36,7 @@ fn request(mission_id: &str) -> TeamInstantiationRequest {
         cardinality_overrides: Vec::new(),
         focus_partition_plans: Vec::new(),
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-        model_lease: "default".to_string(),
+        model_lease: "deepseek-v4-flash".to_string(),
         execution_budget: harness_contract::context::ParentExecutionBudget::new(
             "working-state-team-budget",
             65_536,
@@ -90,84 +56,11 @@ fn request(mission_id: &str) -> TeamInstantiationRequest {
     }
 }
 
-struct CompletedBackend;
-
-#[async_trait]
-impl AgentRuntimeBackend for CompletedBackend {
-    fn kind(&self) -> AgentBackendKind {
-        AgentBackendKind::InProcess
-    }
-    fn capabilities(&self) -> AgentBackendCapabilities {
-        AgentBackendCapabilities::in_process()
-    }
-    async fn execute(
-        &self,
-        packet: AgentTaskPacket,
-        selection: AgentModelSelection,
-    ) -> Result<AgentReturnPacket, String> {
-        let mut evidence_refs = packet.evidence_refs.clone();
-        evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::context::EvidenceRef::observed(
-                "tool",
-                format!("materialized:{}", packet.node_id()),
-            ),
-            "a".repeat(64),
-            1,
-            "application/json",
-            "artifact://art_team_working_state",
-            format!("session:{}", packet.session_id()),
-        ));
-        Ok(AgentReturnPacket {
-            answer_candidate: None,
-            run_id: packet.run_id().to_string(),
-            agent_id: packet.agent_id().to_string(),
-            task_id: packet.task_id().to_string(),
-            session_id: packet.session_id().to_string(),
-            mission_id: packet.mission_id().to_string(),
-            team_id: packet.team_id().map(ToString::to_string),
-            graph_id: packet.graph_id().to_string(),
-            node_id: packet.node_id().to_string(),
-            attempt: packet.attempt,
-            expected_graph_revision: packet.expected_graph_revision,
-            status: AgentTerminalStatus::Completed,
-            outcome: serde_json::json!({
-                "summary": "completed with evidence",
-                "evidence": "materialized durable tool evidence"
-            })
-            .to_string(),
-            observed_acceptance: harness_contract::context::ObservedAcceptance {
-                satisfied_criteria: packet.acceptance.clone(),
-                observed_evidence: Vec::new(),
-                unresolved_obligation_ids: Vec::new(),
-            },
-            acceptance: packet.acceptance,
-            evidence_refs,
-            changes: Vec::new(),
-            runtime_change_receipts: Vec::new(),
-            conflicts: Vec::new(),
-            unresolved: Vec::new(),
-            input_tokens: 1,
-            output_tokens: 1,
-            cached_tokens: 0,
-            model: selection.model,
-            provider: selection.provider,
-            tool_calls: 1,
-            duplicate_tool_calls: 0,
-            max_tool_concurrency_observed: 1,
-            parallel_tool_batches: 0,
-            runtime_write_attempt_paths: Vec::new(),
-            runtime_observed_resource_scopes: Vec::new(),
-            failure: None,
-        })
-    }
-}
-
 #[tokio::test]
 async fn terminal_graph_transition_commits_exactly_one_replayable_team_working_state_entry() {
-    let services = services_with_provider();
-    services
-        .agent_runtime()
-        .register_backend(Arc::new(CompletedBackend));
+    let (services, _provider) =
+        canonical_agent_fixture::services_with_canonical_agent("session:working-state-commit")
+            .await;
     let projection = services
         .team_runtime()
         .instantiate(request(services.mission_runtime().default_mission_id()))

@@ -80,7 +80,10 @@ impl TeamRuntime {
         self.instantiation.instantiate(request)
     }
 
-    fn ensure_root_task(&self, request: &TeamInstantiationRequest) -> Result<(), String> {
+    pub(crate) fn ensure_root_task(
+        &self,
+        request: &TeamInstantiationRequest,
+    ) -> Result<(), String> {
         if self.tasks.get(&request.lineage.root_task_id)?.is_some() {
             return Ok(());
         }

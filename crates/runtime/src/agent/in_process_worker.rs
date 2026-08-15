@@ -542,8 +542,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             }
         };
         normalize_verified_narrative_terminal(&packet, &tool_executor, &mut summary);
-        let evidence_refs =
-            agent_evidence_refs(&packet, &summary.context_turn_report.audit_projections);
+        let evidence_refs = agent_evidence_refs(
+            &packet,
+            &summary.context_turn_report.audit_projections,
+            &tool_executor
+                .receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         let (acceptance, runtime_change_receipts) =
             runtime_evaluated_acceptance(&packet, &summary, &evidence_refs, &tool_executor);
         // `submit_turn` is the delegated child terminal boundary. From this
@@ -2151,9 +2157,16 @@ fn system_prompt(
 fn agent_evidence_refs(
     packet: &AgentTaskPacket,
     audits: &[harness_contract::context::EvidenceAuditProjection],
+    receipts: &[ScopedToolExecutionReceipt],
 ) -> Vec<harness_contract::context::EvidenceAccessRef> {
     let mut refs = packet.evidence_refs.clone();
     refs.extend(audits.iter().filter_map(|audit| audit.access.clone()));
+    refs.extend(
+        receipts
+            .iter()
+            .flat_map(|receipt| receipt.observed_evidence.iter())
+            .filter_map(|evidence| evidence.evidence_ref.clone()),
+    );
     refs.sort_by(|left, right| {
         left.evidence_ref
             .ref_type
@@ -4361,7 +4374,7 @@ mod tests {
         }];
 
         assert_eq!(
-            agent_evidence_refs(&packet, &audits)
+            agent_evidence_refs(&packet, &audits, &[])
                 .into_iter()
                 .map(|reference| reference.evidence_ref.id)
                 .collect::<Vec<_>>(),

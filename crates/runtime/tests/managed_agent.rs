@@ -1,12 +1,9 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use harness_contract::agent::{
-    AgentCapability, AgentDefinitionId, AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus,
-    DefinitionScope, RevisionSelector,
+    AgentCapability, AgentDefinitionId, DefinitionScope, RevisionSelector,
 };
 use harness_contract::managed_agent::{
     ManagedAgentDefinition, ManagedAgentHealthPolicy, ManagedAgentOverlapPolicy,
@@ -14,10 +11,10 @@ use harness_contract::managed_agent::{
 };
 use harness_contract::mission::ScheduleTrigger;
 use harness_contract::team::{TeamTemplateDefinitionId, TeamTemplateSelector};
-use runtime::{
-    AgentBackendCapabilities, AgentBackendKind, AgentModelSelection, AgentRuntimeBackend,
-    ManagedAgentDispatcher, ManagedAgentInvocationStatus, RuntimeServices,
-};
+use runtime::{ManagedAgentDispatcher, ManagedAgentInvocationStatus, RuntimeServices};
+
+#[path = "support/canonical_agent_fixture.rs"]
+mod canonical_agent_fixture;
 
 fn dispatcher() -> ManagedAgentDispatcher {
     ManagedAgentDispatcher::in_memory().expect("dispatcher")
@@ -37,115 +34,15 @@ fn definition(trigger: ManagedAgentTrigger) -> ManagedAgentDefinition {
         objective: "collect a bounded evidence update".to_string(),
         acceptance: vec!["evidence".to_string()],
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-        model_lease: "default".to_string(),
+        model_lease: "deepseek-v4-flash".to_string(),
         granted_capabilities: vec![AgentCapability::Read],
-        allowed_tool_contract_refs: Vec::new(),
+        allowed_tool_contract_refs: vec!["read_file".to_string()],
         allowed_skill_refs: Vec::new(),
         resource_scopes: vec!["read:crates/runtime".to_string()],
         overlap_policy: ManagedAgentOverlapPolicy::Forbid,
         retry_policy: ManagedAgentRetryPolicy::default(),
         health_policy: ManagedAgentHealthPolicy::default(),
         enabled: true,
-    }
-}
-
-fn services_with_provider() -> Arc<RuntimeServices> {
-    let root = tempfile::tempdir().expect("temporary runtime root").keep();
-    let workspace = root.join("workspace");
-    std::fs::create_dir_all(&workspace).expect("workspace");
-    let providers = model_protocol::provider_config::ProvidersConfig {
-        providers: HashMap::from([(
-            "test".to_string(),
-            model_protocol::provider_config::ProviderConfig {
-                name: "test".to_string(),
-                base_url: "https://example.test/v1".to_string(),
-                api_key: "test".to_string(),
-                models: vec!["default".to_string()],
-                protocol: Some("responses".to_string()),
-                parallel_tool_calls: Default::default(),
-                early_tool_start: Default::default(),
-            },
-        )]),
-    };
-    RuntimeServices::builder(&root, &workspace)
-        .provider_registry(Arc::new(
-            runtime::ProviderRegistry::new(providers).expect("provider registry"),
-        ))
-        .build()
-        .expect("runtime services")
-}
-
-struct CompletedBackend;
-
-#[async_trait]
-impl AgentRuntimeBackend for CompletedBackend {
-    fn kind(&self) -> AgentBackendKind {
-        AgentBackendKind::InProcess
-    }
-
-    fn capabilities(&self) -> AgentBackendCapabilities {
-        AgentBackendCapabilities::in_process()
-    }
-
-    async fn execute(
-        &self,
-        packet: AgentTaskPacket,
-        selection: AgentModelSelection,
-    ) -> Result<AgentReturnPacket, String> {
-        let mut evidence_refs = packet.evidence_refs.clone();
-        evidence_refs.push(harness_contract::context::EvidenceAccessRef::durable(
-            harness_contract::context::EvidenceRef::observed(
-                "tool",
-                format!("materialized:{}", packet.node_id()),
-            ),
-            "a".repeat(64),
-            1,
-            "application/json",
-            "artifact://art_managed_agent",
-            format!("session:{}", packet.session_id()),
-        ));
-        Ok(AgentReturnPacket {
-            answer_candidate: None,
-            run_id: packet.run_id().to_string(),
-            agent_id: packet.agent_id().to_string(),
-            task_id: packet.task_id().to_string(),
-            session_id: packet.session_id().to_string(),
-            mission_id: packet.mission_id().to_string(),
-            team_id: packet.team_id().map(ToString::to_string),
-            graph_id: packet.graph_id().to_string(),
-            node_id: packet.node_id().to_string(),
-            attempt: packet.attempt,
-            expected_graph_revision: packet.expected_graph_revision,
-            status: AgentTerminalStatus::Completed,
-            outcome: serde_json::json!({
-                "summary": "managed Agent completed through Runtime binding",
-                "evidence": "materialized durable tool evidence"
-            })
-            .to_string(),
-            observed_acceptance: harness_contract::context::ObservedAcceptance {
-                satisfied_criteria: packet.acceptance.clone(),
-                observed_evidence: Vec::new(),
-                unresolved_obligation_ids: Vec::new(),
-            },
-            acceptance: packet.acceptance,
-            evidence_refs,
-            changes: Vec::new(),
-            runtime_change_receipts: Vec::new(),
-            conflicts: Vec::new(),
-            unresolved: Vec::new(),
-            input_tokens: 1,
-            output_tokens: 1,
-            cached_tokens: 0,
-            model: selection.model,
-            provider: selection.provider,
-            tool_calls: 1,
-            duplicate_tool_calls: 0,
-            max_tool_concurrency_observed: 1,
-            parallel_tool_batches: 0,
-            runtime_write_attempt_paths: Vec::new(),
-            runtime_observed_resource_scopes: Vec::new(),
-            failure: None,
-        })
     }
 }
 
@@ -257,10 +154,8 @@ fn terminal_failures_open_the_health_circuit_until_human_reset() {
 
 #[tokio::test]
 async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_state() {
-    let services = services_with_provider();
-    services
-        .agent_runtime()
-        .register_backend(Arc::new(CompletedBackend));
+    let (services, _provider) =
+        canonical_agent_fixture::services_with_canonical_agent("managed-session").await;
     let mut managed = definition(ManagedAgentTrigger::Manual);
     managed.managed_agent_id = "workspace/cowd/runtime-dispatch".to_string();
     managed.target = ManagedAgentTarget::Agent {
@@ -284,6 +179,15 @@ async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_
     assert_eq!(admitted.submitted.len(), 1, "{admitted:#?}");
     assert!(admitted.completed.is_empty());
     assert!(admitted.failed.is_empty());
+    let canonical_task = services
+        .task_runtime_port()
+        .get(&format!(
+            "managed-run:{}:1:fence:1:task",
+            admitted.submitted[0].invocation_id
+        ))
+        .expect("canonical managed Agent Task lookup")
+        .expect("canonical managed Agent Task");
+    assert!(canonical_task.execution_policy.binding.is_some());
     let graph_id = admitted.submitted[0]
         .execution_ref
         .clone()
@@ -295,7 +199,15 @@ async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_
         .expect("managed graph completes");
     let completed =
         await_terminal_projection(&services, &admitted.submitted[0].invocation_id).await;
-    assert_eq!(completed.status, ManagedAgentInvocationStatus::Completed);
+    let graph = services
+        .graph_state_store()
+        .load(&graph_id)
+        .expect("managed Agent graph projection");
+    assert_eq!(
+        completed.status,
+        ManagedAgentInvocationStatus::Completed,
+        "{completed:#?}\n{graph:#?}"
+    );
     assert!(completed
         .execution_ref
         .as_deref()
@@ -304,10 +216,8 @@ async fn runtime_dispatch_executes_a_bound_definition_without_gateway_scheduler_
 
 #[tokio::test]
 async fn runtime_dispatch_uses_team_instantiation_for_managed_team_targets() {
-    let services = services_with_provider();
-    services
-        .agent_runtime()
-        .register_backend(Arc::new(CompletedBackend));
+    let (services, _provider) =
+        canonical_agent_fixture::services_with_canonical_agent("managed-session").await;
     let mut managed = definition(ManagedAgentTrigger::Manual);
     managed.managed_agent_id = "workspace/cowd/runtime-team-dispatch".to_string();
     managed.target = ManagedAgentTarget::Team {
@@ -343,6 +253,15 @@ async fn runtime_dispatch_uses_team_instantiation_for_managed_team_targets() {
     assert_eq!(admitted.submitted.len(), 1, "{admitted:?}");
     assert!(admitted.completed.is_empty(), "{admitted:?}");
     assert!(admitted.failed.is_empty(), "{admitted:?}");
+    let canonical_root_task = services
+        .task_runtime_port()
+        .get(&format!(
+            "managed-root-task:{}",
+            admitted.submitted[0].invocation_id
+        ))
+        .expect("canonical managed Team root Task lookup")
+        .expect("canonical managed Team root Task");
+    assert!(canonical_root_task.execution_policy.binding.is_some());
     let graph_id = admitted.submitted[0]
         .execution_ref
         .clone()
@@ -354,7 +273,15 @@ async fn runtime_dispatch_uses_team_instantiation_for_managed_team_targets() {
         .expect("managed Team graph completes");
     let completed =
         await_terminal_projection(&services, &admitted.submitted[0].invocation_id).await;
-    assert_eq!(completed.status, ManagedAgentInvocationStatus::Completed);
+    let graph = services
+        .graph_state_store()
+        .load(&graph_id)
+        .expect("managed Team graph projection");
+    assert_eq!(
+        completed.status,
+        ManagedAgentInvocationStatus::Completed,
+        "{completed:#?}\n{graph:#?}"
+    );
     assert!(completed
         .evidence_refs
         .iter()

@@ -779,7 +779,7 @@ fn ensure_static_graph_ceiling(
     Ok(())
 }
 
-fn team_acceptance_contract(
+pub(crate) fn team_acceptance_contract(
     criteria: &[String],
     resource_scopes: &[String],
     allow_legacy_custom_contract: bool,
