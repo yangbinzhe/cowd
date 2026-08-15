@@ -1,0 +1,122 @@
+{
+  "contract": "cowd.ownership-reconcile/v1",
+  "invariant": "one source record has exactly one authoritative owner; projections and runtime state are never promoted to authority",
+  "preflight": [
+    "freeze_source_writes_or_acquire_migration_fence",
+    "export_all_46_tables_with_explicit_columns_and_no_defaults",
+    "verify_source_schema_and_contract_digest",
+    "validate_all_json_payloads_and_reference_edges"
+  ],
+  "stages": [
+    {
+      "order": 1,
+      "action": "import_core_owned_tables",
+      "tables": [
+        "matrix_entity",
+        "matrix_entity_source_key",
+        "matrix_relation",
+        "matrix_fact",
+        "matrix_attention_item",
+        "matrix_evidence_packet",
+        "matrix_quality_gate",
+        "matrix_metric_definition",
+        "matrix_metric_state",
+        "matrix_metric_dependency",
+        "matrix_compute_job",
+        "matrix_change_event",
+        "matrix_source_pack",
+        "matrix_data_plane_watermark",
+        "matrix_connector_run",
+        "matrix_ontology_pack",
+        "matrix_entity_match_candidate",
+        "matrix_entity_conflict_decision",
+        "matrix_metric_snapshot"
+      ],
+      "atomic": "core_store_transaction"
+    },
+    {
+      "order": 2,
+      "action": "import_mfg_owned_tables",
+      "tables": [
+        "mfg_cockpit_profile",
+        "mfg_cockpit_view_draft",
+        "mfg_cockpit_view_proposal",
+        "mfg_cockpit_view_version",
+        "mfg_cockpit_view_active",
+        "mfg_cockpit_report",
+        "mfg_report_delivery_review",
+        "mfg_report_delivery_review_transition",
+        "mfg_report_delivery_review_effect_outbox",
+        "mfg_alert_rule",
+        "mfg_alert_occurrence",
+        "mfg_alert_subscription",
+        "mfg_assignment",
+        "mfg_command_receipt",
+        "mfg_mutation_receipt",
+        "mfg_mutation_receipt_alias",
+        "mfg_mutation_receipt_repair_report",
+        "mfg_incident",
+        "mfg_operational_analysis",
+        "mfg_action_execution",
+        "mfg_memory_case",
+        "mfg_playbook",
+        "mfg_skill_execution",
+        "mfg_workflow_graph"
+      ],
+      "atomic": "mfg_private_store_transaction"
+    },
+    {
+      "order": 3,
+      "action": "resolve_cross_owner_references",
+      "source": "reference-graph.json",
+      "on_failure": "rollback_both_unpublished_imports"
+    },
+    {
+      "order": 4,
+      "action": "regenerate_runtime_state",
+      "tables": [
+        "mfg_projection_event",
+        "mfg_live_epoch",
+        "mfg_live_secret"
+      ],
+      "rule": "new_epoch_new_secret_empty_projection_cursor"
+    },
+    {
+      "order": 5,
+      "action": "delete_legacy_matrix_schema_metadata",
+      "table": "matrix_schema",
+      "precondition": "both_owner_schema_journals_and_semantic_queries_verified"
+    },
+    {
+      "order": 6,
+      "action": "publish_ownership_cutover",
+      "precondition": "all_semantic_queries_match_and_source_fence_is_held"
+    }
+  ],
+  "excluded_regeneration": {
+    "mfg_projection_event": "start_empty_then_rebuild_from_authoritative_events",
+    "mfg_live_epoch": "create_new_epoch_at_cutover_with_zero_retention_window",
+    "mfg_live_secret": "generate_new_secret_in_target_secret_store_never_copy_source"
+  },
+  "conflict_resolution": {
+    "stable_id_collision": "reject_unless_canonical_payload_and_revision_are_identical",
+    "revision_regression": "reject",
+    "same_revision_divergence": "reject",
+    "missing_revision": "preserve_embedded_revision_or_reject_if_owner_requires_revision",
+    "unknown_table": "reject",
+    "unknown_column": "reject",
+    "missing_column": "reject",
+    "implicit_default": "reject",
+    "multiple_owners": "reject",
+    "dangling_reference": "reject"
+  },
+  "semantic_verification": {
+    "query_source": "field-mapping.json#tables.*.fields.*.semantic_query",
+    "comparison": "typed_canonical_value_equality",
+    "excluded_tables": "verify_regeneration_invariants_instead_of_row_equality"
+  },
+  "rollback": {
+    "before_publish": "discard_unpublished_target_transactions_and_release_source_fence",
+    "after_publish": "forward_reconcile_only; never silently restore split-brain source ownership"
+  }
+}

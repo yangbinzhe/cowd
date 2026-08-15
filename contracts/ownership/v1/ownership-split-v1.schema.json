@@ -1,0 +1,343 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cowd.dev/contracts/ownership/ownership-split-v1.schema.json",
+  "title": "MfgOwnershipSplitSnapshotV1",
+  "description": "Atomic, fail-closed split snapshot. Importers must additionally enforce table-ownership.json, field-mapping.json, reference-graph.json and reconcile-rules.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "source",
+    "mfg_domain",
+    "core_matrix_domain",
+    "reconciliation",
+    "excluded",
+    "whole_snapshot_digest"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": "cowd.ownership-split/v1"
+    },
+    "source": {
+      "$ref": "#/$defs/source"
+    },
+    "mfg_domain": {
+      "$ref": "#/$defs/mfgSection"
+    },
+    "core_matrix_domain": {
+      "$ref": "#/$defs/coreSection"
+    },
+    "reconciliation": {
+      "$ref": "#/$defs/reconciliation"
+    },
+    "excluded": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "$ref": "#/$defs/excludedRecord"
+      }
+    },
+    "whole_snapshot_digest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "nonEmpty": {
+      "type": "string",
+      "minLength": 1
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "scalar": {
+      "type": [
+        "string",
+        "integer",
+        "number",
+        "boolean",
+        "null"
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app_id",
+        "source_version",
+        "schema_version",
+        "exported_at",
+        "maintenance_fence_id",
+        "ownership_contract_digest"
+      ],
+      "properties": {
+        "app_id": {
+          "const": "mfg"
+        },
+        "source_version": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "schema_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "exported_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "maintenance_fence_id": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "ownership_contract_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "object": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_table",
+        "stable_id",
+        "revision",
+        "source_references",
+        "evidence_references",
+        "payload",
+        "payload_digest"
+      ],
+      "properties": {
+        "source_table": {
+          "enum": [
+            "mfg_cockpit_profile",
+            "mfg_cockpit_view_draft",
+            "mfg_cockpit_view_proposal",
+            "mfg_cockpit_view_version",
+            "mfg_cockpit_view_active",
+            "mfg_cockpit_report",
+            "mfg_report_delivery_review",
+            "mfg_report_delivery_review_transition",
+            "mfg_report_delivery_review_effect_outbox",
+            "mfg_alert_rule",
+            "mfg_alert_occurrence",
+            "mfg_alert_subscription",
+            "mfg_assignment",
+            "mfg_command_receipt",
+            "mfg_mutation_receipt",
+            "mfg_mutation_receipt_alias",
+            "mfg_mutation_receipt_repair_report",
+            "matrix_entity",
+            "matrix_entity_source_key",
+            "matrix_relation",
+            "matrix_fact",
+            "matrix_attention_item",
+            "matrix_evidence_packet",
+            "matrix_quality_gate",
+            "matrix_metric_definition",
+            "matrix_metric_state",
+            "matrix_metric_dependency",
+            "matrix_compute_job",
+            "matrix_change_event",
+            "mfg_incident",
+            "mfg_operational_analysis",
+            "mfg_action_execution",
+            "mfg_memory_case",
+            "mfg_playbook",
+            "matrix_source_pack",
+            "matrix_data_plane_watermark",
+            "matrix_connector_run",
+            "matrix_ontology_pack",
+            "matrix_entity_match_candidate",
+            "matrix_entity_conflict_decision",
+            "matrix_metric_snapshot",
+            "mfg_skill_execution",
+            "mfg_workflow_graph"
+          ]
+        },
+        "stable_id": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/scalar"
+          }
+        },
+        "revision": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mapping",
+            "value"
+          ],
+          "properties": {
+            "mapping": {
+              "enum": [
+                "column",
+                "embedded",
+                "none"
+              ]
+            },
+            "value": {
+              "$ref": "#/$defs/scalar"
+            }
+          }
+        },
+        "source_references": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/nonEmpty"
+          }
+        },
+        "evidence_references": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/nonEmpty"
+          }
+        },
+        "payload": {
+          "type": "object"
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "sectionBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owner",
+        "object_count",
+        "section_digest",
+        "objects"
+      ],
+      "properties": {
+        "owner": {
+          "enum": [
+            "mfg",
+            "core"
+          ]
+        },
+        "object_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "section_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "objects": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/object"
+          }
+        }
+      }
+    },
+    "mfgSection": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/sectionBase"
+        },
+        {
+          "properties": {
+            "owner": {
+              "const": "mfg"
+            }
+          }
+        }
+      ]
+    },
+    "coreSection": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/sectionBase"
+        },
+        {
+          "properties": {
+            "owner": {
+              "const": "core"
+            }
+          }
+        }
+      ]
+    },
+    "reconcileRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stable_ref",
+        "payload_digest",
+        "status"
+      ],
+      "properties": {
+        "stable_ref": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "payload_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "status": {
+          "$ref": "#/$defs/nonEmpty"
+        }
+      }
+    },
+    "reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pending_outbox",
+        "command_receipts",
+        "mutation_receipts",
+        "set_digest"
+      ],
+      "properties": {
+        "pending_outbox": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reconcileRecord"
+          }
+        },
+        "command_receipts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reconcileRecord"
+          }
+        },
+        "mutation_receipts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reconcileRecord"
+          }
+        },
+        "set_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "excludedRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_table",
+        "reason",
+        "regeneration"
+      ],
+      "properties": {
+        "source_table": {
+          "enum": [
+            "mfg_projection_event",
+            "mfg_live_epoch",
+            "mfg_live_secret"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "regeneration": {
+          "$ref": "#/$defs/nonEmpty"
+        }
+      }
+    }
+  }
+}

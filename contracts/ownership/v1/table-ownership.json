@@ -1,0 +1,1029 @@
+{
+  "contract": "cowd.ownership-split/v1",
+  "source": {
+    "repository": "crates/app-mfg-core/src/repository.rs",
+    "table_inventory": "MFG_MIGRATION_TABLES",
+    "schema_ddl": "initialize_schema"
+  },
+  "expected_counts": {
+    "total": 46,
+    "mfg": 24,
+    "core": 19,
+    "excluded": 3
+  },
+  "tables": [
+    {
+      "source_table": "mfg_cockpit_profile",
+      "owner": "mfg",
+      "target": "mfg.mfg_cockpit_profile",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "profile_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "profile_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_profile"
+    },
+    {
+      "source_table": "mfg_cockpit_view_draft",
+      "owner": "mfg",
+      "target": "mfg.mfg_cockpit_view_draft",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "profile_id",
+        "actor_ref"
+      ],
+      "stable_id": {
+        "fields": [
+          "profile_id",
+          "actor_ref"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "draft_revision",
+          "base_revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_view_draft"
+    },
+    {
+      "source_table": "mfg_cockpit_view_proposal",
+      "owner": "mfg",
+      "target": "mfg.mfg_cockpit_view_proposal",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "proposal_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "proposal_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_view_proposal"
+    },
+    {
+      "source_table": "mfg_cockpit_view_version",
+      "owner": "mfg",
+      "target": "mfg.mfg_cockpit_view_version",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "profile_id",
+        "revision"
+      ],
+      "stable_id": {
+        "fields": [
+          "profile_id",
+          "revision"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "revision",
+          "base_revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_view_version"
+    },
+    {
+      "source_table": "mfg_cockpit_view_active",
+      "owner": "mfg",
+      "target": "mfg.mfg_cockpit_view_active",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "profile_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "profile_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "active_revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_view_active"
+    },
+    {
+      "source_table": "mfg_cockpit_report",
+      "owner": "mfg",
+      "target": "mfg.mfg_cockpit_report",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "report_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "report_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_cockpit_report"
+    },
+    {
+      "source_table": "mfg_report_delivery_review",
+      "owner": "mfg",
+      "target": "mfg.mfg_report_delivery_review",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "review_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "review_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "report_revision",
+          "delivery_revision",
+          "revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_report_delivery_review"
+    },
+    {
+      "source_table": "mfg_report_delivery_review_transition",
+      "owner": "mfg",
+      "target": "mfg.mfg_report_delivery_review_transition",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "transition_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "transition_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_report_delivery_review_transition"
+    },
+    {
+      "source_table": "mfg_report_delivery_review_effect_outbox",
+      "owner": "mfg",
+      "target": "mfg.mfg_report_delivery_review_effect_outbox",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "effect_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "effect_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_report_delivery_review_effect_outbox"
+    },
+    {
+      "source_table": "mfg_alert_rule",
+      "owner": "mfg",
+      "target": "mfg.mfg_alert_rule",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "rule_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "rule_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_alert_rule"
+    },
+    {
+      "source_table": "mfg_alert_occurrence",
+      "owner": "mfg",
+      "target": "mfg.mfg_alert_occurrence",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "occurrence_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "occurrence_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_alert_occurrence"
+    },
+    {
+      "source_table": "mfg_alert_subscription",
+      "owner": "mfg",
+      "target": "mfg.mfg_alert_subscription",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "subscription_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "subscription_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_alert_subscription"
+    },
+    {
+      "source_table": "mfg_assignment",
+      "owner": "mfg",
+      "target": "mfg.mfg_assignment",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "assignment_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "assignment_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_assignment"
+    },
+    {
+      "source_table": "mfg_command_receipt",
+      "owner": "mfg",
+      "target": "mfg.mfg_command_receipt",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "idempotency_key"
+      ],
+      "stable_id": {
+        "fields": [
+          "idempotency_key"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_command_receipt"
+    },
+    {
+      "source_table": "mfg_mutation_receipt",
+      "owner": "mfg",
+      "target": "mfg.mfg_mutation_receipt",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "receipt_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "receipt_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "expected_revision",
+          "result_revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_mutation_receipt"
+    },
+    {
+      "source_table": "mfg_mutation_receipt_alias",
+      "owner": "mfg",
+      "target": "mfg.mfg_mutation_receipt_alias",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "legacy_idempotency_key"
+      ],
+      "stable_id": {
+        "fields": [
+          "legacy_idempotency_key"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_mutation_receipt_alias"
+    },
+    {
+      "source_table": "mfg_mutation_receipt_repair_report",
+      "owner": "mfg",
+      "target": "mfg.mfg_mutation_receipt_repair_report",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "report_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "report_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_mutation_receipt_repair_report"
+    },
+    {
+      "source_table": "mfg_projection_event",
+      "owner": "excluded",
+      "target": null,
+      "disposition": "regenerate",
+      "primary_key": [
+        "event_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "event_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "never_import",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_projection_event"
+    },
+    {
+      "source_table": "mfg_live_epoch",
+      "owner": "excluded",
+      "target": null,
+      "disposition": "regenerate",
+      "primary_key": [
+        "singleton_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "singleton_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "never_import",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_live_epoch"
+    },
+    {
+      "source_table": "mfg_live_secret",
+      "owner": "excluded",
+      "target": null,
+      "disposition": "regenerate",
+      "primary_key": [
+        "singleton_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "singleton_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "never_import",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_live_secret"
+    },
+    {
+      "source_table": "matrix_entity",
+      "owner": "core",
+      "target": "core.matrix_entity",
+      "disposition": "typed_import",
+      "primary_key": [
+        "entity_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "entity_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity"
+    },
+    {
+      "source_table": "matrix_entity_source_key",
+      "owner": "core",
+      "target": "core.matrix_entity_source_key",
+      "disposition": "typed_import",
+      "primary_key": [
+        "source_system",
+        "source_key"
+      ],
+      "stable_id": {
+        "fields": [
+          "source_system",
+          "source_key"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity_source_key"
+    },
+    {
+      "source_table": "matrix_relation",
+      "owner": "core",
+      "target": "core.matrix_relation",
+      "disposition": "typed_import",
+      "primary_key": [
+        "relation_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "relation_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_relation"
+    },
+    {
+      "source_table": "matrix_fact",
+      "owner": "core",
+      "target": "core.matrix_fact",
+      "disposition": "typed_import",
+      "primary_key": [
+        "fact_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "fact_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_fact"
+    },
+    {
+      "source_table": "matrix_attention_item",
+      "owner": "core",
+      "target": "core.matrix_attention_item",
+      "disposition": "typed_import",
+      "primary_key": [
+        "attention_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "attention_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_attention_item"
+    },
+    {
+      "source_table": "matrix_evidence_packet",
+      "owner": "core",
+      "target": "core.matrix_evidence_packet",
+      "disposition": "typed_import",
+      "primary_key": [
+        "packet_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "packet_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_evidence_packet"
+    },
+    {
+      "source_table": "matrix_quality_gate",
+      "owner": "core",
+      "target": "core.matrix_quality_gate",
+      "disposition": "typed_import",
+      "primary_key": [
+        "gate_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "gate_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_quality_gate"
+    },
+    {
+      "source_table": "matrix_metric_definition",
+      "owner": "core",
+      "target": "core.matrix_metric_definition",
+      "disposition": "typed_import",
+      "primary_key": [
+        "metric_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "metric_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_definition"
+    },
+    {
+      "source_table": "matrix_metric_state",
+      "owner": "core",
+      "target": "core.matrix_metric_state",
+      "disposition": "typed_import",
+      "primary_key": [
+        "state_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "state_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_state"
+    },
+    {
+      "source_table": "matrix_metric_dependency",
+      "owner": "core",
+      "target": "core.matrix_metric_dependency",
+      "disposition": "typed_import",
+      "primary_key": [
+        "dependency_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "dependency_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_dependency"
+    },
+    {
+      "source_table": "matrix_compute_job",
+      "owner": "core",
+      "target": "core.matrix_compute_job",
+      "disposition": "typed_import",
+      "primary_key": [
+        "job_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "job_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_compute_job"
+    },
+    {
+      "source_table": "matrix_change_event",
+      "owner": "core",
+      "target": "core.matrix_change_event",
+      "disposition": "typed_import",
+      "primary_key": [
+        "change_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "change_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_change_event"
+    },
+    {
+      "source_table": "mfg_incident",
+      "owner": "mfg",
+      "target": "mfg.mfg_incident",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "incident_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "incident_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_incident"
+    },
+    {
+      "source_table": "mfg_operational_analysis",
+      "owner": "mfg",
+      "target": "mfg.mfg_operational_analysis",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "analysis_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "analysis_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_operational_analysis"
+    },
+    {
+      "source_table": "mfg_action_execution",
+      "owner": "mfg",
+      "target": "mfg.mfg_action_execution",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "execution_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "execution_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_action_execution"
+    },
+    {
+      "source_table": "mfg_memory_case",
+      "owner": "mfg",
+      "target": "mfg.mfg_memory_case",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "case_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "case_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_memory_case"
+    },
+    {
+      "source_table": "mfg_playbook",
+      "owner": "mfg",
+      "target": "mfg.mfg_playbook",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "playbook_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "playbook_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_playbook"
+    },
+    {
+      "source_table": "matrix_source_pack",
+      "owner": "core",
+      "target": "core.matrix_source_pack",
+      "disposition": "typed_import",
+      "primary_key": [
+        "source_pack_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "source_pack_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_source_pack"
+    },
+    {
+      "source_table": "matrix_data_plane_watermark",
+      "owner": "core",
+      "target": "core.matrix_data_plane_watermark",
+      "disposition": "typed_import",
+      "primary_key": [
+        "source_ref",
+        "fact_type",
+        "partition_ref"
+      ],
+      "stable_id": {
+        "fields": [
+          "source_ref",
+          "fact_type",
+          "partition_ref"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_data_plane_watermark"
+    },
+    {
+      "source_table": "matrix_connector_run",
+      "owner": "core",
+      "target": "core.matrix_connector_run",
+      "disposition": "typed_import",
+      "primary_key": [
+        "run_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "run_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_connector_run"
+    },
+    {
+      "source_table": "matrix_ontology_pack",
+      "owner": "core",
+      "target": "core.matrix_ontology_pack",
+      "disposition": "typed_import",
+      "primary_key": [
+        "ontology_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "ontology_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_ontology_pack"
+    },
+    {
+      "source_table": "matrix_entity_match_candidate",
+      "owner": "core",
+      "target": "core.matrix_entity_match_candidate",
+      "disposition": "typed_import",
+      "primary_key": [
+        "candidate_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "candidate_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity_match_candidate"
+    },
+    {
+      "source_table": "matrix_entity_conflict_decision",
+      "owner": "core",
+      "target": "core.matrix_entity_conflict_decision",
+      "disposition": "typed_import",
+      "primary_key": [
+        "decision_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "decision_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_entity_conflict_decision"
+    },
+    {
+      "source_table": "matrix_metric_snapshot",
+      "owner": "core",
+      "target": "core.matrix_metric_snapshot",
+      "disposition": "typed_import",
+      "primary_key": [
+        "snapshot_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "snapshot_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_metric_snapshot"
+    },
+    {
+      "source_table": "mfg_skill_execution",
+      "owner": "mfg",
+      "target": "mfg.mfg_skill_execution",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "execution_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "execution_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "reject_duplicate_stable_id_unless_canonical_payload_equal",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_skill_execution"
+    },
+    {
+      "source_table": "mfg_workflow_graph",
+      "owner": "mfg",
+      "target": "mfg.mfg_workflow_graph",
+      "disposition": "canonical_import",
+      "primary_key": [
+        "workflow_id"
+      ],
+      "stable_id": {
+        "fields": [
+          "workflow_id"
+        ],
+        "required": true
+      },
+      "revision": {
+        "fields": [
+          "revision"
+        ],
+        "embedded_revision_must_be_preserved": true
+      },
+      "conflict": "compare_revision_then_reject_divergence",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::mfg_workflow_graph"
+    }
+  ],
+  "metadata": [
+    {
+      "source_table": "matrix_schema",
+      "owner": "excluded",
+      "disposition": "delete_after_verified_cutover",
+      "replacement": "target-owned schema migration journals",
+      "precondition": "both target stores report their own accepted schema revision and contract digest",
+      "evidence": "crates/app-mfg-core/src/repository.rs::initialize_schema::matrix_schema"
+    }
+  ]
+}
