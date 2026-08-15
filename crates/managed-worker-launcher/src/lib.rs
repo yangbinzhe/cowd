@@ -60,7 +60,7 @@ impl Default for ResourceLimitsV1 {
     fn default() -> Self {
         Self {
             nofile: 256,
-            nproc: 64,
+            nproc: 4096,
             address_space_bytes: 512 * 1024 * 1024,
             cpu_seconds: 300,
             file_size_bytes: 16 * 1024 * 1024,
@@ -1085,5 +1085,13 @@ mod tests {
         install_parent_death_signal(expected).expect("pdeathsig");
         fs::write(pid_file, std::process::id().to_string()).expect("pid evidence");
         std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn default_limits_keep_uid_scope_and_worker_scope_separate() {
+        let limits = ResourceLimitsV1::default();
+        assert_eq!(limits.nproc, 4096);
+        assert_eq!(limits.address_space_bytes, 512 * 1024 * 1024);
+        assert_eq!(limits.cgroup_pids, 64);
     }
 }

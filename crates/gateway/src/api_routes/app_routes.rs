@@ -2018,6 +2018,26 @@ mod tests {
             .iter()
             .find(|profile| profile.is_default)
             .expect("reference default profile");
+        let auth_catalog =
+            auth_broker::AuthorizationCatalog::from_app_manifests([&admitted.manifest])
+                .expect("reference authorization catalog");
+        for surface_id in ["webui", "tui"] {
+            let projected = auth_catalog.surface_capabilities(surface_id);
+            for capability in &profile.capabilities {
+                assert!(
+                    projected.contains(capability),
+                    "{surface_id} did not project signed capability {capability}"
+                );
+            }
+        }
+        let unknown_surface = auth_catalog.surface_capabilities("unknown-surface");
+        assert!(
+            profile
+                .capabilities
+                .iter()
+                .all(|capability| !unknown_surface.contains(capability)),
+            "APP capabilities must be projected only to signed surface identifiers"
+        );
         let admitted_generation = admitted.generation.clone();
         let mut effective_capabilities = profile.capabilities.clone();
         effective_capabilities.extend([

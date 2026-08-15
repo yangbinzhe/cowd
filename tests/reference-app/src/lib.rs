@@ -197,6 +197,10 @@ fn unsigned_manifest(files: BTreeMap<String, Sha256Digest>) -> Result<AppManifes
     let app_id = AppId(APP_ID.to_owned());
     let operation_catalog_digest = app_operation_catalog_digest_v1(&app_id, &operations())
         .map_err(|error| ReferenceError::Protocol(error.to_string()))?;
+    let surface_capabilities = BTreeMap::from([
+        ("tui".to_owned(), capabilities.clone()),
+        ("webui".to_owned(), capabilities.clone()),
+    ]);
     Ok(AppManifestV1 {
         schema_version: 1,
         app_id,
@@ -210,7 +214,7 @@ fn unsigned_manifest(files: BTreeMap<String, Sha256Digest>) -> Result<AppManifes
             profile_id: "operator".to_owned(),
             display_name: "Reference operator".to_owned(),
             capabilities,
-            surface_capabilities: BTreeMap::new(),
+            surface_capabilities,
             is_default: true,
         }],
         operation_catalog_digest,

@@ -1093,7 +1093,7 @@ impl Default for AppWorkerResourcesConfig {
     fn default() -> Self {
         Self {
             nofile: 256,
-            nproc: 64,
+            nproc: 4096,
             address_space_bytes: 512 * 1024 * 1024,
             cpu_seconds: 300,
             file_size_bytes: 16 * 1024 * 1024,
@@ -6177,6 +6177,12 @@ apps:
             Some(Path::new("/sys/fs/cgroup/cowd"))
         );
         assert_eq!(loaded.apps().resources().nofile, 512);
+        assert_eq!(loaded.apps().resources().nproc, 4096);
+        assert_eq!(
+            loaded.apps().resources().address_space_bytes,
+            512 * 1024 * 1024
+        );
+        assert_eq!(loaded.apps().resources().cgroup_pids, 64);
         let mfg = loaded.apps().entry("mfg");
         assert!(mfg.required);
         assert_eq!(mfg.activation, AppActivationPolicyV1::Resident);

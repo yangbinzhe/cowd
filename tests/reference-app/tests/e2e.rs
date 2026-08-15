@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::fmt::Write as _;
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -46,6 +47,19 @@ fn package_is_deterministic_closed_signed_and_tamper_evident() {
     let first_manifest = package(&worker, &first).unwrap();
     let second_manifest = package(&worker, &second).unwrap();
     assert_eq!(first_manifest, second_manifest);
+    let reference_capabilities = vec![
+        "reference-app.command".to_owned(),
+        "reference-app.export".to_owned(),
+        "reference-app.query".to_owned(),
+        "reference-app.subscribe".to_owned(),
+    ];
+    assert_eq!(
+        first_manifest.authorization_profiles[0].surface_capabilities,
+        BTreeMap::from([
+            ("tui".to_owned(), reference_capabilities.clone()),
+            ("webui".to_owned(), reference_capabilities),
+        ])
+    );
     assert_eq!(
         fs::read(first.join("app.json")).unwrap(),
         fs::read(second.join("app.json")).unwrap()
