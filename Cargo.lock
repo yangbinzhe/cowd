@@ -1768,7 +1768,7 @@ dependencies = [
 
 [[package]]
 name = "managed-worker-runtime"
-version = "0.9.692"
+version = "0.9.693"
 dependencies = [
  "base64",
  "bytes",
