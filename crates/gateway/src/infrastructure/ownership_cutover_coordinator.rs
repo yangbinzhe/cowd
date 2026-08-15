@@ -131,13 +131,278 @@ pub struct RollbackCutoverRequest {
     pub target_manifest_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CutoverPublication {
     pub publication_generation: String,
     pub manifest_digest: String,
     pub core_generation: String,
     pub mfg_generation: String,
     pub rollback: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateRequestDocumentV1 {
+    schema_version: u16,
+    external_program: PathBuf,
+    root: PathBuf,
+    publication_generation: String,
+    activation_fence_id: String,
+    created_at: String,
+    source: ActivateSourceDocumentV1,
+    core: TargetDocumentV1,
+    mfg: TargetDocumentV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateSourceDocumentV1 {
+    backend: String,
+    namespace: Option<String>,
+    path: Option<PathBuf>,
+    source_version: String,
+    schema_version: u64,
+    maintenance_fence_id: String,
+    exported_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TargetDocumentV1 {
+    namespace: String,
+    generation: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RollbackRequestDocumentV1 {
+    schema_version: u16,
+    external_program: PathBuf,
+    root: PathBuf,
+    publication_generation: String,
+    activation_fence_id: String,
+    created_at: String,
+    target_manifest_digest: String,
+}
+
+/// Execute the production offline coordinator from the operator CLI.
+///
+/// The request document contains topology only. Credential bytes are accepted
+/// exclusively through an environment name, a private file, or stdin.
+pub fn run_operator_command(args: &[String]) -> Result<CutoverPublication, CutoverError> {
+    let parsed = OperatorArguments::parse(args)?;
+    let bytes = read_regular_bounded(&parsed.request_path, MAX_RECEIPT_BYTES)?;
+    match parsed.action {
+        OperatorAction::Activate => {
+            let document: ActivateRequestDocumentV1 = serde_json::from_slice(&bytes)
+                .map_err(|_| CutoverError::InvalidRequest("activate request JSON is invalid"))?;
+            if document.schema_version != 1 {
+                return Err(CutoverError::InvalidRequest(
+                    "activate request schema_version must be 1",
+                ));
+            }
+            let credential = parsed.credential.ok_or(CutoverError::InvalidRequest(
+                "activate requires exactly one credential channel",
+            ))?;
+            match document.source.backend.as_str() {
+                "sqlite"
+                    if document.source.path.is_none() || document.source.namespace.is_some() =>
+                {
+                    return Err(CutoverError::InvalidRequest(
+                        "SQLite source requires only path",
+                    ));
+                }
+                "postgres"
+                    if document.source.namespace.is_none() || document.source.path.is_some() =>
+                {
+                    return Err(CutoverError::InvalidRequest(
+                        "PostgreSQL source requires only namespace",
+                    ));
+                }
+                _ => {}
+            }
+            let source_location =
+                match document.source.backend.as_str() {
+                    "sqlite" => LegacySourceLocation::Sqlite {
+                        path: document
+                            .source
+                            .path
+                            .ok_or(CutoverError::InvalidRequest("SQLite source requires path"))?,
+                    },
+                    "postgres" => LegacySourceLocation::Postgres {
+                        namespace: document.source.namespace.ok_or(
+                            CutoverError::InvalidRequest("PostgreSQL source requires namespace"),
+                        )?,
+                        credential: credential.clone(),
+                    },
+                    _ => {
+                        return Err(CutoverError::InvalidRequest(
+                            "source backend must be sqlite or postgres",
+                        ))
+                    }
+                };
+            let external = ExternalOwnershipProgram::new(document.external_program)?;
+            let maintenance = FileMaintenancePort;
+            OwnershipCutoverCoordinator::new(
+                &maintenance,
+                &external,
+                &external,
+                &external,
+                &external,
+            )
+            .activate(ActiveCutoverRequest {
+                root: document.root,
+                publication_generation: document.publication_generation,
+                activation_fence_id: document.activation_fence_id,
+                created_at: document.created_at,
+                source: LegacySourceRequest {
+                    location: source_location,
+                    source_version: document.source.source_version,
+                    schema_version: document.source.schema_version,
+                    maintenance_fence_id: document.source.maintenance_fence_id,
+                    exported_at: document.source.exported_at,
+                },
+                core: TargetGenerationRequest {
+                    namespace: document.core.namespace,
+                    generation: document.core.generation,
+                    credential: credential.clone(),
+                },
+                mfg: TargetGenerationRequest {
+                    namespace: document.mfg.namespace,
+                    generation: document.mfg.generation,
+                    credential,
+                },
+            })
+        }
+        OperatorAction::Rollback => {
+            if parsed.credential.is_some() {
+                return Err(CutoverError::InvalidRequest(
+                    "rollback does not consume a credential channel",
+                ));
+            }
+            let document: RollbackRequestDocumentV1 = serde_json::from_slice(&bytes)
+                .map_err(|_| CutoverError::InvalidRequest("rollback request JSON is invalid"))?;
+            if document.schema_version != 1 {
+                return Err(CutoverError::InvalidRequest(
+                    "rollback request schema_version must be 1",
+                ));
+            }
+            let external = ExternalOwnershipProgram::new(document.external_program)?;
+            let maintenance = FileMaintenancePort;
+            OwnershipCutoverCoordinator::new(
+                &maintenance,
+                &external,
+                &external,
+                &external,
+                &external,
+            )
+            .rollback(RollbackCutoverRequest {
+                root: document.root,
+                publication_generation: document.publication_generation,
+                activation_fence_id: document.activation_fence_id,
+                created_at: document.created_at,
+                target_manifest_digest: document.target_manifest_digest,
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorAction {
+    Activate,
+    Rollback,
+}
+
+struct OperatorArguments {
+    action: OperatorAction,
+    request_path: PathBuf,
+    credential: Option<CredentialSource>,
+}
+
+impl OperatorArguments {
+    fn parse(args: &[String]) -> Result<Self, CutoverError> {
+        let action = match args.first().map(String::as_str) {
+            Some("activate") => OperatorAction::Activate,
+            Some("rollback") => OperatorAction::Rollback,
+            _ => {
+                return Err(CutoverError::InvalidRequest(
+                    "usage: ownership-cutover activate|rollback --request <json> [--credential-env <NAME>|--credential-file <path>|--credential-stdin]",
+                ))
+            }
+        };
+        let mut request_path = None;
+        let mut credential = None;
+        let mut index = 1;
+        while index < args.len() {
+            let (next, consumed) = match args[index].as_str() {
+                "--request" => (
+                    Some(args.get(index + 1).ok_or(CutoverError::InvalidRequest(
+                        "--request requires a JSON path",
+                    ))?),
+                    2,
+                ),
+                "--credential-env" => {
+                    let value = args.get(index + 1).ok_or(CutoverError::InvalidRequest(
+                        "--credential-env requires a variable name",
+                    ))?;
+                    if credential
+                        .replace(CredentialSource::Environment {
+                            variable: value.clone(),
+                        })
+                        .is_some()
+                    {
+                        return Err(CutoverError::InvalidRequest(
+                            "credential channels are mutually exclusive",
+                        ));
+                    }
+                    (None, 2)
+                }
+                "--credential-file" => {
+                    let value = args.get(index + 1).ok_or(CutoverError::InvalidRequest(
+                        "--credential-file requires a path",
+                    ))?;
+                    if credential
+                        .replace(CredentialSource::File {
+                            path: PathBuf::from(value),
+                        })
+                        .is_some()
+                    {
+                        return Err(CutoverError::InvalidRequest(
+                            "credential channels are mutually exclusive",
+                        ));
+                    }
+                    (None, 2)
+                }
+                "--credential-stdin" => {
+                    if credential.replace(CredentialSource::Stdin).is_some() {
+                        return Err(CutoverError::InvalidRequest(
+                            "credential channels are mutually exclusive",
+                        ));
+                    }
+                    (None, 1)
+                }
+                _ => {
+                    return Err(CutoverError::InvalidRequest(
+                        "ownership-cutover accepts only request and credential-channel flags",
+                    ))
+                }
+            };
+            if let Some(path) = next {
+                if request_path.replace(PathBuf::from(path)).is_some() {
+                    return Err(CutoverError::InvalidRequest(
+                        "--request may be supplied only once",
+                    ));
+                }
+            }
+            index += consumed;
+        }
+        Ok(Self {
+            action,
+            request_path: request_path
+                .ok_or(CutoverError::InvalidRequest("--request is required"))?,
+            credential,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1931,6 +2196,64 @@ mod tests {
 
     const NO_TAMPER: u8 = 0;
     const TAMPER_CORE_ACL: u8 = 1;
+
+    #[test]
+    fn operator_arguments_accept_only_request_path_and_one_credential_channel() {
+        let parsed = OperatorArguments::parse(&[
+            "activate".to_owned(),
+            "--request".to_owned(),
+            "/tmp/request.json".to_owned(),
+            "--credential-env".to_owned(),
+            "COWD_TEST_POSTGRES_URL".to_owned(),
+        ])
+        .expect("bounded operator arguments");
+        assert_eq!(parsed.action, OperatorAction::Activate);
+        assert_eq!(parsed.request_path, PathBuf::from("/tmp/request.json"));
+        assert!(matches!(
+            parsed.credential,
+            Some(CredentialSource::Environment { ref variable })
+                if variable == "COWD_TEST_POSTGRES_URL"
+        ));
+
+        for args in [
+            vec![
+                "activate".to_owned(),
+                "--request".to_owned(),
+                "/tmp/request.json".to_owned(),
+                "--credential".to_owned(),
+                "secret".to_owned(),
+            ],
+            vec![
+                "activate".to_owned(),
+                "--request".to_owned(),
+                "/tmp/request.json".to_owned(),
+                "--credential-stdin".to_owned(),
+                "--credential-env".to_owned(),
+                "COWD_TEST_POSTGRES_URL".to_owned(),
+            ],
+        ] {
+            assert!(OperatorArguments::parse(&args).is_err());
+        }
+    }
+
+    #[test]
+    fn rollback_rejects_credential_channel_before_running_ports() {
+        let temp = TempDir::new().expect("temp");
+        let request = temp.path().join("rollback.json");
+        fs::write(
+            &request,
+            br#"{"schema_version":1,"external_program":"/missing","root":"/tmp/cutover","publication_generation":"rollback-1","activation_fence_id":"fence-1","created_at":"2026-08-15T00:00:00Z","target_manifest_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        )
+        .expect("request");
+        let error = run_operator_command(&[
+            "rollback".to_owned(),
+            "--request".to_owned(),
+            request.display().to_string(),
+            "--credential-stdin".to_owned(),
+        ])
+        .expect_err("unused rollback credential");
+        assert!(matches!(error, CutoverError::InvalidRequest(_)));
+    }
 
     struct FixturePorts {
         sqlite_was_readonly: AtomicBool,

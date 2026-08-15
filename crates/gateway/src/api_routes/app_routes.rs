@@ -43,6 +43,8 @@ pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::App
     Router::new()
         .route("/api/apps", get(list_apps))
         .route("/api/apps/:app_id", get(get_app))
+        .route("/api/apps/:app_id/logs", get(get_app_logs))
+        .route("/api/apps/:app_id/restart", post(restart_app))
         .route(
             "/api/apps/:app_id/operations/:operation_id/invoke",
             post(invoke_operation),
@@ -72,6 +74,153 @@ pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::App
         .route("/apps/:app_id", get(serve_index))
         .route("/apps/:app_id/*path", get(serve_asset))
         .layer(Extension(platform))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayAppLogStreamV1 {
+    text: String,
+    retained_bytes: usize,
+    dropped_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayAppLogsResponseV1 {
+    schema_version: u16,
+    app_id: AppId,
+    generation: cowd_app_protocol::GenerationId,
+    stdout: GatewayAppLogStreamV1,
+    stderr: GatewayAppLogStreamV1,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayAppRestartResponseV1 {
+    schema_version: u16,
+    app_id: AppId,
+    generation: cowd_app_protocol::GenerationId,
+    lifecycle: AppLifecycleV1,
+}
+
+async fn get_app_logs(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumPath(app_id): AxumPath<String>,
+) -> Result<Json<GatewayAppLogsResponseV1>, (StatusCode, Json<serde_json::Value>)> {
+    require_app_management_access(&platform, &principal, &app_id, "runtime.task.read")?;
+    let app_id = AppId(app_id);
+    let admitted = platform
+        .catalog()
+        .get(&app_id)
+        .ok_or_else(|| typed_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted"))?;
+    let logs = platform
+        .supervisor()
+        .logs(&app_id)
+        .await
+        .map_err(supervisor_management_error)?;
+    Ok(Json(GatewayAppLogsResponseV1 {
+        schema_version: 1,
+        app_id,
+        generation: admitted.generation.clone(),
+        stdout: GatewayAppLogStreamV1 {
+            text: String::from_utf8_lossy(&logs.stdout.bytes).into_owned(),
+            retained_bytes: logs.stdout.bytes.len(),
+            dropped_bytes: logs.stdout.dropped_bytes,
+        },
+        stderr: GatewayAppLogStreamV1 {
+            text: String::from_utf8_lossy(&logs.stderr.bytes).into_owned(),
+            retained_bytes: logs.stderr.bytes.len(),
+            dropped_bytes: logs.stderr.dropped_bytes,
+        },
+    }))
+}
+
+async fn restart_app(
+    Extension(platform): Extension<Arc<GatewayAppPlatform>>,
+    Extension(principal): Extension<super::AuthenticatedPrincipal>,
+    AxumPath(app_id): AxumPath<String>,
+) -> Result<Json<GatewayAppRestartResponseV1>, (StatusCode, Json<serde_json::Value>)> {
+    require_app_management_access(&platform, &principal, &app_id, "runtime.maintenance.manage")?;
+    let app_id = AppId(app_id);
+    let admitted = platform
+        .catalog()
+        .get(&app_id)
+        .ok_or_else(|| typed_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted"))?;
+    let generation = admitted.generation.clone();
+    let cancellation = CancellationToken::default();
+    platform
+        .supervisor()
+        .restart(&app_id, &generation, &cancellation)
+        .await
+        .map_err(supervisor_management_error)?;
+    let status = platform
+        .supervisor()
+        .status(&app_id)
+        .await
+        .map_err(supervisor_management_error)?;
+    Ok(Json(GatewayAppRestartResponseV1 {
+        schema_version: 1,
+        app_id,
+        generation,
+        lifecycle: AppLifecycleV1 {
+            state: status.state,
+            reason_code: status.reason.map(|_| "runtime_failure".to_owned()),
+            retryable: matches!(
+                status.state,
+                cowd_app_protocol::AppLifecycleStateV1::Failed
+                    | cowd_app_protocol::AppLifecycleStateV1::CircuitOpen
+            ),
+            retry_after_ms: None,
+        },
+    }))
+}
+
+fn require_app_management_access(
+    platform: &GatewayAppPlatform,
+    principal: &super::AuthenticatedPrincipal,
+    app_id: &str,
+    core_capability: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let app_id = AppId(app_id.to_owned());
+    if platform.catalog().get(&app_id).is_none() {
+        return Err(typed_error(
+            StatusCode::NOT_FOUND,
+            "app_not_found",
+            "APP is not mounted",
+        ));
+    }
+    let claims = principal.0.claims();
+    if claims.app_profile(&app_id.0).is_none() || !claims.has_capability(core_capability) {
+        return Err(typed_error(
+            StatusCode::FORBIDDEN,
+            "app_management_forbidden",
+            "the principal lacks the signed APP profile or Core management capability",
+        ));
+    }
+    Ok(())
+}
+
+fn supervisor_management_error(
+    error: cowd_app_host::supervisor::SupervisorError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use cowd_app_host::supervisor::SupervisorError;
+    let (status, code) = match &error {
+        SupervisorError::UnknownApp(_) => (StatusCode::NOT_FOUND, "app_not_found"),
+        SupervisorError::CircuitOpen(_) => (StatusCode::SERVICE_UNAVAILABLE, "app_circuit_open"),
+        SupervisorError::BackingOff { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "app_restart_backoff")
+        }
+        SupervisorError::DeadlineExceeded(_) => {
+            (StatusCode::GATEWAY_TIMEOUT, "app_management_deadline")
+        }
+        SupervisorError::Cancelled | SupervisorError::ShuttingDown => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "app_management_unavailable",
+        ),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "app_management_failed"),
+    };
+    typed_error(status, code, &error.to_string())
 }
 
 async fn list_apps(
@@ -1768,6 +1917,14 @@ mod tests {
             .iter()
             .find(|profile| profile.is_default)
             .expect("reference default profile");
+        let admitted_generation = admitted.generation.clone();
+        let mut effective_capabilities = profile.capabilities.clone();
+        effective_capabilities.extend([
+            "runtime.maintenance.manage".to_owned(),
+            "runtime.task.read".to_owned(),
+        ]);
+        effective_capabilities.sort();
+        effective_capabilities.dedup();
         let principal = super::super::AuthenticatedPrincipal(
             runtime::VerifiedPrincipal::from_test_claims(PrincipalClaims {
                 principal_id: "reference-e2e".to_owned(),
@@ -1775,7 +1932,7 @@ mod tests {
                 grant_id: "grant-reference".to_owned(),
                 kind: PrincipalKind::Human,
                 scopes: Vec::new(),
-                capabilities: profile.capabilities.clone(),
+                capabilities: effective_capabilities,
                 assurance: PrincipalAssurance::HumanInteractive,
                 issuer: "cowd.gateway".to_owned(),
                 issued_at_ms: now,
@@ -2093,6 +2250,38 @@ mod tests {
         )
         .await;
         assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
+
+        let logs = get_app_logs(
+            Extension(Arc::clone(&platform)),
+            Extension(principal.clone()),
+            AxumPath("reference-app".to_owned()),
+        )
+        .await
+        .expect("reference APP logs")
+        .0;
+        assert_eq!(logs.app_id, app_id);
+        assert_eq!(logs.generation, admitted_generation);
+        let denied_logs = get_app_logs(
+            Extension(Arc::clone(&platform)),
+            Extension(unauthorized.clone()),
+            AxumPath("reference-app".to_owned()),
+        )
+        .await
+        .expect_err("unsigned management access denied");
+        assert_eq!(denied_logs.0, StatusCode::FORBIDDEN);
+        let restarted = restart_app(
+            Extension(Arc::clone(&platform)),
+            Extension(principal.clone()),
+            AxumPath("reference-app".to_owned()),
+        )
+        .await
+        .expect("reference APP restart")
+        .0;
+        assert_eq!(restarted.app_id, app_id);
+        assert_eq!(
+            restarted.lifecycle.state,
+            cowd_app_protocol::AppLifecycleStateV1::Ready
+        );
 
         let rejected = tui_action(
             Extension(Arc::clone(&platform)),

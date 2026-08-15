@@ -289,9 +289,11 @@ mod tests {
                 ("DELETE", "/api/apps/:app_id/subscriptions/:subscription_id"),
                 ("GET", "/api/apps"),
                 ("GET", "/api/apps/:app_id"),
+                ("GET", "/api/apps/:app_id/logs"),
                 ("GET", "/api/apps/:app_id/receipts/:receipt_id"),
                 ("POST", "/api/apps/:app_id/operations/:operation_id/invoke",),
                 ("POST", "/api/apps/:app_id/operations/:operation_id/stream",),
+                ("POST", "/api/apps/:app_id/restart"),
                 (
                     "POST",
                     "/api/apps/:app_id/subscriptions/:subscription_id/ack",

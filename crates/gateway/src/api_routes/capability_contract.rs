@@ -2814,6 +2814,8 @@ mod tests {
         let paths = document["paths"].as_object().expect("OpenAPI paths");
         assert!(paths.contains_key("/api/apps"));
         assert!(paths.contains_key("/api/apps/{app_id}"));
+        assert!(paths.contains_key("/api/apps/{app_id}/logs"));
+        assert!(paths.contains_key("/api/apps/{app_id}/restart"));
         assert!(paths.contains_key("/api/apps/{app_id}/operations/{operation_id}/invoke"));
         assert!(paths.keys().all(|path| !path.starts_with("/api/apps/mfg")));
         assert!(document["components"]["schemas"]["MfgApiErrorV1"].is_null());

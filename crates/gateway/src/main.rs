@@ -93,6 +93,26 @@ pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
 
 /// Operator-only storage cutover entry used by the thin CLI binary.
 pub fn storage_entry(args: &[String]) -> std::process::ExitCode {
+    if args.first().map(String::as_str) == Some("ownership-cutover") {
+        return match ownership_cutover_coordinator::run_operator_command(
+            args.get(1..).unwrap_or_default(),
+        ) {
+            Ok(publication) => match serde_json::to_string_pretty(&publication) {
+                Ok(output) => {
+                    println!("{output}");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("ownership cutover result encoding failed: {error}");
+                    std::process::ExitCode::from(70)
+                }
+            },
+            Err(error) => {
+                eprintln!("ownership cutover failed: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     match storage_cutover::run(args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {

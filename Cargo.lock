@@ -289,14 +289,17 @@ name = "cli"
 version = "0.9.693"
 dependencies = [
  "auth-broker",
+ "cowd-app-protocol",
  "cowd-app-sdk",
  "gateway",
+ "reqwest",
  "runtime",
  "sandbox-launcher",
  "serde",
  "serde_json",
  "skill",
  "tempfile",
+ "thiserror",
  "tokio",
  "tools",
  "tui",

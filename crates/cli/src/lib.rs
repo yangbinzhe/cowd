@@ -2,6 +2,7 @@ use std::process::ExitCode;
 
 use serde::{Deserialize, Serialize};
 
+mod apps;
 mod local_commands;
 
 const INTERNAL_DISPATCH: &str = "__cowd_internal";
@@ -9,6 +10,12 @@ const INTERNAL_DISPATCH: &str = "__cowd_internal";
 #[must_use]
 pub fn local_command_entry(args: &[String]) -> ExitCode {
     local_commands::entry(args)
+}
+
+/// Execute the live Gateway-backed APP administration surface.
+#[must_use]
+pub fn apps_entry(args: &[String]) -> ExitCode {
+    apps::entry(args)
 }
 
 /// 在公开 CLI 解析前分发 Cowd 的内部子进程角色。
@@ -40,6 +47,7 @@ pub fn dispatch_internal_process(args: &[String]) -> Option<ExitCode> {
 pub enum CliSurfaceCommand {
     Tui,
     Gateway,
+    Apps,
     Doctor,
     Config,
     Auth,
@@ -66,6 +74,7 @@ impl CliSurfacePolicy {
             allowed_commands: vec![
                 CliSurfaceCommand::Tui,
                 CliSurfaceCommand::Gateway,
+                CliSurfaceCommand::Apps,
                 CliSurfaceCommand::Doctor,
                 CliSurfaceCommand::Config,
                 CliSurfaceCommand::Auth,

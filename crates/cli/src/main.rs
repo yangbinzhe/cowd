@@ -27,6 +27,10 @@ fn main() -> std::process::ExitCode {
         return gateway::storage_entry(&args[1..]);
     }
 
+    if matches!(first_arg, Some("apps")) {
+        return cli::apps_entry(&args[1..]);
+    }
+
     if should_open_tui(&args) || matches!(first_arg, Some("tui")) {
         return open_tui();
     }
