@@ -72,7 +72,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth-broker"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "base64",
  "cowd-app-sdk",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "auth-broker",
  "cowd-app-sdk",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "connector"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "connector-postgres"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "connector",
@@ -374,7 +374,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "cowd-app-host"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "axum",
  "cowd-app-sdk",
@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "cowd-app-sdk"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "async-trait",
  "schemars",
@@ -492,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "cowd-product-apps"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "async-trait",
  "cowd-app-host",
@@ -793,12 +793,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "fact-kernel"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "fact-postgres"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -826,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "fact-sqlite"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -1019,7 +1019,7 @@ dependencies = [
 
 [[package]]
 name = "gateway"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "async-trait",
  "auth-broker",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "harness-contract"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "schemars",
@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "harness-eval"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "async-trait",
  "fact-kernel",
@@ -1762,7 +1762,7 @@ checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
 
 [[package]]
 name = "matrix-core"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "fact-kernel",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-repository"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "matrix-core",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "mcp"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "serde",
  "serde_json",
@@ -1817,7 +1817,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memory"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1852,7 +1852,7 @@ dependencies = [
 
 [[package]]
 name = "memory-postgres"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "model-protocol"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "serde",
  "serde_json",
@@ -2185,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "plugins"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "serde",
  "serde_json",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "provider"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "httpdate",
  "model-protocol",
@@ -2372,7 +2372,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2674,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "runtime"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "async-trait",
  "base64",
@@ -2719,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "runtime-postgres"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "harness-contract",
  "postgres",
@@ -2778,7 +2778,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2839,7 +2839,7 @@ dependencies = [
 
 [[package]]
 name = "sandbox-launcher"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "landlock",
  "libc",
@@ -3030,7 +3030,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "session-postgres"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3155,7 +3155,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skill"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "harness-contract",
  "regex",
@@ -3195,7 +3195,7 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 
 [[package]]
 name = "sqlite-pool-tracker"
-version = "0.9.690"
+version = "0.9.691"
 
 [[package]]
 name = "stable_deref_trait"
@@ -3211,7 +3211,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "postgres",
  "r2d2",
@@ -3280,7 +3280,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surface"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3293,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "surface-postgres"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "harness-contract",
@@ -3397,7 +3397,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3618,7 +3618,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tools"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "base64",
  "flate2",
@@ -3863,7 +3863,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "chrono",
  "cowd-app-host",
@@ -4465,7 +4465,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.690"
+version = "0.9.691"
 dependencies = [
  "toml",
 ]

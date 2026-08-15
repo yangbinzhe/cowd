@@ -837,9 +837,51 @@ async fn two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota
     for index in 0..2 {
         let mut graph = test_graph(format!("root Team {index}"));
         graph.id = format!("root-team-overlap-{index}");
-        let mut agent = node(&format!("root-team-agent-{index}"));
+        let node_id = format!("root-team-agent-{index}");
+        let mut agent = node(&node_id);
         agent.kind = ExecutionNodeKind::AgentTask;
-        agent.payload_ref = serde_json::json!({ "deadline_at_ms": u64::MAX }).to_string();
+        agent.payload_ref = serde_json::to_string(&harness_contract::agent::AgentTaskIntent {
+            selected_agent_id: None,
+            definition_ref: None,
+            granted_capabilities: Vec::new(),
+            principal_id: "test".to_string(),
+            source_turn_id: format!("root-team-turn-{index}"),
+            run_id: format!("root-team-run-{index}"),
+            task_id: format!("root-team-task-{index}"),
+            root_task_id: format!("root-team-task-{index}"),
+            parent_task_id: None,
+            session_id: "root-team-session".to_string(),
+            mission_id: "root-team-mission".to_string(),
+            team_id: Some(format!("root-team-{index}")),
+            graph_id: graph.id.clone(),
+            node_id: node_id.clone(),
+            attempt: 1,
+            expected_graph_revision: 0,
+            objective: format!("execute root Team {index}"),
+            required_acceptance: Default::default(),
+            acceptance: Vec::new(),
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            model_lease: "test".to_string(),
+            budget_lease: harness_contract::context::ChildExecutionBudgetReservation::single(
+                format!("root-team-budget-{index}"),
+                format!("root-team-agent-{index}"),
+                "agent",
+                1_000,
+                75_000,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            managed_invocation: None,
+            idempotency_key: format!("root-team-idempotency-{index}"),
+        })
+        .expect("serialize AgentTaskIntent");
         graph.nodes.push(agent);
         supervisor
             .submit_graph(

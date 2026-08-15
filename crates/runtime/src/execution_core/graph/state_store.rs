@@ -48,6 +48,10 @@ pub struct ExecutionChildLink {
 }
 
 impl ExecutionGraphStateStore {
+    pub(crate) fn subscribe_commits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.event_store.subscribe_commits()
+    }
+
     fn team_governance_stream(graph_id: &str) -> String {
         format!("team-projection-governance:{graph_id}")
     }

@@ -513,6 +513,22 @@ impl ExecutionGraphRunner {
         Ok((report(&graph), quiescent))
     }
 
+    pub(crate) fn subscribe_state_commits(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.state_store.subscribe_commits()
+    }
+
+    pub(crate) async fn terminal_report(
+        &self,
+        graph_id: &str,
+    ) -> Result<Option<ExecutionRunReport>, ExecutionRunnerError> {
+        let graph = self.state_store.load_async(graph_id).await?;
+        Ok(graph
+            .node_statuses
+            .values()
+            .all(|status| status.is_terminal())
+            .then(|| report(&graph)))
+    }
+
     /// Resolve the exact parent join from durable child terminal truth.
     /// Duplicate observer/startup reconciliation passes are idempotent; a
     /// concurrent parent cancellation wins because the command is revision

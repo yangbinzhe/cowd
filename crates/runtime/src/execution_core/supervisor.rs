@@ -729,6 +729,40 @@ impl RuntimeExecutionSupervisor {
         Ok((receipt, report))
     }
 
+    /// Admit a graph, release its graph-level concurrency permit whenever it
+    /// becomes quiescent, and keep waiting on durable commits until every node
+    /// reaches a terminal state. This is the foreground execution boundary;
+    /// `submit_and_wait` intentionally retains its lower-level quiescence
+    /// semantics for approval/external-input workflows.
+    pub async fn submit_and_wait_terminal(
+        &self,
+        graph: ExecutionGraph,
+        command: ExecutionGraphCommand,
+    ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
+        let (receipt, slot, generation) = self.admit(graph, command).await?;
+        self.await_slot(&receipt.graph_id, slot, generation).await?;
+        let report = self.wait_for_terminal(&receipt.graph_id).await?;
+        Ok((receipt, report))
+    }
+
+    pub async fn wait_for_terminal(
+        &self,
+        graph_id: &str,
+    ) -> Result<ExecutionRunReport, ExecutionRunnerError> {
+        let mut commits = self.runner.subscribe_state_commits();
+        loop {
+            if let Some(report) = self.runner.terminal_report(graph_id).await? {
+                return Ok(report);
+            }
+            commits.changed().await.map_err(|_| {
+                ExecutionRunnerError::SupervisorUnavailable(
+                    "durable execution commit subscription closed before graph terminalized"
+                        .to_string(),
+                )
+            })?;
+        }
+    }
+
     pub async fn wait_for_quiescence(
         &self,
         graph_id: &str,
@@ -1621,6 +1655,17 @@ mod completion_pump_tests {
                 self.successor_started_before_slow_finished
                     .store(!self.slow_finished.load(Ordering::SeqCst), Ordering::SeqCst);
             }
+            if ticket.node_id == "external-wait" {
+                return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
+                    status: ExecutionNodeStatus::WaitingExternal,
+                    result_ref: Some("external:pending".to_string()),
+                    summary: None,
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                }));
+            }
             let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_running.fetch_max(running, Ordering::SeqCst);
             tokio::time::sleep(
@@ -1771,6 +1816,67 @@ mod completion_pump_tests {
             executor.max_running.load(Ordering::SeqCst) > 1,
             "independent ready nodes must overlap"
         );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn foreground_terminal_wait_does_not_mistake_external_quiescence_for_completion() {
+        let executor = Arc::new(PumpTestExecutor::new([]));
+        let supervisor = Arc::new(test_supervisor(executor));
+        let mut graph = ExecutionGraph::new("foreground waits for durable terminal truth");
+        graph.id = "foreground-terminal-wait".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes = vec![test_node("external-wait")];
+        let graph_id = graph.id.clone();
+        let waiting = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move {
+                supervisor
+                    .submit_and_wait_terminal(
+                        graph,
+                        ExecutionGraphCommand::Start {
+                            expected_revision: 0,
+                        },
+                    )
+                    .await
+            })
+        };
+
+        let projection = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(projection) = supervisor.projection(&graph_id).await {
+                    if projection.nodes[0].status == ExecutionNodeStatus::WaitingExternal {
+                        break projection;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("graph reaches durable WaitingExternal");
+        assert!(
+            !waiting.is_finished(),
+            "foreground completion must remain pending while the graph is only quiescent"
+        );
+
+        supervisor
+            .command_graph(
+                &graph_id,
+                ExecutionGraphCommand::ResolveExternal {
+                    expected_revision: projection.revision,
+                    node_id: "external-wait".to_string(),
+                    result_ref: "external:resolved".to_string(),
+                    correlation_id: "foreground-terminal-wait:resolved".to_string(),
+                },
+            )
+            .await
+            .expect("resolve external wait");
+        let (_, report) = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("terminal wait completes")
+            .expect("terminal wait task joins")
+            .expect("terminal wait succeeds");
+        assert_eq!(report.completed, 1);
         supervisor.shutdown().await;
     }
 

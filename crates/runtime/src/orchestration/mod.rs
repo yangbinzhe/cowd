@@ -458,7 +458,7 @@ async fn propose(
     }
     let run = services
         .execution_supervisor()
-        .submit_and_wait(graph, compiled.command);
+        .submit_and_wait_terminal(graph, compiled.command);
     let (_, report) = await_with_cancellation(run, cancellation, services, &graph_id).await?;
     let projection = services
         .execution_supervisor()
