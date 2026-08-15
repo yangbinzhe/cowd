@@ -606,6 +606,7 @@ mod tests {
     use std::{
         os::unix::fs::{symlink, PermissionsExt},
         path::Path,
+        time::Instant,
     };
 
     use cowd_app_protocol::{
@@ -685,6 +686,70 @@ mod tests {
             AppLifecycleStateV1::Mounted
         );
         assert!(app.executable.exists());
+    }
+
+    #[test]
+    fn one_hundred_signed_bundles_are_verified_stably_without_worker_activation() {
+        const BUNDLE_COUNT: usize = 100;
+
+        let directory = TempDir::new().expect("temp root");
+        let key = FixtureSigningKey::generate();
+        let expected_ids = (0..BUNDLE_COUNT)
+            .map(|index| AppId(format!("capacity-app-{index:03}")))
+            .collect::<Vec<_>>();
+        for app_id in expected_ids.iter().rev() {
+            write_bundle(directory.path(), &app_id.0, &app_id.0, &key);
+        }
+
+        let build = || {
+            AppCatalogBuilder::new(
+                vec![directory.path().to_path_buf()],
+                AppCatalogPolicy::default(),
+                key.trust_store(),
+                current_uid(directory.path()),
+                1,
+            )
+            .build()
+            .expect("100-bundle catalog")
+        };
+        let first_started = Instant::now();
+        let first = build();
+        let first_elapsed = first_started.elapsed();
+        let repeat_started = Instant::now();
+        let repeat = build();
+        let repeat_elapsed = repeat_started.elapsed();
+
+        let first_ids = first
+            .apps()
+            .map(|app| app.manifest.app_id.clone())
+            .collect::<Vec<_>>();
+        let repeat_ids = repeat
+            .apps()
+            .map(|app| app.manifest.app_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(first_ids, expected_ids);
+        assert_eq!(repeat_ids, expected_ids);
+        assert_eq!(first.generation(), repeat.generation());
+        for snapshot in [&first, &repeat] {
+            assert_eq!(snapshot.diagnostics().len(), BUNDLE_COUNT);
+            assert!(snapshot.diagnostics().iter().all(|diagnostic| {
+                diagnostic.outcome == CatalogCandidateOutcome::Admitted
+                    && diagnostic
+                        .app_id
+                        .as_ref()
+                        .is_some_and(|app_id| expected_ids.binary_search(app_id).is_ok())
+            }));
+        }
+        assert!(first.apps().all(|app| {
+            app.catalog_entry().lifecycle.state == AppLifecycleStateV1::Mounted
+                && app.executable.exists()
+        }));
+
+        eprintln!(
+            "catalog_capacity_evidence bundles={BUNDLE_COUNT} first_elapsed_ms={} repeat_elapsed_ms={} activation_count=0",
+            first_elapsed.as_millis(),
+            repeat_elapsed.as_millis()
+        );
     }
 
     #[test]

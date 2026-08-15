@@ -720,6 +720,110 @@ async fn global_starting_limit_serializes_independent_apps() {
 }
 
 #[tokio::test]
+async fn active_worker_limits_hold_for_one_four_and_sixteen_apps_without_orphans() {
+    for active_limit in [1, 4, 16] {
+        let case_started = std::time::Instant::now();
+        let app_ids = (0..=active_limit)
+            .map(|index| format!("active-{active_limit:02}-{index:02}"))
+            .collect::<Vec<_>>();
+        let apps = app_ids
+            .iter()
+            .map(|app_id| app(app_id, AppActivationPolicyV1::Lazy, false))
+            .collect::<Vec<_>>();
+        let (root, snapshot, ids) = fixture(&apps);
+        let connector = Arc::new(FakeConnector::new([], Duration::from_millis(40)));
+        let mut cfg = config(root.path());
+        cfg.max_starting_workers = active_limit;
+        cfg.max_active_workers = active_limit;
+        assert_eq!(cfg.max_starting_workers, active_limit);
+        assert_eq!(cfg.max_active_workers, active_limit);
+        let supervisor = Arc::new(
+            AppRuntimeSupervisor::new(snapshot, Arc::clone(&connector), cfg)
+                .expect("capacity supervisor"),
+        );
+
+        let mut starts = JoinSet::new();
+        for (app_id, generation) in ids.iter().take(active_limit) {
+            let supervisor = Arc::clone(&supervisor);
+            let app_id = app_id.clone();
+            let generation = generation.clone();
+            starts.spawn(async move {
+                supervisor
+                    .acquire(
+                        &app_id,
+                        &generation,
+                        Duration::from_secs(2),
+                        &CancellationToken::default(),
+                    )
+                    .await
+            });
+        }
+        let mut leases = Vec::with_capacity(active_limit);
+        while let Some(result) = starts.join_next().await {
+            leases.push(result.expect("start task").expect("active lease"));
+        }
+
+        assert_eq!(leases.len(), active_limit);
+        assert_eq!(connector.connect_count(), active_limit);
+        assert_eq!(
+            connector.max_concurrent.load(Ordering::Acquire),
+            active_limit
+        );
+        let worker_pids = leases
+            .iter()
+            .map(|lease| lease.connection().pid)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(worker_pids.len(), active_limit, "duplicate worker spawn");
+        let active_statuses = supervisor
+            .statuses()
+            .await
+            .into_iter()
+            .filter(|status| status.pid.is_some())
+            .count();
+        assert_eq!(active_statuses, active_limit);
+
+        let overflow = &ids[active_limit];
+        assert!(matches!(
+            supervisor
+                .acquire(
+                    &overflow.0,
+                    &overflow.1,
+                    Duration::from_millis(50),
+                    &CancellationToken::default(),
+                )
+                .await,
+            Err(SupervisorError::DeadlineExceeded(_))
+        ));
+        assert_eq!(connector.connect_count(), active_limit);
+        assert_eq!(
+            supervisor
+                .status(&overflow.0)
+                .await
+                .expect("overflow status")
+                .state,
+            AppLifecycleStateV1::Mounted
+        );
+
+        for lease in leases {
+            lease.release().await;
+        }
+        supervisor.shutdown().await.expect("capacity shutdown");
+        assert_eq!(connector.disconnect_count(), active_limit);
+        assert!(supervisor.statuses().await.iter().all(|status| {
+            status.state == AppLifecycleStateV1::Stopped && status.pid.is_none()
+        }));
+        assert!(worker_pids
+            .iter()
+            .all(|pid| !Path::new("/proc").join(pid.to_string()).exists()));
+
+        eprintln!(
+            "supervisor_capacity_evidence active_limit={active_limit} spawned={active_limit} duplicate_spawns=0 orphaned=0 elapsed_ms={}",
+            case_started.elapsed().as_millis()
+        );
+    }
+}
+
+#[tokio::test]
 async fn generation_fence_rejects_stale_callers_before_spawn() {
     let (root, snapshot, ids) = fixture(&[app("generation", AppActivationPolicyV1::Lazy, false)]);
     let connector = Arc::new(FakeConnector::new([], Duration::ZERO));
