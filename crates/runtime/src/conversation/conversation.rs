@@ -2342,6 +2342,16 @@ pub trait ToolExecutor: Send + Sync + 'static {
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError>;
 
+    /// Runtime-attested evidence produced by this executor so far.
+    ///
+    /// The default is empty for lightweight/test executors. Production
+    /// delegated executors override it with their typed receipt ledger. This
+    /// keeps ConversationHost acceptance on the same facts consumed by the
+    /// outer Agent validator instead of reparsing tool-result text.
+    fn observed_evidence_snapshot(&self) -> Vec<harness_contract::context::ObservedEvidence> {
+        Vec::new()
+    }
+
     /// Validate provider-supplied input before Runtime publishes the ToolUse
     /// block, negotiates permission, or reserves execution capacity.
     /// Production executors bind this check to their pinned catalog; the

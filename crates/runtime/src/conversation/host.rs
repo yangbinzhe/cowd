@@ -2735,7 +2735,7 @@ where
                 |graph_id| format!("team_graph:{graph_id}"),
             ),
     ];
-    let _terminal_summary = verified_team_terminal_summary(&receipt)
+    let terminal_summary = verified_team_terminal_summary(&receipt)
         .ok_or_else(|| RuntimeError::new("verified Team completed without a terminal summary"))?;
     let runtime = runtime.lock().await;
     if child_early_stopped {
@@ -2761,6 +2761,15 @@ where
             {
                 state.committed_workspace_observed_evidence.push(evidence);
             }
+        }
+        if parent_goal_satisfied {
+            // The typed child envelopes and presentations already prove the
+            // requested Team work. Publish that deterministic carrier as the
+            // parent terminal instead of asking another model to reconstruct
+            // evidence from a JSON-encoded tool result. This removes both the
+            // brittle serialization dependency and the duplicate narrator
+            // path that could contradict completed child work.
+            state.terminal_override = Some((GoalCompletion::Satisfied, terminal_summary));
         }
         state.persistent_collaboration_context.push(item);
     }
@@ -2805,21 +2814,73 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
                             | harness_contract::outcome::TerminalPresentationState::Committed
                     )
             });
-    (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed")
-        && working_state_verified
-        && typed_candidate_verified
-        && receipt
-            .pointer("/execution/terminal_result_available")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false))
-    .then(|| {
+    let typed_team_summaries = receipt
+        .get("team_terminals")
+        .and_then(serde_json::Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .and_then(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let envelope = serde_json::from_value::<
+                        harness_contract::outcome::DeliveryEnvelope,
+                    >(entry.get("delivery_envelope")?.clone())
+                    .ok()?;
+                    let presentation =
+                        serde_json::from_value::<harness_contract::outcome::TerminalPresentation>(
+                            entry.get("terminal_presentation")?.clone(),
+                        )
+                        .ok()?;
+                    let summary = entry
+                        .get("terminal_summary")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|summary| !summary.is_empty())?;
+                    let team_id = entry
+                        .get("team_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("team");
+                    (envelope.pipeline_status
+                        == harness_contract::outcome::PipelineStatus::Completed
+                        && envelope.delivery_status
+                            == harness_contract::outcome::DeliveryStatus::Satisfied
+                        && envelope.unresolved.is_empty()
+                        && envelope.coverage.required_obligation_ids
+                            == envelope.coverage.satisfied_obligation_ids
+                        && presentation.answer_origin
+                            == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+                        && presentation.envelope_id == envelope.envelope_id
+                        && presentation.envelope_revision == envelope.revision
+                        && matches!(
+                            presentation.state,
+                            harness_contract::outcome::TerminalPresentationState::Validating
+                                | harness_contract::outcome::TerminalPresentationState::Committed
+                        ))
+                    .then(|| format!("{team_id}: {summary}"))
+                })
+                .collect::<Option<Vec<_>>>()
+        });
+    let typed_team_carrier_verified = typed_team_summaries.is_some();
+    let terminal_summary = if typed_candidate_verified {
         receipt
             .get("terminal_summary")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|summary| !summary.is_empty())
             .map(str::to_string)
-    })
+    } else {
+        typed_team_summaries.map(|summaries| summaries.join("\n\n"))
+    };
+    let verified_terminal_carrier =
+        typed_candidate_verified && working_state_verified || typed_team_carrier_verified;
+    (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+        && verified_terminal_carrier
+        && terminal_summary.is_some()
+        && receipt
+            .pointer("/execution/terminal_result_available")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false))
+    .then_some(terminal_summary)
     .flatten()
 }
 
@@ -5879,29 +5940,63 @@ where
                                         )]
                                     }
                                     ExhaustedTeamLeaseDisposition::CleanSynthesis => {
-                                        state.clean_terminal_synthesis_attempted = true;
-                                        state.clean_terminal_synthesis_next = true;
-                                        model_intervention = Some(
-                                            harness_contract::goal::RuntimeIntervention {
-                                                goal_id: state.goal_id.clone(),
-                                                kind: RuntimeInterventionKind::Synthesize,
-                                                reason: "one Team execution has already consumed this turn's collaboration lease; synthesize from its retained terminal and evidence receipts instead of starting another Team"
-                                                    .to_string(),
-                                                evidence_refs: vec![format!(
-                                                    "execution_node:{}",
-                                                    ticket.node_id
-                                                )],
-                                                expected_graph_revision: None,
-                                            },
-                                        );
-                                        vec![dynamic_node(
-                                            ticket,
-                                            state.iterations,
-                                            "team-lease-clean-synthesis-model",
-                                            ExecutionNodeKind::InlineModel,
-                                            "inline_model",
-                                            "inline_model",
-                                        )]
+                                        if let Some(candidate) =
+                                            retained_orchestration_terminal_candidate(
+                                                &state.tool_results,
+                                                self.services.workspace_root(),
+                                                &state.content,
+                                            )
+                                        {
+                                            state.terminal_override =
+                                                Some((GoalCompletion::Satisfied, candidate));
+                                            model_intervention = Some(
+                                                harness_contract::goal::RuntimeIntervention {
+                                                    goal_id: state.goal_id.clone(),
+                                                    kind: RuntimeInterventionKind::Synthesize,
+                                                    reason: "a verified Team terminal already satisfies the bounded collaboration phase; publish its typed terminal carrier instead of asking another model to reconstruct evidence"
+                                                        .to_string(),
+                                                    evidence_refs: vec![format!(
+                                                        "execution_node:{}",
+                                                        ticket.node_id
+                                                    )],
+                                                    expected_graph_revision: None,
+                                                },
+                                            );
+                                            let mut node = dynamic_node(
+                                                ticket,
+                                                state.iterations,
+                                                "retained-team-terminal-synthesize",
+                                                ExecutionNodeKind::Synthesize,
+                                                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                                "inline_model",
+                                            );
+                                            node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                            vec![node]
+                                        } else {
+                                            state.clean_terminal_synthesis_attempted = true;
+                                            state.clean_terminal_synthesis_next = true;
+                                            model_intervention = Some(
+                                                harness_contract::goal::RuntimeIntervention {
+                                                    goal_id: state.goal_id.clone(),
+                                                    kind: RuntimeInterventionKind::Synthesize,
+                                                    reason: "one Team execution has already consumed this turn's collaboration lease; synthesize from its retained terminal and evidence receipts instead of starting another Team"
+                                                        .to_string(),
+                                                    evidence_refs: vec![format!(
+                                                        "execution_node:{}",
+                                                        ticket.node_id
+                                                    )],
+                                                    expected_graph_revision: None,
+                                                },
+                                            );
+                                            vec![dynamic_node(
+                                                ticket,
+                                                state.iterations,
+                                                "team-lease-clean-synthesis-model",
+                                                ExecutionNodeKind::InlineModel,
+                                                "inline_model",
+                                                "inline_model",
+                                            )]
+                                        }
                                     }
                                 }
                             } else {
@@ -6730,6 +6825,7 @@ where
             let result = runtime
                 .execute_tool_batch_step(&calls, &prompter, iteration)
                 .await;
+            let observed_evidence = runtime.tool_executor().observed_evidence_snapshot();
             // The legacy conversation engine writes tool messages eagerly. Roll them
             // back until the graph transition commits; after_commit publishes them.
             runtime
@@ -6746,7 +6842,7 @@ where
                 result,
                 orchestration_terminal_summary,
                 prepared_tool_invocations,
-                Vec::new(),
+                observed_evidence,
             )
         };
         self.runtime
@@ -6917,6 +7013,19 @@ where
         );
         let focus_acceptance_pending =
             bounded_evidence_role && !focus_acceptance_scopes.is_empty() && !focus_acceptance_met;
+        if bounded_evidence_role {
+            tracing::debug!(
+                execution_id = %ticket.graph_id,
+                node_id = %ticket.node_id,
+                required_scopes = ?focus_acceptance_scopes,
+                current_observed = successful_observed_evidence.len(),
+                prior_observed = prior_observed_evidence.len(),
+                satisfied_scopes = ?satisfied_focus_acceptance_scope_keys,
+                pending_scopes = ?focus_acceptance_pending_scopes,
+                retained_terminal_candidate = has_retained_focus_terminal_candidate,
+                "delegated Focus acceptance evaluated from typed tool receipts"
+            );
+        }
         state.focus_acceptance_pending_scopes = focus_acceptance_pending_scopes.clone();
         state
             .focus_observed_resource_scopes
@@ -8416,6 +8525,7 @@ fn terminal_delivery_envelope(
     goal_id: &str,
     completion: GoalCompletion,
     objective: &str,
+    committing_node_id: &str,
 ) -> harness_contract::outcome::DeliveryEnvelope {
     use harness_contract::execution_graph::ExecutionNodeStatus;
     use harness_contract::outcome::{
@@ -8427,15 +8537,19 @@ fn terminal_delivery_envelope(
     let branch_terminals = projection
         .nodes
         .iter()
-        .filter(|node| node.status.is_terminal())
+        .filter(|node| node.status.is_terminal() || node.node_id == committing_node_id)
         .map(|node| DeliveryBranchTerminal {
             branch_id: node.node_id.clone(),
             execution_id: Some(projection.graph_id.clone()),
-            status: match node.status {
-                ExecutionNodeStatus::Completed => DeliveryBranchStatus::Completed,
-                ExecutionNodeStatus::Failed => DeliveryBranchStatus::Failed,
-                ExecutionNodeStatus::Cancelled => DeliveryBranchStatus::Cancelled,
-                _ => DeliveryBranchStatus::Blocked,
+            status: if node.node_id == committing_node_id {
+                DeliveryBranchStatus::Completed
+            } else {
+                match node.status {
+                    ExecutionNodeStatus::Completed => DeliveryBranchStatus::Completed,
+                    ExecutionNodeStatus::Failed => DeliveryBranchStatus::Failed,
+                    ExecutionNodeStatus::Cancelled => DeliveryBranchStatus::Cancelled,
+                    _ => DeliveryBranchStatus::Blocked,
+                }
             },
             result_ref: node.result_ref.clone(),
             failure_ref: node
@@ -8473,7 +8587,7 @@ fn terminal_delivery_envelope(
     let pipeline_status = if projection
         .nodes
         .iter()
-        .all(|node| node.status.is_terminal())
+        .all(|node| node.status.is_terminal() || node.node_id == committing_node_id)
     {
         match completion {
             GoalCompletion::Cancelled => PipelineStatus::Cancelled,
@@ -8526,7 +8640,7 @@ fn terminal_delivery_envelope(
         cancellation: None,
         user_answer_contract: UserAnswerContract {
             language: crate::conversation::user_reply_language(objective).to_string(),
-            format: if objective.to_ascii_lowercase().contains("json") {
+            format: if objective_requires_strict_json(objective) {
                 harness_contract::outcome::UserAnswerFormat::StrictJson
             } else {
                 harness_contract::outcome::UserAnswerFormat::Markdown
@@ -8535,6 +8649,29 @@ fn terminal_delivery_envelope(
         },
         created_at_ms: crate::tool_invocation::now_ms(),
     }
+}
+
+fn objective_requires_strict_json(objective: &str) -> bool {
+    let normalized = objective.to_ascii_lowercase();
+    let requests_json = normalized.contains("json")
+        || normalized.contains("machine-readable")
+        || normalized.contains("机器可读");
+    let rejects_json = [
+        "不要求json",
+        "不要求 json",
+        "无需json",
+        "无需 json",
+        "不要json",
+        "不要 json",
+        "非json",
+        "非 json",
+        "not json",
+        "no json",
+        "without json",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    requests_json && !rejects_json
 }
 
 fn qualified_root_answer(
@@ -8840,7 +8977,13 @@ where
             .map(|(completion, _)| *completion)
             .unwrap_or(GoalCompletion::Satisfied);
         let envelope = projection.delivery_envelope.clone().unwrap_or_else(|| {
-            terminal_delivery_envelope(&projection, &goal_id, completion, &objective)
+            terminal_delivery_envelope(
+                &projection,
+                &goal_id,
+                completion,
+                &objective,
+                &ticket.node_id,
+            )
         });
         if terminal_override.is_none() {
             completion = match envelope.delivery_status {
@@ -10134,16 +10277,9 @@ fn retained_orchestration_terminal_candidate(
             }
             _ => None,
         })
-        .filter_map(|receipt| {
-            receipt
-                .get("terminal_summary")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|summary| {
-                    !summary.is_empty() && !looks_like_unfinished_work_preamble(summary)
-                })
-                .map(ToString::to_string)
-        })
+        .filter_map(|receipt| verified_team_terminal_summary(&receipt))
+        .map(|summary| summary.trim().to_string())
+        .filter(|summary| !summary.is_empty() && !looks_like_unfinished_work_preamble(summary))
         .collect::<Vec<_>>();
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.chars().count()));
     candidates.into_iter().find_map(|candidate| {
@@ -11628,11 +11764,34 @@ fn missing_required_structured_fields(candidate: &str, required: &[String]) -> V
 }
 
 fn normalized_team_terminal_candidate(candidate: &str, required: &[String]) -> Option<String> {
-    if let Some(object) = crate::agent_in_process_worker::structured_agent_output(candidate) {
-        return missing_required_structured_fields(candidate, required)
-            .is_empty()
-            .then(|| serde_json::to_string(&object).ok())
-            .flatten();
+    if let Some(mut object) = crate::agent_in_process_worker::structured_agent_output(candidate) {
+        if missing_required_structured_fields(candidate, required).is_empty() {
+            return serde_json::to_string(&object).ok();
+        }
+
+        // A bounded research/direct role may use the two user-facing labels
+        // `summary` and `findings` interchangeably. Once Runtime has already
+        // verified the role's exact Focus receipts, carrying the materialized
+        // value across that single-field alias is deterministic transport
+        // normalization; it does not manufacture evidence or satisfy any
+        // multi-field review/implementation contract.
+        if required.len() == 1 {
+            let required_field = required[0].as_str();
+            let alias = match required_field {
+                "findings" => Some("summary"),
+                "summary" => Some("findings"),
+                _ => None,
+            };
+            if let Some(value) = alias
+                .and_then(|field| object.get(field))
+                .filter(|value| structured_field_is_materialized(Some(value)))
+                .cloned()
+            {
+                object.insert(required_field.to_string(), value);
+                return serde_json::to_string(&object).ok();
+            }
+        }
+        return None;
     }
 
     // A bounded research/direct role's complete final body is its finding or
@@ -12144,6 +12303,16 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&summary).expect("normalized summary JSON")
                 ["summary"],
             "已读取并核对两个授权文件。"
+        );
+        let aliased_findings = normalized_team_terminal_candidate(
+            r#"{"summary":"Cargo.toml declares the workspace package metadata."}"#,
+            &["findings".into()],
+        )
+        .expect("verified bounded summary should normalize to findings");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&aliased_findings)
+                .expect("normalized findings JSON")["findings"],
+            "Cargo.toml declares the workspace package metadata."
         );
         assert!(normalized_team_terminal_candidate(
             "{\"review\":\"checked\",\"risks\":[]}",
@@ -16428,6 +16597,83 @@ mod tests {
             Some("Checked Team conclusion."),
             "only a current typed TeamSynthesizer presentation may bypass the root narrator"
         );
+
+        let typed_children = vec![ConversationMessage::tool_result(
+            "team-1",
+            "runtime_orchestrate",
+            serde_json::json!({
+                "status": "completed",
+                "working_state_verified": true,
+                "execution": {"terminal_result_available": true},
+                "team_terminals": [
+                    {
+                        "team_id": "team-a",
+                        "working_state_verified": true,
+                        "terminal_summary": "First checked conclusion.",
+                        "delivery_envelope": {
+                            "envelope_id": "team-a-envelope",
+                            "revision": 3,
+                            "objective_id": "team-a-objective",
+                            "pipeline_status": "completed",
+                            "delivery_status": "satisfied",
+                            "created_at_ms": 10
+                        },
+                        "terminal_presentation": {
+                            "presentation_id": "team-a-presentation",
+                            "attempt_id": "team-a-attempt",
+                            "envelope_id": "team-a-envelope",
+                            "envelope_revision": 3,
+                            "state": "validating",
+                            "answer_origin": "team_synthesizer",
+                            "generated_at_ms": 11
+                        }
+                    },
+                    {
+                        "team_id": "team-b",
+                        "working_state_verified": true,
+                        "terminal_summary": "Second checked conclusion.",
+                        "delivery_envelope": {
+                            "envelope_id": "team-b-envelope",
+                            "revision": 4,
+                            "objective_id": "team-b-objective",
+                            "pipeline_status": "completed",
+                            "delivery_status": "satisfied",
+                            "created_at_ms": 12
+                        },
+                        "terminal_presentation": {
+                            "presentation_id": "team-b-presentation",
+                            "attempt_id": "team-b-attempt",
+                            "envelope_id": "team-b-envelope",
+                            "envelope_revision": 4,
+                            "state": "validating",
+                            "answer_origin": "team_synthesizer",
+                            "generated_at_ms": 13
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+            false,
+        )];
+        let joined = completed_orchestration_terminal_summary(
+            &calls,
+            &typed_children,
+            workspace.path(),
+            true,
+        )
+        .expect("all child Team carriers are verified");
+        assert!(joined.contains("team-a: First checked conclusion."));
+        assert!(joined.contains("team-b: Second checked conclusion."));
+        assert_eq!(
+            retained_orchestration_terminal_candidate(
+                &typed_children,
+                workspace.path(),
+                "combine the checked Team conclusions",
+            )
+            .as_deref(),
+            Some(joined.as_str()),
+            "a duplicate Team request must reuse the verified typed carrier without another model"
+        );
     }
 
     #[test]
@@ -16601,5 +16847,17 @@ mod tests {
             harness_contract::outcome::UserAnswerFormat::StrictJson;
         assert!(qualified_root_answer(r#"{"ok":true}"#, &envelope));
         assert!(!qualified_root_answer("not json", &envelope));
+    }
+
+    #[test]
+    fn negated_json_requirement_keeps_user_visible_markdown_contract() {
+        assert!(!objective_requires_strict_json(
+            "最后给出自然语言答案，不要求JSON。"
+        ));
+        assert!(!objective_requires_strict_json(
+            "Answer in prose, no JSON required."
+        ));
+        assert!(objective_requires_strict_json("Return strict JSON only."));
+        assert!(objective_requires_strict_json("输出机器可读 JSON。"));
     }
 }

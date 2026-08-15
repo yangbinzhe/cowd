@@ -713,18 +713,7 @@ pub fn evaluate_observed_acceptance(
         .evidence_obligations
         .iter()
         .filter(|obligation| {
-            !observed_evidence.iter().any(|observed| {
-                if obligation.kind == EvidenceObligationKind::VerifyAfterWrite {
-                    observed_evidence_satisfies(obligation, observed)
-                        && observed_evidence.iter().any(|write| {
-                            write.observed_at_sequence > 0
-                                && write.observed_at_sequence < observed.observed_at_sequence
-                                && observed_write_matches_read(write, observed)
-                        })
-                } else {
-                    observed_evidence_satisfies(obligation, observed)
-                }
-            })
+            !observed_evidence_collection_satisfies(obligation, &observed_evidence)
         })
         .map(|obligation| obligation.obligation_id.clone())
         .collect();
@@ -733,6 +722,29 @@ pub fn evaluate_observed_acceptance(
         observed_evidence,
         unresolved_obligation_ids,
     }
+}
+
+/// Match a required obligation against Runtime-attested evidence by canonical
+/// target and coverage semantics. `obligation_id` is an audit correlation key,
+/// not an identity proof: compilation and execution may legitimately mint
+/// different ids for the same canonical object.
+#[must_use]
+pub fn observed_evidence_collection_satisfies(
+    obligation: &EvidenceObligation,
+    observed_evidence: &[ObservedEvidence],
+) -> bool {
+    observed_evidence.iter().any(|observed| {
+        if obligation.kind == EvidenceObligationKind::VerifyAfterWrite {
+            observed_evidence_satisfies(obligation, observed)
+                && observed_evidence.iter().any(|write| {
+                    write.observed_at_sequence > 0
+                        && write.observed_at_sequence < observed.observed_at_sequence
+                        && observed_write_matches_read(write, observed)
+                })
+        } else {
+            observed_evidence_satisfies(obligation, observed)
+        }
+    })
 }
 
 fn observed_write_matches_read(write: &ObservedEvidence, read: &ObservedEvidence) -> bool {

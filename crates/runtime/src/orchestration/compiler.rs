@@ -425,7 +425,7 @@ fn compile_team_subgraph_node(
         selection_mode: TeamSelectionMode::ModelAssisted,
         strategy_binding: request.strategy_binding.clone(),
         template_selector: TeamTemplateSelector::LatestStable { template_id },
-        objective: semantic.objective.clone(),
+        objective: bounded_team_node_objective(semantic),
         acceptance: semantic.evidence_contract.clone(),
         risk: None,
         role_binding_overrides: Vec::new(),
@@ -533,10 +533,31 @@ fn focus_partition_plans(
         .into_iter()
         .map(|(role_id, slots)| FocusPartitionPlan {
             role_id,
-            shared_baseline: vec![semantic.objective.clone()],
+            shared_baseline: vec![bounded_team_node_objective(semantic)],
             slots,
         })
         .collect()
+}
+
+fn bounded_team_node_objective(semantic: &GraphSemanticNode) -> String {
+    let mut focuses = semantic
+        .focuses
+        .iter()
+        .map(|focus| focus.objective.trim())
+        .filter(|objective| !objective.is_empty())
+        .collect::<Vec<_>>();
+    focuses.sort_unstable();
+    focuses.dedup();
+    let focus_text = if focuses.is_empty() {
+        "Use only the Runtime-assigned resource scopes and evidence contract for this Team node."
+            .to_string()
+    } else {
+        focuses.join("; ")
+    };
+    format!(
+        "Bounded Team node `{}`. Complete only these assigned focuses: {} Parent and peer-Team objectives are intentionally outside this Team's authority.",
+        semantic.node_id, focus_text
+    )
 }
 
 fn compile_agent_node(
@@ -874,7 +895,7 @@ mod tests {
         let semantic = GraphSemanticNode {
             node_id: "research".to_string(),
             recipe: CapabilityRecipeId::Team,
-            objective: "research independent evidence domains".to_string(),
+            objective: "Team A reads secret-a; Team B reads secret-b; merge both".to_string(),
             depends_on: Vec::new(),
             multiplicity: 2,
             focuses: vec![
@@ -918,5 +939,11 @@ mod tests {
             .iter()
             .all(|slot| slot.overlap_budget_bp == 10_000));
         assert_ne!(plans[0].slots[0].boundary, plans[0].slots[1].boundary);
+        assert!(plans[0].shared_baseline[0].contains("collect official evidence"));
+        assert!(plans[0].shared_baseline[0].contains("collect ecosystem evidence"));
+        assert!(!plans[0].shared_baseline[0].contains("secret-a"));
+        assert!(!plans[0].shared_baseline[0].contains("secret-b"));
+        let bounded = bounded_team_node_objective(&semantic);
+        assert!(!bounded.contains("merge both"));
     }
 }
