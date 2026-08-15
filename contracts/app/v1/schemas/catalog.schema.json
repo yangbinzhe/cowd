@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppCatalogV1",
+  "type": "object",
+  "properties": {
+    "apps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AppCatalogEntryV1"
+      }
+    },
+    "catalog_generation": {
+      "type": "string"
+    },
+    "protocol_digest": {
+      "type": "string"
+    },
+    "protocol_revision": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "protocol_revision",
+    "protocol_digest",
+    "catalog_generation",
+    "apps"
+  ],
+  "$defs": {
+    "AppActivationPolicyV1": {
+      "type": "string",
+      "enum": [
+        "lazy",
+        "resident"
+      ]
+    },
+    "AppCatalogEntryV1": {
+      "type": "object",
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/AppActivationPolicyV1"
+        },
+        "app_id": {
+          "type": "string"
+        },
+        "artifact_version": {
+          "type": "string"
+        },
+        "compatibility": {
+          "$ref": "#/$defs/AppCompatibilityV1"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "effective_authorization_profile": {
+          "type": "string"
+        },
+        "effective_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "generation": {
+          "type": "string"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/AppLifecycleV1"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "web_surface": {
+          "$ref": "#/$defs/AppWebSurfaceV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "app_id",
+        "display_name",
+        "artifact_version",
+        "generation",
+        "required",
+        "activation",
+        "lifecycle",
+        "compatibility",
+        "web_surface",
+        "effective_capabilities",
+        "effective_authorization_profile"
+      ]
+    },
+    "AppCompatibilityStatusV1": {
+      "type": "string",
+      "enum": [
+        "compatible",
+        "protocol_incompatible"
+      ]
+    },
+    "AppCompatibilityV1": {
+      "type": "object",
+      "properties": {
+        "app_required_maximum": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "app_required_minimum": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "gateway_supported_maximum": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "gateway_supported_minimum": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/AppCompatibilityStatusV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "gateway_supported_minimum",
+        "gateway_supported_maximum",
+        "app_required_minimum",
+        "app_required_maximum"
+      ]
+    },
+    "AppLifecycleStateV1": {
+      "type": "string",
+      "enum": [
+        "mounted",
+        "starting",
+        "ready",
+        "idle",
+        "stopping",
+        "stopped",
+        "failed",
+        "invalid",
+        "circuit_open",
+        "protocol_incompatible"
+      ]
+    },
+    "AppLifecycleV1": {
+      "type": "object",
+      "properties": {
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/AppLifecycleStateV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "retryable"
+      ]
+    },
+    "AppWebSurfaceV1": {
+      "type": "object",
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "bridge_revision": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "entry_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "available",
+        "bridge_revision"
+      ]
+    }
+  }
+}

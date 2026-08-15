@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppInvocationEnvelopeV1",
+  "type": "object",
+  "properties": {
+    "call_chain": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "causation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "correlation_id": {
+      "type": "string"
+    },
+    "deadline_unix_ms": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "execution": {
+      "$ref": "#/$defs/ExecutionContextV1",
+      "default": {}
+    },
+    "expected_revision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "idempotency_key": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "input_schema_digest": {
+      "type": "string"
+    },
+    "max_hops": {
+      "type": "integer",
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0
+    },
+    "operation_id": {
+      "type": "string"
+    },
+    "payload": true,
+    "principal": {
+      "$ref": "#/$defs/PrincipalContextV1"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operation_id",
+    "request_id",
+    "correlation_id",
+    "deadline_unix_ms",
+    "call_chain",
+    "max_hops",
+    "input_schema_digest",
+    "principal",
+    "payload"
+  ],
+  "$defs": {
+    "DelegationKindV1": {
+      "type": "string",
+      "enum": [
+        "user",
+        "service"
+      ]
+    },
+    "ExecutionContextV1": {
+      "type": "object",
+      "properties": {
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PrincipalContextV1": {
+      "type": "object",
+      "properties": {
+        "delegation": {
+          "$ref": "#/$defs/DelegationKindV1"
+        },
+        "grant_id": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "subject",
+        "tenant_id",
+        "workspace_id",
+        "delegation",
+        "grant_id"
+      ]
+    }
+  }
+}

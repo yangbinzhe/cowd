@@ -1,0 +1,9 @@
+{
+  "app_id": "reference-app",
+  "catalog_generation": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "frame_nonce": "frame-nonce-1",
+  "kind": "host_init",
+  "message_id": "message-1",
+  "protocol_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "schema_version": 1
+}

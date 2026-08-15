@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppStreamFrameV1",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "open"
+        },
+        "schema_digest": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "subscription_id",
+        "sequence",
+        "schema_digest"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "data"
+        },
+        "payload": true,
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "subscription_id",
+        "sequence",
+        "payload"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "checkpoint"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "subscription_id",
+        "sequence",
+        "cursor"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "error": {
+          "$ref": "#/$defs/AppErrorDetailV1"
+        },
+        "kind": {
+          "type": "string",
+          "const": "error"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "subscription_id",
+        "sequence",
+        "error"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "end"
+        },
+        "reason": {
+          "$ref": "#/$defs/StreamEndReasonV1"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "subscription_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "subscription_id",
+        "sequence",
+        "reason"
+      ]
+    }
+  ],
+  "$defs": {
+    "AppErrorCodeV1": {
+      "type": "string",
+      "enum": [
+        "INVALID_REQUEST",
+        "UNAUTHENTICATED",
+        "OPERATION_NOT_GRANTED",
+        "APP_NOT_FOUND",
+        "RECEIPT_NOT_FOUND",
+        "REVISION_CONFLICT",
+        "IDEMPOTENCY_CONFLICT",
+        "CALL_CYCLE_DETECTED",
+        "PROTOCOL_INCOMPATIBLE",
+        "APP_ACTIVATION_OVERLOADED",
+        "REQUEST_TOO_LARGE",
+        "CURSOR_EXPIRED",
+        "DEADLINE_EXCEEDED",
+        "APP_UNAVAILABLE",
+        "DEPENDENCY_UNAVAILABLE",
+        "INTERNAL_ERROR"
+      ]
+    },
+    "AppErrorDetailV1": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/AppErrorCodeV1"
+        },
+        "details": {
+          "default": null
+        },
+        "message": {
+          "type": "string"
+        },
+        "receipt_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    },
+    "StreamEndReasonV1": {
+      "type": "string",
+      "enum": [
+        "completed",
+        "cancelled",
+        "deadline_exceeded",
+        "failed"
+      ]
+    }
+  }
+}

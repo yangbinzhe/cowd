@@ -1,0 +1,345 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppManifestV1",
+  "type": "object",
+  "properties": {
+    "app_id": {
+      "type": "string"
+    },
+    "artifact_version": {
+      "type": "string"
+    },
+    "authorization_profiles": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/AuthorizationProfileV1"
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "display_name": {
+      "type": "string"
+    },
+    "executable": {
+      "type": "string"
+    },
+    "integrity": {
+      "$ref": "#/$defs/BundleIntegrityV1"
+    },
+    "presentation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AppPresentationV1"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "required_protocol": {
+      "$ref": "#/$defs/ProtocolRangeV1"
+    },
+    "sandbox": {
+      "$ref": "#/$defs/SandboxProfileV1"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "signature": {
+      "$ref": "#/$defs/BundleSignatureV1"
+    },
+    "surfaces": {
+      "$ref": "#/$defs/AppSurfacesV1"
+    },
+    "web_root": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "app_id",
+    "display_name",
+    "artifact_version",
+    "required_protocol",
+    "executable",
+    "surfaces",
+    "integrity",
+    "signature",
+    "sandbox"
+  ],
+  "$defs": {
+    "AppPresentationV1": {
+      "type": "object",
+      "properties": {
+        "core_navigation_kinds": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "result_shape_revision": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "view_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "result_shape_revision"
+      ]
+    },
+    "AppSurfacesV1": {
+      "type": "object",
+      "properties": {
+        "tui_view": {
+          "type": "boolean"
+        },
+        "web": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "web",
+        "tui_view"
+      ]
+    },
+    "AuthorizationProfileV1": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "is_default": {
+          "type": "boolean"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "surface_capabilities": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "display_name",
+        "is_default"
+      ]
+    },
+    "BundleIntegrityV1": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/IntegrityAlgorithmV1"
+        },
+        "files": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "manifest_digest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "files",
+        "manifest_digest"
+      ]
+    },
+    "BundleSignatureV1": {
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "$ref": "#/$defs/SignatureAlgorithmV1"
+        },
+        "expires_unix_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "key_id": {
+          "type": "string"
+        },
+        "provenance_digest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signature": {
+          "type": "string"
+        },
+        "signed_digest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "key_id",
+        "signature",
+        "signed_digest"
+      ]
+    },
+    "FilesystemPolicyV1": {
+      "type": "string",
+      "enum": [
+        "bundle_read_only_data_read_write"
+      ]
+    },
+    "IntegrityAlgorithmV1": {
+      "type": "string",
+      "enum": [
+        "sha256"
+      ]
+    },
+    "NetworkPolicyV1": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "const": "deny"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "mode": {
+              "type": "string",
+              "const": "capability_allowlist"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "capabilities"
+          ]
+        }
+      ]
+    },
+    "ProtocolRangeV1": {
+      "type": "object",
+      "properties": {
+        "maximum": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "minimum": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "minimum",
+        "maximum"
+      ]
+    },
+    "SandboxProfileV1": {
+      "type": "object",
+      "properties": {
+        "cpu_quota_millis_per_second": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "filesystem": {
+          "$ref": "#/$defs/FilesystemPolicyV1"
+        },
+        "max_memory_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_open_files": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "max_processes": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkPolicyV1"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "filesystem",
+        "network",
+        "max_processes",
+        "max_open_files",
+        "max_memory_bytes",
+        "cpu_quota_millis_per_second"
+      ]
+    },
+    "SignatureAlgorithmV1": {
+      "type": "string",
+      "enum": [
+        "ed25519"
+      ]
+    }
+  }
+}

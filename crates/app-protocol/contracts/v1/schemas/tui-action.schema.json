@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppActionV1",
+  "type": "object",
+  "properties": {
+    "action_id": {
+      "type": "string"
+    },
+    "app_id": {
+      "type": "string"
+    },
+    "component_id": {
+      "type": "string"
+    },
+    "confirmed": {
+      "type": "boolean"
+    },
+    "document_revision": {
+      "type": "string"
+    },
+    "form": {
+      "default": null
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "selection": {
+      "default": null
+    },
+    "view_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "app_id",
+    "view_id",
+    "document_revision",
+    "component_id",
+    "action_id",
+    "confirmed"
+  ]
+}

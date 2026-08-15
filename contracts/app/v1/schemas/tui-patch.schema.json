@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AppViewPatchV1",
+  "type": "object",
+  "properties": {
+    "app_id": {
+      "type": "string"
+    },
+    "base_revision": {
+      "type": "string"
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AppViewPatchOperationV1"
+      }
+    },
+    "revision": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0
+    },
+    "view_id": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "app_id",
+    "view_id",
+    "base_revision",
+    "revision",
+    "operations"
+  ],
+  "$defs": {
+    "AppViewPatchOperationV1": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "replace"
+            },
+            "path": {
+              "type": "string"
+            },
+            "value": true
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "path",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "add"
+            },
+            "path": {
+              "type": "string"
+            },
+            "value": true
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "path",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "type": "string",
+              "const": "remove"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "op",
+            "path"
+          ]
+        }
+      ]
+    }
+  }
+}

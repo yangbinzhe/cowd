@@ -1,0 +1,404 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "IframeBridgeMessageV1",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "catalog_generation": {
+          "type": "string"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "host_init"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "protocol_digest": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id",
+        "protocol_digest",
+        "catalog_generation"
+      ]
+    },
+    {
+      "description": "Window-level bridge messages are accepted only from the exact iframe\n`event.source`, opaque origin `\"null\"`, and a matching nonce/app identity.",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "app_ready"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id"
+      ]
+    },
+    {
+      "description": "Window-level bridge messages are accepted only from the exact iframe\n`event.source`, opaque origin `\"null\"`, and a matching nonce/app identity.",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "app_navigate"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id",
+        "route"
+      ]
+    },
+    {
+      "description": "Window-level bridge messages are accepted only from the exact iframe\n`event.source`, opaque origin `\"null\"`, and a matching nonce/app identity.",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "height_css_px": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "kind": {
+          "type": "string",
+          "const": "app_resize"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id",
+        "height_css_px"
+      ]
+    },
+    {
+      "description": "Window-level bridge messages are accepted only from the exact iframe\n`event.source`, opaque origin `\"null\"`, and a matching nonce/app identity.",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "app_request_core_navigation"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "object_id": {
+          "type": "string"
+        },
+        "object_kind": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id",
+        "object_kind",
+        "object_id"
+      ]
+    },
+    {
+      "description": "Window-level bridge messages are accepted only from the exact iframe\n`event.source`, opaque origin `\"null\"`, and a matching nonce/app identity.",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "host_theme"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "theme": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id",
+        "theme"
+      ]
+    },
+    {
+      "description": "Window-level bridge messages are accepted only from the exact iframe\n`event.source`, opaque origin `\"null\"`, and a matching nonce/app identity.",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "host_locale"
+        },
+        "locale": {
+          "type": "string"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id",
+        "locale"
+      ]
+    },
+    {
+      "description": "Window-level bridge messages are accepted only from the exact iframe\n`event.source`, opaque origin `\"null\"`, and a matching nonce/app identity.",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "host_visibility"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id",
+        "visible"
+      ]
+    },
+    {
+      "description": "Window-level bridge messages are accepted only from the exact iframe\n`event.source`, opaque origin `\"null\"`, and a matching nonce/app identity.",
+      "type": "object",
+      "properties": {
+        "app_id": {
+          "type": "string"
+        },
+        "error": {
+          "$ref": "#/$defs/AppErrorDetailV1"
+        },
+        "frame_nonce": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "host_error"
+        },
+        "message_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "schema_version",
+        "app_id",
+        "frame_nonce",
+        "message_id",
+        "error"
+      ]
+    }
+  ],
+  "$defs": {
+    "AppErrorCodeV1": {
+      "type": "string",
+      "enum": [
+        "INVALID_REQUEST",
+        "UNAUTHENTICATED",
+        "OPERATION_NOT_GRANTED",
+        "APP_NOT_FOUND",
+        "RECEIPT_NOT_FOUND",
+        "REVISION_CONFLICT",
+        "IDEMPOTENCY_CONFLICT",
+        "CALL_CYCLE_DETECTED",
+        "PROTOCOL_INCOMPATIBLE",
+        "APP_ACTIVATION_OVERLOADED",
+        "REQUEST_TOO_LARGE",
+        "CURSOR_EXPIRED",
+        "DEADLINE_EXCEEDED",
+        "APP_UNAVAILABLE",
+        "DEPENDENCY_UNAVAILABLE",
+        "INTERNAL_ERROR"
+      ]
+    },
+    "AppErrorDetailV1": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/AppErrorCodeV1"
+        },
+        "details": {
+          "default": null
+        },
+        "message": {
+          "type": "string"
+        },
+        "receipt_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ]
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "info": {
+    "title": "Cowd APP Protocol",
+    "version": "1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/_cowd/core/v1/operations": {
+      "get": {
+        "operationId": "coreOperations"
+      }
+    },
+    "/_cowd/core/v1/operations/{operation_id}/invoke": {
+      "post": {
+        "operationId": "coreInvoke"
+      }
+    },
+    "/_cowd/core/v1/operations/{operation_id}/stream": {
+      "post": {
+        "operationId": "coreStream"
+      }
+    },
+    "/_cowd/v1/handshake": {
+      "post": {
+        "operationId": "appHandshake"
+      }
+    },
+    "/_cowd/v1/health": {
+      "get": {
+        "operationId": "appHealth"
+      }
+    },
+    "/_cowd/v1/operations": {
+      "get": {
+        "operationId": "appOperations"
+      }
+    },
+    "/_cowd/v1/operations/{operation_id}/invoke": {
+      "post": {
+        "operationId": "appInvoke"
+      }
+    },
+    "/_cowd/v1/operations/{operation_id}/stream": {
+      "post": {
+        "operationId": "appStream"
+      }
+    },
+    "/_cowd/v1/shutdown": {
+      "post": {
+        "operationId": "appShutdown"
+      }
+    },
+    "/api/apps": {
+      "get": {
+        "operationId": "appCatalog"
+      }
+    },
+    "/api/apps/{app_id}": {
+      "get": {
+        "operationId": "appCatalogEntry"
+      }
+    }
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "output_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "payload": {
+    "items": []
+  },
+  "request_id": "request-query-1",
+  "revision": "7",
+  "schema_version": 1
+}

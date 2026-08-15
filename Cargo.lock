@@ -479,6 +479,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowd-app-protocol"
+version = "0.9.690"
+dependencies = [
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "cowd-app-sdk"
 version = "0.9.693"
 dependencies = [
@@ -4216,7 +4227,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
