@@ -4927,10 +4927,10 @@ mod tests {
         parse_optional_hot_state_config, parse_optional_model_context_windows,
         parse_optional_session_history_config, parse_optional_storage_config,
         parse_permission_mode_label, parse_routing_mode, redact_serde_json, AppActivationPolicyV1,
-        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport, PathBuf,
-        ProviderProtocol, ResolvedPermissionMode, RoutingMode, RuntimeConfig, RuntimeFeatureConfig,
-        RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig, StorageBackendSelection,
-        COWD_SETTINGS_SCHEMA_NAME,
+        AppsConfig, ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport,
+        PathBuf, ProviderProtocol, ResolvedPermissionMode, RoutingMode, RuntimeConfig,
+        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
+        StorageBackendSelection, COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -6187,6 +6187,38 @@ apps:
         assert_eq!(
             loaded.apps().configured_app_ids().collect::<Vec<_>>(),
             vec!["future_app", "mfg"]
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn shipped_default_config_uses_the_strict_zero_app_shape() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            include_str!("../../../../config-default.yaml"),
+        )
+        .expect("write shipped default config");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("shipped default config should load");
+
+        assert!(loaded.apps().configured_app_ids().next().is_none());
+        assert_eq!(
+            loaded.apps().directories(),
+            AppsConfig::default().directories()
+        );
+        assert!(loaded.apps().trust_store().is_none());
+        assert!(loaded.apps().launcher().is_none());
+        assert_eq!(
+            loaded.apps().entry("unconfigured-app").activation,
+            AppActivationPolicyV1::Lazy
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");

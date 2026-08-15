@@ -451,14 +451,25 @@ mcp:
   #       Authorization: "Bearer ..."
 
 # =============================================================================
-# 应用启停（已编译、已审核的 APP）
+# 签名 APP Bundle 发现与托管
 # =============================================================================
-# 此处只决定 Gateway 本次启动是否注册 APP；修改后需重启 Gateway。
-# 不支持运行时拉取 Git 源码或执行未进入发行版的 APP。
-# TUI 与 WebUI 会读取 Gateway 的应用清单，因此不会各自维护启停开关。
+# Cowd 不内置或强制依赖任何 APP；空发现目录是完整且有效的启动形态。
+# Gateway 仅在启动时扫描签名 Bundle。目录或策略变更后需重启 Gateway。
+# 未覆盖 directories 时使用 COWD_CONFIG_HOME/apps（默认 ~/.cowd/apps）。
+# 自定义发现目录必须使用绝对路径：
+# directories:
+#   - /opt/cowd/apps
+#
+# 默认不声明任何 APP 专属策略。已验签 Bundle 使用 lazy 激活；只有在
+# entries.<app-id>.activation 显式配置为 resident 时才随 Gateway 启动。
+# entries:
+#   <app-id>:
+#     enabled: true
+#     required: false
+#     activation: lazy
+#     config_file: /etc/cowd/apps/<app-id>.json
 apps:
-  mfg:
-    enabled: true
+  entries: {}
 
 # =============================================================================
 # 网关 (多平台接入)
