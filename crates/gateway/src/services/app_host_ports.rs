@@ -1419,6 +1419,30 @@ mod tests {
         assert_eq!(contract.contract_id, "mfg.cockpit.view-intent.v1");
         assert_eq!(contract.schema_id, "cowd.mfg.cockpit.view-intent");
     }
+
+    #[test]
+    fn matrix_host_binding_accepts_only_the_new_atomic_operation_envelopes() {
+        for operation in ["connector_run.execute", "evidence.context.get"] {
+            let request = RealityMatrixOperationIntentV1::parse(serde_json::json!({
+                "operation": operation,
+                "input": {}
+            }))
+            .expect("catalogued atomic operation binds");
+            assert_eq!(request.operation, operation);
+        }
+
+        assert!(RealityMatrixOperationIntentV1::parse(serde_json::json!({
+            "operation": "connector_run.run",
+            "input": {}
+        }))
+        .is_err());
+        assert!(RealityMatrixOperationIntentV1::parse(serde_json::json!({
+            "operation": "evidence.context.get",
+            "input": {},
+            "unknown": true
+        }))
+        .is_err());
+    }
 }
 
 fn current_time_ms() -> u64 {
@@ -1571,6 +1595,7 @@ impl RealityPort for GatewayAppHostBinding {
             REALITY_MATRIX_OPERATION_INTENT_V1 => {
                 let request = RealityMatrixOperationIntentV1::parse(intent.payload)?;
                 let matrix = state.services.matrix.clone();
+                let context_service = state.services.context.clone();
                 let config_home = state.config_home.clone();
                 let operation = request.operation;
                 let input = request.input;
@@ -1578,7 +1603,12 @@ impl RealityPort for GatewayAppHostBinding {
                     let store = matrix
                         .store(&config_home)
                         .map_err(matrix_app_reality::MatrixAppRealityError::from)?;
-                    matrix_app_reality::dispatch(store.as_ref(), &operation, &input)
+                    matrix_app_reality::dispatch(
+                        store.as_ref(),
+                        &context_service,
+                        &operation,
+                        &input,
+                    )
                 })
                 .await
                 .map_err(|error| {

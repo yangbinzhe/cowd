@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 
 use matrix_repository::{MatrixStore, MatrixStoreError};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
+
+use super::ContextService;
 
 pub(super) const MATRIX_OPERATION_INTENT_V1: &str = "cowd.reality.matrix_operation.v1";
 
@@ -21,6 +23,7 @@ pub(super) const MATRIX_APP_OPERATIONS: &[&str] = &[
     "source_pack.delta_plan",
     "source_pack.ingest_facts",
     "connector_run.plan",
+    "connector_run.execute",
     "connector_run.get",
     "metric.list_definitions",
     "metric.states",
@@ -47,6 +50,7 @@ pub(super) const MATRIX_APP_OPERATIONS: &[&str] = &[
     "evidence.get",
     "evidence_packet.get",
     "evidence.evaluate_quality",
+    "evidence.context.get",
     "quality_gate.get",
     "skill.metric_lineage_batch",
     "skill.entity_impact_batch",
@@ -116,6 +120,7 @@ fn bounded_depth(value: &serde_json::Value, field: &str) -> Result<usize, Matrix
 
 pub(super) fn dispatch(
     store: &dyn MatrixStore,
+    context: &ContextService,
     operation: &str,
     input_value: &serde_json::Value,
 ) -> Result<serde_json::Value, MatrixAppRealityError> {
@@ -166,6 +171,13 @@ pub(super) fn dispatch(
         "connector_run.plan" => {
             let id: String = input(input_value, "source_pack_id")?;
             serde_json::to_value(store.plan_connector_run(&id, input(input_value, "input")?)?)?
+        }
+        "connector_run.execute" => {
+            let request: ConnectorRunExecuteInput = serde_json::from_value(input_value.clone())?;
+            request.validate()?;
+            let mut input = request.input.into_matrix_input();
+            input.mode = Some("run".to_string());
+            serde_json::to_value(store.plan_connector_run(&request.source_pack_id, input)?)?
         }
         "connector_run.get" => {
             let id: String = input(input_value, "run_id")?;
@@ -343,6 +355,16 @@ pub(super) fn dispatch(
                 &input::<String>(input_value, "gate_id")?,
             )?)?
         }
+        "evidence.context.get" => {
+            let request: EvidenceContextGetInput = serde_json::from_value(input_value.clone())?;
+            request.validate()?;
+            let packet = store
+                .get_evidence_packet(&request.packet_id)?
+                .ok_or_else(|| {
+                    MatrixStoreError::NotFound(format!("evidence packet {}", request.packet_id))
+                })?;
+            serde_json::to_value(context.structured_evidence_item(&packet))?
+        }
         "quality_gate.get" => {
             let id: String = input(input_value, "gate_id")?;
             serde_json::to_value(
@@ -417,6 +439,80 @@ pub(super) fn dispatch(
     Ok(value)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectorRunExecuteInput {
+    source_pack_id: String,
+    input: StrictConnectorRunInput,
+}
+
+impl ConnectorRunExecuteInput {
+    fn validate(&self) -> Result<(), MatrixAppRealityError> {
+        if self.source_pack_id.trim().is_empty()
+            || self.input.run_id.as_deref().is_some_and(str::is_empty)
+            || self.input.mode.as_deref().is_some_and(|mode| mode != "run")
+        {
+            return Err(MatrixStoreError::InvalidScenario(
+                "connector_run.execute requires a non-empty source_pack_id and optional mode=run"
+                    .to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictConnectorRunInput {
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    resource_ref: Option<String>,
+    #[serde(default)]
+    partition_ref: Option<String>,
+    #[serde(default)]
+    credential_ref: Option<String>,
+    #[serde(default)]
+    expected_rows: Option<u64>,
+    #[serde(default)]
+    checksum: Option<String>,
+}
+
+impl StrictConnectorRunInput {
+    fn into_matrix_input(self) -> matrix_core::MatrixConnectorRunInput {
+        matrix_core::MatrixConnectorRunInput {
+            run_id: self.run_id,
+            mode: self.mode,
+            resource_ref: self.resource_ref,
+            partition_ref: self.partition_ref,
+            credential_ref: self.credential_ref,
+            expected_rows: self.expected_rows,
+            checksum: self.checksum,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvidenceContextGetInput {
+    packet_id: String,
+}
+
+impl EvidenceContextGetInput {
+    fn validate(&self) -> Result<(), MatrixAppRealityError> {
+        if self.packet_id.trim().is_empty() {
+            return Err(MatrixStoreError::InvalidScenario(
+                "evidence.context.get requires a non-empty packet_id".to_string(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,12 +530,16 @@ mod tests {
         (config_home, std::sync::Arc::new(store))
     }
 
+    fn context() -> ContextService {
+        ContextService::new()
+    }
+
     #[test]
     fn allowlist_dispatches_typed_operations_and_preserves_revision_conflicts() {
         let (_config_home, store) = fixture_store();
         assert!(supports("entity.upsert_checked"));
         assert!(!supports("sql.execute"));
-        assert_eq!(MATRIX_APP_OPERATIONS.len(), 38);
+        assert_eq!(MATRIX_APP_OPERATIONS.len(), 40);
 
         let entity = serde_json::json!({
             "entity": {
@@ -453,17 +553,18 @@ mod tests {
             },
             "expected_revision": null
         });
-        let created =
-            dispatch(store.as_ref(), "entity.upsert_checked", &entity).expect("entity creates");
+        let created = dispatch(store.as_ref(), &context(), "entity.upsert_checked", &entity)
+            .expect("entity creates");
         assert_eq!(created["created"], true);
         assert_eq!(created["revision"], 1);
 
-        let stale = dispatch(store.as_ref(), "entity.upsert_checked", &entity)
+        let stale = dispatch(store.as_ref(), &context(), "entity.upsert_checked", &entity)
             .expect_err("stale create must conflict");
         assert_eq!(stale.code(), "revision_conflict");
 
         let listed = dispatch(
             store.as_ref(),
+            &context(),
             "entity.list_with_revisions",
             &serde_json::json!({"limit": 10}),
         )
@@ -477,12 +578,19 @@ mod tests {
         let (_config_home, store) = fixture_store();
         let unbounded = dispatch(
             store.as_ref(),
+            &context(),
             "attention.list",
             &serde_json::json!({"limit": 1001}),
         )
         .expect_err("unbounded limit rejected");
         assert_eq!(unbounded.code(), "validation_failed");
-        assert!(dispatch(store.as_ref(), "sql.execute", &serde_json::json!({})).is_err());
+        assert!(dispatch(
+            store.as_ref(),
+            &context(),
+            "sql.execute",
+            &serde_json::json!({})
+        )
+        .is_err());
     }
 
     #[test]
@@ -491,6 +599,7 @@ mod tests {
         let packet_id = "evidence-mfg-idempotent-fixture";
         let first = dispatch(
             store.as_ref(),
+            &context(),
             "evidence.build",
             &serde_json::json!({
                 "packet_id": packet_id,
@@ -500,6 +609,7 @@ mod tests {
         .expect("first evidence build");
         let replay = dispatch(
             store.as_ref(),
+            &context(),
             "evidence.build",
             &serde_json::json!({
                 "packet_id": packet_id,
@@ -509,6 +619,7 @@ mod tests {
         .expect("idempotent evidence replay");
         let fetched = dispatch(
             store.as_ref(),
+            &context(),
             "evidence.get",
             &serde_json::json!({"packet_id": packet_id}),
         )
@@ -518,5 +629,127 @@ mod tests {
         assert_eq!(replay, fetched);
         assert_eq!(first["packet_id"], packet_id);
         assert_eq!(first["problem_statement"], "first canonical problem");
+    }
+
+    #[test]
+    fn connector_execute_is_distinct_strict_and_persisted() {
+        let (_config_home, store) = fixture_store();
+        let context = context();
+        dispatch(
+            store.as_ref(),
+            &context,
+            "source_pack.upsert_checked",
+            &serde_json::json!({
+                "source_pack": {
+                    "source_pack_id": "pack-connector-atomic",
+                    "source_name": "erp",
+                    "owner": "operations",
+                    "access_mode": "connector",
+                    "refresh_mode": "incremental",
+                    "fact_mappings": [{
+                        "source_table": "inventory",
+                        "fact_type": "inventory_balance",
+                        "metric_key": "stock_on_hand",
+                        "dedup_key": "plant:sku",
+                        "delta_signature": "qty"
+                    }]
+                },
+                "expected_revision": null
+            }),
+        )
+        .expect("source pack creates");
+
+        let plan = dispatch(
+            store.as_ref(),
+            &context,
+            "connector_run.plan",
+            &serde_json::json!({
+                "source_pack_id": "pack-connector-atomic",
+                "input": {"run_id": "connector-plan"}
+            }),
+        )
+        .expect("plan persists");
+        let executed = dispatch(
+            store.as_ref(),
+            &context,
+            "connector_run.execute",
+            &serde_json::json!({
+                "source_pack_id": "pack-connector-atomic",
+                "input": {"run_id": "connector-execute", "mode": "run"}
+            }),
+        )
+        .expect("execute persists");
+
+        assert_eq!(plan["run_id"], "connector-plan");
+        assert_eq!(plan["mode"], "plan");
+        assert_eq!(executed["run_id"], "connector-execute");
+        assert_eq!(executed["mode"], "run");
+        // The Core operation persists the governed run record. It does not
+        // claim that an external connector process completed successfully.
+        assert_eq!(executed["status"], "blocked");
+        assert_eq!(
+            dispatch(
+                store.as_ref(),
+                &context,
+                "connector_run.get",
+                &serde_json::json!({"run_id": "connector-execute"}),
+            )
+            .expect("executed record is gettable")["run_id"],
+            "connector-execute"
+        );
+        assert!(dispatch(
+            store.as_ref(),
+            &context,
+            "connector_run.execute",
+            &serde_json::json!({
+                "source_pack_id": "pack-connector-atomic",
+                "input": {"mode": "plan", "unknown": true}
+            }),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn evidence_context_is_an_atomic_typed_projection() {
+        let (_config_home, store) = fixture_store();
+        let context = context();
+        dispatch(
+            store.as_ref(),
+            &context,
+            "evidence.build",
+            &serde_json::json!({
+                "packet_id": "packet-context-atomic",
+                "problem_statement": "line pressure is unstable"
+            }),
+        )
+        .expect("evidence packet creates");
+
+        let projected = dispatch(
+            store.as_ref(),
+            &context,
+            "evidence.context.get",
+            &serde_json::json!({"packet_id": "packet-context-atomic"}),
+        )
+        .expect("packet read and projection are one dispatch");
+        assert_eq!(projected["id"], "structured-evidence:packet-context-atomic");
+        assert!(projected["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("line pressure is unstable")));
+
+        let missing = dispatch(
+            store.as_ref(),
+            &context,
+            "evidence.context.get",
+            &serde_json::json!({"packet_id": "missing"}),
+        )
+        .expect_err("missing packet fails closed");
+        assert_eq!(missing.code(), "not_found");
+        assert!(dispatch(
+            store.as_ref(),
+            &context,
+            "evidence.context.get",
+            &serde_json::json!({"packet_id": "packet-context-atomic", "extra": true}),
+        )
+        .is_err());
     }
 }
