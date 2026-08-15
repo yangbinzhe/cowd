@@ -37,6 +37,7 @@ pub(crate) use types::{
 
 use ledger::push_supervisor_event;
 use repair::{classify_surface_error, managed_actions};
+pub(crate) use static_assets::cache_control_for_static_file;
 use static_assets::normalize_request_path;
 use types::ManagedSurfaceProcess;
 
@@ -433,6 +434,11 @@ mod tests {
         fs::create_dir_all(&public_dir).unwrap();
         fs::write(public_dir.join("index.html"), "<!doctype html>panel").unwrap();
         fs::write(public_dir.join("app.js"), "console.log('ok');").unwrap();
+        fs::write(
+            public_dir.join("app-AbCd1234.js"),
+            "console.log('immutable');",
+        )
+        .unwrap();
         let sidecar = surface_dir.join("cowd-edge-panel");
         fs::write(
             &sidecar,
@@ -469,6 +475,18 @@ mod tests {
             app.file_path.file_name().and_then(|name| name.to_str()),
             Some("app.js")
         );
+        assert_eq!(
+            cache_control_for_static_file(&app),
+            static_assets::STATIC_ASSET_CACHE_CONTROL
+        );
+        let hashed = host
+            .resolve_static("panel", "/app-AbCd1234.js")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cache_control_for_static_file(&hashed),
+            static_assets::STATIC_HASHED_ASSET_CACHE_CONTROL
+        );
         let fallback = host
             .resolve_static("panel", "/missing/route")
             .unwrap()
@@ -480,6 +498,10 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str()),
             Some("index.html")
+        );
+        assert_eq!(
+            cache_control_for_static_file(&fallback),
+            static_assets::STATIC_ENTRY_CACHE_CONTROL
         );
         assert!(host
             .resolve_static("panel", "/../secret")

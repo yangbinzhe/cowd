@@ -4,6 +4,37 @@ use surface::{SurfaceDescriptor, SurfaceError, SurfaceResource};
 
 use super::{SurfaceHost, SurfaceResourceSummary, SurfaceRouteSummary, SurfaceStaticFile};
 
+pub(crate) const STATIC_ENTRY_CACHE_CONTROL: &str = "no-cache, no-store, must-revalidate";
+pub(crate) const STATIC_HASHED_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+pub(crate) const STATIC_ASSET_CACHE_CONTROL: &str = "no-cache, must-revalidate";
+
+pub(crate) fn cache_control_for_static_file(file: &SurfaceStaticFile) -> &'static str {
+    if file.spa_fallback
+        || file
+            .file_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("html"))
+    {
+        return STATIC_ENTRY_CACHE_CONTROL;
+    }
+    if file
+        .file_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.rsplit_once('-'))
+        .is_some_and(|(_, digest)| {
+            digest.len() >= 8
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+    {
+        return STATIC_HASHED_ASSET_CACHE_CONTROL;
+    }
+    STATIC_ASSET_CACHE_CONTROL
+}
+
 impl SurfaceHost {
     pub(crate) fn routes(&self, id: &str) -> Option<SurfaceRouteSummary> {
         self.get(id).map(|surface| SurfaceRouteSummary {

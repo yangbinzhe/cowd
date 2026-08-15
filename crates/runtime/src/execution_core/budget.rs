@@ -586,4 +586,23 @@ mod tests {
         assert!(reservation.reconcile(TokenUsage::default()).is_err());
         assert_eq!(ledger.snapshot().unwrap().reserved_tokens, reserved);
     }
+
+    #[test]
+    fn configured_deepseek_primary_is_admitted_by_a_finite_parent_budget() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let parent = parent();
+        let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
+        let reservation = ledger
+            .reserve_provider(
+                &child(&parent, 0),
+                "configured-deepseek-primary",
+                "deepseek-v4-flash",
+                10,
+                100,
+            )
+            .expect("the configured production primary has canonical pricing");
+        assert_eq!(reservation.reserved_tokens, 120);
+        assert!(reservation.reserved_cost_microusd > 0);
+        assert!(reservation.reserved_cost_microusd <= parent.max_cost_microusd);
+    }
 }

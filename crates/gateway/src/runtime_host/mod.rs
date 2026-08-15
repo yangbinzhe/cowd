@@ -809,12 +809,24 @@ async fn webui_static_fallback_handler(state: Arc<api_routes::AppState>, uri: Ur
     }
     match state.services.surface.resolve_static("webui", uri.path()) {
         Ok(Some(file)) => match tokio::fs::read(&file.file_path).await {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, content_type_for_path(&file.file_path))],
-                bytes,
-            )
-                .into_response(),
+            Ok(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, content_type_for_path(&file.file_path))
+                .header(
+                    header::CACHE_CONTROL,
+                    crate::surface_host::cache_control_for_static_file(&file),
+                )
+                .body(axum::body::Body::from(bytes))
+                .unwrap_or_else(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "ok": false,
+                            "error": format!("failed to build WebUI response: {error}"),
+                        })),
+                    )
+                        .into_response()
+                }),
             Err(error) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 axum::Json(serde_json::json!({

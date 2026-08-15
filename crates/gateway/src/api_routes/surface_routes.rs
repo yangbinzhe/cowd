@@ -701,6 +701,10 @@ async fn surface_static_handler(
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CACHE_CONTROL,
+            crate::surface_host::cache_control_for_static_file(&file),
+        )
         .header("x-cowd-edge-surface", file.surface)
         .header("x-cowd-edge-spa-fallback", file.spa_fallback.to_string())
         .body(axum::body::Body::from(bytes))

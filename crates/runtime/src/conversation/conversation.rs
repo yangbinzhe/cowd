@@ -14284,6 +14284,28 @@ mod tests {
     }
 
     #[test]
+    fn two_domain_teams_remain_parallel_when_parent_owns_the_final_html() {
+        let call = required_team_orchestration_call(
+            "请启动两个团队，一个业务团队和一个技术团队，两个团队研讨后形成统一的 HTML 方案并落盘",
+        );
+        let input = serde_json::from_str::<serde_json::Value>(&call.input)
+            .expect("runtime orchestration input is JSON");
+        let nodes = input["proposal"]["nodes"]
+            .as_array()
+            .expect("semantic Team nodes");
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes.iter().all(|node| {
+            node["template"] == "cowd/parallel-research-synthesis"
+                && node["depends_on"].as_array().is_some_and(Vec::is_empty)
+        }));
+        assert_eq!(input["constraints"]["requires_write"], false);
+        assert_eq!(
+            input["proposal"]["completion"]["required_artifact_kinds"],
+            serde_json::json!(["terminal_synthesis"]),
+        );
+    }
+
+    #[test]
     fn ordinal_group_constraint_materializes_exactly_three_teams() {
         let objective = "第一组研究 Runtime，第二组审查 Gateway，第三组汇总结论";
         let decision = build_runtime_execution_decision(objective, None);

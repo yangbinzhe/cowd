@@ -55,6 +55,27 @@ impl UsageCostEstimate {
 #[must_use]
 pub fn heuristic_pricing_for_model(model: &str) -> Option<ModelPricing> {
     let normalized = model.to_ascii_lowercase();
+    // DeepSeek publishes these exact model identifiers and per-million-token
+    // prices. Use the announced peak rates effective 2026-08-16 so the
+    // bundled fallback remains conservative across peak/off-peak periods and
+    // a finite delegated budget can admit the configured production model
+    // before Provider IO. Cache creation is charged at the cache-miss rate.
+    if normalized == "deepseek-v4-flash" {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.44,
+            output_cost_per_million: 1.32,
+            cache_creation_cost_per_million: 0.44,
+            cache_read_cost_per_million: 0.014,
+        });
+    }
+    if normalized == "deepseek-v4-pro" {
+        return Some(ModelPricing {
+            input_cost_per_million: 1.32,
+            output_cost_per_million: 3.96,
+            cache_creation_cost_per_million: 1.32,
+            cache_read_cost_per_million: 0.044,
+        });
+    }
     if normalized.contains("haiku") {
         return Some(ModelPricing {
             input_cost_per_million: 1.0,
@@ -213,6 +234,17 @@ mod tests {
         let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
         assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
         assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
+    }
+
+    #[test]
+    fn resolves_configured_deepseek_v4_pricing_for_finite_runtime_budgets() {
+        let flash = heuristic_pricing_for_model("deepseek-v4-flash").unwrap();
+        let pro = heuristic_pricing_for_model("deepseek-v4-pro").unwrap();
+        assert_eq!(flash.input_cost_per_million, 0.44);
+        assert_eq!(flash.output_cost_per_million, 1.32);
+        assert_eq!(pro.input_cost_per_million, 1.32);
+        assert_eq!(pro.output_cost_per_million, 3.96);
+        assert!(heuristic_pricing_for_model("deepseek-v4-future").is_none());
     }
 
     #[test]

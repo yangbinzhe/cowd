@@ -204,8 +204,8 @@ impl InterventionPolicy {
                 goal,
                 progress,
                 observations,
-                RuntimeInterventionKind::Switch,
-                "provider execution failed repeatedly after governed recovery; switch model and preserve committed evidence",
+                RuntimeInterventionKind::Block,
+                "provider execution failed after one replan and one model switch; stop the recovery chain and preserve committed evidence",
             );
         }
         if failed_provider_steps == 2 {
@@ -474,7 +474,7 @@ mod tests {
                 .propose(&goal(), &progress(), &failed)
                 .unwrap()
                 .kind,
-            RuntimeInterventionKind::Switch
+            RuntimeInterventionKind::Block
         );
     }
 

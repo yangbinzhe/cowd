@@ -2830,6 +2830,30 @@ pub fn explicit_team_owns_persisted_artifact(prompt: &str) -> bool {
         return false;
     }
 
+    // Multiple explicitly requested Teams are independent domain owners by
+    // default. Collective language such as "两个团队研讨后形成统一方案" does
+    // not turn the last Team into a serial file writer. Only an explicit
+    // follow-up writer assignment may do that; otherwise the parent execution
+    // consumes every Team receipt and owns the final persisted artifact.
+    if explicit_team_count(&normalized) > 1
+        && !contains_any(
+            &normalized,
+            &[
+                "另一个团队负责",
+                "另外一个团队负责",
+                "第二个团队负责",
+                "最后一个团队负责",
+                "下一团队负责",
+                "another team writes",
+                "second team writes",
+                "final team writes",
+                "writer team",
+            ],
+        )
+    {
+        return false;
+    }
+
     const ARTIFACT_ACTIONS: &[&str] = &[
         "生成", "创建", "制作", "产出", "形成", "保存", "写入", "落盘", "放到", "存入", "build",
         "create", "generate", "save", "write",
@@ -3871,6 +3895,9 @@ mod tests {
         ));
         assert!(explicit_team_owns_persisted_artifact(
             "启动一个团队生成 HTML 报告文件"
+        ));
+        assert!(!explicit_team_owns_persisted_artifact(
+            "请启动两个团队分别研讨，两个团队讨论后形成统一的 HTML 方案并落盘"
         ));
 
         let current_research_with_local_delivery = "请启动2个研究团队开展今年 AI 发展趋势调研，然后使用一个智能体形成 HTML 报告，并保存到本地目标目录";
