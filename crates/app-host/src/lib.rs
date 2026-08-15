@@ -3,6 +3,8 @@
 //! This crate has no product application imports. Product bundles construct
 //! contributions; Gateway, TUI and WebUI consume the registry projection.
 
+pub mod catalog;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,

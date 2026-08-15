@@ -377,12 +377,17 @@ name = "cowd-app-host"
 version = "0.9.693"
 dependencies = [
  "axum",
+ "base64",
+ "cowd-app-protocol",
  "cowd-app-sdk",
  "crossterm",
  "ratatui",
+ "ring",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "storage",
+ "tempfile",
  "thiserror",
 ]
 
