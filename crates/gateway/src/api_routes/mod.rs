@@ -52,7 +52,7 @@ mod capability_contract;
 pub(crate) mod connector_routes;
 mod context_routes;
 mod core_routes;
-mod cross_plane_routes;
+pub(crate) mod cross_plane_routes;
 mod edge_routes;
 mod evolution_routes;
 mod growth_routes;
@@ -564,14 +564,12 @@ pub(super) fn authenticated_human_principal_for_surface(
             .map_err(|error| error.to_string())?
             .verify(&envelope)
             .map_err(|error| error.to_string())?;
+        let app_profiles = envelope.claims.app_profiles.clone();
         Ok((
             principal,
             auth_broker::HumanEntitlementProjection {
                 core_profile_id: "core_manager".to_string(),
-                app_profiles: std::collections::BTreeMap::from([(
-                    "fixture".to_string(),
-                    "fixture_manager".to_string(),
-                )]),
+                app_profiles,
                 profile_revision: 1,
                 credential_epoch: 1,
                 ceiling: test_human_capabilities(),
@@ -664,15 +662,13 @@ pub(super) fn issue_web_session(
         )
         .map_err(|error| error.to_string())?;
         verify_human_envelope(&envelope, &public_key, 0)?;
+        let app_profiles = envelope.claims.app_profiles.clone();
         encode_web_session(&envelope).map(|session| {
             (
                 session,
                 auth_broker::HumanEntitlementProjection {
                     core_profile_id: "core_manager".to_string(),
-                    app_profiles: std::collections::BTreeMap::from([(
-                        "fixture".to_string(),
-                        "fixture_manager".to_string(),
-                    )]),
+                    app_profiles,
                     profile_revision: 1,
                     credential_epoch: 1,
                     ceiling: test_human_capabilities(),

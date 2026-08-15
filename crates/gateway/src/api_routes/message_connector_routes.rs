@@ -64,18 +64,18 @@ struct WechatQrPollRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(super) struct PlatformReadiness {
-    pub(super) name: String,
-    pub(super) platform_type: String,
-    pub(super) enabled: bool,
-    pub(super) status: &'static str,
-    pub(super) configured: bool,
-    pub(super) credential_present: bool,
-    pub(super) missing_required: Vec<String>,
+pub(crate) struct PlatformReadiness {
+    pub(crate) name: String,
+    pub(crate) platform_type: String,
+    pub(crate) enabled: bool,
+    pub(crate) status: &'static str,
+    pub(crate) configured: bool,
+    pub(crate) credential_present: bool,
+    pub(crate) missing_required: Vec<String>,
     #[serde(default)]
-    pub(super) scopes: Vec<String>,
-    pub(super) capabilities: Vec<String>,
-    pub(super) diagnostics: Vec<String>,
+    pub(crate) scopes: Vec<String>,
+    pub(crate) capabilities: Vec<String>,
+    pub(crate) diagnostics: Vec<String>,
 }
 
 fn default_wechat_bot_type() -> String {

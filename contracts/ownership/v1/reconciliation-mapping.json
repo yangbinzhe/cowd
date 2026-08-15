@@ -1,6 +1,13 @@
 {
   "contract": "cowd.ownership-reconciliation/v1.2-final",
   "ordering": "each typed array ascending by stable_ref canonical UTF-8 bytes; duplicate stable_ref rejects",
+  "snapshot_binding": {
+    "source": "mfg_domain.objects payloads for the five arrays' frozen source tables",
+    "projection": "parse mapped *_json source fields as strict JSON, then apply records.<array>.sources without defaults or inferred values",
+    "bidirectional": "every eligible source object projects to exactly one byte-equivalent typed reconciliation record and every record resolves to exactly one source object; terminal_excluded_statuses are the only permitted non-projected source rows",
+    "verification": "compare all projected fields, parsed JSON values, record payload_digest, alias canonical target, repair side digests and conflict_fields before accepting set_digest or whole_snapshot_digest",
+    "rejection": "E_RECONCILIATION"
+  },
   "state_classification": {
     "pending": [
       "mfg_report_delivery_review_effect_outbox:pending",

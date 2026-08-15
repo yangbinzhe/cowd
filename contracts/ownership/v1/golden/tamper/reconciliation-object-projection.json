@@ -1,5 +1,5 @@
 {
-  "expected_rejection_code": "E_MATRIX_SCHEMA",
+  "expected_rejection_code": "E_RECONCILIATION",
   "snapshot": {
     "contract_version": "cowd.ownership-split/v1.2-final",
     "source": {
@@ -15,7 +15,7 @@
       "execution_profile_digest": "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78",
       "legacy_schema": {
         "namespace": "main",
-        "id": 2,
+        "id": 1,
         "schema_version": 1,
         "updated_at": "2026-08-15T00:00:00Z",
         "disposition": "validate_and_record_never_copy"
@@ -1899,7 +1899,7 @@
         {
           "stable_ref": "effect-1",
           "status": "pending",
-          "action": "reroute",
+          "action": "tampered-action",
           "effect_key": "effect-key-1",
           "attempt_count": 0,
           "next_attempt_at": null,
@@ -1908,7 +1908,7 @@
           "payload": {
             "review_id": "mfg_report_delivery_review-review_id"
           },
-          "payload_digest": "sha256:1ce78870c1a82343604ff3882c21e5f31bc1fdff4c25a374d7393620401cf4dc"
+          "payload_digest": "sha256:403179a4ef2a90f14ea29cf30fb05f90db7d279ba2051a1916350b65d989404c"
         }
       ],
       "command_receipts": [
@@ -1981,7 +1981,7 @@
           "payload_digest": "sha256:b47f456936c606f975abd2cc1d5f65f5bcac2ede8eaa00aa2f4e4b54dc24c7f4"
         }
       ],
-      "set_digest": "sha256:14748960340b90b61bec7fdaf185fd4fe7f38309c1ae3198d0340886cd607885"
+      "set_digest": "sha256:2f7d04314261955efb35cdfe447b233c9317c262b04e7146f6c27173bbeeee2e"
     },
     "excluded": [
       {
@@ -2000,6 +2000,6 @@
         "regeneration": "start_empty_then_rebuild_from_authoritative_events"
       }
     ],
-    "whole_snapshot_digest": "sha256:a98287af5710acab37815a1035ea3b8847bae144dcc7cd8d71af169b0fdef883"
+    "whole_snapshot_digest": "sha256:e70dffbce690b3aaddddfa657b1fd48aac1b9c1dcc826726f9b7d2cd656db1cc"
   }
 }

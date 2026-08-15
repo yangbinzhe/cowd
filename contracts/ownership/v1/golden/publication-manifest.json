@@ -1,7 +1,7 @@
 {
   "generation": "comprehensive-1",
   "directory": "comprehensive-1.ownership-split",
-  "snapshot_file_digest": "sha256:d5d3879847b386d6c52d3f0a50d95b8cf825642caf17962725609aa5e0e73006",
-  "receipt_file_digest": "sha256:302dfca6f1aeaada504f99816761c0dbfc8e8232d50dc71c912661a5e2c3b9fd",
+  "snapshot_file_digest": "sha256:c2060e426df7df4bc5f59c91be4f8fa4885216d2901577dc92de1c65a7c2c7c9",
+  "receipt_file_digest": "sha256:fac7a57aa95fecc6df165a813e6c83f3e67e3b7b0530bccb5aeea8d10ca1785c",
   "publish_operation": "single_directory_rename"
 }

@@ -4,7 +4,7 @@ use std::{
     fs,
     os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{Arc, OnceLock, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -30,7 +30,10 @@ use runtime::{
 use sha2::{Digest, Sha256};
 use tokio::{net::UnixListener, task::JoinHandle};
 
-use crate::services::{core_matrix_catalog, ContextService};
+use crate::{
+    api_routes::AppState,
+    services::{core_matrix_catalog, core_platform_operations, ContextService},
+};
 
 const CORE_INVOKE_PREFIX: &str = "/_cowd/core/v1/operations/";
 const CORE_INVOKE_SUFFIX: &str = "/invoke";
@@ -142,10 +145,19 @@ enum CachedCommand {
     Completed(Sha256Digest, DurableReceiptV1),
 }
 
+struct CoreBridgeRequestDependencies {
+    registry: Arc<CoreBridgeRegistry>,
+    store: Arc<dyn MatrixStore>,
+    commands: Arc<tokio::sync::Mutex<HashMap<String, CachedCommand>>>,
+    event_store: Arc<RuntimeEventStore>,
+    app_state: Arc<OnceLock<Arc<AppState>>>,
+}
+
 pub(crate) struct CoreBridgeServer {
     path: PathBuf,
     cancellation: CancellationToken,
     accept_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    app_state: Arc<OnceLock<Arc<AppState>>>,
 }
 
 impl CoreBridgeServer {
@@ -162,7 +174,14 @@ impl CoreBridgeServer {
             .map_err(|error| format!("secure CoreBridge socket {}: {error}", path.display()))?;
         let cancellation = CancellationToken::default();
         let task_cancel = cancellation.clone();
-        let commands = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let app_state = Arc::new(OnceLock::new());
+        let dependencies = Arc::new(CoreBridgeRequestDependencies {
+            registry,
+            store,
+            commands: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            event_store,
+            app_state: Arc::clone(&app_state),
+        });
         let accept_task = tokio::spawn(async move {
             let mut connections = tokio::task::JoinSet::new();
             loop {
@@ -182,20 +201,14 @@ impl CoreBridgeServer {
                                 continue;
                             };
                             let peer_uid = peer.uid();
-                            let registry = Arc::clone(&registry);
-                            let store = Arc::clone(&store);
-                            let commands = Arc::clone(&commands);
-                            let event_store = Arc::clone(&event_store);
+                            let dependencies = Arc::clone(&dependencies);
                             connections.spawn(async move {
                                 let service = service_fn(move |request| {
                                     handle_request(
                                         request,
                                         peer_pid,
                                         peer_uid,
-                                        Arc::clone(&registry),
-                                        Arc::clone(&store),
-                                        Arc::clone(&commands),
-                                        Arc::clone(&event_store),
+                                        Arc::clone(&dependencies),
                                     )
                                 });
                                 if let Err(error) = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
@@ -221,7 +234,14 @@ impl CoreBridgeServer {
             path,
             cancellation,
             accept_task: tokio::sync::Mutex::new(Some(accept_task)),
+            app_state,
         }))
+    }
+
+    pub(crate) fn bind_app_state(&self, state: Arc<AppState>) -> Result<(), String> {
+        self.app_state
+            .set(state)
+            .map_err(|_| "CoreBridge Gateway dependencies are already bound".to_owned())
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
@@ -245,21 +265,9 @@ async fn handle_request(
     request: Request<Incoming>,
     peer_pid: u32,
     peer_uid: u32,
-    registry: Arc<CoreBridgeRegistry>,
-    store: Arc<dyn MatrixStore>,
-    commands: Arc<tokio::sync::Mutex<HashMap<String, CachedCommand>>>,
-    event_store: Arc<RuntimeEventStore>,
+    dependencies: Arc<CoreBridgeRequestDependencies>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let result = route_request(
-        request,
-        peer_pid,
-        peer_uid,
-        &registry,
-        store,
-        commands,
-        event_store,
-    )
-    .await;
+    let result = route_request(request, peer_pid, peer_uid, dependencies).await;
     Ok(match result {
         Ok(response) => response,
         Err(error) => error.response(),
@@ -270,10 +278,7 @@ async fn route_request(
     request: Request<Incoming>,
     peer_pid: u32,
     peer_uid: u32,
-    registry: &CoreBridgeRegistry,
-    store: Arc<dyn MatrixStore>,
-    commands: Arc<tokio::sync::Mutex<HashMap<String, CachedCommand>>>,
-    event_store: Arc<RuntimeEventStore>,
+    dependencies: Arc<CoreBridgeRequestDependencies>,
 ) -> Result<Response<Full<Bytes>>, BridgeFailure> {
     let app_id = AppId(required_header(&request, HEADER_APP_ID_V1)?.to_owned());
     app_id
@@ -292,7 +297,10 @@ async fn route_request(
         ));
     }
     let authorization = required_header(&request, HEADER_AUTHORIZATION_V1)?;
-    let binding = registry.authorize(&app_id, &generation, peer_pid, peer_uid, authorization)?;
+    let binding =
+        dependencies
+            .registry
+            .authorize(&app_id, &generation, peer_pid, peer_uid, authorization)?;
     let catalog = core_matrix_catalog::projected_catalog(&binding.manifest, &generation)
         .map_err(|error| BridgeFailure::internal(error.to_string()))?;
 
@@ -360,7 +368,7 @@ async fn route_request(
         let digest = payload_digest(&binding.registration, &operation_id, &payload)?;
         let cache_key = format!("{}:{key}", binding.registration.app_id.0);
         {
-            let mut cache = commands.lock().await;
+            let mut cache = dependencies.commands.lock().await;
             match cache.get(&cache_key) {
                 Some(CachedCommand::Completed(existing, receipt)) if existing == &digest => {
                     let mut replayed = receipt.clone();
@@ -400,10 +408,15 @@ async fn route_request(
                 }
             }
         }
-        match durable_command_state(&event_store, &binding.registration, &key, &digest)? {
+        match durable_command_state(
+            &dependencies.event_store,
+            &binding.registration,
+            &key,
+            &digest,
+        )? {
             DurableCommandState::New { stream_id } => {
                 append_command_intent(
-                    &event_store,
+                    &dependencies.event_store,
                     &stream_id,
                     &binding.registration,
                     &operation_id,
@@ -414,7 +427,8 @@ async fn route_request(
             }
             DurableCommandState::Completed(mut receipt) => {
                 receipt.replayed = true;
-                commands
+                dependencies
+                    .commands
                     .lock()
                     .await
                     .insert(cache_key, CachedCommand::Completed(digest, receipt.clone()));
@@ -428,8 +442,15 @@ async fn route_request(
                 ));
             }
         }
-        let output =
-            dispatch_with_deadline(store, operation_for_dispatch, payload, timeout_ms).await?;
+        let output = dispatch_with_deadline(
+            Arc::clone(&dependencies.store),
+            Arc::clone(&dependencies.app_state),
+            &envelope,
+            operation_for_dispatch,
+            payload,
+            timeout_ms,
+        )
+        .await?;
         let receipt = DurableReceiptV1 {
             schema_version: 1,
             request_id,
@@ -444,15 +465,29 @@ async fn route_request(
         receipt
             .validate()
             .map_err(|error| BridgeFailure::internal(error.to_string()))?;
-        append_command_receipt(&event_store, &binding.registration, &key, &digest, &receipt)?;
-        commands
+        append_command_receipt(
+            &dependencies.event_store,
+            &binding.registration,
+            &key,
+            &digest,
+            &receipt,
+        )?;
+        dependencies
+            .commands
             .lock()
             .await
             .insert(cache_key, CachedCommand::Completed(digest, receipt.clone()));
         json_response(StatusCode::OK, &receipt)
     } else {
-        let output =
-            dispatch_with_deadline(store, operation_for_dispatch, payload, timeout_ms).await?;
+        let output = dispatch_with_deadline(
+            Arc::clone(&dependencies.store),
+            Arc::clone(&dependencies.app_state),
+            &envelope,
+            operation_for_dispatch,
+            payload,
+            timeout_ms,
+        )
+        .await?;
         let response = AppProviderResponseV1 {
             schema_version: 1,
             request_id,
@@ -632,6 +667,8 @@ fn command_stream_id(registration: &CoreBridgeRegistration, key: &str) -> String
 
 async fn dispatch_with_deadline(
     store: Arc<dyn MatrixStore>,
+    app_state: Arc<OnceLock<Arc<AppState>>>,
+    envelope: &AppInvocationEnvelopeV1,
     operation_id: String,
     payload: serde_json::Value,
     timeout_ms: u64,
@@ -639,25 +676,46 @@ async fn dispatch_with_deadline(
     if timeout_ms == 0 {
         return Err(BridgeFailure::deadline());
     }
-    let task = tokio::task::spawn_blocking(move || {
-        core_matrix_catalog::dispatch_operation(
-            store.as_ref(),
-            &ContextService::new(),
-            &operation_id,
-            &payload,
+    if operation_id.starts_with("core.matrix.") {
+        let task = tokio::task::spawn_blocking(move || {
+            core_matrix_catalog::dispatch_operation(
+                store.as_ref(),
+                &ContextService::new(),
+                &operation_id,
+                &payload,
+            )
+        });
+        tokio::time::timeout(Duration::from_millis(timeout_ms), task)
+            .await
+            .map_err(|_| BridgeFailure::deadline())?
+            .map_err(|error| BridgeFailure::internal(error.to_string()))?
+            .map_err(|error| match error.code {
+                "not_found" | "validation_failed" => BridgeFailure::invalid(error.detail),
+                "revision_conflict" => {
+                    BridgeFailure::new(AppErrorCodeV1::RevisionConflict, error.detail, false)
+                }
+                _ => BridgeFailure::new(AppErrorCodeV1::DependencyUnavailable, error.detail, true),
+            })
+    } else if core_platform_operations::supports(&operation_id) {
+        let state = app_state.get().cloned().ok_or_else(|| {
+            BridgeFailure::new(
+                AppErrorCodeV1::DependencyUnavailable,
+                "CoreBridge Gateway dependencies are not ready",
+                true,
+            )
+        })?;
+        tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            core_platform_operations::dispatch(&state, envelope, &operation_id, &payload),
         )
-    });
-    tokio::time::timeout(Duration::from_millis(timeout_ms), task)
         .await
         .map_err(|_| BridgeFailure::deadline())?
-        .map_err(|error| BridgeFailure::internal(error.to_string()))?
-        .map_err(|error| match error.code {
-            "not_found" | "validation_failed" => BridgeFailure::invalid(error.detail),
-            "revision_conflict" => {
-                BridgeFailure::new(AppErrorCodeV1::RevisionConflict, error.detail, false)
-            }
-            _ => BridgeFailure::new(AppErrorCodeV1::DependencyUnavailable, error.detail, true),
-        })
+        .map_err(BridgeFailure::invalid)
+    } else {
+        Err(BridgeFailure::invalid(format!(
+            "unknown Core operation `{operation_id}`"
+        )))
+    }
 }
 
 fn validate_manifest_profile(
@@ -665,6 +723,13 @@ fn validate_manifest_profile(
     envelope: &AppInvocationEnvelopeV1,
     descriptor: &OperationDescriptorV1,
 ) -> Result<(), BridgeFailure> {
+    core_matrix_catalog::validate_projected_capabilities(manifest, descriptor).map_err(|_| {
+        BridgeFailure::new(
+            AppErrorCodeV1::OperationNotGranted,
+            "Core operation capabilities differ from Gateway authority",
+            false,
+        )
+    })?;
     let profile = manifest
         .authorization_profiles
         .iter()
@@ -676,6 +741,7 @@ fn validate_manifest_profile(
                 false,
             )
         })?;
+    let app_capability_prefix = format!("{}.", manifest.app_id.0);
     let mut allowed = profile.capabilities.clone();
     if let Some(surface) = profile
         .surface_capabilities
@@ -683,6 +749,23 @@ fn validate_manifest_profile(
     {
         allowed.extend(surface.iter().cloned());
     }
+    if allowed
+        .iter()
+        .any(|capability| !capability.starts_with(&app_capability_prefix))
+    {
+        return Err(BridgeFailure::new(
+            AppErrorCodeV1::OperationNotGranted,
+            "signed APP authorization profile contains a non-APP capability",
+            false,
+        ));
+    }
+    allowed.extend(
+        descriptor
+            .required_capabilities
+            .iter()
+            .filter(|capability| !capability.starts_with(&app_capability_prefix))
+            .cloned(),
+    );
     allowed.sort();
     allowed.dedup();
     if envelope
@@ -690,13 +773,17 @@ fn validate_manifest_profile(
         .granted_capabilities
         .iter()
         .any(|capability| allowed.binary_search(capability).is_err())
-        || allowed
-            .binary_search(&descriptor.required_capability)
-            .is_err()
+        || descriptor.required_capabilities.iter().any(|capability| {
+            envelope
+                .principal
+                .granted_capabilities
+                .binary_search(capability)
+                .is_err()
+        })
     {
         return Err(BridgeFailure::new(
             AppErrorCodeV1::OperationNotGranted,
-            "principal capabilities exceed the signed APP authorization profile",
+            "principal capabilities do not exactly satisfy the signed APP profile and Core authority",
             false,
         ));
     }
@@ -945,11 +1032,11 @@ mod tests {
             required_protocol: ProtocolRangeV1::exact_v1(),
             executable: "bin/worker".to_owned(),
             web_root: None,
-            capabilities: vec!["app.fixture.read".to_owned()],
+            capabilities: vec!["fixture.read".to_owned()],
             authorization_profiles: vec![AuthorizationProfileV1 {
                 profile_id: "operator".to_owned(),
                 display_name: "Operator".to_owned(),
-                capabilities: vec!["app.fixture.read".to_owned()],
+                capabilities: vec!["fixture.read".to_owned()],
                 surface_capabilities: BTreeMap::new(),
                 is_default: true,
             }],
@@ -958,7 +1045,7 @@ mod tests {
                 core_operation_id: definition.descriptor.operation_id.clone(),
                 accepted_input_schema_digest: definition.descriptor.input_schema_digest.clone(),
                 accepted_output_schema_digest: definition.descriptor.output_schema_digest.clone(),
-                required_app_capability: "app.fixture.read".to_owned(),
+                required_app_capability: "fixture.read".to_owned(),
                 kind: definition.descriptor.kind,
                 streaming: false,
             }],
@@ -993,6 +1080,98 @@ mod tests {
             .bind_canonical_signed_digest()
             .expect("manifest digest");
         manifest
+    }
+
+    fn fixture_envelope(
+        descriptor: &OperationDescriptorV1,
+        granted_capabilities: Vec<String>,
+    ) -> AppInvocationEnvelopeV1 {
+        let now = now_unix_ms();
+        AppInvocationEnvelopeV1 {
+            schema_version: 1,
+            operation_id: descriptor.operation_id.clone(),
+            request_id: "request-profile-validation".to_owned(),
+            correlation_id: "correlation-profile-validation".to_owned(),
+            causation_id: None,
+            deadline_unix_ms: now + 5_000,
+            idempotency_key: None,
+            expected_revision: None,
+            call_chain: vec!["app:fixture".to_owned()],
+            max_hops: 4,
+            input_schema_digest: descriptor.input_schema_digest.clone(),
+            principal: cowd_app_protocol::PrincipalContextV1 {
+                subject: "fixture-worker".to_owned(),
+                tenant_id: "deployment-tenant".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                delegation: DelegationKindV1::Service,
+                grant_id: "grant-profile-validation".to_owned(),
+                authorization_profile_id: "operator".to_owned(),
+                authorization_revision: 1,
+                granted_capabilities,
+                granted_scopes: Vec::new(),
+                credential_epoch: 1,
+                expires_at_unix_ms: Some(now + 5_000),
+            },
+            execution: ExecutionContextV1 {
+                surface: "worker".to_owned(),
+                session_id: None,
+                turn_id: None,
+                task_id: None,
+            },
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn manifest_profile_requires_all_core_and_app_capabilities_and_rejects_excess() {
+        let definition = core_matrix_catalog::definitions()
+            .expect("definitions")
+            .into_iter()
+            .find(|definition| definition.short_id == "health")
+            .expect("health");
+        let manifest = fixture_manifest(&definition);
+        let generation = GenerationId(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        );
+        let catalog = core_matrix_catalog::projected_catalog(&manifest, &generation)
+            .expect("projected catalog");
+        let descriptor = &catalog.operations[0];
+
+        let valid = fixture_envelope(
+            descriptor,
+            vec!["core.matrix.read".to_owned(), "fixture.read".to_owned()],
+        );
+        validate_manifest_profile(&manifest, &valid, descriptor)
+            .expect("Core and signed APP capabilities are jointly authorized");
+
+        for (label, capabilities) in [
+            ("missing Core capability", vec!["fixture.read".to_owned()]),
+            (
+                "missing APP capability",
+                vec!["core.matrix.read".to_owned()],
+            ),
+            (
+                "forged extra Core capability",
+                vec![
+                    "core.matrix.read".to_owned(),
+                    "core.matrix.write".to_owned(),
+                    "fixture.read".to_owned(),
+                ],
+            ),
+            (
+                "unsigned extra APP capability",
+                vec![
+                    "core.matrix.read".to_owned(),
+                    "fixture.read".to_owned(),
+                    "fixture.write".to_owned(),
+                ],
+            ),
+        ] {
+            let envelope = fixture_envelope(descriptor, capabilities);
+            let failure =
+                validate_manifest_profile(&manifest, &envelope, descriptor).expect_err(label);
+            assert_eq!(failure.code, AppErrorCodeV1::OperationNotGranted, "{label}");
+        }
     }
 
     fn base_request(
@@ -1143,7 +1322,10 @@ mod tests {
                 grant_id: "grant-1".to_owned(),
                 authorization_profile_id: "operator".to_owned(),
                 authorization_revision: 1,
-                granted_capabilities: vec!["app.fixture.read".to_owned()],
+                granted_capabilities: vec![
+                    "core.matrix.read".to_owned(),
+                    "fixture.read".to_owned(),
+                ],
                 granted_scopes: Vec::new(),
                 credential_epoch: 1,
                 expires_at_unix_ms: Some(now + 5_000),
@@ -1213,6 +1395,67 @@ mod tests {
         assert!(!socket.exists());
     }
 
+    #[tokio::test]
+    async fn platform_dispatch_fails_closed_until_gateway_state_is_bound() {
+        let definition = core_matrix_catalog::definitions()
+            .expect("definitions")
+            .into_iter()
+            .find(|definition| {
+                definition.descriptor.operation_id
+                    == core_platform_operations::ACTION_PLAN_OPERATION_ID
+            })
+            .expect("action plan operation");
+        let now = now_unix_ms();
+        let envelope = AppInvocationEnvelopeV1 {
+            schema_version: 1,
+            operation_id: definition.descriptor.operation_id.clone(),
+            request_id: "request-platform-before-bind".to_owned(),
+            correlation_id: "correlation-platform-before-bind".to_owned(),
+            causation_id: None,
+            deadline_unix_ms: now + 5_000,
+            idempotency_key: None,
+            expected_revision: None,
+            call_chain: vec!["app:fixture".to_owned()],
+            max_hops: 4,
+            input_schema_digest: definition.descriptor.input_schema_digest,
+            principal: cowd_app_protocol::PrincipalContextV1 {
+                subject: "fixture-worker".to_owned(),
+                tenant_id: "deployment-tenant".to_owned(),
+                workspace_id: "workspace-1".to_owned(),
+                delegation: DelegationKindV1::Service,
+                grant_id: "grant-1".to_owned(),
+                authorization_profile_id: "operator".to_owned(),
+                authorization_revision: 1,
+                granted_capabilities: vec![
+                    "core.cross_plane.read".to_owned(),
+                    "fixture.read".to_owned(),
+                ],
+                granted_scopes: Vec::new(),
+                credential_epoch: 1,
+                expires_at_unix_ms: Some(now + 5_000),
+            },
+            execution: ExecutionContextV1 {
+                surface: "worker".to_owned(),
+                session_id: None,
+                turn_id: None,
+                task_id: None,
+            },
+            payload: serde_json::json!({}),
+        };
+        let failure = dispatch_with_deadline(
+            Arc::new(MatrixSqliteRepository::in_memory().expect("matrix")),
+            Arc::new(OnceLock::new()),
+            &envelope,
+            envelope.operation_id.clone(),
+            envelope.payload.clone(),
+            1_000,
+        )
+        .await
+        .expect_err("unbound Gateway state must fail closed");
+        assert_eq!(failure.code, AppErrorCodeV1::DependencyUnavailable);
+        assert!(failure.detail.contains("not ready"));
+    }
+
     #[test]
     fn durable_command_fence_replays_receipt_and_rejects_changed_payload() {
         let store = RuntimeEventStore::open_in_memory().expect("events");
@@ -1250,7 +1493,10 @@ mod tests {
                 grant_id: "grant-1".to_owned(),
                 authorization_profile_id: "operator".to_owned(),
                 authorization_revision: 1,
-                granted_capabilities: vec!["app.fixture.write".to_owned()],
+                granted_capabilities: vec![
+                    "core.matrix.write".to_owned(),
+                    "fixture.write".to_owned(),
+                ],
                 granted_scopes: Vec::new(),
                 credential_epoch: 1,
                 expires_at_unix_ms: None,

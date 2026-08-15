@@ -14,6 +14,12 @@ use runtime::{
 use serde::{Deserialize, Serialize};
 
 use super::{message_connector_routes, principal_actor_id, AppState, AuthenticatedPrincipal};
+use crate::services::core_platform_operations::{
+    AdapterCapabilityProjection, CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput,
+    CrossPlaneActionPreflight, CrossPlaneActionProjection, CrossPlanePolicySimulation,
+    CrossPlaneRiskV1, DataClassificationV1, DispatchTargetProjection, IdentityTrustV1,
+    PlatformReadinessProjection,
+};
 use crate::services::{CrossPlaneExecutionRecord, GatewayCrossPlaneExecutor};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
@@ -120,6 +126,41 @@ impl CrossPlaneActionIntent {
         action.risk = self.risk;
         action.data_classification = self.data_classification;
         action.identity_trust = self.identity_trust;
+        action
+    }
+}
+
+impl CrossPlaneActionPlanInput {
+    fn into_action(self, actor_principal: String) -> CrossPlaneAction {
+        let mut action = CrossPlaneAction::new(actor_principal, self.requested_capability);
+        action.actor_identity_ref = self.actor_identity_ref;
+        action.source_channel = self.source_channel;
+        action.session_id = self.session_id;
+        action.provider_account = self.provider_account;
+        action.target_ref = self.target_ref;
+        action.resource_ref = self.resource_ref;
+        action.risk = match self.risk {
+            CrossPlaneRiskV1::Low => harness_contract::policy::CrossPlaneRisk::Low,
+            CrossPlaneRiskV1::Medium => harness_contract::policy::CrossPlaneRisk::Medium,
+            CrossPlaneRiskV1::High => harness_contract::policy::CrossPlaneRisk::High,
+            CrossPlaneRiskV1::Critical => harness_contract::policy::CrossPlaneRisk::Critical,
+        };
+        action.data_classification = match self.data_classification {
+            DataClassificationV1::Public => harness_contract::policy::DataClassification::Public,
+            DataClassificationV1::Internal => {
+                harness_contract::policy::DataClassification::Internal
+            }
+            DataClassificationV1::Confidential => {
+                harness_contract::policy::DataClassification::Confidential
+            }
+            DataClassificationV1::Secret => harness_contract::policy::DataClassification::Secret,
+        };
+        action.identity_trust = match self.identity_trust {
+            IdentityTrustV1::Verified => runtime::IdentityTrust::Verified,
+            IdentityTrustV1::Claimed => runtime::IdentityTrust::Claimed,
+            IdentityTrustV1::Observed => runtime::IdentityTrust::Observed,
+            IdentityTrustV1::Unknown => runtime::IdentityTrust::Unknown,
+        };
         action
     }
 }
@@ -760,6 +801,101 @@ async fn evaluate_action_readiness(
         executable,
         blockers,
     }
+}
+
+pub(crate) async fn core_action_plan(
+    state: &AppState,
+    actor_principal: String,
+    input: CrossPlaneActionPlanInput,
+) -> CrossPlaneActionPlanOutput {
+    let readiness = evaluate_action_readiness(
+        state,
+        input.into_action(actor_principal),
+        "dry_run",
+        chrono::Utc::now(),
+    )
+    .await;
+    let action = CrossPlaneActionProjection {
+        actor_principal: readiness.action.actor_principal.clone(),
+        actor_identity_ref: readiness.action.actor_identity_ref.clone(),
+        source_channel: readiness.action.source_channel.clone(),
+        session_id: readiness.action.session_id.clone(),
+        requested_capability: readiness.action.requested_capability.clone(),
+        provider_account: readiness.action.provider_account.clone(),
+        target_ref: readiness.action.target_ref.clone(),
+        resource_ref: readiness.action.resource_ref.clone(),
+        risk: enum_name(readiness.action.risk),
+        data_classification: enum_name(readiness.action.data_classification),
+        identity_trust: enum_name(readiness.action.identity_trust),
+    };
+    let policy_simulation = CrossPlanePolicySimulation {
+        decision: enum_name(readiness.decision.decision),
+        reason: readiness.decision.reason.clone(),
+        matched_grant_id: readiness
+            .decision
+            .matched_grant
+            .as_ref()
+            .map(|grant| grant.id.clone()),
+        required_approval: readiness.decision.required_approval.map(enum_name),
+        degrade_to: readiness.decision.degrade_to.clone(),
+        policy_version: readiness.evidence.policy_version.clone(),
+        evaluated_at: readiness
+            .evidence
+            .evaluated_at
+            .map(|value| value.to_rfc3339()),
+        active_grants_before: readiness.evidence.active_grants_before,
+        consumed_grant_id: readiness.evidence.consumed_grant_id.clone(),
+        remaining_uses_after: readiness.evidence.remaining_uses_after,
+    };
+    let action_preflight = CrossPlaneActionPreflight {
+        target_platform: readiness.target_platform.clone(),
+        platform_readiness: readiness
+            .platform_readiness
+            .map(|value| PlatformReadinessProjection {
+                name: value.name,
+                platform_type: value.platform_type,
+                enabled: value.enabled,
+                status: value.status.to_owned(),
+                configured: value.configured,
+                credential_present: value.credential_present,
+                missing_required: value.missing_required,
+                scopes: value.scopes,
+                capabilities: value.capabilities,
+                diagnostics: value.diagnostics,
+            }),
+        adapter_capability: readiness
+            .adapter_capability
+            .map(|value| AdapterCapabilityProjection {
+                platform: value.platform,
+                capability: value.capability,
+                operation: value.operation,
+                live_supported: value.live_supported,
+                adapter_bound: value.adapter_bound,
+            }),
+        dispatch_target: readiness
+            .dispatch_target
+            .map(|value| DispatchTargetProjection {
+                platform: value.platform,
+                operation: value.operation,
+                target_ref: value.target_ref,
+                resource_ref: value.resource_ref,
+                session_key: value.session_key,
+                has_outbound_message: value.outbound_message.is_some(),
+                ready: value.ready,
+                blockers: value.blockers,
+            }),
+        executable: readiness.executable,
+        blockers: readiness.blockers,
+    };
+    CrossPlaneActionPlanOutput {
+        action,
+        policy_simulation,
+        action_preflight,
+    }
+}
+
+fn enum_name(value: impl std::fmt::Debug) -> String {
+    format!("{value:?}").to_ascii_lowercase()
 }
 
 pub(super) fn decide_connector_action(

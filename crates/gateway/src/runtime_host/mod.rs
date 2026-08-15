@@ -1581,7 +1581,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             return Err(startup_registry.rollback(error).await);
         }
     };
-    startup_registry.core_bridge = Some(core_bridge);
+    startup_registry.core_bridge = Some(Arc::clone(&core_bridge));
     let auth_catalog = match auth_broker::AuthorizationCatalog::from_app_manifests(
         app_platform.catalog().apps().map(|app| &app.manifest),
     ) {
@@ -1603,10 +1603,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         }
     };
     *auth_broker.lock().await = started_auth_broker;
-    if let Err(error) = app_platform.start_resident().await {
-        let error = format!("failed to start resident APPs: {error}");
-        return Err(startup_registry.rollback(error).await);
-    }
     let upgrade_coordinator = Arc::new(runtime::UpgradeCoordinator::new());
     let mut runtime_bootstrap = match crate::runtime_bootstrap::assemble_runtime_state_with_loader(
         &workspace_root,
@@ -1966,7 +1962,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             return Err(startup_registry.rollback(error).await);
         }
     }
-    let services = Arc::new(services.with_app_platform(app_platform));
+    let services = Arc::new(services.with_app_platform(Arc::clone(&app_platform)));
     let app_state = Arc::new(api_routes::AppState {
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),
@@ -1980,6 +1976,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         session_lease_registry: Some(lease_registry.clone()),
         live_registry: Arc::new(api_routes::live_routes::LiveRegistry::new()),
     });
+    if let Err(error) = core_bridge.bind_app_state(Arc::clone(&app_state)) {
+        let error = format!("failed to bind CoreBridge Gateway dependencies: {error}");
+        return Err(startup_registry.rollback(error).await);
+    }
+    if let Err(error) = app_platform.start_resident().await {
+        let error = format!("failed to start resident APPs: {error}");
+        return Err(startup_registry.rollback(error).await);
+    }
     config_reload::initialize_config_reload_status(&config_reload, &app_state);
 
     // 2. Build HTTP router (reuse api_routes + SSE)

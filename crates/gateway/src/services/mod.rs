@@ -16,6 +16,7 @@ mod connector_service;
 mod context;
 mod context_service;
 pub(crate) mod core_matrix_catalog;
+pub(crate) mod core_platform_operations;
 mod cross_plane_executor;
 mod cross_plane_service;
 mod error;

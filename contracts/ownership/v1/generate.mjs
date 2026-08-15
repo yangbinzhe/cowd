@@ -658,6 +658,13 @@ const canonicalization = {
 const reconciliationMapping = {
   contract: "cowd.ownership-reconciliation/v1.2-final",
   ordering: "each typed array ascending by stable_ref canonical UTF-8 bytes; duplicate stable_ref rejects",
+  snapshot_binding: {
+    source: "mfg_domain.objects payloads for the five arrays' frozen source tables",
+    projection: "parse mapped *_json source fields as strict JSON, then apply records.<array>.sources without defaults or inferred values",
+    bidirectional: "every eligible source object projects to exactly one byte-equivalent typed reconciliation record and every record resolves to exactly one source object; terminal_excluded_statuses are the only permitted non-projected source rows",
+    verification: "compare all projected fields, parsed JSON values, record payload_digest, alias canonical target, repair side digests and conflict_fields before accepting set_digest or whole_snapshot_digest",
+    rejection: "E_RECONCILIATION",
+  },
   state_classification: {
     pending: ["mfg_report_delivery_review_effect_outbox:pending", "mfg_report_delivery_review_effect_outbox:retry_wait", "mfg_mutation_receipt:accepted", "mfg_mutation_receipt:effect_retryable"],
     started_or_leased: ["mfg_report_delivery_review_effect_outbox:processing", "mfg_mutation_receipt:effect_started", "mfg_mutation_receipt:business_completed"],
@@ -1117,6 +1124,36 @@ const comprehensiveObjects = Object.fromEntries(migration.filter((table) => !exc
   return [table, { source_table: table, stable_id: "", revision: null, source_references: [], evidence_references: [], payload, payload_digest: "" }];
 }));
 
+const fixtureTimestamp = executionInputs.source_metadata.exported_at;
+const fixtureReviewId = comprehensiveObjects.mfg_report_delivery_review.payload.review_id;
+const fixtureExistingReceipt = { status: "completed", revision: 1 };
+const fixtureIncomingReceipt = { status: "completed", revision: 2 };
+Object.assign(comprehensiveObjects.mfg_report_delivery_review_effect_outbox.payload, {
+  effect_id: "effect-1", review_id: fixtureReviewId, action: "reroute", effect_key: "effect-key-1",
+  payload_json: canonical({ review_id: fixtureReviewId }), status: "pending", attempt_count: 0,
+  next_attempt_at: null, last_error: null, receipt_ref: externalKeyValue("core.receipt"),
+  created_at: fixtureTimestamp, updated_at: fixtureTimestamp,
+});
+Object.assign(comprehensiveObjects.mfg_command_receipt.payload, {
+  idempotency_key: "command-1", domain: "mfg", subject_ref: "subject-1",
+  receipt_json: canonical({ ok: true }), created_at: fixtureTimestamp,
+});
+Object.assign(comprehensiveObjects.mfg_mutation_receipt.payload, {
+  receipt_id: "receipt-1", idempotency_key: "mutation-1", actor_principal: "actor-1",
+  action_id: "action-1", resource_ref: "resource-1", expected_revision: 1, result_revision: 2,
+  payload_digest: `sha256:${"a".repeat(64)}`, lease_token: "", status: "completed",
+  response_json: canonical({ completed: true }), contract_version: "mfg.mutation/v1",
+  created_at: fixtureTimestamp, updated_at: fixtureTimestamp,
+});
+Object.assign(comprehensiveObjects.mfg_mutation_receipt_alias.payload, {
+  legacy_idempotency_key: "legacy-1", receipt_id: "receipt-1", created_at: fixtureTimestamp,
+});
+Object.assign(comprehensiveObjects.mfg_mutation_receipt_repair_report.payload, {
+  report_id: "repair-1", idempotency_key: "mutation-1",
+  existing_receipt_json: canonical(fixtureExistingReceipt),
+  incoming_receipt_json: canonical(fixtureIncomingReceipt), created_at: fixtureTimestamp,
+});
+
 function edgeValue(edge) {
   if (edge.target.table) return comprehensiveObjects[edge.target.table].payload[edge.target.field];
   return externalKeyValue(edge.target.external);
@@ -1168,18 +1205,71 @@ revisionSibling.payload_digest = hashDomain("cowd.ownership.payload.v1", revisio
 function reconcileRecord(name, value) {
   return { ...value, payload_digest: hashDomain(reconciliationDomains[name], value) };
 }
+function parseFixtureJson(table, field) {
+  return JSON.parse(comprehensiveObjects[table].payload[field]);
+}
+function jsonPointerEscape(value) {
+  return value.replaceAll("~", "~0").replaceAll("/", "~1");
+}
+function jsonDiffPaths(left, right, path = "") {
+  if (canonical(left) === canonical(right)) return [];
+  if (left && right && typeof left === "object" && typeof right === "object" && !Array.isArray(left) && !Array.isArray(right)) {
+    return [...new Set([...Object.keys(left), ...Object.keys(right)])]
+      .sort(utf8ByteCompare)
+      .flatMap((key) => jsonDiffPaths(left[key], right[key], `${path}/${jsonPointerEscape(key)}`));
+  }
+  return [path || "/"];
+}
+function sortReconciliation(records) {
+  return records.sort((left, right) => utf8ByteCompare(left.stable_ref, right.stable_ref));
+}
+const outboxRow = comprehensiveObjects.mfg_report_delivery_review_effect_outbox.payload;
+const commandRow = comprehensiveObjects.mfg_command_receipt.payload;
+const mutationRow = comprehensiveObjects.mfg_mutation_receipt.payload;
+const aliasRow = comprehensiveObjects.mfg_mutation_receipt_alias.payload;
+const repairRow = comprehensiveObjects.mfg_mutation_receipt_repair_report.payload;
+const mutationRecord = reconcileRecord("mutation_receipts", {
+  stable_ref: mutationRow.receipt_id, status: mutationRow.status, receipt_id: mutationRow.receipt_id,
+  idempotency_key: mutationRow.idempotency_key, actor_principal: mutationRow.actor_principal,
+  action_id: mutationRow.action_id, resource_ref: mutationRow.resource_ref,
+  expected_revision: mutationRow.expected_revision, result_revision: mutationRow.result_revision,
+  mutation_payload_digest: mutationRow.payload_digest, lease_token: mutationRow.lease_token,
+  response: parseFixtureJson("mfg_mutation_receipt", "response_json"),
+  contract_version: mutationRow.contract_version, created_at: mutationRow.created_at,
+  updated_at: mutationRow.updated_at,
+});
+const existingReceipt = parseFixtureJson("mfg_mutation_receipt_repair_report", "existing_receipt_json");
+const incomingReceipt = parseFixtureJson("mfg_mutation_receipt_repair_report", "incoming_receipt_json");
 const comprehensiveReconciliationBody = {
-  pending_outbox: [reconcileRecord("pending_outbox", { stable_ref: "effect-1", status: "pending", action: "reroute", effect_key: "effect-key-1", attempt_count: 0, next_attempt_at: null, last_error: null, receipt_ref: null, payload: { review_id: "review-1" } })],
-  command_receipts: [reconcileRecord("command_receipts", { stable_ref: "mfg\u001fcommand-1", status: "recorded", domain: "mfg", idempotency_key: "command-1", subject_ref: "subject-1", receipt: { ok: true }, created_at: executionInputs.source_metadata.exported_at })],
-  mutation_receipts: [reconcileRecord("mutation_receipts", { stable_ref: "receipt-1", status: "completed", receipt_id: "receipt-1", idempotency_key: "mutation-1", actor_principal: "actor-1", action_id: "action-1", resource_ref: "resource-1", expected_revision: 1, result_revision: 2, mutation_payload_digest: `sha256:${"a".repeat(64)}`, lease_token: "", response: { completed: true }, contract_version: "mfg.mutation/v1", created_at: executionInputs.source_metadata.exported_at, updated_at: executionInputs.source_metadata.exported_at })],
-  mutation_receipt_aliases: [],
-  mutation_receipt_repairs: [],
+  pending_outbox: sortReconciliation([reconcileRecord("pending_outbox", {
+    stable_ref: outboxRow.effect_id, status: outboxRow.status, action: outboxRow.action,
+    effect_key: outboxRow.effect_key, attempt_count: outboxRow.attempt_count,
+    next_attempt_at: outboxRow.next_attempt_at, last_error: outboxRow.last_error,
+    receipt_ref: outboxRow.receipt_ref,
+    payload: parseFixtureJson("mfg_report_delivery_review_effect_outbox", "payload_json"),
+  })]),
+  command_receipts: sortReconciliation([reconcileRecord("command_receipts", {
+    stable_ref: `${commandRow.domain}\u001f${commandRow.idempotency_key}`, status: "recorded",
+    domain: commandRow.domain, idempotency_key: commandRow.idempotency_key,
+    subject_ref: commandRow.subject_ref,
+    receipt: parseFixtureJson("mfg_command_receipt", "receipt_json"), created_at: commandRow.created_at,
+  })]),
+  mutation_receipts: sortReconciliation([mutationRecord]),
+  mutation_receipt_aliases: sortReconciliation([reconcileRecord("mutation_receipt_aliases", {
+    stable_ref: aliasRow.legacy_idempotency_key, status: "bound",
+    legacy_idempotency_key: aliasRow.legacy_idempotency_key,
+    canonical_receipt_stable_id: mutationRecord.receipt_id,
+    canonical_receipt_payload_digest: mutationRecord.payload_digest, created_at: aliasRow.created_at,
+  })]),
+  mutation_receipt_repairs: sortReconciliation([reconcileRecord("mutation_receipt_repairs", {
+    stable_ref: repairRow.report_id, status: "conflict_preserved", report_id: repairRow.report_id,
+    idempotency_key: repairRow.idempotency_key, existing_receipt: existingReceipt,
+    incoming_receipt: incomingReceipt,
+    existing_digest: hashDomain("cowd.ownership.repair-side.v1", existingReceipt),
+    incoming_digest: hashDomain("cowd.ownership.repair-side.v1", incomingReceipt),
+    conflict_fields: jsonDiffPaths(existingReceipt, incomingReceipt), created_at: repairRow.created_at,
+  })]),
 };
-const mutationTarget = comprehensiveReconciliationBody.mutation_receipts[0];
-comprehensiveReconciliationBody.mutation_receipt_aliases.push(reconcileRecord("mutation_receipt_aliases", { stable_ref: "legacy-1", status: "bound", legacy_idempotency_key: "legacy-1", canonical_receipt_stable_id: mutationTarget.stable_ref, canonical_receipt_payload_digest: mutationTarget.payload_digest, created_at: executionInputs.source_metadata.exported_at }));
-const existingReceipt = { status: "completed", revision: 1 };
-const incomingReceipt = { status: "completed", revision: 2 };
-comprehensiveReconciliationBody.mutation_receipt_repairs.push(reconcileRecord("mutation_receipt_repairs", { stable_ref: "repair-1", status: "conflict_preserved", report_id: "repair-1", idempotency_key: "mutation-1", existing_receipt: existingReceipt, incoming_receipt: incomingReceipt, existing_digest: hashDomain("cowd.ownership.repair-side.v1", existingReceipt), incoming_digest: hashDomain("cowd.ownership.repair-side.v1", incomingReceipt), conflict_fields: ["/revision"], created_at: executionInputs.source_metadata.exported_at }));
 const comprehensiveReconciliation = withDigest({ ...comprehensiveReconciliationBody, set_digest: "" }, "set_digest", "cowd.ownership.reconciliation.v1");
 
 const baselineObject = comprehensiveObjects.mfg_cockpit_view_version;
@@ -1233,6 +1323,13 @@ for (const [name, code, mutate] of [
   ["matrix-schema.json", "E_MATRIX_SCHEMA", (value) => { value.source.legacy_schema.id = 2; }],
   ["execution-profile.json", "E_EXECUTION_PROFILE", (value) => { value.source.execution_profile_digest = `sha256:${"d".repeat(64)}`; }],
   ["reconciliation.json", "E_RECONCILIATION", (value) => { value.reconciliation.pending_outbox[0].status = "unknown"; }],
+  ["reconciliation-object-projection.json", "E_RECONCILIATION", (value) => {
+    const record = value.reconciliation.pending_outbox[0];
+    record.action = "tampered-action";
+    record.payload_digest = hashDomain("cowd.ownership.reconcile.outbox.v1", Object.fromEntries(Object.entries(record).filter(([field]) => field !== "payload_digest")));
+    value.reconciliation = withDigest(value.reconciliation, "set_digest", "cowd.ownership.reconciliation.v1");
+    Object.assign(value, withDigest(value, "whole_snapshot_digest", "cowd.ownership.snapshot.v1"));
+  }],
 ]) {
   const value = structuredClone(comprehensiveSnapshot); mutate(value);
   emit(join(here, "golden", "tamper", name), { expected_rejection_code: code, snapshot: value });

@@ -7,7 +7,7 @@
     "exported_at": "2026-08-15T00:00:00Z",
     "maintenance_fence_id": "fixture-fence",
     "expected_legacy_schema_version": 1,
-    "ownership_contract_digest": "sha256:5e4f433154b1a5010018a3eb8d9e1de1fe061dd1105e9e6aa204f7ebd66841a7",
+    "ownership_contract_digest": "sha256:61ed3c6becf145fcf1029b4ee39b2ac4d0aa39177ae2e195fe7ec2b052f270e5",
     "external_catalog_digest": "sha256:1fecd1f83bf491ad4862986cfdfc41d14cdf0770db2f4ff6d0d517aaf9c7e874",
     "revision_baseline_digest": "sha256:ff2c7fe28c7d0f8090ee6f2ace0605dcdc517aa12babbff8395aa7e1b8708431",
     "execution_profile_digest": "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78",
@@ -56,5 +56,5 @@
       "regeneration": "start_empty_then_rebuild_from_authoritative_events"
     }
   ],
-  "whole_snapshot_digest": "sha256:f2e13a060753bae00f58407446ce435a4021e0d1e039906861d1ad225df8775a"
+  "whole_snapshot_digest": "sha256:91b9fbb25adc5ddf307b15f3c81df682bd65a8e40c611e5a85e0131397a28e35"
 }

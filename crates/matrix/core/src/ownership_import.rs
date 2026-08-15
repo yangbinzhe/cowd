@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const OWNERSHIP_CONTRACT_DIGEST_V1: &str =
-    "sha256:5e4f433154b1a5010018a3eb8d9e1de1fe061dd1105e9e6aa204f7ebd66841a7";
+    "sha256:61ed3c6becf145fcf1029b4ee39b2ac4d0aa39177ae2e195fe7ec2b052f270e5";
 pub const OWNERSHIP_CONTRACT_VERSION_V1: &str = "cowd.ownership-split/v1.2-final";
 pub const OWNERSHIP_EXECUTION_PROFILE_DIGEST_V1: &str =
     "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78";
@@ -601,6 +601,7 @@ impl MfgOwnershipSplitSnapshotV1 {
         validate_section(&self.mfg_domain, "mfg", MFG_TABLES)?;
         validate_section(&self.core_matrix_domain, "core", &core_table_names())?;
         validate_reconciliation(&self.reconciliation)?;
+        validate_reconciliation_source_projection(&self.mfg_domain, &self.reconciliation)?;
         validate_excluded(&self.excluded)?;
         verify_embedded(
             &self.mfg_domain,
@@ -1279,6 +1280,263 @@ fn validate_reconciliation(value: &OwnershipReconciliation) -> Result<(), Owners
     verify_embedded(value, "set_digest", "cowd.ownership.reconciliation.v1")
 }
 
+fn validate_reconciliation_source_projection(
+    section: &OwnershipImportSection,
+    reconciliation: &OwnershipReconciliation,
+) -> Result<(), OwnershipImportError> {
+    let receipts = reconciliation
+        .mutation_receipts
+        .iter()
+        .map(|record| (record.receipt_id.as_str(), record.payload_digest.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let actual = [
+        (
+            "mfg_report_delivery_review_effect_outbox",
+            records_without_digest(&reconciliation.pending_outbox)?,
+        ),
+        (
+            "mfg_command_receipt",
+            records_without_digest(&reconciliation.command_receipts)?,
+        ),
+        (
+            "mfg_mutation_receipt",
+            records_without_digest(&reconciliation.mutation_receipts)?,
+        ),
+        (
+            "mfg_mutation_receipt_alias",
+            records_without_digest(&reconciliation.mutation_receipt_aliases)?,
+        ),
+        (
+            "mfg_mutation_receipt_repair_report",
+            records_without_digest(&reconciliation.mutation_receipt_repairs)?,
+        ),
+    ]
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    let mut projected = BTreeMap::<&str, BTreeMap<String, Value>>::new();
+    for object in &section.objects {
+        let table = object.source_table.as_str();
+        if !actual.contains_key(table) {
+            continue;
+        }
+        let payload = &object.payload;
+        let projection = match table {
+            "mfg_report_delivery_review_effect_outbox" => {
+                let status = source_string(payload, "status")?;
+                if status == "completed" {
+                    None
+                } else {
+                    if !matches!(status, "pending" | "retry_wait" | "processing") {
+                        return Err(invalid("unclassified outbox reconciliation status"));
+                    }
+                    Some(serde_json::json!({
+                        "stable_ref": source_string(payload, "effect_id")?,
+                        "status": status,
+                        "action": source_string(payload, "action")?,
+                        "effect_key": source_string(payload, "effect_key")?,
+                        "attempt_count": source_u64(payload, "attempt_count")?,
+                        "next_attempt_at": source_optional_string(payload, "next_attempt_at")?,
+                        "last_error": source_optional_string(payload, "last_error")?,
+                        "receipt_ref": source_optional_string(payload, "receipt_ref")?,
+                        "payload": source_json(payload, "payload_json")?,
+                    }))
+                }
+            }
+            "mfg_command_receipt" => {
+                let domain = source_string(payload, "domain")?;
+                let idempotency_key = source_string(payload, "idempotency_key")?;
+                Some(serde_json::json!({
+                    "stable_ref": format!("{domain}\u{1f}{idempotency_key}"),
+                    "status": "recorded",
+                    "domain": domain,
+                    "idempotency_key": idempotency_key,
+                    "subject_ref": source_string(payload, "subject_ref")?,
+                    "receipt": source_json(payload, "receipt_json")?,
+                    "created_at": source_string(payload, "created_at")?,
+                }))
+            }
+            "mfg_mutation_receipt" => Some(serde_json::json!({
+                "stable_ref": source_string(payload, "receipt_id")?,
+                "status": source_string(payload, "status")?,
+                "receipt_id": source_string(payload, "receipt_id")?,
+                "idempotency_key": source_string(payload, "idempotency_key")?,
+                "actor_principal": source_string(payload, "actor_principal")?,
+                "action_id": source_string(payload, "action_id")?,
+                "resource_ref": source_string(payload, "resource_ref")?,
+                "expected_revision": source_value(payload, "expected_revision")?,
+                "result_revision": source_value(payload, "result_revision")?,
+                "mutation_payload_digest": source_string(payload, "payload_digest")?,
+                "lease_token": source_string(payload, "lease_token")?,
+                "response": source_json(payload, "response_json")?,
+                "contract_version": source_string(payload, "contract_version")?,
+                "created_at": source_string(payload, "created_at")?,
+                "updated_at": source_string(payload, "updated_at")?,
+            })),
+            "mfg_mutation_receipt_alias" => {
+                let legacy = source_string(payload, "legacy_idempotency_key")?;
+                let receipt_id = source_string(payload, "receipt_id")?;
+                let digest = receipts.get(receipt_id).ok_or_else(|| {
+                    invalid("mutation alias source references missing canonical receipt")
+                })?;
+                Some(serde_json::json!({
+                    "stable_ref": legacy,
+                    "status": "bound",
+                    "legacy_idempotency_key": legacy,
+                    "canonical_receipt_stable_id": receipt_id,
+                    "canonical_receipt_payload_digest": digest,
+                    "created_at": source_string(payload, "created_at")?,
+                }))
+            }
+            "mfg_mutation_receipt_repair_report" => {
+                let existing = source_json(payload, "existing_receipt_json")?;
+                let incoming = source_json(payload, "incoming_receipt_json")?;
+                let mut conflict_fields = Vec::new();
+                collect_json_diff_paths("", &existing, &incoming, &mut conflict_fields);
+                conflict_fields.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+                let report_id = source_string(payload, "report_id")?;
+                Some(serde_json::json!({
+                    "stable_ref": report_id,
+                    "status": "conflict_preserved",
+                    "report_id": report_id,
+                    "idempotency_key": source_string(payload, "idempotency_key")?,
+                    "existing_receipt": existing,
+                    "incoming_receipt": incoming,
+                    "existing_digest": domain_digest("cowd.ownership.repair-side.v1", &existing)?,
+                    "incoming_digest": domain_digest("cowd.ownership.repair-side.v1", &incoming)?,
+                    "conflict_fields": conflict_fields,
+                    "created_at": source_string(payload, "created_at")?,
+                }))
+            }
+            _ => unreachable!(),
+        };
+        if let Some(projection) = projection {
+            let stable = projection["stable_ref"]
+                .as_str()
+                .ok_or_else(|| invalid("projected reconciliation stable_ref missing"))?
+                .to_owned();
+            if projected
+                .entry(table)
+                .or_default()
+                .insert(stable, projection)
+                .is_some()
+            {
+                return Err(invalid("duplicate reconciliation source projection"));
+            }
+        }
+    }
+    for (table, actual_records) in actual {
+        if projected.remove(table).unwrap_or_default() != actual_records {
+            return Err(invalid(format!(
+                "reconciliation records do not exactly project source table {table}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn records_without_digest<T: Serialize>(
+    records: &[T],
+) -> Result<BTreeMap<String, Value>, OwnershipImportError> {
+    let mut values = BTreeMap::new();
+    for record in records {
+        let mut value = serde_json::to_value(record).map_err(|error| invalid(error.to_string()))?;
+        let stable_ref = value["stable_ref"]
+            .as_str()
+            .ok_or_else(|| invalid("reconciliation stable_ref missing"))?
+            .to_owned();
+        remove_digest_field(&mut value, "payload_digest")?;
+        if values.insert(stable_ref, value).is_some() {
+            return Err(invalid("duplicate reconciliation stable_ref"));
+        }
+    }
+    Ok(values)
+}
+
+fn source_value(
+    payload: &BTreeMap<String, Value>,
+    field: &str,
+) -> Result<Value, OwnershipImportError> {
+    payload
+        .get(field)
+        .cloned()
+        .ok_or_else(|| invalid(format!("reconciliation source field {field} missing")))
+}
+
+fn source_string<'a>(
+    payload: &'a BTreeMap<String, Value>,
+    field: &str,
+) -> Result<&'a str, OwnershipImportError> {
+    payload.get(field).and_then(Value::as_str).ok_or_else(|| {
+        invalid(format!(
+            "reconciliation source field {field} is not a string"
+        ))
+    })
+}
+
+fn source_optional_string<'a>(
+    payload: &'a BTreeMap<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, OwnershipImportError> {
+    match payload.get(field) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        _ => Err(invalid(format!(
+            "reconciliation source field {field} is not a nullable string"
+        ))),
+    }
+}
+
+fn source_u64(payload: &BTreeMap<String, Value>, field: &str) -> Result<u64, OwnershipImportError> {
+    payload
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| invalid(format!("reconciliation source field {field} is not a u64")))
+}
+
+fn source_json(
+    payload: &BTreeMap<String, Value>,
+    field: &str,
+) -> Result<Value, OwnershipImportError> {
+    let encoded = source_string(payload, field)?;
+    serde_json::from_str(encoded)
+        .map_err(|error| invalid(format!("reconciliation source field {field}: {error}")))
+}
+
+fn collect_json_diff_paths(prefix: &str, left: &Value, right: &Value, output: &mut Vec<String>) {
+    match (left, right) {
+        (Value::Object(left), Value::Object(right)) => {
+            let keys = left.keys().chain(right.keys()).collect::<BTreeSet<_>>();
+            for key in keys {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                let path = format!("{prefix}/{escaped}");
+                match (left.get(key), right.get(key)) {
+                    (Some(left), Some(right)) => {
+                        collect_json_diff_paths(&path, left, right, output);
+                    }
+                    _ => output.push(path),
+                }
+            }
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            for index in 0..left.len().max(right.len()) {
+                let path = format!("{prefix}/{index}");
+                match (left.get(index), right.get(index)) {
+                    (Some(left), Some(right)) => {
+                        collect_json_diff_paths(&path, left, right, output);
+                    }
+                    _ => output.push(path),
+                }
+            }
+        }
+        _ if left != right => output.push(if prefix.is_empty() {
+            "/".to_owned()
+        } else {
+            prefix.to_owned()
+        }),
+        _ => {}
+    }
+}
+
 fn verify_embedded(
     value: &impl Serialize,
     field: &str,
@@ -1532,12 +1790,13 @@ mod tests {
     }
 
     #[test]
-    fn nine_frozen_tamper_classes_fail_closed() {
+    fn ten_frozen_tamper_classes_fail_closed() {
         for bytes in [
             include_bytes!("../../../../contracts/ownership/v1/golden/tamper/catalog-digest-mismatch.json").as_slice(),
             include_bytes!("../../../../contracts/ownership/v1/golden/tamper/execution-profile.json").as_slice(),
             include_bytes!("../../../../contracts/ownership/v1/golden/tamper/matrix-schema.json").as_slice(),
             include_bytes!("../../../../contracts/ownership/v1/golden/tamper/reconciliation.json").as_slice(),
+            include_bytes!("../../../../contracts/ownership/v1/golden/tamper/reconciliation-object-projection.json").as_slice(),
             include_bytes!("../../../../contracts/ownership/v1/golden/tamper/reference-class.json").as_slice(),
             include_bytes!("../../../../contracts/ownership/v1/golden/tamper/revision-baseline.json").as_slice(),
             include_bytes!("../../../../contracts/ownership/v1/golden/tamper/unknown-contract-version.json").as_slice(),

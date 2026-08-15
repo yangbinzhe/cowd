@@ -29,6 +29,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::core_platform_operations::{
+    CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput, SurfaceOutboxListInput,
+    SurfaceOutboxListOutput, ACTION_PLAN_OPERATION_ID, SURFACE_OUTBOX_LIST_OPERATION_ID,
+};
 use super::{matrix_app_reality::MatrixAppRealityError, ContextService};
 use matrix_repository::MatrixStore;
 
@@ -247,6 +251,16 @@ pub(crate) fn definitions() -> Result<Vec<CoreMatrixOperationDefinition>, CoreMa
             "skill.entity_impact_batch",
             OperationKindV1::Query,
         ),
+        platform_definition::<CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput>(
+            ACTION_PLAN_OPERATION_ID,
+            "core.cross_plane.read",
+            "cross_plane.plan.governed",
+        ),
+        platform_definition::<SurfaceOutboxListInput, SurfaceOutboxListOutput>(
+            SURFACE_OUTBOX_LIST_OPERATION_ID,
+            "core.surface.outbox.read",
+            "surface.outbox.query.governed",
+        ),
     ]
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
@@ -259,12 +273,57 @@ pub(crate) fn definitions() -> Result<Vec<CoreMatrixOperationDefinition>, CoreMa
         .iter()
         .map(|value| value.descriptor.operation_id.as_str())
         .collect::<BTreeSet<_>>();
-    if values.len() != 42 || ids.len() != 42 {
+    if values.len() != 44 || ids.len() != 44 {
         return Err(CoreMatrixCatalogError::Invalid(
-            "authority must contain exactly 42 unique operations".to_string(),
+            "authority must contain exactly 44 unique operations".to_string(),
         ));
     }
     Ok(values)
+}
+
+fn platform_definition<I: JsonSchema, O: JsonSchema>(
+    operation_id: &'static str,
+    core_capability: &'static str,
+    audit_classification: &'static str,
+) -> Result<CoreMatrixOperationDefinition, CoreMatrixCatalogError> {
+    let input_schema = canonicalize(
+        serde_json::to_value(schema_for!(I))
+            .map_err(|error| CoreMatrixCatalogError::Invalid(error.to_string()))?,
+    );
+    let output_schema = canonicalize(
+        serde_json::to_value(schema_for!(O))
+            .map_err(|error| CoreMatrixCatalogError::Invalid(error.to_string()))?,
+    );
+    let descriptor = OperationDescriptorV1 {
+        operation_id: operation_id.to_owned(),
+        kind: OperationKindV1::Query,
+        input_schema_digest: schema_digest(&input_schema)?,
+        output_schema_digest: schema_digest(&output_schema)?,
+        required_capabilities: vec![core_capability.to_owned()],
+        delegation: OperationDelegationV1::Either,
+        tenant_scoped: false,
+        workspace_scoped: true,
+        read_only: true,
+        idempotency: IdempotencySemanticsV1::ReadOnly,
+        default_deadline_ms: 10_000,
+        maximum_deadline_ms: 30_000,
+        maximum_request_bytes: 1024 * 1024,
+        maximum_response_bytes: 4 * 1024 * 1024,
+        maximum_frame_bytes: 1024 * 1024,
+        streaming: false,
+        replay_window_seconds: None,
+        degraded_read_allowed: false,
+        audit_classification: audit_classification.to_owned(),
+    };
+    descriptor
+        .validate()
+        .map_err(|error| CoreMatrixCatalogError::Invalid(error.to_string()))?;
+    Ok(CoreMatrixOperationDefinition {
+        short_id: operation_id,
+        descriptor,
+        input_schema,
+        output_schema,
+    })
 }
 
 pub(crate) fn projected_catalog(
@@ -292,9 +351,24 @@ pub(crate) fn projected_catalog(
                 requirement.core_operation_id.clone(),
             ));
         }
+        let insertion = match descriptor
+            .required_capabilities
+            .binary_search(&requirement.required_app_capability)
+        {
+            Ok(_) => {
+                return Err(CoreMatrixCatalogError::RequirementMismatch(
+                    requirement.core_operation_id.clone(),
+                ));
+            }
+            Err(index) => index,
+        };
         descriptor
-            .required_capability
-            .clone_from(&requirement.required_app_capability);
+            .required_capabilities
+            .insert(insertion, requirement.required_app_capability.clone());
+        descriptor
+            .validate()
+            .map_err(|error| CoreMatrixCatalogError::Invalid(error.to_string()))?;
+        validate_projected_capabilities(manifest, &descriptor)?;
         operations.push(descriptor);
     }
     operations.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
@@ -317,6 +391,41 @@ pub(crate) fn projected_catalog(
     Ok(catalog)
 }
 
+pub(crate) fn validate_projected_capabilities(
+    manifest: &AppManifestV1,
+    descriptor: &OperationDescriptorV1,
+) -> Result<(), CoreMatrixCatalogError> {
+    let authority = definitions()?
+        .into_iter()
+        .find(|definition| definition.descriptor.operation_id == descriptor.operation_id)
+        .ok_or_else(|| {
+            CoreMatrixCatalogError::UnknownRequirement(descriptor.operation_id.clone())
+        })?;
+    let requirement = manifest
+        .core_bridge_requirements
+        .iter()
+        .find(|requirement| requirement.core_operation_id == descriptor.operation_id)
+        .ok_or_else(|| {
+            CoreMatrixCatalogError::UnknownRequirement(descriptor.operation_id.clone())
+        })?;
+    let mut expected = authority.descriptor.required_capabilities;
+    let insertion = match expected.binary_search(&requirement.required_app_capability) {
+        Ok(_) => {
+            return Err(CoreMatrixCatalogError::RequirementMismatch(
+                descriptor.operation_id.clone(),
+            ));
+        }
+        Err(index) => index,
+    };
+    expected.insert(insertion, requirement.required_app_capability.clone());
+    if descriptor.required_capabilities != expected {
+        return Err(CoreMatrixCatalogError::RequirementMismatch(
+            descriptor.operation_id.clone(),
+        ));
+    }
+    Ok(())
+}
+
 fn definition<I: JsonSchema, O: JsonSchema>(
     short_id: &'static str,
     kind: OperationKindV1,
@@ -335,11 +444,11 @@ fn definition<I: JsonSchema, O: JsonSchema>(
         kind,
         input_schema_digest: schema_digest(&input_schema)?,
         output_schema_digest: schema_digest(&output_schema)?,
-        required_capability: if read_only {
+        required_capabilities: vec![if read_only {
             READ_CAPABILITY.to_string()
         } else {
             WRITE_CAPABILITY.to_string()
-        },
+        }],
         delegation: OperationDelegationV1::Either,
         tenant_scoped: false,
         workspace_scoped: true,
@@ -729,15 +838,30 @@ mod tests {
         let authority = definitions().expect("authority");
         let authority_ids = authority
             .iter()
+            .filter(|definition| definition.descriptor.operation_id.starts_with(CORE_PREFIX))
             .map(|definition| definition.short_id)
             .collect::<BTreeSet<_>>();
         let dispatcher_ids = super::super::matrix_app_reality::MATRIX_APP_OPERATIONS
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        assert_eq!(authority.len(), 42);
+        assert_eq!(authority.len(), 44);
         assert_eq!(dispatcher_ids.len(), 42);
         assert_eq!(authority_ids, dispatcher_ids);
+        let platform_authority_ids = authority
+            .iter()
+            .filter(|definition| !definition.descriptor.operation_id.starts_with(CORE_PREFIX))
+            .map(|definition| definition.descriptor.operation_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let platform_dispatcher_ids =
+            super::super::core_platform_operations::PLATFORM_OPERATION_IDS
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+        assert_eq!(platform_dispatcher_ids.len(), 2);
+        assert_eq!(platform_authority_ids, platform_dispatcher_ids);
+        assert!(platform_dispatcher_ids
+            .iter()
+            .all(|operation_id| super::super::core_platform_operations::supports(operation_id)));
         for definition in authority {
             definition.descriptor.validate().expect("descriptor");
             assert!(definition.input_schema.is_object());
@@ -792,9 +916,9 @@ mod tests {
             .map(|operation_id| {
                 let definition = by_id.get(operation_id).expect("definition");
                 let capability = if definition.descriptor.read_only {
-                    "app.mfg.read"
+                    "mfg.read"
                 } else {
-                    "app.mfg.write"
+                    "mfg.write"
                 };
                 CoreBridgeRequirementV1 {
                     app_operation_id: operation_id.replacen("core.matrix.", "mfg.reality.", 1),
@@ -821,9 +945,64 @@ mod tests {
         );
         let catalog = projected_catalog(&manifest, &generation).expect("projected catalog");
         assert_eq!(catalog.operations.len(), 39);
+        for descriptor in &catalog.operations {
+            let core_capability = if descriptor.read_only {
+                "core.matrix.read"
+            } else {
+                "core.matrix.write"
+            };
+            let app_capability = if descriptor.read_only {
+                "mfg.read"
+            } else {
+                "mfg.write"
+            };
+            assert_eq!(
+                descriptor.required_capabilities,
+                vec![core_capability.to_string(), app_capability.to_string()]
+            );
+            validate_projected_capabilities(&manifest, descriptor)
+                .expect("projection retains Core authority and signed APP capability");
+        }
         catalog
             .validate_for_manifest(&manifest, &generation)
             .expect("catalog validates against signed requirements");
+    }
+
+    #[test]
+    fn projected_capabilities_reject_forged_core_authority() {
+        let definition = definitions()
+            .expect("authority")
+            .into_iter()
+            .find(|definition| definition.short_id == "health")
+            .expect("health");
+        let mut manifest = fixture_manifest(vec![CoreBridgeRequirementV1 {
+            app_operation_id: "mfg.health".to_string(),
+            core_operation_id: definition.descriptor.operation_id.clone(),
+            accepted_input_schema_digest: definition.descriptor.input_schema_digest.clone(),
+            accepted_output_schema_digest: definition.descriptor.output_schema_digest.clone(),
+            required_app_capability: "mfg.read".to_string(),
+            kind: definition.descriptor.kind,
+            streaming: false,
+        }]);
+        manifest
+            .bind_canonical_signed_digest()
+            .expect("manifest digest");
+        let generation = GenerationId(
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        );
+        let catalog = projected_catalog(&manifest, &generation).expect("projected catalog");
+        let descriptor = &catalog.operations[0];
+        validate_projected_capabilities(&manifest, descriptor).expect("authority projection");
+
+        let mut forged = descriptor.clone();
+        forged
+            .required_capabilities
+            .insert(1, "core.matrix.write".to_string());
+        assert!(validate_projected_capabilities(&manifest, &forged).is_err());
+
+        let mut missing_core = descriptor.clone();
+        missing_core.required_capabilities.remove(0);
+        assert!(validate_projected_capabilities(&manifest, &missing_core).is_err());
     }
 
     #[test]
@@ -842,7 +1021,7 @@ mod tests {
                     .to_string(),
             ),
             accepted_output_schema_digest: definition.descriptor.output_schema_digest,
-            required_app_capability: "app.mfg.write".to_string(),
+            required_app_capability: "mfg.write".to_string(),
             kind: OperationKindV1::Command,
             streaming: false,
         }];
@@ -873,11 +1052,11 @@ mod tests {
             required_protocol: ProtocolRangeV1::exact_v1(),
             executable: "bin/mfg-worker".to_string(),
             web_root: None,
-            capabilities: vec!["app.mfg.read".to_string(), "app.mfg.write".to_string()],
+            capabilities: vec!["mfg.read".to_string(), "mfg.write".to_string()],
             authorization_profiles: vec![AuthorizationProfileV1 {
                 profile_id: "operator".to_string(),
                 display_name: "Operator".to_string(),
-                capabilities: vec!["app.mfg.read".to_string(), "app.mfg.write".to_string()],
+                capabilities: vec!["mfg.read".to_string(), "mfg.write".to_string()],
                 surface_capabilities: BTreeMap::new(),
                 is_default: true,
             }],

@@ -1497,8 +1497,12 @@ impl LocalAuthority {
 /// signer back into the Gateway production API surface.
 #[cfg(feature = "test-support")]
 pub mod test_support {
-    use std::{collections::BTreeMap, path::Path};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        path::Path,
+    };
 
+    use cowd_app_protocol::AppId;
     use harness_contract::security::{SignedDecisionLease, SignedPrincipalEnvelope};
 
     use super::{
@@ -1506,14 +1510,84 @@ pub mod test_support {
         AuthorizationProfile, LocalAuthority,
     };
 
-    /// Test-only permissive catalogue. It is not linked into production: the
-    /// real broker receives its catalogue from the product APP registry.
+    /// Test-only catalogue derived from the same Core/APP ownership boundary
+    /// as production. It is not linked into production: the real broker
+    /// receives its catalogue from the product APP registry.
     #[must_use]
     pub fn catalog_for_capabilities(capabilities: Vec<String>) -> AuthorizationCatalog {
-        let mut capabilities = capabilities;
-        capabilities.sort();
-        capabilities.dedup();
-        AuthorizationCatalog {
+        match try_catalog_for_capabilities(capabilities) {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                panic!("test capabilities must define valid Core or APP namespaces: {error}")
+            }
+        }
+    }
+
+    fn try_catalog_for_capabilities(
+        capabilities: Vec<String>,
+    ) -> Result<AuthorizationCatalog, AuthBrokerError> {
+        let core_capabilities = harness_contract::security::CORE_HUMAN_CAPABILITIES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut unique = BTreeSet::new();
+        let mut core = Vec::new();
+        let mut by_app = BTreeMap::<String, Vec<String>>::new();
+        for capability in capabilities {
+            if capability.trim().is_empty() || !unique.insert(capability.clone()) {
+                return Err(AuthBrokerError::InvalidCredentialState(
+                    "test capability set contains an empty or duplicate entry".to_string(),
+                ));
+            }
+            if core_capabilities.contains(capability.as_str()) {
+                core.push(capability);
+                continue;
+            }
+            let (app_id, suffix) = capability.split_once('.').ok_or_else(|| {
+                AuthBrokerError::InvalidCredentialState(format!(
+                    "test APP capability `{capability}` has no APP namespace"
+                ))
+            })?;
+            if suffix.is_empty() {
+                return Err(AuthBrokerError::InvalidCredentialState(format!(
+                    "test APP capability `{capability}` has an empty capability name"
+                )));
+            }
+            AppId(app_id.to_string())
+                .validate_value()
+                .map_err(|error| {
+                    AuthBrokerError::InvalidCredentialState(format!(
+                        "test APP capability `{capability}` has an invalid APP namespace: {error}"
+                    ))
+                })?;
+            by_app
+                .entry(app_id.to_string())
+                .or_default()
+                .push(capability);
+        }
+        core.sort();
+        let apps = by_app
+            .into_iter()
+            .map(|(app_id, mut capabilities)| {
+                capabilities.sort();
+                let profile_id = format!("{app_id}_manager");
+                AuthorizationAppProfileCatalog {
+                    app_id,
+                    default_profile_id: profile_id.clone(),
+                    profiles: vec![AuthorizationProfile {
+                        id: profile_id,
+                        capabilities: capabilities.clone(),
+                    }],
+                    surface_capabilities: BTreeMap::from([
+                        ("backend".to_string(), capabilities.clone()),
+                        ("webui".to_string(), capabilities.clone()),
+                        ("tui".to_string(), capabilities.clone()),
+                        ("cli".to_string(), capabilities),
+                    ]),
+                }
+            })
+            .collect();
+        let catalog = AuthorizationCatalog {
             schema_version: 1,
             core_profiles: vec![
                 AuthorizationProfile {
@@ -1522,24 +1596,13 @@ pub mod test_support {
                 },
                 AuthorizationProfile {
                     id: "core_manager".to_string(),
-                    capabilities: capabilities.clone(),
+                    capabilities: core,
                 },
             ],
-            apps: vec![AuthorizationAppProfileCatalog {
-                app_id: "fixture".to_string(),
-                default_profile_id: "fixture_manager".to_string(),
-                profiles: vec![AuthorizationProfile {
-                    id: "fixture_manager".to_string(),
-                    capabilities: capabilities.clone(),
-                }],
-                surface_capabilities: BTreeMap::from([
-                    ("backend".to_string(), capabilities.clone()),
-                    ("webui".to_string(), capabilities.clone()),
-                    ("tui".to_string(), capabilities.clone()),
-                    ("cli".to_string(), capabilities.clone()),
-                ]),
-            }],
-        }
+            apps,
+        };
+        catalog.validate()?;
+        Ok(catalog)
     }
 
     pub fn issue_human_principal(
@@ -1548,10 +1611,15 @@ pub mod test_support {
         capabilities: Vec<String>,
         ttl_ms: Option<u64>,
     ) -> Result<(SignedPrincipalEnvelope, String), AuthBrokerError> {
-        let catalog = catalog_for_capabilities(capabilities.clone());
+        let catalog = try_catalog_for_capabilities(capabilities.clone())?;
         let mut authority = LocalAuthority::open_or_initialize(root, credential, catalog)?;
         authority.credential_state.core_profile_id = "core_manager".to_string();
-        authority.credential_state.entitled_capabilities = capabilities;
+        let (_, app_profiles) = authority.catalog.default_selection();
+        authority.credential_state.app_profiles = app_profiles;
+        authority.credential_state.entitled_capabilities = authority.catalog.capabilities_for(
+            &authority.credential_state.core_profile_id,
+            &authority.credential_state.app_profiles,
+        )?;
         let (envelope, _) = authority.issue_human_principal_for_surface(
             credential,
             "legacy_gateway",
@@ -1585,6 +1653,69 @@ pub mod test_support {
             expires_at_ms,
         )?;
         Ok((lease, authority.public_key_base64()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_catalog_separates_core_and_multiple_app_namespaces() {
+            let Ok(catalog) = try_catalog_for_capabilities(vec![
+                "reference-app.write".to_string(),
+                "approval.respond".to_string(),
+                "mfg.write".to_string(),
+                "mfg.read".to_string(),
+                "reference-app.read".to_string(),
+            ]) else {
+                panic!("multi-APP test catalog must be valid");
+            };
+            let Some(core_manager) = catalog
+                .core_profiles
+                .iter()
+                .find(|profile| profile.id == "core_manager")
+            else {
+                panic!("test catalog must contain Core manager");
+            };
+
+            assert_eq!(
+                core_manager.capabilities,
+                vec!["approval.respond".to_string()]
+            );
+            assert_eq!(
+                catalog
+                    .apps
+                    .iter()
+                    .map(|app| app.app_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["mfg", "reference-app"]
+            );
+            assert_eq!(
+                catalog.apps[0].profiles[0].capabilities,
+                vec!["mfg.read".to_string(), "mfg.write".to_string()]
+            );
+            assert_eq!(
+                catalog.apps[1].profiles[0].capabilities,
+                vec![
+                    "reference-app.read".to_string(),
+                    "reference-app.write".to_string()
+                ]
+            );
+            assert!(catalog.validate().is_ok());
+        }
+
+        #[test]
+        fn test_catalog_rejects_ambiguous_or_invalid_app_capabilities() {
+            for capabilities in [
+                vec!["".to_string()],
+                vec!["missing_namespace".to_string()],
+                vec!["mfg.".to_string()],
+                vec!["Invalid.read".to_string()],
+                vec!["mfg.read".to_string(), "mfg.read".to_string()],
+            ] {
+                assert!(try_catalog_for_capabilities(capabilities).is_err());
+            }
+        }
     }
 }
 
