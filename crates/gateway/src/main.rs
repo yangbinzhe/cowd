@@ -56,6 +56,8 @@ mod matrix_store;
 mod mcp_serve;
 #[path = "infrastructure/ownership_cutover_contract.rs"]
 mod ownership_cutover_contract;
+#[path = "infrastructure/ownership_cutover_coordinator.rs"]
+pub mod ownership_cutover_coordinator;
 #[path = "static/plugin_static.rs"]
 mod plugin_static;
 #[path = "runtime/runtime_bootstrap.rs"]
