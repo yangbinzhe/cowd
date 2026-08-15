@@ -39,8 +39,7 @@ use crate::app_platform::{
     GatewayAppConnection, GatewayAppConnector, GatewayAppPlatform, PROTOCOL_DIGEST_V1,
 };
 
-const APP_STATIC_CONTENT_SECURITY_POLICY: &str =
-    "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'self'";
+const APP_STATIC_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
 
 pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::AppState>> {
     Router::new()
@@ -1791,6 +1790,9 @@ mod tests {
             .to_str()
             .expect("static CSP");
         assert!(csp.contains("frame-ancestors 'self'"));
+        assert!(csp.contains("script-src 'self'"));
+        assert!(csp.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(csp.contains("connect-src 'none'"));
         assert!(!csp.contains("frame-ancestors *"));
         assert!(!csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("object-src 'none'"));
