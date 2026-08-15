@@ -170,7 +170,7 @@ impl ApprovalService {
             .min(u128::from(u64::MAX)) as u64;
         let cutoff = now_ms.saturating_sub(older_than_days.saturating_mul(86_400_000));
         let mut ids = Vec::new();
-        for request in services.approval_queue().list() {
+        for request in services.approval_queue().pending() {
             if self.approval_visible_to(&request, principal).await
                 && request.created_at_ms < cutoff
                 && request.status == runtime::GlobalApprovalStatus::Pending
@@ -1193,6 +1193,10 @@ mod tests {
             .backdate_created_at_for_test(&pending.approval_id, old)
             .expect("backdate pending");
         let decided = submit("prune-decided-1", session_source("decided"));
+        services
+            .approval_queue()
+            .backdate_created_at_for_test(&decided.approval_id, old)
+            .expect("backdate decided before its terminal decision");
         service
             .respond(
                 &decided.approval_id,
@@ -1204,11 +1208,6 @@ mod tests {
             )
             .await
             .expect("decide approval");
-        services
-            .approval_queue()
-            .backdate_created_at_for_test(&decided.approval_id, old)
-            .expect("backdate decided");
-
         let result = service
             .prune(30, Some("housekeeping".to_string()), &operator)
             .await

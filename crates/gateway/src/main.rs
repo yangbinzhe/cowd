@@ -6973,23 +6973,56 @@ UU conflicted.rs",
             let request_id = format!("gateway-mcp-test:{tool_name}");
             let negotiator = runtime::AuthorizationNegotiator::new();
             let policy = runtime::PermissionPolicy::new(PermissionMode::DangerFullAccess);
-            let evaluated = negotiator.assess_effective(
-                &policy,
-                &runtime::AuthorizationRequest {
-                    principal_id: "test:gateway-mcp".to_string(),
-                    capability: descriptor.tool_id.clone(),
-                    input: value.to_string(),
-                    idempotency_key: request_id.clone(),
-                    effect: descriptor.clone(),
-                    parent_ceiling: PermissionMode::DangerFullAccess,
-                    parent_lease_id: None,
-                    policy_revision: 1,
-                    recovery_scope: request_id.clone(),
-                    context: runtime::PermissionContext::default(),
-                    safe_alternatives: Vec::new(),
+            let request = runtime::AuthorizationRequest {
+                principal_id: "test:gateway-mcp".to_string(),
+                capability: descriptor.tool_id.clone(),
+                input: value.to_string(),
+                idempotency_key: request_id.clone(),
+                effect: descriptor.clone(),
+                parent_ceiling: PermissionMode::DangerFullAccess,
+                parent_lease_id: None,
+                policy_revision: 1,
+                recovery_scope: request_id.clone(),
+                context: runtime::PermissionContext::default(),
+                safe_alternatives: Vec::new(),
+            };
+            let evaluated = negotiator.assess_effective(&policy, &request);
+            let assessment = evaluated.assessment.lease.clone().map_or_else(
+                || {
+                    negotiator.approve_effective(
+                        &policy,
+                        &request,
+                        &evaluated.effective,
+                        &harness_contract::policy::ApprovalGrant {
+                            grant_id: format!("grant:{request_id}"),
+                            approval_id: format!("approval:{request_id}"),
+                            scope: harness_contract::policy::ApprovalGrantScope::Once,
+                            principal_id: request.principal_id.clone(),
+                            profile_id: "gateway-mcp-test".to_string(),
+                            workspace_key: "gateway-mcp-test".to_string(),
+                            capability: request.capability.clone(),
+                            session_id: Some("gateway-mcp-session".to_string()),
+                            turn_id: None,
+                            task_id: None,
+                            invocation_id: Some(request_id.clone()),
+                            resource_targets: Vec::new(),
+                            effect_descriptor_hash: Some(descriptor.descriptor_hash.clone()),
+                            risk_ceiling: harness_contract::core::TaskRisk::Critical,
+                            policy_revision: 1,
+                            status: harness_contract::policy::ApprovalGrantStatus::Active,
+                            issued_by: harness_contract::policy::ApprovalDecisionActor {
+                                kind: harness_contract::policy::ApprovalDecisionActorKind::Human,
+                                actor_id: "gateway-mcp-test-human".to_string(),
+                            },
+                            created_at_ms: 1,
+                            expires_at_ms: None,
+                            revoked_at_ms: None,
+                            revoke_reason: None,
+                        },
+                    )
                 },
+                |_| evaluated.assessment.clone(),
             );
-            let assessment = evaluated.assessment;
             let authorization = runtime::ToolPolicy
                 .authorize(
                     &evaluated.effective,

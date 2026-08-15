@@ -251,6 +251,20 @@ impl CrossPlaneService {
             .session_id
             .clone()
             .unwrap_or_else(|| format!("system:cross-plane:{idempotency_key}"));
+        let fallback_policy = action.session_id.is_none().then(|| {
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Supervised,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::ConfigDefault,
+            )
+        });
+        let fallback_policy_binding = fallback_policy.as_ref().map(|policy| {
+            harness_contract::policy::ExecutionPolicyBinding::bind(
+                &operation_session_id,
+                policy,
+                policy.permission_mode,
+            )
+        });
         let operation_turn_id = format!("turn:cross-plane:{idempotency_key}");
         let route = runtime::materialize_session_task_route(
             &self.runtime_services,
@@ -267,7 +281,7 @@ impl CrossPlaneService {
             None,
             harness_contract::task::TaskOrigin::System,
             None,
-            None,
+            fallback_policy_binding.as_ref(),
         )
         .await
         .map_err(CrossPlaneCommitGraphError::State)?;

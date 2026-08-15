@@ -3198,6 +3198,19 @@ mod tests {
             .authorization
     }
 
+    async fn execute_signed_test_tool(
+        executor: &GatewayToolExecutor,
+        tool_name: &str,
+        input: &str,
+        policy_revision: u64,
+    ) -> Result<String, ToolError> {
+        let value = serde_json::from_str(input).expect("test tool input JSON");
+        let authorization = signed_test_authorization(executor, tool_name, &value, policy_revision);
+        executor
+            .execute_authorized(&authorization, tool_name, input)
+            .await
+    }
+
     #[tokio::test]
     async fn production_control_writes_require_authentic_current_session_authorization() {
         let registry = GatewayToolRegistry::builtin()
@@ -3946,13 +3959,14 @@ mod tests {
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
             .unwrap();
 
-        let output = executor
-            .execute(
-                "runtime_orchestrate",
-                r#"{"intent":"检查 Runtime 状态","operation":"inspect"}"#,
-            )
-            .await
-            .expect("runtime orchestrate should execute without MCP");
+        let output = execute_signed_test_tool(
+            &executor,
+            "runtime_orchestrate",
+            r#"{"intent":"检查 Runtime 状态","operation":"inspect"}"#,
+            1,
+        )
+        .await
+        .expect("runtime orchestrate should execute without MCP");
 
         assert!(output.contains("runtime-orch-"));
         assert!(output.contains("inspected"));
@@ -3982,13 +3996,14 @@ mod tests {
             .expect("runtime tool registry");
         let executor = GatewayToolExecutor::new(None, false, registry);
 
-        let error = executor
-            .execute(
-                "runtime_orchestrate",
-                r#"{"intent":"review","operation":"propose","input_refs":["wrong-level"]}"#,
-            )
-            .await
-            .expect_err("unknown top-level field must be rejected before execution");
+        let error = execute_signed_test_tool(
+            &executor,
+            "runtime_orchestrate",
+            r#"{"intent":"review","operation":"propose","input_refs":["wrong-level"]}"#,
+            2,
+        )
+        .await
+        .expect_err("unknown top-level field must be rejected before execution");
         let failure = error.failure().expect("typed failure");
         assert_eq!(
             failure.class,
@@ -4069,13 +4084,14 @@ mod tests {
         )
         .expect("capability json");
         let orchestration: serde_json::Value = serde_json::from_str(
-            &executor
-                .execute(
-                    "runtime_orchestrate",
-                    r#"{"intent":"换一个描述也必须复用当前 turn 决策","operation":"inspect"}"#,
-                )
-                .await
-                .expect("orchestration"),
+            &execute_signed_test_tool(
+                &executor,
+                "runtime_orchestrate",
+                r#"{"intent":"换一个描述也必须复用当前 turn 决策","operation":"inspect"}"#,
+                3,
+            )
+            .await
+            .expect("orchestration"),
         )
         .expect("orchestration json");
 
@@ -4114,12 +4130,13 @@ mod tests {
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
             .unwrap();
 
-        let error = executor
-            .execute(
-                "runtime_orchestrate",
-                r#"{"intent":"需要多 Agent 协同审查架构","operation":"propose","proposal":{"mutation_id":"missing-runtime-team","reason":"test","nodes":[{"node_id":"team","recipe":"team","objective":"审查架构"}]}}"#,
-            )
-            .await
+        let error = execute_signed_test_tool(
+            &executor,
+            "runtime_orchestrate",
+            r#"{"intent":"需要多 Agent 协同审查架构","operation":"propose","proposal":{"mutation_id":"missing-runtime-team","reason":"test","nodes":[{"node_id":"team","recipe":"team","objective":"审查架构"}]}}"#,
+            4,
+        )
+        .await
             .expect_err("unavailable team orchestration must not be reported as a successful tool");
 
         assert!(
@@ -4158,13 +4175,14 @@ mod tests {
             .bind_runtime_services(runtime::RuntimeServices::in_memory().unwrap())
             .unwrap();
 
-        let output = executor
-            .execute(
-                "runtime_orchestrate",
-                r#"{"intent":"检查 Runtime 状态","operation":"inspect"}"#,
-            )
-            .await
-            .expect("gateway-bound runtime orchestrate should inject a tool host");
+        let output = execute_signed_test_tool(
+            &executor,
+            "runtime_orchestrate",
+            r#"{"intent":"检查 Runtime 状态","operation":"inspect"}"#,
+            5,
+        )
+        .await
+        .expect("gateway-bound runtime orchestrate should inject a tool host");
 
         let response: serde_json::Value = serde_json::from_str(&output).expect("typed response");
         assert_eq!(response["status"], "inspected");

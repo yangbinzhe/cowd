@@ -25,4 +25,6 @@ cargo run --locked --offline --release --manifest-path "$REFERENCE_ROOT/Cargo.to
 echo "[reference-app] Gateway catalog, supervisor, invoke, stream and TUI proxy"
 COWD_REFERENCE_APP_BUNDLE="$ARTIFACT_ROOT/reference-app" \
 COWD_REFERENCE_APP_PUBLIC_KEY_BASE64URL="$PUBLIC_KEY" \
-  cargo test --locked -p gateway reference_bundle_gateway_proxy_e2e
+  cargo test --locked -p gateway --lib \
+    api_routes::app_routes::tests::reference_bundle_gateway_proxy_e2e -- \
+    --ignored --exact --test-threads=1

@@ -1981,6 +1981,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "run via scripts/test/reference-app.sh"]
     async fn reference_bundle_gateway_proxy_e2e() {
         let bundle = std::env::var("COWD_REFERENCE_APP_BUNDLE")
             .expect("COWD_REFERENCE_APP_BUNDLE must name a packaged reference Bundle");

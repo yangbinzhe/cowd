@@ -3689,7 +3689,10 @@ pub(crate) mod tests {
         let snapshot: serde_json::Value =
             serde_json::from_slice(&to_bytes(snapshot.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
-        assert_eq!(snapshot["turns"][0]["turn_id"], turn_id);
+        assert!(
+            snapshot["turns"].as_array().is_some_and(Vec::is_empty),
+            "terminal turns must leave the active Runtime snapshot: {snapshot}"
+        );
     }
 
     #[tokio::test]
@@ -4274,6 +4277,17 @@ pub(crate) mod tests {
                                 "acceptance": ["summary", "evidence"],
                                 "permission_ceiling": "workspace-write",
                                 "model_lease": "default",
+                                "execution_budget": {
+                                    "budget_id": "mission-route-team-budget",
+                                    "predicted_tokens": 32768,
+                                    "predicted_cost_microusd": 2457600,
+                                    "max_tokens": 65536,
+                                    "max_cost_microusd": 4915200,
+                                    "deadline_at_ms": u64::MAX,
+                                    "max_parallel": 4,
+                                    "revision": 1
+                                },
+                                "deadline_at_ms": u64::MAX,
                                 "resource_scopes": ["write:crates/runtime"]
                             }
                         })
@@ -4292,7 +4306,7 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&team_body)
         );
         let team_json: serde_json::Value = serde_json::from_slice(&team_body).unwrap();
-        assert_eq!(team_json["ok"], true);
+        assert_eq!(team_json["ok"], true, "{team_json}");
         assert_eq!(team_json["saga"]["phase"], "finalized");
         assert!(team_json["receipt"]["result"]["graph_id"]
             .as_str()
@@ -5449,7 +5463,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn matrix_fact_and_evidence_append_execution_outcomes_to_runtime_timeline() {
+    async fn matrix_fact_and_evidence_append_execution_summaries_to_runtime_timeline() {
         let workspace = test_temp_dir("matrix-outcome-timeline");
         let config_home = test_temp_dir("matrix-outcome-config");
         let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
@@ -5536,7 +5550,7 @@ pub(crate) mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|event| event["kind"] == "application.execution_outcome")
+            .filter(|event| event["kind"] == "application.execution_summary")
             .collect::<Vec<_>>();
         assert_eq!(outcome_events.len(), 2);
         assert!(outcome_events.iter().any(|event| {
@@ -11604,7 +11618,9 @@ providers:
 
     #[tokio::test]
     async fn connector_service_commit_consumes_single_use_grant_after_effect_receipt() {
-        let app = api_router(test_state());
+        let state = test_state();
+        publish_test_session_policy(&state.services, "service-commit-session");
+        let app = api_router(state);
         let suffix = uuid::Uuid::new_v4().to_string();
         let principal = gateway_test_actor();
         let capability = "service.local.docs.read";

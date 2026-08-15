@@ -6496,7 +6496,17 @@ mod tests {
                 last_activity: now.clone(),
                 message_count: 0,
                 reset_policy: "manual".to_string(),
-                metadata_json: Some(serde_json::json!({ "execution_policy": policy }).to_string()),
+                metadata_json: Some(
+                    serde_json::json!({
+                        "execution_policy": policy,
+                        "execution_policy_state": {
+                            "effective": policy,
+                            "desired": null,
+                            "pending_transition": null
+                        }
+                    })
+                    .to_string(),
+                ),
                 input_tokens: 0,
                 output_tokens: 0,
                 estimated_cost_usd: 0.0,
@@ -6620,7 +6630,17 @@ mod tests {
                 last_activity: now,
                 message_count: 0,
                 reset_policy: "manual".to_string(),
-                metadata_json: Some(serde_json::json!({ "execution_policy": prior }).to_string()),
+                metadata_json: Some(
+                    serde_json::json!({
+                        "execution_policy": prior,
+                        "execution_policy_state": {
+                            "effective": prior,
+                            "desired": null,
+                            "pending_transition": null
+                        }
+                    })
+                    .to_string(),
+                ),
                 input_tokens: 0,
                 output_tokens: 0,
                 estimated_cost_usd: 0.0,
@@ -7767,19 +7787,25 @@ mod tests {
     #[test]
     fn session_cancel_reaches_the_runtime_turn_control_instead_of_only_emitting_ui_state() {
         let service = test_runtime_service(Arc::new(HotSessionPool::default()), None);
-        let (cancellation, _guard) = service
+        let (cancellation, guard) = service
             .install_active_turn_control(
                 "turn-cancel",
                 "session-cancel",
                 Some("execution-cancel".to_string()),
             )
             .unwrap();
+        service.record_live_execution(
+            "session-cancel",
+            "execution-cancel".to_string(),
+            "turn-cancel".to_string(),
+        );
 
         let cancelled =
             service.cancel_active_session("session-cancel", "evaluator timeout isolation");
 
         assert_eq!(cancelled, vec!["execution-cancel"]);
         assert!(cancellation.is_cancelled());
+        drop(guard);
     }
 
     #[tokio::test]

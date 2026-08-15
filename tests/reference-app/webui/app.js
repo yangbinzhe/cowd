@@ -2,6 +2,9 @@
   "use strict";
   const SCHEMA = 1;
   const APP_ID = "reference-app";
+  const parentOrigin = (() => {
+    try { return new URL(document.referrer).origin; } catch (_) { return null; }
+  })();
   let host = null;
   let port = null;
   let frameNonce = null;
@@ -12,7 +15,8 @@
   const echo = document.getElementById("echo");
 
   function validInit(event, message) {
-    return event.origin === "null" && event.source === window.parent && message &&
+    return parentOrigin !== null && event.origin === parentOrigin &&
+      event.source === window.parent && message &&
       message.kind === "host_init" && message.schema_version === SCHEMA &&
       message.app_id === APP_ID && typeof message.frame_nonce === "string" &&
       message.frame_nonce.length >= 1 && typeof message.protocol_digest === "string" &&
@@ -51,7 +55,8 @@
     port.start();
     status.textContent = "Verified MessageChannel connected.";
     echo.disabled = false;
-    port.postMessage({kind:"app_ready", schema_version:SCHEMA, app_id:APP_ID, frame_nonce:frameNonce, message_id:crypto.randomUUID()});
+    host.postMessage({kind:"app_ready", schema_version:SCHEMA, app_id:APP_ID,
+      frame_nonce:frameNonce, message_id:crypto.randomUUID()}, parentOrigin);
   });
 
   echo.addEventListener("click", () => {

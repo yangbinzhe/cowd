@@ -9,13 +9,17 @@ const elements = new Map(["status", "echo", "output"].map((id) => [id, {
   disabled: id === "echo", textContent: "", listeners: new Map(),
   addEventListener(kind, callback) { this.listeners.set(kind, callback); }
 }]));
-const parent = {};
+const parentMessages = [];
+const parent = {
+  postMessage(message, targetOrigin) { parentMessages.push({message, targetOrigin}); }
+};
 const window = {
   parent,
   addEventListener(kind, callback) { listeners.set(kind, callback); }
 };
-const context = vm.createContext({window, document:{getElementById:(id)=>elements.get(id)}, crypto,
-  console, setTimeout, clearTimeout});
+const context = vm.createContext({window, URL,
+  document:{referrer:"https://edge.example.test/apps/reference-app", getElementById:(id)=>elements.get(id)},
+  crypto, console, setTimeout, clearTimeout});
 vm.runInContext(readFileSync(new URL("../webui/app.js", import.meta.url), "utf8"), context,
   {filename:"webui/app.js"});
 
@@ -24,7 +28,7 @@ function receive(port) {
 }
 
 const rejected = new MessageChannel();
-listeners.get("message")({origin:"https://host.invalid", source:parent, ports:[rejected.port1], data:{
+listeners.get("message")({origin:"null", source:parent, ports:[rejected.port1], data:{
   kind:"host_init", schema_version:1, app_id:"reference-app", frame_nonce:"nonce-1",
   message_id:"init-rejected", protocol_digest:"sha256:"+"a".repeat(64),
   catalog_generation:"sha256:"+"b".repeat(64)}});
@@ -33,14 +37,16 @@ assert.equal(elements.get("echo").disabled, true);
 rejected.port1.close(); rejected.port2.close();
 
 const channel = new MessageChannel();
-const readyPromise = receive(channel.port2);
-listeners.get("message")({origin:"null", source:parent, ports:[channel.port1], data:{
+listeners.get("message")({origin:"https://edge.example.test", source:parent, ports:[channel.port1], data:{
   kind:"host_init", schema_version:1, app_id:"reference-app", frame_nonce:"nonce-1",
   message_id:"init-1", protocol_digest:"sha256:"+"a".repeat(64),
   catalog_generation:"sha256:"+"b".repeat(64)}});
-const ready = await readyPromise;
+await new Promise((resolve)=>setTimeout(resolve, 10));
+assert.equal(parentMessages.length, 1);
+const [{message:ready, targetOrigin}] = parentMessages;
 assert.deepEqual({...ready}, {kind:"app_ready", schema_version:1, app_id:"reference-app",
   frame_nonce:"nonce-1", message_id:ready.message_id});
+assert.equal(targetOrigin, "https://edge.example.test");
 assert.equal(elements.get("echo").disabled, false);
 
 const firstRequestPromise = receive(channel.port2);
@@ -74,5 +80,6 @@ assert.equal(cancel.kind, "app_api_cancel");
 assert.equal(cancel.request_id, secondRequest.request_id);
 channel.port2.close();
 
-console.log(JSON.stringify({valid:true, opaque_origin:true, exact_source:true,
-  nonce_bound:true, replay_rejected:true, credit:true, cancel:true}));
+console.log(JSON.stringify({valid:true, parent_origin:true, opaque_child_origin:true,
+  window_ready:true, port_api_only:true, exact_source:true, nonce_bound:true,
+  replay_rejected:true, credit:true, cancel:true}));
