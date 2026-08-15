@@ -822,8 +822,7 @@ mod tests {
             "sha256:{:x}",
             Sha256::digest(format!("{app_id}:1.0.0").as_bytes())
         ));
-        let signature = URL_SAFE_NO_PAD.encode(key.pair.sign(signed_digest.0.as_bytes()).as_ref());
-        let manifest = AppManifestV1 {
+        let mut manifest = AppManifestV1 {
             schema_version: 1,
             app_id: AppId(app_id.to_owned()),
             display_name: "Reference APP".to_owned(),
@@ -832,6 +831,7 @@ mod tests {
             executable: "bin/worker".to_owned(),
             web_root: Some("webui".to_owned()),
             capabilities: vec!["app.reference.read".to_owned()],
+            core_bridge_requirements: Vec::new(),
             authorization_profiles: vec![AuthorizationProfileV1 {
                 profile_id: "operator".to_owned(),
                 display_name: "Operator".to_owned(),
@@ -854,7 +854,7 @@ mod tests {
             signature: BundleSignatureV1 {
                 algorithm: SignatureAlgorithmV1::Ed25519,
                 key_id: key.key_id.clone(),
-                signature,
+                signature: String::new(),
                 signed_digest,
                 expires_unix_ms: None,
                 provenance_digest: None,
@@ -873,6 +873,11 @@ mod tests {
                 core_navigation_kinds: vec!["reality.object".to_owned()],
             }),
         };
+        let signed_digest = manifest
+            .bind_canonical_signed_digest()
+            .expect("canonical manifest digest");
+        manifest.signature.signature =
+            URL_SAFE_NO_PAD.encode(key.pair.sign(signed_digest.0.as_bytes()).as_ref());
         fs::write(
             bundle.join(MANIFEST_FILE),
             serde_json::to_vec_pretty(&manifest).expect("manifest JSON"),

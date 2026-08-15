@@ -733,8 +733,7 @@ fn write_bundle(root: &Path, app_id: &str, script: &str, key: &FixtureKey) -> Pa
         "sha256:{:x}",
         Sha256::digest(format!("{app_id}:supervisor").as_bytes())
     ));
-    let signature = URL_SAFE_NO_PAD.encode(key.pair.sign(signed_digest.0.as_bytes()).as_ref());
-    let manifest = AppManifestV1 {
+    let mut manifest = AppManifestV1 {
         schema_version: 1,
         app_id: AppId(app_id.to_owned()),
         display_name: app_id.to_owned(),
@@ -743,6 +742,7 @@ fn write_bundle(root: &Path, app_id: &str, script: &str, key: &FixtureKey) -> Pa
         executable: "bin/worker".to_owned(),
         web_root: None,
         capabilities: Vec::new(),
+        core_bridge_requirements: Vec::new(),
         authorization_profiles: Vec::new(),
         surfaces: AppSurfacesV1 {
             web: false,
@@ -756,7 +756,7 @@ fn write_bundle(root: &Path, app_id: &str, script: &str, key: &FixtureKey) -> Pa
         signature: BundleSignatureV1 {
             algorithm: SignatureAlgorithmV1::Ed25519,
             key_id: key.key_id.clone(),
-            signature,
+            signature: String::new(),
             signed_digest,
             expires_unix_ms: None,
             provenance_digest: None,
@@ -775,6 +775,11 @@ fn write_bundle(root: &Path, app_id: &str, script: &str, key: &FixtureKey) -> Pa
             core_navigation_kinds: Vec::new(),
         }),
     };
+    let signed_digest = manifest
+        .bind_canonical_signed_digest()
+        .expect("canonical manifest digest");
+    manifest.signature.signature =
+        URL_SAFE_NO_PAD.encode(key.pair.sign(signed_digest.0.as_bytes()).as_ref());
     fs::write(
         bundle.join("app.json"),
         serde_json::to_vec(&manifest).expect("manifest JSON"),
