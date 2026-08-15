@@ -35,6 +35,7 @@ mod metric_attention;
 mod metric_graph;
 #[path = "entity/ontology.rs"]
 mod ontology;
+mod ownership_import;
 #[path = "metric/quality.rs"]
 mod quality;
 #[path = "metric/query.rs"]
@@ -77,6 +78,12 @@ pub use metric_graph::{MatrixMetricDependency, MatrixMetricDependencyInput, Matr
 pub use ontology::{
     match_candidate, MatrixEntityConflictDecision, MatrixEntityMatchCandidate,
     MatrixOntologyConcept, MatrixOntologyMetricBinding, MatrixOntologyPack, MatrixOntologyRelation,
+};
+pub use ownership_import::{
+    ownership_import_digest, CoreMatrixImportPlan, ImportedCoreMatrixRecord, ImportedMatrixFact,
+    ImportedMatrixOntologyPack, ImportedMatrixSourceKey, MfgOwnershipSplitSnapshotV1,
+    OwnershipImportContext, OwnershipImportError, OwnershipImportObject, OwnershipImportRevision,
+    OwnershipImportSource, OWNERSHIP_CONTRACT_DIGEST_V1,
 };
 pub use quality::MatrixQualityGateDecision;
 pub use query::{

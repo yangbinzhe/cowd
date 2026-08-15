@@ -63,6 +63,17 @@ pub struct MatrixSqliteRepository {
 }
 
 impl MatrixSqliteRepository {
+    /// Atomically applies a pre-validated ownership split plan. This path is
+    /// deliberately separate from normal upserts because migration timestamps
+    /// are authoritative and must never be replaced with the local clock.
+    pub fn import_ownership_split(
+        &self,
+        plan: &matrix_core::CoreMatrixImportPlan,
+    ) -> Result<crate::MatrixOwnershipImportOutcome, MatrixSqliteRepositoryError> {
+        let mut connection = self.executor.checkout()?;
+        crate::ownership_import::apply_sqlite(&mut connection, plan)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, MatrixSqliteRepositoryError> {
         let handle = StorageHandle::sqlite("matrix", path.as_ref(), "matrix", "matrix_executor");
         Self::open_storage_handle(&handle)

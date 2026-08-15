@@ -11,6 +11,7 @@
 
 mod data_plane;
 mod migration;
+mod ownership_import;
 mod port;
 mod postgres_repository;
 mod repository;
@@ -18,6 +19,7 @@ mod sqlite_repository;
 
 pub use data_plane::{MatrixDataPlaneBackend, MatrixLocalDataPlane};
 pub use migration::{copy_quiesced_matrix_store, MatrixMigrationManifest, MatrixMigrationSnapshot};
+pub use ownership_import::{MatrixOwnershipImportOutcome, MatrixOwnershipImportReceipt};
 pub use port::{
     MatrixHealth, MatrixMetricRecomputeResult, MatrixRecallQuery, MatrixRevisioned, MatrixStore,
     MatrixStoreError, MatrixStoreHandle, MatrixStoreResult,
