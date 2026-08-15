@@ -19,8 +19,9 @@ fn principal() -> PrincipalContextV1 {
         authorization_profile_id: "operator".to_owned(),
         authorization_revision: 7,
         granted_capabilities: vec![
-            "app.reference.read".to_owned(),
-            "app.reference.write".to_owned(),
+            "approval.respond".to_owned(),
+            "reference-app.read".to_owned(),
+            "reference-app.write".to_owned(),
         ],
         granted_scopes: vec!["workspace:read".to_owned(), "workspace:write".to_owned()],
         credential_epoch: 11,
@@ -34,7 +35,10 @@ fn command_descriptor() -> OperationDescriptorV1 {
         kind: OperationKindV1::Command,
         input_schema_digest: digest(),
         output_schema_digest: digest(),
-        required_capability: "app.reference.write".to_owned(),
+        required_capabilities: vec![
+            "approval.respond".to_owned(),
+            "reference-app.write".to_owned(),
+        ],
         delegation: OperationDelegationV1::User,
         tenant_scoped: true,
         workspace_scoped: true,
@@ -265,7 +269,7 @@ fn verified_context_maps_every_legacy_request_fact_without_payload_inference() {
     assert_eq!(mapped.profile_revision, 7);
     assert_eq!(mapped.credential_epoch, 11);
     assert_eq!(mapped.expires_at_ms, Some(4_000_000_000_000));
-    assert_eq!(mapped.granted_capabilities.len(), 2);
+    assert_eq!(mapped.granted_capabilities.len(), 3);
     assert_eq!(mapped.granted_scopes.len(), 2);
 }
 
@@ -354,8 +358,8 @@ fn descriptor_binding_rejects_operation_and_schema_tamper() {
 fn capabilities_and_scopes_must_be_unique_sorted_and_bounded() {
     let mut envelope = command_envelope();
     envelope.principal.granted_capabilities = vec![
-        "app.reference.write".to_owned(),
-        "app.reference.read".to_owned(),
+        "reference-app.write".to_owned(),
+        "reference-app.read".to_owned(),
     ];
     assert!(envelope.validate().is_err());
 
@@ -373,6 +377,32 @@ fn capabilities_and_scopes_must_be_unique_sorted_and_bounded() {
     let mut envelope = command_envelope();
     envelope.execution.surface = "x".repeat(129);
     assert!(envelope.validate().is_err());
+}
+
+#[test]
+fn operation_requirements_are_non_empty_canonical_and_all_of() {
+    let mut empty = command_descriptor();
+    empty.required_capabilities.clear();
+    assert!(empty.validate().is_err());
+
+    let mut duplicate = command_descriptor();
+    duplicate
+        .required_capabilities
+        .push("reference-app.write".to_owned());
+    assert!(duplicate.validate().is_err());
+
+    let mut unsorted = command_descriptor();
+    unsorted.required_capabilities.reverse();
+    assert!(unsorted.validate().is_err());
+
+    let mut missing_core_grant = command_envelope();
+    missing_core_grant.principal.granted_capabilities = vec![
+        "reference-app.read".to_owned(),
+        "reference-app.write".to_owned(),
+    ];
+    assert!(missing_core_grant
+        .validate_for(&command_descriptor())
+        .is_err());
 }
 
 #[test]
@@ -403,7 +433,10 @@ fn validate_at_enforces_expiry_deadline_delegation_capability_and_scope() {
     assert!(wrong_delegation.validate_for(&descriptor).is_err());
 
     let mut missing_capability = command_envelope();
-    missing_capability.principal.granted_capabilities = vec!["app.reference.read".to_owned()];
+    missing_capability.principal.granted_capabilities = vec![
+        "approval.respond".to_owned(),
+        "reference-app.read".to_owned(),
+    ];
     assert!(missing_capability.validate_for(&descriptor).is_err());
 
     let mut missing_tenant = command_envelope();
@@ -595,11 +628,25 @@ fn app_scoped_core_catalog_closes_manifest_authorization_and_schema_binding() {
         .is_err());
 
     let mut capability_mismatch = valid_core_catalog(&manifest);
-    capability_mismatch.operations[0].required_capability = "core.reference.write".to_owned();
+    capability_mismatch.operations[0].required_capabilities = vec![
+        "approval.respond".to_owned(),
+        "reference-app.read".to_owned(),
+    ];
     capability_mismatch
         .bind_canonical_catalog_digest()
         .expect("bind capability mismatch fixture");
     assert!(capability_mismatch
+        .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
+        .is_err());
+
+    let mut unsigned_app_capability = valid_core_catalog(&manifest);
+    unsigned_app_capability.operations[0]
+        .required_capabilities
+        .insert(1, "reference-app.read".to_owned());
+    unsigned_app_capability
+        .bind_canonical_catalog_digest()
+        .expect("bind unsigned APP capability fixture");
+    assert!(unsigned_app_capability
         .validate_for_manifest(&manifest, &GenerationId(DIGEST.to_owned()))
         .is_err());
 }
@@ -646,8 +693,33 @@ fn core_catalog_and_signed_manifest_reject_tamper_and_unknown_fields() {
             .as_slice(),
         include_bytes!("../contracts/v1/golden/negative/manifest-duplicate-requirement.json")
             .as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/manifest-cross-namespace-capability.json")
+            .as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/manifest-cross-namespace-profile.json")
+            .as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/manifest-cross-namespace-surface.json")
+            .as_slice(),
     ] {
         assert!(decode_strict::<AppManifestV1>(bytes).is_err());
+    }
+
+    for bytes in [
+        include_bytes!(
+            "../contracts/v1/golden/negative/operation-empty-required-capabilities.json"
+        )
+        .as_slice(),
+        include_bytes!(
+            "../contracts/v1/golden/negative/operation-duplicate-required-capabilities.json"
+        )
+        .as_slice(),
+        include_bytes!(
+            "../contracts/v1/golden/negative/operation-unsorted-required-capabilities.json"
+        )
+        .as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/operation-legacy-required-capability.json")
+            .as_slice(),
+    ] {
+        assert!(decode_strict::<OperationDescriptorV1>(bytes).is_err());
     }
 
     for bytes in [
@@ -656,6 +728,8 @@ fn core_catalog_and_signed_manifest_reject_tamper_and_unknown_fields() {
         include_bytes!("../contracts/v1/golden/negative/core-catalog-schema-mismatch.json")
             .as_slice(),
         include_bytes!("../contracts/v1/golden/negative/core-catalog-capability-mismatch.json")
+            .as_slice(),
+        include_bytes!("../contracts/v1/golden/negative/core-catalog-unsigned-app-capability.json")
             .as_slice(),
     ] {
         let catalog: CoreOperationCatalogV1 =
@@ -690,7 +764,7 @@ fn manifest_collections_are_canonical_and_handshake_digests_use_frozen_helpers()
     let mut duplicate_profile_capability = manifest.clone();
     duplicate_profile_capability.authorization_profiles[0]
         .capabilities
-        .push("app.reference.write".to_owned());
+        .push("reference-app.write".to_owned());
     assert!(duplicate_profile_capability.validate().is_err());
 
     let mut no_default = manifest.clone();
@@ -700,6 +774,38 @@ fn manifest_collections_are_canonical_and_handshake_digests_use_frozen_helpers()
         .expect("bind no-default fixture");
     assert!(no_default.validate().is_err());
     assert!(manifest_authorization_profile_digest_v1(&no_default).is_err());
+
+    let mut top_level_core_capability = valid_manifest();
+    top_level_core_capability.capabilities = vec!["approval.respond".to_owned()];
+    top_level_core_capability.authorization_profiles[0].capabilities =
+        vec!["approval.respond".to_owned()];
+    top_level_core_capability.core_bridge_requirements[0].required_app_capability =
+        "approval.respond".to_owned();
+    top_level_core_capability
+        .bind_canonical_signed_digest()
+        .expect("bind cross-namespace APP capability");
+    assert!(top_level_core_capability.validate().is_err());
+
+    let mut profile_core_capability = valid_manifest();
+    profile_core_capability.authorization_profiles[0]
+        .capabilities
+        .push("approval.respond".to_owned());
+    profile_core_capability.authorization_profiles[0]
+        .capabilities
+        .sort();
+    profile_core_capability
+        .bind_canonical_signed_digest()
+        .expect("bind cross-namespace profile capability");
+    assert!(profile_core_capability.validate().is_err());
+
+    let mut surface_core_capability = valid_manifest();
+    surface_core_capability.authorization_profiles[0]
+        .surface_capabilities
+        .insert("web".to_owned(), vec!["approval.respond".to_owned()]);
+    surface_core_capability
+        .bind_canonical_signed_digest()
+        .expect("bind cross-namespace surface capability");
+    assert!(surface_core_capability.validate().is_err());
 
     let mut two_defaults = manifest.clone();
     let mut second_profile = two_defaults.authorization_profiles[0].clone();
@@ -779,15 +885,15 @@ fn valid_manifest() -> AppManifestV1 {
         executable: "bin/reference-worker".to_owned(),
         web_root: Some("webui".to_owned()),
         capabilities: vec![
-            "app.reference.read".to_owned(),
-            "app.reference.write".to_owned(),
+            "reference-app.read".to_owned(),
+            "reference-app.write".to_owned(),
         ],
         authorization_profiles: vec![AuthorizationProfileV1 {
             profile_id: "operator".to_owned(),
             display_name: "Operator".to_owned(),
             capabilities: vec![
-                "app.reference.read".to_owned(),
-                "app.reference.write".to_owned(),
+                "reference-app.read".to_owned(),
+                "reference-app.write".to_owned(),
             ],
             surface_capabilities: BTreeMap::new(),
             is_default: true,
@@ -797,7 +903,7 @@ fn valid_manifest() -> AppManifestV1 {
             core_operation_id: "core.reference.command.v1".to_owned(),
             accepted_input_schema_digest: digest(),
             accepted_output_schema_digest: digest(),
-            required_app_capability: "app.reference.write".to_owned(),
+            required_app_capability: "reference-app.write".to_owned(),
             kind: OperationKindV1::Command,
             streaming: false,
         }],
@@ -841,7 +947,10 @@ fn valid_manifest() -> AppManifestV1 {
 fn valid_core_catalog(manifest: &AppManifestV1) -> CoreOperationCatalogV1 {
     let mut operation = command_descriptor();
     operation.operation_id = "core.reference.command.v1".to_owned();
-    operation.required_capability = "app.reference.write".to_owned();
+    operation.required_capabilities = vec![
+        "approval.respond".to_owned(),
+        "reference-app.write".to_owned(),
+    ];
     let mut catalog = CoreOperationCatalogV1 {
         schema_version: 1,
         protocol_revision: 1,
@@ -882,7 +991,7 @@ fn catalog_entry() -> AppCatalogEntryV1 {
             entry_path: Some("/apps/reference-app/index.html".to_owned()),
             bridge_revision: 1,
         },
-        effective_capabilities: vec!["app.reference.read".to_owned()],
+        effective_capabilities: vec!["reference-app.read".to_owned()],
         effective_authorization_profile: "operator".to_owned(),
     }
 }

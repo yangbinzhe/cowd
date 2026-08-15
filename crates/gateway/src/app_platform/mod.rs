@@ -752,6 +752,7 @@ fn protocol_error<'a, E: std::fmt::Display>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowd_app_protocol::AppManifestV1;
     use std::os::unix::fs::symlink;
 
     #[test]
@@ -764,6 +765,24 @@ mod tests {
         load_trust_store(&path, uid).expect("strict trust store");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("mode");
         assert!(load_trust_store(&path, uid).is_err());
+    }
+
+    #[test]
+    fn handshake_digest_projection_rejects_cross_namespace_app_capabilities() {
+        let mut manifest: AppManifestV1 = serde_json::from_str(include_str!(
+            "../../../../contracts/app/v1/golden/app-manifest.json"
+        ))
+        .expect("frozen manifest");
+        manifest.capabilities = vec!["approval.respond".to_owned()];
+        manifest.authorization_profiles[0].capabilities = vec!["approval.respond".to_owned()];
+        manifest.core_bridge_requirements[0].required_app_capability =
+            "approval.respond".to_owned();
+        manifest
+            .bind_canonical_signed_digest()
+            .expect("bind adversarial manifest");
+
+        assert!(manifest_capability_digest_v1(&manifest).is_err());
+        assert!(manifest_authorization_profile_digest_v1(&manifest).is_err());
     }
 
     #[test]

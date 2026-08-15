@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CoreOperationCatalogV1",
-  "description": "Gateway-generated, APP-scoped projection of Core operation descriptors.\n\nGateway preserves Core-owned schemas, kind, limits, delegation and audit\npolicy, and replaces `required_capability` with the signed APP capability\nnamed by the matching `CoreBridgeRequirementV1`.",
+  "description": "Gateway-generated, APP-scoped projection of Core operation descriptors.\n\nGateway preserves Core-owned schemas, kind, limits, delegation, audit policy\nand required capabilities, then adds the signed APP capability named by the\nmatching `CoreBridgeRequirementV1`.",
   "type": "object",
   "properties": {
     "app_id": {
@@ -122,8 +122,13 @@
           "format": "uint64",
           "minimum": 0
         },
-        "required_capability": {
-          "type": "string"
+        "required_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64,
+          "minItems": 1
         },
         "streaming": {
           "type": "boolean"
@@ -141,7 +146,7 @@
         "kind",
         "input_schema_digest",
         "output_schema_digest",
-        "required_capability",
+        "required_capabilities",
         "delegation",
         "tenant_scoped",
         "workspace_scoped",

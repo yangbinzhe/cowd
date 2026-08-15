@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    require_bounded, require_digest, require_schema, require_unique, DelegationKindV1,
-    ExecutionContextV1, PrincipalContextV1, ProtocolValidate, ProtocolValidationError,
-    Sha256Digest,
+    require_bounded, require_canonical_string_set, require_digest, require_schema, require_unique,
+    DelegationKindV1, ExecutionContextV1, PrincipalContextV1, ProtocolValidate,
+    ProtocolValidationError, Sha256Digest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -43,7 +43,8 @@ pub struct OperationDescriptorV1 {
     pub kind: OperationKindV1,
     pub input_schema_digest: Sha256Digest,
     pub output_schema_digest: Sha256Digest,
-    pub required_capability: String,
+    #[schemars(length(min = 1, max = 64))]
+    pub required_capabilities: Vec<String>,
     pub delegation: OperationDelegationV1,
     pub tenant_scoped: bool,
     pub workspace_scoped: bool,
@@ -64,7 +65,18 @@ pub struct OperationDescriptorV1 {
 impl ProtocolValidate for OperationDescriptorV1 {
     fn validate(&self) -> Result<(), ProtocolValidationError> {
         require_bounded("operation_id", &self.operation_id, 256)?;
-        require_bounded("required_capability", &self.required_capability, 256)?;
+        require_canonical_string_set(
+            "required_capabilities",
+            &self.required_capabilities,
+            64,
+            256,
+        )?;
+        if self.required_capabilities.is_empty() {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "required_capabilities",
+                reason: "must contain at least one capability".to_owned(),
+            });
+        }
         require_bounded("audit_classification", &self.audit_classification, 128)?;
         self.input_schema_digest
             .validate_value("input_schema_digest")?;
@@ -188,16 +200,19 @@ impl AppInvocationEnvelopeV1 {
                 reason: "does not satisfy the operation descriptor".to_owned(),
             });
         }
-        if self
-            .principal
-            .granted_capabilities
-            .binary_search(&descriptor.required_capability)
-            .is_err()
-        {
-            return Err(ProtocolValidationError::InvalidField {
-                field: "principal.granted_capabilities",
-                reason: "does not contain the operation's required capability".to_owned(),
-            });
+        for required in &descriptor.required_capabilities {
+            if self
+                .principal
+                .granted_capabilities
+                .binary_search(required)
+                .is_err()
+            {
+                return Err(ProtocolValidationError::InvalidField {
+                    field: "principal.granted_capabilities",
+                    reason: "does not contain every capability required by the operation"
+                        .to_owned(),
+                });
+            }
         }
         if descriptor.tenant_scoped && self.principal.tenant_id.trim().is_empty() {
             return Err(ProtocolValidationError::InvalidField {

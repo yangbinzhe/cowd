@@ -94,7 +94,7 @@ fn package_is_deterministic_closed_signed_and_tamper_evident() {
 fn vendored_protocol_provenance_and_wire_contract_are_frozen() {
     assert_eq!(
         PROTOCOL_ARTIFACT_SHA256,
-        "3518b38a662c13e8705c84c5bb6e9ca8e129504bc5a0df81693acc3db7848a75"
+        "0151286b0871a854f4d76eed0c45c15c7c5ddcc81dfe9d1f3f3bf346a0891b28"
     );
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/cowd-app-protocol-1.0.0");
     let vcs: Value =
@@ -116,7 +116,7 @@ fn vendored_protocol_provenance_and_wire_contract_are_frozen() {
         });
     assert_eq!(
         format!("{:x}", Sha256::digest(joined)),
-        "7052c985bf70054bd23680ee41985ec862f4ee9d282f91c61acd1b7c50fc9a3c"
+        "f2eedb345b51a6ab54a7328862831a058db7a3d795876ff36d882ea55c5d4d3e"
     );
 }
 
@@ -406,7 +406,7 @@ fn invocation(
     value["request_id"] = Value::String(request_id.to_owned());
     value["correlation_id"] = Value::String(format!("correlation-{request_id}"));
     value["input_schema_digest"] = Value::String(descriptor.input_schema_digest.0);
-    value["principal"]["granted_capabilities"] = json!([descriptor.required_capability]);
+    value["principal"]["granted_capabilities"] = json!(descriptor.required_capabilities);
     value["payload"] = payload;
     if let Some(key) = idempotency {
         value["idempotency_key"] = Value::String(key.to_owned());

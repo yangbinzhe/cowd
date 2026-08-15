@@ -13,9 +13,9 @@ const CORE_OPERATION_CATALOG_DOMAIN_V1: &str = "cowd.core.operation-catalog/v1";
 #[serde(deny_unknown_fields)]
 /// Gateway-generated, APP-scoped projection of Core operation descriptors.
 ///
-/// Gateway preserves Core-owned schemas, kind, limits, delegation and audit
-/// policy, and replaces `required_capability` with the signed APP capability
-/// named by the matching `CoreBridgeRequirementV1`.
+/// Gateway preserves Core-owned schemas, kind, limits, delegation, audit policy
+/// and required capabilities, then adds the signed APP capability named by the
+/// matching `CoreBridgeRequirementV1`.
 pub struct CoreOperationCatalogV1 {
     pub schema_version: u16,
     pub protocol_revision: u16,
@@ -102,11 +102,26 @@ impl CoreOperationCatalogV1 {
                         .to_owned(),
                 });
             }
-            if descriptor.required_capability != requirement.required_app_capability {
+            if descriptor
+                .required_capabilities
+                .binary_search(&requirement.required_app_capability)
+                .is_err()
+            {
                 return Err(ProtocolValidationError::InvalidField {
-                    field: "core_operation_catalog.operations.required_capability",
-                    reason: "must be the signed APP capability projected onto the Core descriptor"
-                        .to_owned(),
+                    field: "core_operation_catalog.operations.required_capabilities",
+                    reason:
+                        "must include the signed APP capability projected onto the Core descriptor"
+                            .to_owned(),
+                });
+            }
+            let app_namespace = format!("{}.", manifest.app_id.0);
+            if descriptor.required_capabilities.iter().any(|capability| {
+                capability.starts_with(&app_namespace)
+                    && capability != &requirement.required_app_capability
+            }) {
+                return Err(ProtocolValidationError::InvalidField {
+                    field: "core_operation_catalog.operations.required_capabilities",
+                    reason: "must not add an unsigned capability from the APP namespace".to_owned(),
                 });
             }
         }

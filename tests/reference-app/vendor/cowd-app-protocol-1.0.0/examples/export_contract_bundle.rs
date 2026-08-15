@@ -119,7 +119,7 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
         "grant_id": "grant:1",
         "authorization_profile_id": "operator",
         "authorization_revision": 7,
-        "granted_capabilities": ["app.reference.read", "app.reference.write"],
+        "granted_capabilities": ["approval.respond", "reference-app.read", "reference-app.write"],
         "granted_scopes": ["workspace:read", "workspace:write"],
         "credential_epoch": 11,
         "expires_at_unix_ms": 4_000_000_000_000_u64
@@ -354,8 +354,10 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     );
 
     let mut capability_mismatch_catalog = catalog.clone();
-    capability_mismatch_catalog.operations[0].required_capability =
-        "core.reference.write".to_owned();
+    capability_mismatch_catalog.operations[0].required_capabilities = vec![
+        "approval.respond".to_owned(),
+        "reference-app.read".to_owned(),
+    ];
     capability_mismatch_catalog
         .bind_canonical_catalog_digest()
         .expect("bind capability mismatch catalog fixture");
@@ -363,6 +365,96 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
         "negative/core-catalog-capability-mismatch.json",
         serde_json::to_value(capability_mismatch_catalog)
             .expect("capability mismatch catalog JSON"),
+    );
+
+    let mut unsigned_app_capability_catalog = catalog.clone();
+    unsigned_app_capability_catalog.operations[0]
+        .required_capabilities
+        .insert(1, "reference-app.read".to_owned());
+    unsigned_app_capability_catalog
+        .bind_canonical_catalog_digest()
+        .expect("bind unsigned APP capability catalog fixture");
+    fixtures.insert(
+        "negative/core-catalog-unsigned-app-capability.json",
+        serde_json::to_value(unsigned_app_capability_catalog)
+            .expect("unsigned APP capability catalog JSON"),
+    );
+
+    let mut empty_requirements = reference_operation();
+    empty_requirements.required_capabilities.clear();
+    fixtures.insert(
+        "negative/operation-empty-required-capabilities.json",
+        serde_json::to_value(empty_requirements).expect("empty operation requirements JSON"),
+    );
+
+    let mut duplicate_requirements = reference_operation();
+    duplicate_requirements
+        .required_capabilities
+        .push("reference-app.write".to_owned());
+    fixtures.insert(
+        "negative/operation-duplicate-required-capabilities.json",
+        serde_json::to_value(duplicate_requirements)
+            .expect("duplicate operation requirements JSON"),
+    );
+
+    let mut unsorted_requirements = reference_operation();
+    unsorted_requirements.required_capabilities.reverse();
+    fixtures.insert(
+        "negative/operation-unsorted-required-capabilities.json",
+        serde_json::to_value(unsorted_requirements).expect("unsorted operation requirements JSON"),
+    );
+
+    let mut legacy_requirement =
+        serde_json::to_value(reference_operation()).expect("legacy operation requirement JSON");
+    legacy_requirement
+        .as_object_mut()
+        .expect("operation descriptor object")
+        .remove("required_capabilities");
+    legacy_requirement["required_capability"] = json!("reference-app.write");
+    fixtures.insert(
+        "negative/operation-legacy-required-capability.json",
+        legacy_requirement,
+    );
+
+    let mut cross_namespace_manifest = manifest.clone();
+    cross_namespace_manifest.capabilities = vec!["approval.respond".to_owned()];
+    cross_namespace_manifest.authorization_profiles[0].capabilities =
+        vec!["approval.respond".to_owned()];
+    cross_namespace_manifest.core_bridge_requirements[0].required_app_capability =
+        "approval.respond".to_owned();
+    cross_namespace_manifest
+        .bind_canonical_signed_digest()
+        .expect("bind cross-namespace manifest fixture");
+    fixtures.insert(
+        "negative/manifest-cross-namespace-capability.json",
+        serde_json::to_value(cross_namespace_manifest).expect("cross-namespace manifest JSON"),
+    );
+
+    let mut cross_namespace_profile = manifest.clone();
+    cross_namespace_profile.authorization_profiles[0]
+        .capabilities
+        .push("approval.respond".to_owned());
+    cross_namespace_profile.authorization_profiles[0]
+        .capabilities
+        .sort();
+    cross_namespace_profile
+        .bind_canonical_signed_digest()
+        .expect("bind cross-namespace profile fixture");
+    fixtures.insert(
+        "negative/manifest-cross-namespace-profile.json",
+        serde_json::to_value(cross_namespace_profile).expect("cross-namespace profile JSON"),
+    );
+
+    let mut cross_namespace_surface = manifest.clone();
+    cross_namespace_surface.authorization_profiles[0]
+        .surface_capabilities
+        .insert("web".to_owned(), vec!["approval.respond".to_owned()]);
+    cross_namespace_surface
+        .bind_canonical_signed_digest()
+        .expect("bind cross-namespace surface fixture");
+    fixtures.insert(
+        "negative/manifest-cross-namespace-surface.json",
+        serde_json::to_value(cross_namespace_surface).expect("cross-namespace surface JSON"),
     );
 
     let mut catalog_unknown = serde_json::to_value(&catalog).expect("catalog unknown JSON");
@@ -384,7 +476,7 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
 
     let mut duplicate_capability = command_invocation.clone();
     duplicate_capability["principal"]["granted_capabilities"] =
-        json!(["app.reference.write", "app.reference.write"]);
+        json!(["reference-app.write", "reference-app.write"]);
     fixtures.insert("negative/duplicate-capability.json", duplicate_capability);
 
     let mut unsorted_scope = command_invocation.clone();
@@ -404,7 +496,8 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     fixtures.insert("negative/wrong-delegation.json", wrong_delegation);
 
     let mut missing_capability = command_invocation;
-    missing_capability["principal"]["granted_capabilities"] = json!(["app.reference.read"]);
+    missing_capability["principal"]["granted_capabilities"] =
+        json!(["reference-app.read", "reference-app.write"]);
     fixtures.insert("negative/missing-capability.json", missing_capability);
     fixtures
 }
@@ -418,7 +511,10 @@ fn reference_operation() -> OperationDescriptorV1 {
         kind: OperationKindV1::Command,
         input_schema_digest: digest.clone(),
         output_schema_digest: digest,
-        required_capability: "app.reference.write".to_owned(),
+        required_capabilities: vec![
+            "approval.respond".to_owned(),
+            "reference-app.write".to_owned(),
+        ],
         delegation: OperationDelegationV1::User,
         tenant_scoped: true,
         workspace_scoped: true,
@@ -449,15 +545,15 @@ fn reference_manifest() -> AppManifestV1 {
         executable: "bin/reference-worker".to_owned(),
         web_root: Some("webui".to_owned()),
         capabilities: vec![
-            "app.reference.read".to_owned(),
-            "app.reference.write".to_owned(),
+            "reference-app.read".to_owned(),
+            "reference-app.write".to_owned(),
         ],
         authorization_profiles: vec![AuthorizationProfileV1 {
             profile_id: "operator".to_owned(),
             display_name: "Operator".to_owned(),
             capabilities: vec![
-                "app.reference.read".to_owned(),
-                "app.reference.write".to_owned(),
+                "reference-app.read".to_owned(),
+                "reference-app.write".to_owned(),
             ],
             surface_capabilities: BTreeMap::new(),
             is_default: true,
@@ -467,7 +563,7 @@ fn reference_manifest() -> AppManifestV1 {
             core_operation_id: "core.reference.command.v1".to_owned(),
             accepted_input_schema_digest: digest.clone(),
             accepted_output_schema_digest: digest.clone(),
-            required_app_capability: "app.reference.write".to_owned(),
+            required_app_capability: "reference-app.write".to_owned(),
             kind: OperationKindV1::Command,
             streaming: false,
         }],

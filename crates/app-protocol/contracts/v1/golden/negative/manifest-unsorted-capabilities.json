@@ -4,8 +4,8 @@
   "authorization_profiles": [
     {
       "capabilities": [
-        "app.reference.read",
-        "app.reference.write"
+        "reference-app.read",
+        "reference-app.write"
       ],
       "display_name": "Operator",
       "is_default": true,
@@ -14,8 +14,8 @@
     }
   ],
   "capabilities": [
-    "app.reference.write",
-    "app.reference.read"
+    "reference-app.write",
+    "reference-app.read"
   ],
   "core_bridge_requirements": [
     {
@@ -24,7 +24,7 @@
       "app_operation_id": "reference.command.v1",
       "core_operation_id": "core.reference.command.v1",
       "kind": "command",
-      "required_app_capability": "app.reference.write",
+      "required_app_capability": "reference-app.write",
       "streaming": false
     }
   ],
@@ -35,7 +35,7 @@
     "files": {
       "bin/reference-worker": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "manifest_digest": "sha256:71d87ec1db7cf0e1722e400afc4836c4b611652014dcd58b2f202df2424355de"
+    "manifest_digest": "sha256:1aec76200d3505094d3c67d4af94d92b2868b272a388abc312f21878ebdd6f3e"
   },
   "presentation": {
     "core_navigation_kinds": [
@@ -66,7 +66,7 @@
     "key_id": "release-key-1",
     "provenance_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "signature": "base64url-signature",
-    "signed_digest": "sha256:71d87ec1db7cf0e1722e400afc4836c4b611652014dcd58b2f202df2424355de"
+    "signed_digest": "sha256:1aec76200d3505094d3c67d4af94d92b2868b272a388abc312f21878ebdd6f3e"
   },
   "surfaces": {
     "tui_view": true,

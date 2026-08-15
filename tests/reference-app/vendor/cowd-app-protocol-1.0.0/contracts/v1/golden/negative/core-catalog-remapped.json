@@ -1,6 +1,6 @@
 {
   "app_id": "reference-app",
-  "catalog_digest": "sha256:17605e4d97681c5abdd05450a9a8043edbf089e0c809db7f48cc89da46ec0377",
+  "catalog_digest": "sha256:f0de3b88c057aac9a81ae34dd4709d4be2e1cafa20909dc78995bf09d85c92a1",
   "generation": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "operations": [
     {
@@ -18,7 +18,10 @@
       "operation_id": "core.remapped.command.v1",
       "output_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "read_only": false,
-      "required_capability": "app.reference.write",
+      "required_capabilities": [
+        "approval.respond",
+        "reference-app.write"
+      ],
       "streaming": false,
       "tenant_scoped": true,
       "workspace_scoped": true

@@ -24,8 +24,9 @@
     "expires_at_unix_ms": 4000000000000,
     "grant_id": "grant:1",
     "granted_capabilities": [
-      "app.reference.read",
-      "app.reference.write"
+      "approval.respond",
+      "reference-app.read",
+      "reference-app.write"
     ],
     "granted_scopes": [
       "workspace:read",

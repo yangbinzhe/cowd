@@ -1,8 +1,8 @@
 {
   "app_id": "reference-app",
   "artifact_version": "1.0.0",
-  "authorization_profile_digest": "sha256:c60e059950b90c8df6769062fbca629fa15e16850617fdbdd9d85b7f3dec0284",
-  "capability_digest": "sha256:892f73c6ce5781dbd11830ae4b32a2661acb995fa471b6f164d95bce58f0aa7e",
+  "authorization_profile_digest": "sha256:ad026177177dd0fffe636be8b2782bceafc5cc5c52b6327627caf789e9548dc6",
+  "capability_digest": "sha256:b06908cf00aad80d47bad68acfb3f4b71ca9136ff10459cde75d4d828f9229fe",
   "generation": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "operations": [],
   "protocol_revision": 1,

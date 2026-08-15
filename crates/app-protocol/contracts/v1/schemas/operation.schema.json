@@ -63,8 +63,13 @@
       "format": "uint64",
       "minimum": 0
     },
-    "required_capability": {
-      "type": "string"
+    "required_capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 64,
+      "minItems": 1
     },
     "streaming": {
       "type": "boolean"
@@ -82,7 +87,7 @@
     "kind",
     "input_schema_digest",
     "output_schema_digest",
-    "required_capability",
+    "required_capabilities",
     "delegation",
     "tenant_scoped",
     "workspace_scoped",

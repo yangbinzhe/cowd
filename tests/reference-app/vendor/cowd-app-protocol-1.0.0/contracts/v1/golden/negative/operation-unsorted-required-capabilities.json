@@ -1,0 +1,23 @@
+{
+  "audit_classification": "domain_write",
+  "default_deadline_ms": 3000,
+  "degraded_read_allowed": false,
+  "delegation": "user",
+  "idempotency": "required",
+  "input_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "kind": "command",
+  "maximum_deadline_ms": 10000,
+  "maximum_frame_bytes": 1048576,
+  "maximum_request_bytes": 65536,
+  "maximum_response_bytes": 1048576,
+  "operation_id": "core.reference.command.v1",
+  "output_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "read_only": false,
+  "required_capabilities": [
+    "reference-app.write",
+    "approval.respond"
+  ],
+  "streaming": false,
+  "tenant_scoped": true,
+  "workspace_scoped": true
+}

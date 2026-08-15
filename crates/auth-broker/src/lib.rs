@@ -290,6 +290,10 @@ impl AuthorizationCatalog {
             let mut profile_ids = BTreeSet::new();
             for profile in &app.profiles {
                 validate_catalog_profile(&app.app_id, profile, &mut profile_ids)?;
+                validate_app_capability_namespace(
+                    &app.app_id,
+                    profile.capabilities.iter().map(String::as_str),
+                )?;
             }
             if !profile_ids.contains(&app.default_profile_id) {
                 return Err(AuthBrokerError::InvalidCredentialState(format!(
@@ -307,10 +311,31 @@ impl AuthorizationCatalog {
                         app.app_id
                     )));
                 }
+                validate_app_capability_namespace(
+                    &app.app_id,
+                    capabilities.iter().map(String::as_str),
+                )?;
             }
         }
         Ok(())
     }
+}
+
+fn validate_app_capability_namespace<'a>(
+    app_id: &str,
+    capabilities: impl IntoIterator<Item = &'a str>,
+) -> Result<(), AuthBrokerError> {
+    let namespace = format!("{app_id}.");
+    if capabilities.into_iter().any(|capability| {
+        capability
+            .strip_prefix(&namespace)
+            .is_none_or(str::is_empty)
+    }) {
+        return Err(AuthBrokerError::InvalidCredentialState(format!(
+            "APP {app_id} capability is outside the APP-owned {namespace} namespace"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_catalog_profile(
@@ -2070,6 +2095,18 @@ mod generic_catalog_tests {
                 .expect("default")
                 .profile_id
         );
+    }
+
+    #[test]
+    fn catalog_independently_rejects_app_claims_outside_the_app_namespace() {
+        let mut catalog = fixture_catalog();
+        catalog.apps[0].profiles[0].capabilities = vec!["approval.respond".to_owned()];
+        assert!(catalog.validate().is_err());
+
+        let mut catalog = fixture_catalog();
+        catalog.apps[0].surface_capabilities =
+            BTreeMap::from([("web".to_owned(), vec!["approval.respond".to_owned()])]);
+        assert!(catalog.validate().is_err());
     }
 
     fn fixture_catalog() -> AuthorizationCatalog {

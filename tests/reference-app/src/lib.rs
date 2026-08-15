@@ -19,10 +19,10 @@ pub const APP_ID: &str = "reference-app";
 pub const ARTIFACT_VERSION: &str = "1.0.0";
 pub const KEY_ID: &str = "reference-app-fixture-ed25519-v1";
 pub const PROTOCOL_ARTIFACT_SHA256: &str =
-    "3518b38a662c13e8705c84c5bb6e9ca8e129504bc5a0df81693acc3db7848a75";
-pub const PROTOCOL_SOURCE_COMMIT: &str = "0541372742b462be59d8b62dff0670519d6d1527";
+    "0151286b0871a854f4d76eed0c45c15c7c5ddcc81dfe9d1f3f3bf346a0891b28";
+pub const PROTOCOL_SOURCE_COMMIT: &str = "339144e645a58a498e632ca996045fcdb7b37cb5";
 pub const PROTOCOL_WIRE_DIGEST: &str =
-    "sha256:072d80864a8addaecfc4f236d077f9a5f6eaeec2e587518da515b2b7e9768769";
+    "sha256:c7785067155744d3476b8e74061ffa4f6ed7ae80f9a6b679759922d3e03866b8";
 
 const SIGNING_SEED: [u8; 32] = [
     0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
@@ -49,25 +49,25 @@ pub fn operations() -> Vec<OperationDescriptorV1> {
         operation(
             "reference.counter.increment",
             OperationKindV1::Command,
-            "reference.command",
+            "reference-app.command",
             false,
         ),
         operation(
             "reference.echo",
             OperationKindV1::Query,
-            "reference.query",
+            "reference-app.query",
             false,
         ),
         operation(
             "reference.events",
             OperationKindV1::Subscribe,
-            "reference.subscribe",
+            "reference-app.subscribe",
             true,
         ),
         operation(
             "reference.export",
             OperationKindV1::Export,
-            "reference.export",
+            "reference-app.export",
             true,
         ),
     ]
@@ -90,7 +90,7 @@ fn operation(
         kind,
         input_schema_digest: label_digest(&format!("{id}.input/v1")),
         output_schema_digest: label_digest(&format!("{id}.output/v1")),
-        required_capability: capability.to_owned(),
+        required_capabilities: vec![capability.to_owned()],
         delegation: OperationDelegationV1::Either,
         tenant_scoped: false,
         workspace_scoped: false,
@@ -131,10 +131,10 @@ pub fn manifest_digests() -> Result<(Sha256Digest, Sha256Digest)> {
 
 fn unsigned_manifest(files: BTreeMap<String, Sha256Digest>) -> AppManifestV1 {
     let capabilities = vec![
-        "reference.command".to_owned(),
-        "reference.export".to_owned(),
-        "reference.query".to_owned(),
-        "reference.subscribe".to_owned(),
+        "reference-app.command".to_owned(),
+        "reference-app.export".to_owned(),
+        "reference-app.query".to_owned(),
+        "reference-app.subscribe".to_owned(),
     ];
     let placeholder = label_digest("manifest-placeholder");
     AppManifestV1 {

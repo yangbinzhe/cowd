@@ -52,6 +52,11 @@ impl ProtocolValidate for AppManifestV1 {
             require_relative_bundle_path("web_root", web_root)?;
         }
         require_canonical_string_set("capabilities", &self.capabilities, 1024, 192)?;
+        require_app_capability_namespace(
+            "capabilities",
+            &self.app_id,
+            self.capabilities.iter().map(String::as_str),
+        )?;
         validate_manifest_authorization_profiles(self)?;
         require_canonical_requirements(&self.core_bridge_requirements)?;
         for requirement in &self.core_bridge_requirements {
@@ -137,6 +142,11 @@ pub fn manifest_capability_digest_v1(
 ) -> Result<Sha256Digest, ProtocolValidationError> {
     manifest.app_id.validate_value()?;
     require_canonical_string_set("capabilities", &manifest.capabilities, 1024, 192)?;
+    require_app_capability_namespace(
+        "capabilities",
+        &manifest.app_id,
+        manifest.capabilities.iter().map(String::as_str),
+    )?;
     canonical_digest_v1(
         APP_MANIFEST_CAPABILITY_DOMAIN_V1,
         &(
@@ -194,6 +204,20 @@ fn validate_manifest_authorization_profiles(
     }
     for profile in profiles {
         profile.validate()?;
+        require_app_capability_namespace(
+            "authorization_profile.capabilities",
+            &manifest.app_id,
+            profile.capabilities.iter().map(String::as_str),
+        )?;
+        require_app_capability_namespace(
+            "authorization_profile.surface_capabilities",
+            &manifest.app_id,
+            profile
+                .surface_capabilities
+                .values()
+                .flatten()
+                .map(String::as_str),
+        )?;
         for capability in profile
             .capabilities
             .iter()
@@ -267,6 +291,25 @@ impl ProtocolValidate for CoreBridgeRequirementV1 {
         }
         Ok(())
     }
+}
+
+fn require_app_capability_namespace<'a>(
+    field: &'static str,
+    app_id: &AppId,
+    capabilities: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ProtocolValidationError> {
+    let namespace = format!("{}.", app_id.0);
+    if capabilities.into_iter().any(|capability| {
+        capability
+            .strip_prefix(&namespace)
+            .is_none_or(str::is_empty)
+    }) {
+        return Err(ProtocolValidationError::InvalidField {
+            field,
+            reason: format!("must remain within the APP-owned '{namespace}' namespace"),
+        });
+    }
+    Ok(())
 }
 
 fn require_canonical_requirements(

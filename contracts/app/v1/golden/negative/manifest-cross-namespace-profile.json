@@ -1,0 +1,77 @@
+{
+  "app_id": "reference-app",
+  "artifact_version": "1.0.0",
+  "authorization_profiles": [
+    {
+      "capabilities": [
+        "approval.respond",
+        "reference-app.read",
+        "reference-app.write"
+      ],
+      "display_name": "Operator",
+      "is_default": true,
+      "profile_id": "operator",
+      "surface_capabilities": {}
+    }
+  ],
+  "capabilities": [
+    "reference-app.read",
+    "reference-app.write"
+  ],
+  "core_bridge_requirements": [
+    {
+      "accepted_input_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "accepted_output_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "app_operation_id": "reference.command.v1",
+      "core_operation_id": "core.reference.command.v1",
+      "kind": "command",
+      "required_app_capability": "reference-app.write",
+      "streaming": false
+    }
+  ],
+  "display_name": "Reference APP",
+  "executable": "bin/reference-worker",
+  "integrity": {
+    "algorithm": "sha256",
+    "files": {
+      "bin/reference-worker": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "manifest_digest": "sha256:cde9b101c5d1bae7fcf771bf8f25a83fab15d69e3ba076d45a6aed75e5bac5c1"
+  },
+  "presentation": {
+    "core_navigation_kinds": [
+      "reality.object"
+    ],
+    "result_shape_revision": 1,
+    "view_ids": [
+      "main"
+    ]
+  },
+  "required_protocol": {
+    "maximum": 1,
+    "minimum": 1
+  },
+  "sandbox": {
+    "cpu_quota_millis_per_second": 1000,
+    "filesystem": "bundle_read_only_data_read_write",
+    "max_memory_bytes": 268435456,
+    "max_open_files": 256,
+    "max_processes": 8,
+    "network": {
+      "mode": "deny"
+    }
+  },
+  "schema_version": 1,
+  "signature": {
+    "algorithm": "ed25519",
+    "key_id": "release-key-1",
+    "provenance_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "signature": "base64url-signature",
+    "signed_digest": "sha256:cde9b101c5d1bae7fcf771bf8f25a83fab15d69e3ba076d45a6aed75e5bac5c1"
+  },
+  "surfaces": {
+    "tui_view": true,
+    "web": true
+  },
+  "web_root": "webui"
+}
