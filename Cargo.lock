@@ -381,6 +381,7 @@ dependencies = [
  "cowd-app-protocol",
  "cowd-app-sdk",
  "crossterm",
+ "managed-worker-runtime",
  "ratatui",
  "ring",
  "serde",
@@ -389,6 +390,7 @@ dependencies = [
  "storage",
  "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

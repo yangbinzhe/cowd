@@ -4,6 +4,7 @@
 //! contributions; Gateway, TUI and WebUI consume the registry projection.
 
 pub mod catalog;
+pub mod supervisor;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
