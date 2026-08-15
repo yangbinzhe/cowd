@@ -54,6 +54,9 @@ elements.get("echo").listeners.get("click")();
 const firstRequest = await firstRequestPromise;
 const firstCredit = await receive(channel.port2);
 assert.equal(firstRequest.kind, "app_api_request");
+assert.deepEqual({...firstRequest.body}, {
+  payload: {message: "hello from the reference APP"}
+});
 assert.equal(firstCredit.kind, "app_api_credit");
 assert.equal(firstCredit.request_id, firstRequest.request_id);
 channel.port2.postMessage({kind:"host_api_headers", schema_version:1,
