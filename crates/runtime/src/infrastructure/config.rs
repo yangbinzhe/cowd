@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use cowd_app_protocol::{AppActivationPolicyV1, AppId};
 use serde::{Deserialize, Serialize};
 
 use crate::json::JsonValue;
@@ -958,21 +959,51 @@ impl Default for ExtractionConfig {
 
 // ---- Gateway configuration ----
 
-/// Startup policy for product applications that are already part of the
-/// release artifact.  This is intentionally separate from application source
-/// selection: configuration can enable or disable a reviewed APP, but can
-/// never fetch or execute an arbitrary APP revision at runtime.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// Process-wide APP discovery and supervision policy. Bundle contents remain
+/// immutable for the lifetime of a Gateway process.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppsConfig {
+    directories: Vec<PathBuf>,
+    supervisor: AppSupervisorConfig,
     entries: BTreeMap<String, AppStartupConfig>,
+}
+
+impl Default for AppsConfig {
+    fn default() -> Self {
+        Self {
+            directories: vec![crate::cowd_dirs::config_home_dir().join("apps")],
+            supervisor: AppSupervisorConfig::default(),
+            entries: BTreeMap::new(),
+        }
+    }
 }
 
 impl AppsConfig {
     #[must_use]
     pub fn with_app_enabled(mut self, app_id: impl Into<String>, enabled: bool) -> Self {
-        self.entries
-            .insert(app_id.into(), AppStartupConfig { enabled });
+        self.entries.insert(
+            app_id.into(),
+            AppStartupConfig {
+                enabled,
+                ..AppStartupConfig::default()
+            },
+        );
         self
+    }
+
+    #[must_use]
+    pub fn directories(&self) -> &[PathBuf] {
+        &self.directories
+    }
+
+    #[must_use]
+    pub fn supervisor(&self) -> &AppSupervisorConfig {
+        &self.supervisor
+    }
+
+    #[must_use]
+    pub fn entry(&self, app_id: &str) -> AppStartupConfig {
+        self.entries.get(app_id).cloned().unwrap_or_default()
     }
 
     /// An APP not mentioned in configuration is enabled by default when the
@@ -999,11 +1030,48 @@ impl AppsConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStartupConfig {
     pub enabled: bool,
+    pub required: bool,
+    pub activation: AppActivationPolicyV1,
+    pub config_file: Option<PathBuf>,
 }
 
 impl Default for AppStartupConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            required: false,
+            activation: AppActivationPolicyV1::Lazy,
+            config_file: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppSupervisorConfig {
+    pub max_active_workers: usize,
+    pub max_starting_workers: usize,
+    pub activation_timeout_ms: u64,
+    pub handshake_timeout_ms: u64,
+    pub graceful_shutdown_ms: u64,
+    pub idle_ttl_seconds: Option<u64>,
+    pub max_waiters_per_app: usize,
+    pub restart_window_seconds: u64,
+    pub max_restarts_per_window: usize,
+}
+
+impl Default for AppSupervisorConfig {
+    fn default() -> Self {
+        Self {
+            max_active_workers: 16,
+            max_starting_workers: 4,
+            activation_timeout_ms: 10_000,
+            handshake_timeout_ms: 3_000,
+            graceful_shutdown_ms: 5_000,
+            idle_ttl_seconds: Some(300),
+            max_waiters_per_app: 256,
+            restart_window_seconds: 60,
+            max_restarts_per_window: 5,
+        }
     }
 }
 
@@ -3214,19 +3282,158 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
         return Ok(AppsConfig::default());
     };
     let apps = expect_object(apps_value, "merged settings.apps")?;
-    let mut entries = BTreeMap::new();
-    for (app_id, value) in apps {
-        if app_id.trim().is_empty() {
-            return Err(ConfigError::Parse(
-                "merged settings.apps contains an empty application id".to_string(),
-            ));
+    reject_unknown_keys(
+        apps,
+        &["directories", "supervisor", "entries"],
+        "merged settings.apps",
+    )?;
+
+    let directories = match apps.get("directories") {
+        Some(value) => {
+            let values = expect_array(value, "merged settings.apps.directories")?;
+            if values.is_empty() {
+                return Err(ConfigError::Parse(
+                    "merged settings.apps.directories must not be empty".to_string(),
+                ));
+            }
+            values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|path| !path.trim().is_empty())
+                        .map(PathBuf::from)
+                        .ok_or_else(|| {
+                            ConfigError::Parse(
+                                "merged settings.apps.directories must contain non-empty paths"
+                                    .to_string(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
         }
-        let context = format!("merged settings.apps.{app_id}");
-        let entry = expect_object(value, &context)?;
-        let enabled = optional_bool(entry, "enabled", &context)?.unwrap_or(true);
-        entries.insert(app_id.clone(), AppStartupConfig { enabled });
+        None => AppsConfig::default().directories,
+    };
+
+    let mut supervisor = AppSupervisorConfig::default();
+    if let Some(value) = apps.get("supervisor") {
+        let context = "merged settings.apps.supervisor";
+        let object = expect_object(value, context)?;
+        reject_unknown_keys(
+            object,
+            &[
+                "max_active_workers",
+                "max_starting_workers",
+                "activation_timeout_ms",
+                "handshake_timeout_ms",
+                "graceful_shutdown_ms",
+                "idle_ttl_seconds",
+                "max_waiters_per_app",
+                "restart_window_seconds",
+                "max_restarts_per_window",
+            ],
+            context,
+        )?;
+        supervisor.max_active_workers = optional_usize(object, "max_active_workers", context)?
+            .unwrap_or(supervisor.max_active_workers);
+        supervisor.max_starting_workers = optional_usize(object, "max_starting_workers", context)?
+            .unwrap_or(supervisor.max_starting_workers);
+        supervisor.activation_timeout_ms = optional_u64(object, "activation_timeout_ms", context)?
+            .unwrap_or(supervisor.activation_timeout_ms);
+        supervisor.handshake_timeout_ms = optional_u64(object, "handshake_timeout_ms", context)?
+            .unwrap_or(supervisor.handshake_timeout_ms);
+        supervisor.graceful_shutdown_ms = optional_u64(object, "graceful_shutdown_ms", context)?
+            .unwrap_or(supervisor.graceful_shutdown_ms);
+        if object.contains_key("idle_ttl_seconds") {
+            supervisor.idle_ttl_seconds = optional_u64(object, "idle_ttl_seconds", context)?;
+        }
+        supervisor.max_waiters_per_app = optional_usize(object, "max_waiters_per_app", context)?
+            .unwrap_or(supervisor.max_waiters_per_app);
+        supervisor.restart_window_seconds =
+            optional_u64(object, "restart_window_seconds", context)?
+                .unwrap_or(supervisor.restart_window_seconds);
+        supervisor.max_restarts_per_window =
+            optional_usize(object, "max_restarts_per_window", context)?
+                .unwrap_or(supervisor.max_restarts_per_window);
+        if supervisor.max_active_workers == 0
+            || supervisor.max_starting_workers == 0
+            || supervisor.max_starting_workers > supervisor.max_active_workers
+            || supervisor.activation_timeout_ms == 0
+            || supervisor.handshake_timeout_ms == 0
+            || supervisor.graceful_shutdown_ms == 0
+            || supervisor.idle_ttl_seconds == Some(0)
+            || supervisor.max_waiters_per_app == 0
+            || supervisor.restart_window_seconds == 0
+            || supervisor.max_restarts_per_window == 0
+        {
+            return Err(ConfigError::Parse(format!(
+                "{context} requires positive limits and timeouts, max_starting_workers <= max_active_workers, and idle_ttl_seconds null or positive"
+            )));
+        }
     }
-    Ok(AppsConfig { entries })
+
+    let mut entries = BTreeMap::new();
+    let configured_entries = match apps.get("entries") {
+        Some(value) => expect_object(value, "merged settings.apps.entries")?,
+        None => {
+            return Ok(AppsConfig {
+                directories,
+                supervisor,
+                entries,
+            })
+        }
+    };
+    for (app_id, value) in configured_entries {
+        AppId(app_id.clone()).validate_value().map_err(|error| {
+            ConfigError::Parse(format!("merged settings.apps.entries.{app_id}: {error}"))
+        })?;
+        let context = format!("merged settings.apps.entries.{app_id}");
+        let entry = expect_object(value, &context)?;
+        reject_unknown_keys(
+            entry,
+            &["enabled", "required", "activation", "config_file"],
+            &context,
+        )?;
+        let enabled = optional_bool(entry, "enabled", &context)?.unwrap_or(true);
+        let required = optional_bool(entry, "required", &context)?.unwrap_or(false);
+        let activation = match optional_string(entry, "activation", &context)?.unwrap_or("lazy") {
+            "lazy" => AppActivationPolicyV1::Lazy,
+            "resident" => AppActivationPolicyV1::Resident,
+            value => {
+                return Err(ConfigError::Parse(format!(
+                    "{context}.activation must be lazy or resident, got {value}"
+                )))
+            }
+        };
+        let config_file = optional_string(entry, "config_file", &context)?.map(PathBuf::from);
+        entries.insert(
+            app_id.clone(),
+            AppStartupConfig {
+                enabled,
+                required,
+                activation,
+                config_file,
+            },
+        );
+    }
+    Ok(AppsConfig {
+        directories,
+        supervisor,
+        entries,
+    })
+}
+
+fn reject_unknown_keys(
+    object: &BTreeMap<String, JsonValue>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), ConfigError> {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(ConfigError::Parse(format!(
+            "{context}: unsupported field {key}"
+        )));
+    }
+    Ok(())
 }
 
 fn parse_postgres_lane_config(
@@ -4495,9 +4702,9 @@ mod tests {
         parse_optional_context_budget_config, parse_optional_gateway_config,
         parse_optional_hot_state_config, parse_optional_model_context_windows,
         parse_optional_session_history_config, parse_optional_storage_config,
-        parse_permission_mode_label, parse_routing_mode, redact_serde_json, ConfigLoader,
-        ConfigSource, DomainProfile, McpServerConfig, McpTransport, ProviderProtocol,
-        ResolvedPermissionMode, RoutingMode, RuntimeConfig, RuntimeFeatureConfig,
+        parse_permission_mode_label, parse_routing_mode, redact_serde_json, AppActivationPolicyV1,
+        ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport, PathBuf,
+        ProviderProtocol, ResolvedPermissionMode, RoutingMode, RuntimeConfig, RuntimeFeatureConfig,
         RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig, StorageBackendSelection,
         COWD_SETTINGS_SCHEMA_NAME,
     };
@@ -5669,7 +5876,7 @@ approval:
     }
 
     #[test]
-    fn app_startup_policy_defaults_to_enabled_and_allows_explicit_disable() {
+    fn app_runtime_config_is_strict_and_resolves_terminal_defaults() {
         let root = temp_dir();
         let cwd = root.join("project");
         let home = root.join("home").join(".cowd");
@@ -5679,9 +5886,19 @@ approval:
             home.join("config.yaml"),
             r#"
 apps:
-  mfg:
-    enabled: false
-  future_app: {}
+  directories:
+    - /opt/cowd/apps
+  supervisor:
+    max_active_workers: 8
+    max_starting_workers: 2
+    idle_ttl_seconds: null
+  entries:
+    mfg:
+      enabled: false
+      required: true
+      activation: resident
+      config_file: /etc/cowd/apps/mfg.yaml
+    future_app: {}
 "#,
         )
         .expect("write app config");
@@ -5694,10 +5911,52 @@ apps:
         assert!(loaded.apps().is_enabled("future_app"));
         assert!(loaded.apps().is_enabled("unconfigured_app"));
         assert_eq!(
+            loaded.apps().directories(),
+            &[PathBuf::from("/opt/cowd/apps")]
+        );
+        assert_eq!(loaded.apps().supervisor().max_active_workers, 8);
+        assert_eq!(loaded.apps().supervisor().max_starting_workers, 2);
+        assert_eq!(loaded.apps().supervisor().idle_ttl_seconds, None);
+        let mfg = loaded.apps().entry("mfg");
+        assert!(mfg.required);
+        assert_eq!(mfg.activation, AppActivationPolicyV1::Resident);
+        assert_eq!(
+            mfg.config_file,
+            Some(PathBuf::from("/etc/cowd/apps/mfg.yaml"))
+        );
+        assert_eq!(
             loaded.apps().configured_app_ids().collect::<Vec<_>>(),
             vec!["future_app", "mfg"]
         );
 
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn legacy_or_unbounded_app_configuration_is_rejected() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".cowd");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::create_dir_all(&cwd).expect("project dir");
+        fs::write(
+            home.join("config.yaml"),
+            "apps:\n  mfg:\n    enabled: true\n",
+        )
+        .expect("write app config");
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("legacy config must fail closed");
+        assert!(error.to_string().contains("unsupported field mfg"));
+        fs::write(
+            home.join("config.yaml"),
+            "apps:\n  supervisor:\n    max_active_workers: 1\n    max_starting_workers: 2\n",
+        )
+        .expect("write app config");
+        let error = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect_err("invalid capacity must fail closed");
+        assert!(error.to_string().contains("max_starting_workers"));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
