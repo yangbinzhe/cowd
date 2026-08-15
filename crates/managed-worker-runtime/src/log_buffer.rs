@@ -51,6 +51,28 @@ impl BoundedLogBuffer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn drain_skipping<R>(&self, mut reader: R, mut remaining: usize)
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) => return,
+                Ok(read) => {
+                    let skip = remaining.min(read);
+                    remaining -= skip;
+                    self.push(&chunk[skip..read]).await;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "managed worker log drain failed");
+                    return;
+                }
+            }
+        }
+    }
+
     async fn push(&self, chunk: &[u8]) {
         let mut state = self.inner.lock().await;
         if state.capacity == 0 {

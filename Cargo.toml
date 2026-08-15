@@ -2,6 +2,7 @@
 members = [
     "crates/app-protocol",
     "crates/managed-worker-runtime",
+    "crates/managed-worker-launcher",
     "crates/product-apps",
     "crates/app-sdk",
     "crates/app-host",
@@ -41,6 +42,7 @@ resolver = "2"
 default-members = [
     "crates/app-protocol",
     "crates/managed-worker-runtime",
+    "crates/managed-worker-launcher",
     "crates/product-apps",
     "crates/app-sdk",
     "crates/app-host",

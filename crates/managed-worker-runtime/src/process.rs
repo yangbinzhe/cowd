@@ -1,7 +1,9 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Write,
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         process::CommandExt,
     },
     path::{Path, PathBuf},
@@ -14,6 +16,8 @@ use std::{
 };
 
 use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    net::UnixListener,
     process::{Child, Command},
     sync::Mutex,
     task::JoinHandle,
@@ -24,6 +28,11 @@ use crate::{
     log_buffer::BoundedLogBuffer, CancellationToken, CredentialLease, CredentialSecret,
     GenerationFence, LogSnapshot, ManagedWorkerError, ManagedWorkerResult, WorkerRuntimeDir,
 };
+use managed_worker_launcher::{
+    read_boot_id, sha256_file, DirectoryPolicyV1, IsolationModeV1, KernelReceiptV1,
+    LaunchProtocolV1, NetworkPolicyV1, ResourceLimitsV1, WorkerIdentityV1, WorkerIsolationPolicyV1,
+    LAUNCH_SCHEMA_VERSION_V1,
+};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -32,6 +41,7 @@ pub struct ManagedWorkerSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub allowed_env_keys: BTreeSet<String>,
     pub runtime_dir: PathBuf,
     pub generation: String,
     pub startup_timeout: Duration,
@@ -41,6 +51,18 @@ pub struct ManagedWorkerSpec {
     pub socket_env: Option<String>,
     pub credential_env: Option<String>,
     pub generation_env: Option<String>,
+    pub launcher_path: PathBuf,
+    pub launcher_sha256: String,
+    pub gateway_instance: String,
+    pub data_dir: PathBuf,
+    pub config_dir: PathBuf,
+    pub bundle_dir: PathBuf,
+    pub read_only_dirs: Vec<PathBuf>,
+    pub isolation_mode: IsolationModeV1,
+    pub resource_limits: ResourceLimitsV1,
+    pub cgroup_root: Option<PathBuf>,
+    #[cfg(test)]
+    test_launcher_entry: bool,
 }
 
 impl ManagedWorkerSpec {
@@ -54,6 +76,7 @@ impl ManagedWorkerSpec {
             program: program.into(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            allowed_env_keys: BTreeSet::new(),
             runtime_dir: runtime_dir.into(),
             generation: generation.into(),
             startup_timeout: Duration::from_secs(10),
@@ -63,6 +86,18 @@ impl ManagedWorkerSpec {
             socket_env: None,
             credential_env: None,
             generation_env: None,
+            launcher_path: PathBuf::new(),
+            launcher_sha256: String::new(),
+            gateway_instance: String::new(),
+            data_dir: PathBuf::new(),
+            config_dir: PathBuf::new(),
+            bundle_dir: PathBuf::new(),
+            read_only_dirs: Vec::new(),
+            isolation_mode: IsolationModeV1::Enforce,
+            resource_limits: ResourceLimitsV1::default(),
+            cgroup_root: None,
+            #[cfg(test)]
+            test_launcher_entry: false,
         }
     }
 
@@ -75,6 +110,44 @@ impl ManagedWorkerSpec {
     #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
+        self
+    }
+
+    #[must_use]
+    pub fn allow_env_key(mut self, key: impl Into<String>) -> Self {
+        self.allowed_env_keys.insert(key.into());
+        self
+    }
+
+    #[must_use]
+    pub fn launcher(mut self, path: impl Into<PathBuf>, sha256: impl Into<String>) -> Self {
+        self.launcher_path = path.into();
+        self.launcher_sha256 = sha256.into();
+        self
+    }
+
+    #[must_use]
+    pub fn gateway_instance(mut self, value: impl Into<String>) -> Self {
+        self.gateway_instance = value.into();
+        self
+    }
+
+    #[must_use]
+    pub fn directories(
+        mut self,
+        data: impl Into<PathBuf>,
+        config: impl Into<PathBuf>,
+        bundle: impl Into<PathBuf>,
+    ) -> Self {
+        self.data_dir = data.into();
+        self.config_dir = config.into();
+        self.bundle_dir = bundle.into();
+        self
+    }
+
+    #[must_use]
+    pub fn relaxed_for_tests(mut self) -> Self {
+        self.isolation_mode = IsolationModeV1::Relaxed;
         self
     }
 
@@ -94,6 +167,19 @@ impl ManagedWorkerSpec {
                 "log capacity must be positive".to_string(),
             ));
         }
+        if self.launcher_path.as_os_str().is_empty()
+            || self.launcher_sha256.is_empty()
+            || self.gateway_instance.trim().is_empty()
+        {
+            return Err(ManagedWorkerError::InvalidSpec(
+                "launcher path/digest and gateway instance are required".to_string(),
+            ));
+        }
+        if self.isolation_mode == IsolationModeV1::Enforce && self.cgroup_root.is_none() {
+            return Err(ManagedWorkerError::InvalidSpec(
+                "enforced isolation requires a delegated cgroup v2 root".to_string(),
+            ));
+        }
         for name in [
             self.socket_env.as_deref(),
             self.credential_env.as_deref(),
@@ -107,6 +193,15 @@ impl ManagedWorkerSpec {
                     "invalid injected environment name `{name}`"
                 )));
             }
+        }
+        if self
+            .env
+            .keys()
+            .any(|key| !self.allowed_env_keys.contains(key))
+        {
+            return Err(ManagedWorkerError::InvalidSpec(
+                "environment contains a key outside the explicit allowlist".to_string(),
+            ));
         }
         Ok(())
     }
@@ -145,6 +240,8 @@ struct ManagedWorkerInner {
     stderr: BoundedLogBuffer,
     drain_tasks: Mutex<Vec<JoinHandle<()>>>,
     graceful_shutdown_timeout: Duration,
+    identity: WorkerIdentityV1,
+    cgroup_dir: Option<PathBuf>,
     closed: AtomicBool,
 }
 
@@ -154,29 +251,108 @@ impl ManagedWorkerHandle {
         let generation = GenerationFence::new(spec.generation.clone())?;
         let runtime = WorkerRuntimeDir::create(&spec.runtime_dir)?;
         runtime.cleanup_ephemeral()?;
+        if runtime.identity_path().exists() {
+            return Err(ManagedWorkerError::InvalidSpec(
+                "worker identity already exists; runtime recovery is required before spawn"
+                    .to_string(),
+            ));
+        }
+        let mut runtime_guard = RuntimeSpawnGuard::new(runtime.clone());
         let (credential, bootstrap_secret) = CredentialLease::create(&runtime)?;
 
-        let mut command = Command::new(&spec.program);
+        let launcher_path = fs::canonicalize(&spec.launcher_path)
+            .map_err(|error| ManagedWorkerError::io(&spec.launcher_path, error))?;
+        if sha256_file(&launcher_path)
+            .map_err(|error| ManagedWorkerError::Launcher(error.to_string()))?
+            != spec.launcher_sha256
+        {
+            return Err(ManagedWorkerError::Launcher(
+                "launcher artifact digest mismatch".to_string(),
+            ));
+        }
+        let target_path = fs::canonicalize(&spec.program)
+            .map_err(|error| ManagedWorkerError::io(&spec.program, error))?;
+        let target_sha256 = sha256_file(&target_path)
+            .map_err(|error| ManagedWorkerError::Launcher(error.to_string()))?;
+        let launch_id = format!("{:016x}", rand::random::<u64>());
+        let mut cgroup_guard = prepare_cgroup(&spec, &launch_id)?;
+        let status_listener = UnixListener::bind(runtime.status_socket_path())
+            .map_err(|error| ManagedWorkerError::io(runtime.status_socket_path(), error))?;
+        fs::set_permissions(
+            runtime.status_socket_path(),
+            fs::Permissions::from_mode(0o600),
+        )
+        .map_err(|error| ManagedWorkerError::io(runtime.status_socket_path(), error))?;
+
+        let mut env = spec.env.clone();
+        let mut allowed_env_keys = spec.allowed_env_keys.clone();
+        if let Some(name) = &spec.socket_env {
+            env.insert(name.clone(), runtime.socket_path().display().to_string());
+            allowed_env_keys.insert(name.clone());
+        }
+        if let Some(name) = &spec.credential_env {
+            env.insert(name.clone(), credential.path().display().to_string());
+            allowed_env_keys.insert(name.clone());
+        }
+        if let Some(name) = &spec.generation_env {
+            env.insert(name.clone(), generation.as_str().to_string());
+            allowed_env_keys.insert(name.clone());
+        }
+        let launch = LaunchProtocolV1 {
+            schema_version: LAUNCH_SCHEMA_VERSION_V1,
+            launch_id: launch_id.clone(),
+            gateway_instance: spec.gateway_instance.clone(),
+            generation: generation.as_str().to_string(),
+            parent_pid: std::process::id(),
+            parent_boot_id: read_boot_id()
+                .map_err(|error| ManagedWorkerError::Launcher(error.to_string()))?,
+            launcher_sha256: spec.launcher_sha256.clone(),
+            target_path: target_path.clone(),
+            target_sha256: target_sha256.clone(),
+            args: spec.args.clone(),
+            allowed_env_keys,
+            env,
+            isolation: WorkerIsolationPolicyV1 {
+                mode: spec.isolation_mode,
+                directories: DirectoryPolicyV1 {
+                    runtime_dir: runtime.root().to_path_buf(),
+                    data_dir: spec.data_dir.clone(),
+                    config_dir: spec.config_dir.clone(),
+                    bundle_dir: spec.bundle_dir.clone(),
+                    read_only_dirs: spec.read_only_dirs.clone(),
+                },
+                limits: spec.resource_limits.clone(),
+                cgroup_path: cgroup_guard.path().map(Path::to_path_buf),
+                network: NetworkPolicyV1::UnixOnly,
+            },
+            status_socket: runtime.status_socket_path(),
+            identity_path: runtime.identity_path(),
+            deadline_unix_ms: unix_now_ms().saturating_add(
+                u64::try_from(spec.startup_timeout.as_millis()).unwrap_or(u64::MAX),
+            ),
+        };
+        write_launch_spec(&runtime.launch_spec_path(), &launch)?;
+
+        let mut command = Command::new(&launcher_path);
+        command.env_clear();
+        #[cfg(test)]
+        if spec.test_launcher_entry {
+            command
+                .args(["--quiet", "--exact", "process::tests::launcher_entry"])
+                .env("COWD_TEST_LAUNCH_SPEC", runtime.launch_spec_path());
+        } else {
+            command.arg(runtime.launch_spec_path());
+        }
+        #[cfg(not(test))]
+        command.arg(runtime.launch_spec_path());
         command
-            .args(&spec.args)
-            .env_clear()
-            .envs(&spec.env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.as_std_mut().process_group(0);
-        if let Some(name) = &spec.socket_env {
-            command.env(name, runtime.socket_path());
-        }
-        if let Some(name) = &spec.credential_env {
-            command.env(name, credential.path());
-        }
-        if let Some(name) = &spec.generation_env {
-            command.env(name, generation.as_str());
-        }
         let mut child = command
             .spawn()
-            .map_err(|error| ManagedWorkerError::io(&spec.program, error))?;
+            .map_err(|error| ManagedWorkerError::io(&launcher_path, error))?;
         let pid = child.id().ok_or_else(|| {
             ManagedWorkerError::InvalidSpec("spawned worker has no process id".to_string())
         })?;
@@ -185,12 +361,32 @@ impl ManagedWorkerHandle {
         let mut drain_tasks = Vec::with_capacity(2);
         if let Some(pipe) = child.stdout.take() {
             let buffer = stdout.clone();
-            drain_tasks.push(tokio::spawn(async move { buffer.drain(pipe).await }));
+            #[cfg(test)]
+            let task = if spec.test_launcher_entry {
+                tokio::spawn(async move { buffer.drain_skipping(pipe, 16).await })
+            } else {
+                tokio::spawn(async move { buffer.drain(pipe).await })
+            };
+            #[cfg(not(test))]
+            let task = tokio::spawn(async move { buffer.drain(pipe).await });
+            drain_tasks.push(task);
         }
         if let Some(pipe) = child.stderr.take() {
             let buffer = stderr.clone();
             drain_tasks.push(tokio::spawn(async move { buffer.drain(pipe).await }));
         }
+        let identity =
+            match await_launcher_exec(&status_listener, &launch, pid, spec.startup_timeout).await {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let _ = signal_process_group(pid, "KILL").await;
+                    let _ = child.wait().await;
+                    let _ = runtime.cleanup_ephemeral();
+                    let _ = fs::remove_file(runtime.identity_path());
+                    return Err(error);
+                }
+            };
+        let cgroup_dir = cgroup_guard.release();
         let handle = Self {
             inner: Arc::new(ManagedWorkerInner {
                 runtime,
@@ -204,9 +400,12 @@ impl ManagedWorkerHandle {
                 stderr,
                 drain_tasks: Mutex::new(drain_tasks),
                 graceful_shutdown_timeout: spec.graceful_shutdown_timeout,
+                identity,
+                cgroup_dir,
                 closed: AtomicBool::new(false),
             }),
         };
+        runtime_guard.release();
         if spec.require_socket {
             let cancellation = CancellationToken::default();
             if let Err(error) = handle
@@ -238,6 +437,11 @@ impl ManagedWorkerHandle {
     #[must_use]
     pub fn credential_path(&self) -> &Path {
         self.inner.credential.path()
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> &WorkerIdentityV1 {
+        &self.inner.identity
     }
 
     /// Transfer the in-memory bootstrap copy exactly once to the domain handshake owner.
@@ -399,6 +603,8 @@ impl ManagedWorkerHandle {
         if let Err(error) = self.inner.runtime.cleanup_ephemeral() {
             tracing::warn!(%error, "managed worker runtime cleanup failed");
         }
+        let _ = fs::remove_file(self.inner.runtime.identity_path());
+        cleanup_cgroup(self.inner.cgroup_dir.as_deref());
     }
 }
 
@@ -407,7 +613,7 @@ impl Drop for ManagedWorkerInner {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        let _ = std::process::Command::new("kill")
+        let _ = std::process::Command::new("/bin/kill")
             .args(["-KILL", "--", &format!("-{}", self.pid)])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -419,11 +625,13 @@ impl Drop for ManagedWorkerInner {
             }
         }
         let _ = self.runtime.cleanup_ephemeral();
+        let _ = fs::remove_file(self.runtime.identity_path());
+        cleanup_cgroup(self.cgroup_dir.as_deref());
     }
 }
 
 async fn signal_process_group(pid: u32, signal: &str) -> ManagedWorkerResult<()> {
-    let status = Command::new("kill")
+    let status = Command::new("/bin/kill")
         .args([format!("-{signal}"), "--".to_string(), format!("-{pid}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -440,10 +648,235 @@ async fn signal_process_group(pid: u32, signal: &str) -> ManagedWorkerResult<()>
     }
 }
 
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[derive(Debug)]
+struct RuntimeSpawnGuard {
+    runtime: WorkerRuntimeDir,
+    armed: bool,
+}
+
+impl RuntimeSpawnGuard {
+    fn new(runtime: WorkerRuntimeDir) -> Self {
+        Self {
+            runtime,
+            armed: true,
+        }
+    }
+
+    fn release(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RuntimeSpawnGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.runtime.cleanup_ephemeral();
+            let _ = fs::remove_file(self.runtime.identity_path());
+        }
+    }
+}
+
+fn write_launch_spec(path: &Path, launch: &LaunchProtocolV1) -> ManagedWorkerResult<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| ManagedWorkerError::io(path, error))?;
+    serde_json::to_writer(&mut file, launch)
+        .map_err(|error| ManagedWorkerError::Launcher(error.to_string()))?;
+    file.flush()
+        .and_then(|()| file.sync_all())
+        .map_err(|error| ManagedWorkerError::io(path, error))
+}
+
+#[derive(Debug)]
+struct CgroupSpawnGuard {
+    path: Option<PathBuf>,
+}
+
+impl CgroupSpawnGuard {
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn release(&mut self) -> Option<PathBuf> {
+        self.path.take()
+    }
+}
+
+impl Drop for CgroupSpawnGuard {
+    fn drop(&mut self) {
+        cleanup_cgroup(self.path.as_deref());
+    }
+}
+
+fn prepare_cgroup(
+    spec: &ManagedWorkerSpec,
+    launch_id: &str,
+) -> ManagedWorkerResult<CgroupSpawnGuard> {
+    if spec.isolation_mode == IsolationModeV1::Relaxed {
+        return Ok(CgroupSpawnGuard { path: None });
+    }
+    let root = spec.cgroup_root.as_ref().ok_or_else(|| {
+        ManagedWorkerError::Launcher("delegated cgroup v2 root is absent".to_string())
+    })?;
+    if !managed_worker_launcher::is_cgroup2_mount(root)
+        || !root.join("cgroup.controllers").is_file()
+        || !root.join("cgroup.procs").is_file()
+    {
+        return Err(ManagedWorkerError::Launcher(
+            "cgroup root is not a v2 hierarchy".to_string(),
+        ));
+    }
+    let path = root.join(format!("worker-{launch_id}"));
+    fs::create_dir(&path).map_err(|error| ManagedWorkerError::io(&path, error))?;
+    for (name, value) in [
+        (
+            "memory.max",
+            spec.resource_limits.cgroup_memory_bytes.to_string(),
+        ),
+        ("pids.max", spec.resource_limits.cgroup_pids.to_string()),
+        (
+            "cpu.max",
+            format!(
+                "{} {}",
+                spec.resource_limits.cgroup_cpu_quota_us, spec.resource_limits.cgroup_cpu_period_us
+            ),
+        ),
+    ] {
+        let target = path.join(name);
+        if let Err(error) = fs::write(&target, value) {
+            let _ = fs::remove_dir(&path);
+            return Err(ManagedWorkerError::io(target, error));
+        }
+    }
+    Ok(CgroupSpawnGuard { path: Some(path) })
+}
+
+fn cleanup_cgroup(path: Option<&Path>) {
+    if let Some(path) = path {
+        let _ = fs::remove_dir(path);
+    }
+}
+
+async fn await_launcher_exec(
+    listener: &UnixListener,
+    launch: &LaunchProtocolV1,
+    pid: u32,
+    timeout: Duration,
+) -> ManagedWorkerResult<WorkerIdentityV1> {
+    let exchange = async {
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|error| ManagedWorkerError::io(&launch.status_socket, error))?;
+        let peer = stream
+            .peer_cred()
+            .map_err(|error| ManagedWorkerError::io(&launch.status_socket, error))?;
+        let expected_peer = i32::try_from(pid).map_err(|error| {
+            ManagedWorkerError::Launcher(format!("launcher pid is out of range: {error}"))
+        })?;
+        if peer.pid() != Some(expected_peer) {
+            return Err(ManagedWorkerError::Launcher(format!(
+                "status peer pid {:?} did not match launcher pid {pid}",
+                peer.pid()
+            )));
+        }
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| ManagedWorkerError::io(&launch.status_socket, error))?;
+        let receipt: KernelReceiptV1 = serde_json::from_str(line.trim_end()).map_err(|error| {
+            ManagedWorkerError::Launcher(format!("invalid kernel receipt: {error}"))
+        })?;
+        if receipt.schema_version != LAUNCH_SCHEMA_VERSION_V1
+            || receipt.launch_id != launch.launch_id
+            || receipt.pid != pid
+            || receipt.launch_digest
+                != launch
+                    .digest()
+                    .map_err(|error| ManagedWorkerError::Launcher(error.to_string()))?
+            || !receipt.inherited_fds_cloexec
+            || (launch.isolation.mode == IsolationModeV1::Enforce
+                && (!receipt.rlimits_enforced
+                    || !receipt.landlock_enforced
+                    || !receipt.seccomp_unix_only
+                    || !receipt.cgroup_enforced))
+        {
+            return Err(ManagedWorkerError::Launcher(
+                "kernel receipt did not match the admitted launch".to_string(),
+            ));
+        }
+        let mut trailing = Vec::new();
+        reader
+            .read_to_end(&mut trailing)
+            .await
+            .map_err(|error| ManagedWorkerError::io(&launch.status_socket, error))?;
+        if !trailing.is_empty() {
+            return Err(ManagedWorkerError::Launcher(format!(
+                "target exec failed: {}",
+                String::from_utf8_lossy(&trailing)
+            )));
+        }
+        let metadata = fs::symlink_metadata(&launch.identity_path)
+            .map_err(|error| ManagedWorkerError::io(&launch.identity_path, error))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(ManagedWorkerError::Launcher(
+                "worker identity is not a 0600 regular file".to_string(),
+            ));
+        }
+        let identity: WorkerIdentityV1 = serde_json::from_slice(
+            &fs::read(&launch.identity_path)
+                .map_err(|error| ManagedWorkerError::io(&launch.identity_path, error))?,
+        )
+        .map_err(|error| {
+            ManagedWorkerError::Launcher(format!("invalid worker identity: {error}"))
+        })?;
+        if identity.pid != pid
+            || identity.proc_start_ticks != receipt.proc_start_ticks
+            || identity.launch_digest != receipt.launch_digest
+            || identity.target_path != launch.target_path
+            || identity.target_sha256 != launch.target_sha256
+        {
+            return Err(ManagedWorkerError::Launcher(
+                "worker identity did not match the kernel receipt".to_string(),
+            ));
+        }
+        let observed_exe = fs::read_link(format!("/proc/{pid}/exe"))
+            .map_err(|error| ManagedWorkerError::io(format!("/proc/{pid}/exe"), error))?;
+        let (_, observed_ticks) = managed_worker_launcher::proc_identity(pid)
+            .map_err(|error| ManagedWorkerError::Launcher(error.to_string()))?;
+        if observed_exe != launch.target_path || observed_ticks != identity.proc_start_ticks {
+            return Err(ManagedWorkerError::Launcher(
+                "post-exec /proc identity did not match the target".to_string(),
+            ));
+        }
+        Ok(identity)
+    };
+    tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| ManagedWorkerError::DeadlineExceeded(timeout))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs, os::unix::fs::PermissionsExt};
+    use tokio::io::AsyncWriteExt;
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -453,11 +886,52 @@ mod tests {
         ))
     }
 
+    fn launcher_path() -> PathBuf {
+        std::env::current_exe().expect("test executable")
+    }
+
+    fn configure_test_spec(mut spec: ManagedWorkerSpec) -> ManagedWorkerSpec {
+        let runtime = spec.runtime_dir.clone();
+        let data = runtime.join("data");
+        let config = runtime.join("config");
+        let bundle = runtime.with_extension("bundle");
+        for path in [&runtime, &data, &config, &bundle] {
+            fs::create_dir_all(path).expect("test directory");
+        }
+        let launcher = launcher_path();
+        let digest = sha256_file(&launcher).expect("launcher digest");
+        spec.launcher_path = launcher;
+        spec.launcher_sha256 = digest;
+        spec.gateway_instance = "test-gateway".to_string();
+        spec.data_dir = data;
+        spec.config_dir = config;
+        spec.bundle_dir = bundle;
+        spec.isolation_mode = IsolationModeV1::Relaxed;
+        spec.test_launcher_entry = true;
+        spec
+    }
+
+    #[test]
+    fn launcher_entry() {
+        let Some(path) = std::env::var_os("COWD_TEST_LAUNCH_SPEC") else {
+            return;
+        };
+        match managed_worker_launcher::run(Path::new(&path)) {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("test launcher failed: {error}");
+                std::process::exit(125);
+            }
+        }
+    }
+
     fn shell_spec(label: &str, script: &str) -> ManagedWorkerSpec {
-        let mut spec = ManagedWorkerSpec::new("/bin/sh", temp_path(label), "generation-1")
-            .args(["-c", script]);
+        let mut spec = configure_test_spec(
+            ManagedWorkerSpec::new("/bin/sh", temp_path(label), "generation-1")
+                .args(["-c", script]),
+        );
         spec.require_socket = false;
-        spec.startup_timeout = Duration::from_millis(100);
+        spec.startup_timeout = Duration::from_secs(2);
         spec.graceful_shutdown_timeout = Duration::from_millis(150);
         spec.log_capacity_bytes = 1024;
         spec
@@ -524,8 +998,9 @@ mod tests {
     #[tokio::test]
     async fn startup_timeout_kills_process_group_and_cleans_runtime_entries() {
         let root = temp_path("startup-timeout");
-        let mut spec =
-            ManagedWorkerSpec::new("/bin/sh", &root, "generation-1").args(["-c", "sleep 60"]);
+        let mut spec = configure_test_spec(
+            ManagedWorkerSpec::new("/bin/sh", &root, "generation-1").args(["-c", "sleep 60"]),
+        );
         spec.startup_timeout = Duration::from_millis(50);
         spec.graceful_shutdown_timeout = Duration::from_millis(100);
         assert!(matches!(
@@ -550,8 +1025,9 @@ listener.bind(os.environ["WORKER_SOCKET"])
 listener.listen(8)
 time.sleep(60)
 "#;
-        let mut spec =
-            ManagedWorkerSpec::new("/usr/bin/python3", &root, "generation-1").args(["-c", script]);
+        let mut spec = configure_test_spec(
+            ManagedWorkerSpec::new("/usr/bin/python3", &root, "generation-1").args(["-c", script]),
+        );
         spec.socket_env = Some("WORKER_SOCKET".to_string());
         spec.startup_timeout = Duration::from_secs(2);
         spec.graceful_shutdown_timeout = Duration::from_millis(150);
@@ -572,6 +1048,7 @@ time.sleep(60)
             "PATH".to_string(),
             std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
         );
+        spec.allowed_env_keys.insert("PATH".to_string());
         let stable_root = spec.runtime_dir.clone();
         let pid_file = stable_root.join("descendant.pid");
         spec.args = vec![
@@ -630,5 +1107,102 @@ time.sleep(60)
         assert!(!exit.success);
         assert_eq!(handle.try_wait().await.expect("cached exit"), Some(exit));
         fs::remove_dir_all(runtime).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn enforced_mode_rejects_a_fake_cgroup_hierarchy_before_spawn() {
+        let mut spec = shell_spec("fake-cgroup", "sleep 60");
+        spec.isolation_mode = IsolationModeV1::Enforce;
+        let fake = spec.runtime_dir.join("fake-cgroup");
+        fs::create_dir_all(&fake).expect("fake hierarchy");
+        fs::write(fake.join("cgroup.controllers"), b"cpu memory pids").expect("controllers");
+        fs::write(fake.join("cgroup.procs"), b"").expect("procs");
+        spec.cgroup_root = Some(fake);
+        assert!(matches!(
+            ManagedWorkerHandle::spawn(spec).await,
+            Err(ManagedWorkerError::Launcher(message)) if message.contains("not a v2 hierarchy")
+        ));
+    }
+
+    #[tokio::test]
+    async fn launcher_artifact_tamper_is_rejected_before_spawn() {
+        let mut spec = shell_spec("tampered-launcher", "sleep 60");
+        spec.launcher_sha256 = "sha256:00".to_string();
+        assert!(matches!(
+            ManagedWorkerHandle::spawn(spec).await,
+            Err(ManagedWorkerError::Launcher(message)) if message.contains("digest mismatch")
+        ));
+    }
+
+    #[tokio::test]
+    async fn forged_status_receipt_is_rejected() {
+        let spec = shell_spec("forged-status", "sleep 60");
+        let runtime = WorkerRuntimeDir::create(&spec.runtime_dir).expect("runtime");
+        let listener = UnixListener::bind(runtime.status_socket_path()).expect("status listener");
+        let target = fs::canonicalize(&spec.program).expect("target");
+        let launch = LaunchProtocolV1 {
+            schema_version: 1,
+            launch_id: "real-launch".into(),
+            gateway_instance: "test-gateway".into(),
+            generation: "generation-1".into(),
+            parent_pid: std::process::id(),
+            parent_boot_id: read_boot_id().expect("boot id"),
+            launcher_sha256: sha256_file(&std::env::current_exe().expect("launcher path"))
+                .expect("launcher digest"),
+            target_sha256: sha256_file(&target).expect("digest"),
+            target_path: target,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            allowed_env_keys: BTreeSet::new(),
+            isolation: WorkerIsolationPolicyV1 {
+                mode: IsolationModeV1::Relaxed,
+                directories: DirectoryPolicyV1 {
+                    runtime_dir: runtime.root().to_path_buf(),
+                    data_dir: spec.data_dir,
+                    config_dir: spec.config_dir,
+                    bundle_dir: spec.bundle_dir,
+                    read_only_dirs: Vec::new(),
+                },
+                limits: ResourceLimitsV1::default(),
+                cgroup_path: None,
+                network: NetworkPolicyV1::UnixOnly,
+            },
+            status_socket: runtime.status_socket_path(),
+            identity_path: runtime.identity_path(),
+            deadline_unix_ms: unix_now_ms() + 1_000,
+        };
+        let socket = runtime.status_socket_path();
+        tokio::spawn(async move {
+            let mut stream = tokio::net::UnixStream::connect(socket)
+                .await
+                .expect("forge connect");
+            let forged = KernelReceiptV1 {
+                schema_version: 1,
+                launch_id: "forged-launch".into(),
+                pid: std::process::id(),
+                proc_start_ticks: 1,
+                launch_digest: "sha256:forged".into(),
+                landlock_abi: None,
+                landlock_enforced: false,
+                seccomp_unix_only: false,
+                cgroup_enforced: false,
+                rlimits_enforced: false,
+                inherited_fds_cloexec: true,
+            };
+            let mut bytes = serde_json::to_vec(&forged).expect("forge encode");
+            bytes.push(b'\n');
+            stream.write_all(&bytes).await.expect("forge write");
+        });
+        assert!(matches!(
+            await_launcher_exec(
+                &listener,
+                &launch,
+                std::process::id(),
+                Duration::from_secs(1)
+            )
+            .await,
+            Err(ManagedWorkerError::Launcher(message)) if message.contains("did not match")
+        ));
+        fs::remove_dir_all(runtime.root()).expect("cleanup");
     }
 }

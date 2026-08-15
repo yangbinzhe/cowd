@@ -1767,6 +1767,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "managed-worker-launcher"
+version = "0.9.693"
+dependencies = [
+ "landlock",
+ "libc",
+ "seccompiler",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+]
+
+[[package]]
 name = "managed-worker-runtime"
 version = "0.9.693"
 dependencies = [
@@ -1777,7 +1790,9 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "managed-worker-launcher",
  "rand 0.8.7",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",

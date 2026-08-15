@@ -67,8 +67,34 @@ impl WorkerRuntimeDir {
         self.root.join("credential")
     }
 
+    #[must_use]
+    pub fn identity_path(&self) -> PathBuf {
+        self.root.join("worker-identity.json")
+    }
+
+    #[must_use]
+    pub fn identity_temp_path(&self) -> PathBuf {
+        self.root.join("worker-identity.tmp")
+    }
+
+    #[must_use]
+    pub fn launch_spec_path(&self) -> PathBuf {
+        self.root.join("launch-spec.json")
+    }
+
+    #[must_use]
+    pub fn status_socket_path(&self) -> PathBuf {
+        self.root.join("launcher-status.sock")
+    }
+
     pub fn cleanup_ephemeral(&self) -> ManagedWorkerResult<()> {
-        for path in [self.socket_path(), self.credential_path()] {
+        for path in [
+            self.socket_path(),
+            self.credential_path(),
+            self.launch_spec_path(),
+            self.status_socket_path(),
+            self.identity_temp_path(),
+        ] {
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

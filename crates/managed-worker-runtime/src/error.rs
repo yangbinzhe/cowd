@@ -28,6 +28,10 @@ pub enum ManagedWorkerError {
     Signal(String),
     #[error("managed-worker HTTP/2 transport failed: {0}")]
     H2(String),
+    #[error("managed-worker launcher rejected the worker: {0}")]
+    Launcher(String),
+    #[error("managed-worker recovery quarantined an ambiguous process: {0}")]
+    RecoveryIsolation(String),
 }
 
 impl ManagedWorkerError {

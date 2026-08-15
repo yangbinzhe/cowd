@@ -13,6 +13,7 @@ mod error;
 mod generation;
 mod log_buffer;
 mod process;
+mod recovery;
 mod runtime_dir;
 
 pub use cancellation::CancellationToken;
@@ -21,5 +22,12 @@ pub use credential::{CredentialLease, CredentialSecret};
 pub use error::{ManagedWorkerError, ManagedWorkerResult};
 pub use generation::GenerationFence;
 pub use log_buffer::LogSnapshot;
+pub use managed_worker_launcher::{
+    DirectoryPolicyV1 as WorkerDirectoryPolicy, IsolationModeV1 as WorkerIsolationMode,
+    KernelReceiptV1 as WorkerKernelReceipt, NetworkPolicyV1 as WorkerNetworkPolicy,
+    ResourceLimitsV1 as WorkerResourceLimits, WorkerIdentityV1 as WorkerIdentity,
+    WorkerIsolationPolicyV1 as WorkerIsolationPolicy,
+};
 pub use process::{ManagedWorkerHandle, ManagedWorkerSpec, WorkerExit};
+pub use recovery::{recover_runtime_root, RuntimeRecoveryReport};
 pub use runtime_dir::WorkerRuntimeDir;
