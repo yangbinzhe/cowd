@@ -476,6 +476,14 @@ impl ContextBudgetLeaseRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParentExecutionBudget {
     pub budget_id: String,
+    /// Complexity-predicted normal consumption. Crossing it is observable but
+    /// is not a failure while aggregate safety capacity remains.
+    #[serde(default)]
+    pub predicted_tokens: u64,
+    #[serde(default)]
+    pub predicted_cost_microusd: u64,
+    /// Aggregate safety ceilings. These protect the user/system from runaway
+    /// work and must not be confused with the prediction above.
     pub max_tokens: u64,
     pub max_cost_microusd: u64,
     pub deadline_at_ms: u64,
@@ -495,12 +503,51 @@ impl ParentExecutionBudget {
     ) -> Self {
         Self {
             budget_id: budget_id.into(),
+            predicted_tokens: max_tokens,
+            predicted_cost_microusd: max_cost_microusd,
             max_tokens,
             max_cost_microusd,
             deadline_at_ms,
             max_parallel,
             revision,
         }
+    }
+
+    #[must_use]
+    pub fn with_prediction(mut self, tokens: u64, cost_microusd: u64) -> Self {
+        self.predicted_tokens = tokens.clamp(1, self.max_tokens);
+        self.predicted_cost_microusd = cost_microusd.clamp(1, self.max_cost_microusd);
+        self
+    }
+
+    #[must_use]
+    pub fn predicted_tokens(&self) -> u64 {
+        if self.predicted_tokens == 0 {
+            self.max_tokens
+        } else {
+            self.predicted_tokens.min(self.max_tokens)
+        }
+    }
+
+    #[must_use]
+    pub fn predicted_cost_microusd(&self) -> u64 {
+        if self.predicted_cost_microusd == 0 {
+            self.max_cost_microusd
+        } else {
+            self.predicted_cost_microusd.min(self.max_cost_microusd)
+        }
+    }
+
+    #[must_use]
+    pub fn semantically_matches(&self, other: &Self) -> bool {
+        self.budget_id == other.budget_id
+            && self.max_tokens == other.max_tokens
+            && self.max_cost_microusd == other.max_cost_microusd
+            && self.deadline_at_ms == other.deadline_at_ms
+            && self.max_parallel == other.max_parallel
+            && self.revision == other.revision
+            && self.predicted_tokens() == other.predicted_tokens()
+            && self.predicted_cost_microusd() == other.predicted_cost_microusd()
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -512,6 +559,9 @@ impl ParentExecutionBudget {
         }
         if self.max_cost_microusd == 0 {
             return Err("parent execution cost budget must be positive");
+        }
+        if self.predicted_tokens() == 0 || self.predicted_cost_microusd() == 0 {
+            return Err("parent execution budget prediction must be positive");
         }
         if self.deadline_at_ms == 0 {
             return Err("parent execution deadline must be positive");
@@ -526,9 +576,15 @@ impl ParentExecutionBudget {
     }
 }
 
-/// One deterministic child reservation of a [`ParentExecutionBudget`].
-/// The token-shaped fields intentionally match `ContextBudgetLeaseRef` so the
-/// existing context cropper can consume the same authoritative reservation.
+/// One deterministic child allocation target within a [`ParentExecutionBudget`].
+///
+/// `max_tokens` and `max_cost_microusd` are the child's predicted initial
+/// share, not an isolated hard wall. Runtime may let a complex child borrow
+/// unused capacity from the durable parent pool. Only the parent ceiling,
+/// deadline, and parallelism remain hard safety limits. The token-shaped
+/// fields intentionally match `ContextBudgetLeaseRef` so context packing can
+/// still use the predicted share without turning it into an execution kill
+/// switch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildExecutionBudgetReservation {
     pub lease_id: String,
@@ -1582,6 +1638,26 @@ mod tests {
             content,
         )
         .with_score(score)
+    }
+
+    #[test]
+    fn legacy_parent_budget_defaults_prediction_to_its_safety_ceiling() {
+        let legacy = serde_json::json!({
+            "budget_id": "legacy-budget",
+            "max_tokens": 1000,
+            "max_cost_microusd": 5000,
+            "deadline_at_ms": 99,
+            "max_parallel": 2,
+            "revision": 1
+        });
+        let decoded: ParentExecutionBudget =
+            serde_json::from_value(legacy).expect("legacy parent budget");
+        let canonical = ParentExecutionBudget::new("legacy-budget", 1000, 5000, 99, 2, 1);
+
+        assert_eq!(decoded.predicted_tokens(), 1000);
+        assert_eq!(decoded.predicted_cost_microusd(), 5000);
+        assert!(decoded.semantically_matches(&canonical));
+        assert!(decoded.validate().is_ok());
     }
 
     #[test]

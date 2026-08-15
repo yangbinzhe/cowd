@@ -3683,6 +3683,8 @@ where
             subsystem_budget_ratio_bp,
             profile: ContextProfile::MainTurn,
             autonomy_mode: None,
+            expected_parallel_branches: 1,
+            expected_verification_passes: 0,
         });
         let (memory_manager, memory_status) = match memory_composition {
             MemoryManagerComposition::HostSelected(manager) => {
@@ -5559,6 +5561,8 @@ where
             subsystem_budget_ratio_bp: self.subsystem_budget_ratio_bp,
             profile: self.context_profile(),
             autonomy_mode: None,
+            expected_parallel_branches: 1,
+            expected_verification_passes: 0,
         })
     }
 
@@ -5593,6 +5597,8 @@ where
             subsystem_budget_ratio_bp: self.subsystem_budget_ratio_bp,
             profile: self.context_profile(),
             autonomy_mode: None,
+            expected_parallel_branches: 1,
+            expected_verification_passes: 0,
         })
     }
 
@@ -12636,6 +12642,8 @@ pub fn build_cc_memory_config(feature_config: &RuntimeFeatureConfig) -> CcMemory
         subsystem_budget_ratio_bp: ratio_bp,
         profile: ContextProfile::MainTurn,
         autonomy_mode: None,
+        expected_parallel_branches: 1,
+        expected_verification_passes: 0,
     });
     build_cc_memory_config_with_budget(feature_config, &plan)
 }
@@ -16472,6 +16480,8 @@ mod tests {
             subsystem_budget_ratio_bp: 7_000,
             profile: ContextProfile::MainTurn,
             autonomy_mode: None,
+            expected_parallel_branches: 1,
+            expected_verification_passes: 0,
         });
 
         let mem_cfg = build_cc_memory_config_with_budget(&feature_config, &plan);

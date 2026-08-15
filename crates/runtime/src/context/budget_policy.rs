@@ -84,6 +84,12 @@ pub struct RuntimeBudgetInputs {
     pub subsystem_budget_ratio_bp: u32,
     pub profile: ContextProfile,
     pub autonomy_mode: Option<String>,
+    /// Runtime-predicted independent work branches. This is derived from the
+    /// compiled task graph, never from a fixed "one task = N tokens" table.
+    pub expected_parallel_branches: usize,
+    /// Evidence/verification phases that need their own provider continuation
+    /// after branch work finishes.
+    pub expected_verification_passes: usize,
 }
 
 impl RuntimeBudgetInputs {
@@ -95,6 +101,8 @@ impl RuntimeBudgetInputs {
             subsystem_budget_ratio_bp: DEFAULT_SUBSYSTEM_BUDGET_RATIO_BP,
             profile: ContextProfile::MainTurn,
             autonomy_mode: None,
+            expected_parallel_branches: 1,
+            expected_verification_passes: 0,
         }
     }
 }
@@ -161,7 +169,13 @@ impl RuntimeBudgetPlan {
             scaled_budget(tool_total as u64, 0.24, 128, 32_000).min(tool_total as u64) as usize;
         let subagent_default_budget =
             scaled_budget(subsystem_budget_tokens, profile_multiplier, 512, 160_000);
-        let team_total_budget = scaled_budget(subsystem_budget_tokens, 0.35, 1_024, 320_000);
+        let predicted_branch_tokens =
+            subagent_default_budget.saturating_mul(inputs.expected_parallel_branches.max(1) as u64);
+        let predicted_verification_tokens = u64::from(inputs.model_max_output_tokens)
+            .saturating_mul(inputs.expected_verification_passes as u64);
+        let team_total_budget = predicted_branch_tokens
+            .saturating_add(predicted_verification_tokens)
+            .clamp(subagent_default_budget, subsystem_budget_tokens.max(1));
 
         let memory_retrieval_budget = memory_available.max(1);
         let candidate_scan_limit = usize::try_from(memory_retrieval_budget / 256)
@@ -263,12 +277,45 @@ mod tests {
             subsystem_budget_ratio_bp: 7_000,
             profile: ContextProfile::MainTurn,
             autonomy_mode: None,
+            expected_parallel_branches: 1,
+            expected_verification_passes: 0,
         });
 
         assert_eq!(plan.subsystem_budget_tokens, 700_000);
         assert!(plan.memory_retrieval_budget.context_window > 200_000);
         assert!(plan.subagent_default_budget > DEFAULT_SUBAGENT_BUDGET_TOKENS as u64);
+        assert_eq!(plan.team_total_budget, plan.subagent_default_budget);
         assert!(plan.tool_result_budget.per_tool_max_tokens > 10_000);
+    }
+
+    #[test]
+    fn team_budget_is_predicted_from_compiled_branches_and_verification_work() {
+        let simple = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+            model_context_window: 1_000_000,
+            model_max_output_tokens: 128_000,
+            subsystem_budget_ratio_bp: 7_000,
+            profile: ContextProfile::SubAgent,
+            autonomy_mode: None,
+            expected_parallel_branches: 1,
+            expected_verification_passes: 0,
+        });
+        let complex = RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+            expected_parallel_branches: 2,
+            expected_verification_passes: 1,
+            ..RuntimeBudgetInputs {
+                model_context_window: 1_000_000,
+                model_max_output_tokens: 128_000,
+                subsystem_budget_ratio_bp: 7_000,
+                profile: ContextProfile::SubAgent,
+                autonomy_mode: None,
+                expected_parallel_branches: 1,
+                expected_verification_passes: 0,
+            }
+        });
+
+        assert!(complex.team_total_budget > simple.team_total_budget);
+        assert_eq!(complex.team_total_budget, 380_000);
+        assert!(complex.team_total_budget <= complex.subsystem_budget_tokens);
     }
 
     #[test]

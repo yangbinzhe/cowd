@@ -121,18 +121,17 @@ impl ParentExecutionBudgetLedger {
                 .budget
                 .max_tokens
                 .saturating_sub(parent.reserved_tokens);
-            let child_tokens_left = child
-                .max_tokens
-                .saturating_sub(child_totals.reserved_tokens);
             let parent_cost_left = self
                 .budget
                 .max_cost_microusd
                 .saturating_sub(parent.reserved_cost_microusd);
-            let child_cost_left = child
-                .max_cost_microusd
-                .saturating_sub(child_totals.reserved_cost_microusd);
-            let token_capacity = parent_tokens_left.min(child_tokens_left);
-            let cost_capacity = parent_cost_left.min(child_cost_left) / cost_rate.max(1);
+            // Child allocations are complexity-informed starting targets, not
+            // isolated hard caps. Once a child reaches its target it may use
+            // otherwise idle parent capacity. This prevents one difficult
+            // evidence branch or terminal narrator from failing while the
+            // Team still has a safe aggregate token/cost envelope.
+            let token_capacity = parent_tokens_left;
+            let cost_capacity = parent_cost_left / cost_rate.max(1);
             let capacity = token_capacity.min(cost_capacity);
             if guarded_input >= capacity {
                 return Err(format!(
@@ -166,6 +165,14 @@ impl ParentExecutionBudgetLedger {
                         "model": model,
                         "reserved_tokens": reserved_tokens,
                         "reserved_cost_microusd": reserved_cost_microusd,
+                        "child_target_tokens": child.max_tokens,
+                        "child_target_cost_microusd": child.max_cost_microusd,
+                        "child_tokens_before_reservation": child_totals.reserved_tokens,
+                        "borrowed_from_parent_pool": child_totals.reserved_tokens
+                            .saturating_add(reserved_tokens) > child.max_tokens
+                            || child_totals.reserved_cost_microusd
+                                .saturating_add(reserved_cost_microusd)
+                                > child.max_cost_microusd,
                     }),
                 },
                 idempotency_key: Some(format!("provider-reserve:{reservation_id}")),
@@ -226,7 +233,7 @@ impl ParentExecutionBudgetLedger {
     }
 
     fn validate_child(&self, child: &ChildExecutionBudgetReservation) -> Result<(), String> {
-        if child.parent_budget != self.budget
+        if !child.parent_budget.semantically_matches(&self.budget)
             || child.parent_budget_id != self.budget.budget_id
             || child.revision != self.budget.revision
             || child.deadline_at_ms != self.budget.deadline_at_ms
@@ -253,7 +260,7 @@ impl ParentExecutionBudgetLedger {
         let mut durable_budget = None;
         let charges = replay_charges(&events, None, &mut created, &mut durable_budget)?;
         if let Some(durable_budget) = durable_budget {
-            if durable_budget != self.budget {
+            if !durable_budget.semantically_matches(&self.budget) {
                 return Err(format!(
                     "execution budget `{}` durable contract differs from the current packet",
                     self.budget.budget_id
@@ -536,6 +543,27 @@ mod tests {
         let settled = ledger.snapshot().unwrap();
         assert_eq!(settled.settled_tokens, 120);
         assert!(!settled.breached);
+    }
+
+    #[test]
+    fn complex_child_borrows_idle_parent_capacity_without_crossing_parent_ceiling() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let parent = parent();
+        let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
+        let child = child(&parent, 0);
+        let reservation = ledger
+            .reserve_provider(
+                &child,
+                "elastic-child-continuation",
+                "deepseek-v4-flash",
+                10,
+                child.max_tokens + 200,
+            )
+            .expect("unused parent capacity should remain available to a complex child");
+
+        assert!(reservation.reserved_tokens > child.max_tokens);
+        assert!(reservation.reserved_tokens <= parent.max_tokens);
+        assert!(reservation.reserved_cost_microusd <= parent.max_cost_microusd);
     }
 
     #[test]

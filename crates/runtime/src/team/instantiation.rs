@@ -278,8 +278,8 @@ impl TeamInstantiationService {
         ensure_static_graph_ceiling(0, planned_agent_slots)?;
         validate_finite_team_budget_capacity(
             &request.execution_budget.budget_id,
-            request.execution_budget.max_tokens,
-            request.execution_budget.max_cost_microusd,
+            request.execution_budget.predicted_tokens(),
+            request.execution_budget.predicted_cost_microusd(),
             planned_agent_slots,
         )?;
         for role in &manifest.roles {
@@ -1257,13 +1257,13 @@ fn slot_budget_lease(
         parent_budget_id: request.execution_budget.budget_id.clone(),
         owner_id: format!("{}:slot:{}", request.team_id, slot_index + 1),
         scope: "team_agent".to_string(),
-        max_tokens: partition_hard_budget(
+        max_tokens: partition_initial_budget_target(
             request.execution_budget.max_tokens,
             total_slots,
             slot_index,
         ),
         consumed_tokens: 0,
-        max_cost_microusd: partition_hard_budget(
+        max_cost_microusd: partition_initial_budget_target(
             request.execution_budget.max_cost_microusd,
             total_slots,
             slot_index,
@@ -1276,7 +1276,7 @@ fn slot_budget_lease(
     }
 }
 
-fn partition_hard_budget(limit: u64, total_slots: usize, slot_index: usize) -> u64 {
+fn partition_initial_budget_target(limit: u64, total_slots: usize, slot_index: usize) -> u64 {
     if total_slots == 0 || slot_index >= total_slots {
         return 0;
     }
@@ -1304,15 +1304,15 @@ mod acceptance_contract_tests {
     use super::*;
 
     #[test]
-    fn four_agent_reservations_never_exceed_parent_hard_budget() {
+    fn four_agent_initial_targets_cover_but_never_multiply_parent_budget() {
         let reservations = (0..4)
-            .map(|slot| partition_hard_budget(10_003, 4, slot))
+            .map(|slot| partition_initial_budget_target(10_003, 4, slot))
             .collect::<Vec<_>>();
         assert_eq!(reservations, vec![2_501, 2_501, 2_501, 2_500]);
         assert_eq!(reservations.iter().sum::<u64>(), 10_003);
         assert!(validate_finite_team_budget_capacity("finite", 3, 4, 4).is_err());
         assert!(validate_finite_team_budget_capacity("finite", 4, 4, 4).is_ok());
-        assert_eq!(partition_hard_budget(10_003, 4, 4), 0);
+        assert_eq!(partition_initial_budget_target(10_003, 4, 4), 0);
     }
 
     #[test]

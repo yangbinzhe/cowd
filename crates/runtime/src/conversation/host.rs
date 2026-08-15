@@ -8657,22 +8657,31 @@ where
         }
         let visible_facts = serde_json::to_string(envelope)
             .map_err(|error| format!("encode terminal delivery envelope: {error}"))?;
-        match self
-            .runtime
-            .lock()
-            .await
-            .synthesize_failure_explanation(
-                objective,
-                raw,
-                &visible_facts,
-                language,
-                presentation_id,
-                attempt_id,
-                &envelope.envelope_id,
-                envelope.revision,
-            )
-            .await
-        {
+        // Keep the Runtime guard out of the `match` scrutinee. Rust extends a
+        // scrutinee temporary through the match arms; taking the same mutex in
+        // the error arm (to inspect cancellation) would otherwise deadlock
+        // precisely when a delegated budget rejects the narrator before
+        // Provider dispatch.
+        let cancellation = {
+            let runtime = self.runtime.lock().await;
+            runtime.cancellation_token()
+        };
+        let narration = {
+            let mut runtime = self.runtime.lock().await;
+            runtime
+                .synthesize_failure_explanation(
+                    objective,
+                    raw,
+                    &visible_facts,
+                    language,
+                    presentation_id,
+                    attempt_id,
+                    &envelope.envelope_id,
+                    envelope.revision,
+                )
+                .await
+        };
+        match narration {
             Ok((explanation, model, models_used, provider_attempt_id)) => {
                 let mut state = self.state.lock().await;
                 state.terminal_failure_explanation = Some(explanation.clone());
@@ -8680,13 +8689,7 @@ where
                 Ok((explanation, model, models_used, provider_attempt_id))
             }
             Err(error) => {
-                if self
-                    .runtime
-                    .lock()
-                    .await
-                    .cancellation_token()
-                    .is_cancelled()
-                {
+                if cancellation.is_cancelled() {
                     return Err("terminal_presentation_cancelled".to_string());
                 }
                 tracing::warn!(
@@ -11287,7 +11290,8 @@ fn focus_verification_tool_calls(
         .enumerate()
         .map(|(index, scope)| {
             let path = scope
-                .strip_prefix("verify_after_write:")
+                .strip_prefix("read:")
+                .or_else(|| scope.strip_prefix("verify_after_write:"))
                 .or_else(|| scope.strip_prefix("verify_upstream_change:"))?;
             let (_, path) = normalize_workspace_scope(&format!("read:{path}"))?;
             (path != ".").then(|| ModelToolCall {
@@ -12854,6 +12858,24 @@ mod tests {
         services: Arc<crate::RuntimeServices>,
     ) -> StandardRuntimeHost<NoopToolExecutor> {
         let lineage = test_execution_lineage();
+        services.publish_session_execution_policy(
+            lineage.session_id.clone(),
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        let task_spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                &lineage.session_id,
+                Some(harness_contract::policy::PermissionMode::ReadOnly),
+                harness_contract::task::TaskSpec::new("test conversation turn"),
+            )
+            .expect("bind canonical test Task policy");
         services
             .task_runtime_port()
             .create(harness_contract::task::TaskCreateCommand {
@@ -12868,7 +12890,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
                 mission_assigned_by: "runtime.host.test".to_string(),
-                spec: harness_contract::task::TaskSpec::new("test conversation turn"),
+                spec: task_spec,
                 evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "test_input",
                     "host-test",
@@ -12952,6 +12974,24 @@ mod tests {
         T: ToolExecutor,
     {
         lineage.session_id = runtime.session_snapshot().await.session_id;
+        services.publish_session_execution_policy(
+            lineage.session_id.clone(),
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        let task_spec = services
+            .task_runtime_port()
+            .bind_task_spec(
+                &lineage.session_id,
+                Some(harness_contract::policy::PermissionMode::ReadOnly),
+                harness_contract::task::TaskSpec::new(content),
+            )
+            .expect("bind canonical test Task policy");
         services
             .task_runtime_port()
             .create(harness_contract::task::TaskCreateCommand {
@@ -12966,7 +13006,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: harness_contract::task::TaskMissionAssignment::Default,
                 mission_assigned_by: "runtime.host.test".to_string(),
-                spec: harness_contract::task::TaskSpec::new(content),
+                spec: task_spec,
                 evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "test_input",
                     format!("{}:{}", lineage.session_id, lineage.turn_id),
@@ -13717,10 +13757,11 @@ mod tests {
         .await;
         let summary = result.expect("blocked is a governed terminal completion");
 
-        // Two bounded main-turn attempts, plus the two candidate attempts of
-        // the zero-tool failure explanation. Both phases stay bounded; the
-        // explanation falls back to the structured blocked answer.
-        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        // Two bounded main-turn attempts, plus exactly one zero-tool failure
+        // explanation attempt. The narrator failure must return to the
+        // structured blocked answer without re-locking Runtime or trying a
+        // second provider candidate.
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(summary.terminal_completion, GoalCompletion::Partial);
         // The fallback explanation follows the user's original language.
@@ -15139,19 +15180,23 @@ mod tests {
     }
 
     #[test]
-    fn focus_verification_compiles_only_exact_post_write_reads() {
+    fn focus_verification_compiles_exact_required_reads_and_post_write_reads() {
         let calls = focus_verification_tool_calls(
             &[
+                "read:fixtures/source.txt".into(),
                 "verify_after_write:fixtures/a.txt".into(),
                 "verify_upstream_change:fixtures/b.txt".into(),
             ],
             7,
         )
         .expect("exact verification calls");
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert!(calls.iter().all(|call| call.name == "read_file"));
         assert_eq!(calls[0].id, "runtime-focus-verify-7-0");
-        assert!(calls[0].input.contains("fixtures/a.txt"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].input).expect("read input"),
+            serde_json::json!({"path": "fixtures/source.txt"})
+        );
         assert!(
             focus_verification_tool_calls(&["workspace_change:src/lib.rs".into()], 1).is_none()
         );

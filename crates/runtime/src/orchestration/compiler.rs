@@ -436,9 +436,10 @@ fn compile_team_subgraph_node(
             .model_lease
             .clone()
             .unwrap_or_else(|| "default".to_string()),
-        execution_budget: crate::team_instantiation::bounded_parent_execution_budget(
+        execution_budget: adaptive_team_execution_budget(
             format!("runtime-team-budget:{node_id}"),
-            adaptive_subagent_budget(request),
+            request,
+            semantic,
             deadline_at_ms,
             request.constraints.max_parallel_agents.unwrap_or(32),
         ),
@@ -795,6 +796,42 @@ pub(crate) fn materialize_completion(
 }
 
 fn adaptive_subagent_budget(request: &RuntimeOrchestrationCommand) -> u64 {
+    adaptive_runtime_budget_plan(request, 1, 0).subagent_default_budget
+}
+
+fn adaptive_team_execution_budget(
+    budget_id: impl Into<String>,
+    request: &RuntimeOrchestrationCommand,
+    semantic: &GraphSemanticNode,
+    deadline_at_ms: u64,
+    max_parallel: usize,
+) -> harness_contract::context::ParentExecutionBudget {
+    let expected_parallel_branches = usize::from(semantic.multiplicity.max(1))
+        .max(semantic.focuses.len())
+        .max(1);
+    let expected_verification_passes = usize::from(!semantic.evidence_contract.is_empty());
+    let plan = adaptive_runtime_budget_plan(
+        request,
+        expected_parallel_branches,
+        expected_verification_passes,
+    );
+    crate::team_instantiation::bounded_parent_execution_budget(
+        budget_id,
+        plan.subsystem_budget_tokens,
+        deadline_at_ms,
+        max_parallel,
+    )
+    .with_prediction(
+        plan.team_total_budget,
+        plan.team_total_budget.saturating_mul(75),
+    )
+}
+
+fn adaptive_runtime_budget_plan(
+    request: &RuntimeOrchestrationCommand,
+    expected_parallel_branches: usize,
+    expected_verification_passes: usize,
+) -> crate::budget_policy::RuntimeBudgetPlan {
     let model = request.model_lease.as_deref().unwrap_or("unknown");
     let context_window = provider::model_context_window(model);
     let max_output = provider::model_max_output_resolution(model, None).tokens;
@@ -804,8 +841,9 @@ fn adaptive_subagent_budget(request: &RuntimeOrchestrationCommand) -> u64 {
         subsystem_budget_ratio_bp: crate::budget_policy::DEFAULT_SUBSYSTEM_BUDGET_RATIO_BP,
         profile: crate::context_runtime::ContextProfile::SubAgent,
         autonomy_mode: None,
+        expected_parallel_branches,
+        expected_verification_passes,
     })
-    .subagent_default_budget
 }
 
 fn physical_node_id(graph_id: &str, semantic_id: &str, index: u16) -> String {
