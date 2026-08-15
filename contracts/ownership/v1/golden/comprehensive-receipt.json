@@ -1,8 +1,8 @@
 {
   "schema": "OwnershipExportReceiptV1",
   "generation": "comprehensive-1",
-  "snapshot_file_digest": "sha256:16f78b829d86e22c39b4d0c1eca051450f32b945299ea2d7b3c686595594adde",
-  "contract_digest": "sha256:07336a25f0de0bad611026333aaa6256b1afbe31297b0e4670146c0657367eb7",
+  "snapshot_file_digest": "sha256:d5d3879847b386d6c52d3f0a50d95b8cf825642caf17962725609aa5e0e73006",
+  "contract_digest": "sha256:5e4f433154b1a5010018a3eb8d9e1de1fe061dd1105e9e6aa204f7ebd66841a7",
   "schema_digest": "sha256:9af79911b6373a080527380bb560328492060595a6b8131664f32a53c47bc629",
   "external_catalog_digest": "sha256:1fecd1f83bf491ad4862986cfdfc41d14cdf0770db2f4ff6d0d517aaf9c7e874",
   "revision_baseline_digest": "sha256:17c09e791ecb15564bd0c9eaf29368365f646f7f1d64a579e52ece6405f11e6c",
@@ -39,5 +39,5 @@
       "regeneration": "start_empty_then_rebuild_from_authoritative_events"
     }
   ],
-  "receipt_digest": "sha256:44b40a25240f08960570df6e39ae9823d0d93234a79d304c19ab668654b71717"
+  "receipt_digest": "sha256:083d548cfa2699f1bdf4179dcc777a78bdeddfbdd5c4a5aee2e53a3a46693049"
 }

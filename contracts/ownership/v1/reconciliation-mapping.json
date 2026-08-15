@@ -57,7 +57,13 @@
       ],
       "stable_ref": "receipt_id",
       "status": "status",
-      "payload_digest": "stored payload_digest must equal canonical response_json envelope digest"
+      "payload_digest": "cowd.ownership.reconcile.mutation-receipt.v1 over the complete mapped records.mutation_receipts.hash.envelope with output payload_digest excluded",
+      "source_command_payload_digest": {
+        "source_column": "payload_digest",
+        "output_field": "mutation_payload_digest",
+        "semantics": "opaque identity of the original command payload; preserve byte-for-byte after strict lowercase sha256 format validation",
+        "recomputation": "forbidden because the original command payload is not present in the receipt row and response_json is a distinct value"
+      }
     },
     "mutation_receipt_aliases": {
       "table": "mfg_mutation_receipt_alias",

@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub const OWNERSHIP_CONTRACT_DIGEST_V1: &str =
-    "sha256:07336a25f0de0bad611026333aaa6256b1afbe31297b0e4670146c0657367eb7";
+    "sha256:5e4f433154b1a5010018a3eb8d9e1de1fe061dd1105e9e6aa204f7ebd66841a7";
 pub const OWNERSHIP_CONTRACT_VERSION_V1: &str = "cowd.ownership-split/v1.2-final";
 pub const OWNERSHIP_EXECUTION_PROFILE_DIGEST_V1: &str =
     "sha256:93e47823acdfbd15289a4792486c84e136a3b121a7c985fb519b2db30279cc78";
@@ -1220,6 +1220,7 @@ fn validate_reconciliation(value: &OwnershipReconciliation) -> Result<(), Owners
     }
     if value.mutation_receipts.iter().any(|record| {
         record.stable_ref != record.receipt_id
+            || validate_digest(&record.mutation_payload_digest).is_err()
             || !matches!(
                 record.status.as_str(),
                 "accepted"
