@@ -1,5 +1,5 @@
 version: 2
-release_version: 0.9.693
+release_version: 0.9.694
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh
@@ -82,6 +82,12 @@ ignored_tests:
   runtime_projection_performance:
     marker: scripts/test/runtime-projection-performance.sh
     runner: scripts/validate.sh manual runtime-projection-performance
+  reference_app:
+    marker: scripts/test/reference-app.sh
+    runner: scripts/test/reference-app.sh
+  reference_app_performance:
+    marker: scripts/test/reference-app-performance.sh
+    runner: scripts/test/reference-app-performance.sh
   lark_live:
     marker: scripts/test/lark-live.sh
     runner: scripts/validate.sh manual lark-live

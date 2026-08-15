@@ -12,8 +12,11 @@ fail() {
 
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 inventory_version="$(sed -n 's/^release_version: //p' tests/test-governance/test-inventory.yaml)"
+readme_version="$(sed -n 's/^当前治理版本：`\([^`]*\)`.*/\1/p' tests/test-governance/README.md)"
 [[ "$inventory_version" == "$version" ]] \
   || fail "inventory version $inventory_version does not match workspace $version"
+[[ "$readme_version" == "$version" ]] \
+  || fail "governance README version $readme_version does not match workspace $version"
 
 if rg -n 'delete-candidate|planned[_-]v?[0-9]|planned_change|Compatibility aliases|gateway-slow|unit-fast' \
   tests/test-governance scripts/validate.sh scripts/test scripts/ci .github \
@@ -30,7 +33,7 @@ ignored_lines="$(rg -n '#\[ignore' crates --glob '*.rs' || true)"
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   case "$line" in
-    *gateway-global-env.sh*|*COWD_AI_HARNESS_LIVE=1*|*COWD_TEST_POSTGRES_URL*|*memory-performance.sh*|*runtime-projection-performance.sh*|*lark-live.sh*|*public-search-live.sh*) ;;
+    *gateway-global-env.sh*|*COWD_AI_HARNESS_LIVE=1*|*COWD_TEST_POSTGRES_URL*|*memory-performance.sh*|*runtime-projection-performance.sh*|*reference-app.sh*|*reference-app-performance.sh*|*lark-live.sh*|*public-search-live.sh*) ;;
     *) fail "ignored test has no canonical runner classification: $line" ;;
   esac
 done <<<"$ignored_lines"
@@ -48,6 +51,8 @@ while IFS=: read -r file line_number marker; do
     *COWD_TEST_POSTGRES_URL*) runner="scripts/test/postgres-contract.sh" ;;
     *memory-performance.sh*) runner="scripts/test/memory-performance.sh" ;;
     *runtime-projection-performance.sh*) runner="scripts/test/runtime-projection-performance.sh" ;;
+    *reference-app.sh*) runner="scripts/test/reference-app.sh" ;;
+    *reference-app-performance.sh*) runner="scripts/test/reference-app-performance.sh" ;;
     *lark-live.sh*) runner="scripts/test/lark-live.sh" ;;
     *public-search-live.sh*) runner="scripts/test/public-search-live.sh" ;;
     *) continue ;;

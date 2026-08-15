@@ -58,12 +58,21 @@ metadata = json.loads(metadata_path.read_text())
 members = set(metadata["workspace_members"])
 packages = {package["id"]: package for package in metadata["packages"]}
 workspace = [packages[member] for member in members]
-bad = sorted(f"{package['name']}={package['version']}" for package in workspace if package["version"] != expected)
+independent_versions = {"cowd-app-protocol": "1.0.0"}
+bad = sorted(
+    f"{package['name']}={package['version']}"
+    for package in workspace
+    if package["version"] != independent_versions.get(package["name"], expected)
+)
 if bad:
     raise SystemExit("workspace metadata has stale versions: " + ", ".join(bad))
 lock = tomllib.loads(lock_path.read_text())
 lock_pairs = {(package.get("name"), package.get("version")) for package in lock.get("package", [])}
-missing = sorted(package["name"] for package in workspace if (package["name"], expected) not in lock_pairs)
+missing = sorted(
+    package["name"]
+    for package in workspace
+    if (package["name"], independent_versions.get(package["name"], expected)) not in lock_pairs
+)
 if missing:
     raise SystemExit("Cargo.lock lacks current workspace packages: " + ", ".join(missing))
 PY
