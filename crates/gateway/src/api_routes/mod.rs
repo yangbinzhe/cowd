@@ -13468,6 +13468,8 @@ providers:
         let owner = runtime::VerifiedPrincipal::from_test_claims(
             harness_contract::security::PrincipalClaims {
                 principal_id: "approval-owner".to_string(),
+                tenant_id: "tenant:test".to_string(),
+                grant_id: "grant:approval-owner".to_string(),
                 kind: harness_contract::security::PrincipalKind::Human,
                 scopes: vec!["gateway".to_string()],
                 capabilities: vec!["approval.respond".to_string()],
@@ -13478,6 +13480,7 @@ providers:
                 credential_fingerprint: "approval-owner-test".to_string(),
                 credential_epoch: 1,
                 profile_revision: 1,
+                app_profiles: std::collections::BTreeMap::new(),
             },
         );
         let app = approval_routes::router()
@@ -14060,6 +14063,8 @@ providers:
         let principal = runtime::VerifiedPrincipal::from_test_claims(
             harness_contract::security::PrincipalClaims {
                 principal_id: "approval-reviewer-only".to_string(),
+                tenant_id: "tenant:test".to_string(),
+                grant_id: "grant:approval-reviewer".to_string(),
                 kind: harness_contract::security::PrincipalKind::Human,
                 scopes: vec!["gateway".to_string()],
                 capabilities: vec!["approval.respond".to_string()],
@@ -14070,6 +14075,7 @@ providers:
                 credential_fingerprint: "approval-config-test".to_string(),
                 credential_epoch: 1,
                 profile_revision: 1,
+                app_profiles: std::collections::BTreeMap::new(),
             },
         );
         let app = approval_routes::router()

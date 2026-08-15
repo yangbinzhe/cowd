@@ -194,6 +194,7 @@ impl PrincipalVerifier {
         UnparsedPublicKey::new(&ED25519, &self.public_key)
             .verify(&payload, &signature)
             .map_err(|_| PrincipalVerificationError::InvalidSignature)?;
+        validate_authorized_claims(&envelope.claims)?;
         if envelope
             .claims
             .expires_at_ms
@@ -259,6 +260,45 @@ impl PrincipalVerifier {
     }
 }
 
+fn validate_authorized_claims(claims: &PrincipalClaims) -> Result<(), PrincipalVerificationError> {
+    let invalid = |field: &str| {
+        PrincipalVerificationError::InvalidPayload(format!(
+            "signed principal field `{field}` is invalid"
+        ))
+    };
+    if claims.principal_id.trim().is_empty() || claims.principal_id.len() > 256 {
+        return Err(invalid("principal_id"));
+    }
+    if claims.tenant_id.trim().is_empty() || claims.tenant_id.len() > 128 {
+        return Err(invalid("tenant_id"));
+    }
+    if claims.grant_id.trim().is_empty() || claims.grant_id.len() > 256 {
+        return Err(invalid("grant_id"));
+    }
+    if claims.profile_revision == 0 || claims.credential_epoch == 0 {
+        return Err(invalid("authorization_revision"));
+    }
+    if !canonical_strings(&claims.capabilities, 256)
+        || !canonical_strings(&claims.scopes, 256)
+        || claims.app_profiles.iter().any(|(app_id, profile_id)| {
+            app_id.trim().is_empty()
+                || app_id.len() > 128
+                || profile_id.trim().is_empty()
+                || profile_id.len() > 128
+        })
+    {
+        return Err(invalid("authorization_projection"));
+    }
+    Ok(())
+}
+
+fn canonical_strings(values: &[String], max_len: usize) -> bool {
+    values
+        .iter()
+        .all(|value| !value.trim().is_empty() && value.len() <= max_len)
+        && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -272,6 +312,8 @@ pub(crate) fn test_human_interactive_principal() -> VerifiedPrincipal {
     VerifiedPrincipal {
         claims: PrincipalClaims {
             principal_id: "runtime-test-human".to_string(),
+            tenant_id: "tenant:test".to_string(),
+            grant_id: "grant:runtime-test".to_string(),
             kind: harness_contract::security::PrincipalKind::Human,
             scopes: vec!["runtime-test".to_string()],
             capabilities: vec![
@@ -286,6 +328,7 @@ pub(crate) fn test_human_interactive_principal() -> VerifiedPrincipal {
             credential_fingerprint: "test".to_string(),
             credential_epoch: 1,
             profile_revision: 1,
+            app_profiles: std::collections::BTreeMap::new(),
         },
     }
 }
@@ -332,6 +375,8 @@ mod tests {
         .expect("key pair");
         let claims = PrincipalClaims {
             principal_id: "human".to_string(),
+            tenant_id: "tenant:test".to_string(),
+            grant_id: "grant:test".to_string(),
             kind: PrincipalKind::Human,
             scopes: vec!["gateway".to_string()],
             capabilities: vec!["approval.respond".to_string()],
@@ -342,6 +387,7 @@ mod tests {
             credential_fingerprint: "test".to_string(),
             credential_epoch: 1,
             profile_revision: 1,
+            app_profiles: std::collections::BTreeMap::new(),
         };
         let payload = serde_json::to_vec(&claims).expect("payload");
         let mut envelope = SignedPrincipalEnvelope {
@@ -353,6 +399,18 @@ mod tests {
             PrincipalVerifier::from_base64("test", &BASE64.encode(key.public_key().as_ref()))
                 .expect("verifier");
         assert!(verifier.verify(&envelope).is_ok());
+        let mut invalid_context = envelope.claims.clone();
+        invalid_context.tenant_id.clear();
+        let invalid_payload = serde_json::to_vec(&invalid_context).expect("invalid payload");
+        let invalid_envelope = SignedPrincipalEnvelope {
+            key_id: "test".to_string(),
+            claims: invalid_context,
+            signature_base64: BASE64.encode(key.sign(&invalid_payload).as_ref()),
+        };
+        assert!(matches!(
+            verifier.verify(&invalid_envelope),
+            Err(PrincipalVerificationError::InvalidPayload(_))
+        ));
         envelope.claims.capabilities.push("release".to_string());
         assert!(matches!(
             verifier.verify(&envelope),
@@ -370,6 +428,8 @@ mod tests {
         .expect("key pair");
         let claims = PrincipalClaims {
             principal_id: "human".to_string(),
+            tenant_id: "tenant:test".to_string(),
+            grant_id: "grant:test".to_string(),
             kind: PrincipalKind::Human,
             scopes: vec!["gateway".to_string()],
             capabilities: vec!["evolution.release.manage".to_string()],
@@ -380,6 +440,7 @@ mod tests {
             credential_fingerprint: "test".to_string(),
             credential_epoch: 7,
             profile_revision: 1,
+            app_profiles: std::collections::BTreeMap::new(),
         };
         let principal_payload = serde_json::to_vec(&claims).expect("principal payload");
         let principal = SignedPrincipalEnvelope {
@@ -440,6 +501,8 @@ mod tests {
         .expect("key pair");
         let claims = PrincipalClaims {
             principal_id: "human".to_string(),
+            tenant_id: "tenant:test".to_string(),
+            grant_id: "grant:test".to_string(),
             kind: PrincipalKind::Human,
             scopes: vec!["gateway".to_string()],
             capabilities: vec!["approval.respond".to_string()],
@@ -450,6 +513,7 @@ mod tests {
             credential_fingerprint: "test".to_string(),
             credential_epoch: 3,
             profile_revision: 1,
+            app_profiles: std::collections::BTreeMap::new(),
         };
         let payload = serde_json::to_vec(&claims).expect("payload");
         let envelope = SignedPrincipalEnvelope {

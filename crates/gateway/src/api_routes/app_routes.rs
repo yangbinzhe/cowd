@@ -61,29 +61,43 @@ async fn project_catalog(
         .into_iter()
         .map(|status| (status.app_id.clone(), status))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut apps = platform
-        .catalog()
-        .apps()
-        .map(|app| {
-            let mut entry = app.catalog_entry();
-            entry
-                .effective_capabilities
-                .retain(|capability| granted.binary_search(capability).is_ok());
-            if let Some(status) = statuses.get(&entry.app_id) {
-                entry.lifecycle = AppLifecycleV1 {
-                    state: status.state,
-                    reason_code: status.reason.as_ref().map(|_| "runtime_failure".to_owned()),
-                    retryable: matches!(
-                        status.state,
-                        cowd_app_protocol::AppLifecycleStateV1::Failed
-                            | cowd_app_protocol::AppLifecycleStateV1::CircuitOpen
-                    ),
-                    retry_after_ms: None,
-                };
-            }
-            entry
-        })
-        .collect::<Vec<_>>();
+    let mut apps = Vec::new();
+    for app in platform.catalog().apps() {
+        let Some(profile_id) = principal.0.claims().app_profile(&app.manifest.app_id.0) else {
+            continue;
+        };
+        let profile = app
+            .manifest
+            .authorization_profiles
+            .iter()
+            .find(|profile| profile.profile_id == profile_id)
+            .ok_or_else(|| {
+                typed_error(
+                    StatusCode::UNAUTHORIZED,
+                    "signed_app_profile_invalid",
+                    "the signed principal APP profile is not admitted by this catalog generation",
+                )
+            })?;
+        let mut entry = app.catalog_entry();
+        entry.effective_authorization_profile = profile.profile_id.clone();
+        entry.effective_capabilities = profile.capabilities.clone();
+        entry
+            .effective_capabilities
+            .retain(|capability| granted.binary_search(capability).is_ok());
+        if let Some(status) = statuses.get(&entry.app_id) {
+            entry.lifecycle = AppLifecycleV1 {
+                state: status.state,
+                reason_code: status.reason.as_ref().map(|_| "runtime_failure".to_owned()),
+                retryable: matches!(
+                    status.state,
+                    cowd_app_protocol::AppLifecycleStateV1::Failed
+                        | cowd_app_protocol::AppLifecycleStateV1::CircuitOpen
+                ),
+                retry_after_ms: None,
+            };
+        }
+        apps.push(entry);
+    }
     apps.sort_by(|left, right| left.app_id.cmp(&right.app_id));
     let catalog = AppCatalogV1 {
         schema_version: 1,

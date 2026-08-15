@@ -347,6 +347,8 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
     );
     let principal = VerifiedPrincipal::from_test_claims(PrincipalClaims {
         principal_id: "human:full-capability-reviewer".to_string(),
+        tenant_id: "tenant:test".to_string(),
+        grant_id: "grant:full-capability-reviewer".to_string(),
         kind: PrincipalKind::Human,
         scopes: vec!["workspace".to_string()],
         capabilities: vec!["approval.respond".to_string()],
@@ -357,6 +359,7 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         credential_fingerprint: "runtime-test".to_string(),
         credential_epoch: 1,
         profile_revision: 1,
+        app_profiles: std::collections::BTreeMap::new(),
     });
     approval_queue
         .decide(

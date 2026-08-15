@@ -36,6 +36,8 @@ fn signed_human_lease(
         .as_millis() as u64;
     let claims = PrincipalClaims {
         principal_id: "human:policy-operator".to_string(),
+        tenant_id: "tenant:test".to_string(),
+        grant_id: "grant:policy-operator".to_string(),
         kind: PrincipalKind::Human,
         scopes: vec!["workspace".to_string()],
         capabilities: vec!["evolution.release.manage".to_string()],
@@ -46,6 +48,7 @@ fn signed_human_lease(
         credential_fingerprint: "fixture".to_string(),
         credential_epoch: 1,
         profile_revision: 1,
+        app_profiles: std::collections::BTreeMap::new(),
     };
     let verifier =
         PrincipalVerifier::from_base64(key_id, &BASE64.encode(key.public_key().as_ref()))

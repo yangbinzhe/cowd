@@ -4,6 +4,8 @@
 //! authenticated identity; verification and privileged capabilities remain in
 //! the runtime security boundary.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Product-neutral capabilities exposed by Cowd's core human-manager profile.
@@ -47,8 +49,14 @@ pub enum PrincipalAssurance {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PrincipalClaims {
     pub principal_id: String,
+    /// Stable deployment authority identifier. It is signed by AuthBroker and
+    /// is never accepted from an HTTP or APP payload.
+    pub tenant_id: String,
+    /// Unique signed authorization grant for this issued principal envelope.
+    pub grant_id: String,
     pub kind: PrincipalKind,
     pub scopes: Vec<String>,
     pub capabilities: Vec<String>,
@@ -58,19 +66,13 @@ pub struct PrincipalClaims {
     pub expires_at_ms: Option<u64>,
     pub credential_fingerprint: String,
     pub credential_epoch: u64,
-    #[serde(
-        default = "default_profile_revision",
-        skip_serializing_if = "is_default_profile_revision"
-    )]
     pub profile_revision: u64,
+    /// Effective APP profile selections captured at issuance time.
+    pub app_profiles: BTreeMap<String, String>,
 }
 
 const fn default_profile_revision() -> u64 {
     1
-}
-
-fn is_default_profile_revision(revision: &u64) -> bool {
-    *revision == default_profile_revision()
 }
 
 impl PrincipalClaims {
@@ -78,6 +80,8 @@ impl PrincipalClaims {
     pub fn anonymous() -> Self {
         Self {
             principal_id: "anonymous".to_string(),
+            tenant_id: String::new(),
+            grant_id: String::new(),
             kind: PrincipalKind::Anonymous,
             scopes: Vec::new(),
             capabilities: Vec::new(),
@@ -88,6 +92,7 @@ impl PrincipalClaims {
             credential_fingerprint: "anonymous".to_string(),
             credential_epoch: 0,
             profile_revision: default_profile_revision(),
+            app_profiles: BTreeMap::new(),
         }
     }
 
@@ -99,6 +104,11 @@ impl PrincipalClaims {
     #[must_use]
     pub fn is_human_interactive(&self) -> bool {
         self.kind == PrincipalKind::Human && self.assurance == PrincipalAssurance::HumanInteractive
+    }
+
+    #[must_use]
+    pub fn app_profile(&self, app_id: &str) -> Option<&str> {
+        self.app_profiles.get(app_id).map(String::as_str)
     }
 }
 
@@ -130,37 +140,6 @@ pub struct SignedDecisionLease {
     pub key_id: String,
     pub claims: DecisionLeaseClaims,
     pub signature_base64: String,
-}
-
-#[cfg(test)]
-mod compatibility_tests {
-    use super::*;
-
-    #[test]
-    fn profile_revision_preserves_v1_signed_claim_serialization() {
-        let legacy = serde_json::json!({
-            "principal_id": "legacy-human",
-            "kind": "human",
-            "scopes": ["gateway"],
-            "capabilities": ["mfg.read"],
-            "assurance": "human_interactive",
-            "issuer": "cowd.local-auth-broker.v1",
-            "issued_at_ms": 1,
-            "expires_at_ms": null,
-            "credential_fingerprint": "sha256:legacy",
-            "credential_epoch": 1
-        });
-        let claims: PrincipalClaims = serde_json::from_value(legacy.clone()).unwrap();
-        assert_eq!(claims.profile_revision, 1);
-        assert_eq!(serde_json::to_value(claims).unwrap(), legacy);
-    }
-
-    #[test]
-    fn non_default_profile_revision_is_part_of_the_signed_claim() {
-        let mut claims = PrincipalClaims::anonymous();
-        claims.profile_revision = 7;
-        assert_eq!(serde_json::to_value(claims).unwrap()["profile_revision"], 7);
-    }
 }
 
 #[cfg(test)]

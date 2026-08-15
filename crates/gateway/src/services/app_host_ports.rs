@@ -1304,6 +1304,8 @@ mod tests {
     ) -> runtime::VerifiedPrincipal {
         runtime::VerifiedPrincipal::from_test_claims(harness_contract::security::PrincipalClaims {
             principal_id: principal_id.to_string(),
+            tenant_id: "tenant:test".to_string(),
+            grant_id: "grant:test-producer".to_string(),
             kind: harness_contract::security::PrincipalKind::Service,
             scopes: vec!["gateway".to_string()],
             capabilities: Vec::new(),
@@ -1314,6 +1316,7 @@ mod tests {
             credential_fingerprint: credential_fingerprint.to_string(),
             credential_epoch: 1,
             profile_revision: 1,
+            app_profiles: std::collections::BTreeMap::new(),
         })
     }
 

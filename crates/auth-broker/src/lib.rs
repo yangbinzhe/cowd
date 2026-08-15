@@ -22,7 +22,7 @@ use harness_contract::security::{
 };
 use ring::{
     digest,
-    rand::SystemRandom,
+    rand::{SecureRandom, SystemRandom},
     signature::{Ed25519KeyPair, KeyPair},
 };
 use subtle::ConstantTimeEq;
@@ -1170,6 +1170,8 @@ impl LocalAuthority {
         let now = now_ms();
         let claims = PrincipalClaims {
             principal_id: "local-human".to_string(),
+            tenant_id: deployment_tenant_id(&self.key_pair),
+            grant_id: new_grant_id()?,
             kind: PrincipalKind::Human,
             scopes: vec!["gateway".to_string()],
             capabilities: entitlement.granted.clone(),
@@ -1180,6 +1182,7 @@ impl LocalAuthority {
             credential_fingerprint: format!("sha256:{}", self.credential_state.credential_digest),
             credential_epoch: self.credential_state.credential_epoch,
             profile_revision: self.credential_state.profile_revision,
+            app_profiles: entitlement.app_profiles.clone(),
         };
         let signature_base64 = self.sign(&claims)?;
         Ok((
@@ -2008,6 +2011,19 @@ fn hex(value: &[u8]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn deployment_tenant_id(key_pair: &Ed25519KeyPair) -> String {
+    let digest = digest::digest(&digest::SHA256, key_pair.public_key().as_ref());
+    format!("tenant:sha256:{}", hex(digest.as_ref()))
+}
+
+fn new_grant_id() -> Result<String, AuthBrokerError> {
+    let mut nonce = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut nonce)
+        .map_err(|_| AuthBrokerError::Crypto("grant nonce generation failed".to_string()))?;
+    Ok(format!("grant:{}", hex(&nonce)))
+}
+
 #[must_use]
 pub fn entitlement_confirmation_digest(
     credential_epoch: u64,
@@ -2215,6 +2231,14 @@ mod generic_catalog_tests {
         projected.dedup();
         assert_eq!(projected, catalog.surface_capabilities("webui"));
         assert_eq!(principal.claims.capabilities, entitlement.granted);
+        assert_eq!(principal.claims.app_profiles, entitlement.app_profiles);
+        assert!(principal.claims.tenant_id.starts_with("tenant:sha256:"));
+        assert!(principal.claims.grant_id.starts_with("grant:"));
+        let (second, _) = authority
+            .issue_human_principal_for_surface("credential", "webui", Vec::new(), None)
+            .expect("second issuance");
+        assert_eq!(principal.claims.tenant_id, second.claims.tenant_id);
+        assert_ne!(principal.claims.grant_id, second.claims.grant_id);
         assert!(entitlement.granted.contains(&"workbench.read".to_string()));
         assert!(!entitlement
             .granted

@@ -224,6 +224,8 @@ impl HumanAuthority {
         .expect("principal verifier");
         let claims = PrincipalClaims {
             principal_id: "human-evolution-operator".to_string(),
+            tenant_id: "tenant:test".to_string(),
+            grant_id: "grant:evolution-operator".to_string(),
             kind: PrincipalKind::Human,
             scopes: vec!["workspace/cowd/evolution-agent".to_string()],
             capabilities: vec![
@@ -237,6 +239,7 @@ impl HumanAuthority {
             credential_fingerprint: "test-human-evolution-operator".to_string(),
             credential_epoch: 1,
             profile_revision: 1,
+            app_profiles: std::collections::BTreeMap::new(),
         };
         let principal = verifier
             .verify(&SignedPrincipalEnvelope {

@@ -896,6 +896,8 @@ mod tests {
     fn review_principal(capabilities: &[&str]) -> runtime::VerifiedPrincipal {
         runtime::VerifiedPrincipal::from_test_claims(harness_contract::security::PrincipalClaims {
             principal_id: "reviewer".to_string(),
+            tenant_id: "tenant:test".to_string(),
+            grant_id: "grant:reviewer".to_string(),
             kind: harness_contract::security::PrincipalKind::Human,
             scopes: vec!["gateway".to_string()],
             capabilities: capabilities
@@ -909,6 +911,7 @@ mod tests {
             credential_fingerprint: "test".to_string(),
             credential_epoch: 1,
             profile_revision: 1,
+            app_profiles: std::collections::BTreeMap::new(),
         })
     }
 

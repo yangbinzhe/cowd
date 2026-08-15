@@ -1162,6 +1162,8 @@ mod v2_upgrade_tests {
             AuthenticatedPrincipal(runtime::VerifiedPrincipal::from_test_claims(
                 PrincipalClaims {
                     principal_id: "route-test".to_string(),
+                    tenant_id: "tenant:test".to_string(),
+                    grant_id: "grant:route-test".to_string(),
                     kind: PrincipalKind::Human,
                     scopes: vec!["gateway".to_string()],
                     capabilities: capabilities.into_iter().map(str::to_string).collect(),
@@ -1172,6 +1174,7 @@ mod v2_upgrade_tests {
                     credential_fingerprint: "route-test".to_string(),
                     credential_epoch: 1,
                     profile_revision: 1,
+                    app_profiles: std::collections::BTreeMap::new(),
                 },
             ))
         };
