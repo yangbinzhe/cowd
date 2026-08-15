@@ -6850,12 +6850,18 @@ where
             )
             .unwrap_or(10_000)
         };
-        let (bounded_evidence_role, novelty_target_bp, focus_acceptance_scopes) = {
+        let (
+            bounded_evidence_role,
+            novelty_target_bp,
+            focus_acceptance_scopes,
+            has_retained_focus_terminal_candidate,
+        ) = {
             let state = self.state.lock().await;
             (
                 state.bounded_evidence_role,
                 state.focus_novelty_target_bp,
                 state.focus_acceptance_scopes.clone(),
+                state.pending_focus_terminal_candidate.is_some(),
             )
         };
         let satisfied_focus_acceptance_scope_keys = typed_satisfied_focus_acceptance_scope_keys(
@@ -7037,6 +7043,7 @@ where
             focus_acceptance_met,
             &focus_acceptance_scopes,
             repeated_evidence_saturation,
+            has_retained_focus_terminal_candidate,
         );
         let successful_write_observed = write_obligation_satisfied(
             state.required_write_for_completion,
@@ -10466,9 +10473,17 @@ fn should_force_focus_synthesis(
     focus_acceptance_met: bool,
     required_scopes: &[String],
     repeated_evidence_saturation: bool,
+    has_retained_terminal_candidate: bool,
 ) -> bool {
     if !focus_acceptance_met {
         return false;
+    }
+    // Runtime retained this candidate specifically while it completed the
+    // missing deterministic read. Once the typed receipt closes the exact
+    // obligation, another provider answer creates a stale second-final race;
+    // the retained candidate owns the text and the receipt owns the evidence.
+    if has_retained_terminal_candidate {
+        return true;
     }
     let read_only = !required_scopes.is_empty()
         && required_scopes
@@ -16183,16 +16198,30 @@ mod tests {
     fn read_only_focus_converges_on_evidence_saturation_not_first_file() {
         let read_scope = vec!["read:crates/runtime".to_string()];
 
-        assert!(!should_force_focus_synthesis(true, &read_scope, false));
+        assert!(!should_force_focus_synthesis(
+            true,
+            &read_scope,
+            false,
+            false
+        ));
         assert!(
-            should_force_focus_synthesis(true, &read_scope, true),
+            should_force_focus_synthesis(true, &read_scope, false, true),
+            "a retained terminal candidate must finalize as soon as its exact read is verified"
+        );
+        assert!(
+            should_force_focus_synthesis(true, &read_scope, true, false),
             "a bounded read role must converge after repeated responsibility-zone saturation"
         );
         assert!(
-            should_force_focus_synthesis(true, &["write:src/lib.rs".to_string()], false,),
+            should_force_focus_synthesis(true, &["write:src/lib.rs".to_string()], false, false,),
             "effect contracts must synthesize immediately after their exact obligation completes"
         );
-        assert!(!should_force_focus_synthesis(false, &read_scope, true));
+        assert!(!should_force_focus_synthesis(
+            false,
+            &read_scope,
+            true,
+            true
+        ));
     }
 
     #[test]
