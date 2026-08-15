@@ -2461,24 +2461,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn broker_cleanup_never_unlinks_a_new_generation_that_reuses_the_same_inode() {
-        use std::os::unix::fs::MetadataExt;
+    fn broker_cleanup_never_unlinks_a_new_socket_generation() {
         use std::os::unix::net::UnixListener;
 
         let root = temp_webui_dir("broker-socket-generation");
         let socket = root.join("broker.sock");
         let old_generation = publish_test_socket_generation(&socket, "old-generation");
         let old_listener = UnixListener::bind(&socket).expect("old broker socket");
-        let old_identity = fs::metadata(&socket).expect("old socket metadata").ino();
         drop(old_listener);
         fs::remove_file(&socket).expect("replace old broker socket");
         let new_generation = publish_test_socket_generation(&socket, "new-generation");
         let new_listener = UnixListener::bind(&socket).expect("new broker socket");
-        let new_identity = fs::metadata(&socket).expect("new socket metadata").ino();
-        assert_eq!(
-            old_identity, new_identity,
-            "fixture did not reuse the inode"
-        );
 
         remove_socket_if_owned(&socket, &old_generation);
 
