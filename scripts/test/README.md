@@ -13,8 +13,8 @@ scripts/validate.sh changed-crates
 
 `changed-crates` 使用 `cargo metadata` 动态识别 package，不维护手写 crate 清单。根
 Cargo manifest 或 lockfile 变化会自动提升为 workspace all-targets；独立
-`tests/interactive` 变化会检查自己的 manifest。位于 crate 外的 APP source lock
-显式归属 `cowd-product-apps`；该映射由治理门禁自测。
+`tests/interactive` 变化会检查自己的 manifest。APP 由独立仓库构建为签名 Bundle，
+不进入 Cowd 的 changed-crates 源码映射。
 
 ## 阶段
 
@@ -28,7 +28,7 @@ scripts/validate.sh surface
 - `contract`：稳定 crate 合同与依赖边界。
 - `serial-global`：唯一需要串行执行的 Gateway 全局状态测试。
 - `scenario`：少量跨模块黄金路径。
-- `surface`：CLI、TUI、TUI/MFG、WebUI 的真实控制点。
+- `surface`：CLI、TUI、WebUI 与签名 reference Bundle 的真实控制点。
 
 ## 封版
 
@@ -38,7 +38,8 @@ scripts/validate.sh release
 ```
 
 `full-regression` 让普通 Rust 测试使用 Cargo 默认并行度，完成后单独运行
-`gateway-global-env.sh`。不得为了少量全局状态测试把整个 workspace 强制单线程。
+`gateway-global-env.sh`，再通过 `reference-app.sh` 构建、签名、发现并调用独立 APP。
+不得为了少量全局状态测试把整个 workspace 强制单线程。
 各 lane 默认复用仓库唯一 `target` 且关闭 incremental，不保留版本备份；需要验证干净
 构建时显式设置 `COWD_ISOLATED_TARGET=1`，退出后会删除一次性 target。
 验证默认不递归统计大型 `target` 目录，构建体积专项才设置
@@ -60,7 +61,8 @@ scripts/validate.sh manual tui-production-acceptance
 
 PostgreSQL 合同要求隔离、可清空的 `COWD_TEST_POSTGRES_URL`；跨 PostgreSQL 复制还可
 提供 `COWD_TEST_POSTGRES_TARGET_URL`。统一入口覆盖 Fact、Surface、Gateway、
-Memory、Matrix、Runtime、Session、Approval、Connector 和 Product App 存储合同；
+Memory、Matrix、Runtime、Session、Approval、Connector 存储合同；APP 私库合同由各自
+独立仓库负责，Cowd 只验证 Bundle、supervisor 与通用 transport 边界。
 每项必须真实执行且恰好有一个测试通过，禁止因环境缺失静默返回成功。这些入口不会
 读取用户生产数据库。TUI 生产验收使用真实 Gateway、受控 Provider 和 PTY，并把证据
 写入版本化报告目录。

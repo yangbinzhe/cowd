@@ -148,14 +148,24 @@ mapped_packages="$(
   scripts/test/changed-crates.sh --packages-for \
     crates/gateway/src/main.rs \
     crates/matrix/core/src/lib.rs \
-    crates/skill/service/src/lib.rs \
-    apps/mfg/source.lock.toml
+    crates/skill/service/src/lib.rs
 )"
-for package in cowd-product-apps gateway matrix-core skill; do
+for package in gateway matrix-core skill; do
   if ! grep -qx "$package" <<<"$mapped_packages"; then
     fail "changed-crates metadata mapping omitted $package"
   fi
 done
+
+for retired in apps/catalog.toml apps/mfg/source.lock.toml crates/product-apps crates/app-sdk surfaces/webui/apps.generated.ts; do
+  if [[ -e "$retired" ]]; then
+    fail "retired static APP composition returned: $retired"
+  fi
+done
+
+[[ -x scripts/test/reference-app.sh ]] || fail "reference Bundle regression runner is missing or not executable"
+if ! rg -q 'reference-app\.sh' .github/workflows/ci.yml scripts/test/full-regression.sh scripts/validate.sh; then
+  fail "reference Bundle runner is not wired into validation"
+fi
 
 if [[ "$failures" -ne 0 ]]; then
   exit 1

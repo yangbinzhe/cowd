@@ -40,7 +40,7 @@ GROUP_ORDER = [
     "resource",
     "workspace",
     "profile",
-    "mfg",
+    "app",
     "harness_eval",
     "audit",
     "slash",
@@ -72,7 +72,7 @@ GROUP_TITLES = {
     "resource": "Resource 附件资源",
     "workspace": "Workspace 文件工作区",
     "profile": "Profile 配置画像",
-    "mfg": "MFG 上层应用",
+    "app": "签名 APP",
     "harness_eval": "Harness Eval 评测",
     "audit": "Audit 审计",
     "slash": "Slash 命令",
@@ -82,7 +82,7 @@ GROUP_TITLES = {
 GROUP_DESCRIPTIONS = {
     "public": "健康检查、WebUI manifest 和认证入口；公共路由不经过统一 Bearer 中间件。",
     "core": "Gateway 对外暴露的全局能力图、结构化事实投影、发布门禁和路由清单。",
-    "runtime": "AI Harness 的运行状态、事件、控制平面、配置热加载、turn 提交和 session lease。",
+    "runtime": "AI Harness 的运行状态、事件、控制平面、turn 提交和 session lease。",
     "session": "持久会话、分叉、压缩、统计、事件、运行投影和 session 级管理。",
     "message": "用户消息写入、历史消息读取和会话 SSE 流。",
     "mission": "Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、审批和代理关系。",
@@ -104,7 +104,7 @@ GROUP_DESCRIPTIONS = {
     "resource": "上传资源注册、资源详情和资源 evidence。",
     "workspace": "工作区浏览、文件/目录增删改、上传、下载、raw 读取和 session attachment。",
     "profile": "配置画像列表、切换和删除。",
-    "mfg": "制造领域应用：Reality 数据、事件、incident、playbook、case、analysis、action、report。",
+    "app": "签名 APP 的发现、详情、通用 operation 调用、stream 与 TUI view 传输。",
     "harness_eval": "AI Harness 场景评测、运行、报告和最新报告。",
     "audit": "跨模块审计导出。",
     "slash": "Slash 命令目录、详情、解析、分发和历史。",
@@ -146,8 +146,8 @@ PATH_PURPOSES = [
 
 def group_for(rel: str) -> str:
     top = rel.split("/", 1)[0]
-    if top.startswith("mfg_routes"):
-        return "mfg"
+    if top.startswith("app_routes"):
+        return "app"
     if top.startswith("matrix_routes"):
         return "matrix"
     if top.startswith("runtime_routes"):
@@ -200,8 +200,8 @@ def purpose_for(path: str, group: str, method: str) -> str:
     for exact, purpose in PATH_PURPOSES:
         if path == exact:
             return purpose
-    if path.startswith("/api/apps/mfg"):
-        return f"MFG 应用 {operation_kind(method)}接口"
+    if path.startswith("/api/apps"):
+        return f"签名 APP {operation_kind(method)}接口"
     if path.startswith("/api/matrix"):
         return f"Matrix 结构化事实 {operation_kind(method)}接口"
     if path.startswith("/api/mission"):
@@ -262,7 +262,7 @@ def parse_routes() -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     for source_path in sorted(API_ROUTES.rglob("*.rs")):
         rel = source_path.relative_to(API_ROUTES).as_posix()
-        if rel in {"mod.rs", "route_manifest.rs", "matrix_outcomes.rs", "mfg_outcomes.rs"}:
+        if rel in {"mod.rs", "route_manifest.rs", "matrix_outcomes.rs"}:
             continue
         source = source_path.read_text(encoding="utf-8")
         offset = 0
@@ -451,10 +451,10 @@ def write_framework_doc(routes: list[dict[str, str]]) -> None:
             "mission": "WebUI、Runtime、Agent 协同",
             "surface": "WebUI、运维、Gateway supervisor",
             "edge": "WebUI、Gateway hot reload",
-            "connector": "WebUI、Matrix、Reality、MFG",
+            "connector": "WebUI、Matrix、Reality、签名 APP",
             "workspace": "WebUI、TUI、Runtime 工具",
             "resource": "WebUI、Surface 附件、Runtime 上下文",
-            "mfg": "WebUI MFG 应用",
+            "app": "WebUI、TUI、签名 APP",
         }.get(group, "WebUI、TUI、Runtime 或运维工具")
         downstream = GROUP_DESCRIPTIONS.get(group, GROUP_TITLES.get(group, group))
         lines.append(f"| {GROUP_TITLES.get(group, group)} | {downstream} | {consumers} | `{group}` services / kernels | {len(rows)} |")

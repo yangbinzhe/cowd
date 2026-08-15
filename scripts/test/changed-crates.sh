@@ -22,12 +22,6 @@ cargo metadata --format-version 1 --no-deps \
 package_for_file() {
   local file="$1"
   local package directory
-  case "$file" in
-    apps/mfg/*)
-      printf '%s\n' cowd-product-apps
-      return 0
-      ;;
-  esac
   while IFS=$'\t' read -r package directory; do
     case "$file" in
       "$directory"|"$directory"/*)

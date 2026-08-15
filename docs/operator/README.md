@@ -29,6 +29,25 @@ cowd storage adopt-postgres # 回退后显式接管 PG（停机）
 - `live subscription count exceeded` 表示同一实例的活跃订阅超过上限：确认没有重复标签页后
   刷新页面，或提升配置。
 
+## APP Bundle 部署
+
+将独立构建且已签名的 `.cowd-app` Bundle 放入 `apps.directories` 配置的任一目录。Gateway 启动时完成发现、签名与完整性验证，并把通过准入的 Worker 纳入统一 supervisor；未通过准入的 Bundle 不会进入运行目录或能力目录。
+
+```yaml
+apps:
+  directories:
+    - /opt/cowd/apps
+  trust_store: /etc/cowd/app-trust.json
+```
+
+```bash
+cowd apps list
+cowd apps status <app-id>
+cowd apps doctor <app-id>
+cowd apps logs <app-id>
+cowd apps restart <app-id>
+```
+
 ## 常见故障
 
 | 现象 | 原因 | 处理 |

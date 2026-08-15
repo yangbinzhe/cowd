@@ -108,38 +108,11 @@ for _ in {1..160}; do
 done
 curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/health" >/dev/null
 
-profile_show() {
-  printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-    "${BIN}" auth profile show
-}
-
-set_manager_profile() {
-  local current epoch revision confirmation stderr_path
-  stderr_path="${SCENARIO_ROOT}/profile-set.stderr"
-  current="$(profile_show)"
-  epoch="$(jq -er '.credential_epoch' <<<"${current}")"
-  revision="$(jq -er '.profile_revision' <<<"${current}")"
-  if printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-    "${BIN}" auth profile set --core-profile core_manager --apps mfg=mfg_manager \
-      --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm invalid \
-      >/dev/null 2>"${stderr_path}"; then
-    echo "invalid profile confirmation unexpectedly succeeded" >&2
-    return 1
-  fi
-  confirmation="$(sed -n 's/.*confirmation=\([^[:space:]]*\).*/\1/p' "${stderr_path}" | head -n 1)"
-  [[ -n "${confirmation}" ]] || { echo "profile confirmation was not emitted" >&2; return 1; }
-  printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-    "${BIN}" auth profile set --core-profile core_manager --apps mfg=mfg_manager \
-      --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm "${confirmation}" \
-      >"${SCENARIO_ROOT}/profile-manager.json"
-}
-
-set_manager_profile
-curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/apps/mfg/contract" \
+curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/gateway/openapi.json" \
   | jq -e '
-      [.routes[] | select(.availability == "active") | .route_id] as $ids
-      | ($ids | length) > 0
-      and ($ids | length) == ($ids | unique | length)
+      .paths["/api/apps"] != null
+      and .paths["/api/apps/{app_id}"] != null
+      and .paths["/api/apps/{app_id}/operations/{operation_id}/invoke"] != null
     ' >/dev/null
 
 if [[ "${MODE}" == "update" ]]; then

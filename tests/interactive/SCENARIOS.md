@@ -19,7 +19,6 @@
 | `tui_skills` | Skill 面板与导航 | Skill 投影不可达 |
 | `tui_session_sidebar` | 会话侧栏 | 当前会话不可见或不可切换 |
 | `tui_all_panels` | 人工遍历全部二级面板 | 面板可达性与终端布局回归 |
-| `tui_mfg_operations` | MFG 只读控制面 | APP 投影、回链证据和响应式布局回归 |
 | `server_core` | health、session、memory、config | Gateway 核心诊断 |
 | `server_gateway_api` | memory/tool/config API | API 诊断 |
 | `server_gateway_cmd` | CLI Gateway 生命周期 | 启停与状态命令失效 |

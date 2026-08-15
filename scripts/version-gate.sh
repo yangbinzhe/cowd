@@ -121,40 +121,17 @@ for _ in {1..160}; do
 done
 curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/health" >/dev/null
 
-profile_show() {
-  printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-    "${BIN}" auth profile show
-}
-current="$(profile_show)"
-epoch="$(jq -er '.credential_epoch' <<<"${current}")"
-revision="$(jq -er '.profile_revision' <<<"${current}")"
-profile_stderr="${SCENARIO_ROOT}/profile-set.stderr"
-if printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-  "${BIN}" auth profile set --core-profile core_manager --apps mfg=mfg_manager \
-    --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm invalid \
-    >/dev/null 2>"${profile_stderr}"; then
-  echo "invalid profile confirmation unexpectedly succeeded" >&2
-  exit 1
-fi
-confirmation="$(sed -n 's/.*confirmation=\([^[:space:]]*\).*/\1/p' "${profile_stderr}" | head -n 1)"
-[[ -n "${confirmation}" ]] || { echo "profile confirmation was not emitted" >&2; exit 1; }
-printf '%s\n' "${TOKEN}" | env COWD_CONFIG_HOME="${CONFIG_HOME}" HOME="${TEST_HOME}" \
-  "${BIN}" auth profile set --core-profile core_manager --apps mfg=mfg_manager \
-    --expected-epoch "${epoch}" --expected-revision "${revision}" --confirm "${confirmation}" >/dev/null
-
 OPENAPI="${SCENARIO_ROOT}/openapi.json"
-CONTRACT="${SCENARIO_ROOT}/contract.json"
 curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/gateway/openapi.json" >"${OPENAPI}"
-curl -fsS -H "Authorization: Bearer ${TOKEN}" "${BASE_URL}/api/apps/mfg/contract" >"${CONTRACT}"
 jq -e --arg version "${VERSION}" '.openapi == "3.1.0" and .info.version == $version' "${OPENAPI}" >/dev/null
 jq -e '
-  [.routes[] | select(.availability == "active") | .route_id] as $ids
-  | ($ids | length) > 0
-  and ($ids | length) == ($ids | unique | length)
-' "${CONTRACT}" >/dev/null
+  .paths["/api/apps"] != null
+  and .paths["/api/apps/{app_id}"] != null
+  and .paths["/api/apps/{app_id}/operations/{operation_id}/invoke"] != null
+' "${OPENAPI}" >/dev/null
 for stale in 0.9.540 0.9.541 0.9.542 0.9.543 0.9.544 0.9.545 0.9.546 0.9.547; do
-  if grep -F "${stale}" "${OPENAPI}" "${CONTRACT}" >/dev/null; then
-    echo "Gateway OpenAPI or active contract exposes stale release ${stale}" >&2
+  if grep -F "${stale}" "${OPENAPI}" >/dev/null; then
+    echo "Gateway OpenAPI exposes stale release ${stale}" >&2
     exit 1
   fi
 done

@@ -221,6 +221,7 @@ ok "built ${COWD_BIN}"
 # ── Step 5: post-build verification ──────────────────────────────────────────
 
 CONFIG_DIR="${HOME}/.cowd"
+APPS_DIR="${CONFIG_DIR}/apps"
 
 step "Verifying the installed binary"
 
@@ -241,7 +242,7 @@ CONFIG_FILE="${CONFIG_DIR}/config.yaml"
 if [ "${SKIP_CONFIG}" = "1" ]; then
     info "configuration skipped (--no-config / COWD_SKIP_CONFIG=1)"
 else
-    mkdir -p "${CONFIG_DIR}"
+    mkdir -p "${CONFIG_DIR}" "${APPS_DIR}"
 
     # --- API URL ---
     printf '\n%s  API base URL (OpenAI-compatible endpoint)%s\n' "${COLOR_BOLD}" "${COLOR_RESET}"
@@ -293,6 +294,11 @@ gateway:
   enabled: true
   platforms: []
 
+# Signed APP Bundles placed here are discovered and mounted at Gateway startup.
+apps:
+  directories:
+    - "${APPS_DIR}"
+
 memory:
   enabled: true
 YAML
@@ -333,14 +339,13 @@ ${COLOR_GREEN}Cowd is built and ready.${COLOR_RESET}
 
 Try it out:
 
-  ${COLOR_DIM}# interactive REPL${COLOR_RESET}
-  ${COWD_BIN}
+  ${COLOR_DIM}# start the Gateway and TUI${COLOR_RESET}
+  ${COWD_BIN} gateway run
+  ${COWD_BIN} tui
 
-  ${COLOR_DIM}# one-shot prompt${COLOR_RESET}
-  ${COWD_BIN} prompt "summarize this repository"
-
-  ${COLOR_DIM}# HTTP API server${COLOR_RESET}
-  ${COWD_BIN} serve --host 127.0.0.1 --port 8642
+  ${COLOR_DIM}# inspect mounted signed APP Bundles${COLOR_RESET}
+  ${COWD_BIN} apps list
+  ${COWD_BIN} apps doctor
 
 Environment variables:
 

@@ -21,3 +21,6 @@ cargo test --workspace --all-targets
 
 echo "[full-regression] isolated process-global Gateway tests"
 "$ROOT/scripts/test/gateway-global-env.sh"
+
+echo "[full-regression] standalone reference Bundle and generic APP proxy"
+"$ROOT/scripts/test/reference-app.sh"

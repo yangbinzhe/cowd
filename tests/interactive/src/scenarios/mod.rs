@@ -8,7 +8,6 @@ mod tui_basic;
 mod tui_gateway;
 mod tui_interact;
 mod tui_memory;
-mod tui_mfg_operations;
 mod tui_session_sidebar;
 mod tui_skills;
 
@@ -79,10 +78,6 @@ pub fn list() {
             "tui_panel_keybinds",
             "Keyboard hints visible across all panels",
         ),
-        (
-            "tui_mfg_operations",
-            "MFG read-only control plane responsive layout and backlink evidence",
-        ),
     ] {
         println!("  {:<20} {}", name, desc);
     }
@@ -117,7 +112,6 @@ pub fn run_all(runner: &mut TestRunner, filter: Option<String>) -> anyhow::Resul
     run_mod!(server_send_message);
     run_mod!(cross_cut);
     run_mod!(tui_all_panels);
-    run_mod!(tui_mfg_operations);
     if matched_modules == 0 {
         anyhow::bail!(
             "no interactive scenario module matched filter {}",

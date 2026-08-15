@@ -10,6 +10,17 @@ Surface（TUI / WebUI / Connector）
       -> Storage（PostgreSQL 默认；SQLite 仅冷启动回退）
 ```
 
+签名 APP 不进入 Core 的编译依赖图。Gateway 在启动时从 `apps.directories` 发现不可变 Bundle，经 trust store、manifest/catalog digest 与文件完整性准入后交给统一 supervisor；业务调用统一走 typed invoke/stream/TUI transport，APP 请求 Core effect 时只能通过签名 CoreBridge edge。
+
+```text
+APP source -> independent Bundle build/sign
+                    |
+apps.directories -> verify/admit -> catalog -> supervisor -> isolated Worker
+                                      |             |
+                                      |             +-> invoke / stream / TUI
+                                      +-> signed CoreBridge edges -> Core services
+```
+
 - 会话输入经有界执行平面进入 Runtime，每会话串行、跨会话并行。
 - 执行图节点用 `JoinSet` 并行；审批节点只阻塞自身依赖路径。
 - 所有终态、证据、投影均来自 Runtime 事件溯源，Surface 只做投影。

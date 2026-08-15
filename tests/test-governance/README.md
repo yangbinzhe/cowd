@@ -29,8 +29,8 @@ scripts/validate.sh full-regression
 | `changed-crates` | 提交前 | metadata 动态定位变更 package 并跑其 all-targets |
 | `contract` | 阶段合同 | 非重包 workspace tests + Runtime/Gateway/Memory 边界 |
 | `serial-global` | 全局状态 | Gateway env/cwd/provider/session 串行测试 |
-| `scenario` | 黄金路径 | Session、Memory、Tool、Skill/MFG |
-| `surface` | 交互入口 | CLI、TUI、TUI/MFG、WebUI 四个真实控制点 |
+| `scenario` | 黄金路径 | Session、Memory、Tool、Local Skill |
+| `surface` | 交互入口 | CLI、TUI、WebUI、签名 reference Bundle |
 | `release` | 安装产物 | 安装、doctor、OpenAPI、完整产品、TUI attach |
 | `full-regression` | Rust 封版 | workspace all-targets + serial-global；不重复执行 check |
 | `manual` | 外部依赖 | live provider、Lark、PostgreSQL、人工/诊断场景 |

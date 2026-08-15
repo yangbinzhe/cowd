@@ -19,8 +19,8 @@ Lanes:
   full-regression final Rust regression: parallel workspace tests plus isolated global-state tests
   contract   package/API/CLI contracts without browser or tmux scenarios
   serial-global  tests that mutate process-global env/cwd/provider/session state
-  scenario   4 golden paths: session, memory, tool, skill+mfg
-  surface    4 surface control points: CLI, TUI, TUI/MFG, WebUI
+  scenario   4 golden paths: session, memory, tool, skill
+  surface    CLI, TUI, WebUI, and signed reference Bundle control points
   release    install artifact smoke; deep scenario checks stay in scenario/manual
   all        contract + serial-global + scenario + surface
   manual     run one manual script from scripts/manual
@@ -205,6 +205,7 @@ run_contract() {
   run_step static_architecture_boundaries bash scripts/architecture/check-boundaries.sh
   run_step cargo_test_runtime_architecture cargo test -p runtime --test runtime_module_architecture
   run_step test_governance bash scripts/test/governance-gate.sh
+  run_step reference_bundle bash scripts/test/reference-app.sh
 }
 
 run_serial_global() {
@@ -216,16 +217,13 @@ run_serial_global() {
 }
 
 run_scenario() {
-  # The golden Skill/MFG path must exercise the compiled first-party APP.
-  # Keep the feature explicit so this lane cannot silently validate a reduced
-  # binary that omits the capability under test.
-  run_step cargo_build_cli cargo build -p cli --no-default-features --features app-mfg
+  run_step cargo_build_cli cargo build -p cli --features full
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step ai_harness bash scripts/ci/ai-harness.sh
   run_step session_runtime bash scripts/scenarios/runtime-surface.sh
   run_step memory_context bash scripts/scenarios/memory-runtime.sh
   run_step tool_permission bash scripts/scenarios/channel-permission.sh
-  run_step skill_mfg bash scripts/scenarios/skill-surface-unification.sh
+  run_step skill_surface bash scripts/scenarios/skill-surface-unification.sh
 }
 
 run_surface() {
@@ -237,8 +235,8 @@ run_surface() {
   run_step cargo_build_surface_full cargo build -p cli --features full
   export COWD_BIN="$CARGO_TARGET_DIR/debug/cowd"
   run_step tui_projection_smoke bash scripts/scenarios/tui-interaction-quality.sh
-  run_step tui_mfg_operations bash scripts/scenarios/tui-mfg-acceptance.sh
   run_step webui_gateway_contract bash scripts/scenarios/gateway-webui-contract.sh
+  run_step reference_bundle bash scripts/test/reference-app.sh
 }
 
 run_release() {

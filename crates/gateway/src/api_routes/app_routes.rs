@@ -2369,14 +2369,27 @@ mod tests {
         .await
         .expect_err("unsigned management access denied");
         assert_eq!(denied_logs.0, StatusCode::FORBIDDEN);
-        let restarted = restart_app(
+        let first_restart = restart_app(
             Extension(Arc::clone(&platform)),
             Extension(principal.clone()),
             AxumPath("reference-app".to_owned()),
         )
-        .await
-        .expect("reference APP restart")
-        .0;
+        .await;
+        let restarted = match first_restart {
+            Ok(response) => response.0,
+            Err((StatusCode::SERVICE_UNAVAILABLE, _)) => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                restart_app(
+                    Extension(Arc::clone(&platform)),
+                    Extension(principal.clone()),
+                    AxumPath("reference-app".to_owned()),
+                )
+                .await
+                .expect("reference APP restart after bounded backoff")
+                .0
+            }
+            Err(error) => panic!("reference APP restart: {error:?}"),
+        };
         assert_eq!(restarted.app_id, app_id);
         assert_eq!(
             restarted.lifecycle.state,

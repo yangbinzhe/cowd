@@ -1,5 +1,5 @@
 version: 2
-release_version: 0.9.655
+release_version: 0.9.693
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh
@@ -42,7 +42,7 @@ architecture_gates:
     protects:
       - Gateway has no second AI execution loop
       - Runtime, Tools, Provider, Surface, and Connector dependency direction
-      - Gateway has no direct MFG implementation ownership
+      - Gateway has no direct product APP implementation ownership
       - TUI is independent from Runtime implementation crates
       - removed channel document operations do not return
       - Runtime does not depend on transport or Surface crates
@@ -75,7 +75,7 @@ ignored_tests:
       - session
       - approval
       - connector
-      - product-app
+      - app-private-storage
   memory_performance:
     marker: scripts/test/memory-performance.sh
     runner: scripts/validate.sh manual memory-performance
@@ -97,15 +97,15 @@ scenario_gates:
   - script: scripts/scenarios/channel-permission.sh
     capability: tool.permission.audit
   - script: scripts/scenarios/skill-surface-unification.sh
-    capability: skill.mfg
+    capability: skill.local
   - script: scripts/ci/ai-harness.sh
     capability: harness.offline
 
 surface_gates:
   - script: scripts/scenarios/gateway-webui-contract.sh
     capability: gateway.webui.baseline
-  - script: scripts/scenarios/tui-mfg-acceptance.sh
-    capability: mfg.tui.operational
+  - script: scripts/test/reference-app.sh
+    capability: app.bundle.invoke_stream_tui
 
 manual_suites:
   - path: crates/harness-eval/templates/certification-manifest-v1.json
@@ -128,8 +128,6 @@ manual_suites:
     capability: tool.search.public_no_key
   - path: scripts/manual/webui-live-workbench.sh
     capability: webui.live
-  - path: scripts/scenarios/mfg-surface-acceptance.sh
-    capability: mfg.multi_surface
 
 admission_rules:
   - Default checks protect a unique contract, boundary, or high-cost regression.
