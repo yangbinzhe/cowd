@@ -77,11 +77,16 @@ async fn webui_manifest_handler(
     let health = crate::gateway_health::gateway_health_snapshot(&state).await;
     let enabled_app_ids = state
         .services
-        .app_registry
-        .apps()
-        .into_iter()
-        .map(|app| app.descriptor.id.to_string())
-        .collect();
+        .app_platform
+        .as_ref()
+        .map(|platform| {
+            platform
+                .catalog()
+                .apps()
+                .map(|app| app.manifest.app_id.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     Json(
         serde_json::to_value(crate::gateway_service::webui_manifest(
             health,
@@ -92,11 +97,9 @@ async fn webui_manifest_handler(
 }
 
 async fn route_manifest_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
+    AxumState(_state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
-    let routes = super::route_manifest::gateway_route_manifest_for_apps(
-        state.services.app_registry.as_ref(),
-    );
+    let routes = super::route_manifest::gateway_route_manifest_for_apps();
     Json(serde_json::json!({
         "kind": "gateway.route_manifest",
         "schema_version": 1,
@@ -106,22 +109,17 @@ async fn route_manifest_handler(
 }
 
 async fn capability_contract_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
+    AxumState(_state): AxumState<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     Json(
-        serde_json::to_value(gateway_capability_contract_for_apps(
-            state.services.app_registry.as_ref(),
-        ))
-        .unwrap_or_else(
+        serde_json::to_value(gateway_capability_contract_for_apps()).unwrap_or_else(
             |_| serde_json::json!({"kind":"gateway.capability_contract","status":"error"}),
         ),
     )
 }
 
-async fn openapi_handler(AxumState(state): AxumState<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(gateway_openapi_document_for_apps(
-        state.services.app_registry.as_ref(),
-    ))
+async fn openapi_handler(AxumState(_state): AxumState<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(gateway_openapi_document_for_apps())
 }
 
 async fn openai_tools_handler(

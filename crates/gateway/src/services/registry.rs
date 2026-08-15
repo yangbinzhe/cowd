@@ -150,7 +150,6 @@ impl GatewayServices {
         growth_projection_services: Option<super::GrowthProjectionServices>,
     ) -> Self {
         let config_home = config_home.as_ref().to_path_buf();
-        let app_host_binding = GatewayAppHostBinding::new();
         let command_host_runtime = Arc::clone(&runtime);
         let runtime_services = runtime.runtime_services();
         let runtime_events = RuntimeEventService::from_runtime_services(runtime_services.as_ref());
@@ -181,7 +180,7 @@ impl GatewayServices {
             crate::gateway_capacity::GatewayCapacityConfig::resolve(&capacity_config),
             Arc::clone(runtime_services.resource_manager()),
         );
-        let (app_registry, mut memory, connector, mut growth, mut matrix) =
+        let (mut memory, connector, mut growth, mut matrix) =
             if let Some(topology) = selected_storage.as_ref() {
                 let matrix_endpoint = topology
                     .registry
@@ -189,7 +188,6 @@ impl GatewayServices {
                     .expect("selected Matrix endpoint")
                     .clone();
                 (
-                    Arc::new(cowd_app_host::AppRegistry::default()),
                     MemoryService::with_manager_and_knowledge(
                         memory_manager,
                         topology.knowledge_fabric.clone(),
@@ -203,10 +201,6 @@ impl GatewayServices {
                 )
             } else {
                 (
-                    Arc::new(embedded_app_registry(
-                        &config_home,
-                        app_host_binding.context(),
-                    )),
                     MemoryService::with_manager(memory_manager),
                     ConnectorService::new(),
                     GrowthService::new_for_config_home(&config_home),
@@ -220,9 +214,7 @@ impl GatewayServices {
         }
         Self {
             selected_storage,
-            app_registry,
             app_platform: None,
-            app_host_binding,
             core_platform_bindings: Default::default(),
             runtime: Some(Arc::clone(&runtime)),
             runtime_events,
@@ -269,7 +261,6 @@ impl GatewayServices {
     )]
     pub(crate) fn baseline_with_config_home(config_home: impl AsRef<std::path::Path>) -> Self {
         let config_home = config_home.as_ref();
-        let app_host_binding = GatewayAppHostBinding::new();
         let baseline_runtime =
             runtime::RuntimeServices::in_memory().expect("baseline runtime event projection");
         let capacity = crate::gateway_capacity::GatewayCapacityController::defaults(Arc::clone(
@@ -286,12 +277,7 @@ impl GatewayServices {
             Arc::new(crate::services::session_service::presence::SessionPresenceLedger::new());
         Self {
             selected_storage: None,
-            app_registry: Arc::new(embedded_app_registry(
-                config_home,
-                app_host_binding.context(),
-            )),
             app_platform: None,
-            app_host_binding,
             core_platform_bindings: Default::default(),
             runtime: None,
             runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
@@ -327,15 +313,6 @@ impl GatewayServices {
         }
     }
 
-    /// Product assembly injects a completely validated, immutable registry
-    /// before Gateway starts serving requests. The method deliberately takes
-    /// ownership so a running Gateway cannot hot-load source or mutate routes.
-    #[must_use]
-    pub(crate) fn with_app_registry(mut self, app_registry: cowd_app_host::AppRegistry) -> Self {
-        self.app_registry = Arc::new(app_registry);
-        self
-    }
-
     #[must_use]
     pub(crate) fn with_app_platform(
         mut self,
@@ -343,37 +320,6 @@ impl GatewayServices {
     ) -> Self {
         self.app_platform = Some(app_platform);
         self
-    }
-
-    #[must_use]
-    pub(crate) fn app_host_context(&self) -> cowd_app_sdk::CowdAppContext {
-        self.app_host_binding.context()
-    }
-
-    /// Complete the composition root after an immutable APP registry and the
-    /// concrete application state both exist. APP handlers still see only the
-    /// stable SDK ports supplied by this binding.
-    pub(crate) fn bind_app_host_ports(&self, state: &Arc<crate::api_routes::AppState>) {
-        self.app_host_binding.bind(state);
-    }
-
-    /// Associate an APP request correlation id with the Gateway-verified
-    /// principal before an external APP can submit a host effect.
-    pub(crate) fn bind_app_request_principal(
-        &self,
-        principal: &runtime::VerifiedPrincipal,
-        context: &cowd_app_sdk::InvocationContext,
-        producer_id: String,
-    ) {
-        self.app_host_binding
-            .bind_request_principal(principal, context, producer_id.clone());
-        self.core_platform_bindings.bind_request_principal(
-            principal,
-            &context.request_id,
-            &context.workspace_id,
-            &context.surface,
-            producer_id,
-        );
     }
 
     /// Gateway only projects the Runtime-owned capability snapshot. Baseline
@@ -591,143 +537,5 @@ impl GatewayServices {
         ]
         .into_iter()
         .all(|(service, operation)| has(service, operation))
-    }
-}
-
-/// Build the deterministic first-party application registry for local/test
-/// Gateway instances. Production startup replaces this with the same static
-/// registry using broker-backed live credential revalidation before accepting
-/// traffic.  The APP source itself remains external; this helper owns only
-/// product assembly policy.
-pub(crate) fn embedded_app_registry(
-    config_home: &std::path::Path,
-    host_context: cowd_app_sdk::CowdAppContext,
-) -> cowd_app_host::AppRegistry {
-    embedded_app_registry_with_policy(config_home, host_context, &runtime::AppsConfig::default())
-}
-
-#[allow(
-    clippy::expect_used,
-    reason = "compile-time linked APP descriptors are source-locked and validated by product-app contract tests"
-)]
-fn embedded_app_registry_with_policy(
-    config_home: &std::path::Path,
-    host_context: cowd_app_sdk::CowdAppContext,
-    apps: &runtime::AppsConfig,
-) -> cowd_app_host::AppRegistry {
-    let mut registry = cowd_app_host::AppRegistry::default();
-    cowd_product_apps::register_enabled(&mut registry, config_home, host_context, &|app_id| {
-        apps.is_enabled(app_id)
-    })
-    .expect("static APP product contributions must have valid descriptors");
-    registry
-}
-
-/// The set of application descriptors admitted to this Gateway process.
-///
-/// Source selection is deliberately already complete at this point: this
-/// function only filters compile-time linked product contributions according
-/// to the unified startup policy.  The same result is used for broker
-/// capabilities and the AppRegistry so an APP cannot be authorised without
-/// being mounted, or mounted without being authorised.
-pub(crate) fn enabled_app_descriptors(
-    apps: &runtime::AppsConfig,
-) -> Vec<cowd_app_sdk::AppDescriptor> {
-    cowd_product_apps::enabled_descriptors(&|app_id| apps.is_enabled(app_id))
-}
-
-#[allow(
-    clippy::expect_used,
-    reason = "compile-time linked APP descriptors are source-locked and validated by product-app contract tests"
-)]
-pub(crate) fn broker_backed_app_registry(
-    config_home: impl AsRef<std::path::Path>,
-    host_context: cowd_app_sdk::CowdAppContext,
-    apps: &runtime::AppsConfig,
-) -> cowd_app_host::AppRegistry {
-    let mut registry = cowd_app_host::AppRegistry::default();
-    cowd_product_apps::register_enabled(
-        &mut registry,
-        config_home.as_ref(),
-        host_context,
-        &|app_id| apps.is_enabled(app_id),
-    )
-    .expect("static APP product contributions must have valid descriptors");
-    registry
-}
-
-pub(crate) fn broker_backed_app_registry_with_storage(
-    host_context: cowd_app_sdk::CowdAppContext,
-    apps: &runtime::AppsConfig,
-    storage_registry: storage::StorageRegistry,
-    topology: cowd_product_apps::AppStorageTopology,
-) -> Result<cowd_app_host::AppRegistry, cowd_product_apps::ProductAppRegistrationError> {
-    let mut registry = cowd_app_host::AppRegistry::default();
-    cowd_product_apps::register_enabled_with_storage(
-        &mut registry,
-        host_context,
-        storage_registry,
-        topology,
-        &|app_id| apps.is_enabled(app_id),
-    )?;
-    Ok(registry)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disabled_app_is_absent_from_descriptor_and_router_composition() {
-        let apps = runtime::AppsConfig::default().with_app_enabled("mfg", false);
-        let binding = GatewayAppHostBinding::new();
-        let registry = broker_backed_app_registry(std::env::temp_dir(), binding.context(), &apps);
-
-        assert!(enabled_app_descriptors(&apps).is_empty());
-        assert!(registry.apps().is_empty());
-        assert!(registry.skills().is_empty());
-        assert!(registry.storage_endpoints().is_empty());
-    }
-
-    #[test]
-    fn enabled_app_registry_owns_source_storage_and_surface_truth_together() {
-        let apps = runtime::AppsConfig::default();
-        let binding = GatewayAppHostBinding::new();
-        let config_home =
-            std::env::temp_dir().join(format!("cowd-registry-test-{}", std::process::id()));
-        let registry = broker_backed_app_registry(&config_home, binding.context(), &apps);
-        let registered = registry.apps();
-        let mfg = registered
-            .iter()
-            .find(|app| app.descriptor.id.as_str() == "mfg")
-            .expect("enabled MFG descriptor");
-        assert!(mfg.source_lock.is_some());
-        let storage = mfg.storage.as_ref().expect("MFG storage contract");
-        assert_eq!(storage.contract.migration_owner.as_str(), "mfg");
-        assert_eq!(storage.provisions.len(), 1);
-        assert_eq!(
-            storage.provisions[0].backend,
-            cowd_app_sdk::AppStorageBackend::Sqlite
-        );
-        assert!(registry.storage_endpoints().iter().any(|endpoint| {
-            endpoint.domain == storage::StorageDomainId::app("mfg", "primary")
-        }));
-        let reviewed_revision = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../apps/mfg/source.lock.toml"
-        ))
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("rev = "))
-        .map(|value| value.trim_matches('"'))
-        .expect("reviewed MFG source-lock revision");
-        assert_eq!(
-            mfg.source_lock.as_ref().expect("MFG source lock").revision,
-            reviewed_revision
-        );
-        let projection = serde_json::to_string(&registered).expect("registry projection");
-        assert!(projection.contains(reviewed_revision));
-        assert!(!projection.contains(".sqlite"));
-        assert!(!projection.contains(config_home.to_string_lossy().as_ref()));
-        let _ = std::fs::remove_dir_all(config_home);
     }
 }

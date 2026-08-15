@@ -40,24 +40,18 @@ fn wait_for_broker(client: &auth_broker::BrokerClient, child: &mut Child) {
 }
 
 fn workbench_catalog() -> auth_broker::AuthorizationCatalog {
-    auth_broker::AuthorizationCatalog::from_app_descriptors([cowd_app_sdk::AppDescriptor {
-        id: cowd_app_sdk::AppId::parse("workbench").expect("valid generic app id"),
-        display_name: "Workbench".to_string(),
-        sdk_api: cowd_app_sdk::SDK_API_VERSION,
-        version: "test".to_string(),
-        capabilities: Vec::new(),
-        routes: Vec::new(),
-        actions: Vec::new(),
-        profile: Some(cowd_app_sdk::AppProfileDescriptor {
-            catalog_revision: 1,
-            capability_digest: "sha256:workbench-test-profile".to_string(),
+    auth_broker::AuthorizationCatalog {
+        schema_version: 1,
+        core_profiles: auth_broker::AuthorizationCatalog::core_only().core_profiles,
+        apps: vec![auth_broker::AuthorizationAppProfileCatalog {
+            app_id: "workbench".to_string(),
             default_profile_id: "viewer".to_string(),
             profiles: vec![
-                cowd_app_sdk::AppProfileVariant {
+                auth_broker::AuthorizationProfile {
                     id: "viewer".to_string(),
                     capabilities: vec!["workbench.read".to_string()],
                 },
-                cowd_app_sdk::AppProfileVariant {
+                auth_broker::AuthorizationProfile {
                     id: "manager".to_string(),
                     capabilities: vec![
                         "workbench.read".to_string(),
@@ -72,9 +66,8 @@ fn workbench_catalog() -> auth_broker::AuthorizationCatalog {
                 ),
                 ("tui".to_string(), vec!["workbench.read".to_string()]),
             ]),
-        }),
-    }])
-    .expect("generic descriptor catalogue")
+        }],
+    }
 }
 
 fn spawn_auth_broker(
@@ -206,8 +199,7 @@ fn cowd_runs_the_auth_broker_as_an_internal_child_role() {
     let mut child = spawn_auth_broker(
         &authority_root,
         &socket,
-        &auth_broker::AuthorizationCatalog::from_app_descriptors(Vec::new())
-            .expect("generic core catalogue"),
+        &auth_broker::AuthorizationCatalog::core_only(),
         "single-binary-test-credential",
     );
 
@@ -329,8 +321,7 @@ fn release_installer_replaces_a_running_cowd_atomically_and_cleans_legacy_helper
     let catalog_path = auth_broker::catalog_file(&authority_root);
     auth_broker::write_catalog(
         &catalog_path,
-        &auth_broker::AuthorizationCatalog::from_app_descriptors(Vec::new())
-            .expect("generic core catalogue"),
+        &auth_broker::AuthorizationCatalog::core_only(),
     )
     .expect("write catalogue");
     fs::create_dir_all(&install_dir).expect("create install directory");

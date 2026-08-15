@@ -146,11 +146,7 @@ async fn skill_delete_handler(
     state
         .services
         .skill
-        .delete_managed(
-            &state.workspace_root,
-            state.services.app_registry.as_ref(),
-            &id,
-        )
+        .delete_managed(&state.workspace_root, &id)
         .map(Json)
         .map_err(skill_error)
 }
@@ -162,11 +158,7 @@ async fn skills_catalog_handler(
     state
         .services
         .skill
-        .catalog(
-            &state.workspace_root,
-            state.services.app_registry.as_ref(),
-            query,
-        )
+        .catalog(&state.workspace_root, query)
         .map(Json)
         .map_err(skill_error)
 }
@@ -178,11 +170,7 @@ async fn skills_projection_handler(
     state
         .services
         .skill
-        .projection(
-            &state.workspace_root,
-            state.services.app_registry.as_ref(),
-            query,
-        )
+        .projection(&state.workspace_root, query)
         .map(Json)
         .map_err(skill_error)
 }
@@ -510,7 +498,6 @@ fn skill_action_handler(
         .skill
         .run_action(
             &state.workspace_root,
-            state.services.app_registry.as_ref(),
             &state.config_home,
             &id,
             action,
@@ -544,11 +531,7 @@ async fn skill_translate_handler(
     state
         .services
         .skill
-        .detail(
-            &state.workspace_root,
-            state.services.app_registry.as_ref(),
-            &id,
-        )
+        .detail(&state.workspace_root, &id)
         .map_err(skill_error)?;
 
     let runtime_service = state.services.runtime.as_ref().ok_or_else(|| {
@@ -659,11 +642,7 @@ async fn skill_get_handler(
     state
         .services
         .skill
-        .detail(
-            &state.workspace_root,
-            state.services.app_registry.as_ref(),
-            &id,
-        )
+        .detail(&state.workspace_root, &id)
         .map(Json)
         .map_err(skill_error)
 }
@@ -675,11 +654,7 @@ async fn skill_files_handler(
     state
         .services
         .skill
-        .files(
-            &state.workspace_root,
-            state.services.app_registry.as_ref(),
-            &id,
-        )
+        .files(&state.workspace_root, &id)
         .map(Json)
         .map_err(skill_error)
 }
@@ -692,12 +667,7 @@ async fn skill_file_raw_handler(
     state
         .services
         .skill
-        .raw_file(
-            &state.workspace_root,
-            state.services.app_registry.as_ref(),
-            &id,
-            query,
-        )
+        .raw_file(&state.workspace_root, &id, query)
         .map(Json)
         .map_err(skill_error)
 }

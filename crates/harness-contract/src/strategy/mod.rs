@@ -2771,7 +2771,7 @@ fn independent_workstreams(normalized: &str) -> u8 {
         "harness-contract",
         "harness-eval",
         "auth-broker",
-        "app-mfg",
+        "app-protocol",
     ]
     .iter()
     .filter(|term| normalized.contains(**term))

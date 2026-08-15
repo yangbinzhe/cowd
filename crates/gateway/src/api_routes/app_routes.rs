@@ -1982,10 +1982,8 @@ mod tests {
 
     #[tokio::test]
     async fn reference_bundle_gateway_proxy_e2e() {
-        let Ok(bundle) = std::env::var("COWD_REFERENCE_APP_BUNDLE") else {
-            eprintln!("COWD_REFERENCE_APP_BUNDLE is unset; external reference Bundle gate skipped");
-            return;
-        };
+        let bundle = std::env::var("COWD_REFERENCE_APP_BUNDLE")
+            .expect("COWD_REFERENCE_APP_BUNDLE must name a packaged reference Bundle");
         let public_key = std::env::var("COWD_REFERENCE_APP_PUBLIC_KEY_BASE64URL")
             .expect("reference Bundle public key");
         let public_key = URL_SAFE_NO_PAD

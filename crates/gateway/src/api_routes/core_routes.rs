@@ -80,22 +80,39 @@ fn product_capability_registry(state: &AppState) -> CowdCapabilityRegistry {
     CowdCapabilityRegistry::core().with_registered_applications(
         state
             .services
-            .app_registry
-            .apps()
-            .into_iter()
-            .map(|application| CowdApplicationCapabilityInput {
-                app_id: application.descriptor.id.as_str().to_string(),
-                display_name: application.descriptor.display_name,
-                version: application.descriptor.version,
-                capabilities: application.descriptor.capabilities,
-                actions: application
-                    .descriptor
-                    .actions
-                    .into_iter()
-                    .map(|action| action.id)
-                    .collect(),
-                webui_registered: application.http_registered,
-                tui_registered: application.tui_registered,
+            .app_platform
+            .iter()
+            .flat_map(|platform| platform.catalog().apps())
+            .map(|application| {
+                let mut capabilities = application
+                    .manifest
+                    .authorization_profiles
+                    .iter()
+                    .flat_map(|profile| profile.capabilities.iter().cloned())
+                    .collect::<Vec<_>>();
+                capabilities.sort();
+                capabilities.dedup();
+                CowdApplicationCapabilityInput {
+                    app_id: application.manifest.app_id.to_string(),
+                    display_name: application.manifest.display_name.clone(),
+                    version: application.manifest.artifact_version.clone(),
+                    capabilities,
+                    actions: application
+                        .manifest
+                        .presentation
+                        .iter()
+                        .flat_map(|presentation| presentation.tui_views.iter())
+                        .flat_map(|view| {
+                            [
+                                view.open_operation_id.clone(),
+                                view.action_operation_id.clone(),
+                                view.stream_operation_id.clone(),
+                            ]
+                        })
+                        .collect(),
+                    webui_registered: application.manifest.surfaces.web,
+                    tui_registered: application.manifest.surfaces.tui_view,
+                }
             }),
     )
 }
@@ -253,19 +270,15 @@ async fn release_gate_runtime_evidence(state: &AppState) -> CowdReleaseGateRunti
         structured_watermark_persistent,
         execution_outcome_timeline_available: execution_outcome_timeline_available(state).await,
         memory_context_bridge_available: memory_context_bridge_available(state).await,
-        graph_skill_quality_contracts_available: graph_skill_quality_contracts_available(
-            state.services.app_registry.as_ref(),
-        ),
+        graph_skill_quality_contracts_available: graph_skill_quality_contracts_available(state),
         gateway_route_manifest_available: gateway_route_manifest_available(state),
         frontend_api_matrix_ready: frontend_api_matrix_ready(),
         surface_version_compatible: surface_version_compatible(),
     }
 }
 
-fn gateway_route_manifest_available(state: &AppState) -> bool {
-    let routes = super::route_manifest::gateway_route_manifest_for_apps(
-        state.services.app_registry.as_ref(),
-    );
+fn gateway_route_manifest_available(_state: &AppState) -> bool {
+    let routes = super::route_manifest::gateway_route_manifest_for_apps();
     let pairs = routes
         .iter()
         .map(|entry| (entry.method.as_str(), entry.path.as_str()))
@@ -471,11 +484,13 @@ fn runtime_skill_memory_candidate(
 /// A product-level release gate must only assess contracts belonging to Apps
 /// mounted in this Gateway process.  A compiled-but-disabled App cannot make
 /// the core release gate depend on its private quality fixtures.
-fn graph_skill_quality_contracts_available(app_registry: &cowd_app_host::AppRegistry) -> bool {
-    app_registry
-        .verify_quality_checks()
-        .into_iter()
-        .all(|check| check.passed)
+fn graph_skill_quality_contracts_available(state: &AppState) -> bool {
+    state.services.app_platform.as_ref().is_none_or(|platform| {
+        platform
+            .catalog()
+            .apps()
+            .all(|app| cowd_app_protocol::ProtocolValidate::validate(&app.manifest).is_ok())
+    })
 }
 
 fn store_error(error: GatewayMatrixRepositoryError) -> (StatusCode, Json<ErrorResponse>) {
@@ -580,8 +595,7 @@ mod tests {
 
     #[test]
     fn registry_without_enabled_apps_has_no_quality_requirement() {
-        assert!(graph_skill_quality_contracts_available(
-            &cowd_app_host::AppRegistry::default()
-        ));
+        let state = crate::api_routes::tests::test_state();
+        assert!(graph_skill_quality_contracts_available(&state));
     }
 }

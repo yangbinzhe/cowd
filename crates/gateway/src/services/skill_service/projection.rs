@@ -3,14 +3,29 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cowd_app_host::AppRegistry;
-use cowd_app_sdk::AppSkillDescriptor;
 use serde::Serialize;
 use skill::{profile_skill_package, SkillInfo, SkillRouter, SkillRouterConfig};
 
 use super::{profile_provider::workspace_skill_snapshot, SkillServiceError};
 
-pub(super) type SkillCatalogItem = AppSkillDescriptor;
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct SkillCatalogItem {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) description: Option<String>,
+    pub(super) scope: String,
+    pub(super) source: String,
+    pub(super) domain: Option<String>,
+    pub(super) status: String,
+    pub(super) risk: String,
+    pub(super) tags: Vec<String>,
+    pub(super) tools: Vec<String>,
+    pub(super) required_evidence: Vec<String>,
+    pub(super) capabilities: Vec<String>,
+    pub(super) profile: Option<serde_json::Value>,
+    pub(super) path: Option<String>,
+    pub(super) shadowed_by: Option<String>,
+}
 
 #[derive(Debug, Serialize)]
 pub(super) struct SkillFileEntry {
@@ -69,9 +84,8 @@ pub(super) struct SkillProjectionGovernance {
 }
 pub(super) fn collect_skill_catalog(
     workspace_root: &Path,
-    app_registry: &AppRegistry,
 ) -> Result<Vec<SkillCatalogItem>, SkillServiceError> {
-    let mut items = app_registry.skills();
+    let mut items = Vec::new();
     for skill in workspace_skill_snapshot(workspace_root).skills.clone() {
         items.push(local_skill_catalog_item(skill));
     }
@@ -85,10 +99,9 @@ pub(super) fn collect_skill_catalog(
 
 pub(super) fn find_catalog_item(
     workspace_root: &Path,
-    app_registry: &AppRegistry,
     id: &str,
 ) -> Result<SkillCatalogItem, SkillServiceError> {
-    collect_skill_catalog(workspace_root, app_registry)?
+    collect_skill_catalog(workspace_root)?
         .into_iter()
         .find(|item| item.id == id || item.name.eq_ignore_ascii_case(id))
         .ok_or_else(|| SkillServiceError::NotFound("skill not found".to_string()))
@@ -121,7 +134,6 @@ fn local_skill_catalog_item(skill: SkillInfo) -> SkillCatalogItem {
         required_evidence: Vec::new(),
         capabilities: skill.related_skills,
         profile,
-        virtual_files: None,
         path: Some(skill.path.display().to_string()),
         shadowed_by: skill.shadowed_by.map(|source| format!("{source:?}")),
     }
@@ -213,36 +225,6 @@ fn collect_skill_files(
         }
     }
     Ok(())
-}
-
-pub(super) fn app_virtual_files(item: &SkillCatalogItem) -> Option<serde_json::Value> {
-    let virtual_files = item.virtual_files.as_ref()?;
-    Some(serde_json::json!({
-        "kind": "skills.files",
-        "schema_version": 1,
-        "skill": item,
-        "root": virtual_files.root,
-        "primary": virtual_files.primary,
-        "files": virtual_files.files.iter().map(|file| serde_json::json!({
-            "path": file.path,
-            "name": file.name,
-            "kind": file.kind,
-            "size": file.content.len(),
-            "primary": file.primary,
-        })).collect::<Vec<_>>(),
-    }))
-}
-
-pub(super) fn app_virtual_skill_file(
-    item: &SkillCatalogItem,
-    requested: &str,
-) -> Option<(String, String)> {
-    let files = item.virtual_files.as_ref()?;
-    files
-        .files
-        .iter()
-        .find(|file| file.path == requested)
-        .map(|file| (file.content_type.clone(), file.content.clone()))
 }
 
 pub(super) fn filter_scope(
@@ -400,9 +382,6 @@ pub(super) fn projection_facets(items: &[SkillCatalogItem]) -> SkillProjectionFa
 
 pub(super) fn projection_diagnostics(items: &[SkillCatalogItem]) -> Vec<String> {
     let mut diagnostics = Vec::new();
-    if !items.iter().any(|item| item.virtual_files.is_some()) {
-        diagnostics.push("application_skill_catalog_empty".to_string());
-    }
     if !items.iter().any(|item| item.scope == "local") {
         diagnostics.push("local_skill_registry_empty".to_string());
     }
@@ -468,7 +447,7 @@ mod tests {
         )
         .expect("write pyproject");
 
-        let items = collect_skill_catalog(&workspace, &AppRegistry::default()).expect("catalog");
+        let items = collect_skill_catalog(&workspace).expect("catalog");
         let item = items
             .iter()
             .find(|item| item.id == "local:profile-demo")

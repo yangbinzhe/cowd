@@ -6,7 +6,7 @@
 //! normal PostgreSQL startup. There is no dual-write or automatic fallback.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     sync::Arc,
@@ -31,7 +31,6 @@ const REQUIRED_CORE_DOMAINS: &[&str] = &[
     "knowledge",
     "surface_message",
     "connector_directory",
-    "apps",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,8 +50,6 @@ struct CutoverManifest {
     target_logical_identity: String,
     target_secret_ref: String,
     status: CutoverStatus,
-    product_sources: BTreeMap<String, cowd_app_sdk::AppSourceLock>,
-    enabled_apps: Vec<String>,
     domains: BTreeMap<String, serde_json::Value>,
     digest: String,
 }
@@ -92,7 +89,6 @@ pub(crate) fn validate_active_manifest(
     config_home: &Path,
     workspace_root: &Path,
     storage: &runtime::StorageTopologyConfig,
-    apps: &runtime::AppsConfig,
 ) -> Result<(), String> {
     let path = active_path(config_home);
     if !path.is_file() {
@@ -108,7 +104,6 @@ pub(crate) fn validate_active_manifest(
         workspace_root,
         CutoverStatus::Active,
         postgres,
-        &enabled_apps(apps),
         false,
     )
 }
@@ -162,8 +157,6 @@ impl CutoverContext {
             "workspace_key": workspace_key(&self.workspace_root),
             "source_endpoints": source_registry.inventory(),
             "domains": REQUIRED_CORE_DOMAINS,
-            "product_sources": product_sources()?,
-            "enabled_apps": enabled_apps(self.runtime_config.apps()),
             "commands": ["migrate", "verify", "cutover"],
             "fallback": "none",
             "dual_write": false,
@@ -178,26 +171,16 @@ impl CutoverContext {
         self.require_postgres_target()?;
         ensure_gateway_stopped()?;
         let _guard = MaintenanceGuard::acquire(&self.config_home)?;
-        let target = SelectedStorageTopology::compose_for_maintenance(
+        let _target = SelectedStorageTopology::compose_for_maintenance(
             self.runtime_config.storage(),
             &self.config_home,
             &self.workspace_root,
         )?;
-        let mut registry = cowd_app_host::AppRegistry::default();
-        cowd_product_apps::register_enabled_with_storage(
-            &mut registry,
-            crate::services::GatewayAppHostBinding::new().context(),
-            target.registry,
-            target.app_topology,
-            &|app_id| self.runtime_config.apps().is_enabled(app_id),
-        )
-        .map_err(stringify)?;
         print_json(&serde_json::json!({
             "operation": "postgres_schema_upgrade",
             "backend": "postgres",
             "gateway_stopped": true,
             "cowd_version": env!("CARGO_PKG_VERSION"),
-            "enabled_apps": enabled_apps(self.runtime_config.apps()),
             "status": "completed",
         }))
     }
@@ -384,8 +367,6 @@ impl CutoverContext {
             target_logical_identity: postgres.logical_identity.clone(),
             target_secret_ref: postgres.secret_ref.clone(),
             status: CutoverStatus::Migrated,
-            product_sources: product_sources()?,
-            enabled_apps: enabled_apps(self.runtime_config.apps()),
             domains,
             digest: String::new(),
         };
@@ -602,30 +583,6 @@ impl CutoverContext {
                 }),
             ));
         }
-        {
-            let source_registry = source.registry.clone();
-            let target_registry = target.registry.clone();
-            let executor = executor.clone();
-            let enabled = enabled_apps(self.runtime_config.apps());
-            jobs.push((
-                "apps",
-                tokio::task::spawn_blocking(move || {
-                    let enabled = enabled.into_iter().collect::<BTreeSet<_>>();
-                    record(
-                        "apps",
-                        cowd_product_apps::migrate_enabled_storage(
-                            source_registry,
-                            cowd_product_apps::AppStorageTopology::Sqlite,
-                            target_registry,
-                            cowd_product_apps::AppStorageTopology::Postgres { executor },
-                            &|app_id| enabled.contains(app_id),
-                        )
-                        .map_err(stringify)?,
-                    )
-                }),
-            ));
-        }
-
         let mut domains = BTreeMap::new();
         for (scheduled_domain, job) in jobs {
             let (domain, evidence) = job
@@ -661,27 +618,17 @@ impl CutoverContext {
             &self.workspace_root,
             CutoverStatus::Migrated,
             postgres,
-            &enabled_apps(self.runtime_config.apps()),
             true,
         )?;
         validate_domain_evidence(&manifest)?;
-        // Reopen every PostgreSQL adapter and APP storage provision through
-        // the production composition code. This proves schema/readiness and
-        // secret resolution without mutating the staged equality evidence.
-        let target = SelectedStorageTopology::compose_for_maintenance(
+        // Reopen every PostgreSQL Core adapter through the production
+        // composition code. This proves schema/readiness and secret
+        // resolution without mutating the staged equality evidence.
+        let _target = SelectedStorageTopology::compose_for_maintenance(
             self.runtime_config.storage(),
             &self.config_home,
             &self.workspace_root,
         )?;
-        let mut registry = cowd_app_host::AppRegistry::default();
-        cowd_product_apps::register_enabled_with_storage(
-            &mut registry,
-            crate::services::GatewayAppHostBinding::new().context(),
-            target.registry,
-            target.app_topology,
-            &|app_id| self.runtime_config.apps().is_enabled(app_id),
-        )
-        .map_err(stringify)?;
         manifest.status = CutoverStatus::Verified;
         seal_manifest(&mut manifest)?;
         write_manifest(&verified_path(&self.config_home), &manifest)?;
@@ -701,7 +648,6 @@ impl CutoverContext {
             &self.workspace_root,
             CutoverStatus::Verified,
             postgres,
-            &enabled_apps(self.runtime_config.apps()),
             true,
         )?;
         validate_domain_evidence(&manifest)?;
@@ -758,50 +704,13 @@ fn record(domain: &str, evidence: impl Serialize) -> Result<(String, serde_json:
         .map_err(stringify)
 }
 
-fn product_sources() -> Result<BTreeMap<String, cowd_app_sdk::AppSourceLock>, String> {
-    cowd_product_apps::compiled_products()
-        .into_iter()
-        .map(|product| {
-            let app_id = product.app_id().to_string();
-            product
-                .source_lock()
-                .map(|source| (app_id.clone(), source))
-                .ok_or_else(|| format!("compiled APP {app_id} has no immutable source lock"))
-        })
-        .collect()
-}
-
-fn enabled_apps(config: &runtime::AppsConfig) -> Vec<String> {
-    let mut apps = cowd_product_apps::compiled_products()
-        .into_iter()
-        .filter_map(|product| {
-            let app_id = product.app_id().to_string();
-            config.is_enabled(&app_id).then_some(app_id)
-        })
-        .collect::<Vec<_>>();
-    apps.sort();
-    apps
-}
-
 fn validate_domain_evidence(manifest: &CutoverManifest) -> Result<(), String> {
     for domain in REQUIRED_CORE_DOMAINS {
         let evidence = manifest
             .domains
             .get(*domain)
             .ok_or_else(|| format!("cutover manifest is missing {domain} evidence"))?;
-        if *domain == "apps" {
-            let app_evidence = serde_json::from_value::<
-                Vec<cowd_app_host::AppStorageMigrationEvidence>,
-            >(evidence.clone())
-            .map_err(stringify)?;
-            for enabled in &manifest.enabled_apps {
-                let evidence = app_evidence
-                    .iter()
-                    .find(|evidence| evidence.app_id.as_str() == enabled)
-                    .ok_or_else(|| format!("enabled APP {enabled} has no migration evidence"))?;
-                evidence.validate_for(&evidence.app_id).map_err(stringify)?;
-            }
-        } else {
+        {
             let source = evidence
                 .get("source_digest")
                 .and_then(serde_json::Value::as_str)
@@ -823,7 +732,6 @@ fn validate_manifest(
     workspace_root: &Path,
     expected_status: CutoverStatus,
     postgres: &runtime::PostgresTopologyConfig,
-    enabled_apps: &[String],
     require_current_build_identity: bool,
 ) -> Result<(), String> {
     if manifest.manifest_version != MANIFEST_VERSION
@@ -838,11 +746,7 @@ fn validate_manifest(
                 .to_string(),
         );
     }
-    if require_current_build_identity
-        && (manifest.cowd_version != env!("CARGO_PKG_VERSION")
-            || manifest.product_sources != product_sources()?
-            || manifest.enabled_apps != enabled_apps)
-    {
+    if require_current_build_identity && manifest.cowd_version != env!("CARGO_PKG_VERSION") {
         return Err(
             "in-progress cutover evidence was produced by a different Cowd/App build; restart the offline migration with one immutable build"
                 .to_string(),
@@ -1065,8 +969,6 @@ mod tests {
             target_logical_identity: "test-primary".to_string(),
             target_secret_ref: "env:COWD_TEST_POSTGRES_URL".to_string(),
             status: CutoverStatus::Migrated,
-            product_sources: product_sources().expect("product sources"),
-            enabled_apps: Vec::new(),
             domains: BTreeMap::new(),
             digest: String::new(),
         };
@@ -1087,14 +989,10 @@ mod tests {
         let domains = REQUIRED_CORE_DOMAINS
             .iter()
             .map(|domain| {
-                let evidence = if *domain == "apps" {
-                    serde_json::json!([])
-                } else {
-                    serde_json::json!({
-                        "source_digest": "sha256:historical",
-                        "target_digest": "sha256:historical",
-                    })
-                };
+                let evidence = serde_json::json!({
+                    "source_digest": "sha256:historical",
+                    "target_digest": "sha256:historical",
+                });
                 ((*domain).to_string(), evidence)
             })
             .collect();
@@ -1106,14 +1004,6 @@ mod tests {
             target_logical_identity: postgres.logical_identity.clone(),
             target_secret_ref: postgres.secret_ref.clone(),
             status: CutoverStatus::Active,
-            product_sources: BTreeMap::from([(
-                "historical-app".to_string(),
-                cowd_app_sdk::AppSourceLock {
-                    git: "https://example.invalid/historical-app".to_string(),
-                    revision: "0123456789abcdef".to_string(),
-                },
-            )]),
-            enabled_apps: Vec::new(),
             domains,
             digest: String::new(),
         };
@@ -1124,7 +1014,6 @@ mod tests {
             workspace.path(),
             CutoverStatus::Active,
             &postgres,
-            &[],
             false,
         )
         .expect("runtime startup accepts immutable historical evidence");
@@ -1134,7 +1023,6 @@ mod tests {
                 workspace.path(),
                 CutoverStatus::Active,
                 &postgres,
-                &[],
                 true,
             )
             .is_err(),
@@ -1149,7 +1037,6 @@ mod tests {
                 workspace.path(),
                 CutoverStatus::Active,
                 &wrong_target,
-                &[],
                 false,
             )
             .is_err(),

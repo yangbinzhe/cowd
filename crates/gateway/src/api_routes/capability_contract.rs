@@ -93,10 +93,8 @@ pub(crate) fn gateway_capability_contract() -> GatewayCapabilityContract {
     gateway_capability_contract_from_routes(gateway_route_manifest())
 }
 
-pub(crate) fn gateway_capability_contract_for_apps(
-    app_registry: &cowd_app_host::AppRegistry,
-) -> GatewayCapabilityContract {
-    gateway_capability_contract_from_routes(gateway_route_manifest_for_apps(app_registry))
+pub(crate) fn gateway_capability_contract_for_apps() -> GatewayCapabilityContract {
+    gateway_capability_contract_from_routes(gateway_route_manifest_for_apps())
 }
 
 fn gateway_capability_contract_from_routes(
@@ -148,10 +146,8 @@ pub(crate) fn gateway_openapi_document() -> Value {
     gateway_openapi_document_from_contract(contract, Map::new())
 }
 
-pub(crate) fn gateway_openapi_document_for_apps(
-    app_registry: &cowd_app_host::AppRegistry,
-) -> Value {
-    let contract = gateway_capability_contract_for_apps(app_registry);
+pub(crate) fn gateway_openapi_document_for_apps() -> Value {
+    let contract = gateway_capability_contract_for_apps();
     gateway_openapi_document_from_contract(contract, Map::new())
 }
 
@@ -2619,9 +2615,8 @@ mod tests {
 
     #[test]
     fn disabled_app_is_not_published_to_http_or_ai_contracts() {
-        let app_registry = cowd_app_host::AppRegistry::default();
-        let contract = gateway_capability_contract_for_apps(&app_registry);
-        let openapi = gateway_openapi_document_for_apps(&app_registry);
+        let contract = gateway_capability_contract_for_apps();
+        let openapi = gateway_openapi_document_for_apps();
 
         assert!(contract
             .capabilities
@@ -2809,8 +2804,7 @@ mod tests {
 
     #[test]
     fn dynamic_app_openapi_advertises_only_generic_gateway_paths() {
-        let services = crate::services::GatewayServices::baseline();
-        let document = gateway_openapi_document_for_apps(services.app_registry.as_ref());
+        let document = gateway_openapi_document_for_apps();
         let paths = document["paths"].as_object().expect("OpenAPI paths");
         assert!(paths.contains_key("/api/apps"));
         assert!(paths.contains_key("/api/apps/{app_id}"));

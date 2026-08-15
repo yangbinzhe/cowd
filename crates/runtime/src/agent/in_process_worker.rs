@@ -3571,10 +3571,10 @@ mod tests {
     #[test]
     fn sole_directory_scope_normalizes_a_bare_delegated_read_path() {
         let root = tempfile::tempdir().expect("workspace");
-        std::fs::create_dir_all(root.path().join("cowd-app-mfg")).expect("project directory");
+        std::fs::create_dir_all(root.path().join("external-app")).expect("project directory");
         std::fs::write(
-            root.path().join("cowd-app-mfg/Cargo.toml"),
-            "[package]\nname='mfg'\n",
+            root.path().join("external-app/Cargo.toml"),
+            "[package]\nname='external-app'\n",
         )
         .expect("fixture");
         let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
@@ -3582,20 +3582,20 @@ mod tests {
         let input = serde_json::json!({"path": "Cargo.toml"}).to_string();
         assert_eq!(
             resolver
-                .resolve_existing("cowd-app-mfg")
+                .resolve_existing("external-app")
                 .expect("scope directory")
                 .object_kind,
             harness_contract::context::WorkspaceObjectKind::Directory
         );
         let candidate = resolver
-            .resolve_existing("cowd-app-mfg/Cargo.toml")
+            .resolve_existing("external-app/Cargo.toml")
             .expect("candidate");
-        let scope = resolver.resolve_existing("cowd-app-mfg").expect("scope");
+        let scope = resolver.resolve_existing("external-app").expect("scope");
         assert!(
             resource_path_is_authorized(
                 &resolver,
-                "cowd-app-mfg/Cargo.toml",
-                &["read:cowd-app-mfg".to_string()],
+                "external-app/Cargo.toml",
+                &["read:external-app".to_string()],
                 false,
             ),
             "candidate={candidate:?}; scope={scope:?}"
@@ -3604,20 +3604,20 @@ mod tests {
             "read_file",
             serde_json::json!({"path": "Cargo.toml"}),
             &resolver,
-            Some(&["read:cowd-app-mfg".to_string()]),
+            Some(&["read:external-app".to_string()]),
         );
-        assert_eq!(direct["path"], "cowd-app-mfg/Cargo.toml");
+        assert_eq!(direct["path"], "external-app/Cargo.toml");
 
         let normalized = normalize_delegated_resource_paths(
             "read_file",
             &input,
             root.path(),
             &resolver,
-            Some(&["read:cowd-app-mfg".to_string()]),
+            Some(&["read:external-app".to_string()]),
         )
         .expect("normalize sole scoped read");
         let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
-        assert_eq!(normalized["path"], "cowd-app-mfg/Cargo.toml");
+        assert_eq!(normalized["path"], "external-app/Cargo.toml");
     }
 
     #[test]
@@ -4601,7 +4601,7 @@ mod tests {
         assert!(prompt.contains("If no native tool is authorized, answer directly"));
         assert!(!prompt.contains("## Runtime clock"));
 
-        packet.resource_scopes = vec!["read:cowd-app-mfg".to_string()];
+        packet.resource_scopes = vec!["read:external-app".to_string()];
         let scoped_prompt =
             system_prompt(&packet, std::path::Path::new("/workspace"), &[]).join("\n");
         assert!(scoped_prompt.contains("scope read:project means project/Cargo.toml"));

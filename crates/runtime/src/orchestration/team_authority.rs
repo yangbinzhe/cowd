@@ -1222,7 +1222,6 @@ fn workspace_focus_score(objective: &str, path: &str) -> u16 {
         ("tui", &["crates/tui"][..]),
         ("memory", &["crates/memory"][..]),
         ("matrix", &["crates/matrix"][..]),
-        ("mfg", &["crates/app-mfg", "crates/app-mfg-contract"][..]),
         ("test", &["tests", "scripts/test"][..]),
         ("测试", &["tests", "scripts/test"][..]),
         ("docs", &["docs"][..]),

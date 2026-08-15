@@ -1450,7 +1450,6 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let selected_storage =
         match crate::selected_storage::SelectedStorageTopology::compose_for_runtime(
             runtime_config.storage(),
-            runtime_config.apps(),
             &approval_dir,
             &workspace_root,
         ) {

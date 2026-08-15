@@ -40,21 +40,14 @@ pub(crate) struct GatewayAppSemanticMetadata {
 /// must use [`gateway_route_manifest_for_apps`] so a disabled APP is never
 /// advertised as an available route family.
 pub(crate) fn gateway_route_manifest() -> Vec<GatewayRouteManifestEntry> {
-    gateway_route_manifest_with_apps(Vec::new())
+    gateway_route_manifest_with_apps()
 }
 
-pub(crate) fn gateway_route_manifest_for_apps(
-    _app_registry: &cowd_app_host::AppRegistry,
-) -> Vec<GatewayRouteManifestEntry> {
-    // APP discovery is dynamic. Public contracts expose only Gateway-owned
-    // generic proxy paths; product-specific legacy routers remain callable
-    // during R01 migration but are deliberately not advertised.
-    gateway_route_manifest_with_apps(Vec::new())
+pub(crate) fn gateway_route_manifest_for_apps() -> Vec<GatewayRouteManifestEntry> {
+    gateway_route_manifest_with_apps()
 }
 
-fn gateway_route_manifest_with_apps(
-    app_routes: Vec<cowd_app_host::RegisteredAppRouteMetadata>,
-) -> Vec<GatewayRouteManifestEntry> {
+fn gateway_route_manifest_with_apps() -> Vec<GatewayRouteManifestEntry> {
     let mut entries = BTreeSet::new();
     for route in generated_route_metadata() {
         entries.insert(manifest_entry(route));
@@ -82,28 +75,6 @@ fn gateway_route_manifest_with_apps(
             });
         }
     }
-    // APP routers are composed at startup and are therefore not visible to
-    // the literal-route build scanner. Complete the public inventory from the
-    // static APP contract, preserving any Gateway-owned route entry already
-    // found above. The resulting metadata explicitly records that these are
-    // APP-owned handlers rather than synthetic Gateway handlers.
-    for registered in app_routes
-        .into_iter()
-        .filter(|registered| registered.route.active)
-    {
-        let contract = registered.route;
-        let auth_error_schema = registered.auth_error_schema;
-        if entries.iter().any(|entry: &GatewayRouteManifestEntry| {
-            entry.method == contract.method && entry.path == contract.path
-        }) {
-            continue;
-        }
-        entries.insert(app_manifest_entry(
-            registered.app_id,
-            contract,
-            auth_error_schema,
-        ));
-    }
     entries.into_iter().collect()
 }
 
@@ -118,41 +89,6 @@ fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
         source: route.source.to_string(),
         handler: route.handler.to_string(),
         app: None,
-    }
-}
-
-fn app_manifest_entry(
-    app_id: cowd_app_sdk::AppId,
-    contract: cowd_app_sdk::AppRouteMetadata,
-    auth_error_schema: Option<String>,
-) -> GatewayRouteManifestEntry {
-    GatewayRouteManifestEntry {
-        method: contract.method.clone(),
-        path: contract.path.to_string(),
-        group: "app".to_string(),
-        owner: format!("app:{app_id}"),
-        criticality: route_criticality(&contract.path),
-        stability: "stable",
-        source: format!("app_registry:{app_id}"),
-        handler: contract.route_id.clone(),
-        app: Some(app_semantic_metadata(contract, auth_error_schema)),
-    }
-}
-
-fn app_semantic_metadata(
-    contract: cowd_app_sdk::AppRouteMetadata,
-    auth_error_schema: Option<String>,
-) -> GatewayAppSemanticMetadata {
-    GatewayAppSemanticMetadata {
-        route_id: contract.route_id,
-        request_schema: contract.request_schema,
-        response_schema: contract.response_schema,
-        class: contract.class,
-        capability: contract.capability,
-        risk: contract.risk,
-        confirmation: contract.confirmation,
-        emits_live_event: contract.streaming,
-        auth_error_schema,
     }
 }
 
@@ -273,11 +209,7 @@ mod tests {
 
     #[test]
     fn dynamic_app_manifest_exposes_the_complete_generic_proxy_surface_only() {
-        let manifest = gateway_route_manifest_for_apps(
-            crate::services::GatewayServices::baseline()
-                .app_registry
-                .as_ref(),
-        );
+        let manifest = gateway_route_manifest_for_apps();
         let app_routes = manifest
             .iter()
             .filter(|entry| entry.path.starts_with("/api/apps"))
@@ -311,7 +243,7 @@ mod tests {
 
     #[test]
     fn runtime_manifest_does_not_advertise_an_unregistered_app() {
-        let manifest = gateway_route_manifest_for_apps(&cowd_app_host::AppRegistry::default());
+        let manifest = gateway_route_manifest_for_apps();
         assert!(manifest
             .iter()
             .all(|entry| !entry.path.starts_with("/api/apps/mfg/")));

@@ -26,7 +26,6 @@ pub enum SessionDomainScope {
     Memory,
     Policy,
     ApplicationTask,
-    Mfg,
 }
 
 /// Reference from a domain event to a related durable object.

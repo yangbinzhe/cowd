@@ -10,7 +10,6 @@ use crate::runtime_service::RuntimeService;
 use memory::CognitiveContextManager;
 
 mod agent_service;
-mod app_host_ports;
 mod approval_service;
 mod connector_service;
 mod context;
@@ -41,7 +40,6 @@ mod system_service;
 mod task_service;
 mod workspace_service;
 
-pub(crate) use app_host_ports::GatewayAppHostBinding;
 pub(crate) use approval_service::{ApprovalPendingFilter, ApprovalService};
 pub(crate) use context_service::ContextServiceError;
 pub(crate) use cross_plane_executor::{GatewayConnectorServiceExecutor, GatewayCrossPlaneExecutor};
@@ -63,7 +61,6 @@ pub(crate) use mission_service::{
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
-pub(crate) use registry::embedded_app_registry;
 pub(crate) use runtime_event_service::RuntimeEventService;
 pub(crate) use session_service::{
     ActiveMessagesPage, EnsureSessionRequest, SessionCompactResult, SessionMessageCounts,
@@ -617,16 +614,9 @@ pub(crate) struct GatewayServices {
     /// Immutable process-wide durable backend composition retained for health
     /// and APP provisioning. Business services consume only its typed ports.
     pub(crate) selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
-    /// Legacy static registry retained only for unported internal callers.
-    /// It is never a source for V1 discovery, authorization, or routing.
-    pub(crate) app_registry: Arc<cowd_app_host::AppRegistry>,
     /// Immutable dynamically admitted APP platform. This is the sole truth
     /// used by the V1 catalogue and static APP routes.
     pub(crate) app_platform: Option<Arc<crate::app_platform::GatewayAppPlatform>>,
-    /// Generic APP-to-host effect binding. This is deliberately separate from
-    /// the immutable registry so product startup can compose descriptors
-    /// before the final `AppState` exists.
-    pub(crate) app_host_binding: GatewayAppHostBinding,
     pub(crate) core_platform_bindings: core_platform_operations::CorePlatformBindings,
     pub(crate) runtime: Option<Arc<RuntimeService>>,
     pub(crate) runtime_events: RuntimeEventService,

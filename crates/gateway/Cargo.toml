@@ -12,11 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 harness-contract = { path = "../harness-contract" }
-cowd-product-apps = { path = "../product-apps", default-features = false, features = ["app-postgres"] }
 cowd-app-host = { path = "../app-host" }
 cowd-app-protocol = { path = "../app-protocol" }
 managed-worker-runtime = { path = "../managed-worker-runtime" }
-cowd-app-sdk = { path = "../app-sdk" }
 auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }
 fact-kernel = { path = "../fact-kernel" }
@@ -74,8 +72,7 @@ async-trait = "0.1"
 zip = { version = "8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [features]
-default = ["app-mfg"]
-app-mfg = ["cowd-product-apps/app-mfg"]
+default = []
 code-index = ["memory/code-index"]
 # Explicit opt-in harness for black-box Gateway integration tests. It is never
 # enabled by the production default feature set.
@@ -117,7 +114,6 @@ unsafe_code = "allow"
 
 [dev-dependencies]
 cowd-app-host = { path = "../app-host", features = ["test-support"] }
-app-mfg = { package = "cowd-app-mfg-core", git = "https://gitee.com/eyeout/cowd-app-mfg", rev = "4ee6fb9" }
 auth-broker = { path = "../auth-broker", features = ["test-support"] }
 runtime = { path = "../runtime", features = ["test-fixtures"] }
 managed-worker-runtime = { path = "../managed-worker-runtime", features = ["test-support"] }

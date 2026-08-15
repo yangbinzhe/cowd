@@ -13,7 +13,6 @@ path = "src/lib.rs"
 test-support = []
 
 [dependencies]
-cowd-app-sdk = { path = "../app-sdk" }
 cowd-app-protocol = { path = "../app-protocol" }
 base64 = "0.22"
 harness-contract = { path = "../harness-contract" }

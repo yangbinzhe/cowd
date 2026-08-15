@@ -6,18 +6,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-axum = "0.7"
 base64 = "0.22"
 cowd-app-protocol = { path = "../app-protocol" }
-cowd-app-sdk = { path = "../app-sdk" }
 managed-worker-runtime = { path = "../managed-worker-runtime" }
-crossterm = "0.29"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 serde.workspace = true
 serde_json.workspace = true
 ring = "0.17"
 sha2 = "0.10"
-storage = { path = "../storage" }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
@@ -27,7 +22,6 @@ tempfile = "3"
 
 [features]
 default = []
-app-postgres = ["storage/storage-postgres"]
 test-support = []
 
 [lints]

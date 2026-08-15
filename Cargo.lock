@@ -76,7 +76,6 @@ version = "0.9.693"
 dependencies = [
  "base64",
  "cowd-app-protocol",
- "cowd-app-sdk",
  "harness-contract",
  "ring",
  "rustix",
@@ -290,7 +289,6 @@ version = "0.9.693"
 dependencies = [
  "auth-broker",
  "cowd-app-protocol",
- "cowd-app-sdk",
  "gateway",
  "reqwest",
  "runtime",
@@ -380,113 +378,16 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 name = "cowd-app-host"
 version = "0.9.693"
 dependencies = [
- "axum",
  "base64",
  "cowd-app-protocol",
- "cowd-app-sdk",
- "crossterm",
  "managed-worker-runtime",
- "ratatui",
  "ring",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "storage",
  "tempfile",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "cowd-app-mfg-adapter"
-version = "0.9.659"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4ee6fb9#4ee6fb95ecf18439fa40414689c743a4de88d3f3"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "chrono",
- "cowd-app-host",
- "cowd-app-mfg-contract",
- "cowd-app-mfg-core",
- "cowd-app-mfg-tui",
- "cowd-app-sdk",
- "futures",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "storage",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "cowd-app-mfg-bundle"
-version = "0.9.659"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4ee6fb9#4ee6fb95ecf18439fa40414689c743a4de88d3f3"
-dependencies = [
- "async-trait",
- "cowd-app-host",
- "cowd-app-mfg-adapter",
- "cowd-app-mfg-core",
- "cowd-app-mfg-tui",
- "cowd-app-sdk",
-]
-
-[[package]]
-name = "cowd-app-mfg-contract"
-version = "0.9.659"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4ee6fb9#4ee6fb95ecf18439fa40414689c743a4de88d3f3"
-dependencies = [
- "chrono",
- "matrix-core",
- "schemars",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "cowd-app-mfg-core"
-version = "0.9.659"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4ee6fb9#4ee6fb95ecf18439fa40414689c743a4de88d3f3"
-dependencies = [
- "chrono",
- "cowd-app-mfg-contract",
- "cowd-app-sdk",
- "matrix-core",
- "postgres",
- "r2d2",
- "r2d2_sqlite",
- "rusqlite",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "storage",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "cowd-app-mfg-tui"
-version = "0.9.659"
-source = "git+https://gitee.com/eyeout/cowd-app-mfg?rev=4ee6fb9#4ee6fb95ecf18439fa40414689c743a4de88d3f3"
-dependencies = [
- "chrono",
- "cowd-app-host",
- "cowd-app-mfg-contract",
- "cowd-app-sdk",
- "crossterm",
- "harness-contract",
- "ratatui",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "uuid",
 ]
 
 [[package]]
@@ -501,32 +402,6 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror",
  "zeroize",
-]
-
-[[package]]
-name = "cowd-app-sdk"
-version = "0.9.693"
-dependencies = [
- "async-trait",
- "schemars",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror",
-]
-
-[[package]]
-name = "cowd-product-apps"
-version = "0.9.693"
-dependencies = [
- "async-trait",
- "cowd-app-host",
- "cowd-app-mfg-bundle",
- "cowd-app-sdk",
- "serde_json",
- "storage",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]
@@ -818,7 +693,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1055,10 +930,7 @@ dependencies = [
  "connector",
  "connector-postgres",
  "cowd-app-host",
- "cowd-app-mfg-core",
  "cowd-app-protocol",
- "cowd-app-sdk",
- "cowd-product-apps",
  "fact-kernel",
  "fact-postgres",
  "fact-sqlite",
@@ -2434,7 +2306,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2841,7 +2713,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3460,7 +3332,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

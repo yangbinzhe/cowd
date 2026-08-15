@@ -29,7 +29,6 @@ pub(crate) struct SelectedStorageTopology {
     pub(crate) fallback_reason: Option<String>,
     pub(crate) registry: StorageRegistry,
     pub(crate) postgres_executor: Option<PostgresExecutor>,
-    pub(crate) app_topology: cowd_product_apps::AppStorageTopology,
     pub(crate) session_store: Arc<UnifiedSessionStore>,
     pub(crate) memory_store: Arc<dyn MemoryStore>,
     pub(crate) memory_maintenance_queue: memory::MaintenanceQueue,
@@ -48,11 +47,10 @@ pub(crate) struct SelectedStorageTopology {
 impl SelectedStorageTopology {
     pub(crate) fn compose_for_runtime(
         config: &runtime::StorageTopologyConfig,
-        apps: &runtime::AppsConfig,
         config_home: &Path,
         workspace_root: &Path,
     ) -> Result<Self, String> {
-        Self::compose(config, Some(apps), config_home, workspace_root)
+        Self::compose(config, true, config_home, workspace_root)
     }
 
     pub(crate) fn compose_for_maintenance(
@@ -60,12 +58,12 @@ impl SelectedStorageTopology {
         config_home: &Path,
         workspace_root: &Path,
     ) -> Result<Self, String> {
-        Self::compose(config, None, config_home, workspace_root)
+        Self::compose(config, false, config_home, workspace_root)
     }
 
     fn compose(
         config: &runtime::StorageTopologyConfig,
-        activation_apps: Option<&runtime::AppsConfig>,
+        runtime_mode: bool,
         config_home: &Path,
         workspace_root: &Path,
     ) -> Result<Self, String> {
@@ -75,18 +73,18 @@ impl SelectedStorageTopology {
                 Self::sqlite(registry, config.session_execution, config.artifacts)
             }
             runtime::StorageBackendSelection::Postgres => {
-                Self::compose_postgres(config, activation_apps, config_home, registry)
+                Self::compose_postgres(config, runtime_mode, config_home, registry)
             }
             runtime::StorageBackendSelection::Auto => {
                 // Maintenance/cutover mode stays deterministic: PostgreSQL only.
-                if activation_apps.is_none() {
-                    return Self::compose_postgres(config, activation_apps, config_home, registry);
+                if !runtime_mode {
+                    return Self::compose_postgres(config, runtime_mode, config_home, registry);
                 }
                 let fallback_reason = match config.postgres.as_ref() {
                     Some(_) => {
                         match Self::compose_postgres(
                             config,
-                            activation_apps,
+                            runtime_mode,
                             config_home,
                             registry.clone(),
                         ) {
@@ -107,7 +105,7 @@ impl SelectedStorageTopology {
 
     fn compose_postgres(
         config: &runtime::StorageTopologyConfig,
-        activation_apps: Option<&runtime::AppsConfig>,
+        runtime_mode: bool,
         config_home: &Path,
         registry: StorageRegistry,
     ) -> Result<Self, String> {
@@ -115,7 +113,7 @@ impl SelectedStorageTopology {
             .postgres
             .as_ref()
             .ok_or_else(|| "storage.backend=postgres requires storage.postgres".to_string())?;
-        let migration_mode = if activation_apps.is_some() {
+        let migration_mode = if runtime_mode {
             PostgresMigrationMode::RuntimeReadiness
         } else {
             PostgresMigrationMode::Maintenance
@@ -210,7 +208,6 @@ impl SelectedStorageTopology {
             fallback_reason: None,
             registry,
             postgres_executor: None,
-            app_topology: cowd_product_apps::AppStorageTopology::Sqlite,
             session_store,
             memory_store,
             memory_maintenance_queue,
@@ -316,7 +313,6 @@ impl SelectedStorageTopology {
             fallback_reason: None,
             registry,
             postgres_executor: Some(executor.clone()),
-            app_topology: cowd_product_apps::AppStorageTopology::Postgres { executor },
             session_store,
             memory_store,
             memory_maintenance_queue,
@@ -715,7 +711,6 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let topology = SelectedStorageTopology::compose_for_runtime(
             &runtime::StorageTopologyConfig::default(),
-            &runtime::AppsConfig::default(),
             home.path(),
             workspace.path(),
         )
@@ -757,14 +752,10 @@ mod tests {
             }),
             ..runtime::StorageTopologyConfig::default()
         };
-        let error = SelectedStorageTopology::compose_for_runtime(
-            &config,
-            &runtime::AppsConfig::default(),
-            home.path(),
-            workspace.path(),
-        )
-        .err()
-        .expect("missing secret blocks startup after topology selection");
+        let error =
+            SelectedStorageTopology::compose_for_runtime(&config, home.path(), workspace.path())
+                .err()
+                .expect("missing secret blocks startup after topology selection");
         assert!(error.contains("THIS_MUST_NOT_BE_READ"));
         assert!(!error.contains("activation manifest"));
     }
@@ -843,7 +834,6 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let topology = SelectedStorageTopology::compose_for_runtime(
             &runtime::StorageTopologyConfig::default(),
-            &runtime::AppsConfig::default(),
             home.path(),
             workspace.path(),
         )

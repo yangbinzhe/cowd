@@ -107,7 +107,7 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
             .as_ref()
             .and_then(|service| service.runtime_services().evolution_projector_health().ok()),
     };
-    let mut storage_registry = state.services.selected_storage.as_ref().map_or_else(
+    let storage_registry = state.services.selected_storage.as_ref().map_or_else(
         || {
             StorageRegistry::default_for_config_home(&state.config_home)
                 .with_workspace(&state.workspace_root)
@@ -119,11 +119,6 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
         },
         |selected| selected.registry.clone(),
     );
-    for endpoint in state.services.app_registry.storage_endpoints() {
-        if let Err(error) = storage_registry.register_endpoint(endpoint) {
-            tracing::error!(%error, "gateway health skipped a duplicate APP storage endpoint");
-        }
-    }
     let pragma = SqlitePragmaConfig::default();
     let storage = StorageGatewaySnapshot {
         registry: storage_registry.health(),

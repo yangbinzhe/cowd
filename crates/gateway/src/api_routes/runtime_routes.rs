@@ -95,7 +95,6 @@ fn session_domain_scope_label(scope: session::SessionDomainScope) -> &'static st
         session::SessionDomainScope::Memory => "memory",
         session::SessionDomainScope::Policy => "policy",
         session::SessionDomainScope::ApplicationTask => "task",
-        session::SessionDomainScope::Mfg => "mfg",
     }
 }
 
