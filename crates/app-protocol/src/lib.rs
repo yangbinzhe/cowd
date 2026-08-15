@@ -10,6 +10,7 @@ mod invocation;
 mod manifest;
 mod stream;
 mod surface;
+mod transport;
 
 pub use catalog::*;
 pub use error::*;
@@ -18,15 +19,10 @@ pub use invocation::*;
 pub use manifest::*;
 pub use stream::*;
 pub use surface::*;
+pub use transport::*;
 
 /// The only wire revision implemented by this crate.
 pub const PROTOCOL_REVISION_V1: u16 = 1;
-
-/// MIME type for unary JSON messages.
-pub const UNARY_CONTENT_TYPE_V1: &str = "application/vnd.cowd.app+json;version=1";
-
-/// MIME type for newline-delimited stream frames.
-pub const STREAM_CONTENT_TYPE_V1: &str = "application/vnd.cowd.app.ndjson;version=1";
 
 /// Default maximum unary request size.
 pub const DEFAULT_UNARY_REQUEST_BYTES: u64 = 1_048_576;

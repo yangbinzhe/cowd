@@ -489,11 +489,14 @@ dependencies = [
 name = "cowd-app-protocol"
 version = "1.0.0"
 dependencies = [
+ "base64",
+ "hmac 0.12.1",
  "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
