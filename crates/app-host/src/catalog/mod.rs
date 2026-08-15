@@ -691,6 +691,10 @@ mod tests {
     #[test]
     fn one_hundred_signed_bundles_are_verified_stably_without_worker_activation() {
         const BUNDLE_COUNT: usize = 100;
+        const SAMPLE_COUNT: usize = 20;
+        const P95_LIMIT_MS: u128 = 500;
+        const BASE_RSS_LIMIT_KIB: u64 = 32 * 1024;
+        const PER_APP_RSS_LIMIT_KIB: u64 = 128;
 
         let directory = TempDir::new().expect("temp root");
         let key = FixtureSigningKey::generate();
@@ -712,12 +716,32 @@ mod tests {
             .build()
             .expect("100-bundle catalog")
         };
-        let first_started = Instant::now();
-        let first = build();
-        let first_elapsed = first_started.elapsed();
-        let repeat_started = Instant::now();
-        let repeat = build();
-        let repeat_elapsed = repeat_started.elapsed();
+        let warm = build();
+        let rss_before_kib = resident_set_kib();
+        let mut elapsed_us = Vec::with_capacity(SAMPLE_COUNT);
+        let mut snapshots = Vec::with_capacity(SAMPLE_COUNT);
+        for _ in 0..SAMPLE_COUNT {
+            let started = Instant::now();
+            snapshots.push(build());
+            elapsed_us.push(started.elapsed().as_micros());
+        }
+        let rss_after_kib = resident_set_kib();
+        let rss_delta_kib = rss_after_kib.saturating_sub(rss_before_kib);
+        let rss_limit_kib = BASE_RSS_LIMIT_KIB + PER_APP_RSS_LIMIT_KIB * BUNDLE_COUNT as u64;
+        elapsed_us.sort_unstable();
+        let p95_us = nearest_rank(&elapsed_us, 95);
+        let p99_us = nearest_rank(&elapsed_us, 99);
+        assert!(
+            p95_us <= P95_LIMIT_MS * 1_000,
+            "100-APP Catalog p95 exceeded 500ms"
+        );
+        assert!(
+            rss_delta_kib <= rss_limit_kib,
+            "100-APP Catalog RSS delta {rss_delta_kib}KiB exceeded {rss_limit_kib}KiB"
+        );
+
+        let first = &snapshots[0];
+        let repeat = snapshots.last().expect("Catalog samples");
 
         let first_ids = first
             .apps()
@@ -729,8 +753,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(first_ids, expected_ids);
         assert_eq!(repeat_ids, expected_ids);
+        assert_eq!(warm.generation(), first.generation());
         assert_eq!(first.generation(), repeat.generation());
-        for snapshot in [&first, &repeat] {
+        for snapshot in [first, repeat] {
             assert_eq!(snapshot.diagnostics().len(), BUNDLE_COUNT);
             assert!(snapshot.diagnostics().iter().all(|diagnostic| {
                 diagnostic.outcome == CatalogCandidateOutcome::Admitted
@@ -746,10 +771,37 @@ mod tests {
         }));
 
         eprintln!(
-            "catalog_capacity_evidence bundles={BUNDLE_COUNT} first_elapsed_ms={} repeat_elapsed_ms={} activation_count=0",
-            first_elapsed.as_millis(),
-            repeat_elapsed.as_millis()
+            "COWD_PERF_JSON {}",
+            serde_json::json!({
+                "case": "catalog_100",
+                "bundles": BUNDLE_COUNT,
+                "samples": SAMPLE_COUNT,
+                "p95_us": p95_us,
+                "p99_us": p99_us,
+                "rss_delta_kib": rss_delta_kib,
+                "rss_limit_kib": rss_limit_kib,
+                "activation_count": 0,
+            })
         );
+    }
+
+    fn nearest_rank(samples: &[u128], percentile: usize) -> u128 {
+        let rank = samples.len().saturating_mul(percentile).saturating_add(99) / 100;
+        samples[rank.saturating_sub(1).min(samples.len().saturating_sub(1))]
+    }
+
+    fn resident_set_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("process status")
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("VmRSS:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("VmRSS")
     }
 
     #[test]

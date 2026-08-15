@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -449,20 +449,26 @@ async fn two_hundred_fifty_six_callers_share_exactly_one_spawn() {
         let app_id = app_id.clone();
         let generation = generation.clone();
         callers.spawn(async move {
-            supervisor
+            let started = Instant::now();
+            let result = supervisor
                 .acquire(
                     &app_id,
                     &generation,
                     Duration::from_secs(2),
                     &CancellationToken::default(),
                 )
-                .await
+                .await;
+            (result, started.elapsed())
         });
     }
     let mut leases = Vec::new();
+    let mut elapsed_us = Vec::new();
     while let Some(result) = callers.join_next().await {
-        leases.push(result.expect("caller").expect("lease"));
+        let (lease, elapsed) = result.expect("caller");
+        leases.push(lease.expect("lease"));
+        elapsed_us.push(elapsed.as_micros());
     }
+    elapsed_us.sort_unstable();
     assert_eq!(connector.connect_count(), 1);
     assert!(leases
         .iter()
@@ -471,6 +477,17 @@ async fn two_hundred_fifty_six_callers_share_exactly_one_spawn() {
         lease.release().await;
     }
     supervisor.shutdown().await.expect("shutdown");
+    eprintln!(
+        "COWD_PERF_JSON {}",
+        serde_json::json!({
+            "case": "supervisor_singleflight_256",
+            "callers": 256,
+            "spawns": connector.connect_count(),
+            "p95_us": nearest_rank(&elapsed_us, 95),
+            "p99_us": nearest_rank(&elapsed_us, 99),
+            "max_us": elapsed_us.last().copied().unwrap_or_default(),
+        })
+    );
 }
 
 #[tokio::test]
@@ -592,7 +609,10 @@ async fn idle_ttl_reaps_and_next_request_restarts() {
         .expect("first")
         .release()
         .await;
+    let reap_started = Instant::now();
     wait_for_state(&supervisor, app_id, AppLifecycleStateV1::Stopped).await;
+    let reap_elapsed = reap_started.elapsed();
+    assert!(reap_elapsed <= Duration::from_millis(20) + Duration::from_secs(1));
     supervisor
         .acquire(
             app_id,
@@ -606,6 +626,15 @@ async fn idle_ttl_reaps_and_next_request_restarts() {
         .await;
     assert_eq!(connector.connect_count(), 2);
     supervisor.shutdown().await.expect("shutdown");
+    eprintln!(
+        "COWD_PERF_JSON {}",
+        serde_json::json!({
+            "case": "supervisor_idle_reap",
+            "idle_ttl_ms": 20,
+            "elapsed_ms": reap_elapsed.as_millis(),
+            "restart_spawns": connector.connect_count(),
+        })
+    );
 }
 
 #[tokio::test]
@@ -620,8 +649,11 @@ async fn repeated_resident_crashes_open_the_circuit() {
     let connector = Arc::new(FakeConnector::new([], Duration::ZERO));
     let supervisor =
         AppRuntimeSupervisor::new(snapshot, connector, config(root.path())).expect("supervisor");
+    let crash_started = Instant::now();
     let _ = supervisor.start_resident().await;
     wait_for_state(&supervisor, &ids[0].0, AppLifecycleStateV1::CircuitOpen).await;
+    let crash_elapsed = crash_started.elapsed();
+    assert!(crash_elapsed <= Duration::from_secs(3));
     assert!(supervisor
         .logs(&ids[0].0)
         .await
@@ -641,6 +673,15 @@ async fn repeated_resident_crashes_open_the_circuit() {
         Err(SupervisorError::CircuitOpen(_))
     ));
     supervisor.shutdown().await.expect("shutdown");
+    eprintln!(
+        "COWD_PERF_JSON {}",
+        serde_json::json!({
+            "case": "supervisor_crash_budget",
+            "crash_budget": 3,
+            "elapsed_ms": crash_elapsed.as_millis(),
+            "circuit_open": true,
+        })
+    );
 }
 
 #[tokio::test]
@@ -748,20 +789,26 @@ async fn active_worker_limits_hold_for_one_four_and_sixteen_apps_without_orphans
             let app_id = app_id.clone();
             let generation = generation.clone();
             starts.spawn(async move {
-                supervisor
+                let started = Instant::now();
+                let result = supervisor
                     .acquire(
                         &app_id,
                         &generation,
                         Duration::from_secs(2),
                         &CancellationToken::default(),
                     )
-                    .await
+                    .await;
+                (result, started.elapsed())
             });
         }
         let mut leases = Vec::with_capacity(active_limit);
+        let mut elapsed_us = Vec::with_capacity(active_limit);
         while let Some(result) = starts.join_next().await {
-            leases.push(result.expect("start task").expect("active lease"));
+            let (lease, elapsed) = result.expect("start task");
+            leases.push(lease.expect("active lease"));
+            elapsed_us.push(elapsed.as_micros());
         }
+        elapsed_us.sort_unstable();
 
         assert_eq!(leases.len(), active_limit);
         assert_eq!(connector.connect_count(), active_limit);
@@ -817,8 +864,17 @@ async fn active_worker_limits_hold_for_one_four_and_sixteen_apps_without_orphans
             .all(|pid| !Path::new("/proc").join(pid.to_string()).exists()));
 
         eprintln!(
-            "supervisor_capacity_evidence active_limit={active_limit} spawned={active_limit} duplicate_spawns=0 orphaned=0 elapsed_ms={}",
-            case_started.elapsed().as_millis()
+            "COWD_PERF_JSON {}",
+            serde_json::json!({
+                "case": "supervisor_active_fairness",
+                "active_limit": active_limit,
+                "spawned": active_limit,
+                "duplicate_spawns": 0,
+                "orphaned": 0,
+                "p95_us": nearest_rank(&elapsed_us, 95),
+                "max_us": elapsed_us.last().copied().unwrap_or_default(),
+                "case_elapsed_ms": case_started.elapsed().as_millis(),
+            })
         );
     }
 }
@@ -925,7 +981,10 @@ async fn shutdown_drains_leases_then_leaves_no_child() {
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(!shutdown.is_finished(), "shutdown skipped lease drain");
     lease.release().await;
+    let released_at = Instant::now();
     shutdown.await.expect("shutdown task").expect("shutdown");
+    let shutdown_elapsed = released_at.elapsed();
+    assert!(shutdown_elapsed <= Duration::from_millis(100) + Duration::from_secs(1));
     assert!(
         !Path::new("/proc").join(pid.to_string()).exists(),
         "worker child survived shutdown"
@@ -934,6 +993,20 @@ async fn shutdown_drains_leases_then_leaves_no_child() {
         supervisor.status(&ids[0].0).await.expect("status").state,
         AppLifecycleStateV1::Stopped
     );
+    eprintln!(
+        "COWD_PERF_JSON {}",
+        serde_json::json!({
+            "case": "supervisor_shutdown",
+            "shutdown_grace_ms": 100,
+            "elapsed_after_release_ms": shutdown_elapsed.as_millis(),
+            "orphaned": 0,
+        })
+    );
+}
+
+fn nearest_rank(samples: &[u128], percentile: usize) -> u128 {
+    let rank = samples.len().saturating_mul(percentile).saturating_add(99) / 100;
+    samples[rank.saturating_sub(1).min(samples.len().saturating_sub(1))]
 }
 
 fn write_bundle(root: &Path, app_id: &str, script: &str, key: &FixtureKey) -> PathBuf {

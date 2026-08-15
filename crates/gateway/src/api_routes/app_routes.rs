@@ -1780,6 +1780,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     #[test]
     fn app_static_headers_allow_only_same_origin_embedding() {
@@ -2442,6 +2443,407 @@ mod tests {
         .await;
         assert!(!rejected.status().is_success());
         platform.shutdown().await.expect("reference APP shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "run via scripts/test/reference-app-performance.sh"]
+    async fn reference_bundle_performance_contract() {
+        const COLD_SAMPLES: usize = 100;
+        const HOT_SAMPLES: usize = 500;
+
+        let bundle = PathBuf::from(
+            std::env::var("COWD_REFERENCE_APP_BUNDLE")
+                .expect("COWD_REFERENCE_APP_BUNDLE must name a packaged reference Bundle"),
+        );
+        let public_key = URL_SAFE_NO_PAD
+            .decode(
+                std::env::var("COWD_REFERENCE_APP_PUBLIC_KEY_BASE64URL")
+                    .expect("reference Bundle public key"),
+            )
+            .expect("reference Bundle public key encoding");
+        let now = now_unix_ms().expect("trusted test clock");
+        let discovered = AppCatalogBuilder::new(
+            vec![bundle.parent().expect("Bundle parent").to_path_buf()],
+            AppCatalogPolicy::default(),
+            AppTrustStore::new([TrustedSigningKey {
+                key_id: "reference-app-fixture-ed25519-v1".to_owned(),
+                public_key,
+                revoked: false,
+            }]),
+            unsafe { libc::geteuid() },
+            now,
+        )
+        .build()
+        .expect("admitted reference Bundle");
+        let manifest = &discovered
+            .get(&AppId("reference-app".to_owned()))
+            .expect("reference APP admitted")
+            .manifest;
+        let profile = manifest
+            .authorization_profiles
+            .iter()
+            .find(|profile| profile.is_default)
+            .expect("reference default profile");
+        let mut capabilities = profile.capabilities.clone();
+        capabilities.extend([
+            "runtime.maintenance.manage".to_owned(),
+            "runtime.task.read".to_owned(),
+        ]);
+        capabilities.sort();
+        capabilities.dedup();
+        let principal = super::super::AuthenticatedPrincipal(
+            runtime::VerifiedPrincipal::from_test_claims(PrincipalClaims {
+                principal_id: "reference-performance".to_owned(),
+                tenant_id: "tenant-reference".to_owned(),
+                grant_id: "grant-reference-performance".to_owned(),
+                kind: PrincipalKind::Human,
+                scopes: Vec::new(),
+                capabilities,
+                assurance: PrincipalAssurance::HumanInteractive,
+                issuer: "cowd.gateway".to_owned(),
+                issued_at_ms: now,
+                expires_at_ms: Some(now + 300_000),
+                credential_fingerprint: "reference-performance".to_owned(),
+                credential_epoch: 1,
+                profile_revision: 1,
+                app_profiles: BTreeMap::from([(
+                    "reference-app".to_owned(),
+                    profile.profile_id.clone(),
+                )]),
+            }),
+        );
+        let root = tempfile::tempdir().expect("reference performance root");
+        let workspace = root.path().join("workspace");
+        let app_id = AppId("reference-app".to_owned());
+        let headers = HeaderMap::new();
+
+        let mut cold_us = Vec::with_capacity(COLD_SAMPLES);
+        for index in 0..COLD_SAMPLES {
+            let case_root = root.path().join(format!("cold-{index:03}"));
+            let platform = GatewayAppPlatform::for_test_direct_catalog(
+                discovered.clone(),
+                case_root.join("runtime"),
+                case_root.join("data"),
+                case_root.join("core-bridge.sock"),
+            );
+            let started = Instant::now();
+            let response = proxy_unary(
+                &platform,
+                &workspace,
+                &principal,
+                &headers,
+                "reference-app",
+                "reference-app.echo",
+                echo_input(),
+                None,
+                None,
+            )
+            .await;
+            let status = response.status();
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("cold response body");
+            cold_us.push(started.elapsed().as_micros());
+            assert_eq!(status, StatusCode::OK);
+            platform.shutdown().await.expect("cold platform shutdown");
+        }
+        cold_us.sort_unstable();
+        let cold_p95_us = nearest_rank_u128(&cold_us, 95);
+        let cold_p99_us = nearest_rank_u128(&cold_us, 99);
+        assert!(cold_p95_us <= 1_000_000, "reference cold p95 exceeded 1s");
+        assert!(cold_p99_us <= 2_000_000, "reference cold p99 exceeded 2s");
+
+        let platform = GatewayAppPlatform::for_test_direct_catalog(
+            discovered,
+            root.path().join("hot-runtime"),
+            root.path().join("hot-data"),
+            root.path().join("hot-core-bridge.sock"),
+        );
+        let warm = proxy_unary(
+            &platform,
+            &workspace,
+            &principal,
+            &headers,
+            "reference-app",
+            "reference-app.echo",
+            echo_input(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(warm.status(), StatusCode::OK);
+        warm.into_body().collect().await.expect("warm response");
+        let (lease, descriptor) =
+            acquire_operation(&platform, &principal, "reference-app", "reference-app.echo")
+                .await
+                .expect("hot direct lease");
+        let worker_pid = platform
+            .supervisor()
+            .status(&app_id)
+            .await
+            .expect("hot worker status")
+            .pid
+            .expect("hot worker pid");
+
+        let direct_cpu_before = process_and_worker_cpu_ticks(worker_pid);
+        let direct_wall_started = Instant::now();
+        let mut direct_us = Vec::with_capacity(HOT_SAMPLES);
+        for _ in 0..HOT_SAMPLES {
+            let envelope = invocation_envelope(
+                &platform,
+                &workspace,
+                &principal,
+                &headers,
+                "reference-app",
+                &descriptor,
+                echo_input(),
+            )
+            .expect("direct envelope");
+            let started = Instant::now();
+            let response = send_worker(
+                lease.connection(),
+                lease.app_id(),
+                lease.generation().0.as_str(),
+                &envelope.request_id,
+                envelope.effective_deadline_unix_ms(),
+                Method::POST,
+                "/_cowd/v1/operations/reference-app.echo/invoke",
+                Some(&envelope),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("direct UDS response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("direct body")
+                .to_bytes();
+            let provider: AppProviderResponseV1 =
+                serde_json::from_slice(&body).expect("direct typed response");
+            provider.validate().expect("direct response contract");
+            direct_us.push(started.elapsed().as_micros());
+        }
+        let direct_wall = direct_wall_started.elapsed();
+        let direct_cpu_ticks =
+            process_and_worker_cpu_ticks(worker_pid).saturating_sub(direct_cpu_before);
+
+        let gateway_cpu_before = process_and_worker_cpu_ticks(worker_pid);
+        let gateway_wall_started = Instant::now();
+        let mut gateway_us = Vec::with_capacity(HOT_SAMPLES);
+        for _ in 0..HOT_SAMPLES {
+            let started = Instant::now();
+            let response = proxy_unary(
+                &platform,
+                &workspace,
+                &principal,
+                &headers,
+                "reference-app",
+                "reference-app.echo",
+                echo_input(),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("Gateway hot body");
+            gateway_us.push(started.elapsed().as_micros());
+        }
+        let gateway_wall = gateway_wall_started.elapsed();
+        let gateway_cpu_ticks =
+            process_and_worker_cpu_ticks(worker_pid).saturating_sub(gateway_cpu_before);
+        direct_us.sort_unstable();
+        gateway_us.sort_unstable();
+        let direct_p95_us = nearest_rank_u128(&direct_us, 95);
+        let gateway_p95_us = nearest_rank_u128(&gateway_us, 95);
+        let allowed_gateway_p95_us = direct_p95_us
+            .saturating_mul(115)
+            .div_ceil(100)
+            .max(direct_p95_us.saturating_add(2_000));
+        assert!(
+            gateway_p95_us <= allowed_gateway_p95_us,
+            "Gateway p95 overhead exceeded max(2ms, 15%)"
+        );
+        let direct_rps = HOT_SAMPLES as f64 / direct_wall.as_secs_f64();
+        let gateway_rps = HOT_SAMPLES as f64 / gateway_wall.as_secs_f64();
+        assert!(
+            gateway_rps >= direct_rps * 0.85,
+            "Gateway throughput fell below 85%"
+        );
+        let direct_cpu_per_request = direct_cpu_ticks as f64 / HOT_SAMPLES as f64;
+        let gateway_cpu_per_request = gateway_cpu_ticks as f64 / HOT_SAMPLES as f64;
+        assert!(
+            gateway_cpu_per_request <= direct_cpu_per_request * 1.20 + 0.01,
+            "Gateway CPU/request increment exceeded 20%"
+        );
+
+        let (_, stream_descriptor) = acquire_operation(
+            &platform,
+            &principal,
+            "reference-app",
+            "reference-app.events",
+        )
+        .await
+        .expect("stream descriptor");
+        let direct_stream_envelope = invocation_envelope(
+            &platform,
+            &workspace,
+            &principal,
+            &headers,
+            "reference-app",
+            &stream_descriptor,
+            InvokeInput {
+                payload: json!({}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: None,
+            },
+        )
+        .expect("direct stream envelope");
+        let direct_stream_started = Instant::now();
+        let direct_stream = send_worker(
+            lease.connection(),
+            lease.app_id(),
+            lease.generation().0.as_str(),
+            &direct_stream_envelope.request_id,
+            direct_stream_envelope.effective_deadline_unix_ms(),
+            Method::POST,
+            "/_cowd/v1/operations/reference-app.events/stream",
+            Some(&direct_stream_envelope),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("direct stream");
+        let mut direct_stream_body = direct_stream.into_body();
+        direct_stream_body
+            .frame()
+            .await
+            .expect("direct stream first frame")
+            .expect("direct stream frame");
+        let direct_ttfb_us = direct_stream_started.elapsed().as_micros();
+
+        let gateway_stream_started = Instant::now();
+        let gateway_stream = proxy_stream(
+            &platform,
+            &workspace,
+            &principal,
+            &headers,
+            "reference-app",
+            "reference-app.events",
+            InvokeInput {
+                payload: json!({}),
+                idempotency_key: None,
+                expected_revision: None,
+                deadline_ms: None,
+            },
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(gateway_stream.status(), StatusCode::OK);
+        let mut gateway_stream_body = gateway_stream.into_body();
+        let first_gateway_frame = gateway_stream_body
+            .frame()
+            .await
+            .expect("Gateway stream first frame")
+            .expect("Gateway stream frame")
+            .into_data()
+            .expect("Gateway stream data");
+        let gateway_ttfb_us = gateway_stream_started.elapsed().as_micros();
+        assert!(
+            gateway_ttfb_us <= direct_ttfb_us.saturating_add(10_000),
+            "Gateway stream TTFB overhead exceeded 10ms"
+        );
+        let open_line = first_gateway_frame
+            .split(|byte| *byte == b'\n')
+            .find(|line| !line.is_empty())
+            .expect("Gateway stream open line");
+        let open: AppStreamFrameV1 =
+            serde_json::from_slice(open_line).expect("Gateway stream open frame");
+        let cancel_started = Instant::now();
+        let cancel = cancel_subscription(
+            Extension(Arc::clone(&platform)),
+            Extension(principal.clone()),
+            AxumPath((
+                "reference-app".to_owned(),
+                open.subscription_id().to_owned(),
+            )),
+        )
+        .await;
+        let cancel_us = cancel_started.elapsed().as_micros();
+        assert_eq!(cancel.status(), StatusCode::NO_CONTENT);
+        assert!(cancel_us <= 1_000_000, "stream cancellation exceeded 1s");
+
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "case": "reference_transport",
+            "cold": {"samples": COLD_SAMPLES, "p95_us": cold_p95_us, "p99_us": cold_p99_us},
+            "hot": {
+                "samples": HOT_SAMPLES,
+                "direct_p95_us": direct_p95_us,
+                "gateway_p95_us": gateway_p95_us,
+                "direct_rps": direct_rps,
+                "gateway_rps": gateway_rps,
+                "direct_cpu_ticks_per_request": direct_cpu_per_request,
+                "gateway_cpu_ticks_per_request": gateway_cpu_per_request,
+            },
+            "stream": {
+                "direct_ttfb_us": direct_ttfb_us,
+                "gateway_ttfb_us": gateway_ttfb_us,
+                "cancel_us": cancel_us,
+            },
+        });
+        let report_path = std::env::var("COWD_PERFORMANCE_REPORT")
+            .expect("COWD_PERFORMANCE_REPORT must name a /tmp JSON report");
+        assert!(Path::new(&report_path).starts_with("/tmp"));
+        std::fs::write(
+            report_path,
+            serde_json::to_vec_pretty(&report).expect("performance report JSON"),
+        )
+        .expect("performance report");
+        eprintln!("COWD_PERF_JSON {report}");
+        lease.release().await;
+        platform.shutdown().await.expect("performance shutdown");
+    }
+
+    fn echo_input() -> InvokeInput {
+        InvokeInput {
+            payload: json!({"message":"performance"}),
+            idempotency_key: None,
+            expected_revision: None,
+            deadline_ms: None,
+        }
+    }
+
+    fn nearest_rank_u128(samples: &[u128], percentile: usize) -> u128 {
+        let rank = samples.len().saturating_mul(percentile).saturating_add(99) / 100;
+        samples[rank.saturating_sub(1).min(samples.len().saturating_sub(1))]
+    }
+
+    fn process_and_worker_cpu_ticks(worker_pid: u32) -> u64 {
+        process_cpu_ticks("/proc/self/stat")
+            .saturating_add(process_cpu_ticks(&format!("/proc/{worker_pid}/stat")))
+    }
+
+    fn process_cpu_ticks(path: &str) -> u64 {
+        let stat = std::fs::read_to_string(path).expect("process stat");
+        let fields = stat
+            .rsplit_once(')')
+            .expect("process stat comm")
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        fields[11]
+            .parse::<u64>()
+            .expect("process user ticks")
+            .saturating_add(fields[12].parse::<u64>().expect("process system ticks"))
     }
 
     async fn decode_response<T: serde::de::DeserializeOwned>(response: Response<Body>) -> T {
