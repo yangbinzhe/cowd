@@ -1303,8 +1303,14 @@ pub fn api_router(state: Arc<AppState>) -> Router {
     state.services.bind_app_host_ports(&state);
     let public_routes = public_routes::router();
 
+    let dynamic_app_routes = state
+        .services
+        .app_platform
+        .as_ref()
+        .map(|platform| app_routes::router(Arc::clone(platform)))
+        .unwrap_or_default();
     let protected_routes = Router::new()
-        .merge(app_routes::router(Arc::clone(&state.services.app_registry)))
+        .merge(dynamic_app_routes)
         .merge(approval_routes::router())
         .merge(agent_routes::router())
         .merge(audit_routes::router())

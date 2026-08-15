@@ -964,6 +964,13 @@ impl Default for ExtractionConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppsConfig {
     directories: Vec<PathBuf>,
+    trust_store: Option<PathBuf>,
+    launcher: Option<AppLauncherConfig>,
+    runtime_root: PathBuf,
+    data_root: PathBuf,
+    core_bridge_socket: PathBuf,
+    cgroup_root: Option<PathBuf>,
+    resources: AppWorkerResourcesConfig,
     supervisor: AppSupervisorConfig,
     entries: BTreeMap<String, AppStartupConfig>,
 }
@@ -972,6 +979,13 @@ impl Default for AppsConfig {
     fn default() -> Self {
         Self {
             directories: vec![crate::cowd_dirs::config_home_dir().join("apps")],
+            trust_store: None,
+            launcher: None,
+            runtime_root: crate::cowd_dirs::config_home_dir().join("app-runtime"),
+            data_root: crate::cowd_dirs::config_home_dir().join("app-data"),
+            core_bridge_socket: crate::cowd_dirs::config_home_dir().join("core-bridge.sock"),
+            cgroup_root: None,
+            resources: AppWorkerResourcesConfig::default(),
             supervisor: AppSupervisorConfig::default(),
             entries: BTreeMap::new(),
         }
@@ -997,6 +1011,35 @@ impl AppsConfig {
     }
 
     #[must_use]
+    pub fn trust_store(&self) -> Option<&Path> {
+        self.trust_store.as_deref()
+    }
+    #[must_use]
+    pub fn launcher(&self) -> Option<&AppLauncherConfig> {
+        self.launcher.as_ref()
+    }
+    #[must_use]
+    pub fn runtime_root(&self) -> &Path {
+        &self.runtime_root
+    }
+    #[must_use]
+    pub fn data_root(&self) -> &Path {
+        &self.data_root
+    }
+    #[must_use]
+    pub fn core_bridge_socket(&self) -> &Path {
+        &self.core_bridge_socket
+    }
+    #[must_use]
+    pub fn cgroup_root(&self) -> Option<&Path> {
+        self.cgroup_root.as_deref()
+    }
+    #[must_use]
+    pub fn resources(&self) -> &AppWorkerResourcesConfig {
+        &self.resources
+    }
+
+    #[must_use]
     pub fn supervisor(&self) -> &AppSupervisorConfig {
         &self.supervisor
     }
@@ -1006,9 +1049,7 @@ impl AppsConfig {
         self.entries.get(app_id).cloned().unwrap_or_default()
     }
 
-    /// An APP not mentioned in configuration is enabled by default when the
-    /// product contains it.  This preserves a full product's existing
-    /// behaviour while still allowing an explicit operational kill switch.
+    /// A discovered signed bundle is admitted unless startup policy disables it.
     #[must_use]
     pub fn is_enabled(&self, app_id: &str) -> bool {
         self.entries
@@ -1020,6 +1061,41 @@ impl AppsConfig {
     #[must_use]
     pub fn configured_app_ids(&self) -> impl Iterator<Item = &str> {
         self.entries.keys().map(String::as_str)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppLauncherConfig {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppWorkerResourcesConfig {
+    pub nofile: u64,
+    pub nproc: u64,
+    pub address_space_bytes: u64,
+    pub cpu_seconds: u64,
+    pub file_size_bytes: u64,
+    pub cgroup_memory_bytes: u64,
+    pub cgroup_pids: u64,
+    pub cgroup_cpu_quota_us: u64,
+    pub cgroup_cpu_period_us: u64,
+}
+
+impl Default for AppWorkerResourcesConfig {
+    fn default() -> Self {
+        Self {
+            nofile: 256,
+            nproc: 64,
+            address_space_bytes: 512 * 1024 * 1024,
+            cpu_seconds: 300,
+            file_size_bytes: 16 * 1024 * 1024,
+            cgroup_memory_bytes: 512 * 1024 * 1024,
+            cgroup_pids: 64,
+            cgroup_cpu_quota_us: 100_000,
+            cgroup_cpu_period_us: 100_000,
+        }
     }
 }
 
@@ -3284,7 +3360,18 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
     let apps = expect_object(apps_value, "merged settings.apps")?;
     reject_unknown_keys(
         apps,
-        &["directories", "supervisor", "entries"],
+        &[
+            "directories",
+            "trust_store",
+            "launcher",
+            "runtime_root",
+            "data_root",
+            "core_bridge_socket",
+            "cgroup_root",
+            "resources",
+            "supervisor",
+            "entries",
+        ],
         "merged settings.apps",
     )?;
 
@@ -3314,6 +3401,99 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
         }
         None => AppsConfig::default().directories,
     };
+    let path_value = |key: &str, default: PathBuf| -> Result<PathBuf, ConfigError> {
+        Ok(optional_string(apps, key, "merged settings.apps")?
+            .map(PathBuf::from)
+            .unwrap_or(default))
+    };
+    let defaults = AppsConfig::default();
+    let trust_store =
+        optional_string(apps, "trust_store", "merged settings.apps")?.map(PathBuf::from);
+    let launcher = if let Some(value) = apps.get("launcher") {
+        let context = "merged settings.apps.launcher";
+        let object = expect_object(value, context)?;
+        reject_unknown_keys(object, &["path", "sha256"], context)?;
+        let path = optional_string(object, "path", context)?
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| ConfigError::Parse(format!("{context}.path is required")))?;
+        let sha256 = optional_string(object, "sha256", context)?
+            .filter(|v| {
+                v.len() == 71
+                    && v.starts_with("sha256:")
+                    && v[7..]
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+            .ok_or_else(|| {
+                ConfigError::Parse(format!(
+                    "{context}.sha256 must be canonical sha256:<64 lowercase hex>"
+                ))
+            })?;
+        Some(AppLauncherConfig {
+            path: PathBuf::from(path),
+            sha256: sha256.to_owned(),
+        })
+    } else {
+        None
+    };
+    let runtime_root = path_value("runtime_root", defaults.runtime_root)?;
+    let data_root = path_value("data_root", defaults.data_root)?;
+    let core_bridge_socket = path_value("core_bridge_socket", defaults.core_bridge_socket)?;
+    let cgroup_root =
+        optional_string(apps, "cgroup_root", "merged settings.apps")?.map(PathBuf::from);
+    let mut resources = AppWorkerResourcesConfig::default();
+    if let Some(value) = apps.get("resources") {
+        let context = "merged settings.apps.resources";
+        let object = expect_object(value, context)?;
+        reject_unknown_keys(
+            object,
+            &[
+                "nofile",
+                "nproc",
+                "address_space_bytes",
+                "cpu_seconds",
+                "file_size_bytes",
+                "cgroup_memory_bytes",
+                "cgroup_pids",
+                "cgroup_cpu_quota_us",
+                "cgroup_cpu_period_us",
+            ],
+            context,
+        )?;
+        resources.nofile = optional_u64(object, "nofile", context)?.unwrap_or(resources.nofile);
+        resources.nproc = optional_u64(object, "nproc", context)?.unwrap_or(resources.nproc);
+        resources.address_space_bytes = optional_u64(object, "address_space_bytes", context)?
+            .unwrap_or(resources.address_space_bytes);
+        resources.cpu_seconds =
+            optional_u64(object, "cpu_seconds", context)?.unwrap_or(resources.cpu_seconds);
+        resources.file_size_bytes =
+            optional_u64(object, "file_size_bytes", context)?.unwrap_or(resources.file_size_bytes);
+        resources.cgroup_memory_bytes = optional_u64(object, "cgroup_memory_bytes", context)?
+            .unwrap_or(resources.cgroup_memory_bytes);
+        resources.cgroup_pids =
+            optional_u64(object, "cgroup_pids", context)?.unwrap_or(resources.cgroup_pids);
+        resources.cgroup_cpu_quota_us = optional_u64(object, "cgroup_cpu_quota_us", context)?
+            .unwrap_or(resources.cgroup_cpu_quota_us);
+        resources.cgroup_cpu_period_us = optional_u64(object, "cgroup_cpu_period_us", context)?
+            .unwrap_or(resources.cgroup_cpu_period_us);
+        if [
+            resources.nofile,
+            resources.nproc,
+            resources.address_space_bytes,
+            resources.cpu_seconds,
+            resources.file_size_bytes,
+            resources.cgroup_memory_bytes,
+            resources.cgroup_pids,
+            resources.cgroup_cpu_quota_us,
+            resources.cgroup_cpu_period_us,
+        ]
+        .contains(&0)
+        {
+            return Err(ConfigError::Parse(format!(
+                "{context} values must be positive"
+            )));
+        }
+    }
 
     let mut supervisor = AppSupervisorConfig::default();
     if let Some(value) = apps.get("supervisor") {
@@ -3378,6 +3558,13 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
         None => {
             return Ok(AppsConfig {
                 directories,
+                trust_store,
+                launcher,
+                runtime_root,
+                data_root,
+                core_bridge_socket,
+                cgroup_root,
+                resources,
                 supervisor,
                 entries,
             })
@@ -3418,6 +3605,13 @@ fn parse_optional_apps_config(root: &JsonValue) -> Result<AppsConfig, ConfigErro
     }
     Ok(AppsConfig {
         directories,
+        trust_store,
+        launcher,
+        runtime_root,
+        data_root,
+        core_bridge_socket,
+        cgroup_root,
+        resources,
         supervisor,
         entries,
     })
@@ -4712,6 +4906,7 @@ mod tests {
     use crate::sandbox::FilesystemIsolationMode;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::Path;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -5888,6 +6083,16 @@ approval:
 apps:
   directories:
     - /opt/cowd/apps
+  trust_store: /etc/cowd/app-trust.json
+  launcher:
+    path: /opt/cowd/bin/managed-worker-launcher
+    sha256: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  runtime_root: /run/cowd/apps
+  data_root: /var/lib/cowd/apps
+  core_bridge_socket: /run/cowd/core-bridge.sock
+  cgroup_root: /sys/fs/cgroup/cowd
+  resources:
+    nofile: 512
   supervisor:
     max_active_workers: 8
     max_starting_workers: 2
@@ -5917,6 +6122,25 @@ apps:
         assert_eq!(loaded.apps().supervisor().max_active_workers, 8);
         assert_eq!(loaded.apps().supervisor().max_starting_workers, 2);
         assert_eq!(loaded.apps().supervisor().idle_ttl_seconds, None);
+        assert_eq!(
+            loaded.apps().trust_store(),
+            Some(Path::new("/etc/cowd/app-trust.json"))
+        );
+        assert_eq!(
+            loaded.apps().launcher().expect("launcher").path,
+            PathBuf::from("/opt/cowd/bin/managed-worker-launcher")
+        );
+        assert_eq!(loaded.apps().runtime_root(), Path::new("/run/cowd/apps"));
+        assert_eq!(loaded.apps().data_root(), Path::new("/var/lib/cowd/apps"));
+        assert_eq!(
+            loaded.apps().core_bridge_socket(),
+            Path::new("/run/cowd/core-bridge.sock")
+        );
+        assert_eq!(
+            loaded.apps().cgroup_root(),
+            Some(Path::new("/sys/fs/cgroup/cowd"))
+        );
+        assert_eq!(loaded.apps().resources().nofile, 512);
         let mfg = loaded.apps().entry("mfg");
         assert!(mfg.required);
         assert_eq!(mfg.activation, AppActivationPolicyV1::Resident);

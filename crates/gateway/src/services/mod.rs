@@ -61,9 +61,7 @@ pub(crate) use mission_service::{
 };
 pub(crate) use reality_service::RealityService;
 pub(crate) use receipt::{service_envelope, ServiceEnvelope};
-pub(crate) use registry::{
-    broker_backed_app_registry_with_storage, embedded_app_registry, enabled_app_descriptors,
-};
+pub(crate) use registry::embedded_app_registry;
 pub(crate) use runtime_event_service::RuntimeEventService;
 pub(crate) use session_service::{
     ActiveMessagesPage, EnsureSessionRequest, SessionCompactResult, SessionMessageCounts,
@@ -617,9 +615,12 @@ pub(crate) struct GatewayServices {
     /// Immutable process-wide durable backend composition retained for health
     /// and APP provisioning. Business services consume only its typed ports.
     pub(crate) selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
-    /// Product-composed APP catalogue. The core host only consumes its generic
-    /// descriptors and routers; it never imports an APP implementation.
+    /// Legacy static registry retained only for unported internal callers.
+    /// It is never a source for V1 discovery, authorization, or routing.
     pub(crate) app_registry: Arc<cowd_app_host::AppRegistry>,
+    /// Immutable dynamically admitted APP platform. This is the sole truth
+    /// used by the V1 catalogue and static APP routes.
+    pub(crate) app_platform: Option<Arc<crate::app_platform::GatewayAppPlatform>>,
     /// Generic APP-to-host effect binding. This is deliberately separate from
     /// the immutable registry so product startup can compose descriptors
     /// before the final `AppState` exists.

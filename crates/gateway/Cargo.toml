@@ -14,6 +14,8 @@ path = "src/main.rs"
 harness-contract = { path = "../harness-contract" }
 cowd-product-apps = { path = "../product-apps", default-features = false, features = ["app-postgres"] }
 cowd-app-host = { path = "../app-host" }
+cowd-app-protocol = { path = "../app-protocol" }
+managed-worker-runtime = { path = "../managed-worker-runtime" }
 cowd-app-sdk = { path = "../app-sdk" }
 auth-broker = { path = "../auth-broker" }
 harness-eval = { path = "../harness-eval" }

@@ -75,6 +75,7 @@ name = "auth-broker"
 version = "0.9.693"
 dependencies = [
  "base64",
+ "cowd-app-protocol",
  "cowd-app-sdk",
  "harness-contract",
  "ring",
@@ -1052,6 +1053,7 @@ dependencies = [
  "connector-postgres",
  "cowd-app-host",
  "cowd-app-mfg-core",
+ "cowd-app-protocol",
  "cowd-app-sdk",
  "cowd-product-apps",
  "fact-kernel",
@@ -1065,6 +1067,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "managed-worker-runtime",
  "matrix-core",
  "matrix-repository",
  "mcp",

@@ -221,6 +221,7 @@ impl GatewayServices {
         Self {
             selected_storage,
             app_registry,
+            app_platform: None,
             app_host_binding,
             runtime: Some(Arc::clone(&runtime)),
             runtime_events,
@@ -288,6 +289,7 @@ impl GatewayServices {
                 config_home,
                 app_host_binding.context(),
             )),
+            app_platform: None,
             app_host_binding,
             runtime: None,
             runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
@@ -329,6 +331,15 @@ impl GatewayServices {
     #[must_use]
     pub(crate) fn with_app_registry(mut self, app_registry: cowd_app_host::AppRegistry) -> Self {
         self.app_registry = Arc::new(app_registry);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_app_platform(
+        mut self,
+        app_platform: Arc<crate::app_platform::GatewayAppPlatform>,
+    ) -> Self {
+        self.app_platform = Some(app_platform);
         self
     }
 

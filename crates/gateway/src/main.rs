@@ -16,6 +16,7 @@
     )
 )]
 mod api_routes;
+mod app_platform;
 #[path = "core/bootstrap.rs"]
 mod bootstrap;
 #[path = "core/boundary_policy.rs"]

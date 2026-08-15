@@ -1025,6 +1025,7 @@ struct GatewayRuntimeShutdownResources<'a> {
     runtime_services: Option<&'a Arc<runtime::RuntimeServices>>,
     cognitive: Option<&'a Arc<CognitiveContextManager>>,
     surface_host: Option<&'a Arc<crate::surface_host::SurfaceHost>>,
+    app_platform: Option<&'a Arc<crate::app_platform::GatewayAppPlatform>>,
     auth_broker: &'a Arc<tokio::sync::Mutex<Option<AuthBrokerProcess>>>,
 }
 
@@ -1034,6 +1035,7 @@ struct GatewayRuntimeStartupRegistry {
     selected_storage: Option<Arc<crate::selected_storage::SelectedStorageTopology>>,
     cognitive: Option<Arc<CognitiveContextManager>>,
     surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
+    app_platform: Option<Arc<crate::app_platform::GatewayAppPlatform>>,
     runtime_services: Option<Arc<runtime::RuntimeServices>>,
     runtime_service: Option<Arc<RuntimeService>>,
     session_activation:
@@ -1050,6 +1052,7 @@ impl GatewayRuntimeStartupRegistry {
             selected_storage: None,
             cognitive: None,
             surface_host: None,
+            app_platform: None,
             runtime_services: None,
             runtime_service: None,
             session_activation: None,
@@ -1068,6 +1071,7 @@ impl GatewayRuntimeStartupRegistry {
             runtime_services: self.runtime_services.as_ref(),
             cognitive: self.cognitive.as_ref(),
             surface_host: self.surface_host.as_ref(),
+            app_platform: self.app_platform.as_ref(),
             auth_broker: &self.auth_broker,
         }
     }
@@ -1179,6 +1183,14 @@ async fn shutdown_runtime_host_resources(
                 if let Err(error) = surface_host.shutdown().await {
                     failures.push(format!("surface host shutdown incomplete: {error}"));
                     coordinator.publish("drain_surface", &failures);
+                }
+            }
+
+            enter_phase("drain_apps", &failures);
+            if let Some(platform) = resources.app_platform {
+                if let Err(error) = platform.shutdown().await {
+                    failures.push(format!("APP supervisor shutdown incomplete: {error}"));
+                    coordinator.publish("drain_apps", &failures);
                 }
             }
 
@@ -1534,12 +1546,19 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         unified_store.clone(),
         event_bus.clone(),
     ));
-    // Authentication starts before the concrete HTTP host exists.  It uses
-    // exactly the same enabled-APP set that will later build AppRegistry, so
-    // a disabled APP cannot remain present in the broker's capability
-    // catalogue.
-    let auth_catalog = match auth_broker::AuthorizationCatalog::from_app_descriptors(
-        crate::services::enabled_app_descriptors(runtime_config.apps()),
+    // APP discovery is a one-shot startup transaction. Its immutable admitted
+    // manifests become the sole input to authentication and V1 routes.
+    let app_platform =
+        match crate::app_platform::GatewayAppPlatform::build(runtime_config.apps()).await {
+            Ok(platform) => platform,
+            Err(error) => {
+                let error = format!("failed to compose dynamic APP platform: {error}");
+                return Err(startup_registry.rollback(error).await);
+            }
+        };
+    startup_registry.app_platform = Some(Arc::clone(&app_platform));
+    let auth_catalog = match auth_broker::AuthorizationCatalog::from_app_manifests(
+        app_platform.catalog().apps().map(|app| &app.manifest),
     ) {
         Ok(catalog) => catalog,
         Err(error) => {
@@ -1912,25 +1931,13 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Arc::clone(&selected_storage),
         growth_projection_services,
     );
-    let app_registry = match crate::services::broker_backed_app_registry_with_storage(
-        services.app_host_context(),
-        runtime_config.apps(),
-        selected_storage.registry.clone(),
-        selected_storage.app_topology.clone(),
-    ) {
-        Ok(registry) => registry,
-        Err(error) => {
-            let error = format!("failed to provision enabled APP storage: {error}");
-            return Err(startup_registry.rollback(error).await);
-        }
-    };
     if let Some(executor) = &selected_storage.postgres_executor {
         if let Err(error) = executor.verify_registered_migration_catalogs() {
             let error = format!("failed to verify enabled APP storage catalogs: {error}");
             return Err(startup_registry.rollback(error).await);
         }
     }
-    let services = Arc::new(services.with_app_registry(app_registry));
+    let services = Arc::new(services.with_app_platform(app_platform));
     let app_state = Arc::new(api_routes::AppState {
         tool_registry: tools.clone(),
         config: config.runtime_config.clone(),

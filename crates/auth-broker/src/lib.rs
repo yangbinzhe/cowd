@@ -14,6 +14,7 @@ use std::{
 };
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use cowd_app_protocol::{AppManifestV1, ProtocolValidate};
 use cowd_app_sdk::AppDescriptor;
 use harness_contract::security::{
     DecisionLeaseClaims, PrincipalAssurance, PrincipalClaims, PrincipalKind, SignedDecisionLease,
@@ -76,6 +77,67 @@ pub struct HumanEntitlementProjection {
 }
 
 impl AuthorizationCatalog {
+    /// Compose authorization exclusively from admitted, immutable V1 manifests.
+    pub fn from_app_manifests<'a>(
+        manifests: impl IntoIterator<Item = &'a AppManifestV1>,
+    ) -> Result<Self, AuthBrokerError> {
+        let mut apps = Vec::new();
+        for manifest in manifests {
+            manifest.validate().map_err(|error| {
+                AuthBrokerError::InvalidCredentialState(format!(
+                    "invalid APP manifest {}: {error}",
+                    manifest.app_id
+                ))
+            })?;
+            let default = manifest
+                .authorization_profiles
+                .iter()
+                .find(|profile| profile.is_default);
+            if let Some(default) = default {
+                apps.push(AuthorizationAppProfileCatalog {
+                    app_id: manifest.app_id.0.clone(),
+                    default_profile_id: default.profile_id.clone(),
+                    profiles: manifest
+                        .authorization_profiles
+                        .iter()
+                        .map(|profile| AuthorizationProfile {
+                            id: profile.profile_id.clone(),
+                            capabilities: profile.capabilities.clone(),
+                        })
+                        .collect(),
+                    surface_capabilities: default.surface_capabilities.clone(),
+                });
+            }
+        }
+        apps.sort_by(|left, right| left.app_id.cmp(&right.app_id));
+        let catalog = Self {
+            schema_version: 1,
+            core_profiles: Self::core_profiles(),
+            apps,
+        };
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    fn core_profiles() -> Vec<AuthorizationProfile> {
+        vec![
+            AuthorizationProfile {
+                id: "core_operator".to_string(),
+                capabilities: vec![
+                    "approval.respond".to_string(),
+                    "mission.observe".to_string(),
+                ],
+            },
+            AuthorizationProfile {
+                id: "core_manager".to_string(),
+                capabilities: CORE_HUMAN_CAPABILITIES
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+            },
+        ]
+    }
+
     /// Compose the generic catalogue from already validated APP descriptors.
     pub fn from_app_descriptors(
         descriptors: impl IntoIterator<Item = AppDescriptor>,
@@ -103,22 +165,7 @@ impl AuthorizationCatalog {
         apps.sort_by(|left, right| left.app_id.cmp(&right.app_id));
         let catalog = Self {
             schema_version: 1,
-            core_profiles: vec![
-                AuthorizationProfile {
-                    id: "core_operator".to_string(),
-                    capabilities: vec![
-                        "approval.respond".to_string(),
-                        "mission.observe".to_string(),
-                    ],
-                },
-                AuthorizationProfile {
-                    id: "core_manager".to_string(),
-                    capabilities: CORE_HUMAN_CAPABILITIES
-                        .iter()
-                        .map(|value| (*value).to_string())
-                        .collect(),
-                },
-            ],
+            core_profiles: Self::core_profiles(),
             apps,
         };
         catalog.validate()?;
@@ -1988,6 +2035,26 @@ fn storage_error(error: std::io::Error) -> AuthBrokerError {
 #[cfg(test)]
 mod generic_catalog_tests {
     use super::*;
+
+    #[test]
+    fn admitted_manifest_projection_is_product_neutral_and_deterministic() {
+        let manifest: AppManifestV1 = serde_json::from_str(include_str!(
+            "../../../contracts/app/v1/golden/app-manifest.json"
+        ))
+        .expect("frozen manifest");
+        let catalog = AuthorizationCatalog::from_app_manifests([&manifest]).expect("catalog");
+        assert_eq!(catalog.apps.len(), 1);
+        assert_eq!(catalog.apps[0].app_id, manifest.app_id.0);
+        assert_eq!(
+            catalog.apps[0].default_profile_id,
+            manifest
+                .authorization_profiles
+                .iter()
+                .find(|profile| profile.is_default)
+                .expect("default")
+                .profile_id
+        );
+    }
 
     fn fixture_catalog() -> AuthorizationCatalog {
         AuthorizationCatalog {
