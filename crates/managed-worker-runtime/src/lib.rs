@@ -17,7 +17,9 @@ mod recovery;
 mod runtime_dir;
 
 pub use cancellation::CancellationToken;
-pub use channel::ManagedH2Channel;
+pub use channel::{
+    ManagedH2Channel, ManagedH2ConnectError, PeerCredentialPolicy, PeerCredentialReceipt,
+};
 pub use credential::{CredentialLease, CredentialSecret};
 pub use error::{ManagedWorkerError, ManagedWorkerResult};
 pub use generation::GenerationFence;
