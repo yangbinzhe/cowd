@@ -1,4 +1,11 @@
 {
+  "components": {
+    "schemas": {
+      "AppInvocationEnvelopeV1": {
+        "$ref": "./schemas/invocation.schema.json"
+      }
+    }
+  },
   "info": {
     "title": "Cowd APP Protocol",
     "version": "1"
@@ -12,12 +19,34 @@
     },
     "/_cowd/core/v1/operations/{operation_id}/invoke": {
       "post": {
-        "operationId": "coreInvoke"
+        "operationId": "coreInvoke",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-authorization-context": "gateway-verified"
       }
     },
     "/_cowd/core/v1/operations/{operation_id}/stream": {
       "post": {
-        "operationId": "coreStream"
+        "operationId": "coreStream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-authorization-context": "gateway-verified"
       }
     },
     "/_cowd/v1/handshake": {
@@ -37,12 +66,34 @@
     },
     "/_cowd/v1/operations/{operation_id}/invoke": {
       "post": {
-        "operationId": "appInvoke"
+        "operationId": "appInvoke",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-authorization-context": "gateway-verified"
       }
     },
     "/_cowd/v1/operations/{operation_id}/stream": {
       "post": {
-        "operationId": "appStream"
+        "operationId": "appStream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppInvocationEnvelopeV1"
+              }
+            }
+          },
+          "required": true
+        },
+        "x-cowd-authorization-context": "gateway-verified"
       }
     },
     "/_cowd/v1/shutdown": {

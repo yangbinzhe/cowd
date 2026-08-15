@@ -110,7 +110,54 @@ fn digest_files(files: &BTreeMap<String, Vec<u8>>) -> String {
 
 fn golden_fixtures() -> BTreeMap<&'static str, Value> {
     let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    BTreeMap::from([
+    let principal = json!({
+        "subject": "user:1",
+        "tenant_id": "tenant:1",
+        "workspace_id": "workspace:1",
+        "delegation": "user",
+        "grant_id": "grant:1",
+        "authorization_profile_id": "operator",
+        "authorization_revision": 7,
+        "granted_capabilities": ["app.reference.read", "app.reference.write"],
+        "granted_scopes": ["workspace:read", "workspace:write"],
+        "credential_epoch": 11,
+        "expires_at_unix_ms": 4_000_000_000_000_u64
+    });
+    let execution = json!({
+        "surface": "web",
+        "session_id": "session:1",
+        "turn_id": "turn:1",
+        "task_id": "task:1"
+    });
+    let command_invocation = json!({
+        "schema_version": 1,
+        "operation_id": "reference.command.v1",
+        "request_id": "request:1",
+        "correlation_id": "correlation:1",
+        "deadline_unix_ms": 4_000_000_000_000_u64,
+        "idempotency_key": "idempotency:1",
+        "expected_revision": "7",
+        "call_chain": ["core:runtime"],
+        "max_hops": 4,
+        "input_schema_digest": digest,
+        "principal": principal,
+        "execution": execution,
+        "payload": {"value": 1}
+    });
+    let query_invocation = json!({
+        "schema_version": 1,
+        "operation_id": "reference.query.v1",
+        "request_id": "request:query:1",
+        "correlation_id": "correlation:1",
+        "deadline_unix_ms": 4_000_000_000_000_u64,
+        "call_chain": ["surface:web"],
+        "max_hops": 4,
+        "input_schema_digest": digest,
+        "principal": command_invocation["principal"].clone(),
+        "execution": command_invocation["execution"].clone(),
+        "payload": {"filter": "active"}
+    });
+    let mut fixtures = BTreeMap::from([
         (
             "handshake-success.json",
             json!({
@@ -150,6 +197,8 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
                 "payload": {"accepted": true}
             }),
         ),
+        ("query-invocation.json", query_invocation),
+        ("command-invocation.json", command_invocation.clone()),
         (
             "stream-open.json",
             json!({
@@ -185,7 +234,43 @@ fn golden_fixtures() -> BTreeMap<&'static str, Value> {
                 "catalog_generation": digest
             }),
         ),
-    ])
+    ]);
+
+    let mut missing_revision = command_invocation.clone();
+    missing_revision["principal"]
+        .as_object_mut()
+        .expect("principal fixture")
+        .remove("authorization_revision");
+    fixtures.insert(
+        "negative/missing-authorization-revision.json",
+        missing_revision,
+    );
+
+    let mut duplicate_capability = command_invocation.clone();
+    duplicate_capability["principal"]["granted_capabilities"] =
+        json!(["app.reference.write", "app.reference.write"]);
+    fixtures.insert("negative/duplicate-capability.json", duplicate_capability);
+
+    let mut unsorted_scope = command_invocation.clone();
+    unsorted_scope["principal"]["granted_scopes"] = json!(["workspace:write", "workspace:read"]);
+    fixtures.insert("negative/unsorted-scope.json", unsorted_scope);
+
+    let mut unknown_principal = command_invocation.clone();
+    unknown_principal["principal"]["unverified_role"] = json!("admin");
+    fixtures.insert("negative/unknown-principal-field.json", unknown_principal);
+
+    let mut expired = command_invocation.clone();
+    expired["principal"]["expires_at_unix_ms"] = json!(1_700_000_000_000_u64);
+    fixtures.insert("negative/expired-grant.json", expired);
+
+    let mut wrong_delegation = command_invocation.clone();
+    wrong_delegation["principal"]["delegation"] = json!("service");
+    fixtures.insert("negative/wrong-delegation.json", wrong_delegation);
+
+    let mut missing_capability = command_invocation;
+    missing_capability["principal"]["granted_capabilities"] = json!(["app.reference.read"]);
+    fixtures.insert("negative/missing-capability.json", missing_capability);
+    fixtures
 }
 
 fn openapi() -> Value {
@@ -196,14 +281,33 @@ fn openapi() -> Value {
             "/_cowd/v1/handshake": {"post": {"operationId": "appHandshake"}},
             "/_cowd/v1/health": {"get": {"operationId": "appHealth"}},
             "/_cowd/v1/operations": {"get": {"operationId": "appOperations"}},
-            "/_cowd/v1/operations/{operation_id}/invoke": {"post": {"operationId": "appInvoke"}},
-            "/_cowd/v1/operations/{operation_id}/stream": {"post": {"operationId": "appStream"}},
+            "/_cowd/v1/operations/{operation_id}/invoke": {"post": {
+                "operationId": "appInvoke",
+                "x-cowd-authorization-context": "gateway-verified",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+            }},
+            "/_cowd/v1/operations/{operation_id}/stream": {"post": {
+                "operationId": "appStream",
+                "x-cowd-authorization-context": "gateway-verified",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+            }},
             "/_cowd/v1/shutdown": {"post": {"operationId": "appShutdown"}},
             "/_cowd/core/v1/operations": {"get": {"operationId": "coreOperations"}},
-            "/_cowd/core/v1/operations/{operation_id}/invoke": {"post": {"operationId": "coreInvoke"}},
-            "/_cowd/core/v1/operations/{operation_id}/stream": {"post": {"operationId": "coreStream"}},
+            "/_cowd/core/v1/operations/{operation_id}/invoke": {"post": {
+                "operationId": "coreInvoke",
+                "x-cowd-authorization-context": "gateway-verified",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+            }},
+            "/_cowd/core/v1/operations/{operation_id}/stream": {"post": {
+                "operationId": "coreStream",
+                "x-cowd-authorization-context": "gateway-verified",
+                "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AppInvocationEnvelopeV1"}}}}
+            }},
             "/api/apps": {"get": {"operationId": "appCatalog"}},
             "/api/apps/{app_id}": {"get": {"operationId": "appCatalogEntry"}}
-        }
+        },
+        "components": {"schemas": {
+            "AppInvocationEnvelopeV1": {"$ref": "./schemas/invocation.schema.json"}
+        }}
     })
 }

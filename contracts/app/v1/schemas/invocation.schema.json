@@ -24,8 +24,7 @@
       "minimum": 0
     },
     "execution": {
-      "$ref": "#/$defs/ExecutionContextV1",
-      "default": {}
+      "$ref": "#/$defs/ExecutionContextV1"
     },
     "expected_revision": {
       "type": [
@@ -76,6 +75,7 @@
     "max_hops",
     "input_schema_digest",
     "principal",
+    "execution",
     "payload"
   ],
   "$defs": {
@@ -95,6 +95,9 @@
             "null"
           ]
         },
+        "surface": {
+          "type": "string"
+        },
         "task_id": {
           "type": [
             "string",
@@ -108,16 +111,52 @@
           ]
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "surface"
+      ]
     },
     "PrincipalContextV1": {
       "type": "object",
       "properties": {
+        "authorization_profile_id": {
+          "type": "string"
+        },
+        "authorization_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "credential_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "delegation": {
           "$ref": "#/$defs/DelegationKindV1"
         },
+        "expires_at_unix_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "grant_id": {
           "type": "string"
+        },
+        "granted_capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "granted_scopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "subject": {
           "type": "string"
@@ -135,7 +174,13 @@
         "tenant_id",
         "workspace_id",
         "delegation",
-        "grant_id"
+        "grant_id",
+        "authorization_profile_id",
+        "authorization_revision",
+        "granted_capabilities",
+        "granted_scopes",
+        "credential_epoch",
+        "expires_at_unix_ms"
       ]
     }
   }

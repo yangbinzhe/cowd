@@ -1,12 +1,21 @@
 {
   "files": {
+    "golden/command-invocation.json": "sha256:2b980820244e936e6dd6dc98c0c5c74f55033ccd8b30107291c490c5f59c1e01",
     "golden/command-receipt.json": "sha256:fdfd5eb6e1c27723185674c729aa620d861458ca026e5bb75c9a768570bfda91",
     "golden/error-cycle.json": "sha256:9b67ed0567833ffcad037cc8438be13bb0cf92898fdf7386231ce6247f349c19",
     "golden/handshake-success.json": "sha256:f09c0397774421e272d22f6ec55f375ae0f77c11d61e040e22d8506f31a87b85",
     "golden/iframe-host-init.json": "sha256:c8e314d590a41a6afa1aa2886e55eda6e21867b7544112df85fff288be8e67fe",
+    "golden/negative/duplicate-capability.json": "sha256:fbcd523aa0cdbfdcb94c82fc32b3cab1613b56c57fead81022188ca7be4b1731",
+    "golden/negative/expired-grant.json": "sha256:68c86fb2ad5abe20ccaeec83b83ee6ee98a693e36b8dd5e3fb2b92a4f8693b4f",
+    "golden/negative/missing-authorization-revision.json": "sha256:a357d971480c0305781b6b68b4dd103273767f313701ec3a2a89f1f5eec45ae6",
+    "golden/negative/missing-capability.json": "sha256:bb53a738b468b40a2b9a9852a0185777a75f9ba2b90bfc926118e549a052a290",
+    "golden/negative/unknown-principal-field.json": "sha256:6d6e0e05f6680dc5e7abeb180576435ed476832ffb37f3d69344185425706973",
+    "golden/negative/unsorted-scope.json": "sha256:150baa4908cf1c9fa1c24eb4de70f20d9851d0a29bb3e171809ba29148b592ce",
+    "golden/negative/wrong-delegation.json": "sha256:9b01d51e2bdb250194ef6bf401eb08522963be30c6f91d855ecaa2c6406e16ba",
+    "golden/query-invocation.json": "sha256:9d1cd5bef84515ce7255ebce9441f79405c7fc6f0f6fb66e9f85b87b77025f5d",
     "golden/query-success.json": "sha256:2bde7ec9dadbdf6ef5fb468e4fe3bc984242a7575452375661beeff075712a1a",
     "golden/stream-open.json": "sha256:4c0d8edffa6facf4414c1890479f1abee3ba88a9b51b0caf639586af61c96411",
-    "openapi.json": "sha256:03476de3b7690ab3ed5d60f67ce669f98152897e3404a8c3c7f7bb258258f7f0",
+    "openapi.json": "sha256:0055bdf107c81dbac19e9e8d284b0e3d127ea9020da4c484fa2852c4a48f785a",
     "schemas/app-manifest.schema.json": "sha256:2c71709dca0d3188ac620f593f1008ef3b2b037a532a6f7fe4ef082cb4ea896a",
     "schemas/application-execution-outcome.schema.json": "sha256:2df112c4c51f846778437a42b910bb37dfd5e6961bbaa07318451428b7ab2063",
     "schemas/catalog.schema.json": "sha256:067b28e70ecdae69f1bd92813a5e4f692062884aa5e9943db09b63fc294a2431",
@@ -16,7 +25,7 @@
     "schemas/health.schema.json": "sha256:001caea79a0dad468f15cdb38705f872fb461aab0e4a64d472b732ebbf2ba12a",
     "schemas/iframe-api.schema.json": "sha256:9a0f5024d392c597d80bfbbfd6b5a22ffd8071b7a93511c4a687f179b4842e0b",
     "schemas/iframe-bridge.schema.json": "sha256:3e2b5edf1193663e4ae2bd58ddbbf76926ee3c549826a082b95660fbedfdf871",
-    "schemas/invocation.schema.json": "sha256:92f14d3dead0e49191234dac20130009aaab3ae99eed7e5c9d62fddd804fdf46",
+    "schemas/invocation.schema.json": "sha256:faff87280b7653f1de5de0896a2d0087c16c3d850a2167cbc8a95ba6f105efba",
     "schemas/operation.schema.json": "sha256:cb523ad8a7141e8c1f27109b79add10b6d710d8e2ae58f6f86d41078469a1372",
     "schemas/provider-response.schema.json": "sha256:d1283809e2a036368c16d8908cf64adb244170b9c046a96649bd9e9dbd9eb534",
     "schemas/receipt.schema.json": "sha256:68ce475de96c73f85596c0bf31f371274e5ebfece64c7dd29875d998d4077893",
@@ -25,7 +34,7 @@
     "schemas/tui-patch.schema.json": "sha256:e5f9be9a1e064e88143bba4453bc359c5f2de10bc2efceaa110d48f29b79ae5f",
     "schemas/tui-view.schema.json": "sha256:333188036a79ecf19669cf530127b5e0a48187f812fac0255444027c30e826b5"
   },
-  "protocol_digest": "sha256:54030ea4f653de5c1e4ebb4fd5cd236df8e5ea51136dd74f3dcd648beb8ca87d",
+  "protocol_digest": "sha256:07ed07c4d5cebef91735c9ee17b5a2116b7c7faec530fef3cd4e81cfe81ddde6",
   "protocol_revision": 1,
   "schema_version": 1
 }

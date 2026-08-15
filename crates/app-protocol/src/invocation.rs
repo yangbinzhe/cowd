@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    require_bounded, require_digest, require_schema, require_unique, ExecutionContextV1,
-    PrincipalContextV1, ProtocolValidate, ProtocolValidationError, Sha256Digest,
+    require_bounded, require_digest, require_schema, require_unique, DelegationKindV1,
+    ExecutionContextV1, PrincipalContextV1, ProtocolValidate, ProtocolValidationError,
+    Sha256Digest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -145,7 +146,6 @@ pub struct AppInvocationEnvelopeV1 {
     pub max_hops: u8,
     pub input_schema_digest: Sha256Digest,
     pub principal: PrincipalContextV1,
-    #[serde(default)]
     pub execution: ExecutionContextV1,
     pub payload: Value,
 }
@@ -169,6 +169,41 @@ impl AppInvocationEnvelopeV1 {
                 reason: "does not match the operation descriptor".to_owned(),
             });
         }
+        let delegation_matches = matches!(
+            (self.principal.delegation, descriptor.delegation),
+            (DelegationKindV1::User, OperationDelegationV1::User)
+                | (DelegationKindV1::Service, OperationDelegationV1::Service)
+                | (_, OperationDelegationV1::Either)
+        );
+        if !delegation_matches {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "principal.delegation",
+                reason: "does not satisfy the operation descriptor".to_owned(),
+            });
+        }
+        if self
+            .principal
+            .granted_capabilities
+            .binary_search(&descriptor.required_capability)
+            .is_err()
+        {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "principal.granted_capabilities",
+                reason: "does not contain the operation's required capability".to_owned(),
+            });
+        }
+        if descriptor.tenant_scoped && self.principal.tenant_id.trim().is_empty() {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "principal.tenant_id",
+                reason: "is required by the tenant-scoped operation".to_owned(),
+            });
+        }
+        if descriptor.workspace_scoped && self.principal.workspace_id.trim().is_empty() {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "principal.workspace_id",
+                reason: "is required by the workspace-scoped operation".to_owned(),
+            });
+        }
         match descriptor.kind {
             OperationKindV1::Command if self.idempotency_key.is_none() => {
                 return Err(ProtocolValidationError::InvalidField {
@@ -185,6 +220,34 @@ impl AppInvocationEnvelopeV1 {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Validate shape, operation authorization and the time-bound grant at a
+    /// caller-supplied trusted clock instant.
+    pub fn validate_at(
+        &self,
+        now_unix_ms: u64,
+        descriptor: &OperationDescriptorV1,
+    ) -> Result<(), ProtocolValidationError> {
+        self.validate_for(descriptor)?;
+        if self.effective_deadline_unix_ms() <= now_unix_ms {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "invocation_expiry",
+                reason: "deadline or authorization grant has expired".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The earliest instant at which either the invocation deadline or the
+    /// projected authorization grant expires.
+    #[must_use]
+    pub fn effective_deadline_unix_ms(&self) -> u64 {
+        self.principal
+            .expires_at_unix_ms
+            .map_or(self.deadline_unix_ms, |expires_at| {
+                self.deadline_unix_ms.min(expires_at)
+            })
     }
 
     pub fn append_authority(&mut self, authority: String) -> Result<(), ProtocolValidationError> {
@@ -341,6 +404,9 @@ impl ProtocolValidate for AppArtifactRefV1 {
 }
 
 pub type CoreBridgeOperationV1 = OperationDescriptorV1;
+/// CoreBridge reverse calls use the exact same verified authorization
+/// envelope as Gateway-to-APP calls; this alias introduces no second wire DTO.
+pub type CoreBridgeInvocationV1 = AppInvocationEnvelopeV1;
 
 fn require_authority(value: &str) -> Result<(), ProtocolValidationError> {
     require_bounded("call_chain.authority", value, 192)?;

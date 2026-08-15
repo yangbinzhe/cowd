@@ -1,0 +1,41 @@
+{
+  "call_chain": [
+    "core:runtime"
+  ],
+  "correlation_id": "correlation:1",
+  "deadline_unix_ms": 4000000000000,
+  "execution": {
+    "session_id": "session:1",
+    "surface": "web",
+    "task_id": "task:1",
+    "turn_id": "turn:1"
+  },
+  "expected_revision": "7",
+  "idempotency_key": "idempotency:1",
+  "input_schema_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "max_hops": 4,
+  "operation_id": "reference.command.v1",
+  "payload": {
+    "value": 1
+  },
+  "principal": {
+    "authorization_profile_id": "operator",
+    "authorization_revision": 7,
+    "credential_epoch": 11,
+    "delegation": "user",
+    "expires_at_unix_ms": 4000000000000,
+    "grant_id": "grant:1",
+    "granted_capabilities": [
+      "app.reference.read"
+    ],
+    "granted_scopes": [
+      "workspace:read",
+      "workspace:write"
+    ],
+    "subject": "user:1",
+    "tenant_id": "tenant:1",
+    "workspace_id": "workspace:1"
+  },
+  "request_id": "request:1",
+  "schema_version": 1
+}

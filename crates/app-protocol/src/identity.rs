@@ -1,7 +1,7 @@
-use std::{collections::BTreeSet, fmt};
+use std::{borrow::Cow, collections::BTreeSet, fmt};
 
-use schemars::JsonSchema;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::PROTOCOL_REVISION_V1;
@@ -120,6 +120,39 @@ pub(crate) fn require_unique<'a>(
     Ok(())
 }
 
+pub(crate) fn require_canonical_string_set(
+    field: &'static str,
+    values: &[String],
+    maximum_items: usize,
+    maximum_item_bytes: usize,
+) -> Result<(), ProtocolValidationError> {
+    if values.len() > maximum_items {
+        return Err(ProtocolValidationError::InvalidField {
+            field,
+            reason: format!("must contain at most {maximum_items} values"),
+        });
+    }
+    for value in values {
+        require_bounded(field, value, maximum_item_bytes)?;
+    }
+    require_unique(field, values.iter().map(String::as_str))?;
+    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(ProtocolValidationError::InvalidField {
+            field,
+            reason: "must be in strictly ascending canonical order".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -202,7 +235,7 @@ impl ProtocolValidate for ProtocolRangeV1 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrincipalContextV1 {
     pub subject: String,
@@ -210,14 +243,43 @@ pub struct PrincipalContextV1 {
     pub workspace_id: String,
     pub delegation: DelegationKindV1,
     pub grant_id: String,
+    pub authorization_profile_id: String,
+    pub authorization_revision: u64,
+    pub granted_capabilities: Vec<String>,
+    pub granted_scopes: Vec<String>,
+    pub credential_epoch: u64,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub expires_at_unix_ms: Option<u64>,
 }
 
 impl ProtocolValidate for PrincipalContextV1 {
     fn validate(&self) -> Result<(), ProtocolValidationError> {
         require_bounded("principal.subject", &self.subject, 256)?;
-        require_bounded("principal.tenant_id", &self.tenant_id, 128)?;
-        require_bounded("principal.workspace_id", &self.workspace_id, 256)?;
-        require_bounded("principal.grant_id", &self.grant_id, 256)
+        if self.tenant_id.len() > 128 {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "principal.tenant_id",
+                reason: "must be at most 128 bytes".to_owned(),
+            });
+        }
+        if self.workspace_id.len() > 256 {
+            return Err(ProtocolValidationError::InvalidField {
+                field: "principal.workspace_id",
+                reason: "must be at most 256 bytes".to_owned(),
+            });
+        }
+        require_bounded("principal.grant_id", &self.grant_id, 256)?;
+        require_bounded(
+            "principal.authorization_profile_id",
+            &self.authorization_profile_id,
+            128,
+        )?;
+        require_canonical_string_set(
+            "principal.granted_capabilities",
+            &self.granted_capabilities,
+            128,
+            256,
+        )?;
+        require_canonical_string_set("principal.granted_scopes", &self.granted_scopes, 128, 256)
     }
 }
 
@@ -228,9 +290,58 @@ pub enum DelegationKindV1 {
     Service,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[allow(dead_code)]
+#[derive(JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PrincipalContextV1Schema {
+    subject: String,
+    tenant_id: String,
+    workspace_id: String,
+    delegation: DelegationKindV1,
+    grant_id: String,
+    authorization_profile_id: String,
+    authorization_revision: u64,
+    granted_capabilities: Vec<String>,
+    granted_scopes: Vec<String>,
+    credential_epoch: u64,
+    expires_at_unix_ms: RequiredNullableU64Schema,
+}
+
+#[allow(dead_code)]
+struct RequiredNullableU64Schema;
+
+impl JsonSchema for RequiredNullableU64Schema {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("RequiredNullableU64")
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": ["integer", "null"],
+            "format": "uint64",
+            "minimum": 0
+        })
+    }
+}
+
+impl JsonSchema for PrincipalContextV1 {
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("PrincipalContextV1")
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        PrincipalContextV1Schema::json_schema(generator)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionContextV1 {
+    pub surface: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +352,7 @@ pub struct ExecutionContextV1 {
 
 impl ProtocolValidate for ExecutionContextV1 {
     fn validate(&self) -> Result<(), ProtocolValidationError> {
+        require_bounded("execution.surface", &self.surface, 128)?;
         for (field, value) in [
             ("session_id", self.session_id.as_deref()),
             ("turn_id", self.turn_id.as_deref()),
