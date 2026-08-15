@@ -109,7 +109,11 @@ mod tests {
         ))
     }
 
-    async fn channel() -> (ManagedH2Channel, JoinHandle<()>, std::path::PathBuf) {
+    async fn channel() -> (
+        ManagedH2Channel,
+        JoinHandle<Result<(), hyper::Error>>,
+        std::path::PathBuf,
+    ) {
         let path = socket_path();
         let listener = UnixListener::bind(&path).expect("listener");
         let server = tokio::spawn(async move {
@@ -123,7 +127,6 @@ mod tests {
                     }),
                 )
                 .await
-                .expect("serve H2");
         });
         let channel = ManagedH2Channel::connect(
             &path,
@@ -174,7 +177,10 @@ mod tests {
         observed.sort_unstable();
         assert_eq!(observed, (0..32).collect::<Vec<_>>());
         drop(channel);
-        server.await.expect("server task");
+        server
+            .await
+            .expect("server task")
+            .expect("serve multiplexed H2 requests");
         std::fs::remove_file(path).expect("socket cleanup");
     }
 
@@ -212,7 +218,10 @@ mod tests {
             Err(ManagedWorkerError::Cancelled)
         ));
         drop(channel);
-        server.await.expect("server task");
+        // Both requests were rejected before reaching the channel. Closing the
+        // client without sending a stream may therefore end the server driver
+        // with BrokenPipe; the contract under test is the client-side fence.
+        let _ = server.await.expect("server task");
         std::fs::remove_file(path).expect("socket cleanup");
     }
 }
