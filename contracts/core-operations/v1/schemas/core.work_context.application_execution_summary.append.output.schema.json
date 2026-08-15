@@ -1,0 +1,53 @@
+{
+  "$defs": {
+    "ApplicationExecutionSummaryReceiptV1": {
+      "additionalProperties": false,
+      "properties": {
+        "producer_id": {
+          "type": "string"
+        },
+        "replayed": {
+          "type": "boolean"
+        },
+        "schema_version": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "summary_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "producer_id",
+        "summary_id",
+        "sequence",
+        "replayed"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "receipt": {
+      "$ref": "#/$defs/ApplicationExecutionSummaryReceiptV1"
+    },
+    "session_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "session_id",
+    "receipt"
+  ],
+  "title": "AppendApplicationExecutionSummaryOutput",
+  "type": "object"
+}

@@ -1,0 +1,76 @@
+{
+  "$defs": {
+    "RuntimeMissionSelectorInput": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "selector": {
+              "const": "workspace_default",
+              "type": "string"
+            }
+          },
+          "required": [
+            "selector"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "mission_id": {
+              "type": "string"
+            },
+            "selector": {
+              "const": "mission_id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "selector",
+            "mission_id"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "input": true,
+    "instruction": {
+      "type": "string"
+    },
+    "mission": {
+      "$ref": "#/$defs/RuntimeMissionSelectorInput"
+    },
+    "objective": {
+      "type": "string"
+    },
+    "result_contract_id": {
+      "type": "string"
+    },
+    "source_session_id": {
+      "type": "string"
+    },
+    "source_turn_id": {
+      "type": "string"
+    },
+    "task_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_id",
+    "mission",
+    "source_session_id",
+    "source_turn_id",
+    "objective",
+    "result_contract_id",
+    "instruction",
+    "input"
+  ],
+  "title": "RuntimeStartStructuredTaskInput",
+  "type": "object"
+}

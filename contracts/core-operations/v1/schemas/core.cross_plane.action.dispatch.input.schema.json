@@ -1,0 +1,125 @@
+{
+  "$defs": {
+    "CrossPlaneDispatchSpecInput": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "platform",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "CrossPlaneRiskV1": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "type": "string"
+    },
+    "DataClassificationV1": {
+      "enum": [
+        "public",
+        "internal",
+        "confidential",
+        "secret"
+      ],
+      "type": "string"
+    },
+    "IdentityTrustV1": {
+      "enum": [
+        "verified",
+        "claimed",
+        "observed",
+        "unknown"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "actor_identity_ref": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_classification": {
+      "$ref": "#/$defs/DataClassificationV1",
+      "default": "internal"
+    },
+    "dispatch": {
+      "$ref": "#/$defs/CrossPlaneDispatchSpecInput"
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "identity_trust": {
+      "$ref": "#/$defs/IdentityTrustV1",
+      "default": "unknown"
+    },
+    "mode": {
+      "type": "string"
+    },
+    "provider_account": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requested_capability": {
+      "type": "string"
+    },
+    "resource_ref": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "risk": {
+      "$ref": "#/$defs/CrossPlaneRiskV1",
+      "default": "low"
+    },
+    "session_id": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_channel": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target_ref": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "mode",
+    "idempotency_key",
+    "requested_capability",
+    "dispatch"
+  ],
+  "title": "CrossPlaneDispatchInput",
+  "type": "object"
+}

@@ -19,10 +19,10 @@ pub(super) async fn matrix_data_plane_ingest_plan_handler(
     let ingest = request.ingest;
     let plan = matrix_call!(state, plan_data_plane_ingest(ingest))
         .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    append_matrix_execution_outcome(
+    append_matrix_execution_summary(
         &state,
         session_id.as_deref(),
-        matrix_ingest_plan_outcome(&plan),
+        matrix_ingest_plan_summary(&plan),
     )
     .await
     .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;

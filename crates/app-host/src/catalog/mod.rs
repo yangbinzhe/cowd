@@ -47,6 +47,34 @@ impl AppCatalogSnapshot {
     pub fn diagnostics(&self) -> &[AppCatalogDiagnostic] {
         &self.diagnostics
     }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_admitted_for_tests(apps: Vec<AdmittedApp>) -> Result<Self, String> {
+        let mut accepted = BTreeMap::new();
+        for app in apps {
+            app.manifest
+                .validate()
+                .map_err(|error| format!("invalid admitted test manifest: {error}"))?;
+            app.generation
+                .validate_value()
+                .map_err(|error| format!("invalid admitted test generation: {error}"))?;
+            let expected_generation = bundle_generation(&app.manifest)
+                .map_err(|error| format!("invalid admitted test manifest: {}", error.reason))?;
+            if app.generation != expected_generation {
+                return Err("admitted test generation does not bind the manifest".to_owned());
+            }
+            let app_id = app.manifest.app_id.clone();
+            if accepted.insert(app_id.clone(), app).is_some() {
+                return Err(format!("duplicate admitted test APP `{app_id}`"));
+            }
+        }
+        let generation = catalog_generation(&accepted).map_err(|error| error.to_string())?;
+        Ok(Self {
+            generation,
+            accepted: Arc::new(accepted),
+            diagnostics: Arc::new(Vec::new()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -657,6 +685,40 @@ mod tests {
             AppLifecycleStateV1::Mounted
         );
         assert!(app.executable.exists());
+    }
+
+    #[test]
+    fn admitted_test_snapshot_rejects_duplicate_generation_and_manifest_tamper() {
+        let directory = TempDir::new().expect("temp root");
+        let key = FixtureSigningKey::generate();
+        write_bundle(directory.path(), "reference", "reference-app", &key);
+        let snapshot = AppCatalogBuilder::new(
+            vec![directory.path().to_path_buf()],
+            AppCatalogPolicy::default(),
+            key.trust_store(),
+            current_uid(directory.path()),
+            1,
+        )
+        .build()
+        .expect("catalog");
+        let admitted = snapshot.apps().next().expect("admitted APP").clone();
+        AppCatalogSnapshot::from_admitted_for_tests(vec![admitted.clone()])
+            .expect("valid admitted snapshot");
+        assert!(AppCatalogSnapshot::from_admitted_for_tests(vec![
+            admitted.clone(),
+            admitted.clone(),
+        ])
+        .is_err());
+
+        let mut wrong_generation = admitted.clone();
+        wrong_generation.generation = GenerationId(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        assert!(AppCatalogSnapshot::from_admitted_for_tests(vec![wrong_generation]).is_err());
+
+        let mut invalid_manifest = admitted;
+        invalid_manifest.manifest.app_id = AppId("core.invalid".to_owned());
+        assert!(AppCatalogSnapshot::from_admitted_for_tests(vec![invalid_manifest]).is_err());
     }
 
     #[test]

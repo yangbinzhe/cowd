@@ -15,20 +15,33 @@ use serde::{Deserialize, Serialize};
 /// a Surface must not reconstruct or hard-code either set.
 pub const CORE_HUMAN_CAPABILITIES: &[&str] = &[
     "approval.respond",
-    "definition.manage",
+    "approval.submit",
+    "core.cross_plane.read",
+    "core.matrix.read",
+    "core.matrix.write",
+    "core.surface.outbox.read",
+    "cross_plane.dispatch",
     "definition.default.set",
+    "definition.manage",
     "definition.rollback",
+    "evolution.analyze.run",
     "evolution.candidate.register",
     "evolution.diagnosis.write",
-    "evolution.analyze.run",
     "evolution.evaluate.run",
     "evolution.release.manage",
     "evolution.review.request",
     "evolution.signal.write",
     "mission.observe",
+    "platform.governance.read",
     "runtime.maintenance.manage",
-    "skill.revision.manage",
     "runtime.outbox.retry",
+    "runtime.task.read",
+    "runtime.task.write",
+    "session.outcome.write",
+    "skill.revision.manage",
+    "surface.dispatch",
+    "work_context.read",
+    "work_context.write",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +158,13 @@ pub struct SignedDecisionLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_human_capability_authority_is_sorted_and_unique() {
+        assert!(CORE_HUMAN_CAPABILITIES
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]));
+    }
 
     #[test]
     fn anonymous_claims_have_no_privileged_capabilities() {

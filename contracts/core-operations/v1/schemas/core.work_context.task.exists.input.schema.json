@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "task_ref": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_ref"
+  ],
+  "title": "WorkContextTaskExistsInput",
+  "type": "object"
+}

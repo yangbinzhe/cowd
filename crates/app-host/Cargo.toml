@@ -28,6 +28,7 @@ tempfile = "3"
 [features]
 default = []
 app-postgres = ["storage/storage-postgres"]
+test-support = []
 
 [lints]
 workspace = true

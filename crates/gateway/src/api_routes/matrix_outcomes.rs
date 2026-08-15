@@ -1,16 +1,17 @@
-use cowd_app_sdk::{
-    ApplicationExecutionCounterV1, ApplicationExecutionKind, ApplicationExecutionOutcomeV1,
-    ApplicationExecutionRefV1, ApplicationExecutionStatus, APPLICATION_EXECUTION_OUTCOME_VERSION,
+use cowd_app_protocol::{
+    ApplicationExecutionSummaryCounterV1, ApplicationExecutionSummaryKindV1,
+    ApplicationExecutionSummaryRefV1, ApplicationExecutionSummaryStatusV1,
+    ApplicationExecutionSummaryV1,
 };
 use matrix_core::{MatrixDataPlaneIngestPlan, MatrixEvidencePacket, MatrixFact};
 use serde_json::Value;
 
 use super::AppState;
 
-pub(super) async fn append_matrix_execution_outcome(
+pub(super) async fn append_matrix_execution_summary(
     state: &AppState,
     session_id: Option<&str>,
-    outcome: ApplicationExecutionOutcomeV1,
+    summary: ApplicationExecutionSummaryV1,
 ) -> Result<(), String> {
     let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
         return Ok(());
@@ -18,19 +19,19 @@ pub(super) async fn append_matrix_execution_outcome(
     state
         .services
         .session
-        .append_application_execution_outcome(session_id, &outcome)
+        .append_application_execution_summary(session_id, &summary)
         .await
         .map(|_| ())
 }
 
-pub(super) fn matrix_ingest_plan_outcome(
+pub(super) fn matrix_ingest_plan_summary(
     plan: &MatrixDataPlaneIngestPlan,
-) -> ApplicationExecutionOutcomeV1 {
-    ApplicationExecutionOutcomeV1 {
-        contract_version: APPLICATION_EXECUTION_OUTCOME_VERSION,
-        outcome_id: format!("structured-ingest:{}", plan.batch_id),
-        kind: ApplicationExecutionKind::StructuredIngest,
-        status: ApplicationExecutionStatus::Planned,
+) -> ApplicationExecutionSummaryV1 {
+    ApplicationExecutionSummaryV1 {
+        schema_version: 1,
+        summary_id: format!("structured-ingest:{}", plan.batch_id),
+        kind: ApplicationExecutionSummaryKindV1::StructuredIngest,
+        status: ApplicationExecutionSummaryStatusV1::Planned,
         title: format!("Structured ingest plan for {}", plan.fact_type),
         summary: format!(
             "Plan {} ingests {} estimated rows from {} partition {}.",
@@ -55,7 +56,7 @@ pub(super) fn matrix_ingest_plan_outcome(
     }
 }
 
-pub(super) fn matrix_fact_outcome(fact: &MatrixFact) -> ApplicationExecutionOutcomeV1 {
+pub(super) fn matrix_fact_summary(fact: &MatrixFact) -> ApplicationExecutionSummaryV1 {
     let mut refs = vec![execution_ref(
         "structured_fact",
         &fact.fact_id,
@@ -68,11 +69,11 @@ pub(super) fn matrix_fact_outcome(fact: &MatrixFact) -> ApplicationExecutionOutc
             Some(source_ref),
         ));
     }
-    ApplicationExecutionOutcomeV1 {
-        contract_version: APPLICATION_EXECUTION_OUTCOME_VERSION,
-        outcome_id: format!("structured-fact:{}", fact.fact_id),
-        kind: ApplicationExecutionKind::StructuredFact,
-        status: ApplicationExecutionStatus::Succeeded,
+    ApplicationExecutionSummaryV1 {
+        schema_version: 1,
+        summary_id: format!("structured-fact:{}", fact.fact_id),
+        kind: ApplicationExecutionSummaryKindV1::StructuredFact,
+        status: ApplicationExecutionSummaryStatusV1::Succeeded,
         title: format!("Structured fact {}", fact.fact_type),
         summary: format!(
             "Fact {} of type {} references {} entities with confidence {:.2}.",
@@ -97,17 +98,17 @@ pub(super) fn matrix_fact_outcome(fact: &MatrixFact) -> ApplicationExecutionOutc
     }
 }
 
-pub(super) fn matrix_evidence_packet_outcome(
+pub(super) fn matrix_evidence_packet_summary(
     packet: &MatrixEvidencePacket,
-) -> ApplicationExecutionOutcomeV1 {
-    ApplicationExecutionOutcomeV1 {
-        contract_version: APPLICATION_EXECUTION_OUTCOME_VERSION,
-        outcome_id: format!("structured-evidence:{}", packet.packet_id),
-        kind: ApplicationExecutionKind::StructuredEvidence,
+) -> ApplicationExecutionSummaryV1 {
+    ApplicationExecutionSummaryV1 {
+        schema_version: 1,
+        summary_id: format!("structured-evidence:{}", packet.packet_id),
+        kind: ApplicationExecutionSummaryKindV1::StructuredEvidence,
         status: if packet.missing_evidence.is_empty() {
-            ApplicationExecutionStatus::Succeeded
+            ApplicationExecutionSummaryStatusV1::Succeeded
         } else {
-            ApplicationExecutionStatus::Partial
+            ApplicationExecutionSummaryStatusV1::Partial
         },
         title: format!("Evidence packet {}", packet.packet_id),
         summary: format!(
@@ -156,16 +157,16 @@ fn execution_ref(
     ref_type: impl Into<String>,
     id: impl Into<String>,
     label: Option<&str>,
-) -> ApplicationExecutionRefV1 {
-    ApplicationExecutionRefV1 {
+) -> ApplicationExecutionSummaryRefV1 {
+    ApplicationExecutionSummaryRefV1 {
         ref_type: ref_type.into(),
         id: id.into(),
         label: label.map(ToString::to_string),
     }
 }
 
-fn counter(name: impl Into<String>, value: i64) -> ApplicationExecutionCounterV1 {
-    ApplicationExecutionCounterV1 {
+fn counter(name: impl Into<String>, value: i64) -> ApplicationExecutionSummaryCounterV1 {
+    ApplicationExecutionSummaryCounterV1 {
         name: name.into(),
         value,
     }

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "correlation_id": {
+      "type": "string"
+    },
+    "task_ref": {
+      "type": "string"
+    },
+    "workflow_node_id": {
+      "default": null,
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "task_ref",
+    "correlation_id"
+  ],
+  "title": "WorkContextRecordTaskTerminalInput",
+  "type": "object"
+}

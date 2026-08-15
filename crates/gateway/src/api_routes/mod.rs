@@ -1834,7 +1834,10 @@ pub(crate) mod tests {
         )
     }
 
-    fn publish_test_session_policy(services: &crate::services::GatewayServices, session_id: &str) {
+    pub(crate) fn publish_test_session_policy(
+        services: &crate::services::GatewayServices,
+        session_id: &str,
+    ) {
         let policy = harness_contract::policy::SessionExecutionPolicy::from_profile(
             harness_contract::policy::AutonomyProfileId::Supervised,
             1,
@@ -2002,6 +2005,21 @@ pub(crate) mod tests {
             session_lease_registry: Some(Arc::new(session::SessionLeaseRegistry::default())),
             live_registry: Arc::new(live_routes::LiveRegistry::new()),
         })
+    }
+
+    pub(crate) fn test_state_with_app_platform(
+        app_platform: Arc<crate::app_platform::GatewayAppPlatform>,
+    ) -> Arc<AppState> {
+        let mut state = Arc::try_unwrap(test_state())
+            .unwrap_or_else(|_| panic!("fresh test state must be uniquely owned"));
+        state.services = Arc::new(
+            state
+                .services
+                .as_ref()
+                .clone()
+                .with_app_platform(app_platform),
+        );
+        Arc::new(state)
     }
 
     fn test_state_with_config(config: serde_json::Value) -> Arc<AppState> {

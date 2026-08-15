@@ -11,6 +11,10 @@ use std::{
 };
 
 use async_trait::async_trait;
+use cowd_app_protocol::{
+    AppInvocationEnvelopeV1, ApplicationExecutionSummaryV1, DelegationKindV1, ExecutionContextV1,
+    PrincipalContextV1, ProtocolValidate, Sha256Digest,
+};
 use cowd_app_sdk::{
     AppHostConflict, AppHostError, AppHostPorts, AppId, ApplicationExecutionOutcomeIntentV1,
     ApprovalPort, ConnectorPort, CowdAppContext, CredentialLifecycleCheck,
@@ -233,6 +237,183 @@ impl GatewayAppHostBinding {
             "Gateway {port} port does not accept intent kind {kind} in this product revision"
         ))
     }
+
+    async fn dispatch_core_adapter(
+        &self,
+        context: &InvocationContext,
+        intent: HostIntent,
+    ) -> Result<HostReceipt, AppHostError> {
+        let state = self.state()?;
+        let binding = self.verified_binding(context)?;
+        let (operation_id, command) = legacy_core_operation(&intent.kind)
+            .ok_or_else(|| Self::unsupported("Core adapter", &intent.kind))?;
+        let payload = if intent.kind == APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1 {
+            let request: ApplicationExecutionOutcomeIntentV1 =
+                serde_json::from_value(intent.payload).map_err(|error| {
+                    AppHostError::Denied(format!("invalid execution summary intent: {error}"))
+                })?;
+            request.validate().map_err(|error| {
+                AppHostError::Denied(format!("invalid execution summary intent: {error}"))
+            })?;
+            serde_json::to_value(cowd_app_protocol::ApplicationExecutionSummaryIntentV1 {
+                schema_version: 1,
+                session_id: request.session_id,
+                summary: legacy_application_execution_summary(&request.outcome)?,
+            })
+            .map_err(|error| AppHostError::Denied(error.to_string()))?
+        } else if intent.kind == PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1 && intent.payload.is_null()
+        {
+            serde_json::json!({})
+        } else {
+            intent.payload
+        };
+        let claims = binding.principal.claims();
+        let now = current_time_ms();
+        let envelope = AppInvocationEnvelopeV1 {
+            schema_version: 1,
+            operation_id: operation_id.to_owned(),
+            request_id: context.request_id.clone(),
+            correlation_id: context.request_id.clone(),
+            causation_id: None,
+            deadline_unix_ms: now.saturating_add(120_000),
+            idempotency_key: command.then(|| {
+                payload
+                    .get("idempotency_key")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&context.request_id)
+                    .to_owned()
+            }),
+            expected_revision: None,
+            call_chain: vec![binding.producer_id.clone()],
+            max_hops: 4,
+            input_schema_digest: Sha256Digest(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_owned(),
+            ),
+            principal: PrincipalContextV1 {
+                subject: claims.principal_id.clone(),
+                tenant_id: claims.tenant_id.clone(),
+                workspace_id: context.workspace_id.clone(),
+                delegation: if claims.is_human_interactive() {
+                    DelegationKindV1::User
+                } else {
+                    DelegationKindV1::Service
+                },
+                grant_id: claims.grant_id.clone(),
+                authorization_profile_id: claims
+                    .app_profile(
+                        binding
+                            .producer_id
+                            .strip_prefix("app:")
+                            .unwrap_or(&binding.producer_id),
+                    )
+                    .unwrap_or("default")
+                    .to_owned(),
+                authorization_revision: claims.profile_revision,
+                granted_capabilities: claims.capabilities.clone(),
+                granted_scopes: claims.scopes.clone(),
+                credential_epoch: claims.credential_epoch,
+                expires_at_unix_ms: claims.expires_at_ms,
+            },
+            execution: ExecutionContextV1 {
+                surface: context.surface.clone(),
+                session_id: None,
+                turn_id: None,
+                task_id: None,
+            },
+            payload: payload.clone(),
+        };
+        let app_id = binding
+            .producer_id
+            .strip_prefix("app:")
+            .unwrap_or(&binding.producer_id);
+        let output = super::core_platform_operations::dispatch(
+            &state,
+            &envelope,
+            app_id,
+            operation_id,
+            &payload,
+        )
+        .await
+        .map_err(AppHostError::Failed)?;
+        let replayed = output
+            .get("replayed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let status = output
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("completed")
+            .to_owned();
+        Ok(HostReceipt {
+            id: format!("core-adapter:{}", context.request_id),
+            status,
+            replayed,
+            payload: output,
+        })
+    }
+}
+
+fn legacy_core_operation(kind: &str) -> Option<(&'static str, bool)> {
+    Some(match kind {
+        RUNTIME_START_GOAL_INTENT_V1 => (
+            super::core_platform_operations::RUNTIME_START_GOAL_OPERATION_ID,
+            true,
+        ),
+        RUNTIME_START_STRUCTURED_TASK_INTENT_V1 => (
+            super::core_platform_operations::RUNTIME_START_STRUCTURED_TASK_OPERATION_ID,
+            true,
+        ),
+        RUNTIME_CANCEL_STRUCTURED_TASK_INTENT_V1 => (
+            super::core_platform_operations::RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID,
+            true,
+        ),
+        APPROVAL_SUBMIT_INTENT_V1 => (
+            super::core_platform_operations::APPROVAL_SUBMIT_OPERATION_ID,
+            true,
+        ),
+        APPROVAL_DECIDE_INTENT_V1 => (
+            super::core_platform_operations::APPROVAL_DECIDE_OPERATION_ID,
+            true,
+        ),
+        CROSS_PLANE_DISPATCH_INTENT_V1 => (
+            super::core_platform_operations::CROSS_PLANE_DISPATCH_OPERATION_ID,
+            true,
+        ),
+        CONNECTOR_SURFACE_DISPATCH_BATCH_INTENT_V1 => (
+            super::core_platform_operations::CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
+            true,
+        ),
+        WORK_CONTEXT_TASK_EXISTS_INTENT_V1 => (
+            super::core_platform_operations::WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
+            false,
+        ),
+        WORK_CONTEXT_INSPECT_TASK_TERMINAL_INTENT_V1 => (
+            super::core_platform_operations::WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
+            false,
+        ),
+        WORK_CONTEXT_RECORD_TASK_TERMINAL_OBSERVATION_INTENT_V1 => (
+            super::core_platform_operations::WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID,
+            true,
+        ),
+        WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_INTENT_V1 => (
+            super::core_platform_operations::WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID,
+            false,
+        ),
+        WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_INTENT_V1 => (
+            super::core_platform_operations::WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
+            false,
+        ),
+        APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1 => (
+            super::core_platform_operations::WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
+            true,
+        ),
+        PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1 => (
+            super::core_platform_operations::PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
+            false,
+        ),
+        _ => return None,
+    })
 }
 
 impl AppHostPorts for GatewayAppHostBinding {
@@ -308,6 +489,14 @@ impl RuntimePort for GatewayAppHostBinding {
         context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
+        if matches!(
+            intent.kind.as_str(),
+            RUNTIME_START_GOAL_INTENT_V1
+                | RUNTIME_START_STRUCTURED_TASK_INTENT_V1
+                | RUNTIME_CANCEL_STRUCTURED_TASK_INTENT_V1
+        ) {
+            return self.dispatch_core_adapter(context, intent).await;
+        }
         let state = self.state()?;
         let binding = self.verified_binding(context)?;
         match intent.kind.as_str() {
@@ -907,6 +1096,12 @@ impl ApprovalPort for GatewayAppHostBinding {
         context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
+        if matches!(
+            intent.kind.as_str(),
+            APPROVAL_SUBMIT_INTENT_V1 | APPROVAL_DECIDE_INTENT_V1
+        ) {
+            return self.dispatch_core_adapter(context, intent).await;
+        }
         let state = self.state()?;
         let principal = self.verified_principal(context)?;
         match intent.kind.as_str() {
@@ -1213,6 +1408,30 @@ fn application_execution_host_error(
     }
 }
 
+fn legacy_application_execution_summary(
+    outcome: &cowd_app_sdk::ApplicationExecutionOutcomeV1,
+) -> Result<ApplicationExecutionSummaryV1, AppHostError> {
+    let mut value = serde_json::to_value(outcome)
+        .map_err(|error| AppHostError::Denied(format!("invalid execution summary: {error}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| AppHostError::Denied("invalid execution summary object".to_owned()))?;
+    let schema_version = object
+        .remove("contract_version")
+        .ok_or_else(|| AppHostError::Denied("execution summary version is missing".to_owned()))?;
+    let summary_id = object
+        .remove("outcome_id")
+        .ok_or_else(|| AppHostError::Denied("execution summary id is missing".to_owned()))?;
+    object.insert("schema_version".to_owned(), schema_version);
+    object.insert("summary_id".to_owned(), summary_id);
+    let summary: ApplicationExecutionSummaryV1 = serde_json::from_value(value)
+        .map_err(|error| AppHostError::Denied(format!("invalid execution summary: {error}")))?;
+    summary
+        .validate()
+        .map_err(|error| AppHostError::Denied(format!("invalid execution summary: {error}")))?;
+    Ok(summary)
+}
+
 fn registered_application_approval_source(
     app_registry: &cowd_app_host::AppRegistry,
     app_id: &str,
@@ -1297,6 +1516,58 @@ fn ensure_structured_task_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_intents_map_bijectively_to_all_core_business_operations() {
+        let intents = [
+            RUNTIME_START_GOAL_INTENT_V1,
+            RUNTIME_START_STRUCTURED_TASK_INTENT_V1,
+            RUNTIME_CANCEL_STRUCTURED_TASK_INTENT_V1,
+            APPROVAL_SUBMIT_INTENT_V1,
+            APPROVAL_DECIDE_INTENT_V1,
+            CROSS_PLANE_DISPATCH_INTENT_V1,
+            CONNECTOR_SURFACE_DISPATCH_BATCH_INTENT_V1,
+            WORK_CONTEXT_TASK_EXISTS_INTENT_V1,
+            WORK_CONTEXT_INSPECT_TASK_TERMINAL_INTENT_V1,
+            WORK_CONTEXT_RECORD_TASK_TERMINAL_OBSERVATION_INTENT_V1,
+            WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_INTENT_V1,
+            WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_INTENT_V1,
+            APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1,
+            PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1,
+        ];
+        let mapped = intents
+            .into_iter()
+            .map(|kind| legacy_core_operation(kind).expect("business intent must map"))
+            .collect::<Vec<_>>();
+        let mapped_ids = mapped
+            .iter()
+            .map(|(operation_id, _)| *operation_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let authority_ids = super::super::core_platform_operations::BUSINESS_OPERATION_IDS
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(mapped.len(), 14);
+        assert_eq!(mapped_ids.len(), 14);
+        assert_eq!(mapped_ids, authority_ids);
+        assert_eq!(
+            mapped
+                .iter()
+                .filter_map(|(operation_id, command)| (!command).then_some(*operation_id))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                super::super::core_platform_operations::PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
+                super::super::core_platform_operations::WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
+                super::super::core_platform_operations::WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
+                super::super::core_platform_operations::WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID,
+                super::super::core_platform_operations::WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(legacy_core_operation("cowd.unknown.v1").is_none());
+    }
 
     fn producer_principal(
         principal_id: &str,
@@ -1462,6 +1733,9 @@ impl ConnectorPort for GatewayAppHostBinding {
         context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
+        if intent.kind == CONNECTOR_SURFACE_DISPATCH_BATCH_INTENT_V1 {
+            return self.dispatch_core_adapter(context, intent).await;
+        }
         let state = self.state()?;
         let _principal = self.verified_principal(context)?;
         match intent.kind.as_str() {
@@ -1755,6 +2029,17 @@ impl WorkContextPort for GatewayAppHostBinding {
         context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
+        if matches!(
+            intent.kind.as_str(),
+            APPEND_APPLICATION_EXECUTION_OUTCOME_INTENT_V1
+                | WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_INTENT_V1
+                | WORK_CONTEXT_TASK_EXISTS_INTENT_V1
+                | WORK_CONTEXT_RECORD_TASK_TERMINAL_OBSERVATION_INTENT_V1
+                | WORK_CONTEXT_INSPECT_TASK_TERMINAL_INTENT_V1
+                | WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_INTENT_V1
+        ) {
+            return self.dispatch_core_adapter(context, intent).await;
+        }
         let state = self.state()?;
         // Every WorkContext effect is request-bound before it can touch
         // durable session state or reveal a host projection.
@@ -1772,13 +2057,14 @@ impl WorkContextPort for GatewayAppHostBinding {
                         "application execution outcome intent is invalid: {error}"
                     ))
                 })?;
+                let summary = legacy_application_execution_summary(&request.outcome)?;
                 let receipt = state
                     .services
                     .session
-                    .append_application_execution_outcome_for_producer(
+                    .append_application_execution_summary_for_producer(
                         &request.session_id,
                         &binding.producer_id,
-                        &request.outcome,
+                        &summary,
                     )
                     .await
                     .map_err(|error| {
@@ -2045,6 +2331,9 @@ impl PlatformPort for GatewayAppHostBinding {
         context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
+        if intent.kind == PLATFORM_GOVERNANCE_SNAPSHOT_INTENT_V1 {
+            return self.dispatch_core_adapter(context, intent).await;
+        }
         let state = self.state()?;
         let _principal = self.verified_principal(context)?;
         match intent.kind.as_str() {
@@ -2399,6 +2688,9 @@ impl CrossPlanePort for GatewayAppHostBinding {
         context: &InvocationContext,
         intent: HostIntent,
     ) -> Result<HostReceipt, AppHostError> {
+        if intent.kind == CROSS_PLANE_DISPATCH_INTENT_V1 {
+            return self.dispatch_core_adapter(context, intent).await;
+        }
         // An embedded APP must not be able to manufacture another principal's
         // invocation context.  Resolve the context back to the request that
         // Gateway authenticated before accepting a CrossPlane action.

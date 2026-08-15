@@ -1,0 +1,52 @@
+{
+  "$defs": {
+    "ConnectorSurfaceDeliveryInput": {
+      "additionalProperties": false,
+      "properties": {
+        "idempotency_key": {
+          "type": "string"
+        },
+        "metadata": true,
+        "recipient": {
+          "type": "string"
+        },
+        "surface": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "thread": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "surface",
+        "recipient",
+        "text",
+        "idempotency_key",
+        "metadata"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "deliveries": {
+      "items": {
+        "$ref": "#/$defs/ConnectorSurfaceDeliveryInput"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "deliveries"
+  ],
+  "title": "ConnectorSurfaceDispatchBatchInput",
+  "type": "object"
+}

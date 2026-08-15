@@ -1,0 +1,77 @@
+{
+  "$defs": {
+    "ApprovalTimeoutPolicyInput": {
+      "enum": [
+        "pending",
+        "auto_deny",
+        "continue_alternative",
+        "auto_approve_once"
+      ],
+      "type": "string"
+    },
+    "TaskRiskInput": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "critical"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "app_id": {
+      "type": "string"
+    },
+    "approval_id": {
+      "type": "string"
+    },
+    "correlation_schema": {
+      "type": "string"
+    },
+    "decision_capability": {
+      "type": "string"
+    },
+    "evidence_refs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "resource_ref": {
+      "type": "string"
+    },
+    "review_ref": {
+      "type": "string"
+    },
+    "risk": {
+      "$ref": "#/$defs/TaskRiskInput"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "timeout_policy": {
+      "$ref": "#/$defs/ApprovalTimeoutPolicyInput"
+    }
+  },
+  "required": [
+    "approval_id",
+    "app_id",
+    "correlation_schema",
+    "decision_capability",
+    "resource_ref",
+    "review_ref",
+    "action",
+    "summary",
+    "risk",
+    "evidence_refs",
+    "timeout_policy"
+  ],
+  "title": "ApprovalSubmitInput",
+  "type": "object"
+}

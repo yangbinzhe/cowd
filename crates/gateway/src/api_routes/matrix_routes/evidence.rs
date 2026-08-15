@@ -15,10 +15,10 @@ pub(super) async fn matrix_evidence_build_handler(
         MatrixStoreError::NotFound(message) => api_error(StatusCode::NOT_FOUND, message),
         other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
     })?;
-    append_matrix_execution_outcome(
+    append_matrix_execution_summary(
         &state,
         session_id.as_deref(),
-        matrix_evidence_packet_outcome(&packet),
+        matrix_evidence_packet_summary(&packet),
     )
     .await
     .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;

@@ -1,0 +1,122 @@
+{
+  "catalog": {
+    "path": "catalog.json",
+    "sha256": "sha256:b81c9951e39649a5880b02cc324f1b1b0d9e06568e3f5e534ada0939997464af"
+  },
+  "contract_id": "cowd.core-business-operations.v1",
+  "schema_version": 1,
+  "schemas": [
+    {
+      "path": "schemas/core.approval.decide.input.schema.json",
+      "sha256": "sha256:6a132ed3d1e991ed455ca989d003ce0e5abb266fc436c355e9984a62842f4d42"
+    },
+    {
+      "path": "schemas/core.approval.decide.output.schema.json",
+      "sha256": "sha256:ac89dcc0442d9ae8ecf8a8eeeb210b3b83a5758f1aeae85af46087549074ed0e"
+    },
+    {
+      "path": "schemas/core.approval.submit.input.schema.json",
+      "sha256": "sha256:54540c518fb6a1bb08876758b9219f1cb846c6c9a663f742a28c78a286a7a8d8"
+    },
+    {
+      "path": "schemas/core.approval.submit.output.schema.json",
+      "sha256": "sha256:9aed1a2092f0bbf7f0124487a31db562cece4c80f3fb6e9fc0b99efa93f28c97"
+    },
+    {
+      "path": "schemas/core.connector.surface.dispatch_batch.input.schema.json",
+      "sha256": "sha256:223c8c18c8e8e9194667af4badf49374f7b3965fd576be50106d5fe4d2ab0841"
+    },
+    {
+      "path": "schemas/core.connector.surface.dispatch_batch.output.schema.json",
+      "sha256": "sha256:265ea1ae81a56615adf392fb69a611d45d520f2feb40f09a5329c0f410a50031"
+    },
+    {
+      "path": "schemas/core.cross_plane.action.dispatch.input.schema.json",
+      "sha256": "sha256:f8cf5072e8bd4f8474745896afe9318f53519c6b01c4e47caf203e614559f8a1"
+    },
+    {
+      "path": "schemas/core.cross_plane.action.dispatch.output.schema.json",
+      "sha256": "sha256:525a6b887b42c5e69d4a9436a2fdcf5c213968afb0c3b6f5054b4dc55a946d61"
+    },
+    {
+      "path": "schemas/core.platform.governance.snapshot.input.schema.json",
+      "sha256": "sha256:1aa29ade1700b9308f0a16ece450905206acb6bef255e2c4668da13c6316ad3b"
+    },
+    {
+      "path": "schemas/core.platform.governance.snapshot.output.schema.json",
+      "sha256": "sha256:8c47f13fc3cf24a9701069483f46407cc076fe1567dbe20e03d450ba488bf69c"
+    },
+    {
+      "path": "schemas/core.runtime.goal.start.input.schema.json",
+      "sha256": "sha256:7ec572588a8a11e8d3ea76b92b04d6235f47ac4934ae8921f6da393c2f38ef22"
+    },
+    {
+      "path": "schemas/core.runtime.goal.start.output.schema.json",
+      "sha256": "sha256:1a76b553c8077ec2e86eda42ef6acf77f298bce1e2be542d391112bd21448caa"
+    },
+    {
+      "path": "schemas/core.runtime.structured_task.cancel.input.schema.json",
+      "sha256": "sha256:d0d0466998673ab098f2c81838cad2db32f5e3b2b55af626265130dff34b6ac2"
+    },
+    {
+      "path": "schemas/core.runtime.structured_task.cancel.output.schema.json",
+      "sha256": "sha256:54330b2d8b1466568668f52d5891127c81b23dabcec26f8086570aa72eb62f6f"
+    },
+    {
+      "path": "schemas/core.runtime.structured_task.start.input.schema.json",
+      "sha256": "sha256:30b3c18c9a4252f1cb0b3a2166a3611b91de5a28f62d99eda0d2b6a782461d5e"
+    },
+    {
+      "path": "schemas/core.runtime.structured_task.start.output.schema.json",
+      "sha256": "sha256:a5be4020ffd201e4a1b0a121905e48faf877bd6f5ebba2d542240758766f837e"
+    },
+    {
+      "path": "schemas/core.work_context.application_execution_summary.append.input.schema.json",
+      "sha256": "sha256:8127f65e9dd3c4827618d5780d25e4c71391992bdc12e56f127bb6dcabb1046b"
+    },
+    {
+      "path": "schemas/core.work_context.application_execution_summary.append.output.schema.json",
+      "sha256": "sha256:44fdb0ac39039e1980bbb5929b6c3c3b92f1a607045dd3247701fd607de73d56"
+    },
+    {
+      "path": "schemas/core.work_context.structured_evidence.item.input.schema.json",
+      "sha256": "sha256:59b0fc4f7dbcc81a19f4e8ad8b690ebdcf29e1f6fcb35243600ec005f519effd"
+    },
+    {
+      "path": "schemas/core.work_context.structured_evidence.item.output.schema.json",
+      "sha256": "sha256:7badbb535ede2fb687b51fc7391866e2112fcd1fde758861c24b904c6ef9b7e2"
+    },
+    {
+      "path": "schemas/core.work_context.structured_task_result.inspect.input.schema.json",
+      "sha256": "sha256:29be89cc2592d9c6191b590656d3b160bd909314b7a15d7311be4d305fff653f"
+    },
+    {
+      "path": "schemas/core.work_context.structured_task_result.inspect.output.schema.json",
+      "sha256": "sha256:7faa3597533dc2e3c4cab98f84584c59ddda6218b586b14b65d6075d26240e89"
+    },
+    {
+      "path": "schemas/core.work_context.task.exists.input.schema.json",
+      "sha256": "sha256:ef55efdaecf8f8c9067108f7427ad59d68274e89d8b6f46b6347131dc5a0b8bf"
+    },
+    {
+      "path": "schemas/core.work_context.task.exists.output.schema.json",
+      "sha256": "sha256:46de96a9ae918331c00bfd4a9633334b41ceaa42b6eceef6e77eb0a96136a092"
+    },
+    {
+      "path": "schemas/core.work_context.task_terminal.inspect.input.schema.json",
+      "sha256": "sha256:79c4800e8768539e2090a24361af179933c068daa752223241f7028a47c08a4e"
+    },
+    {
+      "path": "schemas/core.work_context.task_terminal.inspect.output.schema.json",
+      "sha256": "sha256:c2f10c1e488d9579edf8fd61c5a1d645a12381cffbd88556ccc3b4994b671416"
+    },
+    {
+      "path": "schemas/core.work_context.task_terminal.observe.input.schema.json",
+      "sha256": "sha256:e6e4f1a26a5a47ffd50dbb019eeb8665c316ae061d2202868aef63a3c1ee51f5"
+    },
+    {
+      "path": "schemas/core.work_context.task_terminal.observe.output.schema.json",
+      "sha256": "sha256:479825426b1d4e29d289ad72f8d61642269d6d743b2297324c9979987fb91160"
+    }
+  ]
+}

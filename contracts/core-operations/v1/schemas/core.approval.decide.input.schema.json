@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "type": "string"
+    },
+    "app_id": {
+      "type": "string"
+    },
+    "approval_id": {
+      "type": "string"
+    },
+    "approved": {
+      "type": "boolean"
+    },
+    "correlation_schema": {
+      "type": "string"
+    },
+    "decision": {
+      "type": "string"
+    },
+    "evidence_digest": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "review_ref": {
+      "type": "string"
+    },
+    "scope": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "approval_id",
+    "app_id",
+    "correlation_schema",
+    "review_ref",
+    "action",
+    "scope",
+    "evidence_digest",
+    "approved",
+    "decision",
+    "reason"
+  ],
+  "title": "ApprovalDecideInput",
+  "type": "object"
+}

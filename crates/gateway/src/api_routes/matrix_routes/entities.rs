@@ -182,7 +182,7 @@ pub(super) async fn matrix_fact_ingest_handler(
         let persisted_fact = fact.clone();
         let item = matrix_call!(state, ingest_fact(&persisted_fact))
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        append_matrix_execution_outcome(&state, session_id.as_deref(), matrix_fact_outcome(&fact))
+        append_matrix_execution_summary(&state, session_id.as_deref(), matrix_fact_summary(&fact))
             .await
             .map_err(|error| api_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
         facts.push(fact);

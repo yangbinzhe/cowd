@@ -30,8 +30,28 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::core_platform_operations::{
-    CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput, SurfaceOutboxListInput,
-    SurfaceOutboxListOutput, ACTION_PLAN_OPERATION_ID, SURFACE_OUTBOX_LIST_OPERATION_ID,
+    AppendApplicationExecutionSummaryOutput, ApprovalDecideInput, ApprovalDecideOutput,
+    ApprovalSubmitInput, ApprovalSubmitOutput, ConnectorSurfaceDispatchBatchInput,
+    ConnectorSurfaceDispatchBatchOutput, CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput,
+    CrossPlaneDispatchInput, CrossPlaneDispatchOutput, PlatformGovernanceSnapshotInput,
+    PlatformGovernanceSnapshotOutput, RuntimeCancelStructuredTaskInput,
+    RuntimeCancelStructuredTaskOutput, RuntimeStartGoalInput, RuntimeStartGoalOutput,
+    RuntimeStartStructuredTaskInput, RuntimeStartStructuredTaskOutput, SurfaceOutboxListInput,
+    SurfaceOutboxListOutput, WorkContextInspectStructuredTaskResultInput,
+    WorkContextInspectStructuredTaskResultOutput, WorkContextInspectTaskTerminalInput,
+    WorkContextInspectTaskTerminalOutput, WorkContextRecordTaskTerminalInput,
+    WorkContextRecordTaskTerminalOutput, WorkContextStructuredEvidenceItemInput,
+    WorkContextStructuredEvidenceItemOutput, WorkContextTaskExistsInput,
+    WorkContextTaskExistsOutput, ACTION_PLAN_OPERATION_ID, APPROVAL_DECIDE_OPERATION_ID,
+    APPROVAL_SUBMIT_OPERATION_ID, CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
+    CROSS_PLANE_DISPATCH_OPERATION_ID, PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
+    RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID, RUNTIME_START_GOAL_OPERATION_ID,
+    RUNTIME_START_STRUCTURED_TASK_OPERATION_ID, SURFACE_OUTBOX_LIST_OPERATION_ID,
+    WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
+    WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
+    WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
+    WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID,
+    WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID, WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
 };
 use super::{matrix_app_reality::MatrixAppRealityError, ContextService};
 use matrix_repository::MatrixStore;
@@ -255,11 +275,131 @@ pub(crate) fn definitions() -> Result<Vec<CoreMatrixOperationDefinition>, CoreMa
             ACTION_PLAN_OPERATION_ID,
             "core.cross_plane.read",
             "cross_plane.plan.governed",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
         ),
         platform_definition::<SurfaceOutboxListInput, SurfaceOutboxListOutput>(
             SURFACE_OUTBOX_LIST_OPERATION_ID,
             "core.surface.outbox.read",
             "surface.outbox.query.governed",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<RuntimeStartGoalInput, RuntimeStartGoalOutput>(
+            RUNTIME_START_GOAL_OPERATION_ID,
+            "runtime.task.write",
+            "runtime.goal.start",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<RuntimeStartStructuredTaskInput, RuntimeStartStructuredTaskOutput>(
+            RUNTIME_START_STRUCTURED_TASK_OPERATION_ID,
+            "runtime.task.write",
+            "runtime.structured_task.start",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<RuntimeCancelStructuredTaskInput, RuntimeCancelStructuredTaskOutput>(
+            RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID,
+            "runtime.task.write",
+            "runtime.structured_task.cancel",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<ApprovalSubmitInput, ApprovalSubmitOutput>(
+            APPROVAL_SUBMIT_OPERATION_ID,
+            "approval.submit",
+            "approval.submit",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<ApprovalDecideInput, ApprovalDecideOutput>(
+            APPROVAL_DECIDE_OPERATION_ID,
+            "approval.respond",
+            "approval.decide",
+            OperationKindV1::Command,
+            OperationDelegationV1::User,
+        ),
+        platform_definition::<CrossPlaneDispatchInput, CrossPlaneDispatchOutput>(
+            CROSS_PLANE_DISPATCH_OPERATION_ID,
+            "cross_plane.dispatch",
+            "cross_plane.dispatch.governed",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<
+            ConnectorSurfaceDispatchBatchInput,
+            ConnectorSurfaceDispatchBatchOutput,
+        >(
+            CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
+            "surface.dispatch",
+            "surface.dispatch.governed",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<WorkContextTaskExistsInput, WorkContextTaskExistsOutput>(
+            WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
+            "runtime.task.read",
+            "task.exists",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<
+            WorkContextInspectTaskTerminalInput,
+            WorkContextInspectTaskTerminalOutput,
+        >(
+            WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
+            "runtime.task.read",
+            "task.terminal.inspect",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<
+            WorkContextRecordTaskTerminalInput,
+            WorkContextRecordTaskTerminalOutput,
+        >(
+            WORK_CONTEXT_RECORD_TASK_TERMINAL_OPERATION_ID,
+            "work_context.write",
+            "task.terminal.observe",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<
+            WorkContextStructuredEvidenceItemInput,
+            WorkContextStructuredEvidenceItemOutput,
+        >(
+            WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID,
+            "work_context.read",
+            "context.structured_evidence.read",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<
+            WorkContextInspectStructuredTaskResultInput,
+            WorkContextInspectStructuredTaskResultOutput,
+        >(
+            WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
+            "runtime.task.read",
+            "runtime.structured_task_result.inspect",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<
+            cowd_app_protocol::ApplicationExecutionSummaryIntentV1,
+            AppendApplicationExecutionSummaryOutput,
+        >(
+            WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
+            "session.outcome.write",
+            "session.application_execution_summary.append",
+            OperationKindV1::Command,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<PlatformGovernanceSnapshotInput, PlatformGovernanceSnapshotOutput>(
+            PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
+            "platform.governance.read",
+            "platform.governance.snapshot",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
         ),
     ]
     .into_iter()
@@ -273,9 +413,9 @@ pub(crate) fn definitions() -> Result<Vec<CoreMatrixOperationDefinition>, CoreMa
         .iter()
         .map(|value| value.descriptor.operation_id.as_str())
         .collect::<BTreeSet<_>>();
-    if values.len() != 44 || ids.len() != 44 {
+    if values.len() != 58 || ids.len() != 58 {
         return Err(CoreMatrixCatalogError::Invalid(
-            "authority must contain exactly 44 unique operations".to_string(),
+            "authority must contain exactly 58 unique operations".to_string(),
         ));
     }
     Ok(values)
@@ -285,6 +425,8 @@ fn platform_definition<I: JsonSchema, O: JsonSchema>(
     operation_id: &'static str,
     core_capability: &'static str,
     audit_classification: &'static str,
+    kind: OperationKindV1,
+    delegation: OperationDelegationV1,
 ) -> Result<CoreMatrixOperationDefinition, CoreMatrixCatalogError> {
     let input_schema = canonicalize(
         serde_json::to_value(schema_for!(I))
@@ -296,17 +438,29 @@ fn platform_definition<I: JsonSchema, O: JsonSchema>(
     );
     let descriptor = OperationDescriptorV1 {
         operation_id: operation_id.to_owned(),
-        kind: OperationKindV1::Query,
+        kind,
         input_schema_digest: schema_digest(&input_schema)?,
         output_schema_digest: schema_digest(&output_schema)?,
         required_capabilities: vec![core_capability.to_owned()],
-        delegation: OperationDelegationV1::Either,
+        delegation,
         tenant_scoped: false,
         workspace_scoped: true,
-        read_only: true,
-        idempotency: IdempotencySemanticsV1::ReadOnly,
-        default_deadline_ms: 10_000,
-        maximum_deadline_ms: 30_000,
+        read_only: kind == OperationKindV1::Query,
+        idempotency: if kind == OperationKindV1::Query {
+            IdempotencySemanticsV1::ReadOnly
+        } else {
+            IdempotencySemanticsV1::Required
+        },
+        default_deadline_ms: if kind == OperationKindV1::Query {
+            10_000
+        } else {
+            30_000
+        },
+        maximum_deadline_ms: if kind == OperationKindV1::Query {
+            30_000
+        } else {
+            120_000
+        },
         maximum_request_bytes: 1024 * 1024,
         maximum_response_bytes: 4 * 1024 * 1024,
         maximum_frame_bytes: 1024 * 1024,
@@ -334,14 +488,17 @@ pub(crate) fn projected_catalog(
         .into_iter()
         .map(|definition| (definition.descriptor.operation_id.clone(), definition))
         .collect::<BTreeMap<_, _>>();
-    let mut operations = Vec::with_capacity(manifest.core_bridge_requirements.len());
+    // One Core descriptor may serve many signed APP operations.  The catalog
+    // publishes immutable Core authority exactly once; APP capabilities stay
+    // on their individual signed edges in the manifest.
+    let mut operations = BTreeMap::new();
     for requirement in &manifest.core_bridge_requirements {
         let definition = authority
             .get(&requirement.core_operation_id)
             .ok_or_else(|| {
                 CoreMatrixCatalogError::UnknownRequirement(requirement.core_operation_id.clone())
             })?;
-        let mut descriptor = definition.descriptor.clone();
+        let descriptor = definition.descriptor.clone();
         if descriptor.input_schema_digest != requirement.accepted_input_schema_digest
             || descriptor.output_schema_digest != requirement.accepted_output_schema_digest
             || descriptor.kind != requirement.kind
@@ -351,27 +508,15 @@ pub(crate) fn projected_catalog(
                 requirement.core_operation_id.clone(),
             ));
         }
-        let insertion = match descriptor
-            .required_capabilities
-            .binary_search(&requirement.required_app_capability)
-        {
-            Ok(_) => {
-                return Err(CoreMatrixCatalogError::RequirementMismatch(
-                    requirement.core_operation_id.clone(),
-                ));
-            }
-            Err(index) => index,
-        };
-        descriptor
-            .required_capabilities
-            .insert(insertion, requirement.required_app_capability.clone());
         descriptor
             .validate()
             .map_err(|error| CoreMatrixCatalogError::Invalid(error.to_string()))?;
         validate_projected_capabilities(manifest, &descriptor)?;
-        operations.push(descriptor);
+        operations
+            .entry(descriptor.operation_id.clone())
+            .or_insert(descriptor);
     }
-    operations.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    let operations = operations.into_values().collect();
     let mut catalog = CoreOperationCatalogV1 {
         schema_version: 1,
         protocol_revision: PROTOCOL_REVISION_V1,
@@ -401,24 +546,16 @@ pub(crate) fn validate_projected_capabilities(
         .ok_or_else(|| {
             CoreMatrixCatalogError::UnknownRequirement(descriptor.operation_id.clone())
         })?;
-    let requirement = manifest
+    if !manifest
         .core_bridge_requirements
         .iter()
-        .find(|requirement| requirement.core_operation_id == descriptor.operation_id)
-        .ok_or_else(|| {
-            CoreMatrixCatalogError::UnknownRequirement(descriptor.operation_id.clone())
-        })?;
-    let mut expected = authority.descriptor.required_capabilities;
-    let insertion = match expected.binary_search(&requirement.required_app_capability) {
-        Ok(_) => {
-            return Err(CoreMatrixCatalogError::RequirementMismatch(
-                descriptor.operation_id.clone(),
-            ));
-        }
-        Err(index) => index,
-    };
-    expected.insert(insertion, requirement.required_app_capability.clone());
-    if descriptor.required_capabilities != expected {
+        .any(|requirement| requirement.core_operation_id == descriptor.operation_id)
+    {
+        return Err(CoreMatrixCatalogError::UnknownRequirement(
+            descriptor.operation_id.clone(),
+        ));
+    }
+    if descriptor.required_capabilities != authority.descriptor.required_capabilities {
         return Err(CoreMatrixCatalogError::RequirementMismatch(
             descriptor.operation_id.clone(),
         ));
@@ -825,6 +962,8 @@ struct EntityImpactBatchItem {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf};
+
     use cowd_app_protocol::{
         AppId, AppSurfacesV1, AuthorizationProfileV1, BundleIntegrityV1, BundleSignatureV1,
         CoreBridgeRequirementV1, FilesystemPolicyV1, IntegrityAlgorithmV1, NetworkPolicyV1,
@@ -832,6 +971,128 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn frozen_core_business_operation_contract_matches_authority() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("contracts/core-operations/v1");
+        let schema_root = root.join("schemas");
+        let authority = definitions().expect("authority");
+        let by_id = authority
+            .iter()
+            .map(|definition| (definition.descriptor.operation_id.as_str(), definition))
+            .collect::<BTreeMap<_, _>>();
+        let mut operation_ids =
+            super::super::core_platform_operations::BUSINESS_OPERATION_IDS.to_vec();
+        operation_ids.sort_unstable();
+        let mut schema_files = Vec::<(String, Vec<u8>)>::new();
+        let mut operations = Vec::new();
+        for operation_id in operation_ids {
+            let definition = by_id
+                .get(operation_id)
+                .expect("business authority definition");
+            let input_path = format!("schemas/{operation_id}.input.schema.json");
+            let output_path = format!("schemas/{operation_id}.output.schema.json");
+            schema_files.push((input_path.clone(), pretty_json(&definition.input_schema)));
+            schema_files.push((output_path.clone(), pretty_json(&definition.output_schema)));
+            operations.push(serde_json::json!({
+                "operation_id": definition.descriptor.operation_id,
+                "kind": definition.descriptor.kind,
+                "streaming": definition.descriptor.streaming,
+                "input_schema": {
+                    "path": input_path,
+                    "digest": definition.descriptor.input_schema_digest,
+                },
+                "output_schema": {
+                    "path": output_path,
+                    "digest": definition.descriptor.output_schema_digest,
+                },
+                "required_capabilities": definition.descriptor.required_capabilities,
+                "delegation": definition.descriptor.delegation,
+                "tenant_scoped": definition.descriptor.tenant_scoped,
+                "workspace_scoped": definition.descriptor.workspace_scoped,
+                "read_only": definition.descriptor.read_only,
+                "idempotency": definition.descriptor.idempotency,
+                "default_deadline_ms": definition.descriptor.default_deadline_ms,
+                "maximum_deadline_ms": definition.descriptor.maximum_deadline_ms,
+                "maximum_request_bytes": definition.descriptor.maximum_request_bytes,
+                "maximum_response_bytes": definition.descriptor.maximum_response_bytes,
+                "maximum_frame_bytes": definition.descriptor.maximum_frame_bytes,
+                "audit_classification": definition.descriptor.audit_classification,
+            }));
+        }
+        schema_files.sort_by(|left, right| left.0.cmp(&right.0));
+        let operations_value = Value::Array(operations);
+        let catalog_digest = contract_digest("cowd.core-business-operations/v1", &operations_value);
+        let catalog = serde_json::json!({
+            "schema_version": 1,
+            "authority": "cowd-core",
+            "catalog_digest": catalog_digest,
+            "operations": operations_value,
+        });
+        let catalog_bytes = pretty_json(&catalog);
+        let schema_manifest = schema_files
+            .iter()
+            .map(|(path, bytes)| {
+                serde_json::json!({
+                    "path": path,
+                    "sha256": file_sha256(bytes),
+                })
+            })
+            .collect::<Vec<_>>();
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "contract_id": "cowd.core-business-operations.v1",
+            "catalog": {
+                "path": "catalog.json",
+                "sha256": file_sha256(&catalog_bytes),
+            },
+            "schemas": schema_manifest,
+        });
+        let manifest_bytes = pretty_json(&manifest);
+
+        if std::env::var_os("COWD_UPDATE_CORE_OPERATION_CONTRACT").is_some() {
+            fs::create_dir_all(&schema_root).expect("create contract schema directory");
+            fs::write(root.join("catalog.json"), &catalog_bytes).expect("write catalog");
+            fs::write(root.join("contract-manifest.json"), &manifest_bytes)
+                .expect("write contract manifest");
+            for (path, bytes) in &schema_files {
+                fs::write(root.join(path), bytes).expect("write operation schema");
+            }
+        }
+
+        assert_eq!(
+            fs::read(root.join("catalog.json")).expect("frozen catalog"),
+            catalog_bytes
+        );
+        assert_eq!(
+            fs::read(root.join("contract-manifest.json")).expect("frozen contract manifest"),
+            manifest_bytes
+        );
+        for (path, bytes) in schema_files {
+            assert_eq!(fs::read(root.join(path)).expect("frozen schema"), bytes);
+        }
+    }
+
+    fn pretty_json(value: &Value) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec_pretty(value).expect("canonical JSON");
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn file_sha256(bytes: &[u8]) -> String {
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    fn contract_digest(domain: &str, value: &Value) -> String {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "domain": domain,
+            "operations": value,
+        }))
+        .expect("catalog digest payload");
+        file_sha256(&bytes)
+    }
 
     #[test]
     fn authority_and_dispatcher_are_bijective() {
@@ -845,7 +1106,7 @@ mod tests {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        assert_eq!(authority.len(), 44);
+        assert_eq!(authority.len(), 58);
         assert_eq!(dispatcher_ids.len(), 42);
         assert_eq!(authority_ids, dispatcher_ids);
         let platform_authority_ids = authority
@@ -857,15 +1118,33 @@ mod tests {
             super::super::core_platform_operations::PLATFORM_OPERATION_IDS
                 .into_iter()
                 .collect::<BTreeSet<_>>();
-        assert_eq!(platform_dispatcher_ids.len(), 2);
+        assert_eq!(platform_dispatcher_ids.len(), 16);
         assert_eq!(platform_authority_ids, platform_dispatcher_ids);
         assert!(platform_dispatcher_ids
             .iter()
             .all(|operation_id| super::super::core_platform_operations::supports(operation_id)));
+        let core_capabilities = harness_contract::security::CORE_HUMAN_CAPABILITIES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         for definition in authority {
             definition.descriptor.validate().expect("descriptor");
             assert!(definition.input_schema.is_object());
             assert!(definition.output_schema.is_object());
+            assert_eq!(definition.descriptor.required_capabilities.len(), 1);
+            assert!(
+                core_capabilities.contains(definition.descriptor.required_capabilities[0].as_str())
+            );
+            if !definition.descriptor.operation_id.starts_with(CORE_PREFIX) {
+                assert_eq!(
+                    definition.input_schema.get("additionalProperties"),
+                    Some(&Value::Bool(false))
+                );
+                assert_eq!(
+                    definition.output_schema.get("additionalProperties"),
+                    Some(&Value::Bool(false))
+                );
+            }
             if definition.descriptor.kind == OperationKindV1::Command {
                 assert_eq!(
                     definition.descriptor.idempotency,
@@ -928,7 +1207,7 @@ mod tests {
                         .descriptor
                         .output_schema_digest
                         .clone(),
-                    required_app_capability: capability.to_string(),
+                    required_app_capabilities: vec![capability.to_string()],
                     kind: definition.descriptor.kind,
                     streaming: false,
                 }
@@ -951,14 +1230,9 @@ mod tests {
             } else {
                 "core.matrix.write"
             };
-            let app_capability = if descriptor.read_only {
-                "mfg.read"
-            } else {
-                "mfg.write"
-            };
             assert_eq!(
                 descriptor.required_capabilities,
-                vec![core_capability.to_string(), app_capability.to_string()]
+                vec![core_capability.to_string()]
             );
             validate_projected_capabilities(&manifest, descriptor)
                 .expect("projection retains Core authority and signed APP capability");
@@ -980,7 +1254,7 @@ mod tests {
             core_operation_id: definition.descriptor.operation_id.clone(),
             accepted_input_schema_digest: definition.descriptor.input_schema_digest.clone(),
             accepted_output_schema_digest: definition.descriptor.output_schema_digest.clone(),
-            required_app_capability: "mfg.read".to_string(),
+            required_app_capabilities: vec!["mfg.read".to_string()],
             kind: definition.descriptor.kind,
             streaming: false,
         }]);
@@ -1021,7 +1295,7 @@ mod tests {
                     .to_string(),
             ),
             accepted_output_schema_digest: definition.descriptor.output_schema_digest,
-            required_app_capability: "mfg.write".to_string(),
+            required_app_capabilities: vec!["mfg.write".to_string()],
             kind: OperationKindV1::Command,
             streaming: false,
         }];
@@ -1052,6 +1326,11 @@ mod tests {
             required_protocol: ProtocolRangeV1::exact_v1(),
             executable: "bin/mfg-worker".to_string(),
             web_root: None,
+            operation_catalog_digest: cowd_app_protocol::app_operation_catalog_digest_v1(
+                &AppId("mfg".to_string()),
+                &[],
+            )
+            .expect("empty operation catalog digest"),
             capabilities: vec!["mfg.read".to_string(), "mfg.write".to_string()],
             authorization_profiles: vec![AuthorizationProfileV1 {
                 profile_id: "operator".to_string(),

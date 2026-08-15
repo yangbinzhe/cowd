@@ -118,6 +118,27 @@ impl GatewayAppPlatform {
         &self.core_bridge_registry
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test_catalog(catalog: AppCatalogSnapshot) -> Arc<Self> {
+        let catalog = Arc::new(catalog);
+        let core_bridge_registry = Arc::new(CoreBridgeRegistry::default());
+        let connector = Arc::new(GatewayAppConnector::empty(
+            "test-gateway".to_owned(),
+            Arc::clone(&core_bridge_registry),
+        ));
+        let supervisor = AppRuntimeSupervisor::new(
+            Arc::clone(&catalog),
+            connector,
+            AppRuntimeSupervisorConfig::default(),
+        )
+        .expect("test APP supervisor");
+        Arc::new(Self {
+            catalog,
+            supervisor,
+            core_bridge_registry,
+        })
+    }
+
     pub(crate) async fn start_resident(&self) -> Result<(), SupervisorError> {
         self.supervisor.start_resident().await
     }
@@ -775,8 +796,8 @@ mod tests {
         .expect("frozen manifest");
         manifest.capabilities = vec!["approval.respond".to_owned()];
         manifest.authorization_profiles[0].capabilities = vec!["approval.respond".to_owned()];
-        manifest.core_bridge_requirements[0].required_app_capability =
-            "approval.respond".to_owned();
+        manifest.core_bridge_requirements[0].required_app_capabilities =
+            vec!["approval.respond".to_owned()];
         manifest
             .bind_canonical_signed_digest()
             .expect("bind adversarial manifest");

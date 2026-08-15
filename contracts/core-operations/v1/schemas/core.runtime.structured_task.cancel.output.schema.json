@@ -1,0 +1,655 @@
+{
+  "$defs": {
+    "ApprovalProfile": {
+      "enum": [
+        "supervised",
+        "balanced",
+        "autonomous",
+        "trust_all"
+      ],
+      "type": "string"
+    },
+    "AutonomyProfileId": {
+      "enum": [
+        "cautious",
+        "supervised",
+        "stewarded",
+        "autonomous",
+        "yolo"
+      ],
+      "type": "string"
+    },
+    "EvidenceRef": {
+      "description": "Stable evidence pointer shared by runtime, gateway, memory, matrix, and UI\nprojections.",
+      "properties": {
+        "boundary": {
+          "$ref": "#/$defs/RealityBoundary",
+          "default": "unknown"
+        },
+        "confidence_bp": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "ref_type": {
+          "type": "string"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ref_type",
+        "id"
+      ],
+      "type": "object"
+    },
+    "ExecutionPolicyBinding": {
+      "description": "Immutable execution-policy snapshot bound to one concrete Session admission.\n\nSchedules and Tasks retain this value after admission so later policy changes\ncannot silently widen already admitted work. `permission_ceiling` is the\nproduct-owned upper bound; every other effective axis comes from the target\nSession policy after intersecting that bound.",
+      "properties": {
+        "approval_profile": {
+          "$ref": "#/$defs/ApprovalProfile"
+        },
+        "autonomy_profile": {
+          "$ref": "#/$defs/AutonomyProfileId"
+        },
+        "ceiling_digest": {
+          "type": "string"
+        },
+        "interruption_policy": {
+          "$ref": "#/$defs/InterruptionPolicy"
+        },
+        "permission_ceiling": {
+          "$ref": "#/$defs/PermissionMode"
+        },
+        "permission_mode": {
+          "$ref": "#/$defs/PermissionMode"
+        },
+        "policy_digest": {
+          "type": "string"
+        },
+        "policy_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sandbox_posture": {
+          "$ref": "#/$defs/SandboxPosture"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "policy_revision",
+        "autonomy_profile",
+        "permission_mode",
+        "sandbox_posture",
+        "approval_profile",
+        "interruption_policy",
+        "permission_ceiling",
+        "ceiling_digest",
+        "policy_digest"
+      ],
+      "type": "object"
+    },
+    "InterruptionPolicy": {
+      "enum": [
+        "always_pause_for_human",
+        "pause_on_risk",
+        "continue_with_audit",
+        "continue_until_blocked"
+      ],
+      "type": "string"
+    },
+    "PermissionMode": {
+      "enum": [
+        "read-only",
+        "workspace-write",
+        "danger-full-access"
+      ],
+      "type": "string"
+    },
+    "RealityBoundary": {
+      "description": "Boundary assigned to a fact, memory, or recall candidate before it can be\nused as authoritative reality context.",
+      "enum": [
+        "observed",
+        "inferred",
+        "simulated",
+        "hypothetical",
+        "conflict",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "SandboxPosture": {
+      "description": "Execution boundary derived from an autonomy preset. It is a Runtime-owned\ncontract, never a model-authored switch.",
+      "enum": [
+        "read_only_sandbox",
+        "workspace_write_sandbox",
+        "host_full_access"
+      ],
+      "type": "string"
+    },
+    "TaskAggregate": {
+      "properties": {
+        "application_provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskApplicationProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "blocker_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "current_phase_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execution_policy": {
+          "$ref": "#/$defs/TaskExecutionPolicy"
+        },
+        "failure_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "graph_refs": {
+          "items": {
+            "$ref": "#/$defs/TaskGraphRef"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/TaskKind"
+        },
+        "mission_assigned_by": {
+          "type": "string"
+        },
+        "mission_assignment": {
+          "$ref": "#/$defs/TaskMissionAssignment"
+        },
+        "mission_assignment_evidence_refs": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "type": "array"
+        },
+        "mission_assignment_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mission_id": {
+          "type": "string"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/TaskOrigin"
+        },
+        "origin_session_id": {
+          "type": "string"
+        },
+        "origin_turn_id": {
+          "type": "string"
+        },
+        "parent_task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phases": {
+          "items": {
+            "$ref": "#/$defs/TaskPhase"
+          },
+          "type": "array"
+        },
+        "predecessor_task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "root_task_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "strategy_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "updated_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "task_id",
+        "mission_id",
+        "kind",
+        "origin",
+        "origin_session_id",
+        "origin_turn_id",
+        "root_task_id",
+        "mission_assignment",
+        "mission_assignment_revision",
+        "mission_assigned_by",
+        "objective",
+        "status",
+        "revision",
+        "phases",
+        "execution_policy",
+        "failure_count",
+        "graph_refs",
+        "created_at_ms",
+        "updated_at_ms"
+      ],
+      "type": "object"
+    },
+    "TaskApplicationProvenance": {
+      "description": "Immutable Gateway-authored provenance for an application-owned structured\ntask.  The application can request a registered result contract, but it\ncannot author or replace any field in this binding.",
+      "properties": {
+        "producer_id": {
+          "type": "string"
+        },
+        "request_digest": {
+          "type": "string"
+        },
+        "result_contract_id": {
+          "type": "string"
+        },
+        "result_max_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result_schema_digest": {
+          "type": "string"
+        },
+        "result_schema_id": {
+          "type": "string"
+        },
+        "result_schema_version": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "surface": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "producer_id",
+        "workspace_id",
+        "surface",
+        "result_contract_id",
+        "result_schema_id",
+        "result_schema_version",
+        "result_schema_digest",
+        "result_max_bytes",
+        "request_digest"
+      ],
+      "type": "object"
+    },
+    "TaskCommandReceiptProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted_revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "evidence_refs": {
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "type": "array"
+        },
+        "outbox_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "task_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "accepted_revision",
+        "status",
+        "outbox_id",
+        "evidence_refs"
+      ],
+      "type": "object"
+    },
+    "TaskContinuationPolicy": {
+      "enum": [
+        "standard",
+        "continue_until_blocked"
+      ],
+      "type": "string"
+    },
+    "TaskExecutionPolicy": {
+      "description": "Task-local liveness policy plus one immutable Session execution binding.\nSpecs may be unbound while a router is planning; durable Task admission\nrejects them until Runtime attaches the effective Session snapshot.",
+      "properties": {
+        "binding": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskPolicyBinding"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "continuation": {
+          "$ref": "#/$defs/TaskContinuationPolicy",
+          "default": "standard"
+        },
+        "max_failures_before_block": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_failures_before_block"
+      ],
+      "type": "object"
+    },
+    "TaskGraphRef": {
+      "properties": {
+        "graph_id": {
+          "type": "string"
+        },
+        "linked_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "graph_id",
+        "revision",
+        "linked_at_ms"
+      ],
+      "type": "object"
+    },
+    "TaskKind": {
+      "enum": [
+        "root",
+        "delegated"
+      ],
+      "type": "string"
+    },
+    "TaskMissionAssignment": {
+      "enum": [
+        "default",
+        "automatic",
+        "explicit_locked"
+      ],
+      "type": "string"
+    },
+    "TaskOrigin": {
+      "enum": [
+        "user",
+        "schedule",
+        "mission",
+        "delegated",
+        "system"
+      ],
+      "type": "string"
+    },
+    "TaskPhase": {
+      "properties": {
+        "acceptance": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "artifacts": {
+          "items": {
+            "$ref": "#/$defs/TaskPhaseArtifact"
+          },
+          "type": "array"
+        },
+        "created_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dependency_refs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "objective": {
+          "type": "string"
+        },
+        "phase_id": {
+          "type": "string"
+        },
+        "plan": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "review_result": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskPhaseStatus"
+        },
+        "terminal_receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskPhaseTerminalReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "test_commands": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "updated_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "phase_id",
+        "name",
+        "objective",
+        "status",
+        "revision",
+        "dependency_refs",
+        "plan",
+        "acceptance",
+        "test_commands",
+        "artifacts",
+        "created_at_ms",
+        "updated_at_ms"
+      ],
+      "type": "object"
+    },
+    "TaskPhaseArtifact": {
+      "properties": {
+        "created_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "label",
+        "value",
+        "created_at_ms"
+      ],
+      "type": "object"
+    },
+    "TaskPhaseStatus": {
+      "enum": [
+        "pending",
+        "running",
+        "reviewing",
+        "completed",
+        "blocked",
+        "cancelled",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "TaskPhaseTerminalReceipt": {
+      "properties": {
+        "completed_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "evidence_refs": {
+          "items": {
+            "$ref": "#/$defs/EvidenceRef"
+          },
+          "type": "array"
+        },
+        "outcome": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "outcome",
+        "evidence_refs",
+        "completed_at_ms"
+      ],
+      "type": "object"
+    },
+    "TaskPolicyBinding": {
+      "properties": {
+        "execution": {
+          "$ref": "#/$defs/ExecutionPolicyBinding"
+        }
+      },
+      "required": [
+        "execution"
+      ],
+      "type": "object"
+    },
+    "TaskStatus": {
+      "enum": [
+        "pending",
+        "running",
+        "reviewing",
+        "completed",
+        "blocked",
+        "cancelled",
+        "failed"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "command_receipt": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskCommandReceiptProjection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "task": {
+      "$ref": "#/$defs/TaskAggregate"
+    }
+  },
+  "required": [
+    "task"
+  ],
+  "title": "RuntimeCancelStructuredTaskOutput",
+  "type": "object"
+}

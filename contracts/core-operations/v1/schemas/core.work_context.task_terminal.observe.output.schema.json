@@ -1,0 +1,60 @@
+{
+  "$defs": {
+    "TaskCompletionEvidenceProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "correlation_id": {
+          "type": "string"
+        },
+        "owner_kind": {
+          "type": "string"
+        },
+        "receipt_ref": {
+          "type": "string"
+        },
+        "task_ref": {
+          "type": "string"
+        },
+        "terminal_status": {
+          "type": "string"
+        },
+        "workflow_node_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "correlation_id",
+        "owner_kind",
+        "task_ref",
+        "terminal_status",
+        "receipt_ref"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "completion_evidence": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskCompletionEvidenceProjection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "task_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "task_id"
+  ],
+  "title": "WorkContextRecordTaskTerminalOutput",
+  "type": "object"
+}

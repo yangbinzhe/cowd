@@ -1,0 +1,115 @@
+{
+  "$defs": {
+    "MatrixEvidencePacket": {
+      "properties": {
+        "anomaly_evidence": {
+          "default": [],
+          "items": true,
+          "type": "array"
+        },
+        "attention_id": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attribution_candidates": {
+          "default": [],
+          "items": true,
+          "type": "array"
+        },
+        "business_context": {
+          "default": null
+        },
+        "change_evidence": {
+          "default": [],
+          "items": true,
+          "type": "array"
+        },
+        "confidence": {
+          "format": "float",
+          "type": "number"
+        },
+        "created_at": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "impact_paths": {
+          "default": [],
+          "items": true,
+          "type": "array"
+        },
+        "metric_evidence": {
+          "default": [],
+          "items": true,
+          "type": "array"
+        },
+        "missing_evidence": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "packet_id": {
+          "type": "string"
+        },
+        "problem_statement": {
+          "type": "string"
+        },
+        "source_refs": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/MatrixEvidenceSourceRef"
+          },
+          "type": "array"
+        },
+        "token_budget": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "packet_id",
+        "problem_statement",
+        "confidence",
+        "token_budget",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "MatrixEvidenceSourceRef": {
+      "properties": {
+        "kind": {
+          "type": "string"
+        },
+        "reference": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "reference",
+        "summary"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "packet": {
+      "$ref": "#/$defs/MatrixEvidencePacket"
+    }
+  },
+  "required": [
+    "packet"
+  ],
+  "title": "WorkContextStructuredEvidenceItemInput",
+  "type": "object"
+}

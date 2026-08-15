@@ -1,0 +1,125 @@
+{
+  "$defs": {
+    "StructuredTaskContractProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_id": {
+          "type": "string"
+        },
+        "schema_digest": {
+          "type": "string"
+        },
+        "schema_id": {
+          "type": "string"
+        },
+        "schema_version": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "contract_id",
+        "schema_id",
+        "schema_version",
+        "schema_digest"
+      ],
+      "type": "object"
+    },
+    "StructuredTaskResultProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": true,
+        "result_contract": {
+          "$ref": "#/$defs/StructuredTaskContractProjection"
+        },
+        "result_digest": {
+          "type": "string"
+        },
+        "source_receipt_ref": {
+          "type": "string"
+        },
+        "usage": {
+          "$ref": "#/$defs/StructuredTaskUsageProjection"
+        }
+      },
+      "required": [
+        "result",
+        "result_digest",
+        "result_contract",
+        "model",
+        "usage",
+        "source_receipt_ref"
+      ],
+      "type": "object"
+    },
+    "StructuredTaskUsageProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens"
+      ],
+      "type": "object"
+    },
+    "TaskStatus": {
+      "enum": [
+        "pending",
+        "running",
+        "reviewing",
+        "completed",
+        "blocked",
+        "cancelled",
+        "failed"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "result": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/StructuredTaskResultProjection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "task_status": {
+      "$ref": "#/$defs/TaskStatus"
+    }
+  },
+  "required": [
+    "task_id",
+    "task_status"
+  ],
+  "title": "WorkContextInspectStructuredTaskResultOutput",
+  "type": "object"
+}

@@ -1664,6 +1664,7 @@ pub mod test_support {
             let Ok(catalog) = try_catalog_for_capabilities(vec![
                 "reference-app.write".to_string(),
                 "approval.respond".to_string(),
+                "runtime.task.write".to_string(),
                 "mfg.write".to_string(),
                 "mfg.read".to_string(),
                 "reference-app.read".to_string(),
@@ -1680,7 +1681,10 @@ pub mod test_support {
 
             assert_eq!(
                 core_manager.capabilities,
-                vec!["approval.respond".to_string()]
+                vec![
+                    "approval.respond".to_string(),
+                    "runtime.task.write".to_string()
+                ]
             );
             assert_eq!(
                 catalog

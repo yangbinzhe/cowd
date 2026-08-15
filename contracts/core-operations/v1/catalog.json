@@ -1,0 +1,385 @@
+{
+  "authority": "cowd-core",
+  "catalog_digest": "sha256:4eca9846776038c313615c06072e057876e9552d6c488a05a32c92562eebea93",
+  "operations": [
+    {
+      "audit_classification": "approval.decide",
+      "default_deadline_ms": 30000,
+      "delegation": "user",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:45f88a52d1f18c941fc423a7d614aca0eb37b0728f857be928e33ceb98cb17d5",
+        "path": "schemas/core.approval.decide.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.approval.decide",
+      "output_schema": {
+        "digest": "sha256:5552737d39257afe1d8779c27505c717f4277fae439e60f85acc585b353f2292",
+        "path": "schemas/core.approval.decide.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "approval.respond"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "approval.submit",
+      "default_deadline_ms": 30000,
+      "delegation": "either",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:d15adf8dec36b2947b9206d0aeac9345ea052ed3fe3ece3314013e81295801c8",
+        "path": "schemas/core.approval.submit.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.approval.submit",
+      "output_schema": {
+        "digest": "sha256:bf0556c04646a4967359c1b5b243a6f2dc90fc57519cfda571fb15a7202d14b8",
+        "path": "schemas/core.approval.submit.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "approval.submit"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "surface.dispatch.governed",
+      "default_deadline_ms": 30000,
+      "delegation": "either",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:8a275211f49c73b18c9d696c2d0837ba9ef4b73022fb496f0c6786512e3e8306",
+        "path": "schemas/core.connector.surface.dispatch_batch.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.connector.surface.dispatch_batch",
+      "output_schema": {
+        "digest": "sha256:56b2e8667a3324f3f6aedeb1c195a6a33e069bbc69bff71df64768253ca60fa7",
+        "path": "schemas/core.connector.surface.dispatch_batch.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "surface.dispatch"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "cross_plane.dispatch.governed",
+      "default_deadline_ms": 30000,
+      "delegation": "either",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:73806ef0c0dad026f371641c220c9eff919b8b567f00a288c94e85cc1dfab275",
+        "path": "schemas/core.cross_plane.action.dispatch.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.cross_plane.action.dispatch",
+      "output_schema": {
+        "digest": "sha256:4e2f4567fbd4bc4b2953fd62305bc9a6923f6f56208a6ef156168c3e771d05f0",
+        "path": "schemas/core.cross_plane.action.dispatch.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "cross_plane.dispatch"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "platform.governance.snapshot",
+      "default_deadline_ms": 10000,
+      "delegation": "either",
+      "idempotency": "read_only",
+      "input_schema": {
+        "digest": "sha256:27b90091c24bb7ae77f69257896332605e4b859756e202bf8139f22e702b767e",
+        "path": "schemas/core.platform.governance.snapshot.input.schema.json"
+      },
+      "kind": "query",
+      "maximum_deadline_ms": 30000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.platform.governance.snapshot",
+      "output_schema": {
+        "digest": "sha256:fe1480ae5457537e4a18359b7f3ca5374ecdaf0bb4de37ccb1997eada11456e3",
+        "path": "schemas/core.platform.governance.snapshot.output.schema.json"
+      },
+      "read_only": true,
+      "required_capabilities": [
+        "platform.governance.read"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "runtime.goal.start",
+      "default_deadline_ms": 30000,
+      "delegation": "either",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:262358b562d52b3fec32254af768d28a200e7c6e4c3ac7559ad8fdc53b5c1ab5",
+        "path": "schemas/core.runtime.goal.start.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.runtime.goal.start",
+      "output_schema": {
+        "digest": "sha256:5814fc6350b6a9e82bf081fbfbc9b03fc354b4aa6b89757ab5d942f2222229da",
+        "path": "schemas/core.runtime.goal.start.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "runtime.task.write"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "runtime.structured_task.cancel",
+      "default_deadline_ms": 30000,
+      "delegation": "either",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:a27992a4032d4a90bb75b90625792bbbca2699a07da10e08315c7eadd31b24a3",
+        "path": "schemas/core.runtime.structured_task.cancel.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.runtime.structured_task.cancel",
+      "output_schema": {
+        "digest": "sha256:595cdc98da290fad8a5629a9cddf7ae5c0bdcfaf592f369a2be67cda541c2657",
+        "path": "schemas/core.runtime.structured_task.cancel.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "runtime.task.write"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "runtime.structured_task.start",
+      "default_deadline_ms": 30000,
+      "delegation": "either",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:11a6799f77f0567df35b1be5d9af1e487bbf3ebf1f1212ce7c09ac62fefb998c",
+        "path": "schemas/core.runtime.structured_task.start.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.runtime.structured_task.start",
+      "output_schema": {
+        "digest": "sha256:18353b9519ea7e394eb367814dbe7169d872cf1f280c1049d75c0474acf29b0f",
+        "path": "schemas/core.runtime.structured_task.start.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "runtime.task.write"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "session.application_execution_summary.append",
+      "default_deadline_ms": 30000,
+      "delegation": "either",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:018669c804a8517a059ce35c2c7f8dbaa8aa0f015a108e4309faa18638f76484",
+        "path": "schemas/core.work_context.application_execution_summary.append.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.work_context.application_execution_summary.append",
+      "output_schema": {
+        "digest": "sha256:4e083ccfe377f7084d789a93481c449b7c800555af037082fb0212caf82eeded",
+        "path": "schemas/core.work_context.application_execution_summary.append.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "session.outcome.write"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "context.structured_evidence.read",
+      "default_deadline_ms": 10000,
+      "delegation": "either",
+      "idempotency": "read_only",
+      "input_schema": {
+        "digest": "sha256:735f8aef13a46fd455ccf441642299d7195f57491086d48f790ad244c1e6d8b7",
+        "path": "schemas/core.work_context.structured_evidence.item.input.schema.json"
+      },
+      "kind": "query",
+      "maximum_deadline_ms": 30000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.work_context.structured_evidence.item",
+      "output_schema": {
+        "digest": "sha256:22fcdc17a172099803f9129891dd7b6373b7127e1bd83b551c5e37c68f589907",
+        "path": "schemas/core.work_context.structured_evidence.item.output.schema.json"
+      },
+      "read_only": true,
+      "required_capabilities": [
+        "work_context.read"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "runtime.structured_task_result.inspect",
+      "default_deadline_ms": 10000,
+      "delegation": "either",
+      "idempotency": "read_only",
+      "input_schema": {
+        "digest": "sha256:e7ae0fe4ee74970d50c9b677e2f37b1fce93f2754a5bf497e3013992adbdb871",
+        "path": "schemas/core.work_context.structured_task_result.inspect.input.schema.json"
+      },
+      "kind": "query",
+      "maximum_deadline_ms": 30000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.work_context.structured_task_result.inspect",
+      "output_schema": {
+        "digest": "sha256:1606f3d00308882c808cf0d5f874320a486bda59b43de40b86370df03e594e54",
+        "path": "schemas/core.work_context.structured_task_result.inspect.output.schema.json"
+      },
+      "read_only": true,
+      "required_capabilities": [
+        "runtime.task.read"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "task.exists",
+      "default_deadline_ms": 10000,
+      "delegation": "either",
+      "idempotency": "read_only",
+      "input_schema": {
+        "digest": "sha256:ac158ff28fc2cfb717f64a9536940c01dfbcfa79ddfdd9770c2d9213f376ed55",
+        "path": "schemas/core.work_context.task.exists.input.schema.json"
+      },
+      "kind": "query",
+      "maximum_deadline_ms": 30000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.work_context.task.exists",
+      "output_schema": {
+        "digest": "sha256:9378f182b55239924a1a9e7c858ca33bbbcaf74d4ed298e5255a869ead306d01",
+        "path": "schemas/core.work_context.task.exists.output.schema.json"
+      },
+      "read_only": true,
+      "required_capabilities": [
+        "runtime.task.read"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "task.terminal.inspect",
+      "default_deadline_ms": 10000,
+      "delegation": "either",
+      "idempotency": "read_only",
+      "input_schema": {
+        "digest": "sha256:762c8195f31304491a7ec0069a471435464cdb8fba7812dd04c84e62a4505e43",
+        "path": "schemas/core.work_context.task_terminal.inspect.input.schema.json"
+      },
+      "kind": "query",
+      "maximum_deadline_ms": 30000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.work_context.task_terminal.inspect",
+      "output_schema": {
+        "digest": "sha256:90ff24ae2c7515aa4c7aa9e38a8c87e23f9890c840d3040bce3d57657788dfb6",
+        "path": "schemas/core.work_context.task_terminal.inspect.output.schema.json"
+      },
+      "read_only": true,
+      "required_capabilities": [
+        "runtime.task.read"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    },
+    {
+      "audit_classification": "task.terminal.observe",
+      "default_deadline_ms": 30000,
+      "delegation": "either",
+      "idempotency": "required",
+      "input_schema": {
+        "digest": "sha256:a8bc2cbfddacc08409f91d1b9b000b013ce29ff75dbd1b88cd3e8433cf004b45",
+        "path": "schemas/core.work_context.task_terminal.observe.input.schema.json"
+      },
+      "kind": "command",
+      "maximum_deadline_ms": 120000,
+      "maximum_frame_bytes": 1048576,
+      "maximum_request_bytes": 1048576,
+      "maximum_response_bytes": 4194304,
+      "operation_id": "core.work_context.task_terminal.observe",
+      "output_schema": {
+        "digest": "sha256:476aee9b18b95dfd42f7eb0c2383ca112997a8e3b63cda34633edececf6f6140",
+        "path": "schemas/core.work_context.task_terminal.observe.output.schema.json"
+      },
+      "read_only": false,
+      "required_capabilities": [
+        "work_context.write"
+      ],
+      "streaming": false,
+      "tenant_scoped": false,
+      "workspace_scoped": true
+    }
+  ],
+  "schema_version": 1
+}

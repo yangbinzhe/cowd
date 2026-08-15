@@ -1,0 +1,168 @@
+{
+  "$defs": {
+    "ApplicationExecutionSummaryCounterV1": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "value"
+      ],
+      "type": "object"
+    },
+    "ApplicationExecutionSummaryKindV1": {
+      "enum": [
+        "tool",
+        "agent",
+        "task",
+        "structured_ingest",
+        "structured_fact",
+        "structured_evidence",
+        "application_compute",
+        "application_action",
+        "skill_run"
+      ],
+      "type": "string"
+    },
+    "ApplicationExecutionSummaryRefV1": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "id"
+      ],
+      "type": "object"
+    },
+    "ApplicationExecutionSummaryStatusV1": {
+      "enum": [
+        "planned",
+        "running",
+        "succeeded",
+        "failed",
+        "blocked",
+        "partial"
+      ],
+      "type": "string"
+    },
+    "ApplicationExecutionSummaryV1": {
+      "additionalProperties": false,
+      "description": "Timeline-oriented execution summary. This is deliberately distinct from\n[`ApplicationExecutionOutcomeV1`], which models governed APP effects.",
+      "properties": {
+        "counters": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ApplicationExecutionSummaryCounterV1"
+          },
+          "type": "array"
+        },
+        "domain": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence_refs": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/ApplicationExecutionSummaryKindV1"
+        },
+        "metric_refs": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "occurred_at_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "refs": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ApplicationExecutionSummaryRefV1"
+          },
+          "type": "array"
+        },
+        "schema_version": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/ApplicationExecutionSummaryStatusV1"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "summary_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "summary_id",
+        "kind",
+        "status",
+        "title",
+        "summary",
+        "occurred_at_ms"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "APP-submitted intent. The authenticated producer identity is intentionally\nhost-owned and never accepted from this payload.",
+  "properties": {
+    "schema_version": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "summary": {
+      "$ref": "#/$defs/ApplicationExecutionSummaryV1"
+    }
+  },
+  "required": [
+    "schema_version",
+    "session_id",
+    "summary"
+  ],
+  "title": "ApplicationExecutionSummaryIntentV1",
+  "type": "object"
+}

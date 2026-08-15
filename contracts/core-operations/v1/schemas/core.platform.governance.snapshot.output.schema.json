@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval_coordinator_configured": {
+      "type": "boolean"
+    },
+    "audit_export_surface": {
+      "type": "boolean"
+    },
+    "auth_token_configured": {
+      "type": "boolean"
+    },
+    "cross_plane_audit_surface": {
+      "type": "boolean"
+    },
+    "session_store_ready": {
+      "type": "boolean"
+    },
+    "surface_runtime_ready": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "auth_token_configured",
+    "approval_coordinator_configured",
+    "session_store_ready",
+    "surface_runtime_ready",
+    "audit_export_surface",
+    "cross_plane_audit_surface"
+  ],
+  "title": "PlatformGovernanceSnapshotOutput",
+  "type": "object"
+}

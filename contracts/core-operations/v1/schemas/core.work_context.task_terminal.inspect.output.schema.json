@@ -1,0 +1,48 @@
+{
+  "$defs": {
+    "TaskTerminalProjection": {
+      "additionalProperties": false,
+      "properties": {
+        "source_receipt_ref": {
+          "type": "string"
+        },
+        "terminal_status": {
+          "type": "string"
+        },
+        "workflow_node_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "terminal_status",
+        "source_receipt_ref"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {
+      "type": "string"
+    },
+    "terminal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskTerminalProjection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "task_id"
+  ],
+  "title": "WorkContextInspectTaskTerminalOutput",
+  "type": "object"
+}

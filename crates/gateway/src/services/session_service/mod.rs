@@ -22,6 +22,10 @@ use self::repository::SessionRepository;
 use super::ServiceEnvelope;
 use crate::runtime_service::RuntimeService;
 use chrono::{DateTime, Utc};
+use cowd_app_protocol::{
+    ApplicationExecutionSummaryIdempotencyV1, ApplicationExecutionSummaryReceiptV1,
+    ApplicationExecutionSummaryStatusV1, ApplicationExecutionSummaryV1, ProtocolValidate,
+};
 use harness_contract::task::{
     SessionFocusMutation, SessionFocusReceipt, SessionMissionFocus, SessionRoutingFocus,
     SessionTaskFocus,
@@ -602,15 +606,15 @@ impl SessionService {
         Ok(record)
     }
 
-    pub(crate) async fn append_application_execution_outcome(
+    pub(crate) async fn append_application_execution_summary(
         &self,
         session_id: &str,
-        outcome: &cowd_app_sdk::ApplicationExecutionOutcomeV1,
-    ) -> Result<cowd_app_sdk::ApplicationExecutionOutcomeReceiptV1, String> {
-        self.append_application_execution_outcome_for_producer(
+        summary: &ApplicationExecutionSummaryV1,
+    ) -> Result<ApplicationExecutionSummaryReceiptV1, String> {
+        self.append_application_execution_summary_for_producer(
             session_id,
             "gateway.matrix",
-            outcome,
+            summary,
         )
         .await
         .map_err(|error| error.to_string())
@@ -621,22 +625,26 @@ impl SessionService {
     /// `producer_id` must be supplied by a trusted Gateway/Host binding, never
     /// decoded from the APP intent payload. The durable idempotency key is
     /// producer + contract version + outcome id.
-    pub(crate) async fn append_application_execution_outcome_for_producer(
+    pub(crate) async fn append_application_execution_summary_for_producer(
         &self,
         session_id: &str,
         producer_id: &str,
-        outcome: &cowd_app_sdk::ApplicationExecutionOutcomeV1,
-    ) -> Result<cowd_app_sdk::ApplicationExecutionOutcomeReceiptV1, SessionError> {
-        let normalized = outcome.normalized().map_err(|error| {
-            SessionError::InvalidArgument(format!("invalid application execution outcome: {error}"))
+        summary: &ApplicationExecutionSummaryV1,
+    ) -> Result<ApplicationExecutionSummaryReceiptV1, SessionError> {
+        let normalized = summary.normalized().map_err(|error| {
+            SessionError::InvalidArgument(format!("invalid application execution summary: {error}"))
+        })?;
+        normalized.validate().map_err(|error| {
+            SessionError::InvalidArgument(format!("invalid application execution summary: {error}"))
         })?;
         let idempotency_key =
-            cowd_app_sdk::ApplicationExecutionIdempotencyKeyV1::new(producer_id, &normalized)
-                .map_err(|error| {
+            ApplicationExecutionSummaryIdempotencyV1::bind(producer_id, &normalized).map_err(
+                |error| {
                     SessionError::InvalidArgument(format!(
                         "invalid application execution producer identity: {error}"
                     ))
-                })?;
+                },
+            )?;
         self.ensure_internal_context(
             session_id,
             "app",
@@ -648,13 +656,13 @@ impl SessionService {
             session_id,
             0,
             SessionDomainScope::ApplicationTask,
-            "application.execution_outcome",
-            serde_json::to_value(&normalized)
-                .map_err(|error| SessionError::Serialization(error))?,
+            "application.execution_summary",
+            serde_json::to_value(&normalized).map_err(SessionError::Serialization)?,
             normalized.occurred_at_ms,
         );
         event.event_id = idempotency_key.event_id();
-        event.status = Some(application_execution_status_label(normalized.status).to_string());
+        event.status =
+            Some(application_execution_summary_status_label(normalized.status).to_string());
         let mut refs = vec![session::SessionDomainRef {
             ref_type: "producer".to_string(),
             id: idempotency_key.producer_id.clone(),
@@ -695,12 +703,13 @@ impl SessionService {
             .await
             .and_then(|(stored, replayed)| {
                 u64::try_from(stored.sequence)
-                    .map(
-                        |sequence| cowd_app_sdk::ApplicationExecutionOutcomeReceiptV1 {
-                            sequence,
-                            replayed,
-                        },
-                    )
+                    .map(|sequence| ApplicationExecutionSummaryReceiptV1 {
+                        schema_version: 1,
+                        producer_id: idempotency_key.producer_id.clone(),
+                        summary_id: idempotency_key.summary_id.clone(),
+                        sequence,
+                        replayed,
+                    })
                     .map_err(|_| {
                         SessionError::Store(
                             "application execution outcome sequence exceeds u64".to_string(),
@@ -3236,16 +3245,16 @@ fn input_execution_turn_id(envelope: &SessionInputEnvelope) -> String {
         .unwrap_or_else(|| envelope.input_id.to_string())
 }
 
-fn application_execution_status_label(
-    status: cowd_app_sdk::ApplicationExecutionStatus,
+fn application_execution_summary_status_label(
+    status: ApplicationExecutionSummaryStatusV1,
 ) -> &'static str {
     match status {
-        cowd_app_sdk::ApplicationExecutionStatus::Planned => "planned",
-        cowd_app_sdk::ApplicationExecutionStatus::Running => "running",
-        cowd_app_sdk::ApplicationExecutionStatus::Succeeded => "succeeded",
-        cowd_app_sdk::ApplicationExecutionStatus::Failed => "failed",
-        cowd_app_sdk::ApplicationExecutionStatus::Blocked => "blocked",
-        cowd_app_sdk::ApplicationExecutionStatus::Partial => "partial",
+        ApplicationExecutionSummaryStatusV1::Planned => "planned",
+        ApplicationExecutionSummaryStatusV1::Running => "running",
+        ApplicationExecutionSummaryStatusV1::Succeeded => "succeeded",
+        ApplicationExecutionSummaryStatusV1::Failed => "failed",
+        ApplicationExecutionSummaryStatusV1::Blocked => "blocked",
+        ApplicationExecutionSummaryStatusV1::Partial => "partial",
     }
 }
 

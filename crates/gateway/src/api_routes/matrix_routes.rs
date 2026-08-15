@@ -20,8 +20,8 @@ use serde_json::Value;
 use crate::services::GatewayMatrixRepositoryError as MatrixStoreError;
 
 use super::matrix_outcomes::{
-    append_matrix_execution_outcome, matrix_evidence_packet_outcome, matrix_fact_outcome,
-    matrix_ingest_plan_outcome,
+    append_matrix_execution_summary, matrix_evidence_packet_summary, matrix_fact_summary,
+    matrix_ingest_plan_summary,
 };
 use super::{api_error, AppState, ErrorResponse};
 

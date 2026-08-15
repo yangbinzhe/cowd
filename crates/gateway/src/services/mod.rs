@@ -627,6 +627,7 @@ pub(crate) struct GatewayServices {
     /// the immutable registry so product startup can compose descriptors
     /// before the final `AppState` exists.
     pub(crate) app_host_binding: GatewayAppHostBinding,
+    pub(crate) core_platform_bindings: core_platform_operations::CorePlatformBindings,
     pub(crate) runtime: Option<Arc<RuntimeService>>,
     pub(crate) runtime_events: RuntimeEventService,
     pub(crate) surface: SurfaceService,

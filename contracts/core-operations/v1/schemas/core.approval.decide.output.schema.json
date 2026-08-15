@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approval": true,
+    "approval_id": {
+      "type": "string"
+    },
+    "decision_lease_ref": {
+      "type": "string"
+    },
+    "replayed": {
+      "type": "boolean"
+    },
+    "status": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "approval_id",
+    "status",
+    "replayed",
+    "approval",
+    "decision_lease_ref"
+  ],
+  "title": "ApprovalDecideOutput",
+  "type": "object"
+}

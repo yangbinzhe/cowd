@@ -223,6 +223,7 @@ impl GatewayServices {
             app_registry,
             app_platform: None,
             app_host_binding,
+            core_platform_bindings: Default::default(),
             runtime: Some(Arc::clone(&runtime)),
             runtime_events,
             surface: SurfaceService::with_host(surface_host),
@@ -291,6 +292,7 @@ impl GatewayServices {
             )),
             app_platform: None,
             app_host_binding,
+            core_platform_bindings: Default::default(),
             runtime: None,
             runtime_events: RuntimeEventService::from_runtime_services(baseline_runtime.as_ref()),
             surface: SurfaceService::new(),
@@ -364,7 +366,14 @@ impl GatewayServices {
         producer_id: String,
     ) {
         self.app_host_binding
-            .bind_request_principal(principal, context, producer_id);
+            .bind_request_principal(principal, context, producer_id.clone());
+        self.core_platform_bindings.bind_request_principal(
+            principal,
+            &context.request_id,
+            &context.workspace_id,
+            &context.surface,
+            producer_id,
+        );
     }
 
     /// Gateway only projects the Runtime-owned capability snapshot. Baseline
