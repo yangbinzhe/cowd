@@ -9080,8 +9080,12 @@ where
         &self,
         session_id: &str,
         turn_id: &str,
+        execution_id: &str,
     ) -> Result<usize, RuntimeError> {
-        if self.session_id().to_string() != session_id || turn_id.trim().is_empty() {
+        if self.session_id().to_string() != session_id
+            || turn_id.trim().is_empty()
+            || execution_id.trim().is_empty()
+        {
             return Err(RuntimeError::new(
                 "controlled recovery restore identity does not match the active Session turn",
             ));
@@ -9090,7 +9094,10 @@ where
             RuntimeError::new("controlled recovery restore requires the Runtime event store")
         })?;
         let claims = crate::authorization_negotiator::load_open_controlled_recovery_claims(
-            store, session_id, turn_id,
+            store,
+            session_id,
+            turn_id,
+            execution_id,
         )
         .map_err(RuntimeError::new)?;
         let mut restored = 0;

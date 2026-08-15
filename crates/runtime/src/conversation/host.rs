@@ -896,10 +896,6 @@ where
                 .map(|lineage| lineage.turn_id.clone())
         })
         .unwrap_or_else(|| TurnId::new().to_string());
-    if let Err(error) = runtime.restore_controlled_recovery_claims_for_turn(&session_id, &turn_ref)
-    {
-        return (runtime, Err(error));
-    }
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let parent_merge_started_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
     let parent_merge_timer = Arc::clone(&parent_merge_started_at);
@@ -1286,6 +1282,10 @@ where
         }
 
         let graph_id = graph.id.clone();
+        runtime
+            .lock()
+            .await
+            .restore_controlled_recovery_claims_for_turn(&session_id, &turn_ref, &graph_id)?;
         let persisted_graph = services
             .graph_state_store()
             .load_async(&graph_id)

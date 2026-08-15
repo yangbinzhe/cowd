@@ -1637,7 +1637,13 @@ fn normalize_delegated_resource_value(
     path_identity_resolver: &crate::path_identity::WorkspacePathIdentityResolver,
     resource_scopes: Option<&[String]>,
 ) -> serde_json::Value {
-    let mut parsed = normalize_workspace_internal_resource_value(tool_name, parsed, workspace_root);
+    let parsed = normalize_workspace_internal_resource_value(tool_name, parsed, workspace_root);
+    let mut parsed = normalize_single_scope_relative_read_value(
+        tool_name,
+        parsed,
+        path_identity_resolver,
+        resource_scopes,
+    );
     if tool_name != "glob_search" {
         return parsed;
     }
@@ -1771,6 +1777,96 @@ fn workspace_root_request(path: &str, workspace_root: &std::path::Path) -> bool 
             .is_some_and(|(requested, root)| requested == root)
 }
 
+/// Native file tools take workspace-root-relative paths, while a delegated
+/// objective may phrase a file relative to its sole authorized directory.
+/// Normalize only that unambiguous read case: never search sibling scopes,
+/// never rewrite an already-resolvable path, and require the exact scoped
+/// candidate to satisfy the typed authorization boundary.
+fn normalize_single_scope_relative_read_value(
+    tool_name: &str,
+    mut parsed: serde_json::Value,
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+    resource_scopes: Option<&[String]>,
+) -> serde_json::Value {
+    if tool_name != "read_file" {
+        return parsed;
+    }
+    let Some(scopes) = resource_scopes else {
+        return parsed;
+    };
+    let mut directories = scopes
+        .iter()
+        .filter_map(|scope| {
+            let (mode, path) = scope.split_once(':')?;
+            matches!(mode, "read" | "write").then_some(path.trim().replace('\\', "/"))
+        })
+        .filter(|path| !matches!(path.as_str(), "" | "." | "./"))
+        .filter(|path| {
+            resolver.resolve_existing(path).is_ok_and(|identity| {
+                identity.object_kind == harness_contract::context::WorkspaceObjectKind::Directory
+            })
+        })
+        .collect::<Vec<_>>();
+    directories.sort();
+    directories.dedup();
+    let [scope] = directories.as_slice() else {
+        return parsed;
+    };
+
+    let replacements = resource_paths_from_input(&parsed)
+        .into_iter()
+        .filter_map(|requested| {
+            let parts = normalized_relative_parts(&requested)?;
+            let requested = parts.join("/");
+            if requested.is_empty() || path_within_scope(&requested, scope) {
+                return None;
+            }
+            if let Ok(identity) = resolver.resolve_existing(&requested) {
+                let canonical = identity.workspace_relative_path;
+                return (canonical != requested
+                    && resource_path_is_authorized(resolver, &canonical, scopes, false))
+                .then_some((requested, canonical));
+            }
+            let candidate = format!("{scope}/{requested}");
+            resource_path_is_authorized(resolver, &candidate, scopes, false)
+                .then_some((requested, candidate))
+        })
+        .collect::<BTreeMap<_, _>>();
+    rewrite_resource_path_fields(&mut parsed, &replacements);
+    parsed
+}
+
+fn rewrite_resource_path_fields(
+    value: &mut serde_json::Value,
+    replacements: &BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Object(values) => {
+            for (key, value) in values {
+                if matches!(key.as_str(), "path" | "file" | "file_path") {
+                    if let Some(path) = value.as_str() {
+                        let normalized = path.trim().replace('\\', "/");
+                        if let Some(replacement) = replacements.get(&normalized) {
+                            *value = serde_json::Value::String(replacement.clone());
+                        }
+                    }
+                } else {
+                    rewrite_resource_path_fields(value, replacements);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                rewrite_resource_path_fields(value, replacements);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
 /// Normalize workspace-internal absolute resource paths before both effect
 /// description and execution. Keeping those two inputs byte-equivalent is a
 /// security invariant: an input-sensitive ToolHost must be able to verify the
@@ -1804,30 +1900,7 @@ fn normalize_workspace_internal_resource_value(
         return parsed;
     }
 
-    fn rewrite(value: &mut serde_json::Value, replacements: &BTreeMap<String, String>) {
-        match value {
-            serde_json::Value::String(value) => {
-                let normalized = value.trim().replace('\\', "/");
-                if let Some(replacement) = replacements.get(&normalized) {
-                    value.clone_from(replacement);
-                }
-            }
-            serde_json::Value::Array(values) => {
-                for value in values {
-                    rewrite(value, replacements);
-                }
-            }
-            serde_json::Value::Object(values) => {
-                for value in values.values_mut() {
-                    rewrite(value, replacements);
-                }
-            }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            }
-        }
-    }
-
-    rewrite(&mut parsed, &replacements);
+    rewrite_resource_path_fields(&mut parsed, &replacements);
     parsed
 }
 
@@ -1969,7 +2042,7 @@ fn system_prompt(
         format!("Objective: {}", packet.objective),
         format!("Workspace root: {}", workspace_root.display()),
         format!(
-            "Authorized resource scopes: {}. Use only relative paths inside these scopes; a missing path never means the whole workspace.",
+            "Authorized resource scopes: {}. Every native file-tool path must be relative to the displayed Workspace root and retain the complete authorized scope prefix. For example, scope read:project means project/Cargo.toml, never bare Cargo.toml. A missing path never means the whole workspace.",
             if packet.resource_scopes.is_empty() {
                 "(none)".to_string()
             } else {
@@ -2465,7 +2538,8 @@ fn path_within_scope(path: &str, scope: &str) -> bool {
     let scope = normalized_scope(scope);
     !path.is_empty()
         && !scope.is_empty()
-        && (path == scope
+        && (scope == "."
+            || path == scope
             || path
                 .strip_prefix(scope)
                 .is_some_and(|suffix| suffix.starts_with('/')))
@@ -3282,6 +3356,82 @@ mod tests {
         assert!(normalized["content"]
             .as_str()
             .is_some_and(|content| content.contains(&root.path().display().to_string())));
+    }
+
+    #[test]
+    fn sole_directory_scope_normalizes_a_bare_delegated_read_path() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("cowd-app-mfg")).expect("project directory");
+        std::fs::write(
+            root.path().join("cowd-app-mfg/Cargo.toml"),
+            "[package]\nname='mfg'\n",
+        )
+        .expect("fixture");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
+        let input = serde_json::json!({"path": "Cargo.toml"}).to_string();
+        assert_eq!(
+            resolver
+                .resolve_existing("cowd-app-mfg")
+                .expect("scope directory")
+                .object_kind,
+            harness_contract::context::WorkspaceObjectKind::Directory
+        );
+        let candidate = resolver
+            .resolve_existing("cowd-app-mfg/Cargo.toml")
+            .expect("candidate");
+        let scope = resolver.resolve_existing("cowd-app-mfg").expect("scope");
+        assert!(
+            resource_path_is_authorized(
+                &resolver,
+                "cowd-app-mfg/Cargo.toml",
+                &["read:cowd-app-mfg".to_string()],
+                false,
+            ),
+            "candidate={candidate:?}; scope={scope:?}"
+        );
+        let direct = normalize_single_scope_relative_read_value(
+            "read_file",
+            serde_json::json!({"path": "Cargo.toml"}),
+            &resolver,
+            Some(&["read:cowd-app-mfg".to_string()]),
+        );
+        assert_eq!(direct["path"], "cowd-app-mfg/Cargo.toml");
+
+        let normalized = normalize_delegated_resource_paths(
+            "read_file",
+            &input,
+            root.path(),
+            &resolver,
+            Some(&["read:cowd-app-mfg".to_string()]),
+        )
+        .expect("normalize sole scoped read");
+        let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
+        assert_eq!(normalized["path"], "cowd-app-mfg/Cargo.toml");
+    }
+
+    #[test]
+    fn ambiguous_or_existing_bare_read_path_is_never_retargeted() {
+        let root = tempfile::tempdir().expect("workspace");
+        for project in ["one", "two"] {
+            std::fs::create_dir_all(root.path().join(project)).expect("project directory");
+            std::fs::write(root.path().join(project).join("Cargo.toml"), project).expect("fixture");
+        }
+        std::fs::write(root.path().join("Cargo.toml"), "root").expect("root fixture");
+        let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+            .expect("path identities");
+        let input = serde_json::json!({"path": "Cargo.toml"}).to_string();
+
+        let normalized = normalize_delegated_resource_paths(
+            "read_file",
+            &input,
+            root.path(),
+            &resolver,
+            Some(&["read:one".to_string(), "read:two".to_string()]),
+        )
+        .expect("preserve ambiguous path");
+        let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
+        assert_eq!(normalized["path"], "Cargo.toml");
     }
 
     #[test]
@@ -4175,6 +4325,12 @@ mod tests {
         assert!(prompt.contains("Never write simulated tool syntax"));
         assert!(prompt.contains("If no native tool is authorized, answer directly"));
         assert!(!prompt.contains("## Runtime clock"));
+
+        packet.resource_scopes = vec!["read:cowd-app-mfg".to_string()];
+        let scoped_prompt =
+            system_prompt(&packet, std::path::Path::new("/workspace"), &[]).join("\n");
+        assert!(scoped_prompt.contains("scope read:project means project/Cargo.toml"));
+        assert!(scoped_prompt.contains("never bare Cargo.toml"));
 
         packet.objective = "update fixtures/target.txt".into();
         packet.constraints = vec![

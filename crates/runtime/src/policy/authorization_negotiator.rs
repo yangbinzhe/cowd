@@ -83,7 +83,15 @@ pub(crate) struct ControlledRecoveryTerminalRecord {
 }
 
 #[must_use]
-pub(crate) fn controlled_recovery_stream_id(session_id: &str, turn_id: &str) -> String {
+pub(crate) fn controlled_recovery_stream_id(
+    session_id: &str,
+    turn_id: &str,
+    execution_id: &str,
+) -> String {
+    format!("authorization-recovery:{session_id}:turn:{turn_id}:execution:{execution_id}")
+}
+
+fn legacy_controlled_recovery_stream_id(session_id: &str, turn_id: &str) -> String {
     format!("authorization-recovery:{session_id}:turn:{turn_id}")
 }
 
@@ -91,8 +99,12 @@ fn controlled_recovery_claim_idempotency_key(fingerprint: &str) -> String {
     format!("authorization-recovery-claim:{fingerprint}")
 }
 
-fn controlled_recovery_terminal_idempotency_key(session_id: &str, turn_id: &str) -> String {
-    format!("authorization-recovery-terminal:{session_id}:turn:{turn_id}")
+fn controlled_recovery_terminal_idempotency_key(
+    session_id: &str,
+    turn_id: &str,
+    execution_id: &str,
+) -> String {
+    format!("authorization-recovery-terminal:{session_id}:turn:{turn_id}:execution:{execution_id}")
 }
 
 fn persisted_controlled_recovery_claim(
@@ -111,8 +123,10 @@ fn persisted_controlled_recovery_claim(
 }
 
 /// Persists a claim before Runtime tells the model that recovery is available.
-/// A stream is shared only by one exact turn; optimistic conflicts between
-/// parallel Tool assessments are retried with stable event identity.
+/// A stream is owned by one exact execution inside one exact turn; optimistic
+/// conflicts between parallel Tool assessments in that execution are retried
+/// with stable event identity. Sibling Agent/Team executions never share this
+/// terminal key.
 pub(crate) fn persist_controlled_recovery_claim(
     store: &crate::RuntimeEventStore,
     record: &ControlledRecoveryClaimRecord,
@@ -128,13 +142,18 @@ pub(crate) fn persist_controlled_recovery_claim(
             "controlled recovery claim requires exact Session/execution/turn identity".to_string(),
         );
     }
-    let stream_id = controlled_recovery_stream_id(&record.session_id, &record.turn_id);
+    let stream_id =
+        controlled_recovery_stream_id(&record.session_id, &record.turn_id, &record.execution_id);
     let idempotency_key = controlled_recovery_claim_idempotency_key(&record.fingerprint);
     for _ in 0..8 {
         if store
             .event_by_idempotency_key(
                 &stream_id,
-                &controlled_recovery_terminal_idempotency_key(&record.session_id, &record.turn_id),
+                &controlled_recovery_terminal_idempotency_key(
+                    &record.session_id,
+                    &record.turn_id,
+                    &record.execution_id,
+                ),
             )
             .map_err(|error| error.to_string())?
             .is_some()
@@ -213,17 +232,37 @@ pub(crate) fn load_open_controlled_recovery_claims(
     store: &crate::RuntimeEventStore,
     session_id: &str,
     turn_id: &str,
+    execution_id: &str,
 ) -> Result<Vec<ControlledRecoveryClaimRecord>, String> {
-    let stream_id = controlled_recovery_stream_id(session_id, turn_id);
+    if execution_id.trim().is_empty() {
+        return Err("controlled recovery restore requires an exact execution".to_string());
+    }
+    let stream_id = controlled_recovery_stream_id(session_id, turn_id, execution_id);
+    let exact_events = store.list_stream(&stream_id)?;
+    // v0.9.689 used a turn-wide stream. Read that shape only when the exact
+    // execution stream does not exist, and filter rather than treating sibling
+    // execution records as corruption. New writes never return to this path.
+    let (events, exact_stream) = if exact_events.is_empty() {
+        (
+            store.list_stream(&legacy_controlled_recovery_stream_id(session_id, turn_id))?,
+            false,
+        )
+    } else {
+        (exact_events, true)
+    };
     let mut claims = BTreeMap::<String, ControlledRecoveryClaimRecord>::new();
     let mut terminal = false;
-    for event in store.list_stream(&stream_id)? {
+    for event in events {
         match event.kind.as_str() {
             CONTROLLED_RECOVERY_CLAIMED_EVENT => {
                 let claim = serde_json::from_value::<ControlledRecoveryClaimRecord>(event.payload)
                     .map_err(|error| format!("decode controlled recovery claim: {error}"))?;
+                if !exact_stream && claim.execution_id != execution_id {
+                    continue;
+                }
                 if claim.session_id != session_id
                     || claim.turn_id != turn_id
+                    || claim.execution_id != execution_id
                     || claim.recovery_scope != format!("turn:{turn_id}")
                 {
                     return Err(
@@ -236,8 +275,12 @@ pub(crate) fn load_open_controlled_recovery_claims(
                 let settled =
                     serde_json::from_value::<ControlledRecoveryTerminalRecord>(event.payload)
                         .map_err(|error| format!("decode controlled recovery terminal: {error}"))?;
+                if !exact_stream && settled.execution_id != execution_id {
+                    continue;
+                }
                 if settled.session_id != session_id
                     || settled.turn_id != turn_id
+                    || settled.execution_id != execution_id
                     || settled.recovery_scope != format!("turn:{turn_id}")
                 {
                     return Err(
@@ -264,7 +307,11 @@ pub(crate) fn controlled_recovery_terminal_event(
     }
     Ok(crate::RuntimeTransactionEventInput {
         event: crate::RuntimeEventInput {
-            stream_id: controlled_recovery_stream_id(&record.session_id, &record.turn_id),
+            stream_id: controlled_recovery_stream_id(
+                &record.session_id,
+                &record.turn_id,
+                &record.execution_id,
+            ),
             scope: crate::RuntimeEventScope::Tool,
             kind: CONTROLLED_RECOVERY_TERMINAL_EVENT.to_string(),
             status: Some("terminal".to_string()),
@@ -289,6 +336,7 @@ pub(crate) fn controlled_recovery_terminal_event(
         idempotency_key: Some(controlled_recovery_terminal_idempotency_key(
             &record.session_id,
             &record.turn_id,
+            &record.execution_id,
         )),
         schema_version: 1,
     })
@@ -311,7 +359,12 @@ pub(crate) fn is_controlled_recovery_terminal_event(input: &crate::RuntimeEventI
         return false;
     };
     record.recovery_scope == format!("turn:{}", record.turn_id)
-        && input.stream_id == controlled_recovery_stream_id(&record.session_id, &record.turn_id)
+        && input.stream_id
+            == controlled_recovery_stream_id(
+                &record.session_id,
+                &record.turn_id,
+                &record.execution_id,
+            )
         && input
             .refs
             .iter()
@@ -1825,7 +1878,8 @@ mod tests {
             store
                 .list_stream(&controlled_recovery_stream_id(
                     &record.session_id,
-                    &record.turn_id
+                    &record.turn_id,
+                    &record.execution_id,
                 ))
                 .expect("claim stream")
                 .len(),
@@ -1833,9 +1887,13 @@ mod tests {
         );
 
         let restarted = AuthorizationNegotiator::new();
-        let open =
-            load_open_controlled_recovery_claims(&store, &record.session_id, &record.turn_id)
-                .expect("restart recovery");
+        let open = load_open_controlled_recovery_claims(
+            &store,
+            &record.session_id,
+            &record.turn_id,
+            &record.execution_id,
+        )
+        .expect("restart recovery");
         assert_eq!(open, vec![record.clone()]);
         assert!(restarted
             .restore_controlled_recovery_claim(&open[0].fingerprint, &open[0].recovery_scope));
@@ -1852,12 +1910,21 @@ mod tests {
         let terminal_event = controlled_recovery_terminal_event(&terminal).expect("terminal event");
         assert_eq!(hot_state_counts(&restarted).3, 1);
         assert_eq!(
-            load_open_controlled_recovery_claims(&store, &record.session_id, &record.turn_id)
-                .expect("abort preserves durable claim"),
+            load_open_controlled_recovery_claims(
+                &store,
+                &record.session_id,
+                &record.turn_id,
+                &record.execution_id,
+            )
+            .expect("abort preserves durable claim"),
             vec![record.clone()]
         );
 
-        let stream_id = controlled_recovery_stream_id(&record.session_id, &record.turn_id);
+        let stream_id = controlled_recovery_stream_id(
+            &record.session_id,
+            &record.turn_id,
+            &record.execution_id,
+        );
         let revision = store.stream_revision(&stream_id).expect("stream revision");
         store
             .append_transaction(crate::AppendTransactionRequest {
@@ -1869,11 +1936,14 @@ mod tests {
                 events: vec![terminal_event],
             })
             .expect("graph terminal commit");
-        assert!(
-            load_open_controlled_recovery_claims(&store, &record.session_id, &record.turn_id)
-                .expect("settled recovery stream")
-                .is_empty()
-        );
+        assert!(load_open_controlled_recovery_claims(
+            &store,
+            &record.session_id,
+            &record.turn_id,
+            &record.execution_id,
+        )
+        .expect("settled recovery stream")
+        .is_empty());
         assert!(persist_controlled_recovery_claim(&store, &record).is_err());
         assert_eq!(hot_state_counts(&restarted).3, 1);
         assert_eq!(
@@ -1881,6 +1951,41 @@ mod tests {
             1
         );
         assert_eq!(hot_state_counts(&restarted).3, 0);
+    }
+
+    #[test]
+    fn sibling_executions_in_one_turn_commit_distinct_recovery_terminals() {
+        let store = crate::RuntimeEventStore::try_open_in_memory().expect("event store");
+        let terminal = |execution_id: &str| ControlledRecoveryTerminalRecord {
+            recovery_scope: "turn:shared-turn".to_string(),
+            session_id: "shared-session".to_string(),
+            turn_id: "shared-turn".to_string(),
+            execution_id: execution_id.to_string(),
+            fingerprints: Vec::new(),
+        };
+        let first = terminal("team-one-agent");
+        let second = terminal("team-two-agent");
+        let first_event = controlled_recovery_terminal_event(&first).expect("first terminal");
+        let second_event = controlled_recovery_terminal_event(&second).expect("second terminal");
+
+        assert_ne!(first_event.event.stream_id, second_event.event.stream_id);
+        assert_ne!(first_event.idempotency_key, second_event.idempotency_key);
+        store
+            .append_transaction(crate::AppendTransactionRequest {
+                transaction_id: "parallel-recovery-terminals".to_string(),
+                expected_streams: vec![
+                    crate::ExpectedStreamRevision {
+                        stream_id: first_event.event.stream_id.clone(),
+                        expected_revision: 0,
+                    },
+                    crate::ExpectedStreamRevision {
+                        stream_id: second_event.event.stream_id.clone(),
+                        expected_revision: 0,
+                    },
+                ],
+                events: vec![first_event, second_event],
+            })
+            .expect("parallel execution terminals must not collide");
     }
 
     #[test]

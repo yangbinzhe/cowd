@@ -873,9 +873,15 @@ fn strip_repository_prefix(path: &Path, repository: &RepositoryBinding) -> Strin
     if repository.workspace_prefix.is_empty() {
         return path_to_slash(path);
     }
-    path.strip_prefix(&repository.workspace_prefix)
+    let relative = path
+        .strip_prefix(&repository.workspace_prefix)
         .map(path_to_slash)
-        .unwrap_or_else(|_| path_to_slash(path))
+        .unwrap_or_else(|_| path_to_slash(path));
+    if relative.is_empty() {
+        ".".to_string()
+    } else {
+        relative
+    }
 }
 
 fn path_to_slash(path: &Path) -> String {
