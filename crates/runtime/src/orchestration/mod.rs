@@ -3,6 +3,7 @@
 //! The model may inspect state and propose semantic topology. Runtime alone
 //! resolves definitions, executors, leases, physical identities and commands.
 
+pub mod collaboration_continuation;
 pub mod compiler;
 pub(crate) mod input_disposition;
 pub mod planner;

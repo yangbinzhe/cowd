@@ -598,6 +598,10 @@ pub use mission_schedule::{
 pub use module_map::{
     runtime_module_map, runtime_module_names_by_domain, RuntimeDomain, RuntimeModuleDescriptor,
 };
+pub use orchestration::collaboration_continuation::{
+    claim_continuation_root, compile_continuation_binding, ensure_reauthorized, resolve_candidate,
+    ContinuationCandidate, ContinuationPriority,
+};
 pub use orchestration::{
     handle_runtime_orchestration_request, handle_runtime_orchestration_request_with_decision,
     runtime_orchestration_response, runtime_orchestration_response_with_decision,
