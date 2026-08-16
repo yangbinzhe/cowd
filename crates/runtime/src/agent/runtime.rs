@@ -858,12 +858,6 @@ impl AgentRuntime {
             returned.failure = Some("agent cancelled by command".into());
         }
         if let Err(error) = validate_agent_return(&packet, &returned) {
-            // A backend result that fails the Runtime contract is itself a
-            // terminal failure. Returning early here used to leave the
-            // durable Agent projection at `running` even though the owning
-            // graph had already failed the node. Preserve consumed usage for
-            // budget truth, but bind the failed result back to the canonical
-            // task identity before committing its terminal snapshot.
             let missing_acceptance = packet
                 .acceptance
                 .iter()
@@ -875,24 +869,18 @@ impl AgentRuntime {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let mut failed = failed_return(
-                &packet,
-                format!(
-                    "Runtime rejected Agent terminal result: {error}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_evidence_count={}; unresolved_obligations={:?}",
-                    returned.runtime_change_receipts.len(),
-                    returned.observed_acceptance.observed_evidence.len(),
-                    returned.observed_acceptance.unresolved_obligation_ids,
-                ),
-            );
-            failed.input_tokens = returned.input_tokens;
-            failed.output_tokens = returned.output_tokens;
-            failed.cached_tokens = returned.cached_tokens;
-            failed.model = returned.model.clone();
-            failed.provider = returned.provider.clone();
-            failed.tool_calls = returned.tool_calls;
-            failed.duplicate_tool_calls = returned.duplicate_tool_calls;
-            failed.runtime_write_attempt_paths = returned.runtime_write_attempt_paths.clone();
-            returned = failed;
+            // A backend result that fails the Runtime contract is a terminal
+            // failure, but committed effects, observed evidence, artifacts
+            // and the Runtime acceptance evaluation are facts that must
+            // survive the verdict. They are never rewritten to empty.
+            returned.status = AgentTerminalStatus::Failed;
+            returned.outcome.clear();
+            returned.failure = Some(format!(
+                "Runtime rejected Agent terminal result: {error}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_evidence_count={}; unresolved_obligations={:?}",
+                returned.runtime_change_receipts.len(),
+                returned.observed_acceptance.observed_evidence.len(),
+                returned.observed_acceptance.unresolved_obligation_ids,
+            ));
         }
         let mut terminal = self.get(packet.agent_id()).ok_or_else(|| {
             format!(
