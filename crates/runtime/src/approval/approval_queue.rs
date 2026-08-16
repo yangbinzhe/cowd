@@ -832,28 +832,66 @@ impl ApprovalQueue {
             },
             grant_id: None,
         };
-        self.event_store
-            .append_batch_if_revision(
-                stream_id.clone(),
-                revision,
-                format!("approval-timeout:{}", request.approval_id),
-                vec![RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::Approval,
-                    kind: "approval.timed_out".to_string(),
-                    status: Some(next_status.as_str().to_string()),
-                    actor: Some("approval_queue".to_string()),
-                    refs: approval_source_refs(&request.source),
-                    payload: serde_json::json!({
-                        "schema_version": 2,
-                        "timeout_policy": request.timeout_policy,
-                        "message": receipt.message,
-                        "resolved_at_ms": resolved_at_ms,
+        let (event_kind, marker_key, marker_status, extra_payload) =
+            if next_status == GlobalApprovalStatus::Pending {
+                (
+                    "approval.deadline_elapsed.manual_hold",
+                    format!(
+                        "approval:{}:deadline_elapsed:manual_hold",
+                        request.approval_id
+                    ),
+                    "pending".to_string(),
+                    serde_json::json!({
+                        "expires_at_ms": request.expires_at_ms,
+                        "manual_hold": true,
                     }),
+                )
+            } else {
+                (
+                    "approval.timed_out",
+                    format!("approval-timeout:{}", request.approval_id),
+                    next_status.as_str().to_string(),
+                    serde_json::json!({}),
+                )
+            };
+        if self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &marker_key)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            let mut payload = serde_json::json!({
+                "schema_version": 2,
+                "timeout_policy": request.timeout_policy,
+                "message": receipt.message,
+                "resolved_at_ms": resolved_at_ms,
+            });
+            if let serde_json::Value::Object(ref mut object) = payload {
+                if let serde_json::Value::Object(extra) = extra_payload {
+                    object.extend(extra);
                 }
-                .into()],
-            )
-            .map_err(|error| error.to_string())?;
+            }
+            self.event_store
+                .append_batch_if_revision(
+                    stream_id.clone(),
+                    revision,
+                    marker_key.clone(),
+                    vec![RuntimeTransactionEventInput {
+                        event: RuntimeEventInput {
+                            stream_id,
+                            scope: RuntimeEventScope::Approval,
+                            kind: event_kind.to_string(),
+                            status: Some(marker_status),
+                            actor: Some("approval_queue".to_string()),
+                            refs: approval_source_refs(&request.source),
+                            payload,
+                        },
+                        idempotency_key: Some(marker_key.clone()),
+                        schema_version: 1,
+                    }],
+                )
+                .map_err(|error| error.to_string())?;
+        }
         request.status = next_status;
         request.resolved_at_ms = resolved_at_ms;
         request.decision =
@@ -2133,6 +2171,57 @@ mod tests {
             .expect("timeout alternative");
         assert_eq!(receipt.status, GlobalApprovalStatus::TimedOut);
         assert!(receipt.message.contains("alternative"));
+    }
+
+    #[test]
+    fn pending_hold_writes_typed_deadline_elapsed_marker_without_terminalizing() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let queue = ApprovalQueue::new(store.clone());
+        let held = queue
+            .submit(SubmitGlobalApprovalRequest {
+                source: session_source(),
+                context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
+                action: "critical-hold".to_string(),
+                summary: "stays actionable after deadline".to_string(),
+                risk: TaskRisk::Critical,
+                evidence_refs: Vec::new(),
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .expect("held approval");
+
+        let receipt = queue.timeout(&held.approval_id).expect("deadline passes");
+        assert_eq!(receipt.status, GlobalApprovalStatus::Pending);
+        assert_eq!(
+            queue
+                .get(&held.approval_id)
+                .expect("request remains hot")
+                .status,
+            GlobalApprovalStatus::Pending
+        );
+        let stream_id = format!("approval:{}", held.approval_id);
+        let marker = store
+            .event_by_idempotency_key(
+                &stream_id,
+                &format!("approval:{}:deadline_elapsed:manual_hold", held.approval_id),
+            )
+            .expect("marker read")
+            .expect("typed manual-hold marker persisted");
+        assert_eq!(marker.kind, "approval.deadline_elapsed.manual_hold");
+        assert_eq!(marker.status.as_deref(), Some("pending"));
+
+        let again = queue.timeout(&held.approval_id).expect("replay timeout");
+        assert_eq!(again.status, GlobalApprovalStatus::Pending);
+        let events = store.list_stream(&stream_id).expect("stream");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "approval.deadline_elapsed.manual_hold")
+                .count(),
+            1,
+            "manual-hold marker must be idempotent across deadline replays"
+        );
     }
 
     #[test]
