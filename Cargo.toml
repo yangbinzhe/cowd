@@ -74,7 +74,7 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.9.697"
+version = "0.9.698"
 edition = "2021"
 license = "MIT"
 publish = false
