@@ -34,6 +34,22 @@ pub enum ExecutionWorkRole {
     Verify,
 }
 
+/// A typed dependency predicate. It consumes only Runtime-attested terminal
+/// facts; it must not degrade into a presentation boolean or an arbitrary
+/// evidence count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DependencyPredicate {
+    EvidenceReady {
+        minimum: u16,
+        required_fact_kinds: Vec<String>,
+        accepted_execution_statuses: Vec<String>,
+        accepted_acceptance_verdicts: Vec<String>,
+        #[serde(default)]
+        require_committed_effect: bool,
+    },
+}
+
 /// Readiness rule applied to one node's `DependsOn` predecessors.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -46,6 +62,12 @@ pub enum ExecutionDependencyPolicy {
     },
     Quorum {
         minimum: u16,
+        #[serde(default)]
+        cancel_remaining: bool,
+    },
+    /// Ready once enough predecessors satisfy the attached typed predicate.
+    EvidenceReady {
+        predicate: DependencyPredicate,
         #[serde(default)]
         cancel_remaining: bool,
     },
@@ -62,6 +84,9 @@ impl ExecutionDependencyPolicy {
             Self::All => false,
             Self::Any { cancel_remaining }
             | Self::Quorum {
+                cancel_remaining, ..
+            } => *cancel_remaining,
+            Self::EvidenceReady {
                 cancel_remaining, ..
             } => *cancel_remaining,
             Self::Finally => false,

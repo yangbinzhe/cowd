@@ -8,10 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::EvidenceAccessRef;
 
+pub mod binding;
 pub mod definition;
 pub mod instantiation;
 
 pub use crate::evaluation::EvaluationContract as TeamEvaluationContract;
+pub use binding::{
+    AgentDisplayIdentity, DeliveryStatus, TeamBindingSnapshot, TeamDisplayIdentity,
+    TeamLifecycleState, TeamRoleBehaviorContract, TeamRoleBindingSnapshot,
+};
 pub use definition::{
     RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDefinition,
     TeamRoleDependency, TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest,

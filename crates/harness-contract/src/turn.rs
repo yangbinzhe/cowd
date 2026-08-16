@@ -228,6 +228,21 @@ pub struct SessionHandoff {
     pub task_route_hint: Option<crate::task::TaskRouteHint>,
 }
 
+/// Binds a follow-up turn to a prior durable team set with CAS and digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationContinuationBinding {
+    pub source_session_id: String,
+    pub source_turn_id: String,
+    pub source_root_id: String,
+    pub team_set_ref: String,
+    pub delivery_revision: u64,
+    pub result_refs: Vec<String>,
+    pub current_ingress: String,
+    pub candidate_revision: u64,
+    pub binding_digest: String,
+    pub authorized: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionDispatchAction {

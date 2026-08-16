@@ -340,6 +340,16 @@ pub enum ApprovalTimeoutPolicy {
     AutoApproveOnce,
 }
 
+/// Deadline state distinguishes an elapsed-but-manually-held pending approval
+/// from a true terminal timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDeadlineState {
+    WithinWindow,
+    DeadlineElapsedManualHold,
+    TimedOut,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalProfile {

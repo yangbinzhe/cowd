@@ -437,6 +437,27 @@ fn validate_proposal(
                     reject(status, findings, "cancelling_dependency_requires_group");
                 }
             }
+            ExecutionDependencyPolicy::EvidenceReady {
+                ref predicate,
+                cancel_remaining,
+            } => {
+                let minimum = match predicate {
+                    harness_contract::execution_graph::DependencyPredicate::EvidenceReady {
+                        minimum,
+                        ..
+                    } => *minimum,
+                };
+                if minimum == 0 || usize::from(minimum) > predecessor_instances {
+                    reject(
+                        status,
+                        findings,
+                        "evidence_ready_dependency_is_out_of_range",
+                    );
+                }
+                if cancel_remaining && node.cancellation_group.is_none() {
+                    reject(status, findings, "cancelling_dependency_requires_group");
+                }
+            }
         }
         for dependency in &node.depends_on {
             if ids.contains(dependency) {

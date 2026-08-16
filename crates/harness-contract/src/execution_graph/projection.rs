@@ -451,5 +451,10 @@ fn dependency_completion(
         ExecutionDependencyPolicy::Quorum { minimum, .. } => predecessor_completion
             .get(usize::from(minimum).saturating_sub(1))
             .copied(),
+        ExecutionDependencyPolicy::EvidenceReady { predicate, .. } => match &predicate {
+            super::DependencyPredicate::EvidenceReady { minimum, .. } => predecessor_completion
+                .get(usize::from(*minimum).saturating_sub(1))
+                .copied(),
+        },
     }
 }

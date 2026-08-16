@@ -123,6 +123,19 @@ pub fn validate_execution_graph(
                     ),
                 });
             }
+            ExecutionDependencyPolicy::EvidenceReady { ref predicate, .. } => {
+                let minimum = match predicate {
+                    super::DependencyPredicate::EvidenceReady { minimum, .. } => *minimum,
+                };
+                if minimum == 0 || usize::from(minimum) > predecessor_count {
+                    return Err(ExecutionGraphValidationError::InvalidDependencyPolicy {
+                        node_id: node.id.clone(),
+                        reason: format!(
+                            "evidence-ready minimum {minimum} exceeds {predecessor_count} dependencies"
+                        ),
+                    });
+                }
+            }
             ExecutionDependencyPolicy::Any { .. } | ExecutionDependencyPolicy::Quorum { .. } => {}
         }
         if !work.required

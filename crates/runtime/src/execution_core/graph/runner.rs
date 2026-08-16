@@ -1722,6 +1722,12 @@ fn dependency_target(
         ExecutionDependencyPolicy::All | ExecutionDependencyPolicy::Finally => predecessors.len(),
         ExecutionDependencyPolicy::Any { .. } => 1,
         ExecutionDependencyPolicy::Quorum { minimum, .. } => usize::from(*minimum),
+        ExecutionDependencyPolicy::EvidenceReady { predicate, .. } => match predicate {
+            harness_contract::execution_graph::DependencyPredicate::EvidenceReady {
+                minimum,
+                ..
+            } => usize::from(*minimum),
+        },
     };
     if completed >= required {
         Some(ExecutionNodeStatus::Ready)
