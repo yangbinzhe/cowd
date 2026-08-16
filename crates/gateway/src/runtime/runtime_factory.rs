@@ -159,6 +159,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         execution_identity: None,
         execution_lineage: None,
         execution_parent: None,
+        execution_role: runtime::TurnExecutionRole::RootTurn,
         runtime_services,
     })
     .map_err(std::io::Error::other)?;

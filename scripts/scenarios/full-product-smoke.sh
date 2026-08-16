@@ -34,12 +34,12 @@ curl() {
 }
 
 cleanup() {
+  if command -v tmux >/dev/null 2>&1; then
+    tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
+  fi
   if [[ "$FAILED" == "1" && "${COWD_RELEASE_SMOKE_KEEP_TMP:-}" == "1" ]]; then
     echo "preserving release smoke temp dir: $TMP_DIR" >&2
     return
-  fi
-  if command -v tmux >/dev/null 2>&1; then
-    tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
   fi
   rm -rf "$TMP_DIR"
 }
@@ -156,6 +156,8 @@ memory:
     sqlite_path: "$TMP_DIR/memory.db"
     blob_dir: "$TMP_DIR/blobs"
     enable_vector_index: false
+storage:
+  backend: sqlite
 gateway:
   enabled: true
   sessionReset: "none"
@@ -214,7 +216,7 @@ curl -fsS "$BASE_URL/api/mission/control" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); receipt=data.get("receipt",{}); assert receipt.get("status") == "accepted" and receipt.get("result",{}).get("mission",{}).get("mission_id") == sys.argv[1], data' "$MISSION_ID"
 curl -fsS -X POST "$BASE_URL/api/tasks/start" \
   -H 'content-type: application/json' \
-  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"origin_session_id\":\"$SMOKE_ID\",\"origin_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"release full product smoke\",\"yolo_mode\":true}" \
+  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"origin_session_id\":\"$SMOKE_ID\",\"origin_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"release full product smoke\"}" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert data.get("task_id") == sys.argv[1] and data.get("mission_id") == sys.argv[2] and data.get("status") == "running", data' "$TASK_ID" "$MISSION_ID"
 curl -fsS "$BASE_URL/api/runtime/snapshot" \
   | python3 -c 'import json,sys; data=json.load(sys.stdin); assert sys.argv[1] in (data.get("sessions") or []), data' "$SMOKE_ID"
@@ -249,7 +251,7 @@ curl -fsS "$BASE_URL/api/matrix/evidence/build" \
   -d "{\"request_id\":\"release-smoke-evidence\",\"session_id\":\"$SMOKE_ID\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"Release smoke validates structured evidence and outcome timeline\"}" \
   | rg -q '"kind":"matrix.evidence.packet"'
 curl -fsS "$BASE_URL/api/runtime/timeline?session_id=$SMOKE_ID&limit=200" \
-  | rg -q '"kind":"application.execution_outcome"'
+  | python3 -c 'import json,sys; events=json.load(sys.stdin).get("events", []); assert any(e.get("kind")=="runtime.outcome.recorded.v1" and e.get("status")=="succeeded" for e in events), events; assert any(e.get("kind")=="application.execution_summary" for e in events), events'
 
 release_gate_json="$(curl -fsS "$BASE_URL/api/cowd/release-gate")"
 printf '%s' "$release_gate_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); checks={item.get("check_id"): item.get("status") for item in data.get("checks", [])}; assert data.get("status")=="pass", data; required=["structured_data.indexes.ready","structured_data.watermark.persistent","execution_outcome.timeline.available"]; missing=[item for item in required if checks.get(item)!="pass"]; assert not missing, f"release gate checks not passing: {missing}"'

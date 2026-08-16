@@ -403,6 +403,7 @@ impl TeamInstantiationService {
                         },
                     ),
                     required_acceptance,
+                    output_acceptance: acceptance_contract,
                     acceptance: slot_acceptance,
                     constraints: vec![
                         format!("team_template:{}@{}", template.revision.revision_ref.template_id.as_str(), template.revision.revision_ref.revision),
@@ -426,12 +427,6 @@ impl TeamInstantiationService {
                         format!(
                             "focus_output_acceptance:{}",
                             focus_partition.output_acceptance.join(", ")
-                        ),
-                        format!(
-                            "team_acceptance_contract:{}",
-                            serde_json::to_string(&acceptance_contract).map_err(|error| {
-                                format!("encode Team acceptance contract: {error}")
-                            })?
                         ),
                         "nested_orchestration:forbidden".to_string(),
                         "parent_merge:exactly_once".to_string(),

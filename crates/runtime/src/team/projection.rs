@@ -25,16 +25,27 @@ pub struct TeamProjectionQuarantine {
     pub evidence_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamProjectionCursor {
+    pub commit_cursor: u64,
+    pub graph_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamProjectionPage {
+    pub teams: Vec<TeamProjection>,
+    pub next_cursor: Option<TeamProjectionCursor>,
+}
+
 /// Read-only Team facade. The graph and AgentRuntime are the sources of truth.
 pub struct TeamProjectionReader {
     graphs: ExecutionGraphStateStore,
-    agents: Arc<AgentRuntime>,
 }
 
 impl TeamProjectionReader {
     #[must_use]
-    pub fn new(graphs: ExecutionGraphStateStore, agents: Arc<AgentRuntime>) -> Self {
-        Self { graphs, agents }
+    pub fn new(graphs: ExecutionGraphStateStore, _agents: Arc<AgentRuntime>) -> Self {
+        Self { graphs }
     }
 
     pub fn project(&self, graph_id: &str) -> Result<TeamProjection, String> {
@@ -47,7 +58,43 @@ impl TeamProjectionReader {
 
     pub fn list(&self) -> Result<Vec<TeamProjection>, String> {
         let mut projections = Vec::new();
-        for graph_id in self.graphs.graph_ids().map_err(|error| error.to_string())? {
+        let mut cursor = None;
+        loop {
+            let page = self.list_page(cursor, 256)?;
+            projections.extend(page.teams);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        projections.sort_by(|left, right| left.graph_id.cmp(&right.graph_id));
+        Ok(projections)
+    }
+
+    pub fn list_page(
+        &self,
+        after: Option<TeamProjectionCursor>,
+        limit: usize,
+    ) -> Result<TeamProjectionPage, String> {
+        let limit = limit.clamp(1, 512);
+        let graph_page = self
+            .graphs
+            .graph_ids_page(
+                after.map(|cursor| (cursor.commit_cursor, cursor.graph_id)),
+                limit,
+            )
+            .map_err(|error| error.to_string())?;
+        let next_cursor = (graph_page.len() == limit).then(|| {
+            let (graph_id, commit_cursor) = graph_page
+                .last()
+                .expect("a full graph page has a terminal cursor");
+            TeamProjectionCursor {
+                commit_cursor: *commit_cursor,
+                graph_id: graph_id.clone(),
+            }
+        });
+        let mut projections = Vec::new();
+        for (graph_id, _) in graph_page {
             if self
                 .graphs
                 .team_projection_quarantine(&graph_id)
@@ -89,30 +136,54 @@ impl TeamProjectionReader {
             }
         }
         projections.sort_by(|left, right| left.graph_id.cmp(&right.graph_id));
-        Ok(projections)
+        Ok(TeamProjectionPage {
+            teams: projections,
+            next_cursor,
+        })
     }
 
     pub fn quarantined(&self) -> Result<Vec<TeamProjectionQuarantine>, String> {
         let mut quarantined = Vec::new();
-        for graph_id in self.graphs.graph_ids().map_err(|error| error.to_string())? {
-            let Some(value) = self
+        let mut cursor = None;
+        loop {
+            let graph_page = self
                 .graphs
-                .team_projection_quarantine(&graph_id)
-                .map_err(|error| error.to_string())?
-            else {
-                continue;
-            };
-            quarantined.push(TeamProjectionQuarantine {
-                graph_id,
-                reason: value["reason"]
-                    .as_str()
-                    .unwrap_or("invalid Team graph")
-                    .to_string(),
-                evidence_id: value["evidence_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
-            });
+                .graph_ids_page(
+                    cursor.take().map(|cursor: TeamProjectionCursor| {
+                        (cursor.commit_cursor, cursor.graph_id)
+                    }),
+                    256,
+                )
+                .map_err(|error| error.to_string())?;
+            for (graph_id, _) in &graph_page {
+                let Some(value) = self
+                    .graphs
+                    .team_projection_quarantine(graph_id)
+                    .map_err(|error| error.to_string())?
+                else {
+                    continue;
+                };
+                quarantined.push(TeamProjectionQuarantine {
+                    graph_id: graph_id.clone(),
+                    reason: value["reason"]
+                        .as_str()
+                        .unwrap_or("invalid Team graph")
+                        .to_string(),
+                    evidence_id: value["evidence_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+            if graph_page.len() < 256 {
+                break;
+            }
+            cursor = graph_page
+                .last()
+                .map(|(graph_id, commit_cursor)| TeamProjectionCursor {
+                    commit_cursor: *commit_cursor,
+                    graph_id: graph_id.clone(),
+                });
         }
         quarantined.sort_by(|left, right| left.graph_id.cmp(&right.graph_id));
         Ok(quarantined)
@@ -153,7 +224,7 @@ impl TeamProjectionReader {
             } else {
                 session_id = Some(packet.session_id().to_string());
             }
-            let returned = self.agents.terminal_return(packet.agent_id());
+            let durable_result = graph.node_results.get(&node.id);
             tasks.push(TeamTaskTrace {
                 task_id: packet.task_id().to_string(),
                 role_id: node.id.rsplit(':').next().unwrap_or_default().to_string(),
@@ -169,8 +240,10 @@ impl TeamProjectionReader {
                     .node_results
                     .get(&node.id)
                     .and_then(|result| result.result_ref.clone()),
-                evidence_refs: returned.map(|item| item.evidence_refs).unwrap_or_default(),
-                failure: graph.node_results.get(&node.id).and_then(|result| {
+                evidence_refs: durable_result
+                    .map(|result| result.evidence_refs.clone())
+                    .unwrap_or_default(),
+                failure: durable_result.and_then(|result| {
                     result
                         .failure
                         .as_ref()

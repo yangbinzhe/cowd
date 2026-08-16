@@ -787,6 +787,7 @@ impl AgentBindingSnapshot {
             expected_graph_revision: intent.expected_graph_revision,
             objective: intent.objective,
             required_acceptance,
+            output_acceptance: intent.output_acceptance,
             acceptance: intent.acceptance,
             constraints: intent.constraints,
             context_refs: intent.context_refs,

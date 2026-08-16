@@ -262,6 +262,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 criteria: acceptance.clone(),
                 evidence_obligations: Vec::new(),
             },
+            output_acceptance: Vec::new(),
             acceptance,
             constraints,
             context_refs: self.request.context_refs.clone(),

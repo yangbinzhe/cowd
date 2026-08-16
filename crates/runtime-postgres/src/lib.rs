@@ -1668,6 +1668,51 @@ impl RuntimeEventStoreBackend for PostgresRuntimeEventStore {
         rows.into_iter().map(|row| pg(row.try_get(0))).collect()
     }
 
+    fn stream_ids_for_scope_kind_at_sequence_page(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<(String, u64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sequence = to_i64(sequence, "runtime event sequence")?;
+        let limit = to_i64(limit as u64, "stream page limit")?;
+        let mut connection = self.checkout_event_read()?;
+        let rows = match after {
+            Some((after_cursor, after_stream_id)) => pg(connection.query(
+                "SELECT stream_id, commit_cursor FROM runtime_events
+                 WHERE scope=$1 AND kind=$2 AND sequence=$3
+                   AND (commit_cursor > $4 OR (commit_cursor = $4 AND stream_id > $5))
+                 ORDER BY commit_cursor ASC, stream_id ASC LIMIT $6",
+                &[
+                    &scope.as_str(),
+                    &kind,
+                    &sequence,
+                    &to_i64(after_cursor, "stream page cursor")?,
+                    &after_stream_id,
+                    &limit,
+                ],
+            )),
+            None => pg(connection.query(
+                "SELECT stream_id, commit_cursor FROM runtime_events
+                 WHERE scope=$1 AND kind=$2 AND sequence=$3
+                 ORDER BY commit_cursor ASC, stream_id ASC LIMIT $4",
+                &[&scope.as_str(), &kind, &sequence, &limit],
+            )),
+        }?;
+        rows.into_iter()
+            .map(|row| {
+                let stream_id = pg(row.try_get::<_, String>(0))?;
+                let commit_cursor = pg(row.try_get::<_, i64>(1))?;
+                Ok((stream_id, commit_cursor.max(0) as u64))
+            })
+            .collect()
+    }
+
     fn latest_stream_statuses_for_scope_kind_at_sequence(
         &self,
         scope: RuntimeEventScope,

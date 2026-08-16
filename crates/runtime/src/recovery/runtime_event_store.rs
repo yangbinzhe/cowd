@@ -823,6 +823,17 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
         kind: &str,
         sequence: u64,
     ) -> RuntimeEventStoreResult<Vec<String>>;
+    /// Page canonical stream identifiers without materialising the complete
+    /// aggregate catalogue. The cursor is the last `(commit_cursor, stream_id)`
+    /// returned by the previous page.
+    fn stream_ids_for_scope_kind_at_sequence_page(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<(String, u64)>>;
     /// Return the latest status for canonical streams identified by one exact
     /// first-event predicate. Backends must answer this without loading event
     /// payloads or replaying the streams.
@@ -1368,6 +1379,18 @@ impl RuntimeEventStore {
     ) -> RuntimeEventStoreResult<Vec<String>> {
         self.backend
             .stream_ids_for_scope_kind_at_sequence(scope, kind, sequence)
+    }
+
+    pub fn stream_ids_for_scope_kind_at_sequence_page(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<(String, u64)>> {
+        self.backend
+            .stream_ids_for_scope_kind_at_sequence_page(scope, kind, sequence, after, limit)
     }
 
     pub fn latest_stream_statuses_for_scope_kind_at_sequence(
@@ -2538,6 +2561,52 @@ impl SqliteRuntimeEventStore {
         Ok(stream_ids)
     }
 
+    pub fn stream_ids_for_scope_kind_at_sequence_page(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<(String, u64)>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sequence = i64::try_from(sequence).map_err(|_| {
+            RuntimeEventStoreError::Corrupt(format!(
+                "runtime event sequence `{sequence}` exceeds SQLite range"
+            ))
+        })?;
+        let (after_cursor, after_stream_id) = after.unwrap_or_default();
+        let conn = self.checkout_event_connection()?;
+        let mut statement = conn.prepare(
+            "SELECT stream_id, commit_cursor FROM runtime_events
+             WHERE scope = ?1 AND kind = ?2 AND sequence = ?3
+               AND (?4 = 0 OR commit_cursor > ?4
+                    OR (commit_cursor = ?4 AND stream_id > ?5))
+             ORDER BY commit_cursor ASC, stream_id ASC LIMIT ?6",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    scope.as_str(),
+                    kind,
+                    sequence,
+                    after_cursor as i64,
+                    after_stream_id,
+                    limit as i64
+                ],
+                |row| {
+                    let stream_id = row.get::<_, String>(0)?;
+                    let commit_cursor = row.get::<_, i64>(1)?;
+                    Ok((stream_id, commit_cursor.max(0) as u64))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RuntimeEventStoreError::from)?;
+        Ok(rows)
+    }
+
     pub fn stream_ids_for_scope_kind_at_sequence(
         &self,
         scope: RuntimeEventScope,
@@ -3398,6 +3467,17 @@ impl RuntimeEventStoreBackend for SqliteRuntimeEventStore {
         sequence: u64,
     ) -> RuntimeEventStoreResult<Vec<String>> {
         Self::stream_ids_for_scope_kind_at_sequence(self, scope, kind, sequence)
+    }
+
+    fn stream_ids_for_scope_kind_at_sequence_page(
+        &self,
+        scope: RuntimeEventScope,
+        kind: &str,
+        sequence: u64,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> RuntimeEventStoreResult<Vec<(String, u64)>> {
+        Self::stream_ids_for_scope_kind_at_sequence_page(self, scope, kind, sequence, after, limit)
     }
 
     fn latest_stream_statuses_for_scope_kind_at_sequence(

@@ -641,6 +641,7 @@ fn compile_agent_node(
             criteria: semantic.evidence_contract.clone(),
             evidence_obligations: Vec::new(),
         },
+        output_acceptance: Vec::new(),
         acceptance: semantic.evidence_contract.clone(),
         constraints: focus
             .map(|focus| {

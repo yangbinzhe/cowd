@@ -17,9 +17,9 @@ use crate::{
     ExecutionGraphStateStore, ExpectedStreamRevision, LegacyTeamImportReport,
     LegacyTeamProfileMigrationReport, MissionRuntime, RuntimeDefinitionRegistry, RuntimeEventInput,
     RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeExecutionSupervisor,
-    RuntimeTransactionEventInput, TaskRuntimePort, TeamProjection, TeamProjectionReader,
-    TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStatePublishRequest,
-    TeamWorkingStateReadRequest, TeamWorkingStateVisibility,
+    RuntimeTransactionEventInput, TaskRuntimePort, TeamProjection, TeamProjectionCursor,
+    TeamProjectionPage, TeamProjectionReader, TeamWorkingState, TeamWorkingStateEntry,
+    TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest, TeamWorkingStateVisibility,
 };
 
 pub struct TeamRuntime {
@@ -697,6 +697,14 @@ impl TeamRuntime {
     /// Team projections.
     pub fn list(&self) -> Result<Vec<TeamProjection>, String> {
         self.projection.list()
+    }
+
+    pub fn list_page(
+        &self,
+        after: Option<TeamProjectionCursor>,
+        limit: usize,
+    ) -> Result<TeamProjectionPage, String> {
+        self.projection.list_page(after, limit)
     }
 
     #[must_use]

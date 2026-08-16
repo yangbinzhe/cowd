@@ -397,6 +397,7 @@ mod tests {
             policy_revision: 1,
             objective: "wait for cancellation".into(),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),

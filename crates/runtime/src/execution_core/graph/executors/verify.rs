@@ -177,15 +177,21 @@ impl NodeExecutor for VerifyNodeExecutor {
                                     )
                         })
                     });
-                    let typed_requirements = packet
-                        .constraints
-                        .iter()
-                        .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
-                        .and_then(|value| {
-                            serde_json::from_str::<
-                                Vec<harness_contract::team::TeamAcceptanceRequirement>,
-                            >(value)
-                            .ok()
+                    let typed_requirements = (!packet.output_acceptance.is_empty())
+                        .then(|| packet.output_acceptance.clone())
+                        .or_else(|| {
+                            packet
+                                .constraints
+                                .iter()
+                                .find_map(|constraint| {
+                                    constraint.strip_prefix("team_acceptance_contract:")
+                                })
+                                .and_then(|value| {
+                                    serde_json::from_str::<
+                                        Vec<harness_contract::team::TeamAcceptanceRequirement>,
+                                    >(value)
+                                    .ok()
+                                })
                         })
                         .filter(|requirements| {
                             requirements.len() == packet.acceptance.len()

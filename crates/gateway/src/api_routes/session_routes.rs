@@ -1964,6 +1964,22 @@ async fn cancel_session_turn_handler(
             .is_some_and(|live| {
                 live.status == harness_contract::projection::ExecutionLiveStatus::Cancelled
             });
+    if !intent.execution_id.is_empty() {
+        runtime_services
+            .cancel_execution_tree(
+                &intent.execution_id,
+                "Session cancellation propagated through durable execution lineage",
+            )
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("failed to cancel descendant execution graphs: {error}"),
+                    }),
+                )
+            })?;
+    }
     let mut receipt = intent;
     receipt.effective_at_ms = Some(session_route_now_ms());
     receipt.status = if cancellation_won {

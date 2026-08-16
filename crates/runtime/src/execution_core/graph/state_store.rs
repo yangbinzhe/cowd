@@ -217,6 +217,22 @@ impl ExecutionGraphStateStore {
             .map_err(ExecutionStateStoreError::EventStore)
     }
 
+    pub fn graph_ids_page(
+        &self,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>, ExecutionStateStoreError> {
+        self.event_store
+            .stream_ids_for_scope_kind_at_sequence_page(
+                RuntimeEventScope::ExecutionGraph,
+                "execution_graph.planned",
+                1,
+                after,
+                limit,
+            )
+            .map_err(ExecutionStateStoreError::EventStore)
+    }
+
     pub async fn graph_ids_async(&self) -> Result<Vec<String>, ExecutionStateStoreError> {
         let store = self.clone();
         tokio::task::spawn_blocking(move || store.graph_ids())

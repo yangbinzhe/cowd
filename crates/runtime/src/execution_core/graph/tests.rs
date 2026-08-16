@@ -771,6 +771,7 @@ fn agent_intent_payload(graph_id: &str, node_id: &str, deadline_at_ms: u64) -> S
         expected_graph_revision: 0,
         objective: format!("execute {node_id}"),
         required_acceptance: Default::default(),
+        output_acceptance: Vec::new(),
         acceptance: Vec::new(),
         constraints: Vec::new(),
         context_refs: Vec::new(),
@@ -904,6 +905,7 @@ async fn two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota
             expected_graph_revision: 0,
             objective: format!("execute root Team {index}"),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -2624,4 +2626,34 @@ fn graph_enumeration_excludes_legacy_non_graph_execution_scope_streams() {
             .expect("nonterminal graph ids"),
         vec![graph.id]
     );
+}
+
+#[test]
+fn team_projection_is_cursor_paginated_without_graph_ids_full_scan() {
+    let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
+    let commits = ExecutionCommitService::new(Arc::clone(&event_store));
+    let mut expected = Vec::new();
+    for objective in ["team page one", "team page two", "team page three"] {
+        let mut graph = test_graph(objective);
+        graph.nodes.push(node(objective));
+        expected.push(
+            commits
+                .register_graph(graph)
+                .expect("graph registers")
+                .graph
+                .id,
+        );
+    }
+    let state = ExecutionGraphStateStore::new(event_store);
+    let first = state.graph_ids_page(None, 2).expect("first page");
+    assert_eq!(
+        first.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        expected.iter().take(2).collect::<Vec<_>>()
+    );
+    let (last_id, last_cursor) = first.last().expect("first page cursor");
+    let second = state
+        .graph_ids_page(Some((*last_cursor, last_id.clone())), 2)
+        .expect("second page");
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].0, expected[2]);
 }

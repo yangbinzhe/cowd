@@ -176,6 +176,9 @@ pub(crate) fn required_acceptance_for_packet(
     packet: &AgentTaskPacket,
     resolver: &crate::path_identity::WorkspacePathIdentityResolver,
 ) -> RequiredAcceptance {
+    if !packet.required_acceptance.is_empty() {
+        return packet.required_acceptance.clone();
+    }
     let mut scopes = Vec::new();
     for constraint in &packet.constraints {
         if let Some(value) = constraint.strip_prefix("focus_output_acceptance:") {
@@ -193,49 +196,54 @@ pub(crate) fn required_acceptance_for_packet(
                     }),
             );
         }
-        if let Some(value) = constraint.strip_prefix("team_acceptance_contract:") {
-            let requirements = serde_json::from_str::<
-                Vec<harness_contract::team::TeamAcceptanceRequirement>,
-            >(value)
-            .unwrap_or_default();
-            for requirement in requirements {
-                use harness_contract::team::TeamAcceptanceCheck;
-                match requirement.check {
-                    TeamAcceptanceCheck::ScopedEvidence { scopes: required }
-                    | TeamAcceptanceCheck::LegacyEvidenceBound { scopes: required } => scopes
-                        .extend(required.into_iter().map(|scope| {
-                            if scope == "network:*" || scope.contains(':') {
-                                scope
-                            } else {
-                                format!("read:{scope}")
-                            }
-                        })),
-                    TeamAcceptanceCheck::WorkspaceChange {
-                        scopes: required, ..
-                    } => scopes.extend(required.into_iter().map(|scope| {
-                        if scope.contains(':') {
-                            scope
-                        } else {
-                            format!("write:{scope}")
-                        }
-                    })),
-                    TeamAcceptanceCheck::SourceVerification { scopes: required } => {
-                        for scope in required {
-                            let path = scope.strip_prefix("write:").unwrap_or(&scope).to_string();
-                            scopes.push(format!("write:{path}"));
-                            scopes.push(format!("verify_after_write:{path}"));
-                        }
+    }
+    let requirements = if packet.output_acceptance.is_empty() {
+        packet
+            .constraints
+            .iter()
+            .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or_default()
+    } else {
+        packet.output_acceptance.clone()
+    };
+    for requirement in requirements {
+        use harness_contract::team::TeamAcceptanceCheck;
+        match requirement.check {
+            TeamAcceptanceCheck::ScopedEvidence { scopes: required }
+            | TeamAcceptanceCheck::LegacyEvidenceBound { scopes: required } => {
+                scopes.extend(required.into_iter().map(|scope| {
+                    if scope == "network:*" || scope.contains(':') {
+                        scope
+                    } else {
+                        format!("read:{scope}")
                     }
-                    TeamAcceptanceCheck::UpstreamReview => scopes.extend(
-                        packet
-                            .constraints
-                            .iter()
-                            .filter_map(|value| value.strip_prefix("upstream_change_scope:"))
-                            .map(|value| format!("verify_upstream_change:{value}")),
-                    ),
-                    TeamAcceptanceCheck::StructuredField { .. }
-                    | TeamAcceptanceCheck::UpstreamEvidence => {}
+                }))
+            }
+            TeamAcceptanceCheck::WorkspaceChange {
+                scopes: required, ..
+            } => scopes.extend(required.into_iter().map(|scope| {
+                if scope.contains(':') {
+                    scope
+                } else {
+                    format!("write:{scope}")
                 }
+            })),
+            TeamAcceptanceCheck::SourceVerification { scopes: required } => {
+                for scope in required {
+                    let path = scope.strip_prefix("write:").unwrap_or(&scope).to_string();
+                    scopes.push(format!("write:{path}"));
+                    scopes.push(format!("verify_after_write:{path}"));
+                }
+            }
+            TeamAcceptanceCheck::UpstreamReview => scopes.extend(
+                packet
+                    .constraints
+                    .iter()
+                    .filter_map(|value| value.strip_prefix("upstream_change_scope:"))
+                    .map(|value| format!("verify_upstream_change:{value}")),
+            ),
+            TeamAcceptanceCheck::StructuredField { .. } | TeamAcceptanceCheck::UpstreamEvidence => {
             }
         }
     }

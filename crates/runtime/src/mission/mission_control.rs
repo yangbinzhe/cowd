@@ -28,7 +28,29 @@ impl MissionControlRuntime {
         active_session_id: Option<String>,
         selected_mission_id: Option<String>,
     ) -> MissionControlProjection {
-        build_projection(services, sessions, active_session_id, selected_mission_id)
+        build_projection(
+            services,
+            sessions,
+            active_session_id,
+            selected_mission_id,
+            true,
+        )
+    }
+
+    #[must_use]
+    pub fn summary_projection(
+        services: &RuntimeServices,
+        sessions: Vec<MissionControlSessionNode>,
+        active_session_id: Option<String>,
+        selected_mission_id: Option<String>,
+    ) -> MissionControlProjection {
+        build_projection(
+            services,
+            sessions,
+            active_session_id,
+            selected_mission_id,
+            false,
+        )
     }
 }
 
@@ -37,6 +59,7 @@ fn build_projection(
     sessions: Vec<MissionControlSessionNode>,
     active_session_id: Option<String>,
     selected_mission_id: Option<String>,
+    include_execution_details: bool,
 ) -> MissionControlProjection {
     let mut mission_aggregates = services.mission_runtime().aggregates();
     mission_aggregates.sort_by(|left, right| {
@@ -175,8 +198,17 @@ fn build_projection(
         &selected_agent_ids,
         &unambiguous_session_ids,
     );
-    let execution_graphs =
-        mission_execution_graph_summary(services, &selected_graph_ids, &graph_bindings);
+    let execution_graphs = if include_execution_details {
+        mission_execution_graph_summary(services, &selected_graph_ids, &graph_bindings)
+    } else {
+        serde_json::json!({
+            "kind": "runtime.mission_execution_graphs",
+            "count": selected_graph_ids.len(),
+            "execution_graphs": [],
+            "relation_source": "task_lineage",
+            "detail": "summary",
+        })
+    };
     let relations = mission.relation_projection.clone();
     let conflicts = mission.conflict_projection.clone();
     let evidence = mission.evidence_projection.clone();
@@ -253,6 +285,7 @@ fn build_projection(
         &mission.schedule_projection,
         &conflicts,
         &event_digest,
+        include_execution_details,
     );
     let pending_organization_count = summary.pending_organization_count;
 
@@ -676,6 +709,7 @@ fn mission_graph(
     schedule_projection: &serde_json::Value,
     conflicts: &serde_json::Value,
     event_digest: &MissionControlEventDigest,
+    include_execution_details: bool,
 ) -> MissionControlGraphProjection {
     let mut nodes = BTreeMap::<String, MissionControlGraphNode>::new();
     let mut edges = BTreeMap::<String, MissionControlGraphEdge>::new();
@@ -764,7 +798,9 @@ fn mission_graph(
         if bound_mission_id != mission_id {
             continue;
         }
-        let graph = services.graph_state_store().projection(graph_id).ok();
+        let graph = include_execution_details
+            .then(|| services.graph_state_store().projection(graph_id).ok())
+            .flatten();
         let node_id = format!("execution:{graph_id}");
         let status = graph
             .as_ref()
@@ -917,7 +953,7 @@ fn mission_graph(
             },
         );
     }
-    for approval in approvals {
+    for approval in approvals.iter().filter(|_| include_execution_details) {
         let node_id = format!("approval:{}", approval.approval_id);
         insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
         nodes.insert(
@@ -943,6 +979,7 @@ fn mission_graph(
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|_| include_execution_details)
         .filter(|schedule| schedule["mission_id"].as_str() == Some(mission_id))
     {
         let Some(schedule_id) = schedule["schedule_id"].as_str() else {
@@ -970,7 +1007,11 @@ fn mission_graph(
             },
         );
     }
-    let conflict_count = conflict_receipts(conflicts).count();
+    let conflict_count = if include_execution_details {
+        conflict_receipts(conflicts).count()
+    } else {
+        0
+    };
     if conflict_count > 0 {
         let node_id = format!("conflict-summary:{mission_id}");
         insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
@@ -997,7 +1038,7 @@ fn mission_graph(
             },
         );
     }
-    if !event_digest.recovery_required.is_empty() {
+    if include_execution_details && !event_digest.recovery_required.is_empty() {
         let node_id = format!("recovery-summary:{mission_id}");
         insert_graph_edge(&mut edges, "contains", &mission_node_id, &node_id);
         nodes.insert(
@@ -1488,6 +1529,7 @@ mod tests {
                 }]
             }),
             &digest,
+            true,
         );
         assert!(graph
             .nodes

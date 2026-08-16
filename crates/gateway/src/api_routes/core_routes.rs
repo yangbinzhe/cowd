@@ -322,18 +322,26 @@ fn surface_repo_file_exists(relative: &str) -> bool {
 }
 
 async fn execution_outcome_timeline_available(state: &AppState) -> bool {
-    matches!(
-        state
-            .services
-            .session
-            .has_domain_event_kind("application.execution_outcome")
-            .await,
-        Ok(Some(true))
-    )
+    for kind in [
+        "application.execution_summary",
+        // Historical Session databases may still contain the pre-R4 projection.
+        "application.execution_outcome",
+    ] {
+        if matches!(
+            state.services.session.has_domain_event_kind(kind).await,
+            Ok(Some(true))
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_execution_outcome_event(event: &session::SessionDomainEvent) -> bool {
-    event.kind == "application.execution_outcome"
+    matches!(
+        event.kind.as_str(),
+        "application.execution_summary" | "application.execution_outcome"
+    )
 }
 
 async fn memory_context_bridge_available(state: &AppState) -> bool {
@@ -581,16 +589,26 @@ mod tests {
     }
 
     #[test]
-    fn release_gate_recognizes_application_execution_outcome() {
+    fn release_gate_recognizes_current_and_legacy_execution_outcomes() {
         let event = session::SessionDomainEvent::new(
             "session-1",
             1,
             session::SessionDomainScope::ApplicationTask,
-            "application.execution_outcome",
+            "application.execution_summary",
             serde_json::json!({"status": "succeeded"}),
             1,
         );
         assert!(is_execution_outcome_event(&event));
+
+        let legacy = session::SessionDomainEvent::new(
+            "session-1",
+            2,
+            session::SessionDomainScope::ApplicationTask,
+            "application.execution_outcome",
+            serde_json::json!({"status": "succeeded"}),
+            2,
+        );
+        assert!(is_execution_outcome_event(&legacy));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_contract::agent::{AgentTaskPacket, AgentTerminalStatus};
+use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage};
 
 use crate::execution_core::graph::executors::{SynthesizeBackend, SynthesizeBackendResolver};
@@ -10,33 +10,28 @@ use crate::execution_core::graph::{
 };
 use crate::AgentRuntime;
 
-/// Canonically reduces already-persisted protocol AgentRuntime returns.
+/// Canonically reduces already-persisted protocol graph node results.
 ///
 /// The reducer has no scheduling or graph mutation privilege. It validates
 /// each agent-to-graph binding and returns a single terminal candidate to the
 /// V3 commit path, exactly like every other node executor.
 pub struct ProtocolResultReducer {
     state_store: ExecutionGraphStateStore,
-    agents: Arc<AgentRuntime>,
 }
 
 impl ProtocolResultReducer {
     #[must_use]
-    pub fn new(state_store: ExecutionGraphStateStore, agents: Arc<AgentRuntime>) -> Self {
-        Self {
-            state_store,
-            agents,
-        }
+    pub fn new(state_store: ExecutionGraphStateStore, _agents: Arc<AgentRuntime>) -> Self {
+        Self { state_store }
     }
 }
 
 impl SynthesizeBackendResolver for ProtocolResultReducer {
     fn resolve(&self, ticket: &NodeExecutionTicket) -> Option<Arc<dyn SynthesizeBackend>> {
         ticket.payload_ref.starts_with("protocol:").then(|| {
-            Arc::new(Self::new(
-                self.state_store.clone(),
-                Arc::clone(&self.agents),
-            )) as Arc<dyn SynthesizeBackend>
+            Arc::new(Self {
+                state_store: self.state_store.clone(),
+            }) as Arc<dyn SynthesizeBackend>
         })
     }
 }
@@ -63,30 +58,19 @@ impl SynthesizeBackend for ProtocolResultReducer {
         }) {
             let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
                 .map_err(|_| format!("protocol node {} is not an AgentTask packet", node.id))?;
-            let returned = self
-                .agents
-                .terminal_return(packet.agent_id())
-                .ok_or_else(|| {
-                    format!(
-                        "protocol binding missing terminal AgentRuntime result for {}",
-                        packet.agent_id()
-                    )
-                })?;
-            if returned.run_id != packet.run_id()
-                || returned.graph_id != graph.id
-                || returned.node_id != node.id
-                || returned.attempt != packet.attempt
-                || returned.expected_graph_revision != packet.expected_graph_revision
-            {
-                return Err(format!(
-                    "protocol result binding mismatch for {}",
-                    packet.agent_id()
-                ));
-            }
-            usage.input_tokens = usage.input_tokens.saturating_add(returned.input_tokens);
-            usage.output_tokens = usage.output_tokens.saturating_add(returned.output_tokens);
-            usage.tool_calls = usage.tool_calls.saturating_add(returned.tool_calls);
-            evidence.extend(returned.evidence_refs.clone());
+            let result = graph
+                .node_results
+                .get(&node.id)
+                .ok_or_else(|| format!("protocol node {} has no durable result", node.id))?;
+            usage.input_tokens = usage.input_tokens.saturating_add(result.usage.input_tokens);
+            usage.output_tokens = usage
+                .output_tokens
+                .saturating_add(result.usage.output_tokens);
+            usage.cached_tokens = usage
+                .cached_tokens
+                .saturating_add(result.usage.cached_tokens);
+            usage.tool_calls = usage.tool_calls.saturating_add(result.usage.tool_calls);
+            evidence.extend(result.evidence_refs.clone());
             let role = packet
                 .constraints
                 .iter()
@@ -96,23 +80,27 @@ impl SynthesizeBackend for ProtocolResultReducer {
                 .constraints
                 .iter()
                 .any(|constraint| constraint == "protocol_allows_unresolved:true");
-            match returned.status {
-                AgentTerminalStatus::Completed => {
-                    summaries.push(format!("## {role}\n{}", returned.outcome))
-                }
-                AgentTerminalStatus::Failed
-                | AgentTerminalStatus::Cancelled
-                | AgentTerminalStatus::Blocked => blockers.push(format!(
-                    "{role}: {}",
-                    returned
-                        .failure
-                        .unwrap_or_else(|| "no terminal outcome".to_string())
+            match result.status {
+                ExecutionNodeStatus::Completed => summaries.push(format!(
+                    "## {role}\n{}",
+                    result.summary.as_deref().unwrap_or("completed")
                 )),
+                ExecutionNodeStatus::Failed
+                | ExecutionNodeStatus::Cancelled
+                | ExecutionNodeStatus::Blocked => blockers.push(format!(
+                    "{role}: {}",
+                    result
+                        .failure
+                        .as_ref()
+                        .map(|failure| failure.message.as_str())
+                        .unwrap_or("no durable terminal outcome")
+                )),
+                _ => blockers.push(format!("{role}: protocol node is not terminal")),
             }
         }
 
         if summaries.is_empty() {
-            return Err("protocol synthesis has no completed AgentRuntime results".to_string());
+            return Err("protocol synthesis has no completed durable Agent results".to_string());
         }
         if !blockers.is_empty() && !allows_unresolved {
             return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {

@@ -73,6 +73,7 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                     criteria: vec!["evidence".to_string()],
                     evidence_obligations: Vec::new(),
                 },
+                output_acceptance: Vec::new(),
                 acceptance: vec!["evidence".to_string()],
                 constraints: Vec::new(),
                 context_refs: Vec::new(),

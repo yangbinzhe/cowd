@@ -16,6 +16,7 @@ use crate::validate_agent_return;
 pub trait AgentTaskBackend: Send + Sync {
     async fn execute(&self, packet: AgentTaskPacket) -> Result<AgentReturnPacket, String>;
     async fn cancel(&self, packet: &AgentTaskPacket) -> Result<(), String>;
+    fn terminal_committed(&self, _packet: &AgentTaskPacket) {}
     fn cancellation_finalized(&self, packet: &AgentTaskPacket);
 }
 
@@ -389,6 +390,25 @@ impl NodeExecutor for AgentTaskExecutor {
             })
     }
 
+    async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        let packet: AgentTaskPacket =
+            serde_json::from_str(&ticket.payload_ref).map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: format!("persistent AgentTaskPacket is invalid after commit: {error}"),
+            })?;
+        if let Some(backend) = self
+            .resolvers
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find_map(|resolver| resolver.resolve(&packet))
+        {
+            backend.terminal_committed(&packet);
+        }
+        Ok(())
+    }
+
     fn cancellation_finalized(&self, ticket: &NodeExecutionTicket) {
         let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(&ticket.payload_ref) else {
             return;
@@ -508,6 +528,7 @@ mod tests {
             policy_revision: 1,
             objective: "inspect".into(),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: vec!["reviewed".into()],
             constraints: Vec::new(),
             context_refs: Vec::new(),

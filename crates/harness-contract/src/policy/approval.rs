@@ -9,6 +9,7 @@ use crate::core::TaskRisk;
 use crate::tool::ToolEffectDescriptor;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -553,6 +554,30 @@ pub struct ApprovalRequest {
     pub resolved_at_ms: Option<u64>,
 }
 
+/// Server-derived equivalence boundary for safe visual grouping. Matching
+/// this key never grants batch authority by itself: a future batch decision
+/// must still carry a server token and produce one receipt per approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalEquivalenceKey {
+    pub digest: String,
+    pub principal_id: String,
+    pub workspace_key: String,
+    pub session_id: Option<String>,
+    pub policy_revision: u64,
+    pub domain: ApprovalDomain,
+    pub risk: TaskRisk,
+    pub capability: String,
+    pub effect_descriptor_hash: Option<String>,
+    pub effect_kind: Option<crate::tool::ToolEffectKind>,
+    pub required_permission: Option<super::PermissionMode>,
+    pub uses_network: bool,
+    pub spawns_process: bool,
+    pub resource_targets: Vec<String>,
+    pub allowed_scopes: Vec<ApprovalGrantScope>,
+    pub blocks_execution: bool,
+    pub skippable: bool,
+}
+
 impl ApprovalRequest {
     #[must_use]
     pub fn subject(&self) -> ApprovalSubject {
@@ -567,6 +592,79 @@ impl ApprovalRequest {
                 .as_ref()
                 .map(|effect| effect.descriptor_hash.clone()),
             summary: self.summary.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn equivalence_key(&self) -> ApprovalEquivalenceKey {
+        let mut resource_targets = self.context.resource_targets.clone();
+        resource_targets.sort();
+        resource_targets.dedup();
+        let mut allowed_scopes = self.allowed_scopes.clone();
+        allowed_scopes.sort_by_key(|scope| scope.as_str());
+        allowed_scopes.dedup();
+        let effect_descriptor_hash = self
+            .context
+            .effect
+            .as_ref()
+            .map(|effect| effect.descriptor_hash.clone());
+        let effect_kind = self
+            .context
+            .effect
+            .as_ref()
+            .map(|effect| effect.effect_kind);
+        let required_permission = self
+            .context
+            .effect
+            .as_ref()
+            .map(|effect| effect.required_permission);
+        let uses_network = self
+            .context
+            .effect
+            .as_ref()
+            .is_some_and(|effect| effect.uses_network);
+        let spawns_process = self
+            .context
+            .effect
+            .as_ref()
+            .is_some_and(|effect| effect.spawns_process);
+        let canonical = serde_json::json!({
+            "principal_id": &self.context.principal_id,
+            "workspace_key": &self.context.workspace_key,
+            "session_id": &self.context.session_id,
+            "policy_revision": self.context.policy_revision,
+            "domain": self.domain.as_str(),
+            "risk": self.risk,
+            "capability": &self.context.capability,
+            "effect_descriptor_hash": &effect_descriptor_hash,
+            "effect_kind": effect_kind,
+            "required_permission": required_permission,
+            "uses_network": uses_network,
+            "spawns_process": spawns_process,
+            "resource_targets": &resource_targets,
+            "allowed_scopes": allowed_scopes.iter().map(|scope| scope.as_str()).collect::<Vec<_>>(),
+            "blocks_execution": self.blocks_execution,
+            "skippable": self.skippable,
+        });
+        let digest = format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()));
+        ApprovalEquivalenceKey {
+            digest,
+            principal_id: self.context.principal_id.clone(),
+            workspace_key: self.context.workspace_key.clone(),
+            session_id: self.context.session_id.clone(),
+            policy_revision: self.context.policy_revision,
+            domain: self.domain,
+            risk: self.risk,
+            capability: self.context.capability.clone(),
+            effect_descriptor_hash,
+            effect_kind,
+            required_permission,
+            uses_network,
+            spawns_process,
+            resource_targets,
+            allowed_scopes,
+            blocks_execution: self.blocks_execution,
+            skippable: self.skippable,
         }
     }
 }

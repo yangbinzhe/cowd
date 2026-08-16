@@ -383,6 +383,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 execution_id: packet.graph_id().to_string(),
                 node_id: packet.node_id().to_string(),
             }),
+            execution_role: crate::TurnExecutionRole::DelegatedLeaf,
         });
         let mut runtime = match host {
             Ok(runtime) => runtime,
@@ -2460,6 +2461,11 @@ fn has_matching_pre_write_evidence(
 fn packet_acceptance_contract(
     packet: &AgentTaskPacket,
 ) -> Option<Vec<harness_contract::team::TeamAcceptanceRequirement>> {
+    if !packet.output_acceptance.is_empty() {
+        return Some(packet.output_acceptance.clone());
+    }
+    // One rolling migration boundary for durable pre-typed packets. Newly
+    // compiled work never recovers acceptance authority from a string.
     packet
         .constraints
         .iter()
@@ -2475,6 +2481,68 @@ fn materialized_json_value(value: &serde_json::Value) -> bool {
         serde_json::Value::Object(values) => !values.is_empty(),
         serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
     }
+}
+
+/// Repair only the common syntactic drift where a provider leaves a trailing
+/// comma before `}` or `]`. This deliberately does not invent keys, values, or
+/// quote unquoted prose, so acceptance semantics remain model-authored.
+fn without_json_trailing_commas(text: &str) -> String {
+    let characters = text.chars().collect::<Vec<_>>();
+    let mut repaired = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < characters.len() {
+        let character = characters[index];
+        if in_string {
+            repaired.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            repaired.push('"');
+            index += 1;
+            continue;
+        }
+        if character == ',' {
+            let mut lookahead = index + 1;
+            while lookahead < characters.len() && characters[lookahead].is_ascii_whitespace() {
+                lookahead += 1;
+            }
+            if lookahead < characters.len() && matches!(characters[lookahead], '}' | ']') {
+                index += 1;
+                continue;
+            }
+        }
+        repaired.push(character);
+        index += 1;
+    }
+    repaired
+}
+
+fn parse_first_contract_json(text: &str) -> Option<serde_json::Value> {
+    let text = text.trim_start_matches('\u{feff}').trim();
+    serde_json::Deserializer::from_str(text)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok)
+        .or_else(|| {
+            let repaired = without_json_trailing_commas(text);
+            (repaired != text).then(|| {
+                serde_json::Deserializer::from_str(&repaired)
+                    .into_iter::<serde_json::Value>()
+                    .next()
+                    .and_then(Result::ok)
+            })?
+        })
 }
 
 pub(crate) fn structured_agent_output(
@@ -2537,7 +2605,7 @@ pub(crate) fn structured_agent_output(
         let object = canonicalize(object);
         has_contract_field(&object).then_some(object)
     };
-    if let Ok(serde_json::Value::Object(object)) = serde_json::from_str(text) {
+    if let Some(serde_json::Value::Object(object)) = parse_first_contract_json(text) {
         if let Some(object) = contract_object(object.clone()) {
             return Some(object);
         }
@@ -2551,8 +2619,7 @@ pub(crate) fn structured_agent_output(
             };
             let nested = match value {
                 serde_json::Value::Object(nested) => Some(nested.clone()),
-                serde_json::Value::String(encoded) => serde_json::from_str(encoded)
-                    .ok()
+                serde_json::Value::String(encoded) => parse_first_contract_json(encoded)
                     .and_then(|value: serde_json::Value| value.as_object().cloned()),
                 _ => None,
             };
@@ -2564,12 +2631,7 @@ pub(crate) fn structured_agent_output(
     if let Some(object) = text
         .char_indices()
         .filter(|(_, character)| *character == '{')
-        .filter_map(|(start, _)| {
-            serde_json::Deserializer::from_str(&text[start..])
-                .into_iter::<serde_json::Value>()
-                .next()
-                .and_then(Result::ok)
-        })
+        .filter_map(|(start, _)| parse_first_contract_json(&text[start..]))
         .filter_map(|value| value.as_object().cloned())
         // An agent may quote an upstream JSON result before returning its own
         // terminal object. The terminal contract is the last matching object,
@@ -2625,6 +2687,34 @@ pub(crate) fn structured_agent_output(
                     "risk" | "风险" => Some("risks"),
                     _ => None,
                 });
+        } else if let Some((label, value)) = trimmed.split_once(':') {
+            let normalized = label
+                .trim()
+                .trim_start_matches(['-', '*'])
+                .trim()
+                .to_ascii_lowercase()
+                .replace([' ', '-'], "_");
+            let field = CONTRACT_FIELDS
+                .iter()
+                .copied()
+                .find(|field| *field == normalized)
+                .or_else(|| match normalized.as_str() {
+                    "conclusion" | "result" | "摘要" | "总结" => Some("summary"),
+                    "finding" | "observations" | "发现" => Some("findings"),
+                    "proof" | "证据" => Some("evidence"),
+                    "open_questions" | "gaps" | "未解决" => Some("unresolved"),
+                    "risk" | "风险" => Some("risks"),
+                    _ => None,
+                });
+            if let Some(field) = field {
+                flush(&mut object, active_field, &mut active_lines);
+                active_field = Some(field);
+                if !value.trim().is_empty() {
+                    active_lines.push(value.trim());
+                }
+            } else if active_field.is_some() {
+                active_lines.push(line);
+            }
         } else if active_field.is_some() {
             active_lines.push(line);
         }
@@ -2726,15 +2816,8 @@ fn normalized_narrative_terminal_body(
                 .filter(|value| materialized_json_value(value))
                 .cloned()
                 .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
-            harness_contract::team::TeamStructuredOutputField::Unresolved => {
-                serde_json::Value::String(
-                    "No separately structured unresolved item; preserve any caveats stated in the summary."
-                        .to_string(),
-                )
-            }
-            harness_contract::team::TeamStructuredOutputField::Risks => {
-                serde_json::Value::Array(Vec::new())
-            }
+            harness_contract::team::TeamStructuredOutputField::Unresolved
+            | harness_contract::team::TeamStructuredOutputField::Risks => return None,
             _ => return None,
         };
         output.insert(field.as_str().to_string(), value);
@@ -2878,6 +2961,7 @@ mod tests {
             policy_revision: 1,
             objective: "review".into(),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -4175,6 +4259,16 @@ mod tests {
         assert_eq!(output["summary"], "完成读取。");
         assert_eq!(output["risks"], "无。");
 
+        let trailing = "{\"findings\":\"verified\",\"risks\":[],}";
+        let output = structured_agent_output(trailing).expect("trailing comma repair");
+        assert_eq!(output["findings"], "verified");
+        assert_eq!(output["risks"], serde_json::json!([]));
+
+        let labeled = "Summary: verified result\nRisks: none identified";
+        let output = structured_agent_output(labeled).expect("exact labeled contract");
+        assert_eq!(output["summary"], "verified result");
+        assert_eq!(output["risks"], "none identified");
+
         assert!(structured_agent_output(r#"{"output":{"unrelated":"claim"}}"#).is_none());
     }
 
@@ -4210,21 +4304,17 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&prose).expect("normalized JSON")["findings"],
             "Cargo.toml declares the workspace package metadata."
         );
-        let synthesis = normalized_narrative_terminal_body(
-            "Both researchers confirmed the workspace metadata.",
-            &[
-                TeamStructuredOutputField::Summary,
-                TeamStructuredOutputField::Unresolved,
-            ],
-        )
-        .expect("verified upstream synthesis should accept narrative output");
-        let synthesis =
-            serde_json::from_str::<serde_json::Value>(&synthesis).expect("synthesis JSON");
-        assert_eq!(
-            synthesis["summary"],
-            "Both researchers confirmed the workspace metadata."
+        assert!(
+            normalized_narrative_terminal_body(
+                "Both researchers confirmed the workspace metadata.",
+                &[
+                    TeamStructuredOutputField::Summary,
+                    TeamStructuredOutputField::Unresolved,
+                ],
+            )
+            .is_none(),
+            "Runtime must not invent an unresolved conclusion that the Agent omitted"
         );
-        assert!(synthesis["unresolved"].is_string());
         assert!(normalized_narrative_terminal_body(
             "<synthesized_terminal evidence_committed=1 />",
             &[TeamStructuredOutputField::Findings],
@@ -4325,6 +4415,7 @@ mod tests {
             policy_revision: 1,
             objective: "inspect".into(),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -4586,6 +4677,7 @@ mod tests {
             policy_revision: 1,
             objective: "inspect source".into(),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),

@@ -89,6 +89,22 @@ impl MissionRuntimePort {
         ))
     }
 
+    #[must_use]
+    pub fn control_summary_projection(
+        &self,
+        sessions: Vec<MissionControlSessionNode>,
+        active_session_id: Option<String>,
+        selected_mission_id: Option<String>,
+    ) -> Result<MissionControlProjection, String> {
+        self.mission().ensure_default_mission()?;
+        Ok(MissionControlRuntime::summary_projection(
+            &self.services,
+            sessions,
+            active_session_id,
+            selected_mission_id,
+        ))
+    }
+
     /// Return sessions that contribute to at least one Task.
     #[must_use]
     pub fn referenced_session_ids(&self) -> Vec<String> {
@@ -345,12 +361,13 @@ impl MissionRuntimePort {
     }
 
     pub fn team_projection(&self, team_id: &str) -> Result<TeamProjection, String> {
-        self.services
+        let projection = self
+            .services
             .team_runtime()
-            .list()?
-            .into_iter()
-            .find(|team| team.team_id == team_id)
-            .ok_or_else(|| format!("team not found: {team_id}"))
+            .project(&format!("team-graph:{team_id}"))?;
+        (projection.team_id == team_id)
+            .then_some(projection)
+            .ok_or_else(|| format!("team identity mismatch: {team_id}"))
     }
 
     pub fn team_graph(&self, team_id: &str) -> Result<ExecutionGraph, String> {
@@ -364,6 +381,20 @@ impl MissionRuntimePort {
     #[must_use]
     pub fn team_projection_json(&self) -> Value {
         self.services.team_runtime().projection_json()
+    }
+
+    /// Bounded aggregate used by Mission Session summary nodes. Avoids the
+    /// legacy JSON projection, which also materializes every Team working
+    /// state and turns a simple count into an O(history × graph-read) query.
+    #[must_use]
+    pub fn team_session_counts(&self) -> BTreeMap<String, (usize, usize)> {
+        let mut counts = BTreeMap::<String, (usize, usize)>::new();
+        for team in self.services.team_runtime().list().unwrap_or_default() {
+            let entry = counts.entry(team.session_id).or_default();
+            entry.0 = entry.0.saturating_add(1);
+            entry.1 = entry.1.saturating_add(team.tasks.len());
+        }
+        counts
     }
 
     pub async fn cancel_team(&self, team_id: &str) -> Result<Value, String> {

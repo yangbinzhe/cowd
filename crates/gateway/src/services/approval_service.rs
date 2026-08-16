@@ -3,6 +3,7 @@ use std::sync::Arc;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::policy::{PolicyDecisionKind, RiskAssessment, RiskGateReceipt, RiskLevel};
 use runtime::{ApprovalConfig, ExecutionGraphHost};
+use sha2::{Digest, Sha256};
 
 use super::ServiceEnvelope;
 
@@ -243,10 +244,58 @@ impl ApprovalService {
             }
             requests.push(request);
         }
-        let pending = requests
+        let pending_requests = requests
             .iter()
             .filter(|request| request.status == runtime::GlobalApprovalStatus::Pending)
+            .collect::<Vec<_>>();
+        let pending = pending_requests
+            .iter()
             .map(|request| project_approval_request(request, principal))
+            .collect::<Vec<_>>();
+        let mut grouped = std::collections::BTreeMap::<
+            String,
+            (
+                harness_contract::policy::ApprovalEquivalenceKey,
+                Vec<String>,
+            ),
+        >::new();
+        for request in &pending_requests {
+            let key = request.equivalence_key();
+            grouped
+                .entry(key.digest.clone())
+                .or_insert_with(|| (key, Vec::new()))
+                .1
+                .push(request.approval_id.clone());
+        }
+        let groups = grouped
+            .into_values()
+            .map(|(key, mut approval_ids)| {
+                approval_ids.sort();
+                let count = approval_ids.len();
+                let token_material = serde_json::json!({
+                    "equivalence_digest": &key.digest,
+                    "approval_ids": &approval_ids,
+                });
+                let batch_token = format!(
+                    "approval-batch:{}",
+                    format!(
+                        "{:x}",
+                        Sha256::digest(token_material.to_string().as_bytes())
+                    )
+                );
+                serde_json::json!({
+                    "equivalence_key": {
+                        "digest": key.digest,
+                        "domain": key.domain,
+                        "risk": key.risk,
+                        "blocks_execution": key.blocks_execution,
+                    },
+                    "approval_ids": approval_ids,
+                    "count": count,
+                    "batch_token": batch_token,
+                    "batch_decision_supported": false,
+                })
+            })
             .collect::<Vec<_>>();
         let requests = requests
             .iter()
@@ -266,6 +315,7 @@ impl ApprovalService {
                 "blocks_execution": filter.blocks_execution,
             },
             "pending": pending,
+            "groups": groups,
             "approvals": projection,
         })
     }
@@ -715,6 +765,10 @@ fn project_approval_request(
             "effect".to_string(),
             serde_json::to_value(&request.context.effect).unwrap_or(serde_json::Value::Null),
         );
+        object.insert(
+            "equivalence_key".to_string(),
+            serde_json::json!({"digest": request.equivalence_key().digest}),
+        );
     }
     if approval_admin(principal) {
         return value;
@@ -1018,13 +1072,33 @@ mod tests {
         );
         assert_eq!(projected["expires_at_ms"], 20);
         assert_eq!(projected["effect"]["effect_kind"], "read");
+        let read_group = projected["equivalence_key"]["digest"]
+            .as_str()
+            .expect("server-derived equivalence digest")
+            .to_string();
+        assert_eq!(
+            read.equivalence_key().digest,
+            approval_projection_fixture(
+                harness_contract::tool::ToolEffectKind::Read,
+                harness_contract::policy::PermissionMode::ReadOnly,
+                true,
+            )
+            .equivalence_key()
+            .digest,
+            "equivalent approvals must group deterministically"
+        );
 
         let write = approval_projection_fixture(
             harness_contract::tool::ToolEffectKind::Write,
             harness_contract::policy::PermissionMode::WorkspaceWrite,
             true,
         );
-        assert_eq!(project_approval_request(&write, &admin)["skippable"], false);
+        let write_projected = project_approval_request(&write, &admin);
+        assert_eq!(write_projected["skippable"], false);
+        assert_ne!(
+            write_projected["equivalence_key"]["digest"], read_group,
+            "read and write approval boundaries must never visually coalesce"
+        );
 
         let mut non_graph = read;
         non_graph.approval_id = "session-approval:not-a-graph".to_string();

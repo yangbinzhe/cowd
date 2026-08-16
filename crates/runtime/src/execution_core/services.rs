@@ -176,6 +176,12 @@ pub struct RuntimeServicesBuilder {
 /// the response path without creating detached tasks.
 type MaintenanceWork = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+// Maintenance is intentionally off the response-critical path, but it still
+// needs a hard memory bound. Backpressure preserves every completed turn's
+// work instead of dropping or coalescing semantically distinct memory updates.
+const MAX_MAINTENANCE_OWNERS: usize = 1_024;
+const MAX_QUEUED_MAINTENANCE_PER_OWNER: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaintenanceLifecycle {
     Open,
@@ -203,8 +209,8 @@ struct MaintenanceCompletion {
 pub(crate) struct RuntimeMaintenanceSupervisor {
     state: Arc<Mutex<MaintenanceState>>,
     changed: Arc<tokio::sync::Notify>,
-    completion_tx: tokio::sync::mpsc::UnboundedSender<MaintenanceCompletion>,
-    completion_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<MaintenanceCompletion>>>,
+    completion_tx: tokio::sync::mpsc::Sender<MaintenanceCompletion>,
+    completion_rx: Mutex<Option<tokio::sync::mpsc::Receiver<MaintenanceCompletion>>>,
     reaper: Mutex<Option<tokio::task::JoinHandle<()>>>,
     reaper_cancellation: crate::CancellationToken,
     shutdown_lock: tokio::sync::Mutex<()>,
@@ -217,7 +223,7 @@ impl RuntimeMaintenanceSupervisor {
     }
 
     fn with_shutdown_timeout(shutdown_timeout: Duration) -> Self {
-        let (completion_tx, completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (completion_tx, completion_rx) = tokio::sync::mpsc::channel(MAX_MAINTENANCE_OWNERS);
         Self {
             state: Arc::new(Mutex::new(MaintenanceState {
                 lifecycle: MaintenanceLifecycle::Open,
@@ -242,75 +248,103 @@ impl RuntimeMaintenanceSupervisor {
         if !self.ensure_reaper() {
             return false;
         }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.lifecycle != MaintenanceLifecycle::Open {
-            return false;
-        }
-
-        if let Some(existing) = state.owners.get_mut(&owner) {
-            existing.queued.push_back(Box::pin(work));
-            return true;
-        }
-
-        state.next_generation = state.next_generation.saturating_add(1);
-        let generation = state.next_generation;
-        let worker_state = Arc::downgrade(&self.state);
-        let worker_changed = Arc::clone(&self.changed);
-        let completion_tx = self.completion_tx.clone();
-        let worker_owner = owner.clone();
-        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            if start_rx.await.is_err() {
-                return;
-            }
-            let mut current: MaintenanceWork = Box::pin(work);
-            loop {
-                let _ = std::panic::AssertUnwindSafe(current).catch_unwind().await;
-                let Some(state) = worker_state.upgrade() else {
-                    return;
-                };
-                let next = {
-                    let mut state = state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let Some(entry) = state.owners.get_mut(&worker_owner) else {
-                        return;
-                    };
-                    if entry.generation != generation {
-                        return;
-                    }
-                    if let Some(next) = entry.queued.pop_front() {
-                        Some(next)
-                    } else {
-                        let completed = state
-                            .owners
-                            .remove(&worker_owner)
-                            .expect("maintenance owner exists while its worker is running");
-                        state.reaping = state.reaping.saturating_add(1);
-                        let _ = completion_tx.send(MaintenanceCompletion { owner: completed });
-                        None
-                    }
-                };
-                worker_changed.notify_waiters();
-                match next {
-                    Some(next) => current = next,
-                    None => return,
+        let mut pending_work: Option<MaintenanceWork> = Some(Box::pin(work));
+        loop {
+            let changed = self.changed.notified();
+            let should_wait = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.lifecycle != MaintenanceLifecycle::Open {
+                    return false;
                 }
+
+                if let Some(existing) = state.owners.get_mut(&owner) {
+                    if existing.queued.len() < MAX_QUEUED_MAINTENANCE_PER_OWNER {
+                        existing
+                            .queued
+                            .push_back(pending_work.take().expect("maintenance work is pending"));
+                        return true;
+                    }
+                    true
+                } else if state.owners.len() >= MAX_MAINTENANCE_OWNERS {
+                    true
+                } else {
+                    state.next_generation = state.next_generation.saturating_add(1);
+                    let generation = state.next_generation;
+                    let worker_state = Arc::downgrade(&self.state);
+                    let worker_changed = Arc::clone(&self.changed);
+                    let completion_tx = self.completion_tx.clone();
+                    let worker_owner = owner.clone();
+                    let initial_work = pending_work.take().expect("maintenance work is pending");
+                    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+                    let handle = tokio::spawn(async move {
+                        if start_rx.await.is_err() {
+                            return;
+                        }
+                        let mut current = initial_work;
+                        loop {
+                            let _ = std::panic::AssertUnwindSafe(current).catch_unwind().await;
+                            let Some(state) = worker_state.upgrade() else {
+                                return;
+                            };
+                            let (next, completed) = {
+                                let mut state = state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                let Some(entry) = state.owners.get_mut(&worker_owner) else {
+                                    return;
+                                };
+                                if entry.generation != generation {
+                                    return;
+                                }
+                                if let Some(next) = entry.queued.pop_front() {
+                                    (Some(next), None)
+                                } else {
+                                    let completed = state.owners.remove(&worker_owner).expect(
+                                        "maintenance owner exists while its worker is running",
+                                    );
+                                    state.reaping = state.reaping.saturating_add(1);
+                                    (None, Some(completed))
+                                }
+                            };
+                            worker_changed.notify_waiters();
+                            if let Some(completed) = completed {
+                                if completion_tx
+                                    .send(MaintenanceCompletion { owner: completed })
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::debug!(
+                                        owner = %worker_owner,
+                                        "maintenance completion reaper is closed"
+                                    );
+                                }
+                                return;
+                            }
+                            match next {
+                                Some(next) => current = next,
+                                None => return,
+                            }
+                        }
+                    });
+                    state.owners.insert(
+                        owner.clone(),
+                        MaintenanceOwner {
+                            generation,
+                            queued: VecDeque::new(),
+                            handle,
+                        },
+                    );
+                    let _ = start_tx.send(());
+                    return true;
+                }
+            };
+            if should_wait {
+                changed.await;
             }
-        });
-        state.owners.insert(
-            owner,
-            MaintenanceOwner {
-                generation,
-                queued: VecDeque::new(),
-                handle,
-            },
-        );
-        let _ = start_tx.send(());
-        true
+        }
     }
 
     fn ensure_reaper(&self) -> bool {
@@ -373,6 +407,9 @@ impl RuntimeMaintenanceSupervisor {
                 MaintenanceLifecycle::Closed => return,
             }
         };
+        // Wake submissions currently applying bounded-queue backpressure so
+        // they observe Closing and return instead of waiting through shutdown.
+        self.changed.notify_waiters();
 
         let deadline = tokio::time::Instant::now() + self.shutdown_timeout;
         loop {
@@ -2468,10 +2505,7 @@ impl RuntimeServices {
                 persisted.projection_revision = existing.sequence;
                 return Ok(persisted);
             }
-            let valid_requested_transition = persisted.status
-                == harness_contract::turn::CancellationStatus::Requested
-                && receipt.status != harness_contract::turn::CancellationStatus::Requested
-                && persisted.cancellation_id == receipt.cancellation_id
+            let same_identity = persisted.cancellation_id == receipt.cancellation_id
                 && persisted.session_id == receipt.session_id
                 && persisted.turn_id == receipt.turn_id
                 && persisted.execution_id == receipt.execution_id
@@ -2479,6 +2513,22 @@ impl RuntimeServices {
                 && persisted.cause == receipt.cause
                 && persisted.reason == receipt.reason
                 && persisted.requested_at_ms == receipt.requested_at_ms;
+            // HTTP, the ingress worker, and the recovery reconciler can all
+            // finalize the same Requested intent. Once a final receipt exists,
+            // its status and effective timestamp are the durable winner; a
+            // concurrent writer with the same immutable request identity must
+            // return it rather than treating timestamp drift as ID reuse.
+            if same_identity
+                && persisted.status != harness_contract::turn::CancellationStatus::Requested
+            {
+                persisted.journal_sequence = existing.commit_cursor;
+                persisted.projection_revision = existing.sequence;
+                return Ok(persisted);
+            }
+            let valid_requested_transition = persisted.status
+                == harness_contract::turn::CancellationStatus::Requested
+                && receipt.status != harness_contract::turn::CancellationStatus::Requested
+                && same_identity;
             if !valid_requested_transition {
                 return Err(RuntimeServicesError::Invariant(format!(
                     "cancellation id `{}` was reused with a different receipt",
@@ -3146,6 +3196,94 @@ impl RuntimeServices {
     pub fn execution_supervisor(&self) -> &Arc<crate::RuntimeExecutionSupervisor> {
         &self.execution_supervisor
     }
+
+    /// Durably cancel an execution graph and every graph registered beneath it.
+    ///
+    /// Session cancellation cannot stop at the process-local provider token or
+    /// the live projection: Team/Subgraph work may already have been admitted
+    /// into independent supervisor slots. The lineage stream is the canonical
+    /// ownership relation, so walk it breadth-first and terminalize every
+    /// non-terminal descendant. A graph that is already terminal is still
+    /// traversed because its children may outlive a failed or cancelled parent.
+    pub async fn cancel_execution_tree(
+        &self,
+        root_execution_id: &str,
+        reason: &str,
+    ) -> Result<Vec<String>, RuntimeServicesError> {
+        if root_execution_id.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pending = VecDeque::from([root_execution_id.to_string()]);
+        let mut seen = BTreeSet::new();
+        let mut cancelled = Vec::new();
+        while let Some(graph_id) = pending.pop_front() {
+            if !seen.insert(graph_id.clone()) {
+                continue;
+            }
+
+            // Discover children even when the parent is already terminal. This
+            // is the exact crash/race shape that previously left Team
+            // synthesizers running after a Session cancellation won.
+            for link in self
+                .graph_state_store
+                .child_links_async(graph_id.clone())
+                .await?
+            {
+                pending.push_back(link.child_execution_id);
+            }
+
+            let mut terminalized = false;
+            for _ in 0..4 {
+                let graph = match self.graph_state_store.load_async(&graph_id).await {
+                    Ok(graph) => graph,
+                    Err(ExecutionStateStoreError::NotFound(_)) => break,
+                    Err(error) => return Err(error.into()),
+                };
+                if graph
+                    .node_statuses
+                    .values()
+                    .all(|status| status.is_terminal())
+                {
+                    break;
+                }
+                match self
+                    .execution_supervisor
+                    .command_graph(
+                        &graph_id,
+                        ExecutionGraphCommand::Cancel {
+                            expected_revision: graph.revision,
+                            reason: reason.to_string(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        terminalized = true;
+                        break;
+                    }
+                    Err(ExecutionRunnerError::Commit(
+                        super::graph::ExecutionCommitError::StaleRevision { .. },
+                    )) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if terminalized {
+                cancelled.push(graph_id.clone());
+            }
+
+            // A running parent can register a child concurrently with the
+            // first observation. Re-read after cancellation and enqueue only
+            // newly committed lineage; `seen` keeps replay idempotent.
+            for link in self.graph_state_store.child_links_async(graph_id).await? {
+                if !seen.contains(&link.child_execution_id) {
+                    pending.push_back(link.child_execution_id);
+                }
+            }
+        }
+        Ok(cancelled)
+    }
+
     pub fn approval_queue(&self) -> &Arc<ApprovalQueue> {
         &self.approval_queue
     }
@@ -4639,6 +4777,7 @@ impl RuntimeServices {
                 criteria: scenario.acceptance.clone(),
                 evidence_obligations: Vec::new(),
             },
+            output_acceptance: Vec::new(),
             acceptance: scenario.acceptance.clone(),
             constraints: vec![
                 "evolution_evaluation:isolation_required".to_string(),
@@ -5844,6 +5983,7 @@ impl RuntimeServices {
                         criteria: definition.acceptance.clone(),
                         evidence_obligations: Vec::new(),
                     },
+                    output_acceptance: acceptance_contract,
                     acceptance: definition.acceptance.clone(),
                     constraints: vec![
                         format!(
@@ -5852,14 +5992,6 @@ impl RuntimeServices {
                         ),
                         format!("managed_invocation:{}", invocation.invocation_id),
                         format!("managed_fence:{}", invocation.fence_generation),
-                        format!(
-                            "team_acceptance_contract:{}",
-                            serde_json::to_string(&acceptance_contract).map_err(|error| {
-                                RuntimeServicesError::Invariant(format!(
-                                    "serialize Managed Agent acceptance contract: {error}"
-                                ))
-                            })?
-                        ),
                     ],
                     context_refs: Vec::new(),
                     evidence_refs: Vec::new(),
@@ -7308,6 +7440,49 @@ mod tests {
         supervisor.shutdown_and_drain().await;
         assert_eq!(maximum.load(Ordering::SeqCst), 1);
         assert_eq!(completed.load(Ordering::SeqCst), 8);
+        assert_eq!(supervisor.tracked_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_supervisor_backpressures_instead_of_growing_owner_queue() {
+        let supervisor = Arc::new(RuntimeMaintenanceSupervisor::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let release_work = Arc::clone(&release);
+        assert!(
+            supervisor
+                .submit("session-bounded".to_string(), async move {
+                    release_work.notified().await;
+                })
+                .await
+        );
+        for _ in 0..MAX_QUEUED_MAINTENANCE_PER_OWNER {
+            assert!(
+                supervisor
+                    .submit("session-bounded".to_string(), async {})
+                    .await
+            );
+        }
+
+        let overflow = {
+            let supervisor = Arc::clone(&supervisor);
+            tokio::spawn(async move {
+                supervisor
+                    .submit("session-bounded".to_string(), async {})
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !overflow.is_finished(),
+            "the first overflow item must wait for bounded capacity"
+        );
+
+        release.notify_one();
+        assert!(tokio::time::timeout(Duration::from_secs(1), overflow)
+            .await
+            .expect("capacity is released")
+            .expect("overflow submitter joins"));
+        supervisor.shutdown_and_drain().await;
         assert_eq!(supervisor.tracked_task_count(), 0);
     }
 
@@ -8787,6 +8962,7 @@ mod tests {
                 criteria: vec!["completed".into()],
                 evidence_obligations: Vec::new(),
             },
+            output_acceptance: Vec::new(),
             acceptance: vec!["completed".into()],
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -8951,23 +9127,14 @@ mod tests {
                     criteria: vec!["evidence".to_string()],
                     evidence_obligations: Vec::new(),
                 },
+                output_acceptance: vec![harness_contract::team::TeamAcceptanceRequirement {
+                    criterion: "evidence".to_string(),
+                    check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                        scopes: vec![format!("read:binding-domain-{index}")],
+                    },
+                }],
                 acceptance: vec!["evidence".to_string()],
-                constraints: vec![
-                    format!("role_slot:researcher-{index}"),
-                    format!(
-                        "team_acceptance_contract:{}",
-                        serde_json::to_string(&vec![
-                            harness_contract::team::TeamAcceptanceRequirement {
-                                criterion: "evidence".to_string(),
-                                check:
-                                    harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
-                                        scopes: vec![format!("read:binding-domain-{index}")],
-                                    },
-                            },
-                        ])
-                        .expect("team acceptance contract")
-                    ),
-                ],
+                constraints: vec![format!("role_slot:researcher-{index}")],
                 context_refs: Vec::new(),
                 evidence_refs: Vec::new(),
                 resource_scopes: vec![format!("read:binding-domain-{index}")],
@@ -9207,6 +9374,80 @@ mod tests {
                 .status,
             harness_contract::task::TaskStatus::Cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn session_cancellation_terminalizes_descendants_of_an_already_terminal_root() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let lineage = harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-cancel-lineage".to_string(),
+            turn_id: "turn-cancel-lineage".to_string(),
+            root_task_id: "task-cancel-lineage".to_string(),
+            task_id: "task-cancel-lineage".to_string(),
+            generation: 1,
+        };
+        let mut parent =
+            ExecutionGraph::new("cancelled Session root").with_lineage(lineage.clone());
+        parent.id = "session-cancel-root".to_string();
+        let mut parent_node =
+            ExecutionNodeSpec::new(ExecutionNodeKind::Subgraph, "team_subgraph", "{}");
+        parent_node.id = "team-node".to_string();
+        parent_node.idempotency_key = "team-node".to_string();
+        parent.nodes.push(parent_node);
+        let parent = services
+            .commit_service()
+            .register_graph(parent)
+            .expect("register parent")
+            .graph;
+
+        let mut child = ExecutionGraph::new("running Team child").with_lineage(lineage);
+        child.id = "session-cancel-child".to_string();
+        child.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: parent.id.clone(),
+            node_id: "team-node".to_string(),
+        });
+        let mut child_node =
+            ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        child_node.id = "researcher".to_string();
+        child_node.idempotency_key = "researcher".to_string();
+        child.nodes.push(child_node);
+        let child = services
+            .commit_service()
+            .register_graph(child)
+            .expect("register child")
+            .graph;
+
+        services
+            .execution_supervisor()
+            .command_graph(
+                &parent.id,
+                ExecutionGraphCommand::Cancel {
+                    expected_revision: parent.revision,
+                    reason: "root already terminal".to_string(),
+                },
+            )
+            .await
+            .expect("cancel root");
+        assert!(services
+            .graph_state_store()
+            .load(&child.id)
+            .expect("child before propagation")
+            .node_statuses
+            .values()
+            .any(|status| !status.is_terminal()));
+
+        let cancelled = services
+            .cancel_execution_tree(&parent.id, "user cancelled Session")
+            .await
+            .expect("cancel execution tree");
+        assert_eq!(cancelled, vec![child.id.clone()]);
+        assert!(services
+            .graph_state_store()
+            .load(&child.id)
+            .expect("child after propagation")
+            .node_statuses
+            .values()
+            .all(|status| *status == ExecutionNodeStatus::Cancelled));
     }
 
     #[tokio::test]
@@ -9616,6 +9857,16 @@ mod tests {
             .commit_cancellation_receipt(receipt.clone())
             .unwrap();
         assert_eq!(first, duplicate);
+        let mut concurrent_finalizer = receipt.clone();
+        concurrent_finalizer.effective_at_ms = Some(99);
+        concurrent_finalizer.status = harness_contract::turn::CancellationStatus::AlreadyTerminal;
+        assert_eq!(
+            services
+                .commit_cancellation_receipt(concurrent_finalizer)
+                .unwrap(),
+            first,
+            "the first durable finalizer owns status and effective timestamp"
+        );
         assert!(first.journal_sequence > intent.journal_sequence);
         assert_eq!(first.projection_revision, 2);
 

@@ -58,15 +58,18 @@ pub fn validate_agent_return(
             &task.required_acceptance.criteria
         };
         if task.team_id().is_some() {
-            let requirements = task
-                .constraints
-                .iter()
-                .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
-                .and_then(|value| {
-                    serde_json::from_str::<Vec<harness_contract::team::TeamAcceptanceRequirement>>(
-                        value,
-                    )
-                    .ok()
+            let requirements = (!task.output_acceptance.is_empty())
+                .then(|| task.output_acceptance.clone())
+                .or_else(|| {
+                    task.constraints
+                        .iter()
+                        .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
+                        .and_then(|value| {
+                            serde_json::from_str::<
+                                Vec<harness_contract::team::TeamAcceptanceRequirement>,
+                            >(value)
+                            .ok()
+                        })
                 })
                 .filter(|requirements| {
                     requirements.len() == task.acceptance.len()
@@ -199,17 +202,14 @@ mod tests {
             policy_revision: 1,
             objective: "inspect".to_string(),
             required_acceptance: Default::default(),
+            output_acceptance: vec![harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "evidence".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                    scopes: vec!["read:src".to_string()],
+                },
+            }],
             acceptance: vec!["evidence".to_string()],
-            constraints: vec![format!(
-                "team_acceptance_contract:{}",
-                serde_json::to_string(&vec![harness_contract::team::TeamAcceptanceRequirement {
-                    criterion: "evidence".to_string(),
-                    check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
-                        scopes: vec!["read:src".to_string()],
-                    },
-                },])
-                .expect("acceptance contract")
-            )],
+            constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
             resource_scopes: vec!["read:src".to_string()],
@@ -336,14 +336,10 @@ mod tests {
     #[test]
     fn upstream_synthesis_allows_zero_tools_but_never_missing_predecessor_evidence() {
         let mut task = team_task();
-        task.constraints = vec![format!(
-            "team_acceptance_contract:{}",
-            serde_json::to_string(&vec![harness_contract::team::TeamAcceptanceRequirement {
-                criterion: "evidence".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
-            },])
-            .expect("upstream contract")
-        )];
+        task.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+            criterion: "evidence".to_string(),
+            check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
+        }];
         let upstream = EvidenceAccessRef::durable(
             EvidenceRef::observed("tool", "upstream"),
             "b".repeat(64),

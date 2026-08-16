@@ -8,7 +8,9 @@ use harness_contract::agent::{
     AgentTaskPacket, AgentTerminalStatus, RevisionSelector,
 };
 use harness_contract::execution::ExecutionIdentity;
-use harness_contract::execution_graph::{ExecutionEdgeKind, ExecutionNodeKind};
+use harness_contract::execution_graph::{
+    ExecutionEdgeKind, ExecutionNodeKind, ExecutionNodeStatus,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::execution_core::graph::executors::{AgentTaskBackend, AgentTaskBackendResolver};
@@ -329,6 +331,10 @@ impl AgentRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
             .and_then(|record| record.snapshot.clone())
+            .or_else(|| {
+                self.latest_durable_record(agent_id)
+                    .and_then(|record| record.snapshot)
+            })
     }
 
     /// Return the canonical terminal packet retained with an Agent lifecycle
@@ -341,6 +347,36 @@ impl AgentRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(agent_id)
             .and_then(|record| record.returned.clone())
+            .or_else(|| {
+                self.event_store
+                    .list_stream(&agent_stream_id(agent_id))
+                    .ok()?
+                    .into_iter()
+                    .rev()
+                    .filter_map(|event| {
+                        serde_json::from_value::<PersistedAgentEvent>(event.payload).ok()
+                    })
+                    .find_map(|payload| payload.returned)
+            })
+    }
+
+    fn latest_durable_record(&self, agent_id: &str) -> Option<AgentRunRecord> {
+        let event = self
+            .event_store
+            .latest_for_stream(&agent_stream_id(agent_id))
+            .ok()
+            .flatten()?;
+        let payload = serde_json::from_value::<PersistedAgentEvent>(event.payload).ok()?;
+        let mut receipts = BTreeMap::new();
+        if let Some(receipt) = payload.receipt {
+            receipts.insert(receipt.command_id.clone(), receipt);
+        }
+        Some(AgentRunRecord {
+            snapshot: Some(payload.snapshot),
+            returned: payload.returned,
+            receipts,
+            inputs: Vec::new(),
+        })
     }
 
     /// Restore a verified durable run projection during Runtime recovery.
@@ -563,15 +599,9 @@ impl AgentRuntime {
         let _run_guard = self.acquire_run_lock(packet.agent_id()).await;
         if let Some(existing) = self.get(packet.agent_id()) {
             if existing.run_id == packet.run_id() && existing.status.is_terminal() {
-                return self
-                    .records
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(packet.agent_id())
-                    .and_then(|record| record.returned.clone())
-                    .ok_or_else(|| {
-                        "terminal AgentRuntime state lacks a canonical return packet".to_string()
-                    });
+                return self.terminal_return(packet.agent_id()).ok_or_else(|| {
+                    "terminal AgentRuntime state lacks a canonical return packet".to_string()
+                });
             }
             if existing.run_id != packet.run_id() && !existing.status.is_terminal() {
                 return Err(format!(
@@ -1236,25 +1266,12 @@ impl AgentRuntime {
                         predecessor.id
                     )
                 })?;
-            let returned = self
-                .terminal_return(predecessor_packet.agent_id())
-                .ok_or_else(|| {
-                    format!(
-                        "completed predecessor {} has no AgentRuntime terminal return",
-                        predecessor.id
-                    )
-                })?;
-            if returned.run_id != predecessor_packet.run_id()
-                || returned.graph_id != graph.id
-                || returned.node_id != predecessor.id
-                || returned.attempt != predecessor_packet.attempt
-                || returned.expected_graph_revision != predecessor_packet.expected_graph_revision
-            {
-                return Err(format!(
-                    "predecessor AgentRuntime binding mismatch for {}",
-                    predecessor_packet.agent_id()
-                ));
-            }
+            let result = graph.node_results.get(&predecessor.id).ok_or_else(|| {
+                format!(
+                    "completed predecessor {} has no durable graph result",
+                    predecessor.id
+                )
+            })?;
             let role = predecessor_packet
                 .constraints
                 .iter()
@@ -1268,15 +1285,18 @@ impl AgentRuntime {
             if available == 0 {
                 break;
             }
-            let upstream_outcome = if returned.status == AgentTerminalStatus::Completed {
-                returned.outcome.clone()
+            let upstream_outcome = if result.status == ExecutionNodeStatus::Completed {
+                result.summary.clone().unwrap_or_else(|| {
+                    format!("completed upstream result {}", predecessor_packet.run_id())
+                })
             } else {
                 format!(
                     "UNRESOLVED: upstream role did not complete: {}",
-                    returned
+                    result
                         .failure
-                        .clone()
-                        .unwrap_or_else(|| "no terminal outcome".to_string())
+                        .as_ref()
+                        .map(|failure| failure.message.clone())
+                        .unwrap_or_else(|| "no durable terminal summary".to_string())
                 )
             };
             let outcome = truncate_context_text(&upstream_outcome, available);
@@ -1770,26 +1790,52 @@ impl AgentRuntime {
     }
 
     fn restore_projection(&self) {
-        let Ok(events) = self.event_store.replay_scope(RuntimeEventScope::Agent) else {
-            return;
-        };
+        const RESTORE_PAGE_SIZE: usize = 512;
+        let mut after_position = None;
         let mut records = self
             .records
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for event in events {
-            let Ok(payload) = serde_json::from_value::<PersistedAgentEvent>(event.payload) else {
-                continue;
+        loop {
+            let Ok(events) = self.event_store.list_scope_page_asc(
+                RuntimeEventScope::Agent,
+                after_position,
+                RESTORE_PAGE_SIZE,
+            ) else {
+                return;
             };
-            let record = records
-                .entry(payload.snapshot.agent_id.clone())
-                .or_default();
-            record.snapshot = Some(payload.snapshot);
-            if let Some(receipt) = payload.receipt {
-                record.receipts.insert(receipt.command_id.clone(), receipt);
+            if events.is_empty() {
+                break;
             }
-            if payload.returned.is_some() {
-                record.returned = payload.returned;
+            let page_is_complete = events.len() < RESTORE_PAGE_SIZE;
+            after_position = events
+                .last()
+                .map(|event| (event.commit_cursor, event.transaction_index));
+            for event in events {
+                let Ok(payload) = serde_json::from_value::<PersistedAgentEvent>(event.payload)
+                else {
+                    continue;
+                };
+                if payload.snapshot.status.is_terminal() {
+                    // Terminal history remains in the event store and is loaded
+                    // only by exact lookup. Keeping it in the active projection
+                    // makes restart memory proportional to all historical Agents.
+                    records.remove(&payload.snapshot.agent_id);
+                    continue;
+                }
+                let record = records
+                    .entry(payload.snapshot.agent_id.clone())
+                    .or_default();
+                record.snapshot = Some(payload.snapshot);
+                if let Some(receipt) = payload.receipt {
+                    record.receipts.insert(receipt.command_id.clone(), receipt);
+                }
+                if payload.returned.is_some() {
+                    record.returned = payload.returned;
+                }
+            }
+            if page_is_complete {
+                break;
             }
         }
         let index = records
@@ -1882,6 +1928,27 @@ impl AgentTaskBackend for AgentRuntime {
                 packet.agent_id(),
                 receipt.message
             ))
+        }
+    }
+
+    fn terminal_committed(&self, packet: &AgentTaskPacket) {
+        let removed = self
+            .records
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(packet.agent_id());
+        if removed.is_none() {
+            return;
+        }
+        let mut index = self
+            .graph_agent_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(agent_ids) = index.get_mut(packet.graph_id()) {
+            agent_ids.remove(packet.agent_id());
+            if agent_ids.is_empty() {
+                index.remove(packet.graph_id());
+            }
         }
     }
 
@@ -2418,6 +2485,7 @@ mod tests {
             policy_revision: 1,
             objective: "verify lifecycle".into(),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: vec!["verified".into()],
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -2782,6 +2850,22 @@ mod tests {
         assert_eq!(evaluations[0].definition_revision, 1);
         assert_eq!(evaluations[0].binding_digest, "b".repeat(64));
         assert_eq!(runtime.self_models().len(), 1);
+        AgentTaskBackend::terminal_committed(&runtime, &packet);
+        assert!(
+            !runtime
+                .records
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(packet.agent_id()),
+            "a graph-committed terminal Agent must leave the active hot projection"
+        );
+        assert_eq!(
+            runtime
+                .get(packet.agent_id())
+                .map(|snapshot| snapshot.status),
+            Some(AgentStatus::Completed),
+            "exact history lookup must rehydrate from the durable stream"
+        );
         let replayed_return = runtime
             .execute_task(packet.clone())
             .await

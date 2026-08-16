@@ -71,6 +71,28 @@ where
     services: Arc<crate::RuntimeServices>,
     execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
     execution_lineage: Option<harness_contract::execution_graph::ExecutionGraphLineage>,
+    execution_role: TurnExecutionRole,
+}
+
+/// Immutable semantic role for one provider-backed conversation graph.
+///
+/// Root turns own user-visible delivery and terminal presentation. Delegated
+/// leaves only return facts/candidates to their Team or parent graph; they may
+/// never invoke the root narrator or publish a root presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnExecutionRole {
+    RootTurn,
+    DelegatedLeaf,
+}
+
+impl TurnExecutionRole {
+    const fn is_delegated_leaf(self) -> bool {
+        matches!(self, Self::DelegatedLeaf)
+    }
+
+    const fn owns_root_presentation(self) -> bool {
+        matches!(self, Self::RootTurn)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +156,9 @@ where
     /// Optional runtime-owned parent graph/node for nested agent turns.
     /// Surface-originated turns leave this empty.
     pub execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
+    /// Explicit terminal/presentation ownership. This must come from the
+    /// Runtime composition boundary, never from prompt text or model output.
+    pub execution_role: TurnExecutionRole,
 }
 
 impl<T> StandardRuntimeHost<T>
@@ -142,7 +167,7 @@ where
 {
     pub fn new(config: StandardRuntimeHostConfig<T>) -> Result<Self, String> {
         let services = Arc::clone(&config.runtime_services);
-        let root_provider_owner = config.execution_parent.is_none();
+        let root_provider_owner = config.execution_role.owns_root_presentation();
         let execution_service_class = if config
             .reality_binding
             .as_ref()
@@ -236,6 +261,7 @@ where
             services,
             execution_parent: config.execution_parent,
             execution_lineage: config.execution_lineage,
+            execution_role: config.execution_role,
         })
     }
 
@@ -483,6 +509,7 @@ where
         let prompter = prompter.clone();
         let execution_parent = self.execution_parent.clone();
         let execution_lineage = self.execution_lineage.clone();
+        let execution_role = self.execution_role;
         let (runtime_sender, runtime_receiver) =
             tokio::sync::oneshot::channel::<crate::ConversationRuntime<ProviderRuntimeClient, T>>();
         let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
@@ -571,6 +598,7 @@ where
                                     Some(ingress),
                                     execution_parent,
                                     execution_lineage,
+                                    execution_role,
                                 )
                                 .await
                             }
@@ -589,6 +617,7 @@ where
                             None,
                             execution_parent,
                             execution_lineage,
+                            execution_role,
                         )
                         .await
                     }
@@ -745,6 +774,7 @@ where
         None,
         None,
         Some(lineage),
+        TurnExecutionRole::RootTurn,
     )
     .await
 }
@@ -826,6 +856,7 @@ async fn submit_owned_conversation_turn_with_ingress<C, T>(
     ingress: Option<TurnIngressRef>,
     execution_parent: Option<harness_contract::execution_graph::ExecutionParentBinding>,
     execution_lineage: Option<harness_contract::execution_graph::ExecutionGraphLineage>,
+    execution_role: TurnExecutionRole,
 ) -> (
     crate::ConversationRuntime<C, T>,
     Result<TurnSummary, RuntimeError>,
@@ -958,7 +989,7 @@ where
             force_reasoning_effort_next_model: None,
             terminal_recovery_attempts: 0,
             provider_protocol_recovery_attempts: 0,
-            delegated_agent_role: false,
+            execution_role,
             bounded_evidence_role: false,
             focus_novelty_target_bp: 0,
             focus_acceptance_scopes: Vec::new(),
@@ -1097,7 +1128,13 @@ where
             );
             graph_state.bounded_evidence_role = context_profile == ContextProfile::SubAgent
                 || compile_target == crate::execution_core::RuntimeCompileTarget::EvidenceGraph;
-            graph_state.delegated_agent_role = context_profile == ContextProfile::SubAgent;
+            if execution_role == TurnExecutionRole::DelegatedLeaf
+                && context_profile != ContextProfile::SubAgent
+            {
+                return Err(RuntimeError::new(
+                    "delegated leaf execution requires the SubAgent context profile",
+                ));
+            }
             graph_state.focus_novelty_target_bp = delegated_focus_policy.0;
             graph_state.focus_acceptance_pending_scopes = delegated_focus_policy.1.clone();
             graph_state.focus_acceptance_scopes = delegated_focus_policy.1;
@@ -3421,7 +3458,7 @@ struct TurnGraphState {
     force_reasoning_effort_next_model: Option<String>,
     terminal_recovery_attempts: u8,
     provider_protocol_recovery_attempts: u8,
-    delegated_agent_role: bool,
+    execution_role: TurnExecutionRole,
     bounded_evidence_role: bool,
     focus_novelty_target_bp: u16,
     focus_acceptance_scopes: Vec<String>,
@@ -5062,7 +5099,7 @@ where
                             task_understanding
                                 .as_ref()
                                 .map_or(0, |value| value.required_team_count),
-                            state.delegated_agent_role,
+                            state.execution_role.is_delegated_leaf(),
                         );
                         let mut verified_team_ids = state.verified_team_ids.clone();
                         verified_team_ids
@@ -5151,7 +5188,7 @@ where
                         let missing_language = response_language_mismatch_for_role(
                             &state.content,
                             &text,
-                            state.delegated_agent_role,
+                            state.execution_role.is_delegated_leaf(),
                         );
                         let acceptance_disposition = root_acceptance_disposition(
                             missing_write,
@@ -6562,7 +6599,7 @@ where
                 state.iterations,
                 state.session_id.clone(),
                 state.model.clone(),
-                state.delegated_agent_role,
+                state.execution_role.is_delegated_leaf(),
             )
         };
         let (calls, continue_with_tool_batch) =
@@ -8959,6 +8996,7 @@ where
             turn_transcript_start,
             session_id,
             turn_id,
+            execution_role,
         ) = {
             let state = self.state.lock().await;
             (
@@ -8972,6 +9010,7 @@ where
                 state.turn_transcript_start,
                 state.session_id.clone(),
                 state.turn_id.clone(),
+                state.execution_role,
             )
         };
         let mut completion = terminal_override
@@ -8997,6 +9036,7 @@ where
         }
         let presentation_id = format!("presentation:{}:{}", ticket.graph_id, envelope.revision);
         let attempt_id = format!("{}:attempt:{}", presentation_id, ticket.attempt);
+        let delegated_leaf = execution_role.is_delegated_leaf();
         let direct_answer = match terminal_override.as_ref() {
             Some((GoalCompletion::Satisfied, answer)) if !answer.trim().is_empty() => {
                 Some(answer.clone())
@@ -9006,7 +9046,13 @@ where
                 .filter(|answer| !answer.starts_with("<synthesized_terminal")),
             _ => None,
         }
-        .filter(|answer| qualified_root_answer(answer, &envelope));
+        .filter(|answer| {
+            if delegated_leaf {
+                !answer.trim().is_empty() && !answer.starts_with("<synthesized_terminal")
+            } else {
+                qualified_root_answer(answer, &envelope)
+            }
+        });
         let reusable_origin = projection
             .terminal_presentation
             .as_ref()
@@ -9027,7 +9073,21 @@ where
             narrator_model,
             attempted_models,
             committed_attempt_id,
-        ) = if let Some(answer) = direct_answer {
+        ) = if delegated_leaf {
+            let answer = terminal_override
+                .as_ref()
+                .map(|(_, answer)| answer.clone())
+                .or(direct_answer)
+                .unwrap_or_default();
+            (
+                answer,
+                harness_contract::outcome::AnswerOrigin::TerminalDelegate,
+                None,
+                terminal_model.clone(),
+                Vec::new(),
+                attempt_id.clone(),
+            )
+        } else if let Some(answer) = direct_answer {
             let visible_answer = visible_final_answer(&answer);
             if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
                 bus.emit_synthetic_text_item("terminal-presentation", &visible_answer);
@@ -9119,8 +9179,9 @@ where
             .cancellation_token()
             .is_cancelled()
         {
-            if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
-                bus.emit(CowdEvent::TerminalDelivery {
+            if !delegated_leaf {
+                if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                    bus.emit(CowdEvent::TerminalDelivery {
                     delivery:
                         harness_contract::live::TerminalDeliveryEvent::TerminalPresentationAborted {
                             presentation_id: presentation_id.clone(),
@@ -9128,6 +9189,7 @@ where
                             reason: "user_cancelled".to_string(),
                         },
                 });
+                }
             }
             return Err("terminal_presentation_cancelled".to_string());
         }
@@ -9137,14 +9199,16 @@ where
             .await
             .consume_active_runtime_inputs_for_next_step(TurnInputCheckpoint::BeforeFinalAnswer);
         if !late_inputs.is_empty() {
-            if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
-                bus.emit(CowdEvent::TerminalDelivery {
+            if !delegated_leaf {
+                if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                    bus.emit(CowdEvent::TerminalDelivery {
                     delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationSuperseded {
                         presentation_id: presentation_id.clone(),
                         attempt_id: committed_attempt_id,
                         reason: "new_durable_session_input".to_string(),
                     },
                 });
+                }
             }
             {
                 let mut state = self.state.lock().await;
@@ -9175,66 +9239,69 @@ where
             }));
         }
         let now_ms = crate::tool_invocation::now_ms();
-        let presentation = harness_contract::outcome::TerminalPresentation {
-            presentation_id,
-            attempt_id: committed_attempt_id,
-            envelope_id: envelope.envelope_id.clone(),
-            envelope_revision: envelope.revision,
-            state: harness_contract::outcome::TerminalPresentationState::Committed,
-            answer_origin,
-            source_execution_id: Some(ticket.graph_id.clone()),
-            narrator_model: if answer_origin
-                == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
-            {
-                projection
+        let presentation = execution_role.owns_root_presentation().then(|| {
+            harness_contract::outcome::TerminalPresentation {
+                presentation_id,
+                attempt_id: committed_attempt_id,
+                envelope_id: envelope.envelope_id.clone(),
+                envelope_revision: envelope.revision,
+                state: harness_contract::outcome::TerminalPresentationState::Committed,
+                answer_origin,
+                source_execution_id: Some(ticket.graph_id.clone()),
+                narrator_model: if answer_origin
+                    == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+                {
+                    projection
+                        .terminal_presentation
+                        .as_ref()
+                        .and_then(|candidate| candidate.narrator_model.clone())
+                } else if answer_origin == harness_contract::outcome::AnswerOrigin::TerminalNarrator
+                {
+                    narrator_model.or(terminal_model)
+                } else {
+                    None
+                },
+                narrator_provider: projection
                     .terminal_presentation
                     .as_ref()
-                    .and_then(|candidate| candidate.narrator_model.clone())
-            } else if answer_origin == harness_contract::outcome::AnswerOrigin::TerminalNarrator {
-                narrator_model.or(terminal_model)
-            } else {
-                None
-            },
-            narrator_provider: projection
-                .terminal_presentation
-                .as_ref()
-                .filter(|_| {
-                    answer_origin == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
-                })
-                .and_then(|candidate| candidate.narrator_provider.clone()),
-            models_attempted: if answer_origin
-                == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
-            {
-                projection
-                    .terminal_presentation
-                    .as_ref()
-                    .map(|candidate| candidate.models_attempted.clone())
-                    .unwrap_or_default()
-            } else {
-                attempted_models
-                    .into_iter()
-                    .map(
-                        |model| harness_contract::outcome::PresentationModelAttempt {
-                            provider: "configured".to_string(),
-                            model,
-                            failure: None,
-                        },
-                    )
-                    .collect()
-            },
-            validation: harness_contract::outcome::AnswerValidation {
-                status: harness_contract::outcome::AnswerValidationStatus::Valid,
-                findings: Vec::new(),
-                envelope_revision: Some(envelope.revision),
-            },
-            fallback_reason,
-            generated_at_ms: now_ms,
-            committed_at_ms: Some(now_ms),
-        };
+                    .filter(|_| {
+                        answer_origin == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+                    })
+                    .and_then(|candidate| candidate.narrator_provider.clone()),
+                models_attempted: if answer_origin
+                    == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
+                {
+                    projection
+                        .terminal_presentation
+                        .as_ref()
+                        .map(|candidate| candidate.models_attempted.clone())
+                        .unwrap_or_default()
+                } else {
+                    attempted_models
+                        .into_iter()
+                        .map(
+                            |model| harness_contract::outcome::PresentationModelAttempt {
+                                provider: "configured".to_string(),
+                                model,
+                                failure: None,
+                            },
+                        )
+                        .collect()
+                },
+                validation: harness_contract::outcome::AnswerValidation {
+                    status: harness_contract::outcome::AnswerValidationStatus::Valid,
+                    findings: Vec::new(),
+                    envelope_revision: Some(envelope.revision),
+                },
+                fallback_reason,
+                generated_at_ms: now_ms,
+                committed_at_ms: Some(now_ms),
+            }
+        });
         {
             let mut state = self.state.lock().await;
             state.delivery_envelope = Some(envelope.clone());
-            state.terminal_presentation = Some(presentation.clone());
+            state.terminal_presentation = presentation.clone();
             state.terminal_commit_owner = Some((ticket.node_id.clone(), ticket.attempt));
             state.committed_terminal_answer = Some(final_answer.clone());
             state.committed_terminal_completion = Some(completion);
@@ -9245,7 +9312,7 @@ where
             ExecutionUsage::default(),
         ));
         outcome.delivery_envelope = Some(envelope.clone());
-        outcome.terminal_presentation = Some(presentation.clone());
+        outcome.terminal_presentation = presentation.clone();
         outcome.domain_events.push(
             self.services
                 .goal_store()
@@ -9282,6 +9349,9 @@ where
             .pending_controlled_recovery_claim_fingerprints =
             controlled_recovery_claim_fingerprints.clone();
         if let Some(ingress) = ingress {
+            let presentation = presentation.as_ref().ok_or_else(|| {
+                "root Session ingress terminal is missing its presentation".to_string()
+            })?;
             let (terminal_fence, consumed_input_sequence) = {
                 let runtime = self.runtime.lock().await;
                 let terminal_fence = runtime
@@ -11978,6 +12048,13 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn delegated_leaf_never_owns_root_terminal_presentation() {
+        assert!(TurnExecutionRole::RootTurn.owns_root_presentation());
+        assert!(!TurnExecutionRole::DelegatedLeaf.owns_root_presentation());
+        assert!(TurnExecutionRole::DelegatedLeaf.is_delegated_leaf());
+    }
+
     fn route_input_call(input_slots: &[u16]) -> ModelToolCall {
         ModelToolCall {
             id: "route-input".to_string(),
@@ -13181,6 +13258,7 @@ mod tests {
             execution_identity: None,
             execution_lineage: Some(lineage),
             execution_parent: None,
+            execution_role: TurnExecutionRole::RootTurn,
         })
         .expect("standard host")
     }

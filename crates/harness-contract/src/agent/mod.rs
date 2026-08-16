@@ -77,6 +77,11 @@ pub struct AgentTaskIntent {
     /// criterion carrier for durable migration only.
     #[serde(default)]
     pub required_acceptance: crate::context::RequiredAcceptance,
+    /// Typed output-shape and evidence checks compiled by the Team planner.
+    /// These checks are never recovered from free-form constraint strings for
+    /// newly planned work.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_acceptance: Vec<crate::team::TeamAcceptanceRequirement>,
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
@@ -243,6 +248,11 @@ pub struct AgentTaskPacket {
     pub objective: String,
     #[serde(default)]
     pub required_acceptance: crate::context::RequiredAcceptance,
+    /// Typed output-shape and evidence checks inherited from the planning
+    /// intent. Legacy durable packets deserialize to an empty value and are
+    /// migrated fail-closed at the Runtime boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_acceptance: Vec<crate::team::TeamAcceptanceRequirement>,
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,

@@ -470,7 +470,8 @@ pub use team_agent_task::{
 #[path = "conversation/host.rs"]
 pub mod host;
 pub use host::{
-    submit_owned_conversation_turn, StandardRuntimeHost, StandardRuntimeHostConfig, TurnIngressRef,
+    submit_owned_conversation_turn, StandardRuntimeHost, StandardRuntimeHostConfig,
+    TurnExecutionRole, TurnIngressRef,
 };
 pub use input_classifier::{classify_session_input, RuntimeInputState};
 pub use intent_planner::{classify_intent, IntentPlan, TaskIntent};
@@ -766,7 +767,9 @@ pub use team_l4_promotion::{
 };
 pub use team_legacy_import::LegacyTeamImportReport;
 pub use team_profile_migration::LegacyTeamProfileMigrationReport;
-pub use team_projection::{TeamProjection, TeamProjectionReader};
+pub use team_projection::{
+    TeamProjection, TeamProjectionCursor, TeamProjectionPage, TeamProjectionReader,
+};
 pub use team_result_reducer::TeamResultReducer;
 pub use team_runtime::TeamRuntime;
 pub use team_working_state::{

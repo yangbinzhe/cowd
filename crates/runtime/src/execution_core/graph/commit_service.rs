@@ -2050,6 +2050,7 @@ mod tests {
             policy_revision: 1,
             objective: "verify canonical reverse lineage".to_string(),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),

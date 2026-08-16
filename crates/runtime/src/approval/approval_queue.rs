@@ -177,6 +177,19 @@ impl ApprovalQueue {
         skippable: bool,
         allowed_scopes: Vec<ApprovalGrantScope>,
     ) -> Result<GlobalApprovalRequest, String> {
+        let mut request = request;
+        let created_at_ms = now_ms();
+        // Non-blocking review work must never pin a Session forever. Give it a
+        // risk-scaled review window and continue without promotion when that
+        // window closes. Blocking execution approvals retain their explicit
+        // policy/deadline because a required human choice is authoritative.
+        let expires_at_ms = expires_at_ms.or_else(|| {
+            (!request.blocks_execution)
+                .then(|| created_at_ms.saturating_add(nonblocking_approval_ttl_ms(request.risk)))
+        });
+        if !request.blocks_execution && request.timeout_policy == ApprovalTimeoutPolicy::Pending {
+            request.timeout_policy = ApprovalTimeoutPolicy::ContinueAlternative;
+        }
         request.source.validate()?;
         if request.action.trim().is_empty() {
             return Err("approval action must not be empty".to_string());
@@ -220,7 +233,7 @@ impl ApprovalQueue {
             timeout_policy: request.timeout_policy,
             status: GlobalApprovalStatus::Pending,
             decision: None,
-            created_at_ms: now_ms(),
+            created_at_ms,
             expires_at_ms,
             resolved_at_ms: None,
         };
@@ -787,8 +800,11 @@ impl ApprovalQueue {
             });
         }
         let next_status = match request.timeout_policy {
-            ApprovalTimeoutPolicy::Pending => GlobalApprovalStatus::Pending,
-            ApprovalTimeoutPolicy::AutoDeny
+            ApprovalTimeoutPolicy::Pending if request.blocks_execution => {
+                GlobalApprovalStatus::Pending
+            }
+            ApprovalTimeoutPolicy::Pending
+            | ApprovalTimeoutPolicy::AutoDeny
             | ApprovalTimeoutPolicy::ContinueAlternative
             | ApprovalTimeoutPolicy::AutoApproveOnce => GlobalApprovalStatus::TimedOut,
         };
@@ -798,7 +814,13 @@ impl ApprovalQueue {
             status: next_status,
             route_back: request.source.clone(),
             message: match request.timeout_policy {
-                ApprovalTimeoutPolicy::Pending => "approval remains pending".to_string(),
+                ApprovalTimeoutPolicy::Pending if request.blocks_execution => {
+                    "approval remains pending".to_string()
+                }
+                ApprovalTimeoutPolicy::Pending => {
+                    "non-blocking approval timed out; source should continue without promotion"
+                        .to_string()
+                }
                 ApprovalTimeoutPolicy::AutoDeny => "approval timed out and must deny".to_string(),
                 ApprovalTimeoutPolicy::ContinueAlternative => {
                     "approval timed out; source should continue alternative path".to_string()
@@ -1514,6 +1536,12 @@ const fn risk_rank(risk: harness_contract::core::TaskRisk) -> u8 {
     }
 }
 
+const fn nonblocking_approval_ttl_ms(risk: harness_contract::core::TaskRisk) -> u64 {
+    // Higher-risk governance decisions receive a longer human review window,
+    // while every non-blocking request remains bounded and releasable.
+    5 * 60 * 1_000 * (risk_rank(risk) as u64 + 1)
+}
+
 fn approval_request_indexes(
     requests: &BTreeMap<String, GlobalApprovalRequest>,
 ) -> ApprovalRequestIndexes {
@@ -1530,7 +1558,13 @@ fn approval_deadline_index(
     let mut deadlines = BTreeMap::<u64, BTreeSet<String>>::new();
     for (approval_id, approval) in requests {
         if approval.status == GlobalApprovalStatus::Pending {
-            if let Some(deadline) = approval.expires_at_ms {
+            if let Some(deadline) = approval.expires_at_ms.or_else(|| {
+                (!approval.blocks_execution).then(|| {
+                    approval
+                        .created_at_ms
+                        .saturating_add(nonblocking_approval_ttl_ms(approval.risk))
+                })
+            }) {
                 deadlines
                     .entry(deadline)
                     .or_default()
@@ -2099,6 +2133,38 @@ mod tests {
             .expect("timeout alternative");
         assert_eq!(receipt.status, GlobalApprovalStatus::TimedOut);
         assert!(receipt.message.contains("alternative"));
+    }
+
+    #[test]
+    fn nonblocking_approval_gets_a_risk_scaled_deadline_and_cannot_pin_forever() {
+        let queue = queue();
+        let mut request = pending_request("optional knowledge promotion");
+        request.blocks_execution = false;
+        request.domain = ApprovalDomain::Knowledge;
+        request.timeout_policy = ApprovalTimeoutPolicy::Pending;
+        request.risk = TaskRisk::Medium;
+        let approval = queue.submit(request).expect("nonblocking approval");
+
+        assert_eq!(
+            approval.timeout_policy,
+            ApprovalTimeoutPolicy::ContinueAlternative
+        );
+        assert_eq!(
+            approval.expires_at_ms,
+            Some(
+                approval
+                    .created_at_ms
+                    .saturating_add(nonblocking_approval_ttl_ms(TaskRisk::Medium))
+            )
+        );
+        assert_eq!(queue.active_deadline_count(), 1);
+        let resolved = queue.reconcile_deadlines_at(approval.expires_at_ms.unwrap());
+        assert_eq!(resolved, vec![approval.approval_id.clone()]);
+        assert_eq!(
+            queue.get(&approval.approval_id).map(|value| value.status),
+            Some(GlobalApprovalStatus::TimedOut)
+        );
+        assert_eq!(queue.active_request_count(), 0);
     }
 
     #[test]

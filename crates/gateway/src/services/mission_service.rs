@@ -250,7 +250,9 @@ impl MissionService {
         &self,
         selected_mission_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        let snapshot = self.materialized_snapshot_for(selected_mission_id).await?;
+        let snapshot = self
+            .materialized_snapshot_for_detail(selected_mission_id, false)
+            .await?;
         let graph = &snapshot.projection.mission_graph;
         let digest = {
             use sha2::{Digest, Sha256};
@@ -656,12 +658,23 @@ impl MissionService {
         if !self.runtime().has_default_mission() {
             return Ok(());
         }
-        self.materialized_snapshot().await.map(|_| ())
+        self.materialized_snapshot_for_detail(None, false)
+            .await
+            .map(|_| ())
     }
 
     pub(crate) async fn materialized_snapshot_for(
         &self,
         selected_mission_id: Option<&str>,
+    ) -> Result<MissionMaterializedSnapshot, String> {
+        self.materialized_snapshot_for_detail(selected_mission_id, true)
+            .await
+    }
+
+    async fn materialized_snapshot_for_detail(
+        &self,
+        selected_mission_id: Option<&str>,
+        include_execution_details: bool,
     ) -> Result<MissionMaterializedSnapshot, String> {
         // The default Mission is a durable aggregate. Ensure it before reading
         // the event cursor so the returned snapshot never trails the commit
@@ -674,10 +687,25 @@ impl MissionService {
             .max_by_key(|session| session.updated_at_ms)
             .map(|session| session.session_id.clone());
         let latest_cursor = *self.events().subscribe_commits().borrow();
-        let cache_key = selected_mission_id.unwrap_or_default().to_string();
+        let cache_key = format!(
+            "{}:{}",
+            if include_execution_details {
+                "graph"
+            } else {
+                "summary"
+            },
+            selected_mission_id.unwrap_or_default()
+        );
         let mut cache = self.projection_cache.lock().await;
         if let Some(entry) = cache.get(&cache_key) {
-            if entry.snapshot.cursor == latest_cursor
+            // Summary snapshots are an SSE baseline, not a second current
+            // truth owner. Reusing the last bounded baseline across unrelated
+            // Runtime commits avoids rebuilding hundreds of Mission nodes on
+            // the first panel open; the consumer resumes from its cursor and
+            // receives exact deltas. Canonical Session membership still
+            // invalidates the baseline, while full graph reads remain strictly
+            // cursor-current.
+            if (!include_execution_details || entry.snapshot.cursor == latest_cursor)
                 && entry.canonical_sessions == sessions
                 && entry.snapshot.projection.workspace.active_session_id == active_session_id
             {
@@ -687,11 +715,19 @@ impl MissionService {
         let revision = cache
             .get(&cache_key)
             .map_or(1, |entry| entry.snapshot.revision.saturating_add(1));
-        let projection = self.runtime().control_projection(
-            sessions.clone(),
-            active_session_id,
-            selected_mission_id.map(str::to_owned),
-        )?;
+        let projection = if include_execution_details {
+            self.runtime().control_projection(
+                sessions.clone(),
+                active_session_id,
+                selected_mission_id.map(str::to_owned),
+            )?
+        } else {
+            self.runtime().control_summary_projection(
+                sessions.clone(),
+                active_session_id,
+                selected_mission_id.map(str::to_owned),
+            )?
+        };
         let snapshot = MissionMaterializedSnapshot {
             schema_version: MISSION_CONTROL_SCHEMA_VERSION,
             kind: "mission_control.materialized_snapshot".to_string(),
@@ -805,21 +841,7 @@ impl MissionService {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let teams = self.runtime().team_projection_json();
-        let mut team_counts = HashMap::<String, usize>::new();
-        let mut agent_counts = HashMap::<String, usize>::new();
-        if let Some(items) = teams.get("teams").and_then(serde_json::Value::as_array) {
-            for team in items {
-                if let Some(session_id) = team.get("session_id").and_then(serde_json::Value::as_str)
-                {
-                    *team_counts.entry(session_id.to_string()).or_default() += 1;
-                    *agent_counts.entry(session_id.to_string()).or_default() += team
-                        .get("tasks")
-                        .and_then(serde_json::Value::as_array)
-                        .map_or(0, Vec::len);
-                }
-            }
-        }
+        let team_session_counts = self.runtime().team_session_counts();
         let active = self
             .sessions()
             .list_active_session_ids()
@@ -828,7 +850,7 @@ impl MissionService {
         let mut relevant_session_ids = active.clone();
         relevant_session_ids.extend(presence.keys().cloned());
         relevant_session_ids.extend(hydration.keys().cloned());
-        relevant_session_ids.extend(team_counts.keys().cloned());
+        relevant_session_ids.extend(team_session_counts.keys().cloned());
         relevant_session_ids.extend(self.runtime().referenced_session_ids());
         let relevant_session_ids = relevant_session_ids.into_iter().collect::<Vec<_>>();
         let task_contributions = self.runtime().session_task_contributions();
@@ -889,8 +911,12 @@ impl MissionService {
                     hydration,
                     active: active.contains(&record.session_id),
                     attachment_count: lifecycle.map_or(0, |snapshot| snapshot.attachments.len()),
-                    team_count: team_counts.get(&record.session_id).copied().unwrap_or(0),
-                    agent_count: agent_counts.get(&record.session_id).copied().unwrap_or(0),
+                    team_count: team_session_counts
+                        .get(&record.session_id)
+                        .map_or(0, |counts| counts.0),
+                    agent_count: team_session_counts
+                        .get(&record.session_id)
+                        .map_or(0, |counts| counts.1),
                     contributing_task_count: task_contributions
                         .get(&record.session_id)
                         .map_or(0, Vec::len),
@@ -1651,6 +1677,13 @@ mod tests {
         assert!(summary["summary"]["graph"]["hash"]
             .as_str()
             .is_some_and(|hash| !hash.is_empty()));
+        let summary_nodes = summary["summary"]["projection"]["mission_graph"]["nodes"]
+            .as_array()
+            .expect("summary graph nodes");
+        assert!(summary_nodes.iter().all(|node| !matches!(
+            node["kind"].as_str(),
+            Some("artifact" | "outcome" | "approval" | "schedule" | "conflict" | "recovery")
+        )));
 
         let control = service
             .mission_control(None, "graph")

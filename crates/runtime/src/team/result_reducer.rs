@@ -2,15 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use harness_contract::agent::{AgentTaskPacket, AgentTerminalStatus};
+use harness_contract::agent::AgentTaskPacket;
+#[cfg(test)]
+use harness_contract::agent::AgentTerminalStatus;
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
 };
+#[cfg(test)]
+use harness_contract::outcome::PresentationModelAttempt;
 use harness_contract::outcome::{
     AnswerContentKind, AnswerObjectiveScope, AnswerOrigin, AnswerValidation,
     AnswerValidationStatus, DeliveryBranchStatus, DeliveryBranchTerminal, DeliveryCoverage,
-    DeliveryEnvelope, DeliveryStatus, DeliveryUnresolved, PipelineStatus, PresentationModelAttempt,
-    TerminalPresentation, TerminalPresentationState, UserAnswerContract, VerifiedDeliveryEffect,
+    DeliveryEnvelope, DeliveryStatus, DeliveryUnresolved, PipelineStatus, TerminalPresentation,
+    TerminalPresentationState, UserAnswerContract, VerifiedDeliveryEffect,
     VerifiedDeliveryReference, VerifiedEffectStatus,
 };
 
@@ -22,20 +26,18 @@ use crate::execution_core::{ImmutableWorkKey, InFlightCoalescer};
 use crate::AgentRuntime;
 
 /// Reduces durable graph terminal facts into one DeliveryEnvelope. A
-/// process-local AgentRuntime packet is consulted only for an optional wording
-/// candidate and never replaces committed branch/evidence/effect truth.
+/// wording candidates are derived from committed node summaries, never from
+/// process-local AgentRuntime terminal packets.
 pub struct TeamResultReducer {
     state_store: ExecutionGraphStateStore,
-    agents: Arc<AgentRuntime>,
     coalescer: Arc<InFlightCoalescer<ImmutableWorkKey, NodeExecutionOutcome, String>>,
 }
 
 impl TeamResultReducer {
     #[must_use]
-    pub fn new(state_store: ExecutionGraphStateStore, agents: Arc<AgentRuntime>) -> Self {
+    pub fn new(state_store: ExecutionGraphStateStore, _agents: Arc<AgentRuntime>) -> Self {
         Self {
             state_store,
-            agents,
             coalescer: Arc::new(InFlightCoalescer::default()),
         }
     }
@@ -51,27 +53,16 @@ impl TeamResultReducer {
             .map_err(|error| error.to_string())?;
         let mut evidence = Vec::new();
         let mut usage = ExecutionUsage::default();
-        let mut returned_by_node = BTreeMap::new();
         let terminal_agent_nodes = terminal_agent_node_ids(&graph);
 
         for node in graph.nodes.iter().filter(|node| {
             node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
         }) {
-            let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
+            let _: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
                 .map_err(|_| format!("team node {} is not an AgentTask packet", node.id))?;
             if let Some(result) = graph.node_results.get(&node.id) {
                 merge_usage(&mut usage, &result.usage);
                 evidence.extend(result.evidence_refs.clone());
-            }
-            if let Some(returned) = self.agents.terminal_return(packet.agent_id()) {
-                if returned.run_id == packet.run_id()
-                    && returned.graph_id == graph.id
-                    && returned.node_id == node.id
-                    && returned.attempt == packet.attempt
-                    && returned.expected_graph_revision == packet.expected_graph_revision
-                {
-                    returned_by_node.insert(node.id.clone(), returned);
-                }
             }
         }
 
@@ -88,37 +79,13 @@ impl TeamResultReducer {
         usage.runtime_observed_resource_scopes.dedup();
 
         let envelope = build_delivery_envelope(&graph);
-        let positive_evidence_summary = graph.nodes.iter().find_map(|node| {
-            let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()?;
-            let role = packet
-                .constraints
-                .iter()
-                .find_map(|constraint| constraint.strip_prefix("team_role:"))?;
-            if matches!(role, "synthesizer" | "decision_synthesis" | "finalizer") {
-                return None;
-            }
-            let result = graph.node_results.get(&node.id)?;
-            if result.status != ExecutionNodeStatus::Completed
-                || !result
-                    .evidence_refs
-                    .iter()
-                    .any(|evidence| evidence.is_durable())
-            {
-                return None;
-            }
-            let summary = result.summary.as_deref()?;
-            let object = crate::agent_in_process_worker::structured_agent_output(summary)?;
-            object
-                .get("findings")
-                .or_else(|| object.get("summary"))
-                .and_then(positive_field_text)
-        });
+        let positive_evidence_summary = aggregate_positive_evidence_summary(&graph);
         let reusable = terminal_agent_nodes.iter().find_map(|node_id| {
             let node = graph.nodes.iter().find(|node| node.id == *node_id)?;
             let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()?;
-            let returned = returned_by_node.get(node_id)?;
-            eligible_team_synthesizer(
-                returned,
+            let result = graph.node_results.get(node_id)?;
+            eligible_team_synthesizer_result(
+                result,
                 &packet,
                 &envelope,
                 positive_evidence_summary.as_deref(),
@@ -157,6 +124,69 @@ impl TeamResultReducer {
         outcome.terminal_presentation = terminal_presentation;
         Ok(outcome)
     }
+}
+
+/// Build one deterministic wording input from every completed evidence-bearing
+/// worker branch.  A Team result must never depend on whichever branch happens
+/// to appear first in the graph, and a useful plain-text result must not be
+/// discarded merely because the delegated model omitted an optional JSON
+/// wrapper.
+fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String> {
+    let mut branch_summaries = BTreeMap::new();
+    for node in &graph.nodes {
+        if node.kind != ExecutionNodeKind::AgentTask {
+            continue;
+        }
+        let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref) else {
+            continue;
+        };
+        let role = packet
+            .constraints
+            .iter()
+            .find_map(|constraint| constraint.strip_prefix("team_role:"))
+            .map(str::trim);
+        if matches!(
+            role,
+            Some("synthesizer" | "decision_synthesis" | "finalizer")
+        ) {
+            continue;
+        }
+        let Some(result) = graph.node_results.get(&node.id) else {
+            continue;
+        };
+        if result.status != ExecutionNodeStatus::Completed
+            || !result
+                .evidence_refs
+                .iter()
+                .any(|evidence| evidence.is_durable())
+        {
+            continue;
+        }
+        let Some(raw_summary) = result.summary.as_deref().map(str::trim) else {
+            continue;
+        };
+        if raw_summary.is_empty() {
+            continue;
+        }
+        let summary = crate::agent_in_process_worker::structured_agent_output(raw_summary)
+            .and_then(|object| {
+                object
+                    .get("findings")
+                    .or_else(|| object.get("summary"))
+                    .and_then(positive_field_text)
+            })
+            .unwrap_or_else(|| raw_summary.to_string());
+        if !summary.trim().is_empty() {
+            branch_summaries.insert(node.id.clone(), summary);
+        }
+    }
+    (!branch_summaries.is_empty()).then(|| {
+        branch_summaries
+            .into_iter()
+            .map(|(branch_id, summary)| format!("[{branch_id}] {summary}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 fn merge_usage(aggregate: &mut ExecutionUsage, observed: &ExecutionUsage) {
@@ -448,6 +478,72 @@ fn stable_effect_id(node_id: &str, path: &str) -> String {
     format!("effect:{node_id}:{digest:016x}")
 }
 
+fn eligible_team_synthesizer_result(
+    result: &ExecutionNodeResult,
+    packet: &AgentTaskPacket,
+    envelope: &DeliveryEnvelope,
+    positive_evidence_summary: Option<&str>,
+) -> Option<(
+    harness_contract::outcome::AnswerCandidate,
+    TerminalPresentation,
+)> {
+    let role = packet
+        .constraints
+        .iter()
+        .find_map(|constraint| constraint.strip_prefix("team_role:"))
+        .map(str::trim);
+    if result.status != ExecutionNodeStatus::Completed
+        || !matches!(
+            role,
+            Some("synthesizer" | "decision_synthesis" | "finalizer")
+        )
+    {
+        return None;
+    }
+    let text = positive_evidence_summary?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut candidate = harness_contract::outcome::AnswerCandidate {
+        candidate_id: format!("team-terminal-candidate:{}", packet.run_id()),
+        origin: AnswerOrigin::TerminalDelegate,
+        objective_scope: AnswerObjectiveScope::Root,
+        source_execution_id: packet.run_id().to_string(),
+        consumed_envelope_revision: Some(envelope.revision),
+        model: result.usage.model.clone(),
+        provider: None,
+        completed_at_ms: result.finished_at_ms,
+        text: text.to_string(),
+        content_kind: AnswerContentKind::UserText,
+        terminal_delegate: true,
+        validation: AnswerValidation {
+            status: AnswerValidationStatus::Valid,
+            findings: Vec::new(),
+            envelope_revision: Some(envelope.revision),
+        },
+    };
+    candidate.origin = AnswerOrigin::TeamSynthesizer;
+    candidate.validation.status = AnswerValidationStatus::Pending;
+    let presentation = TerminalPresentation {
+        presentation_id: format!("team-presentation:{}", candidate.candidate_id),
+        attempt_id: candidate.candidate_id.clone(),
+        envelope_id: envelope.envelope_id.clone(),
+        envelope_revision: envelope.revision,
+        state: TerminalPresentationState::Validating,
+        answer_origin: AnswerOrigin::TeamSynthesizer,
+        source_execution_id: Some(packet.run_id().to_string()),
+        narrator_model: result.usage.model.clone(),
+        narrator_provider: None,
+        models_attempted: Vec::new(),
+        validation: candidate.validation.clone(),
+        fallback_reason: None,
+        generated_at_ms: result.finished_at_ms,
+        committed_at_ms: None,
+    };
+    Some((candidate, presentation))
+}
+
+#[cfg(test)]
 fn eligible_team_synthesizer(
     returned: &harness_contract::agent::AgentReturnPacket,
     packet: &AgentTaskPacket,
@@ -618,7 +714,6 @@ impl SynthesizeBackendResolver for TeamResultReducer {
         ticket.payload_ref.starts_with("team:").then(|| {
             Arc::new(Self {
                 state_store: self.state_store.clone(),
-                agents: Arc::clone(&self.agents),
                 coalescer: Arc::clone(&self.coalescer),
             }) as Arc<dyn SynthesizeBackend>
         })
@@ -678,8 +773,8 @@ fn terminal_agent_node_ids(
 mod tests {
     use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
     use harness_contract::context::{
-        ChildExecutionBudgetReservation, EvidenceObligation, EvidenceObligationKind,
-        EvidenceTargetIdentity, RequiredAcceptance,
+        ChildExecutionBudgetReservation, EvidenceAccessRef, EvidenceObligation,
+        EvidenceObligationKind, EvidenceRef, EvidenceTargetIdentity, RequiredAcceptance,
     };
     use harness_contract::execution_graph::{
         ExecutionEdge, ExecutionEdgeKind, ExecutionFailure, ExecutionGraph, ExecutionNodeKind,
@@ -691,8 +786,8 @@ mod tests {
     };
 
     use super::{
-        build_delivery_envelope, eligible_team_synthesizer, mechanical_delivery_summary,
-        terminal_agent_node_ids,
+        aggregate_positive_evidence_summary, build_delivery_envelope, eligible_team_synthesizer,
+        eligible_team_synthesizer_result, mechanical_delivery_summary, terminal_agent_node_ids,
     };
 
     fn result(status: ExecutionNodeStatus, usage: ExecutionUsage) -> ExecutionNodeResult {
@@ -764,6 +859,7 @@ mod tests {
             policy_revision: 1,
             objective: "synthesize".to_string(),
             required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
             acceptance: Vec::new(),
             constraints: vec!["team_role:synthesizer".to_string()],
             context_refs: Vec::new(),
@@ -843,6 +939,41 @@ mod tests {
         }
     }
 
+    fn add_evidence_branch(
+        graph: &mut ExecutionGraph,
+        node_id: &str,
+        summary: &str,
+        structured: bool,
+    ) {
+        let mut packet = synthesizer_packet();
+        packet.constraints = vec!["team_role:researcher".to_string()];
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent_task",
+            serde_json::to_string(&packet).expect("packet"),
+        );
+        node.id = node_id.to_string();
+        graph
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Completed);
+        let mut branch_result = result(ExecutionNodeStatus::Completed, ExecutionUsage::default());
+        branch_result.summary = Some(if structured {
+            serde_json::json!({"findings": [summary]}).to_string()
+        } else {
+            summary.to_string()
+        });
+        branch_result.evidence_refs.push(EvidenceAccessRef::durable(
+            EvidenceRef::durable(format!("evidence:{node_id}")),
+            "0".repeat(64),
+            1,
+            "text/plain",
+            format!("artifact:{node_id}"),
+            "team:fixture",
+        ));
+        graph.node_results.insert(node.id.clone(), branch_result);
+        graph.nodes.push(node);
+    }
+
     #[test]
     fn only_topology_terminal_agent_publishes_the_team_answer() {
         let mut graph = ExecutionGraph::new("research");
@@ -862,6 +993,20 @@ mod tests {
         assert_eq!(
             terminal_agent_node_ids(&graph),
             std::collections::BTreeSet::from(["synthesizer".to_string()])
+        );
+    }
+
+    #[test]
+    fn team_evidence_summary_aggregates_every_branch_in_stable_order() {
+        let mut graph = ExecutionGraph::new("all branches");
+        // Insert in reverse order to prove scheduling/insertion order cannot
+        // select the visible Team result.
+        add_evidence_branch(&mut graph, "branch-b", "plain text finding B", false);
+        add_evidence_branch(&mut graph, "branch-a", "structured finding A", true);
+
+        assert_eq!(
+            aggregate_positive_evidence_summary(&graph).as_deref(),
+            Some("[branch-a] structured finding A\n[branch-b] plain text finding B")
         );
     }
 
@@ -997,6 +1142,29 @@ mod tests {
             None,
         )
         .is_none());
+    }
+
+    #[test]
+    fn durable_terminal_result_can_publish_without_agent_hot_state() {
+        let mut graph = ExecutionGraph::new("durable candidate");
+        add_agent(&mut graph, "agent-a", ExecutionNodeStatus::Completed);
+        add_verify(&mut graph, true);
+        let envelope = build_delivery_envelope(&graph);
+        let packet = synthesizer_packet();
+        let mut durable = result(ExecutionNodeStatus::Completed, ExecutionUsage::default());
+        durable.finished_at_ms = 42;
+        let (candidate, presentation) = eligible_team_synthesizer_result(
+            &durable,
+            &packet,
+            &envelope,
+            Some("all durable branch facts"),
+        )
+        .expect("durable graph result is sufficient");
+        assert_eq!(candidate.text, "all durable branch facts");
+        assert_eq!(
+            presentation.source_execution_id.as_deref(),
+            Some(packet.run_id())
+        );
     }
 
     #[test]

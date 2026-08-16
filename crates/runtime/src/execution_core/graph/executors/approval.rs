@@ -20,6 +20,8 @@ use crate::{
 type SessionPolicyLookup =
     Arc<dyn Fn(&str) -> Option<SessionExecutionPolicy> + Send + Sync + 'static>;
 
+const DEFAULT_BLOCKING_APPROVAL_TIMEOUT_MS: u64 = 15 * 60 * 1_000;
+
 #[derive(Debug, Deserialize)]
 struct ApprovalPayload {
     action: String,
@@ -202,9 +204,13 @@ impl NodeExecutor for ApprovalNodeExecutor {
                     evidence_refs: payload.evidence_refs,
                     timeout_policy: ApprovalTimeoutPolicy::ContinueAlternative,
                 },
-                payload
-                    .timeout_ms
-                    .map(|timeout| now_ms().saturating_add(timeout)),
+                Some(
+                    now_ms().saturating_add(
+                        payload
+                            .timeout_ms
+                            .unwrap_or(DEFAULT_BLOCKING_APPROVAL_TIMEOUT_MS),
+                    ),
+                ),
                 payload.read_only,
                 vec![
                     harness_contract::policy::ApprovalGrantScope::Once,
@@ -316,6 +322,21 @@ impl NodeExecutor for ApprovalNodeExecutor {
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
+
+    async fn cancel(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
+        let approval_id = graph_approval_id(&ticket.graph_id, &ticket.node_id);
+        self.queue
+            .cancel(
+                &approval_id,
+                "parent execution terminated before approval was decided",
+                false,
+            )
+            .map(|_| ())
+            .map_err(|reason| NodeExecutorError::Cancel {
+                node_id: ticket.node_id.clone(),
+                reason,
+            })
+    }
 }
 
 fn now_ms() -> u64 {
@@ -353,6 +374,10 @@ mod tests {
         let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
         assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
         let approval_id = waiting.result_ref.unwrap();
+        assert!(queue
+            .get(&approval_id)
+            .and_then(|request| request.expires_at_ms)
+            .is_some_and(|deadline| deadline > now_ms()));
         queue
             .decide(
                 &crate::security::test_human_interactive_principal(),
@@ -421,6 +446,46 @@ mod tests {
             .summary
             .as_deref()
             .is_some_and(|summary| summary.contains("skipped")));
+    }
+
+    #[tokio::test]
+    async fn parent_terminal_cancels_correlated_pending_approval() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let queue = Arc::new(ApprovalQueue::new(store));
+        let executor = ApprovalNodeExecutor::new(Arc::clone(&queue));
+        let mut graph = ExecutionGraph::new("cancel pending approval");
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Approval,
+            ApprovalNodeExecutor::KIND,
+            serde_json::json!({
+                "action": "write",
+                "summary": "write workspace",
+                "session_id": "session-cancel"
+            })
+            .to_string(),
+        );
+        graph.nodes.push(node.clone());
+        let ticket = executor
+            .start(NodeExecutionContext {
+                graph: Arc::new(graph),
+                node,
+                attempt: 1,
+            })
+            .await
+            .unwrap();
+        let waiting = executor.poll_or_await(&ticket).await.unwrap().result;
+        let approval_id = waiting.result_ref.expect("pending approval id");
+
+        executor.cancel(&ticket).await.expect("parent cancellation");
+
+        assert!(queue.pending().is_empty());
+        assert_eq!(
+            queue
+                .get(&approval_id)
+                .expect("durable terminal approval")
+                .status,
+            GlobalApprovalStatus::Cancelled
+        );
     }
 
     #[tokio::test]
