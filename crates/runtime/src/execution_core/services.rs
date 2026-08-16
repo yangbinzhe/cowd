@@ -9556,6 +9556,16 @@ mod tests {
         assert!(services.team_runtime().projection_json()["teams"]
             .as_array()
             .is_some_and(|teams| teams.len() == 1));
+        let binding =
+            crate::team_binding::load_binding(services.event_store(), &projection.graph_id)
+                .expect("binding read")
+                .expect("normal Team admission persists its frozen Binding");
+        assert_eq!(binding.roles.len(), 2);
+        assert!(
+            crate::team_binding::has_ready_marker(services.event_store(), &projection.graph_id)
+                .expect("ready marker read"),
+            "normal Team admission closes the exact link set with a Ready marker"
+        );
     }
 
     #[tokio::test]
