@@ -292,18 +292,6 @@ async fn terminal_role_transition_commits_team_working_state_with_graph() {
         "canonical InProcess execution must link its child execution graph"
     );
     assert!(delegated_task.graph_refs[1].revision > 0);
-    let agent_runs = services.agent_runtime().list();
-    assert_eq!(agent_runs.len(), 1);
-    assert_eq!(agent_runs[0].task_id, delegated_task.task_id);
-    assert_eq!(agent_runs[0].root_task_id, root_task.task_id);
-    assert_eq!(agent_runs[0].session_id, root_task.origin_session_id);
-    assert!(
-        agent_runs[0]
-            .run_id
-            .starts_with("team-instantiation-test:run:"),
-        "Agent runtime must retain the canonical Team run identity"
-    );
-
     let state = services
         .team_runtime()
         .working_state("team-instantiation-test")
@@ -319,6 +307,21 @@ async fn terminal_role_transition_commits_team_working_state_with_graph() {
     assert!(
         !state.entries[0].producer_instance_id.is_empty(),
         "working state records the immutable producing Agent instance"
+    );
+    assert!(
+        services.agent_runtime().list().is_empty(),
+        "terminal Agent projections must leave bounded hot state"
+    );
+    let agent_run = services
+        .agent_runtime()
+        .get(&state.entries[0].producer_instance_id)
+        .expect("durable terminal Agent projection");
+    assert_eq!(agent_run.task_id, delegated_task.task_id);
+    assert_eq!(agent_run.root_task_id, root_task.task_id);
+    assert_eq!(agent_run.session_id, root_task.origin_session_id);
+    assert!(
+        agent_run.run_id.starts_with("team-instantiation-test:run:"),
+        "Agent runtime must retain the canonical Team run identity"
     );
     assert!(state.entries[0]
         .boundary

@@ -9169,16 +9169,33 @@ mod tests {
         let graph = services
             .compile_graph_agent_intents(graph)
             .expect("bind graph");
-        assert!(graph.nodes.iter().all(|node| {
-            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
-                .ok()
-                .is_some_and(|packet| {
-                    packet
-                        .constraints
-                        .iter()
-                        .any(|constraint| constraint.starts_with("team_acceptance_contract:"))
-                })
+        let packets = graph
+            .nodes
+            .iter()
+            .map(|node| {
+                serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                    .expect("canonical AgentTaskPacket")
+            })
+            .collect::<Vec<_>>();
+        assert!(packets.iter().all(|packet| {
+            let typed_acceptance_matches_lease =
+                packet.output_acceptance.iter().any(|requirement| {
+                    matches!(
+                        &requirement.check,
+                        harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { scopes }
+                            if scopes == &packet.resource_scopes
+                    )
+                });
+            let legacy_constraint_is_absent = packet
+                .constraints
+                .iter()
+                .all(|constraint| !constraint.starts_with("team_acceptance_contract:"));
+            typed_acceptance_matches_lease && legacy_constraint_is_absent
         }));
+        let agent_ids = packets
+            .iter()
+            .map(|packet| packet.agent_id().to_string())
+            .collect::<Vec<_>>();
 
         let (_, report) = services
             .execution_supervisor()
@@ -9191,11 +9208,18 @@ mod tests {
             .await
             .expect("run graph");
         assert_eq!(report.completed, 8, "parallel agent report: {report:?}");
-        let snapshots = services
-            .agent_runtime()
-            .list()
+        assert!(
+            services.agent_runtime().list().is_empty(),
+            "terminal Agent projections must leave bounded hot state"
+        );
+        let snapshots = agent_ids
             .into_iter()
-            .filter(|snapshot| snapshot.session_id == "binding-session")
+            .map(|agent_id| {
+                services
+                    .agent_runtime()
+                    .get(&agent_id)
+                    .expect("durable terminal Agent projection")
+            })
             .collect::<Vec<_>>();
         assert_eq!(snapshots.len(), 8);
         let bindings = snapshots
