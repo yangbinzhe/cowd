@@ -310,16 +310,10 @@ fn authorized_focuses_for_team(
     if team_count <= 1 || requires_write {
         return focuses.to_vec();
     }
-    let is_reducer = |role: &str| {
-        matches!(
-            role,
-            "synthesizer" | "reviewer" | "arbiter" | "coordinator" | "comparator"
-        )
-    };
     let mut primary_index = 0_usize;
     let mut selected = Vec::new();
     for focus in focuses {
-        if is_reducer(&focus.role_id) {
+        if is_reducer_focus(focus) {
             selected.push(focus.clone());
         } else {
             if primary_index % team_count == team_index {
@@ -335,13 +329,13 @@ fn authorized_focuses_for_team(
     // overlap remains visible to the existing evidence-overlap accounting.
     let minimum_primary = focuses
         .iter()
-        .filter(|focus| !is_reducer(&focus.role_id))
+        .filter(|focus| !is_reducer_focus(focus))
         .count()
         .min(2);
-    for focus in focuses.iter().filter(|focus| !is_reducer(&focus.role_id)) {
+    for focus in focuses.iter().filter(|focus| !is_reducer_focus(focus)) {
         if selected
             .iter()
-            .filter(|candidate| !is_reducer(&candidate.role_id))
+            .filter(|candidate| !is_reducer_focus(candidate))
             .count()
             >= minimum_primary
         {
@@ -355,6 +349,18 @@ fn authorized_focuses_for_team(
         }
     }
     selected
+}
+
+/// Reducer/terminal roles are identified by their compiled output contract,
+/// never by a global role-name map. Renaming a role (including localization)
+/// therefore cannot change focus authority or reducer eligibility.
+fn is_reducer_focus(focus: &SemanticFocus) -> bool {
+    focus.output_contract.iter().any(|field| {
+        matches!(
+            field.as_str(),
+            "review" | "summary" | "risks" | "arbitration" | "decision"
+        )
+    })
 }
 
 fn direct_executor_focus_for_team(
@@ -371,12 +377,7 @@ fn direct_executor_focus_for_team(
     if scopes.is_empty() {
         let primary = authorized_focuses
             .iter()
-            .filter(|focus| {
-                !matches!(
-                    focus.role_id.as_str(),
-                    "synthesizer" | "reviewer" | "arbiter" | "coordinator" | "comparator"
-                )
-            })
+            .filter(|focus| !is_reducer_focus(focus))
             .collect::<Vec<_>>();
         for (index, focus) in primary.iter().enumerate() {
             if index % team_count == team_index {
@@ -1271,13 +1272,21 @@ mod tests {
     use harness_contract::execution_graph::ExecutionCompletionContract;
 
     fn focus(id: &str, role: &str) -> SemanticFocus {
+        let output_contract = if matches!(
+            role,
+            "synthesizer" | "reviewer" | "arbiter" | "coordinator" | "comparator"
+        ) {
+            vec!["summary".to_string(), "evidence".to_string()]
+        } else {
+            vec!["findings".to_string(), "evidence".to_string()]
+        };
         SemanticFocus {
             focus_id: id.to_string(),
             role_id: role.to_string(),
             objective: id.to_string(),
             resource_scopes: vec![format!("read:{id}")],
             evidence_responsibilities: vec!["evidence".to_string()],
-            output_contract: Vec::new(),
+            output_contract,
             output_acceptance: Vec::new(),
         }
     }
@@ -1307,6 +1316,40 @@ mod tests {
         assert_eq!(left_primary.union(&right_primary).count(), 3);
         assert!(left.iter().any(|focus| focus.focus_id == "synthesis"));
         assert!(right.iter().any(|focus| focus.focus_id == "synthesis"));
+    }
+
+    #[test]
+    fn reducer_authority_uses_output_contract_not_role_name() {
+        let mut reviewer = focus("review-1", "实现者");
+        reviewer.output_contract = vec![
+            "review".to_string(),
+            "evidence".to_string(),
+            "risks".to_string(),
+        ];
+        let mut researcher = focus("research-1", "synthesizer");
+        researcher.output_contract = vec!["findings".to_string(), "evidence".to_string()];
+        let focuses = vec![reviewer, researcher];
+
+        let left = authorized_focuses_for_team(&focuses, 0, 2, false);
+        let right = authorized_focuses_for_team(&focuses, 1, 2, false);
+        assert!(
+            left.iter().any(|focus| focus.focus_id == "review-1")
+                && right.iter().any(|focus| focus.focus_id == "review-1"),
+            "a renamed reducer role stays shared through its typed output contract"
+        );
+        assert!(is_reducer_focus(
+            left.iter()
+                .find(|focus| focus.focus_id == "review-1")
+                .expect("reviewer focus")
+        ));
+        assert!(
+            !is_reducer_focus(
+                left.iter()
+                    .find(|focus| focus.focus_id == "research-1")
+                    .expect("research focus")
+            ),
+            "a role named synthesizer without a reducer contract is never treated as a reducer"
+        );
     }
 
     #[test]

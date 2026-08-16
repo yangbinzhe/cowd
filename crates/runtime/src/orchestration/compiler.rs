@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
 use harness_contract::agent::{AgentCapability, AgentTaskIntent};
 use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::execution_graph::{
-    validate_execution_graph, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
-    ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec, ExecutionOrchestrationMetadata,
-    ExecutionParentBinding, ExecutionWorkContract, ExecutionWorkRole,
+    validate_execution_graph, DependencyPredicate, ExecutionDependencyPolicy, ExecutionEdge,
+    ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec,
+    ExecutionNodeStatus, ExecutionOrchestrationMetadata, ExecutionParentBinding,
+    ExecutionWorkContract, ExecutionWorkRole,
 };
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, TeamInstantiationRequest, TeamSelectionMode,
@@ -356,8 +358,52 @@ fn compile_semantic_node(
     work.dependency = semantic.dependency.clone();
     work.cancellation_group = semantic.cancellation_group.clone();
     work.required_evidence_refs = semantic.required_evidence_refs.clone();
+    work.dependency = default_review_dependency(
+        semantic.recipe,
+        work.dependency,
+        &work.required_evidence_refs,
+        !semantic.depends_on.is_empty(),
+    );
     node.work = Some(work);
     Ok(node)
+}
+
+/// Reviewer/CrossCheck edges consume terminal predecessor facts, not raw
+/// execution status. A failed or FrameworkInvalid predecessor with durable
+/// evidence stays reviewable; only the typed predicate decides readiness.
+fn default_review_dependency(
+    recipe: CapabilityRecipeId,
+    dependency: ExecutionDependencyPolicy,
+    required_evidence_refs: &[String],
+    has_predecessors: bool,
+) -> ExecutionDependencyPolicy {
+    if recipe == CapabilityRecipeId::Review
+        && dependency == ExecutionDependencyPolicy::All
+        && required_evidence_refs.is_empty()
+        && has_predecessors
+    {
+        return ExecutionDependencyPolicy::EvidenceReady {
+            predicate: DependencyPredicate::EvidenceReady {
+                minimum: 1,
+                required_fact_kinds: vec![
+                    TerminalFactKind::ObservedEvidence,
+                    TerminalFactKind::AcceptanceVerdict,
+                ],
+                accepted_execution_statuses: vec![
+                    ExecutionNodeStatus::Failed,
+                    ExecutionNodeStatus::Completed,
+                ],
+                accepted_acceptance_verdicts: vec![
+                    AcceptanceVerdict::Satisfied,
+                    AcceptanceVerdict::Unsatisfied,
+                    AcceptanceVerdict::FrameworkInvalid,
+                ],
+                require_committed_effect: false,
+            },
+            cancel_remaining: false,
+        };
+    }
+    dependency
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -890,6 +936,65 @@ pub fn guidance_for_compile_result(compiled: bool) -> String {
 mod tests {
     use super::*;
     use crate::orchestration::request::SemanticFocus;
+
+    #[test]
+    fn review_nodes_default_to_evidence_ready_predicate_not_status_all() {
+        let dependency = default_review_dependency(
+            CapabilityRecipeId::Review,
+            ExecutionDependencyPolicy::All,
+            &[],
+            true,
+        );
+        let ExecutionDependencyPolicy::EvidenceReady { predicate, .. } = dependency else {
+            panic!("Review edges must consume typed terminal facts");
+        };
+        let DependencyPredicate::EvidenceReady {
+            accepted_execution_statuses,
+            accepted_acceptance_verdicts,
+            minimum,
+            ..
+        } = predicate;
+        assert_eq!(minimum, 1);
+        assert!(accepted_execution_statuses.contains(&ExecutionNodeStatus::Failed));
+        assert!(accepted_acceptance_verdicts.contains(&AcceptanceVerdict::FrameworkInvalid));
+
+        let explicit = default_review_dependency(
+            CapabilityRecipeId::Review,
+            ExecutionDependencyPolicy::Quorum {
+                minimum: 2,
+                cancel_remaining: false,
+            },
+            &[],
+            true,
+        );
+        assert_eq!(
+            explicit,
+            ExecutionDependencyPolicy::Quorum {
+                minimum: 2,
+                cancel_remaining: false,
+            },
+            "an explicit dependency contract is never overwritten"
+        );
+        assert_eq!(
+            default_review_dependency(
+                CapabilityRecipeId::Synthesis,
+                ExecutionDependencyPolicy::All,
+                &[],
+                true,
+            ),
+            ExecutionDependencyPolicy::All
+        );
+        assert_eq!(
+            default_review_dependency(
+                CapabilityRecipeId::Review,
+                ExecutionDependencyPolicy::All,
+                &[],
+                false,
+            ),
+            ExecutionDependencyPolicy::All,
+            "a Review node without predecessors keeps the plain All dependency"
+        );
+    }
 
     #[test]
     fn shared_infrastructure_scope_does_not_erase_distinct_focus_boundaries() {
