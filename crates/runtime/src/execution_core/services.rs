@@ -9515,7 +9515,7 @@ mod tests {
             .await
             .expect("team execution");
 
-        assert_eq!(projection.status, "completed");
+        assert_eq!(projection.status, "partial");
         assert_eq!(projection.tasks.len(), 2);
         let terminal = projection.terminal_result.expect("one terminal result");
         assert!(
@@ -9631,7 +9631,7 @@ mod tests {
             .instantiate_or_resume(request.clone())
             .await
             .expect("resume reconciles links and executes once");
-        assert_eq!(projection.status, "completed");
+        assert_eq!(projection.status, "partial");
         assert_eq!(projection.tasks.len(), 2);
         assert!(
             crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
@@ -9761,7 +9761,7 @@ mod tests {
             })
             .await
             .expect("fanout team execution");
-        assert_eq!(projection.status, "completed");
+        assert_eq!(projection.status, "partial");
         assert!(max_active.load(Ordering::SeqCst) >= 2);
         assert!(max_active.load(Ordering::SeqCst) <= 3);
     }

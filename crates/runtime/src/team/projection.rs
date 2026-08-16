@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus};
-use harness_contract::team::{TeamRunResult, TeamTaskTrace};
+use harness_contract::team::{AgentDisplayIdentity, TeamRunResult, TeamTaskTrace};
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentRuntime, ExecutionGraphStateStore};
@@ -16,6 +16,15 @@ pub struct TeamProjection {
     pub status: String,
     pub tasks: Vec<TeamTaskTrace>,
     pub terminal_result: Option<TeamRunResult>,
+    /// Frozen Agent Binding digests of every Team node. Surfaces use these as
+    /// stable identity, never raw payload keys.
+    #[serde(default)]
+    pub binding_digests: Vec<String>,
+    /// Compiled display identities. When a display snapshot is unavailable the
+    /// label is the definition id with an explicit `unavailable-name`
+    /// provenance, never a raw payload guess.
+    #[serde(default)]
+    pub agent_displays: Vec<AgentDisplayIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +200,8 @@ impl TeamProjectionReader {
 
     fn project_graph(&self, graph: ExecutionGraph) -> Result<TeamProjection, String> {
         let mut tasks = Vec::new();
+        let mut binding_digests = Vec::new();
+        let mut agent_displays = Vec::new();
         let mut team_id = None;
         let mut session_id: Option<String> = None;
         for node in graph
@@ -250,6 +261,25 @@ impl TeamProjectionReader {
                         .map(|failure| failure.message.clone())
                 }),
             });
+            if let Some(binding) = packet.binding.as_ref() {
+                binding_digests.push(binding.binding_digest.clone());
+                let role_label = binding
+                    .instance
+                    .role_slot_id
+                    .clone()
+                    .unwrap_or_else(|| packet.assignment.role_id.clone());
+                agent_displays.push(AgentDisplayIdentity {
+                    label: binding.definition_ref.definition_id.as_str().to_string(),
+                    role_label,
+                    focus_label: None,
+                    locale: "auto".to_string(),
+                    provenance: "runtime.agent-binding:unavailable-name".to_string(),
+                    digest: model_protocol::fingerprint::stable_hash_bytes(
+                        binding.binding_digest.as_bytes(),
+                    )
+                    .to_string(),
+                });
+            }
         }
         let team_id = team_id.ok_or_else(|| format!("graph {} has no team AgentTask", graph.id))?;
         let session_id =
@@ -269,25 +299,43 @@ impl TeamProjectionReader {
                 })
             })
         });
-        let status = if graph
-            .node_statuses
-            .values()
-            .any(|status| *status == ExecutionNodeStatus::Failed)
+        binding_digests.sort();
+        binding_digests.dedup();
+        agent_displays.sort_by(|left, right| left.label.cmp(&right.label));
+        let status = if !graph.nodes.is_empty()
+            && graph
+                .node_statuses
+                .values()
+                .all(|status| status.is_terminal())
         {
-            "failed"
+            graph
+                .delivery_envelope
+                .as_ref()
+                .map(|envelope| match envelope.delivery_status {
+                    harness_contract::outcome::DeliveryStatus::Satisfied => "completed",
+                    harness_contract::outcome::DeliveryStatus::Partial => "partial",
+                    harness_contract::outcome::DeliveryStatus::Unavailable => "unavailable",
+                    harness_contract::outcome::DeliveryStatus::Denied => "denied",
+                })
+                .unwrap_or_else(|| {
+                    if graph
+                        .node_statuses
+                        .values()
+                        .any(|status| *status == ExecutionNodeStatus::Failed)
+                    {
+                        "failed"
+                    } else {
+                        "completed"
+                    }
+                })
         } else if graph
             .node_statuses
             .values()
             .any(|status| *status == ExecutionNodeStatus::Blocked)
         {
-            "partial"
-        } else if graph
-            .node_statuses
-            .values()
-            .all(|status| status.is_terminal())
-            && !graph.nodes.is_empty()
-        {
-            "completed"
+            // A blocked lane while other lanes are still running is a
+            // non-terminal waiting state; it must never project as partial.
+            "waiting_dependency"
         } else {
             "running"
         }
@@ -300,6 +348,260 @@ impl TeamProjectionReader {
             status,
             tasks,
             terminal_result,
+            binding_digests,
+            agent_displays,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_contract::agent::{AgentAssignment, AgentTaskIntent, AgentTaskPacket};
+    use harness_contract::context::ChildExecutionBudgetReservation;
+    use harness_contract::execution_graph::ExecutionNodeSpec;
+    use harness_contract::policy::PermissionMode;
+    use std::sync::Arc;
+
+    fn packet(node_id: &str, run_id: &str) -> AgentTaskPacket {
+        let intent = AgentTaskIntent {
+            selected_agent_id: None,
+            definition_ref: None,
+            granted_capabilities: Vec::new(),
+            principal_id: "test".to_string(),
+            source_turn_id: "turn-1".to_string(),
+            run_id: run_id.to_string(),
+            task_id: format!("task-{run_id}"),
+            root_task_id: "root".to_string(),
+            parent_task_id: None,
+            session_id: "session-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            team_id: Some("team-1".to_string()),
+            graph_id: "team-graph:team-1".to_string(),
+            node_id: node_id.to_string(),
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: "project".to_string(),
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            acceptance: Vec::new(),
+            constraints: vec!["team_role:implementer".to_string()],
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_ceiling: PermissionMode::ReadOnly,
+            model_lease: "model".to_string(),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent",
+                "team",
+                100,
+                7_500,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            managed_invocation: None,
+            idempotency_key: format!("agent:{run_id}"),
+        };
+        let assignment = crate::test_support::agent_assignment(
+            None,
+            intent.run_id.as_str(),
+            intent.run_id.as_str(),
+            intent.task_id.as_str(),
+            intent.session_id.as_str(),
+            intent.mission_id.as_str(),
+            intent.team_id.as_deref(),
+            intent.graph_id.as_str(),
+            intent.node_id.as_str(),
+        );
+        AgentTaskPacket {
+            assignment: AgentAssignment {
+                role_id: "implementer".to_string(),
+                ..assignment
+            },
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: intent.objective,
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            acceptance: Vec::new(),
+            constraints: intent.constraints,
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_ceiling: PermissionMode::ReadOnly,
+            policy_revision: 1,
+            model_lease: "model".to_string(),
+            budget_lease: intent.budget_lease,
+            deadline_at_ms: u64::MAX,
+            binding: None,
+            managed_invocation: None,
+            idempotency_key: intent.idempotency_key,
+        }
+    }
+
+    fn reader() -> TeamProjectionReader {
+        let store = Arc::new(crate::RuntimeEventStore::try_open_in_memory().unwrap());
+        let agents = Arc::new(crate::AgentRuntime::new(
+            Arc::clone(&store),
+            Arc::new(crate::ProviderRegistry::empty()),
+        ));
+        TeamProjectionReader::new(crate::ExecutionGraphStateStore::new(store), agents)
+    }
+
+    fn agent_node(id: &str, run_id: &str) -> ExecutionNodeSpec {
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent_task",
+            serde_json::to_string(&packet(id, run_id)).expect("packet"),
+        );
+        node.id = id.to_string();
+        node
+    }
+
+    #[test]
+    fn blocked_lane_with_running_sibling_is_nonterminal_not_partial() {
+        let graph = {
+            let mut graph = ExecutionGraph::new("blocked lane");
+            graph.id = "team-graph:team-1".to_string();
+            graph.nodes = vec![agent_node("n-a", "a"), agent_node("n-b", "b")];
+            graph
+                .node_statuses
+                .insert("n-a".to_string(), ExecutionNodeStatus::Blocked);
+            graph
+                .node_statuses
+                .insert("n-b".to_string(), ExecutionNodeStatus::Running);
+            graph
+        };
+        let projection = reader()
+            .project_graph(graph)
+            .expect("projection with a blocked lane");
+        assert_eq!(projection.status, "waiting_dependency");
+    }
+
+    #[test]
+    fn failed_sibling_does_not_flip_status_while_other_lanes_run() {
+        let graph = {
+            let mut graph = ExecutionGraph::new("failed sibling");
+            graph.id = "team-graph:team-1".to_string();
+            graph.nodes = vec![agent_node("n-a", "a"), agent_node("n-b", "b")];
+            graph
+                .node_statuses
+                .insert("n-a".to_string(), ExecutionNodeStatus::Failed);
+            graph
+                .node_statuses
+                .insert("n-b".to_string(), ExecutionNodeStatus::Running);
+            graph
+        };
+        let projection = reader()
+            .project_graph(graph)
+            .expect("projection with a failed sibling");
+        assert_eq!(projection.status, "running");
+    }
+
+    #[test]
+    fn terminal_graph_without_envelope_maps_failed_and_completed_stably() {
+        let failed = {
+            let mut graph = ExecutionGraph::new("terminal failed");
+            graph.id = "team-graph:team-1".to_string();
+            graph.nodes = vec![agent_node("n-a", "a")];
+            graph
+                .node_statuses
+                .insert("n-a".to_string(), ExecutionNodeStatus::Failed);
+            graph
+        };
+        assert_eq!(
+            reader().project_graph(failed).expect("failed").status,
+            "failed"
+        );
+
+        let completed = {
+            let mut graph = ExecutionGraph::new("terminal completed");
+            graph.id = "team-graph:team-1".to_string();
+            graph.nodes = vec![agent_node("n-a", "a")];
+            graph
+                .node_statuses
+                .insert("n-a".to_string(), ExecutionNodeStatus::Completed);
+            graph
+        };
+        assert_eq!(
+            reader().project_graph(completed).expect("completed").status,
+            "completed"
+        );
+    }
+
+    #[test]
+    fn projection_collects_binding_digests_when_packets_carry_bindings() {
+        let mut packet = packet("n-a", "a");
+        let binding = harness_contract::agent::AgentBindingSnapshot {
+            binding_id: "binding:a".to_string(),
+            definition_ref: harness_contract::agent::AgentDefinitionRevisionRef::new(
+                harness_contract::agent::AgentDefinitionId::new(
+                    harness_contract::agent::DefinitionScope::Builtin,
+                    "cowd/execute",
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap(),
+            definition_digest: "a".repeat(64),
+            instructions: "Execute.".to_string(),
+            instance: harness_contract::agent::AgentInstanceRef {
+                instance_id: "instance:a".to_string(),
+                role_slot_id: Some("implementer:1".to_string()),
+            },
+            executor: harness_contract::agent::AgentExecutorPolicy::CowdNative,
+            model_policy: harness_contract::agent::AgentModelPolicy {
+                profile: "coding".to_string(),
+                allowed_models: vec!["test".to_string()],
+                fallback_allowed: false,
+            },
+            effective_capabilities: vec![harness_contract::agent::AgentCapability::Read],
+            skill_refs: Vec::new(),
+            tool_contract_refs: Vec::new(),
+            data_lease: harness_contract::agent::AgentDataLease {
+                session_id: "session-1".to_string(),
+                task_id: "task-a".to_string(),
+                team_id: Some("team-1".to_string()),
+                read_scopes: Vec::new(),
+                write_mode: harness_contract::agent::CognitiveWriteMode::CandidateOnly,
+                team_working_state_visible: false,
+                fact_boundaries: Vec::new(),
+                fact_refs: Vec::new(),
+                matrix_snapshot_refs: Vec::new(),
+            },
+            release: None,
+            evaluation: None,
+            binding_digest: "b".repeat(64),
+        };
+        binding.validate().expect("valid binding");
+        packet.binding = Some(binding);
+        let graph = {
+            let mut graph = ExecutionGraph::new("bound");
+            graph.id = "team-graph:team-1".to_string();
+            let mut node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::AgentTask,
+                "agent_task",
+                serde_json::to_string(&packet).expect("packet"),
+            );
+            node.id = "n-a".to_string();
+            graph.nodes = vec![node];
+            graph
+                .node_statuses
+                .insert("n-a".to_string(), ExecutionNodeStatus::Completed);
+            graph
+        };
+        let projection = reader().project_graph(graph).expect("projection");
+        assert_eq!(projection.binding_digests, vec!["b".repeat(64)]);
+        assert_eq!(projection.agent_displays.len(), 1);
+        assert_eq!(
+            projection.agent_displays[0].provenance,
+            "runtime.agent-binding:unavailable-name"
+        );
     }
 }
