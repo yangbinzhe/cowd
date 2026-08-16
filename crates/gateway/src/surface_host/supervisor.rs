@@ -903,13 +903,6 @@ async fn start_managed_process(
                 reason: "managed surface is missing managed runtime spec".to_string(),
             })?;
     let manifest_path = PathBuf::from(&surface.source);
-    let working_dir = manifest_path.parent().map(Path::to_path_buf);
-    let manifest_dir = working_dir
-        .as_deref()
-        .ok_or_else(|| SurfaceError::Invocation {
-            surface: surface_id.clone(),
-            reason: "managed surface manifest has no parent directory".to_string(),
-        })?;
     let command_path = resolve_managed_artifact(&manifest_path, artifact).map_err(|reason| {
         SurfaceError::Invocation {
             surface: surface_id.clone(),
@@ -967,13 +960,7 @@ async fn start_managed_process(
     // 目录，再以该目录作为最小 sandbox workspace。这样安装包中的
     // `edge/` 二进制无需位于单个 connector 清单目录内，也不会为了
     // 找到程序而把整个安装父目录暴露给 sidecar。
-    let mut sandbox = SandboxLaunchSpec::workspace(&runtime_dir);
-    sandbox.working_directory = Some(runtime_dir.clone());
-    sandbox.readable_roots.push(manifest_dir.to_path_buf());
-    sandbox.writable_roots.push(runtime_dir.clone());
-    if state_mode == SurfaceStateMode::Persistent {
-        sandbox.writable_roots.push(state_dir.clone());
-    }
+    let sandbox = managed_sandbox_spec(&runtime_dir, &state_dir, state_mode);
     let program_args = vec![
         "--socket".to_string(),
         socket_path.display().to_string(),
@@ -1259,6 +1246,24 @@ fn stage_managed_artifact(command: &Path, runtime_dir: &Path) -> std::io::Result
     Ok(staged)
 }
 
+fn managed_sandbox_spec(
+    runtime_dir: &Path,
+    state_dir: &Path,
+    state_mode: SurfaceStateMode,
+) -> SandboxLaunchSpec {
+    let mut sandbox = SandboxLaunchSpec::workspace(runtime_dir);
+    sandbox.working_directory = Some(runtime_dir.to_path_buf());
+    sandbox.writable_roots.push(runtime_dir.to_path_buf());
+    if state_mode == SurfaceStateMode::Persistent {
+        sandbox.writable_roots.push(state_dir.to_path_buf());
+    }
+    // The manifest and installed artifact are trusted only long enough to
+    // resolve and stage the executable. The child never reads them directly,
+    // so exposing their installation directory would unnecessarily reveal the
+    // protected Cowd control root when bundles live under ~/.cowd/bin.
+    sandbox
+}
+
 fn create_runtime_dir(surface: &str) -> std::io::Result<PathBuf> {
     let root = std::env::temp_dir().join("cowd-edge-runtime").join(format!(
         "{}-{}",
@@ -1336,8 +1341,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        default_source_surface_config, restart_with_factory, rollback_managed_worker_parts,
-        stage_managed_artifact, terminate_managed_child,
+        default_source_surface_config, managed_sandbox_spec, restart_with_factory,
+        rollback_managed_worker_parts, stage_managed_artifact, terminate_managed_child,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{
@@ -1421,6 +1426,19 @@ mod tests {
         assert_eq!(staged, runtime.join("cowd-edge-fixture"));
         assert!(staged.starts_with(&runtime));
         assert_eq!(std::fs::read(staged).unwrap(), b"fixture");
+    }
+
+    #[test]
+    fn managed_sandbox_never_exposes_the_installed_manifest_directory() {
+        let runtime = std::path::Path::new("/tmp/cowd-edge-runtime/fixture");
+        let state = runtime.join("state");
+
+        let sandbox = managed_sandbox_spec(runtime, &state, SurfaceStateMode::Ephemeral);
+
+        assert_eq!(sandbox.workspace_root, runtime);
+        assert_eq!(sandbox.working_directory.as_deref(), Some(runtime));
+        assert!(sandbox.readable_roots.is_empty());
+        assert_eq!(sandbox.writable_roots, vec![runtime.to_path_buf()]);
     }
 
     #[tokio::test]
