@@ -14,6 +14,7 @@ glob = "0.3"
 mcp = { path = "../mcp" }
 plugins = { path = "../plugins" }
 sandbox-launcher = { path = "../sandbox-launcher" }
+skill = { path = "../skill/service" }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }

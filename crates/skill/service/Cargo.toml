@@ -9,9 +9,15 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+fs2 = "0.4"
 harness-contract = { path = "../../harness-contract" }
 regex = "1"
+reqwest.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
+sha2 = "0.10"
+tempfile = "3"
 thiserror = "2"
+uuid.workspace = true
+zip = { version = "8.4.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

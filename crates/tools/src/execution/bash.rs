@@ -129,10 +129,11 @@ pub struct BashProgressSample {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BashCommandInput {
     pub command: String,
     pub cwd: Option<String>,
-    pub timeout: Option<u64>,
+    pub timeout_ms: Option<u64>,
     pub description: Option<String>,
     #[serde(rename = "run_in_background")]
     pub run_in_background: Option<bool>,
@@ -149,6 +150,8 @@ pub struct BashCommandInput {
     #[serde(default)]
     pub env: Option<ShellEnvironmentPolicy>,
 }
+
+const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BashCommandOutput {
@@ -335,7 +338,7 @@ fn execute_bash_sync(
     let prepared = prepare_command(&input, &workspace_root, &cwd, false)?;
     let mut command = prepared.command;
     let sandbox_status = prepared.sandbox_status;
-    let (output, interrupted) = if let Some(timeout_ms) = input.timeout {
+    let (output, interrupted) = if let Some(timeout_ms) = input.timeout_ms {
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let started = Instant::now();
@@ -443,12 +446,12 @@ pub async fn execute_bash_async_in_workspace(
         progress_stderr,
     ));
 
-    let (status, interrupted) = if let Some(timeout_ms) = input.timeout {
+    let (status, interrupted) = if let Some(timeout_ms) = input.timeout_ms {
         match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
             Ok(status) => (status?, false),
             Err(_) => {
                 if !kill_process_group(child.id()) {
-                    let _ = child.kill();
+                    let _ = child.kill().await;
                 }
                 (child.wait().await?, true)
             }
@@ -786,6 +789,15 @@ fn prepare_command(
     cwd: &Path,
     create_dirs: bool,
 ) -> io::Result<PreparedBashCommand> {
+    if input
+        .timeout_ms
+        .is_some_and(|timeout_ms| !(1..=MAX_TOOL_TIMEOUT_MS).contains(&timeout_ms))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("timeout_ms must be between 1 and {MAX_TOOL_TIMEOUT_MS} milliseconds"),
+        ));
+    }
     if create_dirs {
         let _ = std::fs::create_dir_all(cwd);
     }
@@ -1072,7 +1084,7 @@ mod tests {
         let base = BashCommandInput {
             command: "printf ok".to_string(),
             cwd: None,
-            timeout: None,
+            timeout_ms: None,
             description: None,
             run_in_background: None,
             dangerously_disable_sandbox: None,
@@ -1135,7 +1147,7 @@ mod tests {
                 let input = BashCommandInput {
                     command: "true".to_string(),
                     cwd: None,
-                    timeout: None,
+                    timeout_ms: None,
                     description: None,
                     run_in_background: None,
                     dangerously_disable_sandbox: Some(false),
@@ -1153,7 +1165,7 @@ mod tests {
         let host = BashCommandInput {
             command: "true".to_string(),
             cwd: None,
-            timeout: None,
+            timeout_ms: None,
             description: None,
             run_in_background: None,
             dangerously_disable_sandbox: Some(true),
@@ -1182,7 +1194,7 @@ mod tests {
         let input = BashCommandInput {
             command: "test ! -e /proc/$$/fd/9 && printf host-write > host.txt".to_string(),
             cwd: None,
-            timeout: None,
+            timeout_ms: None,
             description: None,
             run_in_background: None,
             dangerously_disable_sandbox: Some(true),
@@ -1290,7 +1302,7 @@ mod tests {
         let input = BashCommandInput {
             command: "printf x".to_string(),
             cwd: None,
-            timeout: None,
+            timeout_ms: None,
             description: None,
             run_in_background: None,
             dangerously_disable_sandbox: Some(true),
@@ -1309,5 +1321,38 @@ mod tests {
         let status = output.sandbox_status.expect("sandbox status");
         assert_eq!(status["kernel_hardening_required"], false);
         assert_eq!(status["network_enabled"], false);
+    }
+
+    #[test]
+    fn bash_timeout_wire_contract_rejects_ambiguous_legacy_field() {
+        let input = serde_json::from_value::<BashCommandInput>(serde_json::json!({
+            "command": "true",
+            "timeout_ms": 2500
+        }))
+        .expect("explicit milliseconds");
+        assert_eq!(input.timeout_ms, Some(2500));
+        let legacy = serde_json::from_value::<BashCommandInput>(serde_json::json!({
+            "command": "true",
+            "timeout": 2500
+        }));
+        assert!(legacy.is_err(), "legacy timeout unit must fail closed");
+
+        let root = env::current_dir().expect("timeout workspace");
+        let invalid = BashCommandInput {
+            command: "true".to_string(),
+            cwd: None,
+            timeout_ms: Some(MAX_TOOL_TIMEOUT_MS + 1),
+            description: None,
+            run_in_background: None,
+            dangerously_disable_sandbox: Some(true),
+            env: None,
+            allowed_mounts: None,
+            isolate_network: None,
+            workspace_access: Some(BashWorkspaceAccess::ReadWrite),
+        };
+        let error = prepare_command(&invalid, &root, &root, false)
+            .err()
+            .expect("timeout above the wire maximum must fail closed");
+        assert!(error.to_string().contains("between 1 and 300000"));
     }
 }

@@ -24,7 +24,19 @@ use super::{
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/skills", post(skill_create_handler))
-        .route("/api/skills/install", post(skill_install_handler))
+        .route("/api/skills/install/plan", post(skill_install_plan_handler))
+        .route(
+            "/api/skills/install/commit",
+            post(skill_install_commit_handler),
+        )
+        .route(
+            "/api/skills/install/upload/plan",
+            post(skill_upload_plan_handler),
+        )
+        .route(
+            "/api/skills/install/upload/commit",
+            post(skill_upload_commit_handler),
+        )
         .route("/api/skills/catalog", get(skills_catalog_handler))
         .route("/api/skills/projection", get(skills_projection_handler))
         .route("/api/skills/runs", get(skill_runs_handler))
@@ -75,39 +87,190 @@ pub(super) fn router() -> Router<Arc<AppState>> {
         )
 }
 
-async fn skill_install_handler(
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillInstallPlanRequest {
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillInstallCommitRequest {
+    source: String,
+    expected_digest: String,
+    #[serde(default)]
+    allow_warnings: bool,
+}
+
+async fn skill_install_plan_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
-    mut multipart: Multipart,
+    Json(input): Json<SkillInstallPlanRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     require_skill_manager(&principal)?;
-    let mut archive_name = String::new();
+    let service = state.services.skill.clone();
+    let workspace_root = state.workspace_root.clone();
+    let source = input.source;
+    run_skill_blocking(move || service.plan_install(&workspace_root, &source))
+        .await
+        .map(Json)
+}
+
+async fn skill_install_commit_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(input): Json<SkillInstallCommitRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_manager(&principal)?;
+    let service = state.services.skill.clone();
+    let workspace_root = state.workspace_root.clone();
+    let actor = format!("gateway:{}", principal.0.claims().principal_id);
+    let result = run_skill_blocking(move || {
+        service.commit_install(
+            &workspace_root,
+            &input.source,
+            &input.expected_digest,
+            input.allow_warnings,
+            &actor,
+        )
+    })
+    .await?;
+    crate::services::invalidate_workspace_skill_snapshot(&state.workspace_root);
+    Ok(Json(result))
+}
+
+async fn skill_upload_plan_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    multipart: Multipart,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_manager(&principal)?;
+    let upload = read_skill_upload(multipart).await?;
+    if upload.expected_digest.is_some() || upload.allow_warnings.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "upload plan accepts only the package field",
+        ));
+    }
+    let service = state.services.skill.clone();
+    let result = run_skill_blocking(move || {
+        service.plan_uploaded_tar(&upload.archive_name, &upload.archive_bytes)
+    })
+    .await?;
+    Ok(Json(result))
+}
+
+async fn skill_upload_commit_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    multipart: Multipart,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    require_skill_manager(&principal)?;
+    let upload = read_skill_upload(multipart).await?;
+    let expected_digest = upload.expected_digest.ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "expected_digest is required for upload commit",
+        )
+    })?;
+    let actor = format!("gateway:{}", principal.0.claims().principal_id);
+    let service = state.services.skill.clone();
+    let result = run_skill_blocking(move || {
+        service.commit_uploaded_tar(
+            &upload.archive_name,
+            &upload.archive_bytes,
+            &expected_digest,
+            upload.allow_warnings.unwrap_or(false),
+            &actor,
+        )
+    })
+    .await?;
+    crate::services::invalidate_workspace_skill_snapshot(&state.workspace_root);
+    Ok((StatusCode::CREATED, Json(result)))
+}
+
+struct SkillUploadRequest {
+    archive_name: String,
+    archive_bytes: Vec<u8>,
+    expected_digest: Option<String>,
+    allow_warnings: Option<bool>,
+}
+
+async fn read_skill_upload(
+    mut multipart: Multipart,
+) -> Result<SkillUploadRequest, (StatusCode, Json<ErrorResponse>)> {
+    let mut archive_name = None;
     let mut archive_bytes = None;
+    let mut expected_digest = None;
+    let mut allow_warnings = None;
     while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?
     {
-        if field.name() != Some("package") {
-            continue;
+        match field.name() {
+            Some("package") if archive_bytes.is_none() => {
+                archive_name = Some(field.file_name().unwrap_or("skill.tar").to_string());
+                archive_bytes = Some(
+                    read_bounded_multipart_field(field, skill::MAX_SKILL_ARCHIVE_BYTES).await?,
+                );
+            }
+            Some("expected_digest") if expected_digest.is_none() => {
+                let bytes = read_bounded_multipart_field(field, 256).await?;
+                expected_digest = Some(
+                    String::from_utf8(bytes)
+                        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?
+                        .trim()
+                        .to_string(),
+                );
+            }
+            Some("allow_warnings") if allow_warnings.is_none() => {
+                let bytes = read_bounded_multipart_field(field, 16).await?;
+                let value = String::from_utf8(bytes)
+                    .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?;
+                allow_warnings = Some(value.trim().parse::<bool>().map_err(|_| {
+                    api_error(
+                        StatusCode::BAD_REQUEST,
+                        "allow_warnings must be true or false",
+                    )
+                })?);
+            }
+            _ => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "upload contains an unknown or duplicate field",
+                ))
+            }
         }
-        archive_name = field.file_name().unwrap_or("skill.tar").to_string();
-        archive_bytes = Some(
-            field
-                .bytes()
-                .await
-                .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?,
-        );
-        break;
     }
-    let archive_bytes = archive_bytes
-        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "package is required".to_string()))?;
-    state
-        .services
-        .skill
-        .install_uploaded_tar(&archive_name, &archive_bytes)
-        .map(|value| (StatusCode::CREATED, Json(value)))
-        .map_err(skill_error)
+    Ok(SkillUploadRequest {
+        archive_name: archive_name.unwrap_or_else(|| "skill.tar".to_string()),
+        archive_bytes: archive_bytes
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "package is required"))?,
+        expected_digest,
+        allow_warnings,
+    })
+}
+
+async fn read_bounded_multipart_field(
+    mut field: axum::extract::multipart::Field<'_>,
+    max_bytes: usize,
+) -> Result<Vec<u8>, (StatusCode, Json<ErrorResponse>)> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(api_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("multipart field exceeds {max_bytes} bytes"),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn require_skill_manager(
@@ -129,12 +292,11 @@ async fn skill_create_handler(
     Json(input): Json<skill::SkillCreateInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     require_skill_manager(&principal)?;
-    state
-        .services
-        .skill
-        .create_managed(input)
-        .map(|value| (StatusCode::CREATED, Json(value)))
-        .map_err(skill_error)
+    let service = state.services.skill.clone();
+    let actor = format!("gateway:{}", principal.0.claims().principal_id);
+    let result = run_skill_blocking(move || service.create_managed(input, &actor)).await?;
+    crate::services::invalidate_workspace_skill_snapshot(&state.workspace_root);
+    Ok((StatusCode::CREATED, Json(result)))
 }
 
 async fn skill_delete_handler(
@@ -143,11 +305,27 @@ async fn skill_delete_handler(
     AxumPath(id): AxumPath<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     require_skill_manager(&principal)?;
-    state
-        .services
-        .skill
-        .delete_managed(&state.workspace_root, &id)
-        .map(Json)
+    let service = state.services.skill.clone();
+    let workspace_root = state.workspace_root.clone();
+    let actor = format!("gateway:{}", principal.0.claims().principal_id);
+    let result =
+        run_skill_blocking(move || service.delete_managed(&workspace_root, &id, &actor)).await?;
+    crate::services::invalidate_workspace_skill_snapshot(&state.workspace_root);
+    Ok(Json(result))
+}
+
+async fn run_skill_blocking<T, F>(operation: F) -> Result<T, (StatusCode, Json<ErrorResponse>)>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, SkillServiceError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| {
+            skill_error(SkillServiceError::Internal(format!(
+                "Skill worker failed: {error}"
+            )))
+        })?
         .map_err(skill_error)
 }
 

@@ -4,7 +4,7 @@
 
 来源：`crates/gateway/src/api_routes/**/*.rs` 中实际 `axum::Router::route` 声明，并与 `crates/gateway/src/api_routes/route_manifest.rs` 的运行时清单方向保持一致。
 
-当前共识别 `474` 个唯一 `method + path` 接口。
+当前共识别 `477` 个唯一 `method + path` 接口。
 
 ## Capability Contract / OpenAPI 状态
 
@@ -38,7 +38,7 @@ Gateway 现在以 `/api/gateway/capability-contract` 作为运行时接口能力
 - [Matrix 结构化事实](#matrix-结构化事实)：43 个接口
 - [Growth / 自我演进](#growth--自我演进)：2 个接口
 - [Tools 工具执行](#tools-工具执行)：17 个接口
-- [Skills 技能体系](#skills-技能体系)：21 个接口
+- [Skills 技能体系](#skills-技能体系)：24 个接口
 - [Approval 审批](#approval-审批)：10 个接口
 - [Cross Plane 权限与动作](#cross-plane-权限与动作)：15 个接口
 - [Surface 接入面](#surface-接入面)：30 个接口
@@ -439,7 +439,10 @@ Reality Core 的静态地图、动态 fact flow、promotions、governance、boun
 | `POST` | `/api/skills/:id/rollback-reviews` | 技能系统 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `skill_revision_rollback_review_handler` | `skill_routes.rs` | P2 |
 | `POST` | `/api/skills/:id/translate` | 技能系统 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `skill_translate_handler` | `skill_routes.rs` | P2 |
 | `GET` | `/api/skills/catalog` | 技能系统 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `skills_catalog_handler` | `skill_routes.rs` | P2 |
-| `POST` | `/api/skills/install` | 技能系统 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `skill_install_handler` | `skill_routes.rs` | P2 |
+| `POST` | `/api/skills/install/commit` | 技能系统 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `skill_install_commit_handler` | `skill_routes.rs` | P2 |
+| `POST` | `/api/skills/install/plan` | 技能系统 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `skill_install_plan_handler` | `skill_routes.rs` | P2 |
+| `POST` | `/api/skills/install/upload/commit` | 技能系统 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `skill_upload_commit_handler` | `skill_routes.rs` | P2 |
+| `POST` | `/api/skills/install/upload/plan` | 技能系统 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `skill_upload_plan_handler` | `skill_routes.rs` | P2 |
 | `GET` | `/api/skills/maintenance` | 技能系统 查询接口 | - | 支持 Query 参数，详见 handler Params struct | - | `skill_maintenance_handler` | `skill_routes.rs` | P2 |
 | `GET` | `/api/skills/maintenance/:id` | 技能系统 查询接口 | id | 支持 Query 参数，详见 handler Params struct | - | `skill_maintenance_detail_handler` | `skill_routes.rs` | P2 |
 | `POST` | `/api/skills/maintenance/:id/activation-reviews` | 技能系统 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `skill_revision_activation_review_handler` | `skill_routes.rs` | P2 |

@@ -166,6 +166,72 @@ fn skill_runtime_invocations_are_not_top_level_cli_actions() {
 }
 
 #[test]
+fn skill_plan_accepts_an_absolute_local_source() {
+    let temp_dir = unique_temp_dir("skill-absolute-source");
+    let config_home = temp_dir.join("config");
+    let skill_dir = temp_dir.join("absolute-demo");
+    fs::create_dir_all(&config_home).expect("config home should exist");
+    fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: absolute-demo\ndescription: absolute source fixture\n---\n",
+    )
+    .expect("skill fixture");
+
+    let output = command_in(&temp_dir)
+        .env("COWD_CONFIG_HOME", &config_home)
+        .args([
+            "--output-format",
+            "json",
+            "skill",
+            "plan",
+            skill_dir.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("cowd skill plan should launch");
+    assert_success(&output);
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("plan should be json");
+    assert_eq!(parsed["skill_id"], "absolute-demo");
+    let digest = parsed["package_digest"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+
+    let unreviewed = command_in(&temp_dir)
+        .env("COWD_CONFIG_HOME", &config_home)
+        .args(["skill", "install", skill_dir.to_str().expect("utf8 path")])
+        .output()
+        .expect("unreviewed install should launch");
+    assert_failure(&unreviewed);
+    assert!(!config_home
+        .join("skill-store/v1/absolute-demo/active.json")
+        .exists());
+
+    let installed = command_in(&temp_dir)
+        .env("COWD_CONFIG_HOME", &config_home)
+        .args([
+            "--output-format",
+            "json",
+            "skill",
+            "install",
+            skill_dir.to_str().expect("utf8 path"),
+            "--expected-digest",
+            &digest,
+        ])
+        .output()
+        .expect("reviewed install should launch");
+    assert_success(&installed);
+    let installed: serde_json::Value =
+        serde_json::from_slice(&installed.stdout).expect("receipt should be json");
+    assert_eq!(installed["receipt"]["skill_id"], "absolute-demo");
+    assert_eq!(installed["receipt"]["package_digest"], digest);
+
+    make_tree_writable(&temp_dir);
+    fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+}
+
+#[test]
 fn direct_slash_commands_are_tui_only() {
     let temp_dir = unique_temp_dir("slash-dispatch");
     fs::create_dir_all(&temp_dir).expect("temp dir should exist");
@@ -241,4 +307,22 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         "cowd-{label}-{}-{millis}-{counter}",
         std::process::id()
     ))
+}
+
+fn make_tree_writable(root: &Path) {
+    if !root.exists() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = fs::symlink_metadata(root).expect("tree metadata");
+        let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+        fs::set_permissions(root, fs::Permissions::from_mode(mode)).expect("tree permissions");
+    }
+    if root.is_dir() {
+        for entry in fs::read_dir(root).expect("tree entries") {
+            make_tree_writable(&entry.expect("tree entry").path());
+        }
+    }
 }

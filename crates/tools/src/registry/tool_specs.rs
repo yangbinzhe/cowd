@@ -53,8 +53,13 @@ pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
         | "config"
         | "enter_plan_mode"
         | "exit_plan_mode" => "builtin.workspace_write",
-        "web_fetch" | "web_search" | "remote_trigger" | "send_user_message" => "builtin.network",
-        "request_plugin_install" => "builtin.external_unknown",
+        "web_fetch" | "web_search" | "remote_trigger" | "send_user_message"
+        | "skill_install_plan" => "builtin.network",
+        "request_plugin_install"
+        | "skill_install_commit"
+        | "skill_rollback"
+        | "skill_deactivate" => "builtin.external_unknown",
+        "skill_status" => "builtin.readonly",
         "sleep" => "builtin.process",
         "list_mcp_resources" | "read_mcp_resource" | "mcp_auth" | "mcp" => {
             "builtin.external_unknown"
@@ -110,7 +115,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "command": { "type": "string" },
                     "cwd": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 300000,
+                        "description": "Wall-clock timeout in milliseconds (default: no tool-level timeout; maximum: 300000)."
+                    },
                     "description": { "type": "string" },
                     "env": {
                         "type": "object",
@@ -702,6 +712,74 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::DangerFullAccess,
         },
         ToolSpec {
+            name: "skill_install_plan",
+            description: "Acquire a local or GitHub Skill as inert content, inspect every bounded file, compute the canonical SHA-256 tree digest, and return blockers/warnings without activating it. Supported remote forms are https://github.com/<owner>/<repo>[/tree/<ref>/<path>] and github://<owner>/<repo>/<path>?ref=<ref>.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "minLength": 1 }
+                },
+                "required": ["source"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "skill_install_commit",
+            description: "Re-acquire a previously reviewed Skill, require the exact expected SHA-256 tree digest, enforce supply-chain blockers, atomically activate an immutable revision, and emit a durable provenance receipt. This never executes packaged resources or grants capabilities.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "minLength": 1 },
+                    "expected_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+                    "allow_warnings": { "type": "boolean", "default": false }
+                },
+                "required": ["source", "expected_digest"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "skill_status",
+            description: "Read the active pointer, immutable revision history, and install receipts for one Cowd-managed Skill.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": { "type": "string", "minLength": 1 }
+                },
+                "required": ["skill_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "skill_rollback",
+            description: "Atomically reactivate an existing immutable Skill revision after recomputing and verifying its canonical digest; no package code is executed.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": { "type": "string", "minLength": 1 },
+                    "revision": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+                },
+                "required": ["skill_id", "revision"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
+            name: "skill_deactivate",
+            description: "Atomically remove a managed Skill active pointer while retaining immutable revisions and receipts for audit and rollback.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": { "type": "string", "minLength": 1 }
+                },
+                "required": ["skill_id"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::DangerFullAccess,
+        },
+        ToolSpec {
             name: "tool_search",
             description: "Search for deferred or specialized tools by exact name or keywords.",
             input_schema: json!({
@@ -833,7 +911,12 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "timeout": { "type": "integer", "minimum": 1 },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 300000,
+                        "description": "Wall-clock timeout in milliseconds."
+                    },
                     "description": { "type": "string" },
                     "run_in_background": { "type": "boolean" }
                 },
@@ -1016,6 +1099,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
 #[cfg(test)]
 mod tests {
     use super::{builtin_effect_resolver_spec, mvp_tool_specs, normalize_tool_name};
+    use crate::permissions::PermissionMode;
 
     #[test]
     fn source_inspection_tools_promote_search_before_bounded_reads() {
@@ -1084,5 +1168,43 @@ mod tests {
             invalid.is_empty(),
             "builtin tools with non-snake-case identities: {invalid:?}"
         );
+    }
+
+    #[test]
+    fn skill_supply_chain_tools_separate_review_from_mutation() {
+        let specs = mvp_tool_specs();
+        let plan = specs
+            .iter()
+            .find(|spec| spec.name == "skill_install_plan")
+            .expect("plan tool");
+        let commit = specs
+            .iter()
+            .find(|spec| spec.name == "skill_install_commit")
+            .expect("commit tool");
+        assert_eq!(plan.required_permission, PermissionMode::ReadOnly);
+        assert_eq!(commit.required_permission, PermissionMode::DangerFullAccess);
+        assert_eq!(
+            builtin_effect_resolver_spec(plan.name).resolver_id,
+            "builtin.network"
+        );
+        assert_eq!(
+            builtin_effect_resolver_spec(commit.name).resolver_id,
+            "builtin.external_unknown"
+        );
+    }
+
+    #[test]
+    fn shell_timeout_contract_uses_explicit_milliseconds_only() {
+        for name in ["bash", "power_shell"] {
+            let spec = mvp_tool_specs()
+                .into_iter()
+                .find(|spec| spec.name == name)
+                .expect("shell spec");
+            let properties = spec.input_schema["properties"]
+                .as_object()
+                .expect("properties");
+            assert!(properties.contains_key("timeout_ms"));
+            assert!(!properties.contains_key("timeout"));
+        }
     }
 }

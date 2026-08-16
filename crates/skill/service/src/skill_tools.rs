@@ -303,69 +303,63 @@ impl SkillManager {
 
         // Discover skills from all roots
         for root in &self.roots {
-            if let Ok(entries) = fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let skill_md = path.join("SKILL.md");
-                        if skill_md.exists() {
-                            if let Ok(parsed) = parse_skill_file(&skill_md) {
-                                let name = get_skill_name(&parsed)
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| {
-                                        path.file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .to_string()
-                                    });
-                                let description = get_skill_description(&parsed)
+            for path in skill_directories(root) {
+                let skill_md = path.join("SKILL.md");
+                if skill_md.exists() {
+                    if let Ok(parsed) = parse_skill_file(&skill_md) {
+                        let name = get_skill_name(&parsed)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                path.file_name()
                                     .unwrap_or_default()
-                                    .to_string();
+                                    .to_string_lossy()
+                                    .to_string()
+                            });
+                        let description = get_skill_description(&parsed)
+                            .unwrap_or_default()
+                            .to_string();
 
-                                // Check platform compatibility
-                                if !matches_platform(&parsed, &self.platform) {
-                                    continue;
-                                }
+                        // Check platform compatibility
+                        if !matches_platform(&parsed, &self.platform) {
+                            continue;
+                        }
 
-                                // Check tag filter
-                                if let Some(ref tags) = input.tags {
-                                    let skill_tags = get_tags(&parsed);
-                                    if !tags.iter().any(|t| skill_tags.contains(t)) {
-                                        continue;
-                                    }
-                                }
-
-                                // Check prerequisites
-                                let prereqs_met = matches_prerequisites(
-                                    &parsed,
-                                    &self.env_vars,
-                                    &self.available_commands,
-                                );
-
-                                let tags = get_tags(&parsed);
-                                let category =
-                                    path.file_name().map(|n| n.to_string_lossy().to_string());
-
-                                // Update category counts
-                                if let Some(ref cat) = category {
-                                    *categories.entry(cat.clone()).or_insert(0) += 1;
-                                }
-
-                                // Update tag counts
-                                for tag in &tags {
-                                    *all_tags.entry(tag.clone()).or_insert(0) += 1;
-                                }
-
-                                all_skills.push(SkillMeta {
-                                    name,
-                                    description,
-                                    category,
-                                    tags,
-                                    prerequisites_met: prereqs_met,
-                                    source: skill_md.display().to_string(),
-                                });
+                        // Check tag filter
+                        if let Some(ref tags) = input.tags {
+                            let skill_tags = get_tags(&parsed);
+                            if !tags.iter().any(|t| skill_tags.contains(t)) {
+                                continue;
                             }
                         }
+
+                        // Check prerequisites
+                        let prereqs_met = matches_prerequisites(
+                            &parsed,
+                            &self.env_vars,
+                            &self.available_commands,
+                        );
+
+                        let tags = get_tags(&parsed);
+                        let category = path.file_name().map(|n| n.to_string_lossy().to_string());
+
+                        // Update category counts
+                        if let Some(ref cat) = category {
+                            *categories.entry(cat.clone()).or_insert(0) += 1;
+                        }
+
+                        // Update tag counts
+                        for tag in &tags {
+                            *all_tags.entry(tag.clone()).or_insert(0) += 1;
+                        }
+
+                        all_skills.push(SkillMeta {
+                            name,
+                            description,
+                            category,
+                            tags,
+                            prerequisites_met: prereqs_met,
+                            source: skill_md.display().to_string(),
+                        });
                     }
                 }
             }
@@ -397,68 +391,26 @@ impl SkillManager {
 
         // Search for the skill
         for root in &self.roots {
-            if let Ok(entries) = fs::read_dir(root) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let skill_md = path.join("SKILL.md");
-                        if skill_md.exists() {
-                            if let Ok(parsed) = parse_skill_file(&skill_md) {
-                                let skill_name = get_skill_name(&parsed)
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_else(|| {
-                                        path.file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .to_string()
-                                    });
+            for path in skill_directories(root) {
+                let skill_md = path.join("SKILL.md");
+                if skill_md.exists() {
+                    if let Ok(parsed) = parse_skill_file(&skill_md) {
+                        let skill_name = get_skill_name(&parsed)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| {
+                                path.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string()
+                            });
 
-                                if skill_name.eq_ignore_ascii_case(&name) {
-                                    // Check if viewing a specific file
-                                    if let Some(ref file_path) = input.file_path {
-                                        let full_path = path.join(file_path);
-                                        if let Ok(content) = fs::read_to_string(&full_path) {
-                                            return SkillViewOutput {
-                                                success: true,
-                                                name: skill_name.to_string(),
-                                                description: get_skill_description(&parsed)
-                                                    .unwrap_or_default()
-                                                    .to_string(),
-                                                tags: get_tags(&parsed),
-                                                related_skills: get_related_skills(&parsed),
-                                                content,
-                                                body_summary: truncate_content(
-                                                    &parsed.body,
-                                                    MAX_BODY_SUMMARY_LENGTH,
-                                                ),
-                                                path: full_path.display().to_string(),
-                                                linked_files: discover_linked_files(&path),
-                                                config_vars: get_config_vars(&parsed),
-                                                prerequisites: get_prerequisites_status(
-                                                    &parsed,
-                                                    &self.env_vars,
-                                                    &self.available_commands,
-                                                ),
-                                                setup_needed: !matches_prerequisites(
-                                                    &parsed,
-                                                    &self.env_vars,
-                                                    &self.available_commands,
-                                                ),
-                                                readiness_status: if matches_prerequisites(
-                                                    &parsed,
-                                                    &self.env_vars,
-                                                    &self.available_commands,
-                                                ) {
-                                                    "ready".to_string()
-                                                } else {
-                                                    "setup_needed".to_string()
-                                                },
-                                                platforms: get_platforms(&parsed),
-                                            };
-                                        }
-                                    }
-
-                                    // View full skill content
+                        if skill_name.eq_ignore_ascii_case(&name) {
+                            // Check if viewing a specific file
+                            if let Some(ref file_path) = input.file_path {
+                                let Some(full_path) = safe_skill_resource(&path, file_path) else {
+                                    return unavailable_skill_view(skill_name, "invalid_file_path");
+                                };
+                                if let Ok(content) = fs::read_to_string(&full_path) {
                                     return SkillViewOutput {
                                         success: true,
                                         name: skill_name.to_string(),
@@ -467,15 +419,12 @@ impl SkillManager {
                                             .to_string(),
                                         tags: get_tags(&parsed),
                                         related_skills: get_related_skills(&parsed),
-                                        content: truncate_content(
-                                            &parsed.body,
-                                            MAX_CONTENT_DISPLAY_LENGTH,
-                                        ),
+                                        content,
                                         body_summary: truncate_content(
                                             &parsed.body,
                                             MAX_BODY_SUMMARY_LENGTH,
                                         ),
-                                        path: skill_md.display().to_string(),
+                                        path: full_path.display().to_string(),
                                         linked_files: discover_linked_files(&path),
                                         config_vars: get_config_vars(&parsed),
                                         prerequisites: get_prerequisites_status(
@@ -501,6 +450,45 @@ impl SkillManager {
                                     };
                                 }
                             }
+
+                            // View full skill content
+                            return SkillViewOutput {
+                                success: true,
+                                name: skill_name.to_string(),
+                                description: get_skill_description(&parsed)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                tags: get_tags(&parsed),
+                                related_skills: get_related_skills(&parsed),
+                                content: truncate_content(&parsed.body, MAX_CONTENT_DISPLAY_LENGTH),
+                                body_summary: truncate_content(
+                                    &parsed.body,
+                                    MAX_BODY_SUMMARY_LENGTH,
+                                ),
+                                path: skill_md.display().to_string(),
+                                linked_files: discover_linked_files(&path),
+                                config_vars: get_config_vars(&parsed),
+                                prerequisites: get_prerequisites_status(
+                                    &parsed,
+                                    &self.env_vars,
+                                    &self.available_commands,
+                                ),
+                                setup_needed: !matches_prerequisites(
+                                    &parsed,
+                                    &self.env_vars,
+                                    &self.available_commands,
+                                ),
+                                readiness_status: if matches_prerequisites(
+                                    &parsed,
+                                    &self.env_vars,
+                                    &self.available_commands,
+                                ) {
+                                    "ready".to_string()
+                                } else {
+                                    "setup_needed".to_string()
+                                },
+                                platforms: get_platforms(&parsed),
+                            };
                         }
                     }
                 }
@@ -508,30 +496,7 @@ impl SkillManager {
         }
 
         // Skill not found
-        SkillViewOutput {
-            success: false,
-            name,
-            description: String::new(),
-            tags: Vec::new(),
-            related_skills: Vec::new(),
-            content: String::new(),
-            body_summary: String::new(),
-            path: String::new(),
-            linked_files: SkillLinkedFiles {
-                references: Vec::new(),
-                templates: Vec::new(),
-                scripts: Vec::new(),
-            },
-            config_vars: Vec::new(),
-            prerequisites: SkillPrerequisitesStatus {
-                met: false,
-                missing_env_vars: Vec::new(),
-                missing_commands: Vec::new(),
-            },
-            setup_needed: false,
-            readiness_status: "not_found".to_string(),
-            platforms: Vec::new(),
-        }
+        unavailable_skill_view(name, "not_found")
     }
 
     /// Create a new skill
@@ -853,6 +818,65 @@ impl SkillManager {
     }
 }
 
+fn skill_directories(root: &Path) -> Vec<PathBuf> {
+    if root.join("SKILL.md").is_file() {
+        return vec![root.to_path_buf()];
+    }
+    fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("SKILL.md").is_file())
+        .collect()
+}
+
+fn safe_skill_resource(root: &Path, requested: &str) -> Option<PathBuf> {
+    let relative = Path::new(requested);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let canonical_root = root.canonicalize().ok()?;
+    let candidate = root.join(relative).canonicalize().ok()?;
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    (candidate.starts_with(&canonical_root)
+        && metadata.is_file()
+        && !metadata.file_type().is_symlink())
+    .then_some(candidate)
+}
+
+fn unavailable_skill_view(name: String, status: &str) -> SkillViewOutput {
+    SkillViewOutput {
+        success: false,
+        name,
+        description: String::new(),
+        tags: Vec::new(),
+        related_skills: Vec::new(),
+        content: String::new(),
+        body_summary: String::new(),
+        path: String::new(),
+        linked_files: SkillLinkedFiles {
+            references: Vec::new(),
+            templates: Vec::new(),
+            scripts: Vec::new(),
+        },
+        config_vars: Vec::new(),
+        prerequisites: SkillPrerequisitesStatus {
+            met: false,
+            missing_env_vars: Vec::new(),
+            missing_commands: Vec::new(),
+        },
+        setup_needed: false,
+        readiness_status: status.to_string(),
+        platforms: Vec::new(),
+    }
+}
+
 fn valid_skill_name(value: &str) -> bool {
     let bytes = value.as_bytes();
     !bytes.is_empty()
@@ -880,6 +904,30 @@ mod management_contract_tests {
 
         assert!(!output.success);
         assert!(output.path.is_empty());
+    }
+
+    #[test]
+    fn view_rejects_resource_path_traversal() {
+        let temp = tempfile::tempdir().expect("temporary registry");
+        let skill_root = temp.path().join("demo");
+        fs::create_dir_all(&skill_root).expect("Skill root");
+        fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: demo\ndescription: traversal fixture\n---\n",
+        )
+        .expect("Skill prompt");
+        fs::write(temp.path().join("secret.txt"), "must not be disclosed").expect("secret");
+
+        let output =
+            SkillManager::new(vec![temp.path().to_path_buf()]).view_skill(SkillViewInput {
+                name: "demo".to_string(),
+                file_path: Some("../secret.txt".to_string()),
+                include_files: true,
+            });
+
+        assert!(!output.success);
+        assert_eq!(output.readiness_status, "invalid_file_path");
+        assert!(output.content.is_empty());
     }
 }
 

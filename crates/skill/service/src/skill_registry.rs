@@ -9,6 +9,7 @@ use crate::skill_manifest::{
     get_related_skills, get_skill_description, get_skill_name, get_tags, matches_platform,
     parse_skill_file_header, ParsedSkill,
 };
+use crate::{default_managed_skill_store_root, list_managed_skill_entries};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
@@ -22,6 +23,7 @@ pub enum SkillRegistrySource {
     ProjectAgents,
     ProjectCodex,
     ProjectClaude,
+    UserCowdManaged,
     UserCowdConfigHome,
     UserCodexHome,
     UserCowd,
@@ -38,7 +40,9 @@ impl SkillRegistrySource {
             Self::ProjectCowd | Self::ProjectAgents | Self::ProjectCodex | Self::ProjectClaude => {
                 SkillRegistryScope::Project
             }
-            Self::UserCowdConfigHome | Self::UserCodexHome => SkillRegistryScope::UserConfigHome,
+            Self::UserCowdManaged | Self::UserCowdConfigHome | Self::UserCodexHome => {
+                SkillRegistryScope::UserConfigHome
+            }
             Self::UserCowd
             | Self::UserAgents
             | Self::UserCodex
@@ -59,6 +63,7 @@ pub enum SkillRegistryScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillRegistryRootKind {
+    ManagedStore,
     SkillsDir,
     LegacyCommandsDir,
 }
@@ -198,6 +203,15 @@ pub fn discover_skill_registry_roots(cwd: &Path) -> Vec<SkillRegistryRoot> {
         );
     }
 
+    if let Ok(managed_store) = default_managed_skill_store_root() {
+        push_root(
+            &mut roots,
+            SkillRegistrySource::UserCowdManaged,
+            managed_store,
+            SkillRegistryRootKind::ManagedStore,
+        );
+    }
+
     if let Ok(config_home) = env::var("COWD_CONFIG_HOME") {
         let config_home = PathBuf::from(config_home);
         push_root(
@@ -315,10 +329,20 @@ fn push_root(
 }
 
 fn list_root_skills(root: &SkillRegistryRoot) -> std::io::Result<Vec<SkillInfo>> {
+    if root.kind == SkillRegistryRootKind::ManagedStore {
+        return list_managed_skill_entries(&root.path)
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+            })?
+            .into_iter()
+            .map(|entry| skill_info_from_path(root, &entry.prompt_path, || entry.pointer.skill_id))
+            .collect();
+    }
     let mut skills = Vec::new();
     for entry in fs::read_dir(&root.path)? {
         let entry = entry?;
         match root.kind {
+            SkillRegistryRootKind::ManagedStore => continue,
             SkillRegistryRootKind::SkillsDir => {
                 if !entry.path().is_dir() {
                     continue;
@@ -504,5 +528,43 @@ mod tests {
         assert_eq!(skill.name, "release-ship");
         assert_eq!(skill.kind, SkillRegistryRootKind::LegacyCommandsDir);
         assert!(skill.path.ends_with("ship.md"));
+    }
+
+    #[test]
+    fn registry_resolves_only_the_managed_active_revision() {
+        let root = temp_dir("managed");
+        let source = root.join("source");
+        write(
+            &source.join("SKILL.md"),
+            "---\nname: managed-demo\ndescription: Managed demo\nlicense: MIT\nversion: 1.0.0\n---\nFirst\n",
+        );
+        let store = crate::ManagedSkillStore::new(root.join("store"));
+        let lifecycle = crate::SkillLifecycle::new(store.clone()).unwrap();
+        let source_value = source.to_string_lossy();
+        let first = lifecycle.plan(&source_value, &root).unwrap();
+        lifecycle
+            .commit(&source_value, &root, &first.package_digest, false, "test")
+            .unwrap();
+        write(
+            &source.join("SKILL.md"),
+            "---\nname: managed-demo\ndescription: Managed demo\nlicense: MIT\nversion: 2.0.0\n---\nSecond\n",
+        );
+        let second = lifecycle.plan(&source_value, &root).unwrap();
+        lifecycle
+            .commit(&source_value, &root, &second.package_digest, false, "test")
+            .unwrap();
+
+        let registry = SkillRegistry::with_roots(vec![SkillRegistryRoot {
+            source: SkillRegistrySource::UserCowdManaged,
+            path: store.root().to_path_buf(),
+            kind: SkillRegistryRootKind::ManagedStore,
+        }]);
+        let skills = registry.list().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].version.as_deref(), Some("2.0.0"));
+        assert!(skills[0]
+            .path
+            .to_string_lossy()
+            .contains(second.package_digest.trim_start_matches("sha256:")));
     }
 }

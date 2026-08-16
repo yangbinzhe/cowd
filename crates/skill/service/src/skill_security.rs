@@ -170,29 +170,41 @@ fn scan_command_injection(content: &str) -> Vec<SecurityFinding> {
         (
             r"(?i)\brm\s+-rf\s+(/\*|/home|/etc|/var)",
             "Destructive command with root path",
+            Severity::High,
         ),
         (
             r"(?i);\s*(rm|del|format)\b",
             "Command chaining with destructive command",
+            Severity::High,
         ),
         (
             r"(?i)\|\s*(bash|sh|cmd|powershell)\b",
             "Pipe to shell execution",
+            Severity::High,
         ),
         (
             r"(?i)\$\([^)]{50,}\)",
             "Command substitution with long content",
+            Severity::Medium,
         ),
-        (r"(?i)eval\s*\(\s*\$", "Eval with variable interpolation"),
-        (r"(?i)`[^`]{50,}`", "Backtick command substitution"),
+        (
+            r"(?i)eval\s*\(\s*\$",
+            "Eval with variable interpolation",
+            Severity::High,
+        ),
+        (
+            r"(?i)`[^`]{50,}`",
+            "Long backtick expression requires review",
+            Severity::Medium,
+        ),
     ];
 
-    for (pattern, description) in &injection_patterns {
+    for (pattern, description, severity) in &injection_patterns {
         if let Ok(re) = regex::Regex::new(pattern) {
             for (line_num, line) in content.lines().enumerate() {
                 if re.is_match(line) {
                     findings.push(SecurityFinding {
-                        severity: Severity::High,
+                        severity: *severity,
                         category: FindingCategory::CommandInjection,
                         description: description.to_string(),
                         location: Some(format!("line {}", line_num + 1)),
@@ -327,12 +339,11 @@ fn scan_data_exfiltration(content: &str) -> Vec<SecurityFinding> {
 fn determine_status(findings: &[SecurityFinding]) -> SecurityStatus {
     if findings.is_empty() {
         SecurityStatus::Safe
-    } else if findings.iter().any(|f| f.severity == Severity::Critical) {
+    } else if findings
+        .iter()
+        .any(|finding| matches!(finding.severity, Severity::High | Severity::Critical))
+    {
         SecurityStatus::Danger
-    } else if findings.iter().any(|f| f.severity == Severity::High) {
-        SecurityStatus::Danger
-    } else if findings.iter().any(|f| f.severity == Severity::Medium) {
-        SecurityStatus::Warning
     } else {
         SecurityStatus::Warning
     }
@@ -385,5 +396,17 @@ rm -rf /home/*
             result.findings[0].category,
             FindingCategory::CommandInjection
         );
+        assert_eq!(result.status, SecurityStatus::Danger);
+    }
+
+    #[test]
+    fn long_markdown_code_span_requires_review_but_is_not_a_hard_blocker() {
+        let content = "Document the exact `very_long_command_name --option value --another-option value` contract.";
+        let result = scan_skill_content(content, "documented-workflow");
+        assert_eq!(result.status, SecurityStatus::Warning);
+        assert!(result
+            .findings
+            .iter()
+            .all(|finding| finding.severity != Severity::High));
     }
 }

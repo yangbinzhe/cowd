@@ -1599,7 +1599,10 @@ fn is_static_skill_cli_action(args: Option<&str>) -> bool {
     let parts = args.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
         ["list" | "help" | "-h" | "--help" | "doctor"] => true,
-        ["view" | "show" | "validate" | "install" | "remove" | "import", _] => true,
+        ["view" | "show" | "validate" | "plan" | "install" | "status" | "remove" | "import", _] => {
+            true
+        }
+        ["install", _, "--allow-warnings"] | ["rollback", _, _] => true,
         _ => false,
     }
 }

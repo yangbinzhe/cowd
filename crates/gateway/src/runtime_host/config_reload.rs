@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap},
+    collections::{hash_map::DefaultHasher, BTreeMap, VecDeque},
     fs,
     hash::{Hash, Hasher},
     path::Path,
@@ -1181,6 +1181,9 @@ fn config_fingerprint(workspace_root: &Path, config_home: &Path) -> ConfigFinger
     if let Ok(root) = crate::skill_static::default_skill_install_root() {
         skill_roots.push(root);
     }
+    if let Ok(root) = skill::default_managed_skill_store_root() {
+        skill_roots.push(root);
+    }
     for root in skill_roots {
         collect_skill_fingerprint_entries(&root, &mut entries, 2_048);
     }
@@ -1229,23 +1232,30 @@ fn collect_skill_fingerprint_entries(
     entries: &mut Vec<ConfigFingerprintEntry>,
     max_files: usize,
 ) {
-    let mut pending = vec![root.to_path_buf()];
+    // Breadth-first traversal observes shallow managed active pointers before
+    // immutable historical revisions when the bounded watcher budget is full.
+    let mut pending = VecDeque::from([root.to_path_buf()]);
     let mut skill_files = Vec::new();
-    while let Some(path) = pending.pop() {
+    while let Some(path) = pending.pop_front() {
         if skill_files.len() >= max_files {
             break;
         }
         let Ok(directory) = fs::read_dir(&path) else {
             continue;
         };
-        for entry in directory.flatten() {
+        let mut directory = directory.flatten().collect::<Vec<_>>();
+        directory.sort_by_key(fs::DirEntry::file_name);
+        for entry in directory {
             let path = entry.path();
             if path.is_dir() {
-                pending.push(path);
+                pending.push_back(path);
             } else if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("SKILL.md")
+                        || name.eq_ignore_ascii_case("active.json")
+                })
             {
                 skill_files.push(path);
                 if skill_files.len() >= max_files {
@@ -1257,6 +1267,10 @@ fn collect_skill_fingerprint_entries(
     skill_files.sort();
     for path in skill_files {
         let metadata = fs::metadata(&path).ok();
+        let is_active_pointer = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("active.json"));
         entries.push(ConfigFingerprintEntry {
             source: "skill".to_string(),
             path: path.display().to_string(),
@@ -1266,11 +1280,12 @@ fn collect_skill_fingerprint_entries(
                 .and_then(|metadata| metadata.modified().ok())
                 .and_then(system_time_ms),
             len: metadata.as_ref().map(fs::Metadata::len),
-            // Skill contents are page-loaded only after selection. Normal
-            // editors change mtime and/or length, which is sufficient for the
-            // existing config watcher to invalidate the catalog without
-            // rereading every SKILL.md on each poll.
-            content_hash: None,
+            // SKILL.md bodies remain page-loaded. The small active pointer is
+            // hashed because two SHA-256 revisions have identical length and
+            // rapid rollback can share one filesystem timestamp tick.
+            content_hash: is_active_pointer
+                .then(|| fs::read(&path).ok().map(hash_bytes))
+                .flatten(),
         });
     }
 }
@@ -1343,6 +1358,27 @@ mod tests {
 
         assert_ne!(first.digest, second.digest);
         assert!(second.entries.iter().any(|entry| entry.source == "skill"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skill_fingerprint_hashes_managed_active_pointer_content() {
+        let root = temp_root("managed-active-pointer");
+        let pointer = root.join("demo/active.json");
+        fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("demo/revisions/old/deep")).unwrap();
+        fs::write(root.join("demo/revisions/old/deep/SKILL.md"), "old").unwrap();
+        fs::write(&pointer, "{\"revision\":\"sha256:aaaa\"}\n").unwrap();
+        let mut first = Vec::new();
+        collect_skill_fingerprint_entries(&root, &mut first, 1);
+        fs::write(&pointer, "{\"revision\":\"sha256:bbbb\"}\n").unwrap();
+        let mut second = Vec::new();
+        collect_skill_fingerprint_entries(&root, &mut second, 1);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert!(first[0].content_hash.is_some());
+        assert_ne!(first[0].content_hash, second[0].content_hash);
         let _ = fs::remove_dir_all(root);
     }
 

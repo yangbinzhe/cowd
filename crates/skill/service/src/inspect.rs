@@ -6,7 +6,6 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use harness_contract::skill::{
@@ -14,6 +13,7 @@ use harness_contract::skill::{
     SkillInspectionReport, SkillKind, SkillLifecycleStatus, SkillRiskLevel, SkillRiskSignal,
     SkillStructuredDependency,
 };
+use sha2::{Digest, Sha256};
 
 pub fn inspect_skill_package(root: &Path) -> std::io::Result<SkillInspectionReport> {
     let source_root = package_root(root);
@@ -129,7 +129,7 @@ pub fn profile_skill_package(
         name: name.to_string(),
         version,
         source_root: source_root.display().to_string(),
-        package_fingerprint: package_fingerprint(&source_root, &inspection.detected_files),
+        package_fingerprint: package_fingerprint(&source_root, &inspection.detected_files)?,
         kind,
         lifecycle_status,
         adapters: inspection.recommended_adapters.clone(),
@@ -156,17 +156,11 @@ pub fn profile_skill_catalog_entry(
     } else {
         source_root.join("SKILL.md")
     };
-    let metadata = fs::metadata(&skill_md)?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |value| value.as_nanos());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source_root.display().to_string().hash(&mut hasher);
-    skill_md.display().to_string().hash(&mut hasher);
-    metadata.len().hash(&mut hasher);
-    modified.hash(&mut hasher);
+    let bytes = fs::read(&skill_md)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"cowd.skill.catalog-entry.v2\0");
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(&bytes);
     let summary = description
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -177,7 +171,7 @@ pub fn profile_skill_catalog_entry(
         name: name.to_string(),
         version,
         source_root: source_root.display().to_string(),
-        package_fingerprint: format!("{:016x}", hasher.finish()),
+        package_fingerprint: format!("sha256:{:x}", hasher.finalize()),
         kind: SkillKind::Document,
         lifecycle_status: SkillLifecycleStatus::UsablePrompt,
         adapters: vec![SkillAdapterKind::PromptOnly],
@@ -212,10 +206,25 @@ fn collect_files(
     skipped_dirs: &mut Vec<SkippedDirectory>,
     depth: usize,
 ) -> std::io::Result<()> {
-    if depth > 4 || files.len() >= 512 {
-        return Ok(());
+    if depth > 16 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Skill package inspection depth exceeds 16",
+        ));
+    }
+    if files.len() >= 512 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Skill package inspection file limit exceeds 512",
+        ));
     }
     for entry in fs::read_dir(dir)? {
+        if files.len() >= 512 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Skill package inspection file limit exceeds 512",
+            ));
+        }
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().to_string();
         let path = entry.path();
@@ -507,16 +516,38 @@ fn infer_kind(inspection: &SkillInspectionReport) -> SkillKind {
     }
 }
 
-fn package_fingerprint(root: &Path, files: &[String]) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    root.display().to_string().hash(&mut hasher);
+fn package_fingerprint(root: &Path, files: &[String]) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cowd.skill.inspection.v2\0");
     for file in files {
-        file.hash(&mut hasher);
-        if let Ok(metadata) = fs::metadata(root.join(file)) {
-            metadata.len().hash(&mut hasher);
+        hasher.update((file.len() as u64).to_be_bytes());
+        hasher.update(file.as_bytes());
+        let path = root.join(file);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Skill package contains a symbolic link: {}", path.display()),
+            ));
+        }
+        if metadata.is_dir() {
+            hasher.update(b"dir\0");
+        } else if metadata.is_file() {
+            hasher.update(b"file\0");
+            let bytes = fs::read(&path)?;
+            hasher.update((bytes.len() as u64).to_be_bytes());
+            hasher.update(bytes);
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Skill package contains a non-regular entry: {}",
+                    path.display()
+                ),
+            ));
         }
     }
-    format!("{:016x}", hasher.finish())
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn inspection_summary(inspection: &SkillInspectionReport) -> Vec<String> {
@@ -752,5 +783,20 @@ structured_dependencies:
             .required_fact_types
             .contains(&"supplier.lead_time".to_string()));
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn catalog_fingerprint_is_bound_to_prompt_bytes() {
+        let root = tempfile::tempdir().expect("temporary Skill");
+        let prompt = root.path().join("SKILL.md");
+        fs::write(&prompt, "alpha").expect("first prompt");
+        let first = profile_skill_catalog_entry(&prompt, "demo", None, None)
+            .expect("first catalog profile");
+        fs::write(&prompt, "bravo").expect("same-length replacement");
+        let second = profile_skill_catalog_entry(&prompt, "demo", None, None)
+            .expect("second catalog profile");
+
+        assert_ne!(first.package_fingerprint, second.package_fingerprint);
+        assert!(first.package_fingerprint.starts_with("sha256:"));
     }
 }

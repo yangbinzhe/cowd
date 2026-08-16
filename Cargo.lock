@@ -3093,12 +3093,18 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 name = "skill"
 version = "0.9.695"
 dependencies = [
+ "fs2",
  "harness-contract",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
+ "tempfile",
  "thiserror",
+ "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -3572,6 +3578,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "shlex",
+ "skill",
  "thiserror",
  "tokio",
  "tracing",

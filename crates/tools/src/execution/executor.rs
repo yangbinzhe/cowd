@@ -100,6 +100,15 @@ pub(crate) fn execute_with_lease(
         "tool_cache_stats" => to_pretty_json(lease.cache().stats()),
         "web_fetch" => from_value::<WebFetchInput>(input).and_then(run_web_fetch),
         "web_search" => from_value::<WebSearchInput>(input).and_then(run_web_search),
+        "skill_install_plan" => from_value::<SkillInstallPlanInput>(input)
+            .and_then(|parsed| run_skill_install_plan(lease, parsed)),
+        "skill_install_commit" => from_value::<SkillInstallCommitInput>(input)
+            .and_then(|parsed| run_skill_install_commit(lease, parsed)),
+        "skill_status" => from_value::<SkillStatusInput>(input).and_then(run_skill_status),
+        "skill_rollback" => from_value::<SkillRollbackInput>(input)
+            .and_then(|parsed| run_skill_rollback(lease, parsed)),
+        "skill_deactivate" => from_value::<SkillStatusInput>(input)
+            .and_then(|parsed| run_skill_deactivate(lease, parsed)),
         "todo_write" => {
             from_value::<TodoWriteInput>(input).and_then(|parsed| run_todo_write(lease, parsed))
         }
@@ -1663,6 +1672,121 @@ fn run_web_fetch(input: WebFetchInput) -> Result<String, String> {
     to_pretty_json(execute_web_fetch(&input)?)
 }
 
+fn run_skill_install_plan(
+    lease: &ToolHostLease,
+    input: SkillInstallPlanInput,
+) -> Result<String, String> {
+    ensure_model_skill_source(lease, &input.source)?;
+    let lifecycle = skill::SkillLifecycle::default_for_user().map_err(|error| error.to_string())?;
+    let plan = lifecycle
+        .plan(&input.source, lease.workspace_root())
+        .map_err(|error| error.to_string())?;
+    let next = if plan.installable {
+        "Call skill_install_commit with this exact package_digest after reviewing warnings."
+    } else {
+        "Installation is blocked; do not fall back to shell or package-manager installation."
+    };
+    to_pretty_json(json!({
+        "kind": "skill_install_plan",
+        "schema_version": 1,
+        "plan": plan,
+        "next": next,
+    }))
+}
+
+fn run_skill_install_commit(
+    lease: &ToolHostLease,
+    input: SkillInstallCommitInput,
+) -> Result<String, String> {
+    ensure_model_skill_source(lease, &input.source)?;
+    let lifecycle = skill::SkillLifecycle::default_for_user().map_err(|error| error.to_string())?;
+    let receipt = lifecycle
+        .commit(
+            &input.source,
+            lease.workspace_root(),
+            &input.expected_digest,
+            input.allow_warnings,
+            &format!("model:{}", lease.workspace_id()),
+        )
+        .map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "kind": "skill_install_receipt",
+        "schema_version": 1,
+        "receipt": receipt,
+        "activation": "active_pointer_published",
+        "execution": "none",
+        "capabilities_granted": [],
+    }))
+}
+
+fn ensure_model_skill_source(lease: &ToolHostLease, source: &str) -> Result<(), String> {
+    let source = source.trim();
+    if source.starts_with("https://github.com/") || source.starts_with("github://") {
+        return Ok(());
+    }
+    let candidate = PathBuf::from(source);
+    let candidate = if candidate.is_absolute() {
+        candidate
+    } else {
+        lease.workspace_root().join(candidate)
+    };
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|error| format!("invalid local Skill source: {error}"))?;
+    let workspace = lease
+        .workspace_root()
+        .canonicalize()
+        .map_err(|error| format!("workspace root unavailable: {error}"))?;
+    if !canonical.starts_with(workspace) {
+        return Err(
+            "model Skill acquisition is limited to the current workspace or explicit GitHub sources"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn run_skill_status(input: SkillStatusInput) -> Result<String, String> {
+    let store = skill::ManagedSkillStore::default_for_user().map_err(|error| error.to_string())?;
+    to_pretty_json(
+        store
+            .status(&input.skill_id)
+            .map_err(|error| error.to_string())?,
+    )
+}
+
+fn run_skill_rollback(lease: &ToolHostLease, input: SkillRollbackInput) -> Result<String, String> {
+    let store = skill::ManagedSkillStore::default_for_user().map_err(|error| error.to_string())?;
+    let receipt = store
+        .rollback(
+            &input.skill_id,
+            &input.revision,
+            &format!("model:{}", lease.workspace_id()),
+        )
+        .map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "kind": "skill_rollback_receipt",
+        "schema_version": 1,
+        "receipt": receipt,
+        "execution": "none",
+    }))
+}
+
+fn run_skill_deactivate(lease: &ToolHostLease, input: SkillStatusInput) -> Result<String, String> {
+    let store = skill::ManagedSkillStore::default_for_user().map_err(|error| error.to_string())?;
+    let previous = store
+        .deactivate(&input.skill_id, &format!("model:{}", lease.workspace_id()))
+        .map_err(|error| error.to_string())?;
+    to_pretty_json(json!({
+        "kind": "skill_deactivation_receipt",
+        "schema_version": 1,
+        "skill_id": input.skill_id,
+        "previous_active": previous,
+        "revisions_retained": true,
+        "execution": "none",
+    }))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_web_search(input: WebSearchInput) -> Result<String, String> {
     to_pretty_json(execute_web_search(&input)?)
@@ -1989,11 +2113,40 @@ struct ReplInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PowerShellInput {
     command: String,
-    timeout: Option<u64>,
+    timeout_ms: Option<u64>,
     description: Option<String>,
     run_in_background: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillInstallPlanInput {
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillInstallCommitInput {
+    source: String,
+    expected_digest: String,
+    #[serde(default)]
+    allow_warnings: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillStatusInput {
+    skill_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillRollbackInput {
+    skill_id: String,
+    revision: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3419,7 +3572,7 @@ fn execute_powershell(
                 shell_quote(&input.command)
             ),
             cwd: None,
-            timeout: input.timeout,
+            timeout_ms: input.timeout_ms,
             description: input.description,
             run_in_background: input.run_in_background,
             dangerously_disable_sandbox: Some(false),
@@ -3553,6 +3706,24 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("cowd-tools-{unique}-{name}"))
+    }
+
+    fn make_tree_writable_for_test(root: &Path) {
+        if !root.exists() {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::symlink_metadata(root).expect("tree metadata");
+            let mode = if metadata.is_dir() { 0o700 } else { 0o600 };
+            fs::set_permissions(root, fs::Permissions::from_mode(mode)).expect("tree permissions");
+        }
+        if root.is_dir() {
+            for entry in fs::read_dir(root).expect("tree entries") {
+                make_tree_writable_for_test(&entry.expect("tree entry").path());
+            }
+        }
     }
 
     fn execute_in_workspace(
@@ -4413,6 +4584,87 @@ mod tests {
     }
 
     #[test]
+    fn skill_install_tools_bind_reviewed_digest_and_workspace_source() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("skill-lifecycle");
+        let source = root.join("reviewed-skill");
+        let config = root.join("config");
+        fs::create_dir_all(&source).expect("skill source");
+        fs::write(
+            source.join("SKILL.md"),
+            "---\nname: reviewed-skill\ndescription: reviewed model tool fixture\nlicense: MIT\n---\nUse typed evidence.\n",
+        )
+        .expect("skill prompt");
+        std::env::set_var("COWD_CONFIG_HOME", &config);
+
+        let plan = execute_in_workspace(
+            &root,
+            "skill_install_plan",
+            &json!({"source": "reviewed-skill"}),
+        )
+        .expect("plan");
+        let plan: serde_json::Value = serde_json::from_str(&plan).expect("plan json");
+        let digest = plan["plan"]["package_digest"]
+            .as_str()
+            .expect("package digest");
+        assert!(plan["plan"]["installable"].as_bool().unwrap_or(false));
+
+        let mismatch = execute_in_workspace(
+            &root,
+            "skill_install_commit",
+            &json!({
+                "source": "reviewed-skill",
+                "expected_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        )
+        .expect_err("unreviewed digest must fail");
+        assert!(mismatch.contains("changed after review"));
+
+        let receipt = execute_in_workspace(
+            &root,
+            "skill_install_commit",
+            &json!({"source": "reviewed-skill", "expected_digest": digest}),
+        )
+        .expect("commit");
+        let receipt: serde_json::Value = serde_json::from_str(&receipt).expect("receipt json");
+        assert_eq!(receipt["capabilities_granted"], json!([]));
+        assert_eq!(receipt["execution"], "none");
+        assert_eq!(receipt["receipt"]["package_digest"], digest);
+
+        let status = execute_in_workspace(
+            &root,
+            "skill_status",
+            &json!({"skill_id": "reviewed-skill"}),
+        )
+        .expect("status");
+        let status: serde_json::Value = serde_json::from_str(&status).expect("status json");
+        assert_eq!(status["active"]["revision"], digest);
+
+        let outside = temp_path("outside-skill");
+        fs::create_dir_all(&outside).expect("outside source");
+        fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: outside\ndescription: outside fixture\n---\n",
+        )
+        .expect("outside prompt");
+        let rejected = execute_in_workspace(
+            &root,
+            "skill_install_plan",
+            &json!({"source": outside.display().to_string()}),
+        )
+        .expect_err("model local sources outside the workspace must fail");
+        assert!(rejected.contains("limited to the current workspace"));
+
+        std::env::remove_var("COWD_CONFIG_HOME");
+        fs::remove_dir_all(&outside).expect("outside cleanup");
+        let store = config.join("skill-store/v1");
+        make_tree_writable_for_test(&store);
+        fs::remove_dir_all(&root).expect("workspace cleanup");
+    }
+
+    #[test]
     fn bash_tool_reports_success_exit_failure_timeout_and_background() {
         let root = temp_path("bash-tool-cwd");
         fs::create_dir_all(&root).expect("bash cwd should exist");
@@ -4444,7 +4696,7 @@ mod tests {
         let timeout = execute_in_workspace(
             &root,
             "bash",
-            &json!({ "command": "sleep 1", "cwd": cwd, "timeout": 10, "dangerouslyDisableSandbox": true, "workspaceAccess": "read_write" }),
+            &json!({ "command": "sleep 1", "cwd": cwd, "timeout_ms": 10, "dangerouslyDisableSandbox": true, "workspaceAccess": "read_write" }),
         )
         .expect("bash timeout should return output");
         let timeout_output: serde_json::Value = serde_json::from_str(&timeout).expect("json");
@@ -5662,7 +5914,7 @@ printf 'pwsh:%s' "$1"
 
         let result = execute_tool(
             "power_shell",
-            &json!({"command": "Write-Output hello", "timeout": 1000}),
+            &json!({"command": "Write-Output hello", "timeout_ms": 1000}),
         )
         .expect("PowerShell should succeed");
 

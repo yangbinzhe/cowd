@@ -30,7 +30,17 @@ pub fn entry(args: &[String]) -> ExitCode {
 
 fn run(args: &[String]) -> Result<(), String> {
     let (args, output) = parse_output_format(args)?;
-    if args.iter().any(|arg| arg.trim_start().starts_with('/')) {
+    if args.first().is_some_and(|arg| {
+        arg.trim_start().starts_with('/')
+            || ((arg == "--resume"
+                || arg.starts_with("--resume=")
+                || arg == "--session"
+                || arg.starts_with("--session="))
+                && args
+                    .iter()
+                    .skip(1)
+                    .any(|value| value.trim_start().starts_with('/')))
+    }) {
         if args.first().is_some_and(|arg| {
             arg == "--resume"
                 || arg.starts_with("--resume=")
@@ -122,7 +132,7 @@ fn parse_output_format(args: &[String]) -> Result<(Vec<String>, OutputFormat), S
 
 fn print_help(output: OutputFormat) -> Result<(), String> {
     let message = format!(
-        "Cowd {}\n\nCore commands:\n  cowd\n  cowd gateway start|stop|restart|status|doctor|logs|repair|open\n  cowd apps list|status <id>|doctor [id]|logs <id>|restart <id>\n  cowd storage <action>\n  cowd storage ownership-cutover activate|rollback --request <json> [credential channel]\n  cowd auth profile show|set\n  cowd config list|show|doctor\n  cowd doctor\n  cowd skill list|show|validate\n  cowd tool list|doctor\n  cowd version",
+        "Cowd {}\n\nCore commands:\n  cowd\n  cowd gateway start|stop|restart|status|doctor|logs|repair|open\n  cowd apps list|status <id>|doctor [id]|logs <id>|restart <id>\n  cowd storage <action>\n  cowd storage ownership-cutover activate|rollback --request <json> [credential channel]\n  cowd auth profile show|set\n  cowd config list|show|doctor\n  cowd doctor\n  cowd skill list|show|validate|plan|install|status|rollback|remove\n  cowd tool list|doctor\n  cowd version",
         env!("CARGO_PKG_VERSION")
     );
     if output == OutputFormat::Json {
@@ -317,9 +327,141 @@ fn print_skills(args: &[String], output: OutputFormat) -> Result<(), String> {
                 ),
             }
         }
+        "plan" if args.len() == 2 => {
+            let lifecycle = skill::SkillLifecycle::default_for_user()
+                .map_err(|error| error.to_string())?;
+            let plan = lifecycle
+                .plan(&args[1], &cwd)
+                .map_err(|error| error.to_string())?;
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&plan).map_err(|error| error.to_string())?
+                ),
+                OutputFormat::Text => {
+                    println!("Skill install plan");
+                    println!("  Name             {}", plan.name);
+                    println!("  Class            {:?}", plan.package_class);
+                    println!("  Digest           {}", plan.package_digest);
+                    println!("  Files            {}", plan.files.len());
+                    println!("  Bytes            {}", plan.total_bytes);
+                    println!(
+                        "  Status           {}",
+                        if plan.installable { "installable" } else { "blocked" }
+                    );
+                    for blocker in &plan.blockers {
+                        println!("  Blocker          {blocker}");
+                    }
+                    for warning in &plan.warnings {
+                        println!("  Warning          {warning}");
+                    }
+                }
+            }
+        }
+        "install"
+            if (args.len() == 4 || args.len() == 5)
+                && args[2] == "--expected-digest"
+                && args
+                    .get(4)
+                    .is_none_or(|arg| arg == "--allow-warnings") =>
+        {
+            let allow_warnings = args.get(4).is_some_and(|arg| arg == "--allow-warnings");
+            let lifecycle = skill::SkillLifecycle::default_for_user()
+                .map_err(|error| error.to_string())?;
+            let receipt = lifecycle
+                .commit(
+                    &args[1],
+                    &cwd,
+                    &args[3],
+                    allow_warnings,
+                    "cli:local-user",
+                )
+                .map_err(|error| error.to_string())?;
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "skill_install_receipt",
+                        "receipt": receipt,
+                    }))
+                    .map_err(|error| error.to_string())?
+                ),
+                OutputFormat::Text => {
+                    println!("Skill installed");
+                    println!("  Name             {}", receipt.name);
+                    println!("  Revision         {}", receipt.revision);
+                    println!("  Source           {}", receipt.source.locator);
+                    println!("  Receipt          {}", receipt.install_id);
+                }
+            }
+        }
+        "status" if args.len() == 2 => {
+            let store = skill::ManagedSkillStore::default_for_user()
+                .map_err(|error| error.to_string())?;
+            let status = store.status(&args[1]).map_err(|error| error.to_string())?;
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&status).map_err(|error| error.to_string())?
+                ),
+                OutputFormat::Text => {
+                    println!("Skill status");
+                    println!("  Name             {}", status.skill_id);
+                    println!(
+                        "  Active           {}",
+                        status
+                            .active
+                            .as_ref()
+                            .map_or("none", |pointer| pointer.revision.as_str())
+                    );
+                    println!("  Revisions        {}", status.revisions.len());
+                    println!("  Receipts         {}", status.receipts.len());
+                }
+            }
+        }
+        "rollback" if args.len() == 3 => {
+            let store = skill::ManagedSkillStore::default_for_user()
+                .map_err(|error| error.to_string())?;
+            let receipt = store
+                .rollback(&args[1], &args[2], "cli:local-user")
+                .map_err(|error| error.to_string())?;
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&receipt).map_err(|error| error.to_string())?
+                ),
+                OutputFormat::Text => println!(
+                    "Skill rolled back\n  Name             {}\n  Revision         {}\n  Receipt          {}",
+                    receipt.name, receipt.revision, receipt.install_id
+                ),
+            }
+        }
+        "remove" if args.len() == 2 => {
+            let store = skill::ManagedSkillStore::default_for_user()
+                .map_err(|error| error.to_string())?;
+            let pointer = store
+                .deactivate(&args[1], "cli:local-user")
+                .map_err(|error| error.to_string())?;
+            match output {
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "skill_deactivation_receipt",
+                        "skill_id": args[1],
+                        "previous_active": pointer,
+                    }))
+                    .map_err(|error| error.to_string())?
+                ),
+                OutputFormat::Text => println!(
+                    "Skill deactivated\n  Name             {}\n  Previous         {}",
+                    args[1],
+                    pointer.as_ref().map_or("none", |value| value.revision.as_str())
+                ),
+            }
+        }
         _ => {
             return Err(
-                "cowd skill is limited to static skill management: list, show, or validate"
+                "cowd skill is limited to static skill management; usage: cowd skill list | show <name> | validate <name> | plan <source> | install <source> --expected-digest <sha256:digest> [--allow-warnings] | status <name> | rollback <name> <sha256:digest> | remove <name>"
                     .to_string(),
             )
         }

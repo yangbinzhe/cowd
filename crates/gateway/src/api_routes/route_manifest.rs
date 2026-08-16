@@ -152,6 +152,11 @@ mod tests {
         assert!(has("POST", "/api/skills/:id/actions/plan"));
         assert!(has("POST", "/api/skills/:id/actions/run"));
         assert!(has("POST", "/api/skills"));
+        assert!(!has("POST", "/api/skills/install"));
+        assert!(has("POST", "/api/skills/install/plan"));
+        assert!(has("POST", "/api/skills/install/commit"));
+        assert!(has("POST", "/api/skills/install/upload/plan"));
+        assert!(has("POST", "/api/skills/install/upload/commit"));
         assert!(has("DELETE", "/api/skills/:id"));
         assert!(has("GET", "/api/skills/maintenance"));
         assert!(has("GET", "/api/skills/maintenance/:id"));

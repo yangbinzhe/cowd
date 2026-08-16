@@ -75,8 +75,8 @@ impl SkillRouter {
         let query_lower = query.to_lowercase();
         let mut candidates = skills
             .iter()
-            .cloned()
             .filter(|skill| skill.shadowed_by.is_none())
+            .cloned()
             .filter_map(|skill| score_skill(skill, &query_lower, &query_tokens))
             .filter(|candidate| candidate.score >= config.minimum_score)
             .collect::<Vec<_>>();

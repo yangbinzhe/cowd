@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     hash::{Hash, Hasher},
     path::Path,
@@ -8,10 +9,11 @@ use std::{
 use crate::command::slash::SkillSlashDispatch;
 use chrono::Utc;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use skill::{
-    inspect_skill_package, SkillActionKind, SkillCreateInput, SkillDeleteInput, SkillManager,
+    inspect_skill_package, SkillActionKind, SkillCreateInput, SkillLifecycle, SkillManager,
     SkillRunEvidence, SkillRunPlan, SkillRunReceipt, SkillRunRecord, SkillRunStatus,
-    SkillViewInput,
+    SkillSourceIdentityV1, SkillSourceKindV1, SkillViewInput,
 };
 
 use super::{ServiceEnvelope, SkillService};
@@ -21,10 +23,11 @@ pub(crate) mod profile_provider;
 mod projection;
 mod run_store;
 use local_command::{
-    classify_static_skill_command, discover_skill_root_paths, help_path_from_args, install_skill,
-    install_skill_into, is_help_arg, local_skill_summaries, normalize_optional_args,
-    render_skill_install_report, render_skill_install_report_json, render_skill_view_report,
-    render_skills_report, render_skills_report_json, render_skills_usage, render_skills_usage_json,
+    classify_static_skill_command, discover_skill_root_paths, help_path_from_args,
+    install_skill_with_policy, is_help_arg, local_skill_summaries, normalize_optional_args,
+    parse_reviewed_install_args, render_skill_install_report, render_skill_install_report_json,
+    render_skill_view_report, render_skills_report, render_skills_report_json, render_skills_usage,
+    render_skills_usage_json,
 };
 use projection::{
     activation_projection, collect_skill_catalog, filter_scope, find_catalog_item,
@@ -82,14 +85,126 @@ impl SkillServiceError {
 }
 
 impl SkillService {
-    pub(crate) fn install_uploaded_tar(
+    pub(crate) fn plan_install(
+        &self,
+        workspace_root: &Path,
+        source: &str,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let lifecycle = SkillLifecycle::default_for_user()
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+        let plan = lifecycle
+            .plan(source, workspace_root)
+            .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+        Ok(serde_json::json!({
+            "kind": "skills.install.plan",
+            "schema_version": 1,
+            "plan": plan,
+        }))
+    }
+
+    pub(crate) fn commit_install(
+        &self,
+        workspace_root: &Path,
+        source: &str,
+        expected_digest: &str,
+        allow_warnings: bool,
+        actor: &str,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let lifecycle = SkillLifecycle::default_for_user()
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+        let receipt = lifecycle
+            .commit(
+                source,
+                workspace_root,
+                expected_digest,
+                allow_warnings,
+                actor,
+            )
+            .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+        Ok(serde_json::json!({
+            "kind": "skills.install.receipt",
+            "schema_version": 1,
+            "receipt": receipt,
+        }))
+    }
+
+    pub(crate) fn plan_uploaded_tar(
         &self,
         archive_name: &str,
         bytes: &[u8],
     ) -> Result<serde_json::Value, SkillServiceError> {
-        let install_root = crate::skill_static::default_skill_install_root()
+        let install_root = skill::default_managed_skill_store_root()
             .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
-        self.install_uploaded_tar_into(archive_name, bytes, &install_root)
+        self.plan_uploaded_tar_into(archive_name, bytes, &install_root)
+    }
+
+    fn plan_uploaded_tar_into(
+        &self,
+        archive_name: &str,
+        bytes: &[u8],
+        install_root: &Path,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        self.process_uploaded_tar_into(
+            archive_name,
+            bytes,
+            install_root,
+            |lifecycle, package_root, source| {
+                let plan = lifecycle
+                    .plan_directory(package_root, source)
+                    .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+                Ok(serde_json::json!({
+                    "kind": "skills.upload.plan",
+                    "schema_version": 1,
+                    "plan": plan,
+                }))
+            },
+        )
+    }
+
+    pub(crate) fn commit_uploaded_tar(
+        &self,
+        archive_name: &str,
+        bytes: &[u8],
+        expected_digest: &str,
+        allow_warnings: bool,
+        actor: &str,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        let install_root = skill::default_managed_skill_store_root()
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+        self.commit_uploaded_tar_into(
+            archive_name,
+            bytes,
+            &install_root,
+            expected_digest,
+            allow_warnings,
+            actor,
+        )
+    }
+
+    fn commit_uploaded_tar_into(
+        &self,
+        archive_name: &str,
+        bytes: &[u8],
+        install_root: &Path,
+        expected_digest: &str,
+        allow_warnings: bool,
+        actor: &str,
+    ) -> Result<serde_json::Value, SkillServiceError> {
+        self.process_uploaded_tar_into(
+            archive_name,
+            bytes,
+            install_root,
+            |lifecycle, package_root, source| {
+                let receipt = lifecycle
+                    .commit_directory(package_root, source, expected_digest, allow_warnings, actor)
+                    .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+                Ok(serde_json::json!({
+                    "kind": "skills.upload.receipt",
+                    "schema_version": 1,
+                    "receipt": receipt,
+                }))
+            },
+        )
     }
 
     fn install_uploaded_tar_into(
@@ -98,9 +213,47 @@ impl SkillService {
         bytes: &[u8],
         install_root: &Path,
     ) -> Result<serde_json::Value, SkillServiceError> {
-        const MAX_ARCHIVE_BYTES: usize = 32 * 1024 * 1024;
-        const MAX_EXTRACTED_BYTES: u64 = 64 * 1024 * 1024;
-        const MAX_FILES: usize = 512;
+        self.process_uploaded_tar_into(
+            archive_name,
+            bytes,
+            install_root,
+            |lifecycle, package_root, source| {
+                let plan = lifecycle
+                    .plan_directory(package_root, source.clone())
+                    .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+                let receipt = lifecycle
+                    .commit_directory(
+                        package_root,
+                        source,
+                        &plan.package_digest,
+                        false,
+                        "gateway:human-upload",
+                    )
+                    .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+                Ok(serde_json::json!({
+                    "kind": "skills.management.installed",
+                    "schema_version": 1,
+                    "plan": plan,
+                    "receipt": receipt,
+                    "changed_refs": [format!("managed:{}", receipt.skill_id)],
+                }))
+            },
+        )
+    }
+
+    fn process_uploaded_tar_into<T, F>(
+        &self,
+        archive_name: &str,
+        bytes: &[u8],
+        install_root: &Path,
+        operation: F,
+    ) -> Result<T, SkillServiceError>
+    where
+        F: FnOnce(&SkillLifecycle, &Path, SkillSourceIdentityV1) -> Result<T, SkillServiceError>,
+    {
+        const MAX_ARCHIVE_BYTES: usize = skill::MAX_SKILL_ARCHIVE_BYTES;
+        const MAX_EXTRACTED_BYTES: u64 = skill::MAX_SKILL_EXTRACTED_BYTES;
+        const MAX_FILES: usize = skill::MAX_SKILL_FILES;
         if bytes.is_empty() || bytes.len() > MAX_ARCHIVE_BYTES {
             return Err(SkillServiceError::BadRequest(format!(
                 "skill archive must contain 1..={MAX_ARCHIVE_BYTES} bytes"
@@ -111,10 +264,11 @@ impl SkillService {
                 "skill package must be an uncompressed .tar archive".to_string(),
             ));
         }
-        let staging =
-            std::env::temp_dir().join(format!("cowd-skill-upload-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&staging)
+        let staging = tempfile::Builder::new()
+            .prefix("cowd-skill-upload-")
+            .tempdir()
             .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+        let staging_root = staging.path();
         let result = (|| {
             let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
             let entries = archive
@@ -122,6 +276,7 @@ impl SkillService {
                 .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
             let mut file_count = 0usize;
             let mut extracted_bytes = 0u64;
+            let mut seen_paths = BTreeSet::new();
             for entry in entries {
                 let mut entry =
                     entry.map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
@@ -148,8 +303,34 @@ impl SkillService {
                         "skill archive contains an unsafe path".to_string(),
                     ));
                 }
+                if path.components().count() > skill::MAX_SKILL_DEPTH {
+                    return Err(SkillServiceError::BadRequest(
+                        "skill archive path exceeds the maximum depth".to_string(),
+                    ));
+                }
+                let normalized = path
+                    .to_str()
+                    .ok_or_else(|| {
+                        SkillServiceError::BadRequest(
+                            "skill archive paths must be UTF-8".to_string(),
+                        )
+                    })?
+                    .replace('\\', "/")
+                    .to_lowercase();
+                if !seen_paths.insert(normalized) {
+                    return Err(SkillServiceError::BadRequest(
+                        "skill archive contains a duplicate or case-folding-colliding path"
+                            .to_string(),
+                    ));
+                }
                 if entry_type.is_file() {
                     file_count = file_count.saturating_add(1);
+                    if entry.header().size().unwrap_or_default() > skill::MAX_SKILL_FILE_BYTES {
+                        return Err(SkillServiceError::BadRequest(
+                            "skill archive contains a file larger than the per-file limit"
+                                .to_string(),
+                        ));
+                    }
                 }
                 extracted_bytes =
                     extracted_bytes.saturating_add(entry.header().size().unwrap_or_default());
@@ -159,13 +340,13 @@ impl SkillService {
                     ));
                 }
                 entry
-                    .unpack_in(&staging)
+                    .unpack_in(staging_root)
                     .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
             }
-            let package_root = if staging.join("SKILL.md").is_file() {
-                staging.clone()
+            let package_root = if staging_root.join("SKILL.md").is_file() {
+                staging_root.to_path_buf()
             } else {
-                let roots = fs::read_dir(&staging)
+                let roots = fs::read_dir(staging_root)
                     .map_err(|error| SkillServiceError::Internal(error.to_string()))?
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
@@ -178,29 +359,20 @@ impl SkillService {
                 }
                 roots[0].clone()
             };
-            let inspection = inspect_skill_package(&package_root)
-                .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
-            if !inspection.blocked_reasons.is_empty() {
-                return Err(SkillServiceError::BadRequest(format!(
-                    "skill package inspection blocked installation: {}",
-                    inspection.blocked_reasons.join("; ")
-                )));
-            }
-            let installed = install_skill_into(
-                package_root.to_string_lossy().as_ref(),
-                &staging,
-                install_root,
-            )
-            .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
-            Ok(serde_json::json!({
-                "kind": "skills.management.installed",
-                "schema_version": 1,
-                "receipt": render_skill_install_report_json(&installed),
-                "inspection": inspection,
-                "changed_refs": [installed.installed_path],
-            }))
+            let source = SkillSourceIdentityV1 {
+                kind: SkillSourceKindV1::UploadedArchive,
+                locator: Path::new(archive_name)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                requested_ref: Some(format!("sha256:{:x}", Sha256::digest(bytes))),
+                resolved_ref: None,
+            };
+            let lifecycle = SkillLifecycle::new(skill::ManagedSkillStore::new(install_root))
+                .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+            operation(&lifecycle, &package_root, source)
         })();
-        let _ = fs::remove_dir_all(&staging);
         result
     }
 
@@ -271,13 +443,93 @@ impl SkillService {
                 Ok(render_skills_report(&skills))
             }
             Some("install") => Ok(render_skills_usage(Some("install"))),
+            Some("plan") => Ok(render_skills_usage(Some("install"))),
+            Some(args) if args.starts_with("plan ") => {
+                let source = args["plan ".len()..].trim();
+                let plan = SkillLifecycle::default_for_user()
+                    .map_err(std::io::Error::other)?
+                    .plan(source, workspace_root)
+                    .map_err(std::io::Error::other)?;
+                Ok(format!(
+                    "Skill install plan\n  Name             {}\n  Class            {:?}\n  Digest           {}\n  Files            {}\n  Status           {}\n{}{}",
+                    plan.name,
+                    plan.package_class,
+                    plan.package_digest,
+                    plan.files.len(),
+                    if plan.installable { "installable" } else { "blocked" },
+                    plan.blockers
+                        .iter()
+                        .map(|value| format!("  Blocker          {value}\n"))
+                        .collect::<String>(),
+                    plan.warnings
+                        .iter()
+                        .map(|value| format!("  Warning          {value}\n"))
+                        .collect::<String>(),
+                ))
+            }
             Some(args) if args.starts_with("install ") => {
-                let target = args["install ".len()..].trim();
-                if target.is_empty() {
+                let raw = args["install ".len()..].trim();
+                let Some((target, expected_digest, allow_warnings)) =
+                    parse_reviewed_install_args(raw)
+                else {
+                    return Ok(render_skills_usage(Some("install")));
+                };
+                let install = install_skill_with_policy(
+                    target,
+                    workspace_root,
+                    expected_digest,
+                    allow_warnings,
+                )?;
+                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
+                Ok(render_skill_install_report(&install))
+            }
+            Some(args) if args.starts_with("status ") => {
+                let id = args["status ".len()..].trim();
+                let status = skill::ManagedSkillStore::default_for_user()
+                    .map_err(std::io::Error::other)?
+                    .status(id)
+                    .map_err(std::io::Error::other)?;
+                Ok(format!(
+                    "Skill status\n  Name             {}\n  Active           {}\n  Revisions        {}\n  Receipts         {}",
+                    status.skill_id,
+                    status
+                        .active
+                        .as_ref()
+                        .map_or("none", |pointer| pointer.revision.as_str()),
+                    status.revisions.len(),
+                    status.receipts.len(),
+                ))
+            }
+            Some(args) if args.starts_with("rollback ") => {
+                let parts = args["rollback ".len()..]
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                if parts.len() != 2 {
                     return Ok(render_skills_usage(Some("install")));
                 }
-                let install = install_skill(target, workspace_root)?;
-                Ok(render_skill_install_report(&install))
+                let receipt = skill::ManagedSkillStore::default_for_user()
+                    .map_err(std::io::Error::other)?
+                    .rollback(parts[0], parts[1], "cli:slash")
+                    .map_err(std::io::Error::other)?;
+                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
+                Ok(format!(
+                    "Skill rolled back\n  Name             {}\n  Revision         {}\n  Receipt          {}",
+                    receipt.name, receipt.revision, receipt.install_id
+                ))
+            }
+            Some(args) if args.starts_with("remove ") => {
+                let id = args["remove ".len()..].trim();
+                let previous = skill::ManagedSkillStore::default_for_user()
+                    .map_err(std::io::Error::other)?
+                    .deactivate(id, "cli:slash")
+                    .map_err(std::io::Error::other)?;
+                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
+                Ok(format!(
+                    "Skill deactivated\n  Name             {id}\n  Previous         {}",
+                    previous
+                        .as_ref()
+                        .map_or("none", |pointer| pointer.revision.as_str())
+                ))
             }
             Some("view") => Ok(render_skills_usage(Some("view"))),
             Some(args) if args.starts_with("view ") => {
@@ -335,13 +587,74 @@ impl SkillService {
                 Ok(render_skills_report_json(&skills))
             }
             Some("install") => Ok(render_skills_usage_json(Some("install"))),
+            Some("plan") => Ok(render_skills_usage_json(Some("install"))),
+            Some(args) if args.starts_with("plan ") => {
+                let source = args["plan ".len()..].trim();
+                let plan = SkillLifecycle::default_for_user()
+                    .map_err(std::io::Error::other)?
+                    .plan(source, workspace_root)
+                    .map_err(std::io::Error::other)?;
+                Ok(serde_json::json!({
+                    "kind": "skills.install.plan",
+                    "schema_version": 1,
+                    "plan": plan,
+                }))
+            }
             Some(args) if args.starts_with("install ") => {
-                let target = args["install ".len()..].trim();
-                if target.is_empty() {
+                let raw = args["install ".len()..].trim();
+                let Some((target, expected_digest, allow_warnings)) =
+                    parse_reviewed_install_args(raw)
+                else {
+                    return Ok(render_skills_usage_json(Some("install")));
+                };
+                let install = install_skill_with_policy(
+                    target,
+                    workspace_root,
+                    expected_digest,
+                    allow_warnings,
+                )?;
+                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
+                Ok(render_skill_install_report_json(&install))
+            }
+            Some(args) if args.starts_with("status ") => {
+                let id = args["status ".len()..].trim();
+                let status = skill::ManagedSkillStore::default_for_user()
+                    .map_err(std::io::Error::other)?
+                    .status(id)
+                    .map_err(std::io::Error::other)?;
+                serde_json::to_value(status).map_err(std::io::Error::other)
+            }
+            Some(args) if args.starts_with("rollback ") => {
+                let parts = args["rollback ".len()..]
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                if parts.len() != 2 {
                     return Ok(render_skills_usage_json(Some("install")));
                 }
-                let install = install_skill(target, workspace_root)?;
-                Ok(render_skill_install_report_json(&install))
+                let receipt = skill::ManagedSkillStore::default_for_user()
+                    .map_err(std::io::Error::other)?
+                    .rollback(parts[0], parts[1], "cli:slash")
+                    .map_err(std::io::Error::other)?;
+                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
+                Ok(serde_json::json!({
+                    "kind": "skills.rollback.receipt",
+                    "schema_version": 1,
+                    "receipt": receipt,
+                }))
+            }
+            Some(args) if args.starts_with("remove ") => {
+                let id = args["remove ".len()..].trim();
+                let previous = skill::ManagedSkillStore::default_for_user()
+                    .map_err(std::io::Error::other)?
+                    .deactivate(id, "cli:slash")
+                    .map_err(std::io::Error::other)?;
+                profile_provider::invalidate_workspace_skill_snapshot(workspace_root);
+                Ok(serde_json::json!({
+                    "kind": "skills.deactivation.receipt",
+                    "schema_version": 1,
+                    "skill_id": id,
+                    "previous_active": previous,
+                }))
             }
             Some("view") => Ok(render_skills_usage_json(Some("view"))),
             Some(args) if args.starts_with("view ") => {
@@ -609,41 +922,84 @@ impl SkillService {
     pub(crate) fn create_managed(
         &self,
         input: SkillCreateInput,
+        actor: &str,
     ) -> Result<serde_json::Value, SkillServiceError> {
-        let root = crate::skill_static::default_skill_install_root()
+        let staging = tempfile::Builder::new()
+            .prefix("cowd-skill-generated-")
+            .tempdir()
             .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
-        fs::create_dir_all(&root)
-            .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
-        let output = SkillManager::new(vec![root]).create_skill(input);
-        if !output.success {
-            return Err(SkillServiceError::BadRequest(output.message));
-        }
-        Ok(serde_json::json!({
-            "kind": "skills.management.created",
-            "schema_version": 1,
-            "receipt": output,
-            "changed_refs": [output.path],
-        }))
+        let staging_root = staging.path();
+        let result = (|| {
+            let name = input.name.trim();
+            let description = input.description.trim();
+            if name.is_empty() || description.is_empty() {
+                return Err(SkillServiceError::BadRequest(
+                    "generated Skill name and description must not be empty".to_string(),
+                ));
+            }
+            let tags = input.tags.unwrap_or_default();
+            let tags = serde_json::to_string(&tags)
+                .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+            let name = serde_json::to_string(name)
+                .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+            let description = serde_json::to_string(description)
+                .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+            let content = format!(
+                "---\nname: {name}\ndescription: {description}\ntags: {tags}\n---\n{}\n",
+                input.content.unwrap_or_default()
+            );
+            fs::write(staging_root.join("SKILL.md"), content)
+                .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+            let source = SkillSourceIdentityV1 {
+                kind: SkillSourceKindV1::Generated,
+                locator: "gateway:skill-create".to_string(),
+                requested_ref: None,
+                resolved_ref: None,
+            };
+            let lifecycle = SkillLifecycle::default_for_user()
+                .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+            let plan = lifecycle
+                .plan_directory(staging_root, source.clone())
+                .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+            let receipt = lifecycle
+                .commit_directory(staging_root, source, &plan.package_digest, false, actor)
+                .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
+            Ok(serde_json::json!({
+                "kind": "skills.management.created",
+                "schema_version": 1,
+                "plan": plan,
+                "receipt": receipt,
+                "changed_refs": [format!("managed:{}", receipt.skill_id)],
+            }))
+        })();
+        result
     }
 
     pub(crate) fn delete_managed(
         &self,
         workspace_root: &Path,
         id: &str,
+        actor: &str,
     ) -> Result<serde_json::Value, SkillServiceError> {
         let item = find_catalog_item(workspace_root, id)?;
-        let managed_root = managed_skill_root(&item)?;
-        let output = SkillManager::new(vec![managed_root]).delete_skill(SkillDeleteInput {
-            name: item.name,
-            force: true,
-        });
-        if !output.success {
-            return Err(SkillServiceError::BadRequest(output.message));
+        if item.source != "UserCowdManaged" {
+            return Err(SkillServiceError::BadRequest(
+                "workspace, imported agent, and legacy Cowd skills are read-only".to_string(),
+            ));
         }
+        let skill_id = skill::stable_skill_id(&item.name);
+        let previous = skill::ManagedSkillStore::default_for_user()
+            .map_err(|error| SkillServiceError::Internal(error.to_string()))?
+            .deactivate(&skill_id, actor)
+            .map_err(|error| SkillServiceError::BadRequest(error.to_string()))?;
         Ok(serde_json::json!({
             "kind": "skills.management.deleted",
             "schema_version": 1,
-            "receipt": output,
+            "receipt": {
+                "skill_id": skill_id,
+                "deactivated": previous.is_some(),
+                "previous_active": previous,
+            },
             "changed_refs": [id],
         }))
     }
@@ -697,18 +1053,18 @@ impl SkillService {
 fn managed_skill_root(
     item: &projection::SkillCatalogItem,
 ) -> Result<std::path::PathBuf, SkillServiceError> {
-    if item.scope != "local" {
+    if item.scope != "local" || item.source != "UserCowdManaged" {
         return Err(SkillServiceError::BadRequest(
-            "only user-installed skills can be modified".to_string(),
+            "only Cowd managed-store skills can be modified".to_string(),
         ));
     }
-    let configured_root = crate::skill_static::default_skill_install_root()
+    let configured_root = skill::default_managed_skill_store_root()
         .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
-    let configured_root = configured_root
-        .canonicalize()
-        .map_err(|error| SkillServiceError::Internal(error.to_string()))?;
+    let configured_root = configured_root.canonicalize().map_err(|error| {
+        SkillServiceError::Internal(format!("managed Skill store unavailable: {error}"))
+    })?;
     let skill_root = local_skill_root(item)?;
-    if skill_root.parent() != Some(configured_root.as_path()) {
+    if !skill_root.starts_with(&configured_root) {
         return Err(SkillServiceError::BadRequest(
             "workspace, bundled, and application skills are read-only".to_string(),
         ));
@@ -912,7 +1268,6 @@ fn skill_run_evidence(
 
 #[cfg(test)]
 mod tests {
-    use super::local_command::{install_skill_into, resolve_skill_install_source};
     use super::*;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -945,47 +1300,6 @@ mod tests {
     }
 
     #[test]
-    fn install_skill_uses_frontmatter_name_and_rejects_overwrite() {
-        let temp = TempTree::new("install");
-        let source = temp.root.join("source-skill");
-        fs::create_dir_all(&source).expect("source skill dir should be created");
-        fs::write(
-            source.join("SKILL.md"),
-            "---\nname: \"Display Skill\"\ndescription: demo\n---\n\nRun it.\n",
-        )
-        .expect("skill prompt should be written");
-
-        let registry = temp.root.join("registry");
-        let installed =
-            install_skill_into(source.to_str().unwrap(), &temp.root, &registry).expect("install");
-
-        assert_eq!(installed.invocation_name, "display-skill");
-        assert_eq!(installed.display_name.as_deref(), Some("Display Skill"));
-        assert!(registry.join("display-skill").join("SKILL.md").is_file());
-
-        let error = install_skill_into(source.to_str().unwrap(), &temp.root, &registry)
-            .expect_err("second install must not overwrite existing skill");
-        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
-    }
-
-    #[test]
-    fn install_skill_rejects_non_skill_sources() {
-        let temp = TempTree::new("invalid-source");
-        let plain_dir = temp.root.join("plain-dir");
-        fs::create_dir_all(&plain_dir).expect("plain dir should be created");
-        let plain_file = temp.root.join("notes.txt");
-        fs::write(&plain_file, "not a skill").expect("plain file should be written");
-
-        let dir_error = resolve_skill_install_source(plain_dir.to_str().unwrap(), &temp.root)
-            .expect_err("directories without SKILL.md are not installable");
-        assert_eq!(dir_error.kind(), std::io::ErrorKind::InvalidInput);
-
-        let file_error = resolve_skill_install_source(plain_file.to_str().unwrap(), &temp.root)
-            .expect_err("non-markdown files are not installable");
-        assert_eq!(file_error.kind(), std::io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
     fn uploaded_skill_tar_is_inspected_and_installed_as_one_package() {
         let temp = TempTree::new("uploaded-tar");
         let body = b"---\nname: Uploaded Skill\ndescription: Installed from WebUI\n---\n\nUse verified evidence.\n";
@@ -1004,10 +1318,98 @@ mod tests {
             .expect("uploaded package installs");
 
         assert_eq!(response["kind"], "skills.management.installed");
-        assert!(temp.root.join("registry/uploaded-skill/SKILL.md").is_file());
-        assert!(response["inspection"]["blocked_reasons"]
+        let entries =
+            skill::list_managed_skill_entries(&temp.root.join("registry")).expect("managed entry");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].prompt_path.is_file());
+        assert!(response["plan"]["inspection"]["blocked_reasons"]
             .as_array()
             .is_some_and(Vec::is_empty));
+
+        let reviewed_root = temp.root.join("reviewed-registry");
+        let service = SkillService::new();
+        let plan = service
+            .plan_uploaded_tar_into("uploaded.tar", &bytes, &reviewed_root)
+            .expect("upload plan");
+        assert!(skill::list_managed_skill_entries(&reviewed_root)
+            .expect("empty store")
+            .is_empty());
+        let digest = plan["plan"]["package_digest"].as_str().expect("digest");
+        assert!(service
+            .commit_uploaded_tar_into(
+                "uploaded.tar",
+                &bytes,
+                &reviewed_root,
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                false,
+                "gateway:test",
+            )
+            .is_err());
+        let committed = service
+            .commit_uploaded_tar_into(
+                "uploaded.tar",
+                &bytes,
+                &reviewed_root,
+                digest,
+                false,
+                "gateway:test",
+            )
+            .expect("reviewed upload commit");
+        assert_eq!(committed["kind"], "skills.upload.receipt");
+        assert_eq!(
+            skill::list_managed_skill_entries(&reviewed_root)
+                .expect("active store")
+                .len(),
+            1
+        );
+
+        let script = b"print('still inert')\n";
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut prompt_header = tar::Header::new_gnu();
+        prompt_header.set_size(body.len() as u64);
+        prompt_header.set_mode(0o644);
+        prompt_header.set_cksum();
+        archive
+            .append_data(&mut prompt_header, "uploaded/SKILL.md", &body[..])
+            .expect("append reviewed prompt");
+        let mut script_header = tar::Header::new_gnu();
+        script_header.set_size(script.len() as u64);
+        script_header.set_mode(0o644);
+        script_header.set_cksum();
+        archive
+            .append_data(&mut script_header, "uploaded/scripts/check.py", &script[..])
+            .expect("append inert script");
+        let script_bytes = archive.into_inner().expect("finish script archive");
+        let warning_plan = service
+            .plan_uploaded_tar_into("uploaded.tar", &script_bytes, &reviewed_root)
+            .expect("script package plan");
+        assert!(!warning_plan["plan"]["warnings"]
+            .as_array()
+            .expect("warnings")
+            .is_empty());
+        let warning_digest = warning_plan["plan"]["package_digest"]
+            .as_str()
+            .expect("warning digest");
+        assert!(service
+            .commit_uploaded_tar_into(
+                "uploaded.tar",
+                &script_bytes,
+                &reviewed_root,
+                warning_digest,
+                false,
+                "gateway:test",
+            )
+            .is_err());
+        service
+            .commit_uploaded_tar_into(
+                "uploaded.tar",
+                &script_bytes,
+                &reviewed_root,
+                warning_digest,
+                true,
+                "gateway:test",
+            )
+            .expect("explicit warning acceptance activates inert script package");
     }
 
     #[test]
@@ -1015,6 +1417,13 @@ mod tests {
         assert_eq!(help_path_from_args("install help"), Some(vec!["install"]));
         assert_eq!(help_path_from_args("view --help"), Some(vec!["view"]));
         assert_eq!(help_path_from_args("help install"), Some(Vec::new()));
+        assert_eq!(
+            parse_reviewed_install_args(
+                "/tmp/source with spaces --expected-digest sha256:abc --allow-warnings"
+            ),
+            Some(("/tmp/source with spaces", "sha256:abc", true))
+        );
+        assert!(parse_reviewed_install_args("/tmp/source --allow-warnings").is_none());
     }
 
     #[test]
