@@ -1219,11 +1219,16 @@ pub mod test_support {
 pub fn api_router(state: Arc<AppState>) -> Router {
     let public_routes = public_routes::router();
 
-    let dynamic_app_routes = state
+    let (dynamic_app_routes, static_app_routes) = state
         .services
         .app_platform
         .as_ref()
-        .map(|platform| app_routes::router(Arc::clone(platform)))
+        .map(|platform| {
+            (
+                app_routes::router(Arc::clone(platform)),
+                app_routes::static_router(Arc::clone(platform)),
+            )
+        })
         .unwrap_or_default();
     let protected_routes = Router::new()
         .merge(dynamic_app_routes)
@@ -1262,6 +1267,7 @@ pub fn api_router(state: Arc<AppState>) -> Router {
         ));
 
     public_routes
+        .merge(static_app_routes)
         .merge(protected_routes)
         .layer(middleware::from_fn_with_state(
             state.clone(),

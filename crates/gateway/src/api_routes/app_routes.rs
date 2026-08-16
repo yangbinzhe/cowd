@@ -73,6 +73,17 @@ pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::App
             "/api/apps/:app_id/tui/views/:view_id/stream",
             post(tui_stream),
         )
+        .layer(Extension(platform))
+}
+
+/// Serves immutable, integrity-checked APP web assets without a browser session.
+///
+/// The iframe is sandboxed to an opaque origin and its CSP denies network
+/// access, so it can communicate with Cowd only through the authenticated host
+/// MessageChannel. Keeping signed static bytes public also avoids sending the
+/// `/api` session cookie into an untrusted APP document.
+pub(super) fn static_router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::AppState>> {
+    Router::new()
         .route("/apps/:app_id", get(serve_index))
         .route("/apps/:app_id/*path", get(serve_asset))
         .layer(Extension(platform))
@@ -1780,6 +1791,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
+    use tower::ServiceExt;
 
     #[test]
     fn app_static_headers_allow_only_same_origin_embedding() {
@@ -2111,6 +2123,35 @@ mod tests {
                 .expect("static status")
                 .state,
             cowd_app_protocol::AppLifecycleStateV1::Mounted
+        );
+        let state = super::super::tests::test_state_with_app_platform(Arc::clone(&platform));
+        let mut state = Arc::try_unwrap(state)
+            .unwrap_or_else(|_| panic!("fresh reference state must be unique"));
+        state.auth_token = Some("reference-browser-secret".to_owned());
+        let gateway = super::super::api_router(Arc::new(state));
+        let static_http_response = gateway
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/apps/reference-app/index.html")
+                    .body(Body::empty())
+                    .expect("static APP request"),
+            )
+            .await
+            .expect("static APP response");
+        assert_eq!(static_http_response.status(), StatusCode::OK);
+        let protected_catalog_response = gateway
+            .oneshot(
+                Request::builder()
+                    .uri("/api/apps")
+                    .body(Body::empty())
+                    .expect("protected APP catalog request"),
+            )
+            .await
+            .expect("protected APP catalog response");
+        assert_eq!(
+            protected_catalog_response.status(),
+            StatusCode::UNAUTHORIZED
         );
         let unauthorized = super::super::AuthenticatedPrincipal(
             runtime::VerifiedPrincipal::from_test_claims(PrincipalClaims {
