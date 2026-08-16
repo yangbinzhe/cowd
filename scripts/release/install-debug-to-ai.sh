@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/debug/cowd}"
+LAUNCHER_BIN="${COWD_LAUNCHER_BIN:-$TARGET_ROOT/debug/managed-worker-launcher}"
 CONFIG_HOME="${COWD_CONFIG_HOME:-$HOME/.cowd}"
 VERSION="$(awk -F '"' '/^version = / {print $2; exit}' "$ROOT/Cargo.toml")"
 INSTALL_DIR="${COWD_INSTALL_DIR:-$CONFIG_HOME/bin}"
@@ -29,6 +30,7 @@ Installs the already-built debug cowd binary into ~/.cowd/bin.
 Environment:
   CARGO_TARGET_DIR  target directory containing debug/cowd
   COWD_BIN          explicit cowd binary path
+  COWD_LAUNCHER_BIN explicit managed-worker-launcher binary path
   COWD_CONFIG_HOME  Cowd home, default ~/.cowd
   COWD_INSTALL_DIR  explicit install directory, default ~/.cowd/bin
 EOF
@@ -45,6 +47,10 @@ if [[ ! -x "$BIN" ]]; then
   echo "missing executable cowd binary at $BIN" >&2
   exit 1
 fi
+if [[ ! -x "$LAUNCHER_BIN" ]]; then
+  echo "missing managed-worker-launcher binary at $LAUNCHER_BIN" >&2
+  exit 1
+fi
 BIN_VERSION="$("$BIN" --version | awk '$1 == "Version" {print $2; exit}')"
 if [[ "$BIN_VERSION" != "$VERSION" ]]; then
   echo "cowd binary version mismatch: expected $VERSION, got ${BIN_VERSION:-unknown}" >&2
@@ -55,6 +61,11 @@ INSTALL_TMP="$(mktemp "$INSTALL_DIR/.cowd.install.XXXXXX")"
 trap 'rm -f "$INSTALL_TMP"' EXIT
 install -m 0755 "$BIN" "$INSTALL_TMP"
 mv -f "$INSTALL_TMP" "$INSTALL_DIR/cowd"
+trap - EXIT
+LAUNCHER_TMP="$(mktemp "$INSTALL_DIR/.managed-worker-launcher.install.XXXXXX")"
+trap 'rm -f "$LAUNCHER_TMP"' EXIT
+install -m 0500 "$LAUNCHER_BIN" "$LAUNCHER_TMP"
+mv -f "$LAUNCHER_TMP" "$INSTALL_DIR/managed-worker-launcher"
 trap - EXIT
 rm -f \
   "$INSTALL_DIR/cowd-auth-broker" \
@@ -70,6 +81,7 @@ cat >"$INSTALL_DIR/install.json" <<EOF
   "installed_at": "$(date -Iseconds)",
   "source_root": "$ROOT",
   "binary": "$INSTALL_DIR/cowd",
+  "managed_worker_launcher": "$INSTALL_DIR/managed-worker-launcher",
   "process_model": "single_binary_multi_process"
 }
 EOF

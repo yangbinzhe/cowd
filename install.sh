@@ -212,9 +212,14 @@ info "this may take a few minutes on the first build"
 )
 
 COWD_BUILD_BIN="${SCRIPT_DIR}/target/${BUILD_PROFILE}/cowd"
+LAUNCHER_BUILD_BIN="${SCRIPT_DIR}/target/${BUILD_PROFILE}/managed-worker-launcher"
 
 if [ ! -x "${COWD_BUILD_BIN}" ]; then
     error "Expected binary not found at ${COWD_BUILD_BIN}"
+    exit 1
+fi
+if [ ! -x "${LAUNCHER_BUILD_BIN}" ]; then
+    error "Expected managed worker launcher not found at ${LAUNCHER_BUILD_BIN}"
     exit 1
 fi
 
@@ -234,18 +239,27 @@ fi
 mv -f "${INSTALL_TMP}" "${INSTALL_DIR}/cowd"
 COWD_BIN="${INSTALL_DIR}/cowd"
 
+LAUNCHER_TMP="$(mktemp "${INSTALL_DIR}/.managed-worker-launcher.install.XXXXXX")"
+if ! install -m 0500 "${LAUNCHER_BUILD_BIN}" "${LAUNCHER_TMP}"; then
+    rm -f "${LAUNCHER_TMP}"
+    exit 1
+fi
+mv -f "${LAUNCHER_TMP}" "${INSTALL_DIR}/managed-worker-launcher"
+LAUNCHER_BIN="${INSTALL_DIR}/managed-worker-launcher"
+
 cat >"${INSTALL_DIR}/install.json" <<EOF
 {
   "schema_version": 1,
   "install_root": "${INSTALL_DIR}",
   "binary": "${COWD_BIN}",
+  "managed_worker_launcher": "${LAUNCHER_BIN}",
   "profile": "${BUILD_PROFILE}",
   "source_root": "${SCRIPT_DIR}",
   "installed_at": "$(date -Iseconds)"
 }
 EOF
 
-ok "installed ${COWD_BIN}"
+ok "installed ${COWD_BIN} and ${LAUNCHER_BIN}"
 
 # ── Step 5: post-build verification ──────────────────────────────────────────
 

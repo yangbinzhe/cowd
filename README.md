@@ -66,7 +66,8 @@ cowd gateway doctor
 Gateway 是 Runtime、TUI、WebUI、Connector 和 APP 的统一服务入口。零 APP 时 Core 仍可独立启动；可选 APP 损坏或不可用只隔离自身，只有显式 `required: true` 的 APP 才影响 readiness。
 
 所有编译产物使用唯一安装根 `~/.cowd/bin`：Core 位于
-`~/.cowd/bin/cowd`，Edge sidecar 位于 `~/.cowd/bin/edge`，Connector
+`~/.cowd/bin/cowd`，受管 APP 沙箱 launcher 位于
+`~/.cowd/bin/managed-worker-launcher`，Edge sidecar 位于 `~/.cowd/bin/edge`，Connector
 Manifest 位于 `~/.cowd/bin/connectors`，WebUI 位于
 `~/.cowd/bin/webui`，APP Bundle 位于 `~/.cowd/bin/apps`。配置、凭据、
 运行状态和 APP 数据仍保留在 `~/.cowd` 的非 `bin` 子目录，不与安装产物混放。
