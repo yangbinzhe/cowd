@@ -174,6 +174,8 @@ pub mod cowd_event;
 pub mod cross_plane_policy;
 #[path = "agent/definition_registry.rs"]
 pub mod definition_registry;
+#[path = "agent/display_identity.rs"]
+pub mod display_identity;
 #[path = "session/history.rs"]
 mod session_history;
 #[cfg(test)]

@@ -26,6 +26,14 @@ pub struct AgentBindingRequest {
     pub definition_id: AgentDefinitionId,
     pub selector: RevisionSelector,
     pub instance_id: String,
+    /// Typed semantic role id (`implementer`). It is never the display label
+    /// and never carries a slot suffix.
+    pub role_id: Option<String>,
+    /// Typed 1-based slot index within the role.
+    pub slot_index: Option<u32>,
+    /// Typed focus partition id.
+    pub focus: Option<String>,
+    /// Legacy combined carrier kept only for durable decode/migration.
     pub role_slot_id: Option<String>,
     pub session_id: String,
     pub task_id: String,
@@ -54,6 +62,9 @@ impl AgentBindingRequest {
             definition_id,
             selector,
             instance_id: instance_id.into(),
+            role_id: None,
+            slot_index: None,
+            focus: None,
             role_slot_id: None,
             session_id: session_id.into(),
             task_id: task_id.into(),
@@ -119,6 +130,36 @@ pub(crate) fn request_for_intent(
         .constraints
         .iter()
         .find_map(|constraint| constraint.strip_prefix("role_slot:").map(str::to_string));
+    let role_id = intent
+        .constraints
+        .iter()
+        .find_map(|constraint| constraint.strip_prefix("team_role:").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let (parsed_role_id, slot_index) = request
+        .role_slot_id
+        .as_deref()
+        .map(parse_role_slot_id)
+        .transpose()?
+        .unwrap_or((None, None));
+    if intent.team_id.is_some() && role_id.is_none() && parsed_role_id.is_none() {
+        return Err(AgentBindingError::InvalidRequest(
+            "Team Agent intent must carry a typed `team_role:` identity".to_string(),
+        ));
+    }
+    if role_id.is_some() && parsed_role_id.is_some() && role_id != parsed_role_id {
+        return Err(AgentBindingError::InvalidRequest(format!(
+            "Team role identity mismatch: `team_role:{role_id:?}` vs `role_slot:{parsed_role_id:?}`"
+        )));
+    }
+    request.role_id = role_id.or(parsed_role_id);
+    request.slot_index = slot_index;
+    request.focus = intent
+        .constraints
+        .iter()
+        .find_map(|constraint| constraint.strip_prefix("focus_partition:").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     request.team_id = intent.team_id.clone();
     request.granted_capabilities = granted_capabilities;
     request.allowed_tool_contract_refs = intent.allowed_tools.clone();
@@ -142,6 +183,21 @@ pub(crate) fn request_for_intent(
         .collect();
     request.team_working_state_visible = intent.team_id.is_some();
     Ok(request)
+}
+
+fn parse_role_slot_id(value: &str) -> Result<(Option<String>, Option<u32>), AgentBindingError> {
+    let Some((role_id, slot)) = value.rsplit_once(':') else {
+        // A bare numeric value is the slot-only carrier used by the Team
+        // compiler (`role_slot:1`); a bare name is a legacy role carrier.
+        return match value.parse::<u32>() {
+            Ok(index) => Ok((None, Some(index))),
+            Err(_) => Ok((Some(value.to_string()), None)),
+        };
+    };
+    let slot_index = slot.parse::<u32>().map_err(|_| {
+        AgentBindingError::InvalidRequest(format!("role_slot `{value}` has a non-numeric slot"))
+    })?;
+    Ok((Some(role_id.to_string()), Some(slot_index)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,9 +328,14 @@ impl AgentBindingCompiler {
             fact_refs,
             matrix_snapshot_refs,
         };
+        let role_slot_id = match (&request.role_id, request.slot_index) {
+            (Some(role_id), Some(slot)) => Some(format!("{role_id}:{slot}")),
+            (Some(role_id), None) => Some(role_id.to_string()),
+            _ => request.role_slot_id.clone(),
+        };
         let instance = AgentInstanceRef {
             instance_id: request.instance_id,
-            role_slot_id: request.role_slot_id,
+            role_slot_id,
         };
         let binding_id = binding_id(
             &resolved.revision.revision_ref,
@@ -345,11 +406,19 @@ impl AgentBindingCompiler {
         execution_identity: harness_contract::execution::ExecutionIdentity,
     ) -> Result<AgentTaskPacket, AgentBindingError> {
         let request = request_for_intent(&intent, catalog_entry)?;
+        let typed_role_id = request.role_id.clone();
         let compiled = self.compile(request)?;
-        compiled
+        let mut packet = compiled
             .snapshot
             .compile_task_packet(intent, execution_identity)
-            .map_err(|error| AgentBindingError::InvalidBinding(error.to_string()))
+            .map_err(|error| AgentBindingError::InvalidBinding(error.to_string()))?;
+        if let Some(role_id) = typed_role_id {
+            // The Binding instance carries the combined `role:slot` identity;
+            // the executable assignment keeps the typed semantic role id
+            // separate from its slot, exactly as D1 requires.
+            packet.assignment.role_id = role_id;
+        }
+        Ok(packet)
     }
 }
 
@@ -534,8 +603,10 @@ mod tests {
     use std::sync::Arc;
 
     use harness_contract::agent::{
-        AgentCapability, AgentDefinitionId, DefinitionScope, RevisionSelector,
+        AgentCapability, AgentDefinitionId, AgentTaskIntent, DefinitionScope, RevisionSelector,
     };
+    use harness_contract::context::ChildExecutionBudgetReservation;
+    use harness_contract::policy::PermissionMode;
     use tempfile::TempDir;
 
     use super::*;
@@ -551,6 +622,51 @@ mod tests {
             )
             .expect("registry"),
         )
+    }
+
+    fn team_intent() -> AgentTaskIntent {
+        AgentTaskIntent {
+            selected_agent_id: None,
+            definition_ref: None,
+            granted_capabilities: Vec::new(),
+            principal_id: "test".to_string(),
+            source_turn_id: "turn-1".to_string(),
+            run_id: "run-1".to_string(),
+            task_id: "task-1".to_string(),
+            root_task_id: "task-root-1".to_string(),
+            parent_task_id: None,
+            session_id: "session-1".to_string(),
+            mission_id: "mission-1".to_string(),
+            team_id: Some("team-1".to_string()),
+            graph_id: "graph-1".to_string(),
+            node_id: "node-1".to_string(),
+            attempt: 1,
+            expected_graph_revision: 1,
+            objective: "typed role slot".to_string(),
+            required_acceptance: Default::default(),
+            output_acceptance: Vec::new(),
+            acceptance: Vec::new(),
+            constraints: Vec::new(),
+            context_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            allowed_tools: Vec::new(),
+            allowed_skills: Vec::new(),
+            permission_ceiling: PermissionMode::ReadOnly,
+            model_lease: "model".to_string(),
+            budget_lease: ChildExecutionBudgetReservation::single(
+                "budget",
+                "agent",
+                "team",
+                100,
+                7_500,
+                u64::MAX,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            managed_invocation: None,
+            idempotency_key: "agent:1".to_string(),
+        }
     }
 
     #[test]
@@ -592,5 +708,47 @@ mod tests {
             compiler.compile(request),
             Err(AgentBindingError::EmptyEffectiveCapability)
         ));
+    }
+
+    #[test]
+    fn typed_role_slot_focus_flow_into_the_binding_without_display_guessing() {
+        let temp = TempDir::new().expect("temporary root");
+        let compiler = AgentBindingCompiler::new(registry(&temp));
+        let mut intent = team_intent();
+        intent.constraints = vec![
+            "team_role:implementer".to_string(),
+            "role_slot:implementer:2".to_string(),
+            "focus_partition:focus-alpha".to_string(),
+        ];
+        let request = request_for_intent(&intent, None).expect("typed request");
+        assert_eq!(request.role_id.as_deref(), Some("implementer"));
+        assert_eq!(request.slot_index, Some(2));
+        assert_eq!(request.focus.as_deref(), Some("focus-alpha"));
+
+        let compiled = compiler.compile(request).expect("binding");
+        assert_eq!(
+            compiled.snapshot.instance.role_slot_id.as_deref(),
+            Some("implementer:2")
+        );
+        assert!(
+            !compiled
+                .snapshot
+                .instance
+                .role_slot_id
+                .as_deref()
+                .is_some_and(|value| value.contains("focus-alpha")),
+            "focus must never leak into the semantic role identity"
+        );
+    }
+
+    #[test]
+    fn conflicting_role_identity_is_rejected_before_binding_compilation() {
+        let mut intent = team_intent();
+        intent.constraints = vec![
+            "team_role:implementer".to_string(),
+            "role_slot:reviewer:1".to_string(),
+        ];
+        let error = request_for_intent(&intent, None).expect_err("mismatch fails closed");
+        assert!(error.to_string().contains("role identity mismatch"));
     }
 }

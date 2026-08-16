@@ -17,6 +17,7 @@ use harness_contract::outcome::{
     TerminalPresentationState, UserAnswerContract, VerifiedDeliveryEffect,
     VerifiedDeliveryReference, VerifiedEffectStatus,
 };
+use harness_contract::team::{RoleBehaviorFacet, TeamBindingSnapshot};
 
 use crate::execution_core::graph::executors::{SynthesizeBackend, SynthesizeBackendResolver};
 use crate::execution_core::graph::{
@@ -89,6 +90,7 @@ impl TeamResultReducer {
                 &packet,
                 &envelope,
                 positive_evidence_summary.as_deref(),
+                None,
             )
         });
         let (result_ref, summary, terminal_presentation) = reusable.map_or_else(
@@ -483,21 +485,12 @@ fn eligible_team_synthesizer_result(
     packet: &AgentTaskPacket,
     envelope: &DeliveryEnvelope,
     positive_evidence_summary: Option<&str>,
+    binding: Option<&TeamBindingSnapshot>,
 ) -> Option<(
     harness_contract::outcome::AnswerCandidate,
     TerminalPresentation,
 )> {
-    let role = packet
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix("team_role:"))
-        .map(str::trim);
-    if result.status != ExecutionNodeStatus::Completed
-        || !matches!(
-            role,
-            Some("synthesizer" | "decision_synthesis" | "finalizer")
-        )
-    {
+    if result.status != ExecutionNodeStatus::Completed || !is_synthesizer_role(packet, binding) {
         return None;
     }
     let text = positive_evidence_summary?.trim();
@@ -549,21 +542,14 @@ fn eligible_team_synthesizer(
     packet: &AgentTaskPacket,
     envelope: &DeliveryEnvelope,
     positive_evidence_summary: Option<&str>,
+    binding: Option<&TeamBindingSnapshot>,
 ) -> Option<(
     harness_contract::outcome::AnswerCandidate,
     TerminalPresentation,
 )> {
-    let role = packet
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix("team_role:"))
-        .map(str::trim);
     let synthesized_candidate = (returned.answer_candidate.is_none()
         && returned.status == AgentTerminalStatus::Completed
-        && matches!(
-            role,
-            Some("synthesizer" | "decision_synthesis" | "finalizer")
-        ))
+        && is_synthesizer_role(packet, binding))
     .then(|| {
         let text = positive_evidence_summary.map(str::to_string).or_else(|| {
             crate::agent_in_process_worker::structured_agent_output(&returned.outcome)
@@ -604,10 +590,7 @@ fn eligible_team_synthesizer(
         .as_ref()
         .or(synthesized_candidate.as_ref())?;
     if returned.status != AgentTerminalStatus::Completed
-        || !matches!(
-            role,
-            Some("synthesizer" | "decision_synthesis" | "finalizer")
-        )
+        || !is_synthesizer_role(packet, binding)
         || candidate.source_execution_id != returned.run_id
         || candidate.consumed_envelope_revision != Some(envelope.revision)
         || candidate.validation.status != AnswerValidationStatus::Valid
@@ -662,6 +645,31 @@ fn eligible_team_synthesizer(
         committed_at_ms: None,
     };
     Some((answer, presentation))
+}
+
+/// Synthesizer eligibility is driven by typed `RoleBehaviorFacet::Reducer`
+/// facts from the frozen Team Binding, never by a role-name heuristic. The
+/// constraint-string fallback remains only for legacy graphs without a
+/// Binding.
+fn is_synthesizer_role(packet: &AgentTaskPacket, binding: Option<&TeamBindingSnapshot>) -> bool {
+    if let Some(binding) = binding {
+        return binding.roles.iter().any(|role| {
+            role.role_id == packet.assignment.role_id
+                && role
+                    .behavior
+                    .iter()
+                    .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. }))
+        });
+    }
+    let role = packet
+        .constraints
+        .iter()
+        .find_map(|constraint| constraint.strip_prefix("team_role:"))
+        .map(str::trim);
+    matches!(
+        role,
+        Some("synthesizer" | "decision_synthesis" | "finalizer")
+    )
 }
 
 fn positive_field_text(value: &serde_json::Value) -> Option<String> {
@@ -787,7 +795,8 @@ mod tests {
 
     use super::{
         aggregate_positive_evidence_summary, build_delivery_envelope, eligible_team_synthesizer,
-        eligible_team_synthesizer_result, mechanical_delivery_summary, terminal_agent_node_ids,
+        eligible_team_synthesizer_result, is_synthesizer_role, mechanical_delivery_summary,
+        terminal_agent_node_ids,
     };
 
     fn result(status: ExecutionNodeStatus, usage: ExecutionUsage) -> ExecutionNodeResult {
@@ -1129,6 +1138,7 @@ mod tests {
             &packet,
             &envelope,
             None,
+            None,
         );
         assert!(eligible.is_some());
         assert_eq!(
@@ -1139,6 +1149,7 @@ mod tests {
             &returned_candidate(envelope.revision.saturating_sub(1)),
             &packet,
             &envelope,
+            None,
             None,
         )
         .is_none());
@@ -1158,6 +1169,7 @@ mod tests {
             &packet,
             &envelope,
             Some("all durable branch facts"),
+            None,
         )
         .expect("durable graph result is sufficient");
         assert_eq!(candidate.text, "all durable branch facts");
@@ -1183,7 +1195,7 @@ mod tests {
         .to_string();
 
         let (candidate, presentation) =
-            eligible_team_synthesizer(&returned, &packet, &envelope, None)
+            eligible_team_synthesizer(&returned, &packet, &envelope, None, None)
                 .expect("verified terminal narrative should become the root candidate");
 
         assert_eq!(candidate.text, "Team one verified the runtime manifest.");
@@ -1211,8 +1223,89 @@ mod tests {
             &packet,
             &envelope,
             Some("Verified manifest finding."),
+            None,
         )
         .expect("verified positive finding should replace meta commentary");
         assert_eq!(candidate.text, "Verified manifest finding.");
+    }
+
+    #[test]
+    fn synthesizer_eligibility_uses_typed_reducer_facet_not_role_name() {
+        use harness_contract::team::{
+            RoleBehaviorFacet, RoleCardinalityPolicy, RolePartitionPolicy, TeamBindingSnapshot,
+            TeamDisplayIdentity, TeamRoleBindingSnapshot,
+        };
+
+        let binding = TeamBindingSnapshot {
+            binding_id: "team-binding:test".to_string(),
+            template_ref: "builtin/cowd/test@1".to_string(),
+            template_digest: "digest".to_string(),
+            template_name: "Test".to_string(),
+            template_description: "Test".to_string(),
+            team_instructions: "# Test\n".to_string(),
+            roles: vec![TeamRoleBindingSnapshot {
+                role_id: "implementer".to_string(),
+                slot: 1,
+                focus: Some("focus-1".to_string()),
+                role_name: "实现者".to_string(),
+                role_description: "实现有界变更".to_string(),
+                behavior: vec![
+                    RoleBehaviorFacet::Reducer {
+                        mode: "finally".to_string(),
+                    },
+                    RoleBehaviorFacet::TerminalCandidate { required: true },
+                ],
+                agent_definition_ref: "builtin/cowd/execute".to_string(),
+                agent_name: "Execute".to_string(),
+                agent_description: "Executes".to_string(),
+                agent_definition_digest: "digest".to_string(),
+                responsibility: "实现有界变更".to_string(),
+                cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
+                partition: RolePartitionPolicy::Single,
+                task_contract_ref: "task/implementer@1".to_string(),
+                acceptance: vec!["evidence".to_string()],
+                team_markdown_fragment: Some("# Test\n".to_string()),
+            }],
+            strategy_decision_id: String::new(),
+            strategy_decision_revision: 0,
+            strategy_decision_lease: String::new(),
+            strategy_turn_ref: String::new(),
+            display_identity: TeamDisplayIdentity {
+                label: "Test".to_string(),
+                role_label: "实现者".to_string(),
+                focus_label: Some("focus-1".to_string()),
+                locale: "auto".to_string(),
+                provenance: "runtime.team.compile".to_string(),
+                digest: "digest".to_string(),
+            },
+            binding_digest: "binding-digest".to_string(),
+        };
+
+        let mut packet = synthesizer_packet();
+        packet.assignment.role_id = "implementer".to_string();
+        packet.constraints = vec!["team_role:implementer".to_string()];
+        assert!(
+            is_synthesizer_role(&packet, Some(&binding)),
+            "typed Reducer facet makes the role eligible regardless of its name"
+        );
+        assert!(
+            !is_synthesizer_role(&packet, None),
+            "without a Binding the legacy name fallback must not guess"
+        );
+
+        let mut renamed = binding.clone();
+        renamed.roles[0].role_name = "完全不同的中文名称".to_string();
+        renamed.roles[0].role_id = "implementer".to_string();
+        assert!(
+            is_synthesizer_role(&packet, Some(&renamed)),
+            "display label changes never affect behavior eligibility"
+        );
+
+        let mut non_reducer = binding;
+        non_reducer.roles[0].behavior.clear();
+        assert!(
+            !is_synthesizer_role(&packet, Some(&non_reducer)),
+            "a role without the typed Reducer facet is never a synthesizer"
+        );
     }
 }
