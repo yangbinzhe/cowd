@@ -18,6 +18,7 @@ GENERATED="${WEBUI_ROOT}/src/generated/gateway-api.ts"
 GENERATED_LIVE_CONTRACT="${WEBUI_ROOT}/src/generated/live-contract-meta.ts"
 GENERATED_PROJECTION_GOLDEN="${WEBUI_ROOT}/src/generated/projection-v2-golden.ts"
 GENERATED_PROJECTION_CONTRACT="${WEBUI_ROOT}/src/generated/projection-contract-meta.ts"
+GENERATED_APP_PROTOCOL="${WEBUI_ROOT}/src/generated/app-protocol-meta.ts"
 GATEWAY_PID=""
 
 case "${MODE}" in
@@ -123,11 +124,13 @@ else
   LIVE_CONTRACT_CANDIDATE="${SCENARIO_ROOT}/live-contract-meta.ts"
   PROJECTION_GOLDEN_CANDIDATE="${SCENARIO_ROOT}/projection-v2-golden.ts"
   PROJECTION_CONTRACT_CANDIDATE="${SCENARIO_ROOT}/projection-contract-meta.ts"
+  APP_PROTOCOL_CANDIDATE="${SCENARIO_ROOT}/app-protocol-meta.ts"
   env COWD_GATEWAY_URL="${BASE_URL}" COWD_API_TOKEN="${TOKEN}" \
     COWD_GENERATED_API_OUTPUT="${CANDIDATE}" \
     COWD_GENERATED_LIVE_CONTRACT_OUTPUT="${LIVE_CONTRACT_CANDIDATE}" \
     COWD_GENERATED_PROJECTION_GOLDEN_OUTPUT="${PROJECTION_GOLDEN_CANDIDATE}" \
     COWD_GENERATED_PROJECTION_CONTRACT_OUTPUT="${PROJECTION_CONTRACT_CANDIDATE}" \
+    COWD_GENERATED_APP_PROTOCOL_OUTPUT="${APP_PROTOCOL_CANDIDATE}" \
     npm --prefix "${WEBUI_ROOT}" run generate:api
   if ! cmp -s "${GENERATED}" "${CANDIDATE}"; then
     echo "committed generated API is stale; run: bash scripts/scenarios/openapi-generation.sh update" >&2
@@ -147,6 +150,11 @@ else
   if ! cmp -s "${GENERATED_PROJECTION_CONTRACT}" "${PROJECTION_CONTRACT_CANDIDATE}"; then
     echo "committed projection contract metadata is stale; run: bash scripts/scenarios/openapi-generation.sh update" >&2
     diff -u "${GENERATED_PROJECTION_CONTRACT}" "${PROJECTION_CONTRACT_CANDIDATE}" >&2 || true
+    exit 1
+  fi
+  if ! cmp -s "${GENERATED_APP_PROTOCOL}" "${APP_PROTOCOL_CANDIDATE}"; then
+    echo "committed app protocol metadata is stale; run: bash scripts/scenarios/openapi-generation.sh update" >&2
+    diff -u "${GENERATED_APP_PROTOCOL}" "${APP_PROTOCOL_CANDIDATE}" >&2 || true
     exit 1
   fi
 fi

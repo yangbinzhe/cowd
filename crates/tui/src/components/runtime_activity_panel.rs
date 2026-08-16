@@ -775,10 +775,11 @@ impl Component for RuntimeActivityPanel {
                         self.execution_graph_agent_tasks,
                         self.execution_graph_children
                     ),
-                    Style::default().fg(if self.execution_graph_status == "completed" {
-                        Color::Green
-                    } else {
-                        Color::Cyan
+                    Style::default().fg(match self.execution_graph_status.as_str() {
+                        "completed" => Color::Green,
+                        "partial" | "unavailable" | "denied" => Color::Yellow,
+                        "failed" => Color::Red,
+                        _ => Color::Cyan,
                     }),
                 ),
                 Span::styled(

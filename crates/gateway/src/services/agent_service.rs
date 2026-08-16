@@ -64,18 +64,15 @@ impl AgentService {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let team = agents.first().map(|leader| {
-            serde_json::json!({
-                "leader": leader,
-                "workers": agents.iter().skip(1).take(4).collect::<Vec<_>>(),
-                "selection": "candidate_only",
-            })
-        });
         serde_json::json!({
-            "kind": "agents.assemble",
+            "kind": "agents.assemble_preview",
             "task": task,
-            "agents": agents,
-            "team": team,
+            "candidates": agents,
+            "preview": {
+                "executable": false,
+                "requires_runtime_validation": true,
+                "note": "Runtime must validate revision, permission, budget and deadline, then compile a TeamBinding before any execution. This endpoint never assembles an executable team.",
+            },
             "source": "runtime.definition_catalog",
         })
     }
