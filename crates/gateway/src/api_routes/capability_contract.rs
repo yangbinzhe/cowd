@@ -225,6 +225,8 @@ fn gateway_openapi_document_from_contract(
             "ApprovalPendingResponse",
             approval_pending_response_schema(),
         ),
+        ("ApprovalExactResponse", approval_exact_response_schema()),
+        ("ApprovalRespondReceipt", approval_respond_receipt_schema()),
         (
             "CreateLiveSubscriptionRequest",
             live_create_request_schema(),
@@ -2110,7 +2112,7 @@ fn auth_verify_response_schema() -> Value {
 fn approval_pending_response_schema() -> Value {
     json!({
         "type": "object",
-        "required": ["kind", "filter", "pending", "approvals"],
+        "required": ["kind", "filter", "pending", "groups", "pending_count", "approvals"],
         "properties": {
             "kind": {"type": "string", "const": "gateway.unified_approval_pending"},
             "filter": {
@@ -2129,7 +2131,7 @@ fn approval_pending_response_schema() -> Value {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["approval_id", "domain", "blocks_execution", "status", "action", "summary", "risk", "source", "context"],
+                    "required": ["approval_id", "domain", "blocks_execution", "status", "action", "summary", "risk", "source", "context", "deadline_elapsed"],
                     "properties": {
                         "approval_id": {"type": "string"},
                         "domain": {"type": "string"},
@@ -2138,13 +2140,68 @@ fn approval_pending_response_schema() -> Value {
                         "action": {"type": "string"},
                         "summary": {"type": "string"},
                         "risk": {"type": "string"},
+                        "deadline_elapsed": {"type": "boolean"},
                         "source": {"type": "object", "additionalProperties": true},
                         "context": {"type": "object", "additionalProperties": true}
                     },
-                    "additionalProperties": true
+                    "additionalProperties": false
                 }
             },
+            "groups": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["equivalence_key", "approval_ids", "count", "batch_token", "batch_decision_supported"],
+                    "properties": {
+                        "equivalence_key": {"type": "object", "additionalProperties": true},
+                        "approval_ids": {"type": "array", "items": {"type": "string"}},
+                        "count": {"type": "integer", "minimum": 1},
+                        "batch_token": {"type": "string"},
+                        "batch_decision_supported": {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                }
+            },
+            "pending_count": {"type": "integer", "minimum": 0},
             "approvals": {"type": ["object", "null"], "additionalProperties": true}
+        },
+        "additionalProperties": false
+    })
+}
+
+fn approval_exact_response_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["approval"],
+        "properties": {
+            "approval": {
+                "type": "object",
+                "required": ["approval_id", "status", "blocks_execution", "deadline_elapsed", "action", "summary", "risk", "domain"],
+                "properties": {
+                    "approval_id": {"type": "string"},
+                    "status": {"type": "string"},
+                    "blocks_execution": {"type": "boolean"},
+                    "deadline_elapsed": {"type": "boolean"},
+                    "action": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "risk": {"type": "string"},
+                    "domain": {"type": "string"}
+                },
+                "additionalProperties": false
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn approval_respond_receipt_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["approval_id", "status", "route_back"],
+        "properties": {
+            "approval_id": {"type": "string"},
+            "status": {"type": "string"},
+            "route_back": {"type": "object", "additionalProperties": true}
         },
         "additionalProperties": false
     })

@@ -734,6 +734,19 @@ fn project_approval_request(
             || effect.effect_kind != harness_contract::tool::ToolEffectKind::Read
     });
     if let Some(object) = value.as_object_mut() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        object.insert(
+            "deadline_elapsed".to_string(),
+            serde_json::json!(
+                request.status == runtime::GlobalApprovalStatus::Pending
+                    && request
+                        .expires_at_ms
+                        .is_some_and(|expires_at| expires_at < now_ms)
+            ),
+        );
         // These typed aliases intentionally live only in the authenticated
         // Gateway projection. Runtime remains the durable owner of the
         // underlying context and policy snapshot while every Surface consumes
@@ -1127,6 +1140,59 @@ mod tests {
         assert!(projected["context"]["effect"]
             .get("descriptor_hash")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_response_carries_typed_groups_and_deadline_elapsed() {
+        let services = runtime::RuntimeServices::in_memory().unwrap();
+        let source = runtime::ApprovalSource {
+            kind: runtime::ApprovalSourceKind::Application,
+            session_id: None,
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: Some("application:report:typed-pending".to_string()),
+            review_ref: Some("review-typed-pending".to_string()),
+            application: Some(runtime::ApprovalApplicationSource {
+                app_id: "fulfillment".to_string(),
+                correlation_schema: "fulfillment.review.v1".to_string(),
+                decision_capability: "fulfillment.review".to_string(),
+            }),
+        };
+        let context = harness_contract::policy::ApprovalContext::owned(
+            &source,
+            "fulfillment.review.typed_decision",
+            "application:fulfillment",
+        );
+        for index in 0..2 {
+            services
+                .approval_queue()
+                .submit(runtime::SubmitGlobalApprovalRequest {
+                    source: source.clone(),
+                    context: context.clone(),
+                    domain: harness_contract::policy::ApprovalDomain::Application,
+                    blocks_execution: true,
+                    action: format!("typed-pending-{index}"),
+                    summary: "typed pending group".to_string(),
+                    risk: harness_contract::core::TaskRisk::Medium,
+                    evidence_refs: Vec::new(),
+                    timeout_policy: runtime::ApprovalTimeoutPolicy::Pending,
+                })
+                .expect("submitted approval");
+        }
+        let service = ApprovalService::new().with_runtime_services(Arc::clone(&services));
+        let reviewer = review_principal(&["approval.respond", "fulfillment.review"]);
+        let pending = service.pending(&reviewer).await;
+        assert_eq!(pending["pending"].as_array().unwrap().len(), 2);
+        assert!(
+            pending["pending"][0]["deadline_elapsed"].is_boolean(),
+            "every pending item carries the typed deadline_elapsed fact"
+        );
+        let groups = pending["groups"].as_array().expect("groups");
+        assert!(!groups.is_empty());
+        assert_eq!(groups[0]["batch_decision_supported"], false);
+        assert_eq!(groups[0]["count"], 2);
+        assert!(groups[0]["batch_token"].as_str().is_some());
     }
 
     #[tokio::test]
