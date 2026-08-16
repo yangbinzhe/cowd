@@ -6,15 +6,18 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Typed behavior facets for a team role. Dispatch must not be driven by raw
-/// role-name strings.
+use super::definition::{RoleCardinalityPolicy, RolePartitionPolicy};
+
+/// Typed role behavior facet. Behavior dispatch is driven by these tagged
+/// facets, never by a raw role-name string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamRoleBehaviorContract {
-    pub reducer: String,
-    pub verification: String,
-    pub reacquire_evidence: String,
-    pub terminal_candidate: String,
-    pub upstream_consumption: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RoleBehaviorFacet {
+    Reducer { mode: String },
+    Verification { mode: String },
+    ReacquireEvidence { required: bool },
+    TerminalCandidate { required: bool },
+    UpstreamConsumption { required: bool },
 }
 
 /// Immutable semantic role binding captured before graph registration.
@@ -25,14 +28,14 @@ pub struct TeamRoleBindingSnapshot {
     pub focus: Option<String>,
     pub role_name: String,
     pub role_description: String,
-    pub behavior: TeamRoleBehaviorContract,
+    pub behavior: Vec<RoleBehaviorFacet>,
     pub agent_definition_ref: String,
     pub agent_name: String,
     pub agent_description: String,
     pub agent_definition_digest: String,
     pub responsibility: String,
-    pub cardinality: String,
-    pub partition: String,
+    pub cardinality: RoleCardinalityPolicy,
+    pub partition: RolePartitionPolicy,
     pub task_contract_ref: String,
     pub acceptance: Vec<String>,
     pub team_markdown_fragment: Option<String>,
@@ -79,26 +82,27 @@ pub struct TeamBindingSnapshot {
     pub binding_digest: String,
 }
 
-/// Team lifecycle is a separate axis from execution-node status.
+/// Team lifecycle is a separate axis from execution-node status. Non-terminal
+/// states are fixed; terminal delivery is projected from `DeliveryStatus`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamLifecycleState {
     Preparing,
-    Active,
-    WaitingForPredecessor,
-    Delivering,
-    Completed,
-    Failed,
-    Cancelled,
+    Running,
+    WaitingDependency,
+    WaitingApproval,
+    WaitingExternal,
+    WaitingInput,
+    Paused,
+    Terminal,
 }
 
-/// Delivery status is projected only from a terminal lifecycle state.
+/// Delivery status is projected only after graph execution terminal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
-    Pending,
+    Complete,
     Partial,
-    FailedValidation,
-    Recoverable,
-    Delivered,
+    Unavailable,
+    Cancelled,
 }

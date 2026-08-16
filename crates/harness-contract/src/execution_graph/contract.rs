@@ -42,9 +42,9 @@ pub enum ExecutionWorkRole {
 pub enum DependencyPredicate {
     EvidenceReady {
         minimum: u16,
-        required_fact_kinds: Vec<String>,
-        accepted_execution_statuses: Vec<String>,
-        accepted_acceptance_verdicts: Vec<String>,
+        required_fact_kinds: Vec<crate::acceptance::TerminalFactKind>,
+        accepted_execution_statuses: Vec<ExecutionNodeStatus>,
+        accepted_acceptance_verdicts: Vec<crate::acceptance::AcceptanceVerdict>,
         #[serde(default)]
         require_committed_effect: bool,
     },

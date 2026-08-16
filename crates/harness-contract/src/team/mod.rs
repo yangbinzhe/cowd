@@ -14,8 +14,8 @@ pub mod instantiation;
 
 pub use crate::evaluation::EvaluationContract as TeamEvaluationContract;
 pub use binding::{
-    AgentDisplayIdentity, DeliveryStatus, TeamBindingSnapshot, TeamDisplayIdentity,
-    TeamLifecycleState, TeamRoleBehaviorContract, TeamRoleBindingSnapshot,
+    AgentDisplayIdentity, DeliveryStatus, RoleBehaviorFacet, TeamBindingSnapshot,
+    TeamDisplayIdentity, TeamLifecycleState, TeamRoleBindingSnapshot,
 };
 pub use definition::{
     RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDefinition,

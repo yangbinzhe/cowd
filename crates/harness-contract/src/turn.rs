@@ -240,7 +240,16 @@ pub struct CollaborationContinuationBinding {
     pub current_ingress: String,
     pub candidate_revision: u64,
     pub binding_digest: String,
-    pub authorized: bool,
+    pub authorization: ContinuationAuthorization,
+    pub authorization_revision: u64,
+}
+
+/// Typed continuation authorization state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuationAuthorization {
+    Authorized,
+    Revoked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
