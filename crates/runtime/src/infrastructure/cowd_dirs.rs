@@ -54,6 +54,17 @@ pub fn config_home_dir() -> PathBuf {
     user_dot_dir(&home_dir())
 }
 
+/// Resolve the single installation root for compiled Cowd artifacts.
+///
+/// Configuration and mutable runtime state remain under `config_home_dir()`;
+/// only binaries, manifests, WebUI assets, and sealed APP bundles belong here.
+#[must_use]
+pub fn install_root_dir() -> PathBuf {
+    std::env::var_os("COWD_INSTALL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_home_dir().join("bin"))
+}
+
 // ── Subdirectory names (constants) ──
 
 pub const ENV_PREFIX: &str = "COWD_";

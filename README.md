@@ -44,6 +44,9 @@ Cowd 是面向复杂现实任务的自主智能执行基础设施：它以 Missi
 # 已有配置或自动化环境
 ./install.sh --release --no-config
 
+# 安装目录（可用 COWD_INSTALL_DIR 覆盖）
+# ~/.cowd/bin/cowd
+
 # TUI
 cowd
 
@@ -62,6 +65,20 @@ cowd gateway doctor
 
 Gateway 是 Runtime、TUI、WebUI、Connector 和 APP 的统一服务入口。零 APP 时 Core 仍可独立启动；可选 APP 损坏或不可用只隔离自身，只有显式 `required: true` 的 APP 才影响 readiness。
 
+所有编译产物使用唯一安装根 `~/.cowd/bin`：Core 位于
+`~/.cowd/bin/cowd`，Edge sidecar 位于 `~/.cowd/bin/edge`，Connector
+Manifest 位于 `~/.cowd/bin/connectors`，WebUI 位于
+`~/.cowd/bin/webui`，APP Bundle 位于 `~/.cowd/bin/apps`。配置、凭据、
+运行状态和 APP 数据仍保留在 `~/.cowd` 的非 `bin` 子目录，不与安装产物混放。
+
+```bash
+# 在 cowd-edge 仓库中构建并安装 Edge + WebUI
+./install.sh
+
+# 安装一个已经构建并签名的 APP Bundle
+./scripts/release/install-app-bundle.sh /path/to/app-bundle
+```
+
 源码检查与构建：
 
 ```bash
@@ -76,7 +93,9 @@ npm run dev:webui
 
 ### 动态 APP Bundle
 
-Cowd 不编译或下载 APP 源码。APP 以 sealed signed Bundle 放入配置目录，Gateway 只在启动时发现、验签和建立 immutable Catalog；运行中没有目录监听或热替换。
+Cowd 不编译或下载 APP 源码。APP 以 sealed signed Bundle 安装到
+`~/.cowd/bin/apps`，Gateway 只在启动时发现、验签和建立 immutable Catalog；
+运行中没有目录监听或热替换。
 
 ```yaml
 apps:

@@ -979,7 +979,7 @@ pub struct AppsConfig {
 impl Default for AppsConfig {
     fn default() -> Self {
         Self {
-            directories: vec![crate::cowd_dirs::config_home_dir().join("apps")],
+            directories: vec![crate::cowd_dirs::install_root_dir().join("apps")],
             trust_store: None,
             launcher: None,
             runtime_root: crate::cowd_dirs::config_home_dir().join("app-runtime"),
@@ -1158,7 +1158,7 @@ impl Default for AppSupervisorConfig {
 }
 
 /// Multi-platform gateway configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayConfig {
     pub enabled: bool,
     pub webui_dir: Option<PathBuf>,
@@ -1169,6 +1169,26 @@ pub struct GatewayConfig {
     pub presence: GatewayPresenceConfig,
     pub live: GatewayLiveConfig,
     pub translation: GatewayTranslationConfig,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webui_dir: Some(
+                crate::cowd_dirs::install_root_dir()
+                    .join("webui")
+                    .join("dist"),
+            ),
+            platforms: Vec::new(),
+            session_reset: SessionResetPolicy::default(),
+            capacity: GatewayCapacityConfig::default(),
+            recovery: SessionRecoveryConfig::default(),
+            presence: GatewayPresenceConfig::default(),
+            live: GatewayLiveConfig::default(),
+            translation: GatewayTranslationConfig::default(),
+        }
+    }
 }
 
 /// Session attachment liveness policy. This is independent from multiplex
@@ -3081,8 +3101,9 @@ fn parse_optional_gateway_config(root: &JsonValue) -> Result<GatewayConfig, Conf
         .map(|s| parse_session_reset_policy(s, "merged settings.gateway.sessionReset"))
         .transpose()?
         .unwrap_or_default();
-    let webui_dir =
-        optional_string_dual(gw, "webui_dir", "merged settings.gateway")?.map(PathBuf::from);
+    let webui_dir = optional_string_dual(gw, "webui_dir", "merged settings.gateway")?
+        .map(PathBuf::from)
+        .or_else(|| GatewayConfig::default().webui_dir);
     let platforms = if let Some(plat_val) = gw.get("platforms") {
         let arr = expect_array(plat_val, "merged settings.gateway.platforms")?;
         arr.iter()
@@ -4927,10 +4948,10 @@ mod tests {
         parse_optional_hot_state_config, parse_optional_model_context_windows,
         parse_optional_session_history_config, parse_optional_storage_config,
         parse_permission_mode_label, parse_routing_mode, redact_serde_json, AppActivationPolicyV1,
-        AppsConfig, ConfigLoader, ConfigSource, DomainProfile, McpServerConfig, McpTransport,
-        PathBuf, ProviderProtocol, ResolvedPermissionMode, RoutingMode, RuntimeConfig,
-        RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig, SessionCompactConfig,
-        StorageBackendSelection, COWD_SETTINGS_SCHEMA_NAME,
+        AppsConfig, ConfigLoader, ConfigSource, DomainProfile, GatewayConfig, McpServerConfig,
+        McpTransport, PathBuf, ProviderProtocol, ResolvedPermissionMode, RoutingMode,
+        RuntimeConfig, RuntimeFeatureConfig, RuntimeHookConfig, RuntimePluginConfig,
+        SessionCompactConfig, StorageBackendSelection, COWD_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use crate::sandbox::FilesystemIsolationMode;
@@ -6444,6 +6465,21 @@ gateway:
         );
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn compiled_artifact_defaults_share_the_single_install_root() {
+        let install_root = crate::cowd_dirs::install_root_dir();
+        let expected_webui = install_root.join("webui/dist");
+
+        assert_eq!(
+            AppsConfig::default().directories(),
+            &[install_root.join("apps")]
+        );
+        assert_eq!(
+            GatewayConfig::default().webui_dir.as_deref(),
+            Some(expected_webui.as_path())
+        );
     }
 
     #[test]

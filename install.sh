@@ -13,6 +13,7 @@
 # Environment overrides:
 #   COWD_BUILD_PROFILE=debug|release
 #   COWD_SKIP_CONFIG=1
+#   COWD_INSTALL_DIR=~/.cowd/bin
 
 set -euo pipefail
 
@@ -73,6 +74,7 @@ Options:
 Environment overrides:
   COWD_BUILD_PROFILE   debug | release
   COWD_SKIP_CONFIG     set to 1 to skip configuration
+  COWD_INSTALL_DIR     install root, default ~/.cowd/bin
 EOF
 }
 
@@ -125,9 +127,9 @@ ${COLOR_DIM}---------------${COLOR_RESET}
        cargo clean && cargo build --workspace
 
   ${COLOR_BOLD}4. 'cowd' not found after install${COLOR_RESET}
-     The binary lives at:
-       target/${BUILD_PROFILE}/cowd
-     Add it to your PATH or invoke it with the full path.
+     The binary is installed at:
+       ${COWD_INSTALL_DIR:-$HOME/.cowd/bin}/cowd
+     Add that directory to PATH or invoke it with the full path.
 
 EOF
 }
@@ -209,19 +211,43 @@ info "this may take a few minutes on the first build"
     CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"
 )
 
-COWD_BIN="${SCRIPT_DIR}/target/${BUILD_PROFILE}/cowd"
+COWD_BUILD_BIN="${SCRIPT_DIR}/target/${BUILD_PROFILE}/cowd"
 
-if [ ! -x "${COWD_BIN}" ]; then
-    error "Expected binary not found at ${COWD_BIN}"
+if [ ! -x "${COWD_BUILD_BIN}" ]; then
+    error "Expected binary not found at ${COWD_BUILD_BIN}"
     exit 1
 fi
 
-ok "built ${COWD_BIN}"
+ok "built ${COWD_BUILD_BIN}"
+
+CONFIG_DIR="${COWD_CONFIG_HOME:-${HOME}/.cowd}"
+INSTALL_DIR="${COWD_INSTALL_DIR:-${CONFIG_DIR}/bin}"
+APPS_DIR="${INSTALL_DIR}/apps"
+WEBUI_DIR="${INSTALL_DIR}/webui/dist"
+
+mkdir -p "${INSTALL_DIR}"
+INSTALL_TMP="$(mktemp "${INSTALL_DIR}/.cowd.install.XXXXXX")"
+if ! install -m 0755 "${COWD_BUILD_BIN}" "${INSTALL_TMP}"; then
+    rm -f "${INSTALL_TMP}"
+    exit 1
+fi
+mv -f "${INSTALL_TMP}" "${INSTALL_DIR}/cowd"
+COWD_BIN="${INSTALL_DIR}/cowd"
+
+cat >"${INSTALL_DIR}/install.json" <<EOF
+{
+  "schema_version": 1,
+  "install_root": "${INSTALL_DIR}",
+  "binary": "${COWD_BIN}",
+  "profile": "${BUILD_PROFILE}",
+  "source_root": "${SCRIPT_DIR}",
+  "installed_at": "$(date -Iseconds)"
+}
+EOF
+
+ok "installed ${COWD_BIN}"
 
 # ── Step 5: post-build verification ──────────────────────────────────────────
-
-CONFIG_DIR="${HOME}/.cowd"
-APPS_DIR="${CONFIG_DIR}/apps"
 
 step "Verifying the installed binary"
 
@@ -231,7 +257,7 @@ else
     warn "cowd --help returned an error — check build output"
 fi
 
-info "WebUI assets are external; set gateway.webui_dir in ${CONFIG_DIR}/config.yaml to serve a built cowd-webui dist."
+info "Edge/WebUI artifacts share ${INSTALL_DIR}; the default WebUI location is ${WEBUI_DIR}."
 
 # ── Step 6: interactive configuration ────────────────────────────────────────
 
@@ -292,6 +318,7 @@ providers:
 
 gateway:
   enabled: true
+  webui_dir: "${WEBUI_DIR}"
   platforms: []
 
 # Signed APP Bundles placed here are discovered and mounted at Gateway startup.
@@ -314,7 +341,7 @@ YAML
         SHELL_RC="${HOME}/.zshrc"
     fi
 
-    COWD_BIN_DIR="$(dirname "${COWD_BIN}")"
+    COWD_BIN_DIR="${INSTALL_DIR}"
 
     if ! grep -q 'cowd' "${SHELL_RC}" 2>/dev/null; then
         printf '\n# Cowd\nexport PATH="%s:$PATH"\n' "${COWD_BIN_DIR}" >> "${SHELL_RC}"

@@ -192,7 +192,6 @@ pub(crate) fn default_surface_roots(config_home: &Path) -> Vec<PathBuf> {
 
 fn edge_manifest_roots(root: &Path) -> Vec<PathBuf> {
     [
-        root.join("surfaces"),
         root.join("connectors").join("message"),
         root.join("connectors").join("source"),
         root.join("connectors").join("automation"),
@@ -227,10 +226,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
-    fn edge_manifest_roots_include_surfaces_and_connectors() {
+    fn edge_manifest_roots_only_include_connector_namespaces() {
         let root = PathBuf::from("/tmp/cowd-edge-root");
         let roots = edge_manifest_roots(&root);
-        assert!(roots.contains(&root.join("surfaces")));
+        assert!(!roots.contains(&root.join("surfaces")));
         assert!(roots.contains(&root.join("connectors").join("message")));
         assert!(roots.contains(&root.join("connectors").join("source")));
         assert!(roots.contains(&root.join("connectors").join("automation")));

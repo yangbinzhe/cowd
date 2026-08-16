@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TARGET_ROOT="${CARGO_TARGET_DIR:-$ROOT/target}"
 BIN="${COWD_BIN:-$TARGET_ROOT/release/cowd}"
-AI_ROOT="${COWD_AI_ROOT:-$HOME/AI}"
-INSTALL_DIR="${COWD_INSTALL_DIR:-$AI_ROOT}"
+CONFIG_HOME="${COWD_CONFIG_HOME:-$HOME/.cowd}"
+INSTALL_DIR="${COWD_INSTALL_DIR:-$CONFIG_HOME/bin}"
 INSTALLED_BIN="$INSTALL_DIR/cowd"
 
 if [[ ! -x "$BIN" ]]; then
@@ -25,7 +25,7 @@ if [[ -x "$INSTALLED_BIN" ]]; then
 fi
 
 COWD_BIN="$BIN" \
-  COWD_AI_ROOT="$AI_ROOT" \
+  COWD_CONFIG_HOME="$CONFIG_HOME" \
   COWD_INSTALL_DIR="$INSTALL_DIR" \
   bash "$ROOT/scripts/release/install-debug-to-ai.sh" --print-path-only >/dev/null
 

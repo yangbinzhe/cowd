@@ -455,7 +455,7 @@ mcp:
 # =============================================================================
 # Cowd 不内置或强制依赖任何 APP；空发现目录是完整且有效的启动形态。
 # Gateway 仅在启动时扫描签名 Bundle。目录或策略变更后需重启 Gateway。
-# 未覆盖 directories 时使用 COWD_CONFIG_HOME/apps（默认 ~/.cowd/apps）。
+# 未覆盖 directories 时使用唯一安装根下的 apps（默认 ~/.cowd/bin/apps）。
 # 自定义发现目录必须使用绝对路径：
 # directories:
 #   - /opt/cowd/apps
