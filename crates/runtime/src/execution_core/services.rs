@@ -9607,6 +9607,18 @@ mod tests {
             .team_runtime()
             .plan(request.clone())
             .expect("team plan");
+        services
+            .team_runtime()
+            .ensure_root_task(&request)
+            .expect("root task exists before the crash window");
+        assert!(
+            services
+                .task_runtime_port()
+                .get(&request.lineage.root_task_id)
+                .expect("root lookup")
+                .is_some(),
+            "root task must be durable before the crash window"
+        );
         let registered = services
             .commit_service()
             .register_graph(instantiated.graph.clone())
@@ -9650,6 +9662,159 @@ mod tests {
             .await
             .expect("second resume is idempotent");
         assert_eq!(again.tasks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn team_admission_recovers_crash_after_the_first_task_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let providers = crate::config::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test".into(),
+                crate::config::ProviderConfig {
+                    name: "test".into(),
+                    base_url: "https://example.test/v1".into(),
+                    api_key: "test".into(),
+                    models: vec!["fast".into()],
+                    protocol: Some("responses".into()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
+                },
+            )]),
+        };
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
+            .build()
+            .unwrap();
+        publish_team_test_policy(&services, "team-crash-second-link-session");
+        services
+            .agent_runtime()
+            .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
+        let request = team_request(
+            "team-crash-second-link",
+            "team-crash-second-link-session",
+            "cowd/execute-review",
+            "recover a crash that happened after the first Task link",
+            "fast",
+            services.mission_runtime().default_mission_id(),
+        );
+        let instantiated = services
+            .team_runtime()
+            .plan(request.clone())
+            .expect("team plan");
+        assert_eq!(instantiated.task_commands.len(), 2);
+        services
+            .team_runtime()
+            .ensure_root_task(&request)
+            .expect("root task exists before the crash window");
+        assert!(
+            services
+                .task_runtime_port()
+                .get(&request.lineage.root_task_id)
+                .expect("root lookup")
+                .is_some(),
+            "root task must be durable before the crash window"
+        );
+        let registered = services
+            .commit_service()
+            .register_graph(instantiated.graph.clone())
+            .expect("graph registered");
+        crate::team_binding::persist_preparing(
+            services.event_store(),
+            &registered.graph.id,
+            instantiated
+                .binding
+                .as_ref()
+                .expect("compiled Team Binding"),
+        )
+        .expect("preparing marker persisted");
+        // Simulate a crash after exactly the first Task link was committed.
+        let first = instantiated.task_commands[0].clone();
+        assert_eq!(
+            first.parent_task_id.as_deref(),
+            Some(request.lineage.root_task_id.as_str()),
+            "first command parent is the root task"
+        );
+        let bound_spec = services
+            .task_runtime_port()
+            .bind_inherited_task_spec(
+                request.lineage.root_task_id.as_str(),
+                instantiated.task_permission_ceiling,
+                first.spec.clone(),
+            )
+            .expect("bind inherited task policy");
+        let mut bound_first = first.clone();
+        bound_first.spec = bound_spec;
+        services
+            .task_aggregate_service()
+            .create(bound_first)
+            .expect("first Task committed in the crash window");
+        services
+            .task_runtime_port()
+            .link_existing_graph(
+                &first.task_id,
+                &registered.graph.id,
+                registered.graph.revision,
+                vec![harness_contract::reality::EvidenceRef::observed(
+                    "execution_graph",
+                    format!(
+                        "execution-graph://{}?revision={}",
+                        registered.graph.id, registered.graph.revision
+                    ),
+                )],
+            )
+            .expect("first link committed");
+
+        let projection = services
+            .team_runtime()
+            .instantiate_or_resume(request)
+            .await
+            .expect("resume completes the exact link set");
+        assert_eq!(projection.status, "partial");
+        assert_eq!(projection.tasks.len(), 2);
+        assert!(
+            crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
+                .expect("ready marker read"),
+            "resume must close the remaining link and mark Ready"
+        );
+        let linked = services
+            .task_aggregate_service()
+            .for_graphs(&[registered.graph.id.clone()])
+            .expect("durable Task link set");
+        assert_eq!(
+            linked.len(),
+            2,
+            "final link set must be exact: no duplicate, no missing link"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_team_ingress_claim_never_creates_a_second_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let services = RuntimeServices::in_memory().unwrap();
+        publish_team_test_policy(&services, "team-cas-session");
+        let request = team_request(
+            "team-cas-root",
+            "team-cas-session",
+            "cowd/execute-review",
+            "claim exactly one Team root",
+            "fast",
+            services.mission_runtime().default_mission_id(),
+        );
+        services
+            .team_runtime()
+            .admit(request.clone())
+            .await
+            .expect("first admission claims the root");
+        let second = services
+            .team_runtime()
+            .admit(request)
+            .await
+            .expect_err("same ingress+team tuple must not claim a second root");
+        assert!(second.contains("already claimed"));
     }
 
     #[tokio::test]

@@ -62,6 +62,24 @@ pub struct TaskUnderstanding {
     pub independent_workstreams: u8,
     pub uncertainty: u8,
     pub estimated_duration: TaskDuration,
+    /// Typed collaboration reference for "继续/上一组团队" continuations.
+    /// Only Runtime resolves it from exact Session/root history; ordinal
+    /// text parsing merely proposes the reference.
+    #[serde(default)]
+    pub collaboration_reference: CollaborationReference,
+}
+
+/// Typed continuation reference produced by strategy understanding.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationReference {
+    #[default]
+    None,
+    LatestEligible,
+    ExplicitExecution,
+    ExplicitTeamSet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2354,6 +2372,23 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     };
     let requests_multi_agent =
         (contains_any(&normalized, MULTI_AGENT_TERMS) || required_team_count > 0) && !forbids_team;
+    let collaboration_reference = if contains_any(
+        &normalized,
+        &[
+            "继续上一组",
+            "继续团队",
+            "上一组团队",
+            "继续上次",
+            "继续处理",
+            "continue with the previous",
+            "continue the previous team",
+            "resume the previous team",
+        ],
+    ) {
+        CollaborationReference::LatestEligible
+    } else {
+        CollaborationReference::None
+    };
     let requests_deep_plan = contains_any(&normalized, DEEP_PLAN_TERMS);
     let requests_deliberation = contains_any(&normalized, DELIBERATION_TERMS);
     let requests_background = contains_any(&normalized, BACKGROUND_TERMS);
@@ -2395,6 +2430,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         likely_single_file,
         independent_workstreams: independent_workstreams(&normalized),
         uncertainty: uncertainty_score(&normalized, requires_external_facts),
+        collaboration_reference,
         estimated_duration: estimate_duration(
             complexity,
             requests_background,
@@ -3488,6 +3524,20 @@ const CRITICAL_RISK_TERMS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_phrases_produce_typed_latest_eligible_reference() {
+        let continued = understand(&StrategyInput::from_prompt("继续上一组团队处理剩余问题"));
+        assert_eq!(
+            continued.collaboration_reference,
+            CollaborationReference::LatestEligible
+        );
+        let ordinary = understand(&StrategyInput::from_prompt("重构这个模块"));
+        assert_eq!(
+            ordinary.collaboration_reference,
+            CollaborationReference::None
+        );
+    }
 
     #[test]
     fn explicit_team_cardinality_is_distinct_from_agent_cardinality() {

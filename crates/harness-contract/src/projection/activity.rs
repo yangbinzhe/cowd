@@ -52,6 +52,43 @@ pub enum ActivityRelationKind {
     RecoveredFrom,
 }
 
+/// Typed reason for a waiting, blocked, failed or cancelled activity. Free
+/// text (`status_reason`) remains human-facing only; decision logic and
+/// surfaces must consume this kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatusReasonKind {
+    WaitingPredecessor,
+    PredecessorFailed,
+    EvidenceNotReady,
+    AcceptanceUnsatisfied,
+    AcceptanceFrameworkInvalid,
+    Authorization,
+    ProviderProtocol,
+    Resource,
+    Deadline,
+    Cancelled,
+}
+
+/// Typed committed-effect summary for one activity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EffectSummaryProjection {
+    pub applied: u32,
+    pub not_applied: u32,
+    pub uncertain: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+/// Typed acceptance summary for one activity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AcceptanceSummaryProjection {
+    pub satisfied: u32,
+    pub unsatisfied: u32,
+    pub framework_invalid: bool,
+    pub unresolved: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionScopeProjection {
     pub workspace_id: String,
@@ -122,6 +159,23 @@ pub struct ExecutionActivityProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_id: Option<String>,
     pub status: String,
+    /// Typed status reason. `None` means Runtime has no typed reason (e.g.
+    /// ordinary running/completed states).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason_kind: Option<ExecutionStatusReasonKind>,
+    /// Exact predecessor activity ids that block this activity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocked_by_activity_ids: Vec<String>,
+    /// Whether durable evidence is ready for review, when Runtime can state
+    /// it without guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_ready: Option<bool>,
+    /// Typed effect summary: applied/not_applied/uncertain + bounded paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_summary: Option<EffectSummaryProjection>,
+    /// Typed acceptance summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_summary: Option<AcceptanceSummaryProjection>,
     /// Safe explanation for a waiting, warning, blocked, failed or cancelled
     /// status. Surfaces must not derive this from raw evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]

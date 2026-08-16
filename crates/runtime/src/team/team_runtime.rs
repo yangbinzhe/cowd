@@ -122,6 +122,7 @@ impl TeamRuntime {
         &self,
         request: TeamInstantiationRequest,
     ) -> Result<TeamProjection, String> {
+        self.claim_team_root(&request)?;
         self.ensure_root_task(&request)?;
         let mut instantiated = self.plan(request)?;
         self.bind_instantiated_task_policies(&mut instantiated)?;
@@ -258,6 +259,7 @@ impl TeamRuntime {
         &self,
         request: TeamInstantiationRequest,
     ) -> Result<ExecutionGraphHostReceipt, String> {
+        self.claim_team_root(&request)?;
         self.ensure_root_task(&request)?;
         let mission_id = request.mission_id.clone();
         let team_id = request.team_id.clone();
@@ -401,6 +403,23 @@ impl TeamRuntime {
         crate::team_binding::persist_preparing(&self.event_store, graph_id, binding)?;
         self.admit_tasks(task_commands, graph_id, graph_revision)?;
         crate::team_binding::persist_ready(&self.event_store, graph_id, &binding.binding_digest)
+    }
+
+    /// CAS gate for one Team root per request/team tuple. A concurrent
+    /// continuation or retry can never create a second root for the same
+    /// continuation digest+ingress.
+    fn claim_team_root(&self, request: &TeamInstantiationRequest) -> Result<(), String> {
+        if !crate::claim_continuation_root(
+            &self.event_store,
+            &request.request_id,
+            &format!("team:{}", request.team_id),
+        )? {
+            return Err(format!(
+                "concurrent continuation already claimed Team root `{}` for ingress `{}`",
+                request.team_id, request.request_id
+            ));
+        }
+        Ok(())
     }
 
     /// Reconciliation facade for an existing graph whose durable link set may

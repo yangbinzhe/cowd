@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
 
 use harness_contract::execution_graph::{
-    ExecutionEdgeKind, ExecutionGraphProjection, ExecutionNodeKind, ExecutionNodeStatus,
+    ExecutionEdgeKind, ExecutionFailure, ExecutionGraphProjection, ExecutionNodeKind,
+    ExecutionNodeProjection, ExecutionNodeStatus,
 };
 use harness_contract::projection::{
-    ActivityRelationKind, ActivityVisibility, ExecutionActivityKind, ExecutionActivityProjection,
-    ExecutionActivityRelation, ExecutionScopeProjection, EXECUTION_ACTIVITY_SCHEMA_VERSION,
+    AcceptanceSummaryProjection, ActivityRelationKind, ActivityVisibility, EffectSummaryProjection,
+    ExecutionActivityKind, ExecutionActivityProjection, ExecutionActivityRelation,
+    ExecutionScopeProjection, ExecutionStatusReasonKind, EXECUTION_ACTIVITY_SCHEMA_VERSION,
 };
 
 use super::reducer_support::ExecutionProjectionScope;
@@ -192,6 +194,11 @@ fn project_single_execution_activities_from_events(
             tool_call_id: None,
             approval_id: None,
             status: graph_status(graph),
+            status_reason_kind: None,
+            blocked_by_activity_ids: Vec::new(),
+            evidence_ready: None,
+            effect_summary: None,
+            acceptance_summary: None,
             status_reason: graph_status_reason(graph),
             required: true,
             started_at_ms: root_started,
@@ -282,6 +289,23 @@ fn project_single_execution_activities_from_events(
                 tool_call_id: None,
                 approval_id: None,
                 status: status_name(node.status),
+                status_reason_kind: typed_status_reason_kind(node.status, node.failure.as_ref()),
+                blocked_by_activity_ids: dependency_map
+                    .get(&node.node_id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|dep| {
+                        graph
+                            .nodes
+                            .iter()
+                            .find(|candidate| candidate.node_id == *dep)
+                            .is_some_and(|candidate| !candidate.status.is_terminal())
+                    })
+                    .collect(),
+                evidence_ready: (!node.evidence_refs.is_empty()).then_some(true),
+                effect_summary: effect_summary(node),
+                acceptance_summary: acceptance_summary(node),
                 status_reason: node
                     .failure
                     .as_ref()
@@ -442,6 +466,11 @@ fn project_single_execution_activities_from_events(
             tool_call_id,
             approval_id,
             status,
+            status_reason_kind: None,
+            blocked_by_activity_ids: Vec::new(),
+            evidence_ready: None,
+            effect_summary: None,
+            acceptance_summary: None,
             status_reason: event_status_reason(event),
             required: value_bool(&event.payload, "required").unwrap_or(true),
             started_at_ms,
@@ -1070,6 +1099,92 @@ fn graph_status_reason(graph: &ExecutionGraphProjection) -> Option<String> {
         .then(|| format!("{optional_warnings} optional activities did not complete"))
 }
 
+fn typed_status_reason_kind(
+    status: ExecutionNodeStatus,
+    failure: Option<&ExecutionFailure>,
+) -> Option<ExecutionStatusReasonKind> {
+    match status {
+        ExecutionNodeStatus::Cancelled => Some(ExecutionStatusReasonKind::Cancelled),
+        ExecutionNodeStatus::Blocked => Some(
+            failure
+                .and_then(typed_failure_reason_kind)
+                .unwrap_or(ExecutionStatusReasonKind::WaitingPredecessor),
+        ),
+        ExecutionNodeStatus::Failed => failure.and_then(typed_failure_reason_kind),
+        _ => None,
+    }
+}
+
+fn typed_failure_reason_kind(failure: &ExecutionFailure) -> Option<ExecutionStatusReasonKind> {
+    match failure.kind.as_str() {
+        "execution_deadline_exceeded" => Some(ExecutionStatusReasonKind::Deadline),
+        "missing_evidence" => Some(ExecutionStatusReasonKind::EvidenceNotReady),
+        "team_delivery_unsatisfied" => Some(ExecutionStatusReasonKind::AcceptanceUnsatisfied),
+        _ if failure
+            .message
+            .contains("Runtime rejected Agent terminal result") =>
+        {
+            Some(ExecutionStatusReasonKind::AcceptanceFrameworkInvalid)
+        }
+        _ if failure.kind.contains("authorization") => {
+            Some(ExecutionStatusReasonKind::Authorization)
+        }
+        _ if failure.kind.contains("provider")
+            || failure.message.to_ascii_lowercase().contains("provider") =>
+        {
+            Some(ExecutionStatusReasonKind::ProviderProtocol)
+        }
+        _ if failure.kind.contains("resource") => Some(ExecutionStatusReasonKind::Resource),
+        _ => None,
+    }
+}
+
+fn effect_summary(node: &ExecutionNodeProjection) -> Option<EffectSummaryProjection> {
+    let applied = node
+        .evidence_refs
+        .iter()
+        .filter(|reference| reference.evidence_ref.ref_type == "runtime_change")
+        .count() as u32;
+    let attempted = node.usage.runtime_write_attempt_paths.len() as u32;
+    if applied == 0 && attempted == 0 {
+        return None;
+    }
+    let mut paths = node.usage.runtime_write_attempt_paths.clone();
+    paths.sort();
+    paths.dedup();
+    paths.truncate(12);
+    Some(EffectSummaryProjection {
+        applied,
+        not_applied: attempted.saturating_sub(applied.min(attempted)),
+        uncertain: 0,
+        paths,
+    })
+}
+
+fn acceptance_summary(node: &ExecutionNodeProjection) -> Option<AcceptanceSummaryProjection> {
+    let required = &node.usage.required_acceptance;
+    let observed = &node.usage.observed_acceptance;
+    let framework_invalid = node.failure.as_ref().is_some_and(|failure| {
+        failure
+            .message
+            .contains("Runtime rejected Agent terminal result")
+    });
+    if required.is_empty() && observed.is_empty() && !framework_invalid {
+        return None;
+    }
+    let unsatisfied = required
+        .criteria
+        .iter()
+        .filter(|criterion| !observed.satisfied_criteria.contains(criterion))
+        .count() as u32;
+    Some(AcceptanceSummaryProjection {
+        satisfied: observed.satisfied_criteria.len() as u32,
+        unsatisfied,
+        framework_invalid,
+        unresolved: observed.unresolved_obligation_ids.len() as u32,
+    })
+}
+
 fn node_phase(kind: ExecutionNodeKind) -> &'static str {
     match kind {
         ExecutionNodeKind::InlineModel => "model",
@@ -1578,6 +1693,11 @@ fn materialize_artifact_activities(
                 tool_call_id: producer.tool_call_id.clone(),
                 approval_id: None,
                 status: "completed".to_string(),
+                status_reason_kind: None,
+                blocked_by_activity_ids: Vec::new(),
+                evidence_ready: None,
+                effect_summary: None,
+                acceptance_summary: None,
                 status_reason: None,
                 required: producer.required,
                 started_at_ms: producer.completed_at_ms.or(producer.started_at_ms),
@@ -1713,6 +1833,76 @@ fn merge_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_status_reason_and_summaries_are_projected_from_facts() {
+        use harness_contract::context::{
+            EvidenceAccessRef, EvidenceRef, ObservedAcceptance, RequiredAcceptance,
+        };
+        use harness_contract::execution_graph::{ExecutionFailure, ExecutionUsage};
+
+        let failure = ExecutionFailure {
+            kind: "missing_evidence".to_string(),
+            message: "no durable evidence".to_string(),
+            retryable: false,
+            evidence_refs: Vec::new(),
+        };
+        assert_eq!(
+            typed_status_reason_kind(ExecutionNodeStatus::Blocked, Some(&failure)),
+            Some(ExecutionStatusReasonKind::EvidenceNotReady)
+        );
+        assert_eq!(
+            typed_status_reason_kind(ExecutionNodeStatus::Running, None),
+            None
+        );
+        assert_eq!(
+            typed_status_reason_kind(ExecutionNodeStatus::Cancelled, None),
+            Some(ExecutionStatusReasonKind::Cancelled)
+        );
+
+        let node = ExecutionNodeProjection {
+            node_id: "n".to_string(),
+            kind: ExecutionNodeKind::AgentTask,
+            status: ExecutionNodeStatus::Failed,
+            executor_kind: "agent_task".to_string(),
+            payload_ref: String::new(),
+            acceptance: Default::default(),
+            resource_scopes: Vec::new(),
+            result_ref: None,
+            summary: None,
+            failure: Some(failure),
+            evidence_refs: vec![EvidenceAccessRef::durable(
+                EvidenceRef::observed("runtime_change", "receipt-1"),
+                "sha",
+                1,
+                "text/plain",
+                "evidence://receipt-1",
+                "workspace",
+            )],
+            usage: ExecutionUsage {
+                runtime_write_attempt_paths: vec!["a.txt".to_string(), "b.txt".to_string()],
+                required_acceptance: RequiredAcceptance {
+                    criteria: vec!["ok".to_string()],
+                    evidence_obligations: Vec::new(),
+                },
+                observed_acceptance: ObservedAcceptance {
+                    satisfied_criteria: Vec::new(),
+                    observed_evidence: Vec::new(),
+                    unresolved_obligation_ids: vec!["obligation-1".to_string()],
+                },
+                ..ExecutionUsage::default()
+            },
+            work: None,
+        };
+        let effect = effect_summary(&node).expect("effect summary");
+        assert_eq!(effect.applied, 1);
+        assert_eq!(effect.not_applied, 1);
+        assert_eq!(effect.paths, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        let acceptance = acceptance_summary(&node).expect("acceptance summary");
+        assert_eq!(acceptance.unsatisfied, 1);
+        assert_eq!(acceptance.unresolved, 1);
+        assert!(!acceptance.framework_invalid);
+    }
     use std::collections::BTreeSet;
 
     fn graph_node(
@@ -2037,6 +2227,11 @@ mod tests {
             tool_call_id: Some("call".to_string()),
             approval_id: None,
             status: "running".to_string(),
+            status_reason_kind: None,
+            blocked_by_activity_ids: Vec::new(),
+            evidence_ready: None,
+            effect_summary: None,
+            acceptance_summary: None,
             status_reason: None,
             required: true,
             started_at_ms: Some(10),
@@ -2115,6 +2310,11 @@ mod tests {
                     tool_call_id: None,
                     approval_id: None,
                     status: "completed".to_string(),
+                    status_reason_kind: None,
+                    blocked_by_activity_ids: Vec::new(),
+                    evidence_ready: None,
+                    effect_summary: None,
+                    acceptance_summary: None,
                     status_reason: None,
                     required: true,
                     started_at_ms: Some(1),
@@ -2512,6 +2712,11 @@ mod tests {
                     tool_call_id: None,
                     approval_id: None,
                     status: "completed".to_string(),
+                    status_reason_kind: None,
+                    blocked_by_activity_ids: Vec::new(),
+                    evidence_ready: None,
+                    effect_summary: None,
+                    acceptance_summary: None,
                     status_reason: None,
                     required: true,
                     started_at_ms: Some(10),

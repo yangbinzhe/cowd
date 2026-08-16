@@ -264,6 +264,14 @@ fn approval_pending_spec() -> TypedRouteSpec<(), super::approval_routes::Approva
     TypedRouteSpec::new("GET", "/api/approval/pending", "approval_pending_get")
 }
 
+fn approval_exact_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new("GET", "/api/approval/:id", "approval_exact_get")
+}
+
+fn approval_respond_spec() -> TypedRouteSpec<(), (), ()> {
+    TypedRouteSpec::new("POST", "/api/approval/respond", "approval_respond_post")
+}
+
 fn session_history_index_spec() -> TypedRouteSpec<
     (),
     super::session_routes::SessionHistoryIndexQuery,
@@ -391,6 +399,8 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
             )
             .with_writer(SessionWriterPolicy::Required),
         approval_pending_spec().metadata(None, "ApprovalPendingResponse", false),
+        approval_exact_spec().metadata(None, "ApprovalExactResponse", false),
+        approval_respond_spec().metadata(None, "ApprovalRespondReceipt", false),
         session_history_index_spec().metadata(None, "SessionHistoryIndexProjection", false),
         session_evidence_spec().metadata(None, "SessionEvidenceProjection", false),
         turn_evidence_spec().metadata(None, "TurnEvidenceProjection", false),
