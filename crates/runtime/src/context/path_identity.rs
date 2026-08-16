@@ -269,7 +269,7 @@ impl WorkspacePathIdentityResolver {
             "verify_after_write" => (
                 WorkspaceAccessMode::Read,
                 EvidenceObligationKind::VerifyAfterWrite,
-                Some(EvidenceCoverageKind::ExactContent),
+                None,
                 false,
             ),
             "verify_upstream_change" => (
@@ -733,18 +733,84 @@ pub fn observed_evidence_collection_satisfies(
     obligation: &EvidenceObligation,
     observed_evidence: &[ObservedEvidence],
 ) -> bool {
-    observed_evidence.iter().any(|observed| {
-        if obligation.kind == EvidenceObligationKind::VerifyAfterWrite {
-            observed_evidence_satisfies(obligation, observed)
-                && observed_evidence.iter().any(|write| {
-                    write.observed_at_sequence > 0
-                        && write.observed_at_sequence < observed.observed_at_sequence
-                        && observed_write_matches_read(write, observed)
-                })
-        } else {
-            observed_evidence_satisfies(obligation, observed)
-        }
+    if obligation.kind == EvidenceObligationKind::VerifyAfterWrite {
+        return observed_verify_after_write_satisfies(obligation, observed_evidence);
+    }
+    observed_evidence
+        .iter()
+        .any(|observed| observed_evidence_satisfies(obligation, observed))
+}
+
+/// `verify_after_write:<directory>` is not a directory `ExactContent` read.
+/// It derives one obligation per committed descendant: only the terminal
+/// effect epoch's final after-digest write may produce an obligation, and it
+/// is satisfied by an exact post-write read of the same canonical path and
+/// digest whose sequence is strictly later than the write.
+fn observed_verify_after_write_satisfies(
+    obligation: &EvidenceObligation,
+    observed_evidence: &[ObservedEvidence],
+) -> bool {
+    let EvidenceTargetIdentity::Workspace { scope: required } = &obligation.target else {
+        return false;
+    };
+    let writes = observed_evidence
+        .iter()
+        .filter(|observed| {
+            observed.observed_at_sequence > 0
+                && matches!(
+                    &observed.target,
+                    EvidenceTargetIdentity::Workspace { scope }
+                        if scope.access_mode == WorkspaceAccessMode::Write
+                            && scope.coverage == EvidenceCoverageKind::WriteEffect
+                            && scope_under(scope, required)
+                )
+        })
+        .collect::<Vec<_>>();
+    if writes.is_empty() {
+        return false;
+    }
+    // Only the terminal effect epoch per canonical path: the write with the
+    // highest observed sequence for that path. Earlier writes never satisfy;
+    // they are excluded from the check instead of failing it.
+    let terminal_writes = writes
+        .iter()
+        .filter(|write| {
+            !writes.iter().any(|other| {
+                other.observed_at_sequence > write.observed_at_sequence
+                    && same_workspace_file(other, write)
+            })
+        })
+        .collect::<Vec<_>>();
+    terminal_writes.iter().all(|write| {
+        observed_evidence.iter().any(|read| {
+            read.observed_at_sequence > write.observed_at_sequence
+                && observed_write_matches_read(write, read)
+        })
     })
+}
+
+fn scope_under(child: &WorkspaceScopeIdentity, parent: &WorkspaceScopeIdentity) -> bool {
+    let child_path = &child.path.workspace_relative_path;
+    let parent_path = &parent.path.workspace_relative_path;
+    child.path.workspace_id == parent.path.workspace_id
+        && child.path.repository_id == parent.path.repository_id
+        && (child_path == parent_path
+            || (child_path.starts_with(parent_path)
+                && child_path.as_bytes().get(parent_path.len()) == Some(&b'/')))
+}
+
+fn same_workspace_file(left: &ObservedEvidence, right: &ObservedEvidence) -> bool {
+    match (&left.target, &right.target) {
+        (
+            EvidenceTargetIdentity::Workspace { scope: left },
+            EvidenceTargetIdentity::Workspace { scope: right },
+        ) => {
+            left.path.workspace_id == right.path.workspace_id
+                && left.path.repository_id == right.path.repository_id
+                && left.path.workspace_relative_path == right.path.workspace_relative_path
+        }
+        _ => false,
+    }
 }
 
 fn observed_write_matches_read(write: &ObservedEvidence, read: &ObservedEvidence) -> bool {
@@ -1114,5 +1180,122 @@ mod tests {
             observed_evidence_fingerprint(&retained_changed_digest),
             "replay provenance and wave sequence must not manufacture novelty"
         );
+    }
+
+    #[test]
+    fn verify_after_write_directory_derives_each_committed_file_read() {
+        let root = tempfile::tempdir().unwrap();
+        repository(root.path(), "cowd", "dir/a.rs");
+        repository(root.path(), "cowd", "dir/b.rs");
+        repository(root.path(), "cowd", "dir/c.rs");
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let required = resolver.compile_required_acceptance(
+            &["verified".to_string()],
+            &["verify_after_write:cowd/dir".to_string()],
+        );
+        let wa = resolver
+            .observe_tool_scope("write_file", "write:cowd/dir/a.rs", Some("a"), 1)
+            .unwrap();
+        let wb = resolver
+            .observe_tool_scope("write_file", "write:cowd/dir/b.rs", Some("b"), 2)
+            .unwrap();
+        let wc = resolver
+            .observe_tool_scope("write_file", "write:cowd/dir/c.rs", Some("c"), 3)
+            .unwrap();
+        let ra = resolver
+            .observe_tool_scope("read_file", "read:cowd/dir/a.rs", Some("a"), 4)
+            .unwrap();
+        let rb = resolver
+            .observe_tool_scope("read_file", "read:cowd/dir/b.rs", Some("b"), 5)
+            .unwrap();
+        let rc = resolver
+            .observe_tool_scope("read_file", "read:cowd/dir/c.rs", Some("c"), 6)
+            .unwrap();
+
+        let all = evaluate_observed_acceptance(
+            &required,
+            vec!["verified".to_string()],
+            vec![
+                wa.clone(),
+                wb.clone(),
+                wc.clone(),
+                ra.clone(),
+                rb.clone(),
+                rc.clone(),
+            ],
+        );
+        assert!(all.unresolved_obligation_ids.is_empty());
+
+        let missing_one = evaluate_observed_acceptance(
+            &required,
+            Vec::new(),
+            vec![wa.clone(), wb.clone(), wc.clone(), ra.clone(), rb.clone()],
+        );
+        assert_eq!(missing_one.unresolved_obligation_ids.len(), 1);
+
+        let read_before_write = evaluate_observed_acceptance(
+            &required,
+            Vec::new(),
+            vec![ra.clone(), wa.clone(), wb.clone(), wc.clone(), rb.clone()],
+        );
+        assert_eq!(read_before_write.unresolved_obligation_ids.len(), 1);
+
+        let wrong_digest = evaluate_observed_acceptance(
+            &required,
+            Vec::new(),
+            vec![wa.clone(), wb.clone(), wc.clone(), rb.clone(), rc.clone()],
+        );
+        assert_eq!(wrong_digest.unresolved_obligation_ids.len(), 1);
+
+        // A directory listing read (windowed coverage) never satisfies an
+        // exact post-write read obligation.
+        let listing = resolver
+            .observe_tool_scope("list_directory", "read:cowd/dir", Some("listing"), 7)
+            .unwrap();
+        let windowed_read = evaluate_observed_acceptance(
+            &required,
+            Vec::new(),
+            vec![wa.clone(), wb.clone(), wc.clone(), listing],
+        );
+        assert_eq!(windowed_read.unresolved_obligation_ids.len(), 1);
+    }
+
+    #[test]
+    fn verify_after_write_uses_only_terminal_effect_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        repository(root.path(), "cowd", "src/lib.rs");
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let required = resolver.compile_required_acceptance(
+            &["verified".to_string()],
+            &["verify_after_write:cowd/src/lib.rs".to_string()],
+        );
+        let write_a = resolver
+            .observe_tool_scope("write_file", "write:cowd/src/lib.rs", Some("a"), 1)
+            .unwrap();
+        let write_b = resolver
+            .observe_tool_scope("write_file", "write:cowd/src/lib.rs", Some("b"), 2)
+            .unwrap();
+        let read_a_after = resolver
+            .observe_tool_scope("read_file", "read:cowd/src/lib.rs", Some("a"), 3)
+            .unwrap();
+
+        // A read of the earlier epoch after the terminal write is not enough.
+        let only_a = evaluate_observed_acceptance(
+            &required,
+            Vec::new(),
+            vec![write_a.clone(), write_b.clone(), read_a_after.clone()],
+        );
+        assert_eq!(only_a.unresolved_obligation_ids.len(), 1);
+
+        // The terminal epoch's exact read satisfies the obligation.
+        let read_b_after = resolver
+            .observe_tool_scope("read_file", "read:cowd/src/lib.rs", Some("b"), 4)
+            .unwrap();
+        let terminal = evaluate_observed_acceptance(
+            &required,
+            vec!["verified".to_string()],
+            vec![write_a, write_b, read_a_after, read_b_after],
+        );
+        assert!(terminal.unresolved_obligation_ids.is_empty());
     }
 }

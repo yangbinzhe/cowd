@@ -58,6 +58,8 @@ mod hooks;
 #[path = "infrastructure/json.rs"]
 mod json;
 pub use json::JsonValue;
+#[path = "context/acceptance_evaluator.rs"]
+pub mod acceptance_evaluator;
 #[path = "context/adaptive_allocator.rs"]
 pub mod adaptive_context;
 #[path = "context/budget_policy.rs"]

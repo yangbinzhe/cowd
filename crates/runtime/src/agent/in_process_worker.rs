@@ -2203,6 +2203,10 @@ fn runtime_evaluated_acceptance(
         .iter()
         .flat_map(|receipt| receipt.observed_evidence.iter())
         .collect::<Vec<_>>();
+    let owned_observed_evidence = observed_evidence
+        .iter()
+        .map(|observed| (*observed).clone())
+        .collect::<Vec<_>>();
     let scope_observed = |scope: &str| {
         let raw = if scope.contains(':') {
             scope.to_string()
@@ -2212,9 +2216,10 @@ fn runtime_evaluated_acceptance(
         let required = tool_executor
             .path_identity_resolver
             .compile_obligation_or_unresolved(&raw);
-        observed_evidence
-            .iter()
-            .any(|observed| crate::path_identity::observed_evidence_satisfies(&required, observed))
+        crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
+            &required,
+            &owned_observed_evidence,
+        )
     };
     let output = structured_agent_output(&summary.final_answer);
     let field_present = |field: harness_contract::team::TeamStructuredOutputField| {
