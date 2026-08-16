@@ -121,6 +121,13 @@ pub struct ResolvedRoleSlot {
     pub slot: usize,
     pub focus_partition: ResolvedFocusPartition,
     pub definition_ref: AgentDefinitionRevisionRef,
+    /// Frozen per-slot Agent Binding compiled from the exact published
+    /// Definition revision. Team Binding compilation consumes this once;
+    /// active runs never re-resolve a default pointer.
+    pub agent_binding: Option<harness_contract::agent::AgentBindingSnapshot>,
+    /// Frozen Definition display metadata for the Binding snapshot.
+    pub agent_name: String,
+    pub agent_description: String,
 }
 
 /// The durable explanation of one resolved role cardinality.  A graph
@@ -143,6 +150,10 @@ pub struct TeamInstantiation {
     pub task_permission_ceiling: harness_contract::policy::PermissionMode,
     pub template_ref: harness_contract::team::TeamTemplateRevisionRef,
     pub template_digest: String,
+    /// Frozen typed Team Binding compiled from the published Template and
+    /// per-slot Agent Bindings. `None` is fail-closed for non-Team callers;
+    /// Team admission must persist it before any Task link is created.
+    pub binding: Option<harness_contract::team::TeamBindingSnapshot>,
     /// Immutable Runtime authorization used for this graph's Template
     /// selection. `None` means a normal Stable/default resolution.
     pub release_assignment: Option<EvolutionReleaseAssignment>,
@@ -543,6 +554,28 @@ impl TeamInstantiationService {
                             slot + 1
                         )
                     })?;
+                let agent_binding = packet.binding.clone().ok_or_else(|| {
+                    format!(
+                        "Team role `{}` slot {} packet has no immutable Agent Binding",
+                        role.role_id,
+                        slot + 1
+                    )
+                })?;
+                let resolved_agent = self
+                    .registry
+                    .resolve_agent(
+                        &definition_ref.definition_id,
+                        RevisionSelector::ExactApprovedRevision {
+                            revision: definition_ref.revision,
+                        },
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "resolve Team role `{}` slot {} Definition display metadata: {error}",
+                            role.role_id,
+                            slot + 1
+                        )
+                    })?;
                 let mut node = ExecutionNodeSpec::new(
                     ExecutionNodeKind::AgentTask,
                     AgentTaskExecutor::KIND,
@@ -564,6 +597,9 @@ impl TeamInstantiationService {
                     slot: slot + 1,
                     focus_partition,
                     definition_ref: definition_ref.clone(),
+                    agent_binding: Some(agent_binding),
+                    agent_name: resolved_agent.revision.manifest.name.clone(),
+                    agent_description: resolved_agent.revision.manifest.description.clone(),
                 });
             }
         }
@@ -641,6 +677,14 @@ impl TeamInstantiationService {
         graph.nodes.extend([verify, synthesize]);
         harness_contract::execution_graph::validate_execution_graph(&graph)
             .map_err(|error| error.to_string())?;
+        let binding = crate::team_binding::compile_team_binding(
+            &request,
+            manifest,
+            &template.revision.content_digest,
+            &template.team_markdown,
+            &role_slots,
+            request.strategy_binding.as_ref(),
+        )?;
 
         Ok(TeamInstantiation {
             graph,
@@ -649,6 +693,7 @@ impl TeamInstantiationService {
             task_permission_ceiling: request.permission_ceiling,
             template_ref: template.revision.revision_ref,
             template_digest: template.revision.content_digest,
+            binding: Some(binding),
             release_assignment,
             role_slots,
             cardinality_resolutions,

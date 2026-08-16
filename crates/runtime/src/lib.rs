@@ -288,6 +288,8 @@ pub mod task;
 pub mod team_agent_selector;
 #[path = "team/agent_task.rs"]
 pub mod team_agent_task;
+#[path = "team/team_binding.rs"]
+pub mod team_binding;
 #[path = "team/definition/mod.rs"]
 pub mod team_definition;
 #[path = "team/instantiation.rs"]

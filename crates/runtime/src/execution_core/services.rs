@@ -9559,6 +9559,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn team_admission_recovers_incomplete_task_links_before_drive() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let providers = crate::config::ProvidersConfig {
+            providers: std::collections::HashMap::from([(
+                "test".into(),
+                crate::config::ProviderConfig {
+                    name: "test".into(),
+                    base_url: "https://example.test/v1".into(),
+                    api_key: "test".into(),
+                    models: vec!["fast".into()],
+                    protocol: Some("responses".into()),
+                    parallel_tool_calls: Default::default(),
+                    early_tool_start: Default::default(),
+                },
+            )]),
+        };
+        let services = RuntimeServices::builder(temp.path(), &workspace)
+            .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
+            .build()
+            .unwrap();
+        publish_team_test_policy(&services, "team-crash-session");
+        services
+            .agent_runtime()
+            .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
+        let request = team_request(
+            "team-crash-recovery",
+            "team-crash-session",
+            "cowd/execute-review",
+            "recover the exact link set after a crash between graph registration and Task admission",
+            "fast",
+            services.mission_runtime().default_mission_id(),
+        );
+        let instantiated = services
+            .team_runtime()
+            .plan(request.clone())
+            .expect("team plan");
+        let registered = services
+            .commit_service()
+            .register_graph(instantiated.graph.clone())
+            .expect("graph registered in crash window");
+        crate::team_binding::persist_preparing(
+            services.event_store(),
+            &registered.graph.id,
+            instantiated
+                .binding
+                .as_ref()
+                .expect("compiled Team Binding"),
+        )
+        .expect("preparing marker persisted");
+        assert!(
+            !crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
+                .expect("ready marker read"),
+            "crash window has Preparing but no Ready marker"
+        );
+
+        let projection = services
+            .team_runtime()
+            .instantiate_or_resume(request.clone())
+            .await
+            .expect("resume reconciles links and executes once");
+        assert_eq!(projection.status, "completed");
+        assert_eq!(projection.tasks.len(), 2);
+        assert!(
+            crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
+                .expect("ready marker read"),
+            "Ready marker must close the exact link set"
+        );
+        let binding =
+            crate::team_binding::load_binding(services.event_store(), &registered.graph.id)
+                .expect("binding read")
+                .expect("binding persisted");
+        assert_eq!(binding.roles.len(), 2);
+
+        let again = services
+            .team_runtime()
+            .instantiate_or_resume(request)
+            .await
+            .expect("second resume is idempotent");
+        assert_eq!(again.tasks.len(), 2);
+    }
+
+    #[tokio::test]
     async fn fanout_team_uses_runner_parallelism_without_a_team_scheduler() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");

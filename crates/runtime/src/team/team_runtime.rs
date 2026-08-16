@@ -17,9 +17,10 @@ use crate::{
     ExecutionGraphStateStore, ExpectedStreamRevision, LegacyTeamImportReport,
     LegacyTeamProfileMigrationReport, MissionRuntime, RuntimeDefinitionRegistry, RuntimeEventInput,
     RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeExecutionSupervisor,
-    RuntimeTransactionEventInput, TaskRuntimePort, TeamProjection, TeamProjectionCursor,
-    TeamProjectionPage, TeamProjectionReader, TeamWorkingState, TeamWorkingStateEntry,
-    TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest, TeamWorkingStateVisibility,
+    RuntimeTransactionEventInput, TaskRuntimePort, TeamInstantiation, TeamProjection,
+    TeamProjectionCursor, TeamProjectionPage, TeamProjectionReader, TeamWorkingState,
+    TeamWorkingStateEntry, TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest,
+    TeamWorkingStateVisibility,
 };
 
 pub struct TeamRuntime {
@@ -126,14 +127,23 @@ impl TeamRuntime {
         self.bind_instantiated_task_policies(&mut instantiated)?;
         self.instantiation.validate_release(&instantiated)?;
         let graph_id = instantiated.graph.id.clone();
+        let TeamInstantiation {
+            graph,
+            task_commands,
+            binding,
+            ..
+        } = instantiated;
         let registered = self
             .execution
-            .register_graph(instantiated.graph)
+            .register_graph(graph)
             .await
             .map_err(|error| error.to_string())?;
-        self.admit_tasks(
-            &instantiated.task_commands,
+        let binding = binding
+            .ok_or_else(|| format!("Team graph `{graph_id}` has no compiled Team Binding"))?;
+        self.persist_binding_markers(
             &registered.id,
+            &binding,
+            &task_commands,
             registered.revision,
         )?;
         self.execution
@@ -153,6 +163,8 @@ impl TeamRuntime {
         let graph_id = format!("team-graph:{}", request.team_id);
         match self.graphs.load(&graph_id) {
             Ok(_) => {
+                self.ensure_root_task(&request)?;
+                self.reconcile_binding_markers(&graph_id, &request)?;
                 self.execution
                     .drive_registered(&graph_id)
                     .await
@@ -193,6 +205,8 @@ impl TeamRuntime {
                         "existing Team graph `{graph_id}` projects a different Team or Session identity"
                     ));
                 }
+                self.ensure_root_task(&request)?;
+                self.reconcile_binding_markers(&graph_id, &request)?;
                 if projection.status == "running" {
                     self.execution
                         .admit_registered(&graph_id)
@@ -208,14 +222,27 @@ impl TeamRuntime {
         let mut instantiated = self.plan(request)?;
         self.bind_instantiated_task_policies(&mut instantiated)?;
         self.instantiation.validate_release(&instantiated)?;
+        let TeamInstantiation {
+            graph,
+            task_commands,
+            binding,
+            ..
+        } = instantiated;
         let registered = self
             .execution
-            .register_graph(instantiated.graph)
+            .register_graph(graph)
             .await
             .map_err(|error| error.to_string())?;
-        self.admit_tasks(
-            &instantiated.task_commands,
+        let binding = binding.ok_or_else(|| {
+            format!(
+                "Team graph `{}` has no compiled Team Binding",
+                registered.id
+            )
+        })?;
+        self.persist_binding_markers(
             &registered.id,
+            &binding,
+            &task_commands,
             registered.revision,
         )?;
         self.execution
@@ -262,14 +289,27 @@ impl TeamRuntime {
     ) -> Result<String, String> {
         self.instantiation.validate_release(&instantiated)?;
         self.bind_instantiated_task_policies(&mut instantiated)?;
+        let TeamInstantiation {
+            graph,
+            task_commands,
+            binding,
+            ..
+        } = instantiated;
         let registered = self
             .execution
-            .register_graph(instantiated.graph)
+            .register_graph(graph)
             .await
             .map_err(|error| error.to_string())?;
-        self.admit_tasks(
-            &instantiated.task_commands,
+        let binding = binding.ok_or_else(|| {
+            format!(
+                "Team graph `{}` has no compiled Team Binding",
+                registered.id
+            )
+        })?;
+        self.persist_binding_markers(
             &registered.id,
+            &binding,
+            &task_commands,
             registered.revision,
         )?;
         Ok(registered.id)
@@ -298,14 +338,23 @@ impl TeamRuntime {
         };
         self.bind_instantiated_task_policies(&mut instantiated)?;
         let graph_id = instantiated.graph.id.clone();
+        let TeamInstantiation {
+            graph,
+            task_commands,
+            binding,
+            ..
+        } = instantiated;
         let registered = self
             .execution
-            .register_graph(instantiated.graph)
+            .register_graph(graph)
             .await
             .map_err(|error| error.to_string())?;
-        self.admit_tasks(
-            &instantiated.task_commands,
+        let binding = binding
+            .ok_or_else(|| format!("Team graph `{graph_id}` has no compiled Team Binding"))?;
+        self.persist_binding_markers(
             &registered.id,
+            &binding,
+            &task_commands,
             registered.revision,
         )?;
         self.execution
@@ -334,6 +383,52 @@ impl TeamRuntime {
             )?;
         }
         Ok(())
+    }
+
+    /// Persist the frozen Team Binding and close the durable link set exactly
+    /// once. Recovery retries are idempotent through stable event keys and
+    /// task create/link idempotency.
+    fn persist_binding_markers(
+        &self,
+        graph_id: &str,
+        binding: &harness_contract::team::TeamBindingSnapshot,
+        task_commands: &[harness_contract::task::TaskCreateCommand],
+        graph_revision: u64,
+    ) -> Result<(), String> {
+        if crate::team_binding::has_ready_marker(&self.event_store, graph_id)? {
+            return Ok(());
+        }
+        crate::team_binding::persist_preparing(&self.event_store, graph_id, binding)?;
+        self.admit_tasks(task_commands, graph_id, graph_revision)?;
+        crate::team_binding::persist_ready(&self.event_store, graph_id, &binding.binding_digest)
+    }
+
+    /// Reconciliation facade for an existing graph whose durable link set may
+    /// be incomplete (crash between registration and Ready). It never drives
+    /// an orphan graph and never re-registers the graph.
+    fn reconcile_binding_markers(
+        &self,
+        graph_id: &str,
+        request: &TeamInstantiationRequest,
+    ) -> Result<(), String> {
+        if crate::team_binding::has_ready_marker(&self.event_store, graph_id)? {
+            return Ok(());
+        }
+        let mut instantiated = self.plan(request.clone())?;
+        self.bind_instantiated_task_policies(&mut instantiated)?;
+        let TeamInstantiation {
+            binding,
+            task_commands,
+            ..
+        } = instantiated;
+        let revision = self
+            .graphs
+            .load(graph_id)
+            .map_err(|error| error.to_string())?
+            .revision;
+        let binding = binding
+            .ok_or_else(|| format!("Team graph `{graph_id}` has no compiled Team Binding"))?;
+        self.persist_binding_markers(graph_id, &binding, &task_commands, revision)
     }
 
     fn bind_instantiated_task_policies(
