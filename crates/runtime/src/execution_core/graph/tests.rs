@@ -4,9 +4,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
+use harness_contract::context::{ObservedAcceptance, RequiredAcceptance};
 use harness_contract::execution_graph::{
-    ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage,
-    ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
+    DependencyPredicate, ExecutionDependencyPolicy, ExecutionEdge, ExecutionEdgeKind,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage, ExecutionNodeKind,
+    ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus, ExecutionUsage,
+    ExecutionWorkContract, ExecutionWorkRole,
 };
 use harness_contract::{context::EvidenceAccessRef, reality::EvidenceRef};
 
@@ -967,7 +971,7 @@ async fn durable_agent_deadline_cancels_permanent_branch_and_unblocks_finally() 
             Duration::from_millis(1),
         )))
         .unwrap();
-    let runner = test_runner(registry, state.clone(), commits);
+    let runner = test_runner(registry, state.clone(), commits.clone());
     let mut graph = test_graph("deadline keeps finally reachable");
     let graph_id = graph.id.clone();
     let deadline_at_ms = crate::tool_invocation::now_ms().saturating_add(50);
@@ -1026,6 +1030,116 @@ async fn durable_agent_deadline_cancels_permanent_branch_and_unblocks_finally() 
         ExecutionNodeStatus::Completed
     );
     assert_eq!(pending.cancel_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn evidence_ready_reviewer_runs_on_failed_facts_and_never_rewrites_predecessor() {
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(
+            Vec::new(),
+            Duration::from_millis(1),
+        )))
+        .unwrap();
+    let runner = test_runner(registry, state.clone(), commits.clone());
+    let mut graph = test_graph("evidence ready reviewer");
+    let graph_id = graph.id.clone();
+    let mut source = node("source");
+    source.kind = ExecutionNodeKind::AgentTask;
+    let mut reviewer = node("reviewer");
+    reviewer.work = Some(ExecutionWorkContract {
+        role: ExecutionWorkRole::CrossCheck,
+        dependency: ExecutionDependencyPolicy::EvidenceReady {
+            predicate: DependencyPredicate::EvidenceReady {
+                minimum: 1,
+                required_fact_kinds: vec![
+                    TerminalFactKind::ObservedEvidence,
+                    TerminalFactKind::AcceptanceVerdict,
+                ],
+                accepted_execution_statuses: vec![ExecutionNodeStatus::Failed],
+                accepted_acceptance_verdicts: vec![AcceptanceVerdict::Unsatisfied],
+                require_committed_effect: false,
+            },
+            cancel_remaining: false,
+        },
+        ..ExecutionWorkContract::new(ExecutionWorkRole::CrossCheck)
+    });
+    graph.edges = vec![ExecutionEdge {
+        from: "source".to_string(),
+        to: "reviewer".to_string(),
+        kind: ExecutionEdgeKind::DependsOn,
+    }];
+    graph.nodes = vec![source, reviewer];
+    let graph = runner.register(graph).await.expect("registered");
+    let graph = commits
+        .transition_node(
+            &graph,
+            "source",
+            ExecutionNodeStatus::Ready,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    let graph = commits
+        .transition_node(
+            &graph,
+            "source",
+            ExecutionNodeStatus::Running,
+            None,
+            Vec::new(),
+        )
+        .unwrap()
+        .graph;
+    commits
+        .transition_node(
+            &graph,
+            "source",
+            ExecutionNodeStatus::Failed,
+            Some(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Failed,
+                result_ref: Some("agent-return:run".to_string()),
+                summary: Some("implementer failed but evidence is durable".to_string()),
+                evidence_refs: vec![EvidenceAccessRef::durable(
+                    EvidenceRef::observed("evidence", "proof-1"),
+                    "sha",
+                    1,
+                    "text/plain",
+                    "evidence://proof-1",
+                    "workspace",
+                )],
+                failure: None,
+                usage: ExecutionUsage {
+                    required_acceptance: RequiredAcceptance {
+                        criteria: vec!["ok".to_string()],
+                        evidence_obligations: Vec::new(),
+                    },
+                    observed_acceptance: ObservedAcceptance {
+                        satisfied_criteria: Vec::new(),
+                        observed_evidence: Vec::new(),
+                        unresolved_obligation_ids: vec!["ok".to_string()],
+                    },
+                    ..ExecutionUsage::default()
+                },
+                finished_at_ms: 1,
+            }),
+            Vec::new(),
+        )
+        .unwrap();
+    runner
+        .run_until_quiescent(&graph_id)
+        .await
+        .expect("reviewer quiesces");
+    let settled = state.load(&graph_id).unwrap();
+    assert_eq!(settled.node_statuses["source"], ExecutionNodeStatus::Failed);
+    assert_eq!(
+        settled.node_statuses["reviewer"],
+        ExecutionNodeStatus::Completed
+    );
+    assert_eq!(
+        settled.node_results["source"].status,
+        ExecutionNodeStatus::Failed
+    );
 }
 
 #[tokio::test]

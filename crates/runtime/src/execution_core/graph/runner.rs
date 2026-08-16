@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
 
+use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
 use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand,
     ExecutionGraphValidationError, ExecutionNodeResult, ExecutionNodeStatus,
@@ -491,17 +492,7 @@ impl ExecutionGraphRunner {
             if status != ExecutionNodeStatus::Planned {
                 return false;
             }
-            let required_evidence_refs = node
-                .work
-                .as_ref()
-                .map(|work| work.required_evidence_refs.as_slice())
-                .unwrap_or_default();
-            let predecessors = graph
-                .edges
-                .iter()
-                .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
-                .map(|edge| verified_predecessor_status(&graph, &edge.from, required_evidence_refs))
-                .collect::<Vec<_>>();
+            let predecessors = dependency_predecessors(&graph, node);
             let dependency = node
                 .work
                 .as_ref()
@@ -1656,21 +1647,12 @@ impl ExecutionGraphRunner {
                 .map(|node| node.id.clone())
                 .collect::<Vec<_>>();
             for node_id in planned {
-                let required_evidence_refs = graph
+                let predecessors = graph
                     .nodes
                     .iter()
                     .find(|node| node.id == node_id)
-                    .and_then(|node| node.work.as_ref())
-                    .map(|work| work.required_evidence_refs.as_slice())
+                    .map(|node| dependency_predecessors(&graph, node))
                     .unwrap_or_default();
-                let predecessors = graph
-                    .edges
-                    .iter()
-                    .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node_id)
-                    .map(|edge| {
-                        verified_predecessor_status(&graph, &edge.from, required_evidence_refs)
-                    })
-                    .collect::<Vec<_>>();
                 let dependency = graph
                     .nodes
                     .iter()
@@ -1696,38 +1678,83 @@ impl ExecutionGraphRunner {
     }
 }
 
+/// One predecessor lane carrying both its durable lifecycle status and its
+/// committed terminal result. `EvidenceReady` consumes the result facts;
+/// every other policy only needs the lifecycle status.
+#[derive(Debug, Clone, Copy)]
+struct DependencyPredecessor<'a> {
+    status: ExecutionNodeStatus,
+    result: Option<&'a ExecutionNodeResult>,
+}
+
+impl DependencyPredecessor<'_> {
+    #[cfg(test)]
+    fn status_only(status: ExecutionNodeStatus) -> Self {
+        Self {
+            status,
+            result: None,
+        }
+    }
+}
+
+/// Build the exact `DependsOn` predecessor lanes for one node. The same
+/// helper feeds `current_report`, `advance_dependencies` and every recovery
+/// pump, so a lost notify is repaired by the next durable repump instead of
+/// by a poll loop.
+fn dependency_predecessors<'a>(
+    graph: &'a ExecutionGraph,
+    node: &'a harness_contract::execution_graph::ExecutionNodeSpec,
+) -> Vec<DependencyPredecessor<'a>> {
+    let required_evidence_refs = node
+        .work
+        .as_ref()
+        .map(|work| work.required_evidence_refs.as_slice())
+        .unwrap_or_default();
+    graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
+        .map(|edge| {
+            let status = verified_predecessor_status(graph, &edge.from, required_evidence_refs);
+            DependencyPredecessor {
+                status,
+                result: graph.node_results.get(&edge.from),
+            }
+        })
+        .collect()
+}
+
 fn dependency_target(
     policy: &harness_contract::execution_graph::ExecutionDependencyPolicy,
-    predecessors: &[ExecutionNodeStatus],
+    predecessors: &[DependencyPredecessor<'_>],
 ) -> Option<ExecutionNodeStatus> {
     use harness_contract::execution_graph::ExecutionDependencyPolicy;
 
     if matches!(policy, ExecutionDependencyPolicy::Finally) {
         return predecessors
             .iter()
-            .all(|status| status.is_terminal())
+            .all(|predecessor| predecessor.status.is_terminal())
             .then_some(ExecutionNodeStatus::Ready);
+    }
+
+    if let ExecutionDependencyPolicy::EvidenceReady { predicate, .. } = policy {
+        return evidence_ready_target(predicate, predecessors);
     }
 
     let completed = predecessors
         .iter()
-        .filter(|status| **status == ExecutionNodeStatus::Completed)
+        .filter(|predecessor| predecessor.status == ExecutionNodeStatus::Completed)
         .count();
     let possible = completed
         + predecessors
             .iter()
-            .filter(|status| !status.is_terminal())
+            .filter(|predecessor| !predecessor.status.is_terminal())
             .count();
     let required = match policy {
         ExecutionDependencyPolicy::All | ExecutionDependencyPolicy::Finally => predecessors.len(),
         ExecutionDependencyPolicy::Any { .. } => 1,
         ExecutionDependencyPolicy::Quorum { minimum, .. } => usize::from(*minimum),
-        ExecutionDependencyPolicy::EvidenceReady { predicate, .. } => match predicate {
-            harness_contract::execution_graph::DependencyPredicate::EvidenceReady {
-                minimum,
-                ..
-            } => usize::from(*minimum),
-        },
+        ExecutionDependencyPolicy::EvidenceReady { .. } => unreachable!(),
     };
     if completed >= required {
         Some(ExecutionNodeStatus::Ready)
@@ -1735,6 +1762,172 @@ fn dependency_target(
         Some(ExecutionNodeStatus::Blocked)
     } else {
         None
+    }
+}
+
+/// Ready, wait or permanently block one `EvidenceReady` edge.
+///
+/// The predicate consumes only Runtime-attested terminal facts: lifecycle
+/// status, committed result facts and the acceptance verdict derived from
+/// the persisted `required_acceptance`/`observed_acceptance` pair. It never
+/// consults the filesystem, never re-runs an evaluator, and never rewrites a
+/// predecessor's terminal status.
+fn evidence_ready_target(
+    predicate: &harness_contract::execution_graph::DependencyPredicate,
+    predecessors: &[DependencyPredecessor<'_>],
+) -> Option<ExecutionNodeStatus> {
+    let harness_contract::execution_graph::DependencyPredicate::EvidenceReady {
+        minimum,
+        required_fact_kinds,
+        accepted_execution_statuses,
+        accepted_acceptance_verdicts,
+        require_committed_effect,
+    } = predicate;
+    let required = usize::from(*minimum);
+    if required == 0 {
+        return Some(ExecutionNodeStatus::Ready);
+    }
+    let mut satisfied = 0usize;
+    let mut waiting = 0usize;
+    for predecessor in predecessors {
+        match evidence_ready_satisfaction(
+            predecessor,
+            required_fact_kinds,
+            accepted_execution_statuses,
+            accepted_acceptance_verdicts,
+            *require_committed_effect,
+        ) {
+            EvidenceReadyOutcome::Satisfied => satisfied += 1,
+            EvidenceReadyOutcome::Waiting => waiting += 1,
+            EvidenceReadyOutcome::Blocked => {}
+        }
+    }
+    if satisfied >= required {
+        Some(ExecutionNodeStatus::Ready)
+    } else if satisfied + waiting >= required {
+        None
+    } else {
+        Some(ExecutionNodeStatus::Blocked)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceReadyOutcome {
+    Satisfied,
+    Waiting,
+    Blocked,
+}
+
+fn evidence_ready_satisfaction(
+    predecessor: &DependencyPredecessor<'_>,
+    required_fact_kinds: &[TerminalFactKind],
+    accepted_execution_statuses: &[ExecutionNodeStatus],
+    accepted_acceptance_verdicts: &[AcceptanceVerdict],
+    require_committed_effect: bool,
+) -> EvidenceReadyOutcome {
+    let status = predecessor.status;
+    if !status.is_terminal() {
+        return EvidenceReadyOutcome::Waiting;
+    }
+    // A terminal predecessor without a committed result can never acquire
+    // facts. It is a permanent blocker, never a waiting lane.
+    let Some(result) = predecessor.result else {
+        return EvidenceReadyOutcome::Blocked;
+    };
+    if !accepted_execution_statuses.contains(&status) {
+        return EvidenceReadyOutcome::Blocked;
+    }
+    let verdict = derived_acceptance_verdict(result);
+    if !accepted_acceptance_verdicts.contains(&verdict) {
+        return EvidenceReadyOutcome::Blocked;
+    }
+    if require_committed_effect
+        && !has_terminal_fact_kind(result, TerminalFactKind::CommittedEffect)
+    {
+        return EvidenceReadyOutcome::Blocked;
+    }
+    if !required_fact_kinds
+        .iter()
+        .all(|kind| has_terminal_fact_kind(result, *kind))
+    {
+        return EvidenceReadyOutcome::Blocked;
+    }
+    EvidenceReadyOutcome::Satisfied
+}
+
+/// Deterministic acceptance verdict read from persisted node-result facts.
+/// There is exactly one derivation; no second Runtime path mints a verdict.
+fn derived_acceptance_verdict(result: &ExecutionNodeResult) -> AcceptanceVerdict {
+    // The Runtime contract-rejection terminal is the canonical
+    // FrameworkInvalid marker: it preserves committed facts while reporting
+    // that the Runtime acceptance/evaluation machinery could not validate
+    // the result. Business failures never carry this marker.
+    let framework_invalid = result.failure.as_ref().is_some_and(|failure| {
+        failure.kind == "agent_backend"
+            && failure
+                .message
+                .contains("Runtime rejected Agent terminal result")
+    });
+    if framework_invalid {
+        return AcceptanceVerdict::FrameworkInvalid;
+    }
+    let required = &result.usage.required_acceptance;
+    if required.is_empty() {
+        return AcceptanceVerdict::Satisfied;
+    }
+    let observed = &result.usage.observed_acceptance;
+    if observed.is_empty() {
+        return AcceptanceVerdict::Unresolved;
+    }
+    let obligations_satisfied = required.evidence_obligations.iter().all(|obligation| {
+        crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
+            obligation,
+            &observed.observed_evidence,
+        )
+    });
+    let criteria_satisfied = required
+        .criteria
+        .iter()
+        .all(|criterion| observed.satisfied_criteria.contains(criterion));
+    if obligations_satisfied && criteria_satisfied && observed.unresolved_obligation_ids.is_empty()
+    {
+        AcceptanceVerdict::Satisfied
+    } else {
+        AcceptanceVerdict::Unsatisfied
+    }
+}
+
+fn has_terminal_fact_kind(result: &ExecutionNodeResult, kind: TerminalFactKind) -> bool {
+    match kind {
+        TerminalFactKind::CommittedEffect => {
+            result
+                .usage
+                .observed_acceptance
+                .observed_evidence
+                .iter()
+                .any(|evidence| evidence.workspace_prior_state.is_some())
+                || result
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference.evidence_ref.ref_type == "runtime_change")
+        }
+        TerminalFactKind::ObservedEvidence => {
+            !result
+                .usage
+                .observed_acceptance
+                .observed_evidence
+                .is_empty()
+                || result
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference.is_durable())
+        }
+        TerminalFactKind::Artifact => result.evidence_refs.iter().any(|reference| {
+            reference.evidence_ref.ref_type == "artifact" || reference.is_durable()
+        }),
+        TerminalFactKind::AcceptanceVerdict => {
+            derived_acceptance_verdict(result) != AcceptanceVerdict::Unresolved
+        }
     }
 }
 
@@ -2144,23 +2337,37 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod dependency_policy_tests {
-    use harness_contract::execution_graph::{ExecutionDependencyPolicy, ExecutionNodeStatus};
+    use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
+    use harness_contract::context::{
+        EvidenceAccessRef, EvidenceRef, ObservedAcceptance, RequiredAcceptance,
+    };
+    use harness_contract::execution_graph::{
+        DependencyPredicate, ExecutionFailure, ExecutionUsage,
+    };
+    use harness_contract::execution_graph::{
+        ExecutionDependencyPolicy, ExecutionNodeResult, ExecutionNodeStatus,
+    };
     use harness_contract::execution_graph::{
         ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
         ExecutionWorkContract, ExecutionWorkRole,
     };
 
     use super::{
-        aggregate_team_leaf_usage, dependency_target, quorum_tail_cancellations,
-        team_child_terminal_result, verified_predecessor_status,
+        aggregate_team_leaf_usage, dependency_predecessors, dependency_target,
+        quorum_tail_cancellations, team_child_terminal_result, verified_predecessor_status,
+        DependencyPredecessor,
     };
+
+    fn predecessor(status: ExecutionNodeStatus) -> DependencyPredecessor<'static> {
+        DependencyPredecessor::status_only(status)
+    }
 
     #[test]
     fn any_and_quorum_become_ready_without_waiting_for_every_lane() {
         let running = [
-            ExecutionNodeStatus::Completed,
-            ExecutionNodeStatus::Running,
-            ExecutionNodeStatus::Planned,
+            predecessor(ExecutionNodeStatus::Completed),
+            predecessor(ExecutionNodeStatus::Running),
+            predecessor(ExecutionNodeStatus::Planned),
         ];
         assert_eq!(
             dependency_target(
@@ -2182,9 +2389,9 @@ mod dependency_policy_tests {
             None
         );
         let quorum = [
-            ExecutionNodeStatus::Completed,
-            ExecutionNodeStatus::Completed,
-            ExecutionNodeStatus::Running,
+            predecessor(ExecutionNodeStatus::Completed),
+            predecessor(ExecutionNodeStatus::Completed),
+            predecessor(ExecutionNodeStatus::Running),
         ];
         assert_eq!(
             dependency_target(
@@ -2207,9 +2414,9 @@ mod dependency_policy_tests {
                     cancel_remaining: false,
                 },
                 &[
-                    ExecutionNodeStatus::Completed,
-                    ExecutionNodeStatus::Failed,
-                    ExecutionNodeStatus::Cancelled,
+                    predecessor(ExecutionNodeStatus::Completed),
+                    predecessor(ExecutionNodeStatus::Failed),
+                    predecessor(ExecutionNodeStatus::Cancelled),
                 ],
             ),
             Some(ExecutionNodeStatus::Blocked)
@@ -2222,9 +2429,9 @@ mod dependency_policy_tests {
             dependency_target(
                 &ExecutionDependencyPolicy::Finally,
                 &[
-                    ExecutionNodeStatus::Completed,
-                    ExecutionNodeStatus::Failed,
-                    ExecutionNodeStatus::Running,
+                    predecessor(ExecutionNodeStatus::Completed),
+                    predecessor(ExecutionNodeStatus::Failed),
+                    predecessor(ExecutionNodeStatus::Running),
                 ],
             ),
             None
@@ -2233,12 +2440,317 @@ mod dependency_policy_tests {
             dependency_target(
                 &ExecutionDependencyPolicy::Finally,
                 &[
-                    ExecutionNodeStatus::Completed,
-                    ExecutionNodeStatus::Failed,
-                    ExecutionNodeStatus::Cancelled,
+                    predecessor(ExecutionNodeStatus::Completed),
+                    predecessor(ExecutionNodeStatus::Failed),
+                    predecessor(ExecutionNodeStatus::Cancelled),
                 ],
             ),
             Some(ExecutionNodeStatus::Ready)
+        );
+    }
+
+    fn durable_evidence(ref_type: &str, id: &str) -> EvidenceAccessRef {
+        EvidenceAccessRef::durable(
+            EvidenceRef::observed(ref_type, id),
+            "sha",
+            1,
+            "text/plain",
+            format!("evidence://{id}"),
+            "workspace",
+        )
+    }
+
+    fn framework_failed_result() -> ExecutionNodeResult {
+        ExecutionNodeResult {
+            status: ExecutionNodeStatus::Failed,
+            result_ref: Some("agent-return:run".to_string()),
+            summary: Some("partial".to_string()),
+            evidence_refs: vec![
+                durable_evidence("runtime_change", "receipt-1"),
+                durable_evidence("evidence", "proof-1"),
+            ],
+            failure: Some(ExecutionFailure {
+                kind: "agent_backend".to_string(),
+                message: "Runtime rejected Agent terminal result: fixture".to_string(),
+                retryable: false,
+                evidence_refs: Vec::new(),
+            }),
+            usage: ExecutionUsage {
+                required_acceptance: RequiredAcceptance {
+                    criteria: vec!["ok".to_string()],
+                    evidence_obligations: Vec::new(),
+                },
+                observed_acceptance: ObservedAcceptance {
+                    satisfied_criteria: Vec::new(),
+                    observed_evidence: Vec::new(),
+                    unresolved_obligation_ids: vec!["ok".to_string()],
+                },
+                ..ExecutionUsage::default()
+            },
+            finished_at_ms: 1,
+        }
+    }
+
+    fn evidence_ready_graph(
+        source_status: ExecutionNodeStatus,
+        source_result: Option<ExecutionNodeResult>,
+        required_fact_kinds: Vec<TerminalFactKind>,
+        accepted_execution_statuses: Vec<ExecutionNodeStatus>,
+        accepted_acceptance_verdicts: Vec<AcceptanceVerdict>,
+        require_committed_effect: bool,
+    ) -> ExecutionGraph {
+        let mut graph = ExecutionGraph::new("evidence ready reviewer");
+        let mut source = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "{}");
+        source.id = "source".to_string();
+        let mut reviewer =
+            ExecutionNodeSpec::new(ExecutionNodeKind::Verify, "verify", "team:fixture");
+        reviewer.id = "reviewer".to_string();
+        reviewer.work = Some(ExecutionWorkContract {
+            role: ExecutionWorkRole::CrossCheck,
+            dependency: ExecutionDependencyPolicy::EvidenceReady {
+                predicate: DependencyPredicate::EvidenceReady {
+                    minimum: 1,
+                    required_fact_kinds,
+                    accepted_execution_statuses,
+                    accepted_acceptance_verdicts,
+                    require_committed_effect,
+                },
+                cancel_remaining: false,
+            },
+            ..ExecutionWorkContract::new(ExecutionWorkRole::CrossCheck)
+        });
+        graph.nodes = vec![source, reviewer];
+        graph.edges = vec![ExecutionEdge {
+            from: "source".to_string(),
+            to: "reviewer".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        }];
+        graph
+            .node_statuses
+            .insert("source".to_string(), source_status);
+        if let Some(result) = source_result {
+            graph.node_results.insert("source".to_string(), result);
+        }
+        graph
+    }
+
+    #[test]
+    fn evidence_ready_accepts_failed_predecessor_with_durable_facts() {
+        let graph = evidence_ready_graph(
+            ExecutionNodeStatus::Failed,
+            Some(framework_failed_result()),
+            vec![
+                TerminalFactKind::CommittedEffect,
+                TerminalFactKind::ObservedEvidence,
+                TerminalFactKind::AcceptanceVerdict,
+            ],
+            vec![ExecutionNodeStatus::Failed, ExecutionNodeStatus::Completed],
+            vec![
+                AcceptanceVerdict::FrameworkInvalid,
+                AcceptanceVerdict::Unsatisfied,
+            ],
+            true,
+        );
+        let predecessors = dependency_predecessors(&graph, &graph.nodes[1]);
+        assert_eq!(
+            dependency_target(
+                &graph.nodes[1].work.as_ref().unwrap().dependency,
+                &predecessors,
+            ),
+            Some(ExecutionNodeStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn evidence_ready_waits_for_non_terminal_predecessor() {
+        let graph = evidence_ready_graph(
+            ExecutionNodeStatus::Running,
+            None,
+            Vec::new(),
+            vec![ExecutionNodeStatus::Completed],
+            vec![AcceptanceVerdict::Satisfied],
+            false,
+        );
+        let predecessors = dependency_predecessors(&graph, &graph.nodes[1]);
+        assert_eq!(
+            dependency_target(
+                &graph.nodes[1].work.as_ref().unwrap().dependency,
+                &predecessors,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn evidence_ready_blocks_terminal_predecessor_without_committed_facts() {
+        let graph = evidence_ready_graph(
+            ExecutionNodeStatus::Failed,
+            None,
+            Vec::new(),
+            vec![ExecutionNodeStatus::Failed],
+            vec![AcceptanceVerdict::FrameworkInvalid],
+            false,
+        );
+        let predecessors = dependency_predecessors(&graph, &graph.nodes[1]);
+        assert_eq!(
+            dependency_target(
+                &graph.nodes[1].work.as_ref().unwrap().dependency,
+                &predecessors,
+            ),
+            Some(ExecutionNodeStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn evidence_ready_cancelled_partial_facts_follow_the_contract_opt_in() {
+        let result = ExecutionNodeResult {
+            status: ExecutionNodeStatus::Cancelled,
+            result_ref: Some("agent-return:cancel".to_string()),
+            summary: Some("partial evidence".to_string()),
+            evidence_refs: vec![durable_evidence("evidence", "partial-1")],
+            failure: None,
+            usage: ExecutionUsage {
+                required_acceptance: RequiredAcceptance {
+                    criteria: vec!["ok".to_string()],
+                    evidence_obligations: Vec::new(),
+                },
+                observed_acceptance: ObservedAcceptance {
+                    satisfied_criteria: Vec::new(),
+                    observed_evidence: Vec::new(),
+                    unresolved_obligation_ids: vec!["ok".to_string()],
+                },
+                ..ExecutionUsage::default()
+            },
+            finished_at_ms: 1,
+        };
+        let opted_in = evidence_ready_graph(
+            ExecutionNodeStatus::Cancelled,
+            Some(result.clone()),
+            vec![
+                TerminalFactKind::ObservedEvidence,
+                TerminalFactKind::AcceptanceVerdict,
+            ],
+            vec![ExecutionNodeStatus::Cancelled],
+            vec![AcceptanceVerdict::Unsatisfied],
+            false,
+        );
+        let predecessors = dependency_predecessors(&opted_in, &opted_in.nodes[1]);
+        assert_eq!(
+            dependency_target(
+                &opted_in.nodes[1].work.as_ref().unwrap().dependency,
+                &predecessors,
+            ),
+            Some(ExecutionNodeStatus::Ready)
+        );
+
+        let excluded = evidence_ready_graph(
+            ExecutionNodeStatus::Cancelled,
+            Some(result),
+            vec![
+                TerminalFactKind::ObservedEvidence,
+                TerminalFactKind::AcceptanceVerdict,
+            ],
+            vec![ExecutionNodeStatus::Completed],
+            vec![AcceptanceVerdict::Unsatisfied],
+            false,
+        );
+        let predecessors = dependency_predecessors(&excluded, &excluded.nodes[1]);
+        assert_eq!(
+            dependency_target(
+                &excluded.nodes[1].work.as_ref().unwrap().dependency,
+                &predecessors,
+            ),
+            Some(ExecutionNodeStatus::Blocked)
+        );
+    }
+
+    #[test]
+    fn evidence_ready_committed_effect_is_required_only_when_declared() {
+        let mut result = framework_failed_result();
+        result
+            .evidence_refs
+            .retain(|reference| reference.evidence_ref.ref_type != "runtime_change");
+        let required = evidence_ready_graph(
+            ExecutionNodeStatus::Failed,
+            Some(result.clone()),
+            vec![
+                TerminalFactKind::ObservedEvidence,
+                TerminalFactKind::AcceptanceVerdict,
+            ],
+            vec![ExecutionNodeStatus::Failed],
+            vec![AcceptanceVerdict::FrameworkInvalid],
+            true,
+        );
+        let predecessors = dependency_predecessors(&required, &required.nodes[1]);
+        assert_eq!(
+            dependency_target(
+                &required.nodes[1].work.as_ref().unwrap().dependency,
+                &predecessors,
+            ),
+            Some(ExecutionNodeStatus::Blocked)
+        );
+
+        let optional = evidence_ready_graph(
+            ExecutionNodeStatus::Failed,
+            Some(result),
+            vec![
+                TerminalFactKind::ObservedEvidence,
+                TerminalFactKind::AcceptanceVerdict,
+            ],
+            vec![ExecutionNodeStatus::Failed],
+            vec![AcceptanceVerdict::FrameworkInvalid],
+            false,
+        );
+        let predecessors = dependency_predecessors(&optional, &optional.nodes[1]);
+        assert_eq!(
+            dependency_target(
+                &optional.nodes[1].work.as_ref().unwrap().dependency,
+                &predecessors,
+            ),
+            Some(ExecutionNodeStatus::Ready)
+        );
+    }
+
+    #[test]
+    fn evidence_ready_minimum_keeps_waiting_while_any_lane_can_still_satisfy() {
+        let mut graph = evidence_ready_graph(
+            ExecutionNodeStatus::Running,
+            None,
+            vec![
+                TerminalFactKind::CommittedEffect,
+                TerminalFactKind::ObservedEvidence,
+                TerminalFactKind::AcceptanceVerdict,
+            ],
+            vec![ExecutionNodeStatus::Failed],
+            vec![AcceptanceVerdict::FrameworkInvalid],
+            false,
+        );
+        let mut second_source = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "{}");
+        second_source.id = "second".to_string();
+        graph.nodes.insert(1, second_source);
+        graph
+            .node_statuses
+            .insert("second".to_string(), ExecutionNodeStatus::Failed);
+        graph
+            .node_results
+            .insert("second".to_string(), framework_failed_result());
+        graph.edges.push(ExecutionEdge {
+            from: "second".to_string(),
+            to: "reviewer".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        let dependency = &mut graph.nodes[2].work.as_mut().unwrap().dependency;
+        if let ExecutionDependencyPolicy::EvidenceReady { predicate, .. } = dependency {
+            let DependencyPredicate::EvidenceReady { minimum, .. } = predicate;
+            *minimum = 2;
+        }
+        let predecessors = dependency_predecessors(&graph, &graph.nodes[2]);
+        assert_eq!(
+            dependency_target(
+                &graph.nodes[2].work.as_ref().unwrap().dependency,
+                &predecessors,
+            ),
+            None
         );
     }
 
