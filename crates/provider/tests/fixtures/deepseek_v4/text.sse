@@ -1,0 +1,9 @@
+data: {"id":"chatcmpl-fixture-text","object":"chat.completion.chunk","created":1720000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Checking the repository state."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-text","object":"chat.completion.chunk","created":1720000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"The repository is ready."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-text","object":"chat.completion.chunk","created":1720000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-fixture-text","object":"chat.completion.chunk","created":1720000000,"model":"deepseek-v4-flash","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":9,"total_tokens":21}}
+
+data: [DONE]

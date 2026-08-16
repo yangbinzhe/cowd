@@ -115,6 +115,25 @@ impl std::fmt::Display for SessionInputMutationError {
 
 impl std::error::Error for SessionInputMutationError {}
 
+/// Typed result of one primary-ingress bind attempt. The same tuple replay is
+/// a successful no-op; only a different turn/execution or a non-bindable
+/// record state is a conflict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PrimaryIngressBindOutcome {
+    /// The projection was mutated from QueuedNext to AttachedToTurn.
+    Bound(SessionInputRecord),
+    /// The exact request/turn/execution tuple is already bound; nothing
+    /// changed and no new event should be emitted.
+    AlreadyBoundSame(SessionInputRecord),
+    /// The durable outbox has no in-process input projection (restart-safe).
+    ProjectionMissing,
+    /// The record exists but cannot be bound to this turn/execution.
+    Conflict {
+        existing: SessionInputRecord,
+        reason: String,
+    },
+}
+
 impl Drop for ActiveTurnLease {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.stream.inner.lock() {
@@ -480,13 +499,13 @@ impl SessionInputStream {
         idempotency_key: &str,
         turn_id: TurnId,
         execution_id: &str,
-    ) -> Result<Option<SessionInputRecord>, SessionInputMutationError> {
+    ) -> Result<PrimaryIngressBindOutcome, SessionInputMutationError> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(input_id) = inner.idempotency.get(idempotency_key).cloned() else {
-            return Ok(None);
+            return Ok(PrimaryIngressBindOutcome::ProjectionMissing);
         };
         let updated = {
             let record = inner
@@ -501,13 +520,21 @@ impl SessionInputStream {
                     .iter()
                     .any(|reference| reference == &format!("execution_graph:{execution_id}"))
             {
-                return Ok(Some(record.clone()));
+                return Ok(PrimaryIngressBindOutcome::AlreadyBoundSame(record.clone()));
             }
             if record.consumed_at.is_some()
                 || record.decision != InputRoutingDecision::StartNewTurn
                 || record.status != SessionInputStatus::QueuedNext
             {
-                return Err(SessionInputMutationError::InvalidPrimaryIngress);
+                return Ok(PrimaryIngressBindOutcome::Conflict {
+                    existing: record.clone(),
+                    reason: format!(
+                        "record is not a bindable primary ingress (status={:?}, decision={:?}, consumed={})",
+                        record.status,
+                        record.decision,
+                        record.consumed_at.is_some()
+                    ),
+                });
             }
             record.status = SessionInputStatus::AttachedToTurn;
             record.active_turn_id = Some(turn_id.clone());
@@ -526,7 +553,7 @@ impl SessionInputStream {
             record.clone()
         };
         inner.active_turn_id = Some(turn_id);
-        Ok(Some(updated))
+        Ok(PrimaryIngressBindOutcome::Bound(updated))
     }
 
     pub fn settle_primary_ingress(
@@ -1082,8 +1109,11 @@ mod tests {
 
         let bound = stream
             .bind_primary_ingress("primary-1", turn_id.clone(), "execution-primary")
-            .expect("bind primary ingress")
-            .expect("in-process record");
+            .expect("bind primary ingress");
+        let bound = match bound {
+            PrimaryIngressBindOutcome::Bound(record) => record,
+            outcome => panic!("expected Bound, got {outcome:?}"),
+        };
         assert_eq!(bound.status, SessionInputStatus::AttachedToTurn);
         assert!(stream
             .consume_for_checkpoint(&turn_id, TurnInputCheckpoint::BeforeProviderRequest, 8)
@@ -1121,7 +1151,7 @@ mod tests {
         let error = stream
             .bind_primary_ingress("missing", TurnId::from_string("turn-x"), "execution-x")
             .expect("missing in-memory record is restart-safe");
-        assert!(error.is_none());
+        assert_eq!(error, PrimaryIngressBindOutcome::ProjectionMissing);
         assert_eq!(
             stream
                 .record_snapshot(&receipt.input_id)
@@ -1129,6 +1159,68 @@ mod tests {
                 .status,
             SessionInputStatus::QueuedNext
         );
+    }
+
+    #[test]
+    fn primary_ingress_same_tuple_replay_is_already_bound_same_noop() {
+        let stream = SessionInputStream::new("s1");
+        let receipt = stream.admit(
+            SessionInputEnvelope::text("s1", InputSourceKind::Webui, "primary")
+                .with_idempotency_key("primary-replay"),
+            RuntimeInputState::default(),
+        );
+        let turn_id = TurnId::from_string("turn-replay");
+        let first = stream
+            .bind_primary_ingress("primary-replay", turn_id.clone(), "execution-replay")
+            .expect("first bind");
+        let PrimaryIngressBindOutcome::Bound(first_record) = first else {
+            panic!("first bind must be Bound");
+        };
+        let replay = stream
+            .bind_primary_ingress("primary-replay", turn_id, "execution-replay")
+            .expect("replay bind");
+        assert_eq!(
+            replay,
+            PrimaryIngressBindOutcome::AlreadyBoundSame(first_record)
+        );
+        let record = stream
+            .record_snapshot(&receipt.input_id)
+            .expect("primary record");
+        assert_eq!(record.status, SessionInputStatus::AttachedToTurn);
+        assert_eq!(
+            record
+                .evidence_refs
+                .iter()
+                .filter(|reference| reference.starts_with("execution_graph:"))
+                .count(),
+            1,
+            "same-tuple replay must not append a second execution evidence ref"
+        );
+    }
+
+    #[test]
+    fn primary_ingress_different_execution_is_a_typed_conflict() {
+        let stream = SessionInputStream::new("s1");
+        stream.admit(
+            SessionInputEnvelope::text("s1", InputSourceKind::Webui, "primary")
+                .with_idempotency_key("primary-conflict"),
+            RuntimeInputState::default(),
+        );
+        let turn_id = TurnId::from_string("turn-conflict");
+        let first = stream
+            .bind_primary_ingress("primary-conflict", turn_id.clone(), "execution-first")
+            .expect("first bind");
+        assert!(matches!(first, PrimaryIngressBindOutcome::Bound(_)));
+        let second = stream
+            .bind_primary_ingress("primary-conflict", turn_id, "execution-second")
+            .expect("second bind");
+        match second {
+            PrimaryIngressBindOutcome::Conflict { existing, reason } => {
+                assert_eq!(existing.status, SessionInputStatus::AttachedToTurn);
+                assert!(reason.contains("not a bindable primary ingress"));
+            }
+            outcome => panic!("expected Conflict, got {outcome:?}"),
+        }
     }
 
     #[test]

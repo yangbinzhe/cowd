@@ -15,6 +15,7 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 use crate::{ProviderWireHeader, ProviderWireRequest};
+use model_protocol::provider_capability::ProviderCapabilityProfile;
 
 use super::{preflight_message_request, Provider, ProviderFuture};
 
@@ -1502,7 +1503,12 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             Value::Array(tools.iter().map(openai_tool_definition).collect::<Vec<_>>());
     }
     if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = openai_tool_choice(tool_choice);
+        if !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
+            &request.model,
+            request.reasoning_effort.as_deref(),
+        ) {
+            payload["tool_choice"] = openai_tool_choice(tool_choice);
+        }
     }
     if request
         .tools
@@ -1581,7 +1587,12 @@ fn build_responses_request(request: &MessageRequest) -> Value {
         );
     }
     if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = responses_tool_choice(tool_choice);
+        if !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
+            &request.model,
+            request.reasoning_effort.as_deref(),
+        ) {
+            payload["tool_choice"] = responses_tool_choice(tool_choice);
+        }
     }
     if request
         .tools
@@ -2776,8 +2787,8 @@ mod tests {
         build_chat_completion_request, build_responses_request, chat_completions_endpoint,
         is_reasoning_model, normalize_finish_reason, openai_tool_choice, parse_compat_tool_calls,
         parse_dsml_tool_calls, parse_responses_sse_frame, parse_tool_arguments, responses_endpoint,
-        retry_after_from_headers, OpenAiCompatClient, OpenAiCompatConfig, OpenAiUsage,
-        OpenAiWireProtocol, StreamState,
+        retry_after_from_headers, ChatCompletionChunk, OpenAiCompatClient, OpenAiCompatConfig,
+        OpenAiSseParser, OpenAiUsage, OpenAiWireProtocol, StreamState,
     };
     use crate::error::{ApiError, CompatibilityToolProtocolFailure};
     use crate::types::{
@@ -3254,7 +3265,33 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_serializes_runtime_selected_explicit_tool_choice() {
+    fn deepseek_v4_thinking_omits_explicit_tool_choice_on_the_wire() {
+        let payload = build_chat_completion_request(
+            &MessageRequest {
+                model: "deepseek-v4-flash".to_string(),
+                max_tokens: 64,
+                messages: vec![InputMessage::user_text("inspect")],
+                tools: Some(vec![ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                }]),
+                tool_choice: Some(ToolChoice::Auto),
+                reasoning_effort: Some("high".to_string()),
+                ..Default::default()
+            },
+            OpenAiCompatConfig::deepseek(),
+        );
+
+        assert!(
+            payload.get("tool_choice").is_none(),
+            "DeepSeek v4 thinking must not receive an explicit tool_choice field"
+        );
+        assert!(payload.get("tools").is_some());
+    }
+
+    #[test]
+    fn deepseek_v4_non_thinking_keeps_explicit_tool_choice_on_the_wire() {
         let payload = build_chat_completion_request(
             &MessageRequest {
                 model: "deepseek-v4-flash".to_string(),
@@ -3272,6 +3309,215 @@ mod tests {
         );
 
         assert_eq!(payload["tool_choice"], json!("auto"));
+    }
+
+    #[test]
+    fn responses_wire_omits_tool_choice_for_deepseek_v4_thinking() {
+        let payload = build_responses_request(&MessageRequest {
+            model: "deepseek-v4-pro".to_string(),
+            max_tokens: 64,
+            messages: vec![InputMessage::user_text("inspect")],
+            tools: Some(vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: None,
+                input_schema: json!({"type":"object"}),
+            }]),
+            tool_choice: Some(ToolChoice::Any),
+            reasoning_effort: Some("max".to_string()),
+            ..Default::default()
+        });
+
+        assert!(payload.get("tool_choice").is_none());
+        assert!(payload.get("tools").is_some());
+    }
+
+    fn parse_fixture(contents: &'static str) -> Vec<ChatCompletionChunk> {
+        let mut parser = OpenAiSseParser::with_context(
+            "DeepSeek",
+            "deepseek-v4-flash",
+            OpenAiWireProtocol::Completions,
+        );
+        parser
+            .push(contents.as_bytes())
+            .expect("fixture parses as Chat Completions SSE")
+    }
+
+    #[test]
+    fn deepseek_v4_text_fixture_preserves_thinking_and_text() {
+        let chunks = parse_fixture(include_str!("../../tests/fixtures/deepseek_v4/text.sse"));
+        assert_eq!(
+            chunks[0].choices[0].delta.reasoning_content.as_deref(),
+            Some("Checking the repository state.")
+        );
+        assert_eq!(
+            chunks[1].choices[0].delta.content.as_deref(),
+            Some("The repository is ready.")
+        );
+        assert_eq!(chunks[2].choices[0].finish_reason.as_deref(), Some("stop"));
+
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[]);
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(state.ingest_chunk(chunk).expect("ingest fixture chunk"));
+        }
+        events.extend(state.finish().expect("fixture finishes"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(delta)
+                if matches!(&delta.delta, ContentBlockDelta::ThinkingDelta { thinking }
+                    if thinking == "Checking the repository state.")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(delta)
+                if matches!(&delta.delta, ContentBlockDelta::TextDelta { text }
+                    if text == "The repository is ready.")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::MessageDelta(delta)
+                if delta.delta.stop_reason.as_deref() == Some("end_turn")
+        )));
+    }
+
+    #[test]
+    fn deepseek_v4_single_tool_fixture_yields_one_typed_tool_use() {
+        let chunks = parse_fixture(include_str!(
+            "../../tests/fixtures/deepseek_v4/single_tool.sse"
+        ));
+        let mut state = StreamState::new(
+            "deepseek-v4-flash".to_string(),
+            &[ToolDefinition {
+                name: "read_file".to_string(),
+                description: None,
+                input_schema: json!({"type":"object"}),
+            }],
+        );
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(state.ingest_chunk(chunk).expect("ingest fixture chunk"));
+        }
+        events.extend(state.finish().expect("fixture finishes"));
+        let starts = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart(start) => Some(&start.content_block),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 1);
+        let OutputContentBlock::ToolUse { id, name, .. } = starts[0] else {
+            panic!("expected one ToolUse");
+        };
+        assert_eq!(name, "read_file");
+        assert_eq!(id, "call_read_1");
+        let arguments = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta(delta) => match &delta.delta {
+                    ContentBlockDelta::InputJsonDelta { partial_json } => {
+                        Some(partial_json.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            json!({"path":"Cargo.toml"})
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_multi_tool_fixture_keeps_parallel_tool_calls_structured() {
+        let chunks = parse_fixture(include_str!(
+            "../../tests/fixtures/deepseek_v4/multi_tool.sse"
+        ));
+        let mut state = StreamState::new(
+            "deepseek-v4-flash".to_string(),
+            &[
+                ToolDefinition {
+                    name: "read_file".to_string(),
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                },
+                ToolDefinition {
+                    name: "tool_search".to_string(),
+                    description: None,
+                    input_schema: json!({"type":"object"}),
+                },
+            ],
+        );
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(state.ingest_chunk(chunk).expect("ingest fixture chunk"));
+        }
+        events.extend(state.finish().expect("fixture finishes"));
+        let names = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockStart(start) => match &start.content_block {
+                    OutputContentBlock::ToolUse { name, .. } => Some(name.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["read_file", "tool_search"]);
+    }
+
+    #[test]
+    fn deepseek_v4_streamed_arguments_fixture_assembles_exact_json() {
+        let chunks = parse_fixture(include_str!(
+            "../../tests/fixtures/deepseek_v4/streamed_arguments.sse"
+        ));
+        let mut state = StreamState::new(
+            "deepseek-v4-flash".to_string(),
+            &[ToolDefinition {
+                name: "read_file".to_string(),
+                description: None,
+                input_schema: json!({"type":"object"}),
+            }],
+        );
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(state.ingest_chunk(chunk).expect("ingest fixture chunk"));
+        }
+        events.extend(state.finish().expect("fixture finishes"));
+        let arguments = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ContentBlockDelta(delta) => match &delta.delta {
+                    ContentBlockDelta::InputJsonDelta { partial_json } => {
+                        Some(partial_json.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(arguments, r#"{"path":"Cargo.toml"}"#);
+    }
+
+    #[test]
+    fn deepseek_v4_unknown_frame_fixture_is_skipped_without_losing_text() {
+        let chunks = parse_fixture(include_str!(
+            "../../tests/fixtures/deepseek_v4/unknown_frame.sse"
+        ));
+        assert!(!chunks.is_empty());
+        let mut state = StreamState::new("deepseek-v4-flash".to_string(), &[]);
+        let mut events = Vec::new();
+        for chunk in chunks {
+            events.extend(state.ingest_chunk(chunk).expect("ingest fixture chunk"));
+        }
+        events.extend(state.finish().expect("fixture finishes"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ContentBlockDelta(delta)
+                if matches!(&delta.delta, ContentBlockDelta::TextDelta { text }
+                    if text == "after unknown frames")
+        )));
     }
 
     #[test]

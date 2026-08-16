@@ -2184,6 +2184,13 @@ impl RuntimeService {
                     "bindings": task_route.bindings,
                 }),
                 chrono::Utc::now().timestamp_millis().max(0) as u64,
+                &format!(
+                    "session-input:{}:{}:{}:{}",
+                    crate::session_runtime_data_port::SessionInputJournalKind::TaskRouted.as_str(),
+                    record.session_id,
+                    record.request_id,
+                    record.turn_id
+                ),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -3920,6 +3927,7 @@ impl RuntimeService {
             Some(&receipt),
             record_for_event.as_ref(),
             &stream,
+            &request.request_id,
         )
         .await;
         let execution_graph_id =
@@ -3980,7 +3988,7 @@ impl RuntimeService {
         };
         let turn_id = TurnId::from_string(outbox.turn_id.clone());
         match stream.bind_primary_ingress(&outbox.request_id, turn_id, execution_id) {
-            Ok(Some(record)) => {
+            Ok(runtime::session_input::PrimaryIngressBindOutcome::Bound(record)) => {
                 let receipt = record.to_receipt();
                 self.emit_session_input_events(&outbox.session_id, &stream, Some(receipt.clone()));
                 self.persist_session_input_domain_event(
@@ -3989,13 +3997,33 @@ impl RuntimeService {
                     Some(&receipt),
                     Some(&record),
                     &stream,
+                    &format!("{}:{}:{}", outbox.request_id, outbox.turn_id, execution_id),
                 )
                 .await;
             }
-            Ok(None) => tracing::debug!(
+            Ok(runtime::session_input::PrimaryIngressBindOutcome::AlreadyBoundSame(_)) => {
+                // Idempotent replay of the exact same tuple: no new live
+                // event, no audit journal entry, no warning, no revision.
+            }
+            Ok(runtime::session_input::PrimaryIngressBindOutcome::ProjectionMissing) => {
+                tracing::debug!(
+                    session_id = %outbox.session_id,
+                    request_id = %outbox.request_id,
+                    "durable ingress recovered without an in-process input projection"
+                )
+            }
+            Ok(runtime::session_input::PrimaryIngressBindOutcome::Conflict {
+                existing,
+                reason,
+            }) => tracing::warn!(
                 session_id = %outbox.session_id,
                 request_id = %outbox.request_id,
-                "durable ingress recovered without an in-process input projection"
+                incoming_turn = %outbox.turn_id,
+                incoming_execution = %execution_id,
+                existing_turn = ?existing.active_turn_id,
+                existing_status = ?existing.status,
+                %reason,
+                "refused primary ingress bind: incoming tuple conflicts with the existing binding"
             ),
             Err(error) => tracing::warn!(
                 session_id = %outbox.session_id,
@@ -4036,6 +4064,10 @@ impl RuntimeService {
                     Some(&receipt),
                     Some(&record),
                     &stream,
+                    &format!(
+                        "{}:{}:{}:{}",
+                        outbox.request_id, outbox.turn_id, execution_id, terminal_id
+                    ),
                 )
                 .await;
             }
@@ -4081,6 +4113,7 @@ impl RuntimeService {
                     Some(&receipt),
                     Some(&record),
                     &stream,
+                    &format!("{}:{}", outbox.request_id, outbox.turn_id),
                 )
                 .await;
             }
@@ -4114,6 +4147,7 @@ impl RuntimeService {
                     Some(&receipt),
                     Some(&record),
                     &stream,
+                    &format!("{}:{}", outbox.request_id, outbox.input_id),
                 )
                 .await;
             }
@@ -4144,6 +4178,7 @@ impl RuntimeService {
             Some(&receipt),
             Some(&record),
             &stream,
+            receipt.input_id.as_str(),
         )
         .await;
         let cancelled_execution_ids = self.cancel_active_session_turns(session_id, reason);
@@ -4176,6 +4211,7 @@ impl RuntimeService {
             Some(&receipt),
             Some(&record),
             &stream,
+            &format!("{}:{:?}", receipt.input_id, decision),
         )
         .await;
         Ok(receipt)
@@ -4918,6 +4954,7 @@ impl RuntimeService {
         receipt: Option<&SessionInputReceipt>,
         record: Option<&runtime::SessionInputRecord>,
         stream: &runtime::SessionInputStream,
+        dedup_key: &str,
     ) {
         if let Err(error) = self.ensure_session_domain_record(session_id).await {
             tracing::warn!(
@@ -4947,6 +4984,14 @@ impl RuntimeService {
                 return;
             }
         };
+        // Deterministic journal identity so a replay of the same semantic
+        // fact is appended once, regardless of process-local timing.
+        let event_id = format!(
+            "session-input:{}:{}:{}",
+            kind.as_str(),
+            session_id,
+            dedup_key
+        );
         if let Err(error) = self
             .session_data
             .append_session_input_journal(
@@ -4954,6 +4999,7 @@ impl RuntimeService {
                 kind,
                 payload,
                 Utc::now().timestamp_millis().max(0) as u64,
+                &event_id,
             )
             .await
         {

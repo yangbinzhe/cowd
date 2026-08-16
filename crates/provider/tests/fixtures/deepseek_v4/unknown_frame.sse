@@ -1,0 +1,9 @@
+: keep-alive
+
+event: ping
+
+data: {"id":"chatcmpl-fixture-unknown","object":"chat.completion.chunk","created":1720000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"after unknown frames"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-unknown","object":"chat.completion.chunk","created":1720000000,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
