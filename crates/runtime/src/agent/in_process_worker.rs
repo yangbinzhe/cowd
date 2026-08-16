@@ -28,6 +28,13 @@ pub struct InProcessAgentWorker {
     active_runs: Mutex<BTreeMap<String, ActiveInProcessRun>>,
     pending_cancellations: Mutex<BTreeSet<String>>,
     completed_runs: Mutex<VecDeque<String>>,
+    /// digest-bound TEAM.md public fragments. The key is the exact
+    /// `agent_binding_digest:team_binding_digest` pair so a changed revision
+    /// never reuses a stale prefix.
+    team_prompt_cache: Mutex<BTreeMap<String, Vec<String>>>,
+    team_prompt_cache_hits: AtomicU64,
+    team_prompt_cache_builds: AtomicU64,
+    team_prompt_cache_tokens: AtomicU64,
 }
 
 const COMPLETED_RUN_TOMBSTONE_LIMIT: usize = 1_024;
@@ -91,7 +98,51 @@ impl InProcessAgentWorker {
             active_runs: Mutex::new(BTreeMap::new()),
             pending_cancellations: Mutex::new(BTreeSet::new()),
             completed_runs: Mutex::new(VecDeque::new()),
+            team_prompt_cache: Mutex::new(BTreeMap::new()),
+            team_prompt_cache_hits: AtomicU64::new(0),
+            team_prompt_cache_builds: AtomicU64::new(0),
+            team_prompt_cache_tokens: AtomicU64::new(0),
         }
+    }
+
+    fn cached_team_markdown_fragment(
+        &self,
+        binding_digest: &str,
+        team_binding_digest: &str,
+        team_instructions: &str,
+    ) -> Vec<String> {
+        let key = format!("{binding_digest}:{team_binding_digest}");
+        let mut cache = self
+            .team_prompt_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(segments) = cache.get(&key) {
+            self.team_prompt_cache_hits.fetch_add(1, Ordering::Relaxed);
+            return segments.clone();
+        }
+        let segment = format!(
+            "Team protocol fragment (binding digest {}):\n{}",
+            team_binding_digest,
+            team_instructions.trim()
+        );
+        let segments = vec![segment];
+        self.team_prompt_cache_tokens.fetch_add(
+            crate::context_ledger::estimate_text_tokens(&segments.join("\n\n")),
+            Ordering::Relaxed,
+        );
+        self.team_prompt_cache_builds
+            .fetch_add(1, Ordering::Relaxed);
+        cache.insert(key, segments.clone());
+        segments
+    }
+
+    #[cfg(test)]
+    fn team_prompt_cache_stats(&self) -> (u64, u64, u64) {
+        (
+            self.team_prompt_cache_hits.load(Ordering::Relaxed),
+            self.team_prompt_cache_builds.load(Ordering::Relaxed),
+            self.team_prompt_cache_tokens.load(Ordering::Relaxed),
+        )
     }
 
     fn record_completed_run(&self, run_id: &str) {
@@ -342,6 +393,29 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         } else {
             Vec::new()
         };
+        let (team_instructions, team_binding_digest) =
+            if let Some(team_id) = binding.data_lease.team_id.as_deref() {
+                let graph_id = format!("team-graph:{team_id}");
+                match crate::team_binding::load_binding(services.event_store(), &graph_id) {
+                    Ok(Some(team_binding)) => (
+                        Some(team_binding.team_instructions),
+                        Some(team_binding.binding_digest),
+                    ),
+                    _ => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+        let team_markdown_fragment = match (&team_instructions, &team_binding_digest) {
+            (Some(instructions), Some(team_digest)) => self.cached_team_markdown_fragment(
+                &binding.binding_digest,
+                team_digest,
+                instructions,
+            ),
+            _ => Vec::new(),
+        };
+        let mut prompt_segments = system_prompt(&packet, services.workspace_root(), &tool_names);
+        prompt_segments.extend(team_markdown_fragment);
         let host = StandardRuntimeHost::new(StandardRuntimeHostConfig {
             runtime_services: Arc::clone(&services),
             session: child_session,
@@ -350,7 +424,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             tool_definitions: tool_definitions.clone(),
             tool_executor: Arc::clone(&tool_executor),
             permission_policy: policy,
-            system_prompt: system_prompt(&packet, services.workspace_root(), &tool_names),
+            system_prompt: prompt_segments,
             feature_config: crate::RuntimeFeatureConfig::default(),
             emit_output: false,
             stream_callback: Some(provider_event_sender),
@@ -4730,5 +4804,37 @@ mod tests {
         assert!(mutation_prompt.contains("Read each target at most once before mutation"));
         assert!(mutation_prompt.contains("write:fixtures/target.txt"));
         assert!(mutation_prompt.contains("Repeated reads"));
+    }
+
+    #[test]
+    fn team_markdown_fragment_cache_is_digest_bound_and_counts_metrics() {
+        let worker = InProcessAgentWorker::new(std::sync::Weak::new());
+        let first =
+            worker.cached_team_markdown_fragment("binding-a", "team-a", "# Team\n\nReview.");
+        assert!(first[0].contains("binding digest team-a"));
+        assert_eq!(worker.team_prompt_cache_stats().0, 0);
+        assert_eq!(worker.team_prompt_cache_stats().1, 1);
+        assert!(
+            worker.team_prompt_cache_stats().2 > 0,
+            "token increment is recorded"
+        );
+
+        let second =
+            worker.cached_team_markdown_fragment("binding-a", "team-a", "# Team\n\nReview.");
+        assert_eq!(first, second);
+        assert_eq!(
+            worker.team_prompt_cache_stats().0,
+            1,
+            "same digest pair is a cache hit"
+        );
+        assert_eq!(worker.team_prompt_cache_stats().1, 1);
+
+        worker.cached_team_markdown_fragment("binding-a", "team-b", "# Team\n\nReview.");
+        worker.cached_team_markdown_fragment("binding-b", "team-a", "# Team\n\nReview.");
+        assert_eq!(
+            worker.team_prompt_cache_stats().1,
+            3,
+            "any digest change rebuilds the prefix; no stale prefix is reused"
+        );
     }
 }
