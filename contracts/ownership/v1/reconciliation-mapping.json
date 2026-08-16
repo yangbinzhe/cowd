@@ -1,0 +1,81 @@
+{
+  "contract": "cowd.ownership-reconciliation/v1.1-final",
+  "ordering": "each typed array ascending by stable_ref canonical UTF-8 bytes; duplicate stable_ref rejects",
+  "state_classification": {
+    "pending": [
+      "mfg_report_delivery_review_effect_outbox:pending",
+      "mfg_report_delivery_review_effect_outbox:retry_wait",
+      "mfg_mutation_receipt:accepted",
+      "mfg_mutation_receipt:effect_retryable"
+    ],
+    "started_or_leased": [
+      "mfg_report_delivery_review_effect_outbox:processing",
+      "mfg_mutation_receipt:effect_started",
+      "mfg_mutation_receipt:business_completed"
+    ],
+    "failed": [
+      "mfg_report_delivery_review_effect_outbox:retry_wait"
+    ],
+    "dead_letter": [
+      "mfg_report_delivery_review:delivery_dead_lettered"
+    ],
+    "evidence": "repository.rs claim/fail/complete outbox SQL; mutation durable lease SQL; cockpit.rs delivery_dead_lettered projection"
+  },
+  "arrays": {
+    "pending_outbox": {
+      "table": "mfg_report_delivery_review_effect_outbox",
+      "statuses": [
+        "pending",
+        "retry_wait",
+        "processing"
+      ],
+      "terminal_excluded_statuses": [
+        "completed"
+      ],
+      "stable_ref": "effect_id",
+      "status": "status",
+      "payload_digest": "canonical payload_json plus action/effect_key/attempt_count/next_attempt_at/receipt_ref"
+    },
+    "command_receipts": {
+      "table": "mfg_command_receipt",
+      "statuses": [
+        "recorded"
+      ],
+      "stable_ref": "domain + U+001F + idempotency_key",
+      "status": "constant:recorded",
+      "payload_digest": "canonical receipt_json plus subject_ref"
+    },
+    "mutation_receipts": {
+      "table": "mfg_mutation_receipt",
+      "statuses": [
+        "accepted",
+        "effect_started",
+        "effect_retryable",
+        "business_completed",
+        "preview",
+        "completed"
+      ],
+      "stable_ref": "receipt_id",
+      "status": "status",
+      "payload_digest": "stored payload_digest must equal canonical response_json envelope digest"
+    },
+    "mutation_receipt_aliases": {
+      "table": "mfg_mutation_receipt_alias",
+      "statuses": [
+        "bound"
+      ],
+      "stable_ref": "legacy_idempotency_key",
+      "status": "constant:bound",
+      "payload_digest": "digest of canonical resolved mfg_mutation_receipt; dangling receipt_id rejects"
+    },
+    "mutation_receipt_repairs": {
+      "table": "mfg_mutation_receipt_repair_report",
+      "statuses": [
+        "conflict_preserved"
+      ],
+      "stable_ref": "report_id",
+      "status": "constant:conflict_preserved",
+      "payload_digest": "canonical existing_receipt_json and incoming_receipt_json conflict summary; neither side may be dropped"
+    }
+  }
+}

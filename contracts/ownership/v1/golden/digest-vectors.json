@@ -1,0 +1,28 @@
+{
+  "contract": "cowd.ownership-digest-vectors/v1.1-final",
+  "vectors": [
+    {
+      "domain": "cowd.ownership.payload.v1",
+      "value": {
+        "a": 1,
+        "b": [
+          true,
+          null,
+          "é"
+        ]
+      },
+      "canonical": "{\"a\":1,\"b\":[true,null,\"é\"]}",
+      "digest": "sha256:b12d357a03738b92f788c625f788b421e346236473b6a85cda523933518bcf48"
+    },
+    {
+      "domain": "cowd.ownership.section.v1",
+      "value": {
+        "owner": "mfg",
+        "object_count": 0,
+        "objects": []
+      },
+      "canonical": "{\"object_count\":0,\"objects\":[],\"owner\":\"mfg\"}",
+      "digest": "sha256:8b428d4b7747de1067fb5a05097aad1ad4caf263455ac90dc87ed6ab2d44b0c6"
+    }
+  ]
+}

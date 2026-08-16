@@ -1,0 +1,21 @@
+{
+  "contract": "cowd.ownership-canonicalization/v1.1-final",
+  "encoding": "UTF-8",
+  "unicode_normalization": "none; preserve scalar values byte-for-byte",
+  "object_keys": "ascending UTF-8 byte order; duplicate keys reject",
+  "arrays": "preserve input order except reference arrays, which use reference-encoding canonical order",
+  "numbers": "shortest RFC 8785-compatible finite JSON representation; reject NaN, Infinity, -Infinity, and negative zero",
+  "strings": "JSON escaping with no insignificant whitespace",
+  "null": "literal null",
+  "digest": {
+    "algorithm": "sha256",
+    "representation": "sha256:<lowerhex>"
+  },
+  "domains": {
+    "payload_digest": "cowd.ownership.payload.v1\\0 + canonical object with payload_digest removed",
+    "section_digest": "cowd.ownership.section.v1\\0 + canonical section with section_digest removed",
+    "reconciliation_digest": "cowd.ownership.reconciliation.v1\\0 + canonical reconciliation object with set_digest removed; typed arrays retained independently",
+    "whole_snapshot_digest": "cowd.ownership.snapshot.v1\\0 + canonical snapshot with whole_snapshot_digest removed",
+    "external_catalog_digest": "cowd.ownership.external-catalog.v1\\0 + canonical catalog with digest removed"
+  }
+}

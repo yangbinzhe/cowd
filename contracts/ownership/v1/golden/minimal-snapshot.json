@@ -1,0 +1,50 @@
+{
+  "contract_version": "cowd.ownership-split/v1.1-final",
+  "source": {
+    "app_id": "mfg",
+    "source_version": "fixture",
+    "schema_version": 1,
+    "exported_at": "2026-08-15T00:00:00Z",
+    "maintenance_fence_id": "fixture-fence",
+    "ownership_contract_digest": "sha256:84bd9bb410cb413a7603954af21dbe809b9308ecab86684445c71274de9486e8",
+    "external_reference_catalog_digest": "sha256:90345e6cce7e48cce40cc9df749e3ce6f1dd7ae396551d76f53e754bcca5f2da"
+  },
+  "mfg_domain": {
+    "owner": "mfg",
+    "object_count": 0,
+    "section_digest": "sha256:8b428d4b7747de1067fb5a05097aad1ad4caf263455ac90dc87ed6ab2d44b0c6",
+    "objects": []
+  },
+  "core_matrix_domain": {
+    "owner": "core",
+    "object_count": 0,
+    "section_digest": "sha256:dc18dbc6788e839f9d0d280275947a982d49c5a5531bc3708db2d1cba6e139a7",
+    "objects": []
+  },
+  "reconciliation": {
+    "pending_outbox": [],
+    "command_receipts": [],
+    "mutation_receipts": [],
+    "mutation_receipt_aliases": [],
+    "mutation_receipt_repairs": [],
+    "set_digest": "sha256:f1ade2cdd2041aac44a2e026c08332c97a47a6c80f51b70f27346ce650e575b8"
+  },
+  "excluded": [
+    {
+      "source_table": "mfg_live_epoch",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "create_new_epoch_at_cutover_with_zero_retention_window"
+    },
+    {
+      "source_table": "mfg_live_secret",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "generate_new_secret_in_target_secret_store_never_copy_source"
+    },
+    {
+      "source_table": "mfg_projection_event",
+      "reason": "runtime_or_secret_state_is_not_authority",
+      "regeneration": "start_empty_then_rebuild_from_authoritative_events"
+    }
+  ],
+  "whole_snapshot_digest": "sha256:13b67b060b3b9b0fe2390e079e98abd8eebc3160e37c5a443ccd4400b41d7fdf"
+}

@@ -1,0 +1,919 @@
+const MFG_MIGRATION_TABLES: &[&str] = &[
+    "mfg_cockpit_profile",
+    "mfg_cockpit_view_draft",
+    "mfg_cockpit_view_proposal",
+    "mfg_cockpit_view_version",
+    "mfg_cockpit_view_active",
+    "mfg_cockpit_report",
+    "mfg_report_delivery_review",
+    "mfg_report_delivery_review_transition",
+    "mfg_report_delivery_review_effect_outbox",
+    "mfg_alert_rule",
+    "mfg_alert_occurrence",
+    "mfg_alert_subscription",
+    "mfg_assignment",
+    "mfg_command_receipt",
+    "mfg_mutation_receipt",
+    "mfg_mutation_receipt_alias",
+    "mfg_mutation_receipt_repair_report",
+    "mfg_projection_event",
+    "mfg_live_epoch",
+    "mfg_live_secret",
+    "matrix_entity",
+    "matrix_entity_source_key",
+    "matrix_relation",
+    "matrix_fact",
+    "matrix_attention_item",
+    "matrix_evidence_packet",
+    "matrix_quality_gate",
+    "matrix_metric_definition",
+    "matrix_metric_state",
+    "matrix_metric_dependency",
+    "matrix_compute_job",
+    "matrix_change_event",
+    "mfg_incident",
+    "mfg_operational_analysis",
+    "mfg_action_execution",
+    "mfg_memory_case",
+    "mfg_playbook",
+    "matrix_source_pack",
+    "matrix_data_plane_watermark",
+    "matrix_connector_run",
+    "matrix_ontology_pack",
+    "matrix_entity_match_candidate",
+    "matrix_entity_conflict_decision",
+    "matrix_metric_snapshot",
+    "mfg_skill_execution",
+    "mfg_workflow_graph",
+];
+
+fn export_migration_snapshot(
+    connection: &impl crate::database::ConnectionLike,
+) -> Result<MfgMigrationSnapshot, MfgRepositoryError> {
+    let schema_version = schema_version(connection)?;
+    let mut tables = BTreeMap::new();
+    for table_name in MFG_MIGRATION_TABLES {
+        let columns = migration_columns(connection, table_name)?;
+        let column_list = columns
+            .iter()
+            .map(|column| quote_migration_identifier(&column.name))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        let rows = connection
+            .query_rows(&format!(
+                "SELECT {column_list} FROM {}",
+                quote_migration_identifier(table_name)?
+            ))?
+            .into_iter()
+            .map(|row| {
+                if row.values().len() != columns.len() {
+                    return Err(MfgRepositoryError::MigrationRejected(format!(
+                        "table {table_name} returned {} values for {} columns",
+                        row.values().len(),
+                        columns.len()
+                    )));
+                }
+                Ok(row
+                    .values()
+                    .iter()
+                    .map(migration_value_from_database)
+                    .collect())
+            })
+            .collect::<Result<Vec<Vec<_>>, _>>()?;
+        let mut rows = rows;
+        rows.sort_by(|left, right| {
+            serde_json::to_vec(left)
+                .expect("migration values serialize")
+                .cmp(&serde_json::to_vec(right).expect("migration values serialize"))
+        });
+        tables.insert(table_name.to_string(), MfgMigrationTable { columns, rows });
+    }
+    let digest = migration_snapshot_digest(schema_version, &tables)?;
+    Ok(MfgMigrationSnapshot {
+        schema_version,
+        tables,
+        digest,
+    })
+}
+
+fn import_migration_snapshot(
+    connection: &mut Connection,
+    snapshot: &MfgMigrationSnapshot,
+) -> Result<(), MfgRepositoryError> {
+    let expected_digest = migration_snapshot_digest(snapshot.schema_version, &snapshot.tables)?;
+    if snapshot.digest != expected_digest {
+        return Err(MfgRepositoryError::MigrationRejected(format!(
+            "snapshot digest mismatch: expected {expected_digest}, received {}",
+            snapshot.digest
+        )));
+    }
+    let local_schema_version = schema_version(connection)?;
+    if snapshot.schema_version != local_schema_version {
+        return Err(MfgRepositoryError::MigrationRejected(format!(
+            "schema version mismatch: snapshot {}, target {local_schema_version}",
+            snapshot.schema_version
+        )));
+    }
+    if snapshot.tables.len() != MFG_MIGRATION_TABLES.len() {
+        return Err(MfgRepositoryError::MigrationRejected(format!(
+            "snapshot contains {} tables; expected {}",
+            snapshot.tables.len(),
+            MFG_MIGRATION_TABLES.len()
+        )));
+    }
+    for table_name in MFG_MIGRATION_TABLES {
+        let snapshot_table = snapshot.tables.get(*table_name).ok_or_else(|| {
+            MfgRepositoryError::MigrationRejected(format!(
+                "snapshot is missing required table {table_name}"
+            ))
+        })?;
+        let local_columns = migration_columns(connection, table_name)?;
+        if snapshot_table.columns != local_columns {
+            return Err(MfgRepositoryError::MigrationRejected(format!(
+                "table {table_name} schema differs from the target"
+            )));
+        }
+        if *table_name != "mfg_live_epoch" && count_table(connection, table_name)? != 0 {
+            return Err(MfgRepositoryError::MigrationRejected(format!(
+                "target table {table_name} is not empty"
+            )));
+        }
+    }
+
+    let target_is_sqlite = connection.is_sqlite();
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute("DELETE FROM mfg_live_epoch", params![])?;
+    for table_name in MFG_MIGRATION_TABLES {
+        let table = &snapshot.tables[*table_name];
+        let names = table
+            .columns
+            .iter()
+            .map(|column| quote_migration_identifier(&column.name))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        let placeholders = (1..=table.columns.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO {} ({names}) VALUES ({placeholders})",
+            quote_migration_identifier(table_name)?
+        );
+        for row in &table.rows {
+            if row.len() != table.columns.len() {
+                return Err(MfgRepositoryError::MigrationRejected(format!(
+                    "table {table_name} row width {} differs from column width {}",
+                    row.len(),
+                    table.columns.len()
+                )));
+            }
+            let values = row
+                .iter()
+                .zip(&table.columns)
+                .map(|(value, column)| migration_value_to_database(value, column.kind))
+                .collect::<Vec<_>>();
+            transaction.execute(&sql, values)?;
+        }
+    }
+    let imported = export_migration_snapshot(&transaction)?;
+    if imported.digest != snapshot.digest {
+        return Err(MfgRepositoryError::MigrationRejected(format!(
+            "target digest {} differs from source {}",
+            imported.digest, snapshot.digest
+        )));
+    }
+    if !target_is_sqlite {
+        transaction.query_row(
+            "SELECT setval(pg_get_serial_sequence('mfg_projection_event', 'event_id'), COALESCE(MAX(event_id), 1), MAX(event_id) IS NOT NULL) FROM mfg_projection_event",
+            params![],
+            |row| row.get::<_, i64>(0),
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migration_columns(
+    connection: &impl crate::database::ConnectionLike,
+    table_name: &str,
+) -> Result<Vec<MfgMigrationColumn>, MfgRepositoryError> {
+    quote_migration_identifier(table_name)?;
+    let mut statement = connection.prepare(&format!("PRAGMA table_info(\"{table_name}\")"))?;
+    let columns = statement
+        .query_map(params![], |row| {
+            let name = row.get::<_, String>(1)?;
+            let data_type = row.get::<_, String>(2)?;
+            Ok(MfgMigrationColumn {
+                name,
+                kind: migration_column_kind(&data_type),
+            })
+        })?
+        .collect::<crate::database::Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Err(MfgRepositoryError::MigrationRejected(format!(
+            "required table {table_name} has no columns"
+        )));
+    }
+    Ok(columns)
+}
+
+fn migration_column_kind(data_type: &str) -> MfgMigrationColumnKind {
+    let normalized = data_type.to_ascii_uppercase();
+    if normalized.contains("INT") || normalized.contains("SERIAL") {
+        MfgMigrationColumnKind::Integer
+    } else if normalized.contains("REAL")
+        || normalized.contains("FLOAT")
+        || normalized.contains("DOUBLE")
+        || normalized.contains("NUMERIC")
+        || normalized.contains("DECIMAL")
+    {
+        MfgMigrationColumnKind::Real
+    } else if normalized.contains("BOOL") {
+        MfgMigrationColumnKind::Boolean
+    } else if normalized.contains("BLOB") || normalized.contains("BYTEA") {
+        MfgMigrationColumnKind::Bytes
+    } else {
+        MfgMigrationColumnKind::Text
+    }
+}
+
+fn migration_value_from_database(value: &crate::database::Value) -> MfgMigrationValue {
+    match value {
+        crate::database::Value::NullText
+        | crate::database::Value::NullInteger
+        | crate::database::Value::NullReal
+        | crate::database::Value::NullBool => MfgMigrationValue::Null,
+        crate::database::Value::Integer(value) => MfgMigrationValue::Integer(*value),
+        crate::database::Value::Real(value) => MfgMigrationValue::Real(*value),
+        crate::database::Value::Text(value) => MfgMigrationValue::Text(value.clone()),
+        crate::database::Value::Bool(value) => MfgMigrationValue::Boolean(*value),
+        crate::database::Value::Bytes(value) => MfgMigrationValue::Bytes(value.clone()),
+    }
+}
+
+fn migration_value_to_database(
+    value: &MfgMigrationValue,
+    kind: MfgMigrationColumnKind,
+) -> crate::database::Value {
+    match value {
+        MfgMigrationValue::Null => match kind {
+            MfgMigrationColumnKind::Integer => crate::database::Value::NullInteger,
+            MfgMigrationColumnKind::Real => crate::database::Value::NullReal,
+            MfgMigrationColumnKind::Boolean => crate::database::Value::NullBool,
+            MfgMigrationColumnKind::Text | MfgMigrationColumnKind::Bytes => {
+                crate::database::Value::NullText
+            }
+        },
+        MfgMigrationValue::Integer(value) => crate::database::Value::Integer(*value),
+        MfgMigrationValue::Real(value) => crate::database::Value::Real(*value),
+        MfgMigrationValue::Text(value) => crate::database::Value::Text(value.clone()),
+        MfgMigrationValue::Boolean(value) => crate::database::Value::Bool(*value),
+        MfgMigrationValue::Bytes(value) => crate::database::Value::Bytes(value.clone()),
+    }
+}
+
+fn quote_migration_identifier(identifier: &str) -> Result<String, MfgRepositoryError> {
+    if identifier.is_empty()
+        || !identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(MfgRepositoryError::MigrationRejected(format!(
+            "unsafe relational identifier {identifier:?}"
+        )));
+    }
+    Ok(format!("\"{identifier}\""))
+}
+
+fn migration_snapshot_digest(
+    schema_version: i64,
+    tables: &BTreeMap<String, MfgMigrationTable>,
+) -> Result<String, MfgRepositoryError> {
+    let encoded = serde_json::to_vec(&(schema_version, tables))?;
+    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+}
+
+fn initialize_schema(
+    connection: &impl crate::database::ConnectionLike,
+) -> crate::database::Result<()> {
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS matrix_schema (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            schema_version INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        params![],
+    )?;
+    connection.execute(
+        r"INSERT INTO matrix_schema (id, schema_version, updated_at)
+        VALUES (1, ?1, datetime('now'))
+        ON CONFLICT(id) DO UPDATE SET
+            schema_version = CASE
+                WHEN matrix_schema.schema_version < excluded.schema_version
+                THEN excluded.schema_version
+                ELSE matrix_schema.schema_version
+            END,
+            updated_at = excluded.updated_at",
+        [matrix_core::MATRIX_SCHEMA_VERSION],
+    )?;
+    connection.execute_batch(
+        r"
+
+        CREATE TABLE IF NOT EXISTS mfg_cockpit_profile (
+            profile_id TEXT PRIMARY KEY,
+            owner_ref TEXT NOT NULL,
+            profile_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_cockpit_profile_owner
+            ON mfg_cockpit_profile(owner_ref, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_cockpit_view_draft (
+            profile_id TEXT NOT NULL,
+            draft_revision INTEGER NOT NULL,
+            base_revision INTEGER NOT NULL,
+            actor_ref TEXT NOT NULL,
+            draft_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(profile_id, actor_ref)
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_cockpit_view_draft_actor
+            ON mfg_cockpit_view_draft(actor_ref, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_cockpit_view_proposal (
+            proposal_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            actor_ref TEXT NOT NULL,
+            task_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            proposal_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_cockpit_view_proposal_profile_actor
+            ON mfg_cockpit_view_proposal(profile_id, actor_ref, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_cockpit_view_version (
+            profile_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            base_revision INTEGER NOT NULL,
+            version_json TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            PRIMARY KEY(profile_id, revision)
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_cockpit_view_active (
+            profile_id TEXT PRIMARY KEY,
+            active_revision INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_cockpit_report (
+            report_id TEXT PRIMARY KEY,
+            profile_id TEXT NOT NULL,
+            owner_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            report_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_cockpit_report_profile
+            ON mfg_cockpit_report(profile_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review (
+            review_id TEXT PRIMARY KEY,
+            report_id TEXT NOT NULL,
+            report_revision INTEGER NOT NULL,
+            delivery_revision INTEGER NOT NULL,
+            dead_letter_digest TEXT NOT NULL,
+            requester_principal TEXT NOT NULL,
+            approval_id TEXT,
+            correlation_id TEXT NOT NULL,
+            requested_action TEXT,
+            decision TEXT,
+            reviewer_principal TEXT,
+            decision_lease_ref TEXT,
+            effect_key TEXT,
+            effect_receipt_ref TEXT,
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            review_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS review_approval_id_uq
+            ON mfg_report_delivery_review(approval_id) WHERE approval_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS review_correlation_id_uq
+            ON mfg_report_delivery_review(correlation_id);
+        CREATE INDEX IF NOT EXISTS review_status_updated_idx
+            ON mfg_report_delivery_review(status, updated_at);
+
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review_transition (
+            transition_id TEXT PRIMARY KEY,
+            review_id TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            action TEXT,
+            actor_principal TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            detail_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(review_id, idempotency_key)
+        );
+        CREATE INDEX IF NOT EXISTS transition_review_created_idx
+            ON mfg_report_delivery_review_transition(review_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS mfg_report_delivery_review_effect_outbox (
+            effect_id TEXT PRIMARY KEY,
+            review_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            effect_key TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            receipt_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS outbox_due_idx
+            ON mfg_report_delivery_review_effect_outbox(status, next_attempt_at);
+
+        CREATE TABLE IF NOT EXISTS mfg_alert_rule (
+            rule_id TEXT PRIMARY KEY,
+            owner_ref TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            rule_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_alert_rule_owner
+            ON mfg_alert_rule(owner_ref, enabled, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_alert_occurrence (
+            occurrence_id TEXT PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            occurrence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_alert_occurrence_status
+            ON mfg_alert_occurrence(status, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_alert_subscription (
+            subscription_id TEXT PRIMARY KEY,
+            rule_id TEXT NOT NULL,
+            subscriber_ref TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            subscription_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_alert_subscription_rule
+            ON mfg_alert_subscription(rule_id, subscriber_ref);
+
+        CREATE TABLE IF NOT EXISTS mfg_assignment (
+            assignment_id TEXT PRIMARY KEY,
+            task_ref TEXT NOT NULL,
+            workflow_id TEXT,
+            incident_id TEXT,
+            assignee_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            visibility TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            assignment_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_assignment_assignee
+            ON mfg_assignment(assignee_ref, status, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mfg_assignment_incident
+            ON mfg_assignment(incident_id, updated_at DESC) WHERE incident_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_mfg_assignment_task_assignee
+            ON mfg_assignment(task_ref, assignee_ref);
+
+        CREATE TABLE IF NOT EXISTS mfg_command_receipt (
+            idempotency_key TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            subject_ref TEXT NOT NULL,
+            receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt (
+            receipt_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            actor_principal TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            resource_ref TEXT NOT NULL,
+            expected_revision INTEGER,
+            result_revision INTEGER,
+            payload_digest TEXT NOT NULL,
+            lease_token TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            contract_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS mfg_mutation_receipt_idempotency_uq
+            ON mfg_mutation_receipt(idempotency_key);
+
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt_alias (
+            legacy_idempotency_key TEXT PRIMARY KEY,
+            receipt_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(receipt_id) REFERENCES mfg_mutation_receipt(receipt_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_mutation_receipt_repair_report (
+            report_id TEXT PRIMARY KEY,
+            idempotency_key TEXT NOT NULL,
+            existing_receipt_json TEXT NOT NULL,
+            incoming_receipt_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_projection_event (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            domain TEXT NOT NULL,
+            subject_ref TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_projection_event_cursor
+            ON mfg_projection_event(event_id);
+
+        CREATE TABLE IF NOT EXISTS mfg_live_epoch (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            epoch_id TEXT NOT NULL,
+            contract_version TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            rotation_reason TEXT NOT NULL,
+            retention_low_cursor INTEGER NOT NULL,
+            retention_high_cursor INTEGER NOT NULL,
+            last_sweep_high_cursor INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mfg_live_secret (
+            singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+            cursor_key_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS matrix_entity (
+            entity_id TEXT PRIMARY KEY,
+            entity_type TEXT NOT NULL,
+            canonical_key TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            source_keys_json TEXT NOT NULL,
+            attributes_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            entity_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(entity_type, canonical_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_entity_type
+            ON matrix_entity(entity_type, canonical_key);
+
+        CREATE TABLE IF NOT EXISTS matrix_entity_source_key (
+            source_system TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            source_ref TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(source_system, source_key),
+            FOREIGN KEY(entity_id) REFERENCES matrix_entity(entity_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_entity_source_entity
+            ON matrix_entity_source_key(entity_id);
+
+        CREATE TABLE IF NOT EXISTS matrix_relation (
+            relation_id TEXT PRIMARY KEY,
+            relation_type TEXT NOT NULL,
+            from_entity_id TEXT NOT NULL,
+            to_entity_id TEXT NOT NULL,
+            attributes_json TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            relation_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(relation_type, from_entity_id, to_entity_id),
+            FOREIGN KEY(from_entity_id) REFERENCES matrix_entity(entity_id) ON DELETE CASCADE,
+            FOREIGN KEY(to_entity_id) REFERENCES matrix_entity(entity_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_relation_from
+            ON matrix_relation(from_entity_id, relation_type);
+        CREATE INDEX IF NOT EXISTS idx_matrix_relation_to
+            ON matrix_relation(to_entity_id, relation_type);
+
+        CREATE TABLE IF NOT EXISTS matrix_fact (
+            fact_id TEXT PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            fact_type TEXT NOT NULL,
+            entity_refs_json TEXT NOT NULL,
+            metric_key TEXT,
+            dimensions_json TEXT NOT NULL,
+            measures_json TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            valid_from TEXT,
+            valid_to TEXT,
+            source_ref TEXT,
+            confidence REAL NOT NULL,
+            raw_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_fact_type ON matrix_fact(fact_type);
+        CREATE INDEX IF NOT EXISTS idx_matrix_fact_snapshot ON matrix_fact(snapshot_id);
+
+        CREATE TABLE IF NOT EXISTS matrix_attention_item (
+            attention_id TEXT PRIMARY KEY,
+            priority_score REAL NOT NULL,
+            status TEXT NOT NULL,
+            attention_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_attention_priority
+            ON matrix_attention_item(priority_score DESC, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_evidence_packet (
+            packet_id TEXT PRIMARY KEY,
+            attention_id TEXT,
+            packet_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS matrix_quality_gate (
+            gate_id TEXT PRIMARY KEY,
+            target_ref TEXT NOT NULL,
+            gate_type TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            score REAL NOT NULL,
+            gate_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_quality_gate_target
+            ON matrix_quality_gate(target_ref, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_metric_definition (
+            metric_id TEXT PRIMARY KEY,
+            definition_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS matrix_metric_state (
+            state_id TEXT PRIMARY KEY,
+            metric_id TEXT NOT NULL,
+            entity_scope TEXT NOT NULL,
+            period TEXT NOT NULL,
+            value REAL NOT NULL,
+            previous_value REAL,
+            delta REAL NOT NULL,
+            status TEXT NOT NULL,
+            state_json TEXT NOT NULL,
+            computed_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_metric_state_lookup
+            ON matrix_metric_state(metric_id, entity_scope, period, computed_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_metric_dependency (
+            dependency_id TEXT PRIMARY KEY,
+            upstream_metric_id TEXT NOT NULL,
+            downstream_metric_id TEXT NOT NULL,
+            dependency_type TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            dependency_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(upstream_metric_id, downstream_metric_id, dependency_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_metric_dependency_upstream
+            ON matrix_metric_dependency(upstream_metric_id, downstream_metric_id);
+        CREATE INDEX IF NOT EXISTS idx_matrix_metric_dependency_downstream
+            ON matrix_metric_dependency(downstream_metric_id, upstream_metric_id);
+
+        CREATE TABLE IF NOT EXISTS matrix_compute_job (
+            job_id TEXT PRIMARY KEY,
+            trigger_fact_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            priority REAL NOT NULL,
+            job_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_compute_job_status
+            ON matrix_compute_job(status, priority DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_matrix_compute_job_fact_type
+            ON matrix_compute_job(trigger_fact_type, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_change_event (
+            change_id TEXT PRIMARY KEY,
+            metric_id TEXT,
+            entity_ref TEXT NOT NULL,
+            period TEXT NOT NULL,
+            delta REAL NOT NULL,
+            severity_hint TEXT NOT NULL,
+            change_json TEXT NOT NULL,
+            detected_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_change_detected
+            ON matrix_change_event(detected_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_incident (
+            incident_id TEXT PRIMARY KEY,
+            attention_id TEXT,
+            evidence_packet_id TEXT,
+            task_id TEXT,
+            workflow_graph_id TEXT,
+            status TEXT NOT NULL,
+            incident_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_incident_updated
+            ON mfg_incident(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_operational_analysis (
+            analysis_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL,
+            evidence_packet_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            analysis_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_analysis_incident
+            ON mfg_operational_analysis(incident_id, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_action_execution (
+            execution_id TEXT PRIMARY KEY,
+            analysis_id TEXT NOT NULL,
+            incident_id TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            execution_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_action_execution_analysis
+            ON mfg_action_execution(analysis_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mfg_action_execution_incident
+            ON mfg_action_execution(incident_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_memory_case (
+            case_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL,
+            problem_signature TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            memory_case_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_memory_case_incident
+            ON mfg_memory_case(incident_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mfg_memory_case_signature
+            ON mfg_memory_case(problem_signature);
+
+        CREATE TABLE IF NOT EXISTS mfg_playbook (
+            playbook_id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            scenario TEXT NOT NULL,
+            playbook_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_playbook_domain
+            ON mfg_playbook(domain, scenario);
+
+        CREATE TABLE IF NOT EXISTS matrix_source_pack (
+            source_pack_id TEXT PRIMARY KEY,
+            source_name TEXT NOT NULL,
+            access_mode TEXT NOT NULL,
+            refresh_mode TEXT NOT NULL,
+            source_pack_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_source_pack_source
+            ON matrix_source_pack(source_name, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_data_plane_watermark (
+            source_ref TEXT NOT NULL,
+            fact_type TEXT NOT NULL,
+            partition_ref TEXT NOT NULL,
+            high_watermark TEXT NOT NULL,
+            last_batch_id TEXT NOT NULL,
+            watermark_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(source_ref, fact_type, partition_ref)
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_data_plane_watermark_updated
+            ON matrix_data_plane_watermark(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_connector_run (
+            run_id TEXT PRIMARY KEY,
+            source_pack_id TEXT NOT NULL,
+            connector_kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            run_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_connector_run_source
+            ON matrix_connector_run(source_pack_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_matrix_connector_run_status
+            ON matrix_connector_run(status, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_ontology_pack (
+            ontology_id TEXT PRIMARY KEY,
+            domain TEXT NOT NULL,
+            version TEXT NOT NULL,
+            pack_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS matrix_entity_match_candidate (
+            candidate_id TEXT PRIMARY KEY,
+            left_entity_id TEXT NOT NULL,
+            right_entity_id TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            status TEXT NOT NULL,
+            candidate_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_entity_match_candidate_entities
+            ON matrix_entity_match_candidate(left_entity_id, right_entity_id);
+
+        CREATE TABLE IF NOT EXISTS matrix_entity_conflict_decision (
+            decision_id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            survivor_entity_id TEXT NOT NULL,
+            retired_entity_id TEXT NOT NULL,
+            decision_json TEXT NOT NULL,
+            decided_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_entity_conflict_candidate
+            ON matrix_entity_conflict_decision(candidate_id, decided_at DESC);
+
+        CREATE TABLE IF NOT EXISTS matrix_metric_snapshot (
+            snapshot_id TEXT PRIMARY KEY,
+            scope_ref TEXT NOT NULL,
+            metric_ids_json TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_matrix_metric_snapshot_scope
+            ON matrix_metric_snapshot(scope_ref, created_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_skill_execution (
+            execution_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL,
+            skill_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            execution_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_skill_execution_incident
+            ON mfg_skill_execution(incident_id, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_mfg_skill_execution_skill
+            ON mfg_skill_execution(skill_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS mfg_workflow_graph (
+            workflow_id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL UNIQUE,
+            task_id TEXT,
+            status TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            graph_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_mfg_workflow_graph_incident
+            ON mfg_workflow_graph(incident_id);
+        CREATE INDEX IF NOT EXISTS idx_mfg_workflow_graph_task
+            ON mfg_workflow_graph(task_id) WHERE task_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_mfg_workflow_graph_status
+            ON mfg_workflow_graph(status, updated_at DESC);",
+    )?;
+    migrate_mfg_incident_workflow_column(connection)?;
+    recover_interrupted_report_delivery_review_effects(connection)?;
+    migrate_mfg_command_receipts(connection)?;
+    migrate_mfg_mutation_receipt_lease_token(connection)?;
+    migrate_mfg_live_epoch_sweep_cursor(connection)?;
+    ensure_live_epoch(connection)?;
+    Ok(())
+}

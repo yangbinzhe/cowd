@@ -1,5 +1,5 @@
 {
-  "contract": "cowd.ownership-split/v1",
+  "contract": "cowd.ownership-split/v1.1-final",
   "source": {
     "repository": "crates/app-mfg-core/src/repository.rs",
     "table_inventory": "MFG_MIGRATION_TABLES",

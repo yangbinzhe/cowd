@@ -14,8 +14,17 @@ use crate::{
 };
 
 pub const OWNERSHIP_CONTRACT_DIGEST_V1: &str =
-    "sha256:e0caeb2826dd2e6f113898da212ef3279c8510a9dcde706090aab353b9d7f35f";
-pub const OWNERSHIP_CONTRACT_VERSION_V1: &str = "cowd.ownership-split/v1";
+    "sha256:84bd9bb410cb413a7603954af21dbe809b9308ecab86684445c71274de9486e8";
+pub const OWNERSHIP_CONTRACT_VERSION_V1: &str = "cowd.ownership-split/v1.1-final";
+
+const FIELD_MAPPING: &str = include_str!("../../../../contracts/ownership/v1/field-mapping.json");
+const REVISION_PROJECTION: &str =
+    include_str!("../../../../contracts/ownership/v1/revision-projection.json");
+const REFERENCE_GRAPH: &str = include_str!("../../../../contracts/ownership/v1/reference-graph.json");
+const REFERENCE_ENCODING: &str =
+    include_str!("../../../../contracts/ownership/v1/reference-encoding.json");
+const JSON_SCHEMA_REGISTRY: &str =
+    include_str!("../../../../contracts/ownership/v1/json-schema-registry.json");
 
 const CORE_TABLES: &[(&str, &[&str], &[&str])] = &[
     (
@@ -327,6 +336,7 @@ pub struct OwnershipImportSource {
     pub exported_at: DateTime<Utc>,
     pub maintenance_fence_id: String,
     pub ownership_contract_digest: String,
+    pub external_reference_catalog_digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -344,8 +354,8 @@ pub struct OwnershipImportObject {
     pub source_table: String,
     pub stable_id: BTreeMap<String, Value>,
     pub revision: OwnershipImportRevision,
-    pub source_references: Vec<String>,
-    pub evidence_references: Vec<String>,
+    pub source_references: Vec<OwnershipReference>,
+    pub evidence_references: Vec<OwnershipReference>,
     pub payload: BTreeMap<String, Value>,
     pub payload_digest: String,
 }
@@ -353,8 +363,38 @@ pub struct OwnershipImportObject {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnershipImportRevision {
-    pub mapping: String,
+    pub strategy: String,
+    pub authority: Option<OwnershipRevisionAuthority>,
+    pub context: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipRevisionAuthority {
+    pub field: String,
+    #[serde(rename = "type")]
+    pub value_type: String,
+    pub comparison: String,
     pub value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipReference {
+    pub namespace: String,
+    pub aggregate: String,
+    pub stable_id: BTreeMap<String, Value>,
+    pub revision: Option<Value>,
+    pub digest: Option<String>,
+    pub source: OwnershipReferenceSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipReferenceSource {
+    pub table: String,
+    pub field: String,
+    pub json_pointer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -363,6 +403,8 @@ pub struct OwnershipReconciliation {
     pub pending_outbox: Vec<OwnershipReconcileRecord>,
     pub command_receipts: Vec<OwnershipReconcileRecord>,
     pub mutation_receipts: Vec<OwnershipReconcileRecord>,
+    pub mutation_receipt_aliases: Vec<OwnershipReconcileRecord>,
+    pub mutation_receipt_repairs: Vec<OwnershipReconcileRecord>,
     pub set_digest: String,
 }
 
@@ -384,10 +426,28 @@ pub struct OwnershipExcludedRecord {
 
 #[derive(Debug, Clone, Default)]
 pub struct OwnershipImportContext {
-    /// Evidence references resolved by the offline export verifier.
-    pub evidence_references: BTreeSet<String>,
-    /// References owned outside Matrix (for example Core entity-reference aliases).
-    pub external_references: BTreeSet<String>,
+    /// Strict `ExternalReferenceCatalogV1` bytes bound by the source envelope.
+    pub external_reference_catalog: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReferenceCatalogV1 {
+    schema: String,
+    digest: String,
+    owner: String,
+    exported_at: DateTime<Utc>,
+    entries: Vec<ExternalReferenceCatalogEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalReferenceCatalogEntryV1 {
+    namespace: String,
+    aggregate: String,
+    stable_id: BTreeMap<String, Value>,
+    revision: Option<Value>,
+    digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -504,6 +564,7 @@ impl MfgOwnershipSplitSnapshotV1 {
         context: &OwnershipImportContext,
     ) -> Result<CoreMatrixImportPlan, OwnershipImportError> {
         self.validate_envelope()?;
+        let catalog = decode_external_catalog(context, &self.source)?;
         validate_section(&self.mfg_domain, "mfg", MFG_TABLES)?;
         validate_section(&self.core_matrix_domain, "core", &core_table_names())?;
         validate_digest(&self.reconciliation.set_digest)?;
@@ -513,6 +574,8 @@ impl MfgOwnershipSplitSnapshotV1 {
             .iter()
             .chain(&self.reconciliation.command_receipts)
             .chain(&self.reconciliation.mutation_receipts)
+            .chain(&self.reconciliation.mutation_receipt_aliases)
+            .chain(&self.reconciliation.mutation_receipt_repairs)
         {
             if record.stable_ref.trim().is_empty() || record.status.trim().is_empty() {
                 return Err(invalid(
@@ -525,9 +588,12 @@ impl MfgOwnershipSplitSnapshotV1 {
             "pending_outbox": self.reconciliation.pending_outbox,
             "command_receipts": self.reconciliation.command_receipts,
             "mutation_receipts": self.reconciliation.mutation_receipts,
+            "mutation_receipt_aliases": self.reconciliation.mutation_receipt_aliases,
+            "mutation_receipt_repairs": self.reconciliation.mutation_receipt_repairs,
         });
-        require_digest(
+        require_domain_digest(
             "reconciliation",
+            "cowd.ownership.reconciliation.v1",
             &reconciliation_value,
             &self.reconciliation.set_digest,
         )?;
@@ -536,8 +602,9 @@ impl MfgOwnershipSplitSnapshotV1 {
         let mut mfg_section_value =
             serde_json::to_value(&self.mfg_domain).map_err(|error| invalid(error.to_string()))?;
         remove_digest_field(&mut mfg_section_value, "section_digest")?;
-        require_digest(
+        require_domain_digest(
             "mfg section",
+            "cowd.ownership.section.v1",
             &mfg_section_value,
             &self.mfg_domain.section_digest,
         )?;
@@ -545,8 +612,9 @@ impl MfgOwnershipSplitSnapshotV1 {
         let mut section_value = serde_json::to_value(&self.core_matrix_domain)
             .map_err(|error| invalid(error.to_string()))?;
         remove_digest_field(&mut section_value, "section_digest")?;
-        require_digest(
+        require_domain_digest(
             "core section",
+            "cowd.ownership.section.v1",
             &section_value,
             &self.core_matrix_domain.section_digest,
         )?;
@@ -554,12 +622,20 @@ impl MfgOwnershipSplitSnapshotV1 {
         let mut whole_value =
             serde_json::to_value(self).map_err(|error| invalid(error.to_string()))?;
         remove_digest_field(&mut whole_value, "whole_snapshot_digest")?;
-        require_digest("whole snapshot", &whole_value, &self.whole_snapshot_digest)?;
+        require_domain_digest(
+            "whole snapshot",
+            "cowd.ownership.snapshot.v1",
+            &whole_value,
+            &self.whole_snapshot_digest,
+        )?;
+
+        validate_contract_projection(self)?;
+        validate_typed_references(self, &catalog)?;
 
         let mut seen = BTreeMap::<String, (String, OwnershipImportRevision)>::new();
         let mut records = Vec::with_capacity(self.core_matrix_domain.objects.len());
         for object in &self.core_matrix_domain.objects {
-            let record = validate_core_object(object, context)?;
+            let record = validate_core_object(object)?;
             let stable_ref = stable_ref(object)?;
             if let Some((previous_digest, previous_revision)) = seen.insert(
                 stable_ref.clone(),
@@ -575,7 +651,6 @@ impl MfgOwnershipSplitSnapshotV1 {
             }
             records.push(record);
         }
-        validate_reference_graph(&self.core_matrix_domain.objects, context)?;
         Ok(CoreMatrixImportPlan {
             source: self.source.clone(),
             whole_snapshot_digest: self.whole_snapshot_digest.clone(),
@@ -600,6 +675,7 @@ impl MfgOwnershipSplitSnapshotV1 {
         if self.source.ownership_contract_digest != OWNERSHIP_CONTRACT_DIGEST_V1 {
             return Err(invalid("ownership contract digest mismatch"));
         }
+        validate_digest(&self.source.external_reference_catalog_digest)?;
         validate_digest(&self.whole_snapshot_digest)
     }
 }
@@ -623,9 +699,14 @@ fn validate_section(
             )));
         }
         validate_digest(&object.payload_digest)?;
-        require_digest("payload", &object.payload, &object.payload_digest)?;
-        unique_non_empty(&object.source_references, "source_references")?;
-        unique_non_empty(&object.evidence_references, "evidence_references")?;
+        require_domain_digest(
+            "payload",
+            "cowd.ownership.payload.v1",
+            &object.payload,
+            &object.payload_digest,
+        )?;
+        validate_reference_order(&object.source_references, "source_references")?;
+        validate_reference_order(&object.evidence_references, "evidence_references")?;
     }
     Ok(())
 }
@@ -660,7 +741,6 @@ fn validate_excluded(records: &[OwnershipExcludedRecord]) -> Result<(), Ownershi
 
 fn validate_core_object(
     object: &OwnershipImportObject,
-    context: &OwnershipImportContext,
 ) -> Result<ImportedCoreMatrixRecord, OwnershipImportError> {
     let (_, stable_fields, fields) = table_spec(&object.source_table)
         .ok_or_else(|| invalid(format!("unknown Core table `{}`", object.source_table)))?;
@@ -670,21 +750,6 @@ fn validate_core_object(
         if object.stable_id.get(*field) != object.payload.get(*field) {
             return Err(invalid(format!(
                 "stable id field `{field}` differs from payload"
-            )));
-        }
-    }
-    if !matches!(object.revision.mapping.as_str(), "none" | "embedded") {
-        return Err(invalid(
-            "Core object revision mapping must be none or embedded",
-        ));
-    }
-    if object.revision.mapping == "none" && !object.revision.value.is_null() {
-        return Err(invalid("revision mapping none requires null value"));
-    }
-    for reference in &object.evidence_references {
-        if !context.evidence_references.contains(reference) {
-            return Err(invalid(format!(
-                "unresolved evidence reference `{reference}`"
             )));
         }
     }

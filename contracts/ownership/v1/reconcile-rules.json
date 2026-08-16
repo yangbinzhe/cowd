@@ -1,5 +1,5 @@
 {
-  "contract": "cowd.ownership-reconcile/v1",
+  "contract": "cowd.ownership-reconcile/v1.1-final",
   "invariant": "one source record has exactly one authoritative owner; projections and runtime state are never promoted to authority",
   "preflight": [
     "freeze_source_writes_or_acquire_migration_fence",

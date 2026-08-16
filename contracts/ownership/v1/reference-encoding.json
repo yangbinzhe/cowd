@@ -1,53 +1,61 @@
 {
-  "contract": "cowd.ownership-references/v1.1-final",
-  "policy": {
-    "unknown_reference_kind": "reject",
-    "dangling_reference": "reject_snapshot",
-    "hidden_json_scan": "required"
+  "contract": "cowd.ownership-reference-encoding/v1.1-final",
+  "typed_reference": {
+    "fields": [
+      "namespace",
+      "aggregate",
+      "stable_id",
+      "revision",
+      "digest",
+      "source"
+    ],
+    "optional": [
+      "revision",
+      "digest"
+    ],
+    "stable_id": "canonical object keyed by target primary-key field"
   },
-  "external_targets": {
-    "core.task": {
-      "boundary": "Cowd Core task contract",
-      "key": "task_id"
-    },
-    "core.principal": {
-      "boundary": "Cowd Core identity contract",
-      "key": "principal_ref"
-    },
-    "core.approval": {
-      "boundary": "Cowd Core approval contract",
-      "key": "approval_id"
-    },
-    "core.lease": {
-      "boundary": "Cowd Core lease contract",
-      "key": "lease_ref"
-    },
-    "core.receipt": {
-      "boundary": "Cowd Core receipt contract",
-      "key": "receipt_ref"
-    },
-    "core.runtime_execution": {
-      "boundary": "Cowd Core runtime execution contract",
-      "key": "execution_ref"
-    },
-    "core.entity_reference": {
-      "boundary": "Cowd Core entity reference resolver",
-      "key": "entity_ref"
-    },
-    "core.metric_reference": {
-      "boundary": "Cowd Core metric reference resolver",
-      "key": "metric_ref"
-    },
-    "evidence.reference": {
-      "boundary": "versioned evidence/provenance resolver",
-      "key": "evidence_ref"
-    },
-    "surface.destination": {
-      "boundary": "Cowd Surface notification contract",
-      "key": "destination_ref"
-    }
+  "canonical_order": "ascending canonical UTF-8 encoded bytes",
+  "deduplication": "reject duplicate canonical encoded bytes",
+  "internal_resolution": "every internal reference must resolve within the same complete snapshot",
+  "external_resolution": "every external reference must resolve against the bound ExternalReferenceCatalogV1",
+  "external_catalog": {
+    "contract": "ExternalReferenceCatalogV1",
+    "required": [
+      "schema",
+      "digest",
+      "owner",
+      "exported_at",
+      "entries"
+    ],
+    "binding": "source.external_reference_catalog_digest MUST equal catalog.digest"
   },
-  "edges": [
+  "source_fields": [
+    "matrix_connector_run.source_pack_id",
+    "matrix_data_plane_watermark.source_ref",
+    "matrix_entity.source_keys_json",
+    "matrix_entity_source_key.source_key",
+    "matrix_entity_source_key.source_ref",
+    "matrix_entity_source_key.source_system",
+    "matrix_fact.source_ref",
+    "matrix_source_pack.source_name",
+    "matrix_source_pack.source_pack_id",
+    "matrix_source_pack.source_pack_json",
+    "mfg_mutation_receipt.resource_ref"
+  ],
+  "evidence_fields": [
+    "mfg_command_receipt.receipt_json",
+    "mfg_incident.evidence_packet_id",
+    "mfg_mutation_receipt.receipt_id",
+    "mfg_mutation_receipt.response_json",
+    "mfg_mutation_receipt_alias.receipt_id",
+    "mfg_mutation_receipt_repair_report.existing_receipt_json",
+    "mfg_mutation_receipt_repair_report.incoming_receipt_json",
+    "mfg_operational_analysis.evidence_packet_id",
+    "mfg_report_delivery_review.effect_receipt_ref",
+    "mfg_report_delivery_review_effect_outbox.receipt_ref"
+  ],
+  "column_reference_edges": [
     {
       "source": {
         "table": "mfg_cockpit_view_draft",
@@ -729,7 +737,9 @@
       "resolution": "identity",
       "on_dangling": "reject_snapshot",
       "evidence": "workflow.rs::MfgWorkflowGraph::task_id"
-    },
+    }
+  ],
+  "json_reference_edges": [
     {
       "source": {
         "table": "mfg_cockpit_profile",

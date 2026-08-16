@@ -1,0 +1,78 @@
+{
+  "schema": "ExternalReferenceCatalogV1",
+  "digest": "sha256:90345e6cce7e48cce40cc9df749e3ce6f1dd7ae396551d76f53e754bcca5f2da",
+  "owner": "cowd-core",
+  "exported_at": "2026-08-15T00:00:00Z",
+  "entries": [
+    {
+      "namespace": "core.approval",
+      "aggregate": "approval_id",
+      "stable_id": {
+        "id": "reference-core-approval"
+      }
+    },
+    {
+      "namespace": "core.entity_reference",
+      "aggregate": "entity_ref",
+      "stable_id": {
+        "id": "reference-core-entity_reference"
+      }
+    },
+    {
+      "namespace": "core.lease",
+      "aggregate": "lease_ref",
+      "stable_id": {
+        "id": "reference-core-lease"
+      }
+    },
+    {
+      "namespace": "core.metric_reference",
+      "aggregate": "metric_ref",
+      "stable_id": {
+        "id": "reference-core-metric_reference"
+      }
+    },
+    {
+      "namespace": "core.principal",
+      "aggregate": "principal_ref",
+      "stable_id": {
+        "id": "reference-core-principal"
+      }
+    },
+    {
+      "namespace": "core.receipt",
+      "aggregate": "receipt_ref",
+      "stable_id": {
+        "id": "reference-core-receipt"
+      }
+    },
+    {
+      "namespace": "core.runtime_execution",
+      "aggregate": "execution_ref",
+      "stable_id": {
+        "id": "reference-core-runtime_execution"
+      }
+    },
+    {
+      "namespace": "core.task",
+      "aggregate": "task_id",
+      "stable_id": {
+        "id": "reference-core-task"
+      }
+    },
+    {
+      "namespace": "evidence.reference",
+      "aggregate": "evidence_ref",
+      "stable_id": {
+        "id": "reference-evidence-reference"
+      }
+    },
+    {
+      "namespace": "surface.destination",
+      "aggregate": "destination_ref",
+      "stable_id": {
+        "id": "reference-surface-destination"
+      }
+    }
+  ]
+}

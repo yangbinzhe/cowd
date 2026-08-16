@@ -16,7 +16,7 @@
   ],
   "properties": {
     "contract_version": {
-      "const": "cowd.ownership-split/v1"
+      "const": "cowd.ownership-split/v1.1-final"
     },
     "source": {
       "$ref": "#/$defs/source"
@@ -69,7 +69,8 @@
         "schema_version",
         "exported_at",
         "maintenance_fence_id",
-        "ownership_contract_digest"
+        "ownership_contract_digest",
+        "external_reference_catalog_digest"
       ],
       "properties": {
         "app_id": {
@@ -90,6 +91,9 @@
           "$ref": "#/$defs/nonEmpty"
         },
         "ownership_contract_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "external_reference_catalog_digest": {
           "$ref": "#/$defs/digest"
         }
       }
@@ -165,34 +169,72 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "mapping",
-            "value"
+            "strategy",
+            "authority",
+            "context"
           ],
           "properties": {
-            "mapping": {
+            "strategy": {
               "enum": [
-                "column",
-                "embedded",
-                "none"
+                "monotonic_authority",
+                "immutable_payload"
               ]
             },
-            "value": {
-              "$ref": "#/$defs/scalar"
+            "authority": {
+              "anyOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "field",
+                    "type",
+                    "comparison",
+                    "value"
+                  ],
+                  "properties": {
+                    "field": {
+                      "$ref": "#/$defs/nonEmpty"
+                    },
+                    "type": {
+                      "enum": [
+                        "INTEGER",
+                        "TEXT"
+                      ]
+                    },
+                    "comparison": {
+                      "enum": [
+                        "unsigned_integer",
+                        "lexicographic_utf8"
+                      ]
+                    },
+                    "value": {
+                      "$ref": "#/$defs/scalar"
+                    }
+                  }
+                }
+              ]
+            },
+            "context": {
+              "type": "object",
+              "additionalProperties": {
+                "$ref": "#/$defs/scalar"
+              }
             }
           }
         },
         "source_references": {
           "type": "array",
-          "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/nonEmpty"
+            "$ref": "#/$defs/reference"
           }
         },
         "evidence_references": {
           "type": "array",
-          "uniqueItems": true,
           "items": {
-            "$ref": "#/$defs/nonEmpty"
+            "$ref": "#/$defs/reference"
           }
         },
         "payload": {
@@ -289,6 +331,8 @@
         "pending_outbox",
         "command_receipts",
         "mutation_receipts",
+        "mutation_receipt_aliases",
+        "mutation_receipt_repairs",
         "set_digest"
       ],
       "properties": {
@@ -312,6 +356,18 @@
         },
         "set_digest": {
           "$ref": "#/$defs/digest"
+        },
+        "mutation_receipt_aliases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reconcileRecord"
+          }
+        },
+        "mutation_receipt_repairs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/reconcileRecord"
+          }
         }
       }
     },
@@ -336,6 +392,137 @@
         },
         "regeneration": {
           "$ref": "#/$defs/nonEmpty"
+        }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namespace",
+        "aggregate",
+        "stable_id",
+        "source"
+      ],
+      "properties": {
+        "namespace": {
+          "type": "string",
+          "minLength": 1
+        },
+        "aggregate": {
+          "type": "string",
+          "minLength": 1
+        },
+        "stable_id": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/scalar"
+          }
+        },
+        "revision": {
+          "type": [
+            "integer",
+            "string",
+            "null"
+          ]
+        },
+        "digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "table",
+            "field",
+            "json_pointer"
+          ],
+          "properties": {
+            "table": {
+              "type": "string",
+              "minLength": 1
+            },
+            "field": {
+              "type": "string",
+              "minLength": 1
+            },
+            "json_pointer": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "externalReferenceCatalogEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "namespace",
+        "aggregate",
+        "stable_id"
+      ],
+      "properties": {
+        "namespace": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "aggregate": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "stable_id": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/scalar"
+          }
+        },
+        "revision": {
+          "$ref": "#/$defs/scalar"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "externalReferenceCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "digest",
+        "owner",
+        "exported_at",
+        "entries"
+      ],
+      "properties": {
+        "schema": {
+          "const": "ExternalReferenceCatalogV1"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "owner": {
+          "$ref": "#/$defs/nonEmpty"
+        },
+        "exported_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/externalReferenceCatalogEntry"
+          }
         }
       }
     }
