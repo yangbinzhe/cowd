@@ -11609,13 +11609,13 @@ fn typed_satisfied_focus_acceptance_scope_keys(
                 .into_iter()
                 .all(|concrete| {
                     let required = resolver.compile_required_acceptance(&[], &[concrete]);
-                    crate::path_identity::evaluate_observed_acceptance(
-                        &required,
-                        Vec::new(),
-                        evidence.clone(),
-                    )
-                    .unresolved_obligation_ids
-                    .is_empty()
+                    // Host uses the single Runtime acceptance evaluator; no
+                    // second acceptance algorithm may mint root verdicts.
+                    required.evidence_obligations.iter().all(|obligation| {
+                        crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
+                            obligation, &evidence,
+                        )
+                    })
                 })
         })
         .cloned()
