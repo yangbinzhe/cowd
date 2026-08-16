@@ -242,6 +242,7 @@ impl<C: AppWorkerConnector> AppRuntimeSupervisor<C> {
 
     pub async fn start_resident(&self) -> Result<(), SupervisorError> {
         let mut required_failures = Vec::new();
+        let mut failure_details = Vec::new();
         for app in self
             .inner
             .catalog
@@ -260,14 +261,20 @@ impl<C: AppWorkerConnector> AppRuntimeSupervisor<C> {
                     false,
                 )
                 .await;
-            if result.is_err() && app.policy.required {
-                required_failures.push(app.manifest.app_id.clone());
+            if let Err(error) = result {
+                if app.policy.required {
+                    required_failures.push(app.manifest.app_id.clone());
+                    failure_details.push(format!("{}: {error}", app.manifest.app_id));
+                }
             }
         }
         if required_failures.is_empty() {
             Ok(())
         } else {
-            Err(SupervisorError::RequiredResidentsFailed(required_failures))
+            Err(SupervisorError::RequiredResidentsFailed {
+                apps: required_failures,
+                details: failure_details,
+            })
         }
     }
 
@@ -509,6 +516,7 @@ impl<C: AppWorkerConnector> SupervisorInner<C> {
                             return Err(SupervisorError::BackingOff {
                                 app_id: app_id.clone(),
                                 retry_after: retry_at.saturating_duration_since(Instant::now()),
+                                reason: state.reason.clone(),
                             });
                         }
                     }

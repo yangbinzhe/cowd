@@ -100,15 +100,19 @@ pub enum SupervisorError {
     WaiterOverloaded(AppId),
     #[error("application `{0}` is circuit-open")]
     CircuitOpen(AppId),
-    #[error("application `{app_id}` is backing off for {retry_after:?}")]
+    #[error("application `{app_id}` is backing off for {retry_after:?} reason={reason:?}")]
     BackingOff {
         app_id: AppId,
         retry_after: Duration,
+        reason: Option<String>,
     },
     #[error("application `{app_id}` worker failed: {detail}")]
     Worker { app_id: AppId, detail: String },
-    #[error("required resident applications failed: {0:?}")]
-    RequiredResidentsFailed(Vec<AppId>),
+    #[error("required resident applications failed: {apps:?} details={details:?}")]
+    RequiredResidentsFailed {
+        apps: Vec<AppId>,
+        details: Vec<String>,
+    },
     #[error("supervisor is shutting down")]
     ShuttingDown,
     #[error("operation exceeded its {0:?} deadline")]
