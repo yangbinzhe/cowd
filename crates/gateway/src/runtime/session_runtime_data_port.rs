@@ -398,9 +398,10 @@ impl GatewaySessionRuntimePort {
         kind: SessionInputJournalKind,
         payload: serde_json::Value,
         occurred_at_ms: u64,
+        event_id: &str,
     ) -> Result<Option<usize>, session::SessionError> {
         self.service()?
-            .append_session_input_journal(session_id, kind, payload, occurred_at_ms)
+            .append_session_input_journal(session_id, kind, payload, occurred_at_ms, event_id)
             .await
             .map(|event| Some(event.sequence))
     }

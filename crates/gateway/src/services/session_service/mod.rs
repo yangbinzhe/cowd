@@ -2154,8 +2154,9 @@ impl SessionService {
         kind: crate::session_runtime_data_port::SessionInputJournalKind,
         payload: serde_json::Value,
         occurred_at_ms: u64,
+        event_id: &str,
     ) -> Result<SessionEvent, SessionError> {
-        let event = session::SessionDomainEvent::new(
+        let mut event = session::SessionDomainEvent::new(
             session_id.to_string(),
             0,
             session::SessionDomainScope::Turn,
@@ -2163,7 +2164,9 @@ impl SessionService {
             payload,
             occurred_at_ms,
         );
-        self.append_runtime_domain_event(&event).await
+        event.event_id = event_id.to_string();
+        let (stored, _replayed) = self.append_runtime_domain_event_if_absent(&event).await?;
+        Ok(stored)
     }
 
     pub(crate) async fn append_runtime_context_envelope_if_absent(

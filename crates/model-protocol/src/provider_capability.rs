@@ -79,6 +79,20 @@ impl ProviderCapabilityProfile {
 
     #[must_use]
     pub fn resolve(protocol: ProviderProtocol, model: &str) -> Self {
+        Self::resolve_for_reasoning_mode(protocol, model, None)
+    }
+
+    /// Resolve provider capability facts after the exact model and reasoning
+    /// mode are both known. DeepSeek v4 thinking mode is a documented
+    /// endpoint behavior, not a model-name prefix guess: the same model in a
+    /// non-thinking mode keeps the default explicit `tool_choice` support,
+    /// and any other model with thinking enabled is not downgraded.
+    #[must_use]
+    pub fn resolve_for_reasoning_mode(
+        protocol: ProviderProtocol,
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> Self {
         let parallel_request = match protocol {
             ProviderProtocol::Anthropic => CapabilityState::Unsupported,
             ProviderProtocol::Completions | ProviderProtocol::Responses => {
@@ -105,11 +119,37 @@ impl ProviderCapabilityProfile {
             supports_public_reasoning_summary: CapabilityFact::bundled(public_reasoning),
             requires_reasoning_signature_roundtrip: CapabilityFact::bundled(signature_roundtrip),
         };
+        if Self::explicit_tool_choice_known_unsupported(model, reasoning_effort) {
+            profile.supports_explicit_tool_choice =
+                CapabilityFact::bundled(CapabilityState::Unsupported);
+        }
 
         if let Some(info) = global_registry().capacity_model_info(model) {
             apply_configured_tags(&mut profile, &info.capabilities);
         }
         profile
+    }
+
+    /// The single wire-boundary truth for "this exact model in this reasoning
+    /// mode must not receive an explicit `tool_choice` field". Both the
+    /// Runtime capability gate and the provider payload builders call this
+    /// helper so they cannot drift.
+    #[must_use]
+    pub fn explicit_tool_choice_known_unsupported(
+        model: &str,
+        reasoning_effort: Option<&str>,
+    ) -> bool {
+        let thinking = reasoning_effort
+            .is_some_and(|effort| !effort.trim().is_empty() && effort.trim() != "none");
+        thinking && Self::is_deepseek_v4(model)
+    }
+
+    /// Exact DeepSeek v4 family check. It matches the canonical model id only;
+    /// unknown models are never downgraded by prefix heuristics.
+    fn is_deepseek_v4(model: &str) -> bool {
+        let lowered = model.trim().to_ascii_lowercase();
+        let canonical = lowered.rsplit('/').next().unwrap_or_default();
+        matches!(canonical, "deepseek-v4-pro" | "deepseek-v4-flash")
     }
 }
 
@@ -193,6 +233,90 @@ mod tests {
         assert_eq!(
             decoded.supports_explicit_tool_choice.state,
             CapabilityState::Unknown
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_thinking_disables_explicit_tool_choice_without_prefix_guessing() {
+        let thinking = ProviderCapabilityProfile::resolve_for_reasoning_mode(
+            ProviderProtocol::Completions,
+            "deepseek-v4-flash",
+            Some("high"),
+        );
+        assert_eq!(
+            thinking.supports_explicit_tool_choice,
+            CapabilityFact::bundled(CapabilityState::Unsupported)
+        );
+        assert_eq!(
+            thinking.supports_tool_calls.state,
+            CapabilityState::Supported,
+            "tools stay advertised; only the explicit tool_choice field is omitted"
+        );
+
+        let pro_thinking = ProviderCapabilityProfile::resolve_for_reasoning_mode(
+            ProviderProtocol::Completions,
+            "deepseek-v4-pro",
+            Some("max"),
+        );
+        assert_eq!(
+            pro_thinking.supports_explicit_tool_choice.state,
+            CapabilityState::Unsupported
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_non_thinking_keeps_explicit_tool_choice_support() {
+        for reasoning in [None, Some("none")] {
+            let profile = ProviderCapabilityProfile::resolve_for_reasoning_mode(
+                ProviderProtocol::Completions,
+                "deepseek-v4-flash",
+                reasoning,
+            );
+            assert_eq!(
+                profile.supports_explicit_tool_choice.state,
+                CapabilityState::Supported
+            );
+        }
+    }
+
+    #[test]
+    fn other_models_are_not_downgraded_by_thinking_mode_or_prefix() {
+        let other_thinking = ProviderCapabilityProfile::resolve_for_reasoning_mode(
+            ProviderProtocol::Completions,
+            "deepseek-v3",
+            Some("high"),
+        );
+        assert_eq!(
+            other_thinking.supports_explicit_tool_choice.state,
+            CapabilityState::Supported,
+            "only the exact deepseek-v4 family is downgraded"
+        );
+        assert!(
+            !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
+                "deepseek-v3",
+                Some("high")
+            ),
+            "similar deepseek families must not be downgraded by prefix guessing"
+        );
+        assert!(
+            ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
+                "deepseek-v4-pro",
+                Some("high")
+            )
+        );
+    }
+
+    #[test]
+    fn configured_profile_can_explicitly_override_thinking_unsupported() {
+        let mut thinking = ProviderCapabilityProfile::resolve_for_reasoning_mode(
+            ProviderProtocol::Completions,
+            "deepseek-v4-flash",
+            Some("max"),
+        );
+        apply_configured_tags(&mut thinking, &["explicit_tool_choice".to_string()]);
+        assert_eq!(
+            thinking.supports_explicit_tool_choice,
+            CapabilityFact::configured(CapabilityState::Supported)
         );
     }
 }

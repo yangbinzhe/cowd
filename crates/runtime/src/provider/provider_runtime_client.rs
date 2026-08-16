@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use harness_contract::tool::ToolExposureProjection;
 use model_protocol::provider_capability::{CapabilityState, ProviderCapabilityProfile};
-use model_protocol::provider_config::ParallelToolCallsMode;
+use model_protocol::provider_config::{ParallelToolCallsMode, ProviderProtocol};
 use provider::{
     ApiError, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
@@ -818,6 +818,29 @@ impl ProviderRuntimeClient {
                 };
             }
         };
+        let reasoning_effort = request_reasoning_effort(
+            &entry.model,
+            request.reasoning_effort_override.clone(),
+            self.reasoning_effort.clone(),
+        );
+        // Capability facts are resolved after the exact model and reasoning
+        // mode are both known. The template cache is keyed by model only, so
+        // the request-local profile is re-derived here and never shared
+        // across requests with different reasoning modes.
+        if let Some(protocol) = entry
+            .request_context
+            .profile
+            .protocol
+            .as_deref()
+            .and_then(ProviderProtocol::parse)
+        {
+            entry.request_context.profile.capabilities =
+                ProviderCapabilityProfile::resolve_for_reasoning_mode(
+                    protocol,
+                    &entry.model,
+                    reasoning_effort.as_deref(),
+                );
+        }
         let tool_choice = match provider_tool_choice(
             !active_tools.is_empty(),
             tool_choice_required,
@@ -831,7 +854,12 @@ impl ProviderRuntimeClient {
             Ok(choice) => choice,
             Err(error) => {
                 return ApiClientStream {
-                    events: Box::pin(futures::stream::once(async move { Err(error) })),
+                    events: Box::pin(futures::stream::once(async move {
+                        Err(RuntimeError::new(format!(
+                            "{error} (model={}, reasoning_effort={:?})",
+                            entry.model, reasoning_effort
+                        )))
+                    })),
                     transport_activity: None,
                 };
             }
@@ -840,11 +868,6 @@ impl ProviderRuntimeClient {
             provider_attempt(request.provider_evidence_context.as_ref());
         let (sender, receiver) = tokio::sync::mpsc::channel(PROVIDER_EVENT_QUEUE_CAPACITY);
         let transport_activity = provider::TransportActivity::default();
-        let reasoning_effort = request_reasoning_effort(
-            &entry.model,
-            request.reasoning_effort_override.clone(),
-            self.reasoning_effort.clone(),
-        );
         let producer = match tokio::runtime::Handle::try_current() {
             Ok(handle) => Some(
                 handle.spawn(forward_provider_attempt(
@@ -1624,7 +1647,7 @@ mod tests {
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{AssistantEvent, ProviderRegistry, ProviderRuntimeClient, ProviderTransportPool};
     use harness_contract::tool::ToolExposureProjection;
-    use model_protocol::provider_capability::CapabilityState;
+    use model_protocol::provider_capability::{CapabilityState, ProviderCapabilityProfile};
     use provider::{ToolChoice, ToolDefinition};
     use serde_json::json;
     use std::collections::HashMap;
@@ -1707,12 +1730,48 @@ mod tests {
             provider_tool_choice(true, false, CapabilityState::Unsupported).unwrap(),
             None
         );
+        assert!(
+            provider_tool_choice(true, true, CapabilityState::Unsupported).is_err(),
+            "a required tool_choice must block before any network request"
+        );
         assert!(provider_tool_choice(true, false, CapabilityState::Unknown).is_err());
         assert_eq!(
             provider_tool_choice(false, false, CapabilityState::Unknown).unwrap(),
             None
         );
         assert!(provider_tool_choice(false, true, CapabilityState::Supported).is_err());
+    }
+
+    #[test]
+    fn deepseek_v4_thinking_required_tool_choice_blocks_before_network() {
+        let thinking = ProviderCapabilityProfile::resolve_for_reasoning_mode(
+            model_protocol::provider_config::ProviderProtocol::Completions,
+            "deepseek-v4-flash",
+            Some("high"),
+        );
+        assert_eq!(
+            thinking.supports_explicit_tool_choice.state,
+            CapabilityState::Unsupported
+        );
+        assert!(
+            provider_tool_choice(true, true, thinking.supports_explicit_tool_choice.state).is_err()
+        );
+        assert_eq!(
+            provider_tool_choice(true, false, thinking.supports_explicit_tool_choice.state)
+                .unwrap(),
+            None
+        );
+
+        let non_thinking = ProviderCapabilityProfile::resolve_for_reasoning_mode(
+            model_protocol::provider_config::ProviderProtocol::Completions,
+            "deepseek-v4-flash",
+            None,
+        );
+        assert_eq!(
+            provider_tool_choice(true, true, non_thinking.supports_explicit_tool_choice.state)
+                .unwrap(),
+            Some(ToolChoice::Any)
+        );
     }
 
     #[test]
