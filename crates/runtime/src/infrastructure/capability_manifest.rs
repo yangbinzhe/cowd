@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::context_runtime::ContextProfile;
+use crate::definition_registry::RuntimeTeamTemplateCatalogEntry;
 use crate::evidence_planner::EvidencePlan;
 use crate::execution_core::ProtocolRegistry;
 use crate::execution_core::{
@@ -311,6 +312,52 @@ impl RuntimeCapabilityCatalog {
                 ),
             ],
         }
+    }
+
+    /// Rebuild the model-facing template catalog from the Registry snapshot.
+    ///
+    /// Builtin summaries keep their curated metadata; every custom published
+    /// Template revision enters without any code change. This is the single
+    /// catalog truth for model proposals: `current()` alone is only the
+    /// builtin fallback and must never be presented as the complete registry.
+    #[must_use]
+    pub fn from_registry(entries: &[RuntimeTeamTemplateCatalogEntry]) -> Self {
+        let mut catalog = Self::current();
+        let mut known = catalog
+            .templates
+            .iter()
+            .map(|template| template.template_id.clone())
+            .collect::<Vec<_>>();
+        for entry in entries {
+            let template_id = entry.revision_ref.template_id.as_str().to_string();
+            if known.iter().any(|known| known == &template_id) {
+                continue;
+            }
+            known.push(template_id.clone());
+            let (protocol_id, protocol_version) = entry
+                .topology
+                .protocol_ref
+                .split_once('@')
+                .map(|(id, version)| (id.to_string(), version.parse::<u32>().unwrap_or(1)))
+                .unwrap_or_else(|| (entry.topology.protocol_ref.clone(), 1));
+            catalog.templates.push(RuntimeTemplateSummary {
+                template_id,
+                protocol_id,
+                protocol_version,
+                availability: "available".to_string(),
+                requires_review: entry.topology.require_review,
+                best_for: Vec::new(),
+                role_ids: entry
+                    .roles
+                    .iter()
+                    .map(|role| role.role_id.clone())
+                    .collect(),
+            });
+        }
+        catalog
+            .templates
+            .sort_by(|left, right| left.template_id.cmp(&right.template_id));
+        catalog
     }
 }
 
@@ -1710,6 +1757,64 @@ mod tests {
             .find(|template| template.protocol_id == "direct@1")
             .expect("direct template");
         assert!(direct.role_ids.is_empty());
+    }
+
+    #[test]
+    fn registry_catalog_admits_custom_published_template_without_code_change() {
+        use harness_contract::agent::DefinitionScope;
+        use harness_contract::team::{
+            TeamTemplateDefinitionId, TeamTemplateRevisionRef, TeamTopologyContract,
+        };
+
+        let custom = RuntimeTeamTemplateCatalogEntry {
+            revision_ref: TeamTemplateRevisionRef {
+                template_id: TeamTemplateDefinitionId::new(
+                    DefinitionScope::Workspace,
+                    "cowd/custom-review",
+                )
+                .expect("custom template id"),
+                revision: 3,
+            },
+            name: "Custom Review".to_string(),
+            content_digest: "digest-custom".to_string(),
+            team_markdown_digest: Some("digest-md".to_string()),
+            topology: TeamTopologyContract {
+                protocol_ref: "review_fix@1".to_string(),
+                require_synthesis: true,
+                require_review: true,
+            },
+            role_count: 0,
+            roles: Vec::new(),
+            dependencies: Vec::new(),
+            result_fields: vec!["summary".to_string()],
+        };
+        let current = RuntimeCapabilityCatalog::current();
+        assert!(
+            current
+                .templates
+                .iter()
+                .all(|template| template.template_id != "workspace/cowd/custom-review"),
+            "current() is the builtin-only fallback and must not invent custom templates"
+        );
+
+        let merged = RuntimeCapabilityCatalog::from_registry(&[custom]);
+        let custom_summary = merged
+            .templates
+            .iter()
+            .find(|template| template.template_id == "workspace/cowd/custom-review")
+            .expect("custom published template enters the registry-backed catalog");
+        assert_eq!(custom_summary.protocol_id, "review_fix");
+        assert_eq!(custom_summary.protocol_version, 1);
+        assert!(custom_summary.requires_review);
+        assert_eq!(
+            merged
+                .templates
+                .iter()
+                .filter(|template| template.template_id == "builtin/cowd/direct-executor")
+                .count(),
+            1,
+            "registry merge must deduplicate builtin entries"
+        );
     }
 
     #[test]

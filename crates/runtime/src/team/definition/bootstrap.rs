@@ -511,4 +511,40 @@ mod tests {
         );
         assert!(researcher.grant_ceiling.contains(&AgentCapability::Network));
     }
+
+    #[test]
+    fn role_behavior_is_typed_by_role_id_not_display_responsibility() {
+        let agent = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap();
+        let role = |responsibility: &str| TeamRoleDefinition {
+            role_id: "implementer".to_string(),
+            responsibility: responsibility.to_string(),
+            agent_definition_id: agent.clone(),
+            agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
+            cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
+            partition: RolePartitionPolicy::Single,
+            grant_ceiling: vec![
+                AgentCapability::Read,
+                AgentCapability::Write,
+                AgentCapability::Test,
+            ],
+            task_contract: TeamRoleTaskContract {
+                contract_ref: "builtin/team-role/implementer@1".to_string(),
+                acceptance: vec!["implementation".to_string(), "evidence".to_string()],
+            },
+        };
+        let english = role("Implement the bounded change and provide verification evidence.");
+        let chinese = role("实现有界变更并提供验证证据。");
+
+        assert_eq!(english.role_id, chinese.role_id);
+        assert_eq!(english.agent_selector, chinese.agent_selector);
+        assert_eq!(english.cardinality, chinese.cardinality);
+        assert_eq!(english.partition, chinese.partition);
+        assert_eq!(english.grant_ceiling, chinese.grant_ceiling);
+        assert_eq!(english.task_contract, chinese.task_contract);
+        assert_ne!(english.responsibility, chinese.responsibility);
+        assert!(
+            !chinese.task_contract.contract_ref.contains("实现"),
+            "behavior references must never be derived from display responsibility"
+        );
+    }
 }

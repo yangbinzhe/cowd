@@ -8,6 +8,8 @@ use harness_contract::core::{ExecutionModifier, ExecutionPattern, TaskComplexity
 use harness_contract::strategy::{StrategyDecision, TaskDomain};
 use serde::{Deserialize, Serialize};
 
+use crate::definition_registry::RuntimeTeamTemplateCatalogEntry;
+
 /// Strategy-level reference to one durable Team Template family.
 ///
 /// This is only a recommendation vocabulary. It never constructs a graph or
@@ -194,6 +196,31 @@ impl CollaborationTemplateMatcher {
             rationale: rationale.to_string(),
         }
     }
+
+    /// Fallback matcher consumed against the Registry-built catalog.
+    ///
+    /// The keyword rules above are deliberately low-confidence: they only
+    /// name a builtin family. The Registry snapshot is the template truth, so
+    /// this method returns `None` when the selected family is not actually
+    /// published/runnable, and custom published templates participate through
+    /// the catalog instead of being invented here.
+    #[must_use]
+    pub fn decide_from_catalog<'a>(
+        &self,
+        user_input: &str,
+        strategy: &StrategyDecision,
+        catalog: &'a [RuntimeTeamTemplateCatalogEntry],
+    ) -> Option<(&'a RuntimeTeamTemplateCatalogEntry, CollaborationDecision)> {
+        let decision = self.decide(user_input, strategy);
+        let entry = catalog.iter().find(|entry| {
+            entry
+                .revision_ref
+                .template_id
+                .as_str()
+                .ends_with(decision.template_id.template_path())
+        })?;
+        Some((entry, decision))
+    }
 }
 
 fn contains_any(input: &str, terms: &[&str]) -> bool {
@@ -204,6 +231,42 @@ fn contains_any(input: &str, terms: &[&str]) -> bool {
 mod tests {
     use super::*;
     use harness_contract::strategy::{decide_strategy, StrategyInput};
+    use harness_contract::team::{
+        TeamRoleDependency, TeamTemplateDefinitionId, TeamTemplateRevisionRef, TeamTopologyContract,
+    };
+
+    fn catalog_entry(template_path: &str, revision: u64) -> RuntimeTeamTemplateCatalogEntry {
+        RuntimeTeamTemplateCatalogEntry {
+            revision_ref: TeamTemplateRevisionRef {
+                template_id: TeamTemplateDefinitionId::new(
+                    harness_contract::agent::DefinitionScope::Builtin,
+                    template_path,
+                )
+                .expect("template id"),
+                revision,
+            },
+            name: template_path.to_string(),
+            content_digest: format!("digest:{template_path}:{revision}"),
+            team_markdown_digest: Some(format!("markdown:{template_path}")),
+            topology: TeamTopologyContract {
+                protocol_ref: "review_fix@1".to_string(),
+                require_synthesis: true,
+                require_review: true,
+            },
+            role_count: 0,
+            roles: Vec::new(),
+            dependencies: Vec::<TeamRoleDependency>::new(),
+            result_fields: vec!["summary".to_string()],
+        }
+    }
+
+    fn full_catalog() -> Vec<RuntimeTeamTemplateCatalogEntry> {
+        vec![
+            catalog_entry("cowd/direct-executor", 1),
+            catalog_entry("cowd/implementation-review-fix", 1),
+            catalog_entry("cowd/debate-critic-arbiter", 1),
+        ]
+    }
 
     fn matches(prompt: &str, expected: CollaborationTemplateId) {
         let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
@@ -239,5 +302,59 @@ mod tests {
             .template_id
             .as_str()
             .contains("debate-critic-arbiter"));
+    }
+
+    #[test]
+    fn catalog_matcher_requires_the_registry_truth_and_never_fabricates() {
+        let strategy = decide_strategy(&StrategyInput::from_prompt("重构并修复这个模块"));
+        let decision = CollaborationTemplateMatcher.decide("重构并修复这个模块", &strategy);
+        assert_eq!(
+            decision.template_id,
+            CollaborationTemplateId::ImplementationReviewFix
+        );
+
+        let catalog = full_catalog();
+        let (entry, matched) = CollaborationTemplateMatcher
+            .decide_from_catalog("重构并修复这个模块", &strategy, &catalog)
+            .expect("builtin template is published in the registry catalog");
+        assert_eq!(
+            entry.revision_ref.template_id.as_str(),
+            "builtin/cowd/implementation-review-fix"
+        );
+        assert_eq!(matched.template_id, decision.template_id);
+        assert_eq!(
+            entry.content_digest,
+            "digest:cowd/implementation-review-fix:1"
+        );
+    }
+
+    #[test]
+    fn catalog_matcher_returns_none_when_selected_family_is_not_published() {
+        let strategy = decide_strategy(&StrategyInput::from_prompt("重构并修复这个模块"));
+        let custom_only = vec![catalog_entry("cowd/custom-review-team", 3)];
+        assert!(
+            CollaborationTemplateMatcher
+                .decide_from_catalog("重构并修复这个模块", &strategy, &custom_only)
+                .is_none(),
+            "a keyword match must not fabricate a template absent from the registry catalog"
+        );
+    }
+
+    #[test]
+    fn catalog_matcher_never_uses_display_name_as_behavior_truth() {
+        let strategy = decide_strategy(&StrategyInput::from_prompt("分析架构取舍和利弊"));
+        let catalog = vec![catalog_entry("cowd/debate-critic-arbiter", 2)];
+        let (entry, decision) = CollaborationTemplateMatcher
+            .decide_from_catalog("分析架构取舍和利弊", &strategy, &catalog)
+            .expect("debate family is published");
+        assert_eq!(
+            decision.template_id,
+            CollaborationTemplateId::DebateCriticArbiter
+        );
+        assert_eq!(entry.revision_ref.revision, 2);
+        assert_eq!(
+            entry.revision_ref.template_id.as_str(),
+            "builtin/cowd/debate-critic-arbiter"
+        );
     }
 }

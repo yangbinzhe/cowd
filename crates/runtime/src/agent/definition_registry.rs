@@ -19,6 +19,7 @@ use harness_contract::team::{
     TeamTopologyContract,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::agent::definition::{
@@ -51,6 +52,12 @@ pub enum DefinitionRegistryError {
 pub struct RuntimeTeamTemplateCatalogEntry {
     pub revision_ref: TeamTemplateRevisionRef,
     pub name: String,
+    /// Content digest of the exact published Team Template revision.
+    pub content_digest: String,
+    /// Digest of the digest-bound TEAM.md public fragment, when the revision
+    /// carries one. Binding compilers freeze this once and never rescan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_markdown_digest: Option<String>,
     pub topology: TeamTopologyContract,
     pub role_count: usize,
     #[serde(default)]
@@ -58,6 +65,15 @@ pub struct RuntimeTeamTemplateCatalogEntry {
     #[serde(default)]
     pub dependencies: Vec<TeamRoleDependency>,
     pub result_fields: Vec<String>,
+}
+
+/// Agent catalog entry paired with the frozen content digest of its exact
+/// published revision. Binding compilers consume this once and never re-read
+/// a mutable latest definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenAgentCatalogEntry {
+    pub entry: AgentCatalogEntry,
+    pub content_digest: String,
 }
 
 /// Receipt for an explicitly imported Agent Definition. A draft receipt is
@@ -333,6 +349,20 @@ impl RuntimeDefinitionRegistry {
     pub fn runnable_agent_catalog(
         &self,
     ) -> Result<Vec<AgentCatalogEntry>, DefinitionRegistryError> {
+        Ok(self
+            .runnable_agent_catalog_frozen()?
+            .into_iter()
+            .map(|frozen| frozen.entry)
+            .collect())
+    }
+
+    /// Rebuild the runnable Agent catalog with the frozen revision digest.
+    /// The registry resolves each exact published revision exactly once per
+    /// catalog build; Binding compilers use this carrier instead of re-reading
+    /// or re-scanning Definition files.
+    pub fn runnable_agent_catalog_frozen(
+        &self,
+    ) -> Result<Vec<FrozenAgentCatalogEntry>, DefinitionRegistryError> {
         let mut entries = Vec::new();
         for definition_id in self.agents().list_definition_ids()? {
             let resolved =
@@ -343,9 +373,12 @@ impl RuntimeDefinitionRegistry {
                     )) => continue,
                     Err(error) => return Err(error),
                 };
-            entries.push(agent_catalog_entry(&resolved.revision));
+            entries.push(FrozenAgentCatalogEntry {
+                entry: agent_catalog_entry(&resolved.revision),
+                content_digest: resolved.revision.content_digest.clone(),
+            });
         }
-        entries.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+        entries.sort_by(|left, right| left.entry.agent_id.cmp(&right.entry.agent_id));
         Ok(entries)
     }
 
@@ -368,6 +401,11 @@ impl RuntimeDefinitionRegistry {
             entries.push(RuntimeTeamTemplateCatalogEntry {
                 revision_ref: resolved.revision.revision_ref,
                 name: manifest.name.clone(),
+                content_digest: resolved.revision.content_digest.clone(),
+                team_markdown_digest: Some(format!(
+                    "{:x}",
+                    Sha256::digest(resolved.team_markdown.as_bytes())
+                )),
                 topology: manifest.topology.clone(),
                 role_count: manifest.roles.len(),
                 roles: manifest.roles.clone(),
@@ -801,11 +839,22 @@ mod tests {
         assert_eq!(reviewer_entry.definition_ref.revision, 1);
         assert_eq!(reviewer_entry.capabilities, vec!["read"]);
         assert_eq!(reviewer_entry.evaluation.scenario_refs, vec!["review"]);
-
+        let frozen = registry
+            .runnable_agent_catalog_frozen()
+            .expect("frozen catalog");
+        let frozen_reviewer = frozen
+            .iter()
+            .find(|frozen| frozen.entry.agent_id == reviewer.as_str())
+            .expect("frozen reviewer entry");
         let stored = registry
             .agents()
             .read_revision(&reviewer_entry.definition_ref)
             .expect("stored reviewer");
+        assert_eq!(
+            frozen_reviewer.content_digest,
+            stored.revision.content_digest
+        );
+
         registry
             .agents()
             .record_release_assignment(&ReleaseAssignment {
@@ -827,6 +876,30 @@ mod tests {
         assert!(catalog_after_stop
             .iter()
             .all(|entry| entry.agent_id != reviewer.as_str()));
+    }
+
+    #[test]
+    fn runnable_team_catalog_includes_custom_template_with_frozen_digests() {
+        let (_temporary, registry) = registry();
+        let reviewer = publish_reviewer(&registry);
+        let template = publish_team(&registry, reviewer);
+        let catalog = registry.runnable_team_catalog().expect("team catalog");
+        let entry = catalog
+            .iter()
+            .find(|entry| entry.revision_ref.template_id == template)
+            .expect("custom published Team template enters the runnable catalog");
+        let stored = registry
+            .teams()
+            .read_revision(&entry.revision_ref)
+            .expect("stored custom Team template");
+        assert_eq!(entry.content_digest, stored.revision.content_digest);
+        assert_eq!(
+            entry.team_markdown_digest.as_deref(),
+            Some(format!("{:x}", Sha256::digest(stored.team_markdown.as_bytes())).as_str()),
+            "the catalog freezes the TEAM.md fragment digest for Binding compilers"
+        );
+        assert_eq!(entry.role_count, 1);
+        assert_eq!(entry.roles[0].role_id, "reviewer");
     }
 
     #[test]
