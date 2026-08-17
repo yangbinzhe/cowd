@@ -349,6 +349,12 @@ fn normalize_agent_definition_ref(
         );
         return Ok(());
     };
+    if value.is_null() {
+        // An explicit `null` is the model saying "no preference", exactly
+        // like an absent field: use the safe builtin default.
+        fields.remove("agent_definition_ref");
+        return normalize_agent_definition_ref(fields, ceiling_names, notes);
+    }
     let normalized = match value {
         serde_json::Value::String(raw) => normalize_ref_string(&raw)?,
         serde_json::Value::Object(reference) => {
@@ -656,9 +662,13 @@ fn normalize_dependencies(
                                     json_type_name(&to)
                                 ))
                             }
-                            (None, None) if map.len() == 1 => {
-                                let (label, members) = map.into_iter().next().unwrap_or_default();
-                                groups.insert(label.clone(), members_to_vec(members, &label)?);
+                            (None, None) => {
+                                for (label, members) in map {
+                                    groups.insert(
+                                        label.clone(),
+                                        members_to_vec(members, &label)?,
+                                    );
+                                }
                             }
                             _ => {
                                 return Err(
@@ -867,15 +877,18 @@ impl TemplateCandidateCompiler {
         proposal: &TeamTemplateProposal,
         ceiling: PermissionMode,
     ) -> Result<TemplateCandidate, String> {
-        let template_id = TeamTemplateDefinitionId::new(
-            DefinitionScope::Workspace,
-            proposal
-                .template_id
-                .trim()
-                .strip_prefix("cowd/")
-                .unwrap_or(proposal.template_id.trim()),
-        )
-        .map_err(|error| format!("invalid template_id: {error}"))?;
+        // AI proposals may carry the full id including a scope prefix
+        // (`workspace/biz-tech-...`) or the model-facing `cowd/...` alias.
+        // Publish is always Workspace-scoped, so normalize the local id and
+        // never produce a doubled `workspace/workspace/...` path.
+        let mut local_id = proposal.template_id.trim();
+        for prefix in ["cowd/", "workspace/", "user/", "builtin/"] {
+            while let Some(stripped) = local_id.strip_prefix(prefix) {
+                local_id = stripped;
+            }
+        }
+        let template_id = TeamTemplateDefinitionId::new(DefinitionScope::Workspace, local_id)
+            .map_err(|error| format!("invalid template_id: {error}"))?;
         let mut role_ids = std::collections::BTreeSet::new();
         let mut roles = Vec::with_capacity(proposal.roles.len());
         let mut clipped_capabilities = Vec::new();
@@ -1786,6 +1799,38 @@ mod tests {
                 .agent_definition_id
                 .as_str(),
             "builtin/cowd/explore"
+        );
+    }
+
+    #[test]
+    fn workspace_prefixed_template_id_and_null_agent_ref_are_normalized() {
+        let mut value = serde_json::json!({
+            "template_id": "workspace/biz-tech-dual-team-deliberation",
+            "name": "测试",
+            "roles": [{
+                "role_id": "cto",
+                "responsibility": "x",
+                "grant_ceiling": "workspace-read",
+                "agent_definition_ref": null
+            }]
+        });
+        normalize_template_proposal(&mut value).expect("normalize");
+        assert_eq!(
+            value["roles"][0]["agent_definition_ref"],
+            "builtin/cowd/explore@1"
+        );
+        let (_temp, registry) = registry();
+        let proposal: TeamTemplateProposal =
+            serde_json::from_value(value).expect("parses after normalization");
+        let candidate = TemplateCandidateCompiler::compile(
+            &registry,
+            &proposal,
+            PermissionMode::ReadOnly,
+        )
+        .expect("compile with workspace-prefixed id and null agent ref");
+        assert_eq!(
+            candidate.manifest.template_id.as_str(),
+            "workspace/biz-tech-dual-team-deliberation"
         );
     }
 }

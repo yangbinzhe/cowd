@@ -175,6 +175,113 @@ pub struct ModelRuntimeOrchestrationConstraints {
     pub surface_latency_sensitive: Option<bool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelGrantCapability {
+    Read,
+    Search,
+    Write,
+    Test,
+    Network,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRoleDisplayName {
+    pub role_id: String,
+    pub display_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelProposedRole {
+    pub role_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Human-facing role name shown in the UI (e.g. 高级供应制造领域CTO). Display only; it never affects execution."
+    )]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Team partition label (business/technical/convergence) used only to resolve group dependencies."
+    )]
+    pub team: Option<String>,
+    pub responsibility: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Exact agent definition id copied from runtime_capabilities(detail=agent_catalog), e.g. builtin/cowd/explore@1. Omit or use null to get a safe builtin default matching the grant_ceiling."
+    )]
+    pub agent_definition_ref: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Capability ceiling for this role: read|search|write|test|network. Runtime clips it to the session permission ceiling."
+    )]
+    pub grant_ceiling: Vec<ModelGrantCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub fixed_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub min_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_count: Option<u32>,
+    #[serde(default)]
+    #[schemars(description = "Acceptance criteria the role must satisfy before its evidence is trusted.")]
+    pub acceptance: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelProposedDependency {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ModelTemplateDependencies {
+    /// Explicit role-level edges: [{from: role_id, to: role_id}].
+    Pairs(Vec<ModelProposedDependency>),
+    /// Array of group membership objects: [{"business_team": ["role_id", ...]}].
+    GroupArray(Vec<std::collections::BTreeMap<String, serde_json::Value>>),
+    /// Object keyed by group label -> member role ids (or nested group labels).
+    Groups(std::collections::BTreeMap<String, serde_json::Value>),
+}
+
+/// Structured AI-authored Team template proposal for operation=propose_template.
+///
+/// Every field is declared so the model never has to guess shapes. Runtime
+/// still normalizes tolerant variants (map/array roles, string ceilings,
+/// wrapped JSON) as a safety net, but the schema below is the source of truth
+/// the model is expected to follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelTemplateProposal {
+    #[schemars(
+        description = "Publish-local template id. Scope prefixes (cowd/, workspace/, user/) are accepted and normalized; example: biz-tech-dual-team-deliberation"
+    )]
+    pub template_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(description = "Team display name shown in the UI.")]
+    pub team_display_name: Option<String>,
+    #[serde(default)]
+    pub role_display_names: Vec<ModelRoleDisplayName>,
+    pub roles: Vec<ModelProposedRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<ModelTemplateDependencies>,
+    #[serde(default)]
+    #[schemars(
+        description = "Required result fields of the final synthesis; MUST include summary and evidence."
+    )]
+    pub result_fields: Vec<String>,
+    #[serde(default)]
+    pub evidence_required: bool,
+    #[schemars(description = "Markdown instructions given to every Team role.")]
+    pub instructions: String,
+}
+
 /// The complete model-visible contract for `runtime_orchestrate`.
 ///
 /// Authenticated Session identity, model/provider leases, capability grants,
@@ -193,7 +300,7 @@ pub struct ModelRuntimeOrchestrationInput {
     pub proposal: Option<ModelGraphMutationProposal>,
     /// Structured AI-authored Team template proposal (operation=propose_template).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template_proposal: Option<serde_json::Value>,
+    pub template_proposal: Option<ModelTemplateProposal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ModelRuntimeControlRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,6 +382,95 @@ mod tests {
             );
         }
         assert!(schema.contains("\"target_session_id\""));
+    }
+
+    #[test]
+    fn template_proposal_schema_is_structured_for_the_model() {
+        let schema = serde_json::to_string(&schemars::schema_for!(ModelRuntimeOrchestrationInput))
+            .expect("serialize schema");
+        for needle in [
+            "ModelTemplateProposal",
+            "\"template_id\"",
+            "\"team_display_name\"",
+            "\"role_display_names\"",
+            "\"grant_ceiling\"",
+            "\"agent_definition_ref\"",
+            "\"result_fields\"",
+            "\"instructions\"",
+            "\"dependencies\"",
+            "\"read\"",
+            "\"search\"",
+            "\"write\"",
+            "\"test\"",
+            "\"network\"",
+        ] {
+            assert!(
+                schema.contains(needle),
+                "template_proposal schema must expose `{needle}` to the model"
+            );
+        }
+    }
+
+    #[test]
+    fn model_template_proposal_accepts_pairs_groups_and_group_arrays() {
+        let base = |dependencies: serde_json::Value| {
+            serde_json::json!({
+                "template_id": "biz-tech-dual-team-deliberation",
+                "name": "业务/技术双团队研讨",
+                "team_display_name": "业务-技术双团队研讨组",
+                "roles": [{
+                    "role_id": "business_expert",
+                    "display_name": "供应链专家",
+                    "responsibility": "分析供应链约束",
+                    "agent_definition_ref": "builtin/cowd/explore@1",
+                    "grant_ceiling": ["read", "search"],
+                    "acceptance": ["findings", "evidence"]
+                }],
+                "dependencies": dependencies,
+                "result_fields": ["summary", "evidence"],
+                "instructions": "# 研讨\n"
+            })
+        };
+        let pairs: ModelTemplateProposal = serde_json::from_value(base(serde_json::json!([
+            {"from": "business_expert", "to": "synthesizer"}
+        ])))
+        .expect("pairs shape");
+        assert!(matches!(
+            pairs.dependencies,
+            Some(ModelTemplateDependencies::Pairs(_))
+        ));
+        let groups: ModelTemplateProposal = serde_json::from_value(base(serde_json::json!({
+            "business_team": ["business_expert"],
+            "convergence": ["business_team"]
+        })))
+        .expect("groups shape");
+        assert!(matches!(
+            groups.dependencies,
+            Some(ModelTemplateDependencies::Groups(_))
+        ));
+        let group_array: ModelTemplateProposal = serde_json::from_value(base(
+            serde_json::json!([{"business_team": ["business_expert"]}]),
+        ))
+        .expect("group-array shape");
+        assert!(matches!(
+            group_array.dependencies,
+            Some(ModelTemplateDependencies::GroupArray(_))
+        ));
+    }
+
+    #[test]
+    fn model_template_proposal_rejects_unknown_fields_instead_of_guessing() {
+        let invalid = serde_json::json!({
+            "template_id": "t",
+            "name": "n",
+            "roles": [],
+            "instructions": "i",
+            "mystery_field": "the model should not be able to sneak this in"
+        });
+        assert!(
+            serde_json::from_value::<ModelTemplateProposal>(invalid).is_err(),
+            "deny_unknown_fields must surface a typed error instead of silently ignoring model guesses"
+        );
     }
 
     #[test]

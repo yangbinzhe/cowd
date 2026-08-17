@@ -159,7 +159,9 @@ impl RuntimeOrchestrationCommand {
             operation: input.operation,
             inspect_execution_id: input.inspect_execution_id,
             proposal: input.proposal.map(Into::into),
-            template_proposal: input.template_proposal,
+            template_proposal: input
+                .template_proposal
+                .map(|proposal| serde_json::to_value(proposal).unwrap_or_default()),
             control: input.control,
             input_disposition: input.input_disposition,
             selection_mode: binding.selection_mode,

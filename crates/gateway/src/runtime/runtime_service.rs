@@ -403,7 +403,7 @@ fn session_execution_index_from_outbox(
             .iter()
             .map(|record| SessionExecutionEntryProjection {
                 execution_id: execution_for(record),
-                graph_id: None,
+                graph_id: Some(execution_for(record)),
                 turn_id: Some(record.turn_id.clone()),
                 status: status_for(record),
                 live_revision: None,
@@ -422,7 +422,7 @@ fn session_execution_index_from_outbox(
             .map(|record| execution_for(record))
             .collect(),
         latest_execution_id: latest.map(execution_for),
-        latest_graph_id: None,
+        latest_graph_id: latest.map(execution_for),
         latest_status,
         latest_live_revision: None,
         last_progress_at_ms: latest.map(|record| record.updated_at_ms),
@@ -8131,6 +8131,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["turn-complete", "turn-pending"]
         );
+        assert!(
+            index
+                .executions
+                .iter()
+                .all(|entry| entry.graph_id.as_deref() == Some(entry.execution_id.as_str())),
+            "every durable Session ingress execution must expose a queryable graph id"
+        );
+        assert_eq!(index.latest_graph_id, index.latest_execution_id.clone());
         assert_eq!(
             index.latest_execution_id,
             Some(runtime::session_ingress_graph_id(
