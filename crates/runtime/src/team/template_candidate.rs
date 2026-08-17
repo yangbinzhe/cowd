@@ -841,6 +841,20 @@ fn parse_agent_ref(value: &str) -> Result<(AgentDefinitionId, u64), String> {
         .map_err(|error| format!("invalid agent_definition_ref `{value}`: {error}"))
 }
 
+/// Team instructions are stored as normalized TEAM.md text: CRLF/CR are
+/// folded to LF and a trailing newline is guaranteed. The manifest digest
+/// must be computed over that same normalized text, otherwise
+/// `store_revision` rejects AI-authored proposals containing `\r\n` with an
+/// `instructions_digest` mismatch.
+pub(crate) fn normalized_team_instructions(instructions: &str) -> String {
+    let normalized = instructions.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.ends_with('\n') {
+        normalized
+    } else {
+        format!("{normalized}\n")
+    }
+}
+
 pub struct TemplateCandidateCompiler;
 
 impl TemplateCandidateCompiler {
@@ -980,7 +994,10 @@ impl TemplateCandidateCompiler {
                 ),
                 "team_interoperability",
             ),
-            instructions_digest: format!("{:x}", Sha256::digest(proposal.instructions.as_bytes())),
+            instructions_digest: format!(
+                "{:x}",
+                Sha256::digest(normalized_team_instructions(&proposal.instructions).as_bytes())
+            ),
         };
         manifest
             .validate()
@@ -1614,5 +1631,27 @@ mod tests {
             .roles
             .iter()
             .any(|role| role.grant_ceiling.contains(&AgentCapability::Write)));
+    }
+
+    #[test]
+    fn crlf_instructions_publish_with_a_matching_manifest_digest() {
+        let (_temp, registry) = registry();
+        publish_agent(&registry, "cowd/explore");
+        publish_agent(&registry, "cowd/direct");
+        let mut proposal = business_tech_proposal();
+        proposal.instructions = "第一行\r\n第二行\r\n".to_string();
+        let candidate = TemplateCandidateCompiler::compile(
+            &registry,
+            &proposal,
+            PermissionMode::ReadOnly,
+        )
+        .expect("candidate");
+        // store_revision normalizes CRLF before hashing; the manifest digest
+        // must match that normalized text, not the raw proposal bytes.
+        let stored = registry
+            .teams()
+            .store_revision(candidate.manifest, &proposal.instructions)
+            .expect("CRLF instructions must publish");
+        assert_eq!(stored.revision.revision_ref.revision, 1);
     }
 }

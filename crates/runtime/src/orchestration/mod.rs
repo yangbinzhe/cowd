@@ -381,12 +381,21 @@ async fn propose_template(
         payload: json!({
             "approval_id": approval_id,
             "manifest": candidate.manifest,
-            "instructions": proposal.instructions,
+            "instructions": crate::team_template_candidate::normalized_team_instructions(
+                &proposal.instructions,
+            ),
             "digest": candidate.digest,
             "preview": candidate.preview,
         }),
     });
     let trust_all = session_is_trust_all(services, session_id.as_deref());
+    if !trust_all {
+        tracing::warn!(
+            session_id = ?session_id,
+            policy = ?services.session_execution_policy(session_id.as_deref().unwrap_or("")),
+            "propose_template trust-all auto-approval is inactive"
+        );
+    }
     if trust_all {
         services
             .approval_queue()
@@ -1556,13 +1565,21 @@ fn session_is_trust_all(
     services: &RuntimeServices,
     session_id: Option<&str>,
 ) -> bool {
-    session_id.is_some_and(|session_id| {
+    let trust_all = session_id.is_some_and(|session_id| {
         services
             .session_execution_policy(session_id)
             .is_some_and(|policy| {
                 policy.approval_profile == harness_contract::policy::ApprovalProfile::TrustAll
             })
-    })
+    });
+    if !trust_all {
+        tracing::warn!(
+            session_id = ?session_id,
+            policy = ?session_id.and_then(|session_id| services.session_execution_policy(session_id)),
+            "session_is_trust_all: trust-all policy not visible to orchestration"
+        );
+    }
+    trust_all
 }
 
 fn result_from_outcome(
