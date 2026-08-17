@@ -398,24 +398,60 @@ fn runtime_orchestration_input_schema() -> serde_json::Value {
         harness_contract::orchestration::ModelRuntimeOrchestrationInput
     ))
     .expect("runtime orchestration model contract schema must serialize");
-    // The template_proposal wire field stays tolerant (the Runtime normalizer
-    // accepts wrapped JSON, map/array roles, string ceilings, etc.), but the
-    // model still receives the full typed field-level contract as guidance so
-    // it never has to guess shapes.
-    let proposal_schema = serde_json::to_value(schemars::schema_for!(
-        harness_contract::orchestration::ModelTemplateProposal
-    ))
-    .expect("template proposal model contract schema must serialize");
-    schema["properties"]["template_proposal"] = proposal_schema;
-    // The dependencies union is intentionally shown as a relaxed shape so a
-    // model never refuses to call the tool because of a strict oneOf/anyOf.
-    // Runtime normalization accepts pairs, group objects, group arrays,
-    // string arrays, and single strings; validation happens after admission.
-    schema["properties"]["template_proposal"]["properties"]["dependencies"] =
-        serde_json::json!({
-            "description": "Role-level edges or group memberships. Accepted forms: [{from, to}], [{\"group\": [role_id, ...]}], {\"group\": [role_id, ...]}, [\"from -> to\"], or \"from -> to\". Runtime normalizes every form.",
-            "type": ["array", "object", "string"]
-        });
+    // Guidance-only, deliberately relaxed: every field is described, nothing
+    // is enforced by the schema. The Runtime normalizer accepts wrapped JSON,
+    // map/array roles, string ceilings, group/string dependencies, and ignores
+    // extra fields. A strict embedded schema previously made models refuse to
+    // call the tool at all.
+    schema["properties"]["template_proposal"] = serde_json::json!({
+        "type": "object",
+        "description": "Structured Team template proposal. Every field below is guidance; the Runtime accepts tolerant variants and validates after admission.",
+        "properties": {
+            "template_id": {
+                "type": "string",
+                "description": "Publish-local template id, e.g. cross-team-collaborative-decision. Scope prefixes (cowd/, workspace/, user/) are accepted and normalized."
+            },
+            "name": { "type": "string", "description": "Template name shown in the catalog." },
+            "team_display_name": {
+                "type": "string",
+                "description": "Human-facing Team name shown in the UI."
+            },
+            "role_display_names": {
+                "type": "array",
+                "description": "Optional [{role_id, display_name}] overrides.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role_id": { "type": "string" },
+                        "display_name": { "type": "string" }
+                    }
+                }
+            },
+            "roles": {
+                "type": "array",
+                "description": "One object per role. Recommended fields: role_id (string), display_name (string, shown in UI), team (business/technical/convergence), responsibility (string), grant_ceiling (array of read/search/write/test/network, or a string like workspace-read-write), agent_definition_ref (optional exact id from agent_catalog; omit/null for a safe default), fixed_count/min_count/max_count (positive integers), acceptance (array of strings). Extra fields are tolerated.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                }
+            },
+            "dependencies": {
+                "type": ["array", "object", "string"],
+                "description": "Role-level edges or group memberships. Accepted: [{from, to}], [{\"group\": [role_id, ...]}], {\"group\": [role_id, ...]}, [\"from -> to\"], or \"from -> to\". Runtime normalizes every form."
+            },
+            "result_fields": {
+                "type": "array",
+                "description": "Required result fields of the final synthesis; include summary and evidence.",
+                "items": { "type": "string" }
+            },
+            "evidence_required": { "type": "boolean" },
+            "instructions": {
+                "type": "string",
+                "description": "Markdown instructions given to every Team role (e.g. team_board collaboration protocol)."
+            }
+        },
+        "additionalProperties": true
+    });
     schema
 }
 
