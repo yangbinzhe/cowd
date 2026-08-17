@@ -998,6 +998,7 @@ fn explicit_workspace_paths(
         })
         .map(|token| token.trim_matches(['`', '\'', '"']))
         .filter(|token| !is_definition_like_token(workspace_root, token))
+        .filter(|token| is_probable_workspace_path_token(token))
         .filter(|token| {
             token.starts_with('/')
                 || token.starts_with("./")
@@ -1039,6 +1040,15 @@ fn explicit_workspace_paths(
     paths.sort();
     paths.dedup();
     paths
+}
+
+/// Tokens are only treated as workspace paths when they are explicit (`/…`
+/// or `./…`) or ASCII. Non-ASCII slash-containing tokens are prose such as
+/// template names (“业务/技术双团队研讨”), never filesystem paths in this
+/// workspace; parsing them as paths breaks resource acquisition with
+/// “workspace path does not exist”.
+fn is_probable_workspace_path_token(token: &str) -> bool {
+    token.starts_with('/') || token.starts_with("./") || token.is_ascii()
 }
 
 /// Template/Agent Definition references such as
@@ -1311,6 +1321,24 @@ mod tests {
                 .iter()
                 .any(|scope| scope.contains("biz-tech-dual-team-deliberation")),
             "definition refs must not become workspace leases: {scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|scope| scope == "write:."),
+            "the real workspace write target must still be derived: {scopes:?}"
+        );
+    }
+
+    #[test]
+    fn chinese_template_names_are_not_derived_into_workspace_leases() {
+        let temporary = tempfile::TempDir::new().expect("temporary root");
+        let objective = format!(
+            "发布“业务/技术双团队研讨”模板并写入 {}",
+            temporary.path().display()
+        );
+        let scopes = explicit_workspace_resource_scopes(temporary.path(), &objective, true);
+        assert!(
+            !scopes.iter().any(|scope| scope.contains("业务")),
+            "Chinese template names must not become workspace leases: {scopes:?}"
         );
         assert!(
             scopes.iter().any(|scope| scope == "write:."),
