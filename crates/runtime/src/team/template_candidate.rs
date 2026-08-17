@@ -81,6 +81,13 @@ pub struct TemplateCandidate {
 /// - `role_display_names` may be an object keyed by role_id instead of an
 ///   array of {role_id, display_name}.
 pub(crate) fn normalize_template_proposal(value: &mut serde_json::Value) {
+    if value.get("instructions").is_none() {
+        value["instructions"] =
+            serde_json::json!("# 协作研讨\n\n分工调研、对抗质询并收敛为统一结论。\n");
+    }
+    if let Some(serde_json::Value::String(field)) = value.get("result_fields").cloned() {
+        value["result_fields"] = serde_json::json!([field]);
+    }
     if let Some(serde_json::Value::Object(roles)) = value.get_mut("roles") {
         let roles: serde_json::Map<String, serde_json::Value> = std::mem::take(roles);
         let normalized = roles
@@ -89,10 +96,15 @@ pub(crate) fn normalize_template_proposal(value: &mut serde_json::Value) {
                 if role.is_object() && role.get("role_id").is_none() {
                     role["role_id"] = serde_json::json!(role_id);
                 }
+                normalize_proposed_role(&mut role);
                 role
             })
             .collect::<Vec<_>>();
         value["roles"] = serde_json::json!(normalized);
+    } else if let Some(serde_json::Value::Array(roles)) = value.get_mut("roles") {
+        for role in roles.iter_mut() {
+            normalize_proposed_role(role);
+        }
     }
     if let Some(serde_json::Value::Object(displays)) = value.get_mut("role_display_names") {
         let displays: serde_json::Map<String, serde_json::Value> = std::mem::take(displays);
@@ -103,6 +115,45 @@ pub(crate) fn normalize_template_proposal(value: &mut serde_json::Value) {
             })
             .collect::<Vec<_>>();
         value["role_display_names"] = serde_json::json!(normalized);
+    }
+}
+
+fn normalize_proposed_role(role: &mut serde_json::Value) {
+    let Some(fields) = role.as_object_mut() else {
+        return;
+    };
+    if let Some(serde_json::Value::Object(reference)) = fields.get("agent_definition_ref").cloned()
+    {
+        let definition = reference
+            .get("definition")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| reference.keys().next().cloned());
+        let revision = reference
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                reference
+                    .values()
+                    .next()
+                    .and_then(serde_json::Value::as_u64)
+            })
+            .unwrap_or(1);
+        fields.insert(
+            "agent_definition_ref".to_string(),
+            serde_json::json!(format!("{}@{}", definition.unwrap_or_default(), revision)),
+        );
+    }
+    if let Some(serde_json::Value::Object(ceiling)) = fields.get("grant_ceiling").cloned() {
+        let normalized = ceiling
+            .into_iter()
+            .filter(|(_, enabled)| enabled.as_bool().unwrap_or(true))
+            .map(|(capability, _)| serde_json::json!(capability))
+            .collect::<Vec<_>>();
+        fields.insert("grant_ceiling".to_string(), serde_json::json!(normalized));
+    }
+    if let Some(serde_json::Value::String(acceptance)) = fields.get("acceptance").cloned() {
+        fields.insert("acceptance".to_string(), serde_json::json!([acceptance]));
     }
 }
 
@@ -729,12 +780,16 @@ mod tests {
             "roles": {
                 "business_expert": {
                     "responsibility": "业务分析",
-                    "agent_definition_ref": "workspace/cowd/explore@1",
-                    "grant_ceiling": ["read"]
+                    "agent_definition_ref": {
+                        "definition": "workspace/cowd/explore",
+                        "revision": 1
+                    },
+                    "grant_ceiling": {"read": true, "write": false},
+                    "acceptance": "findings"
                 },
                 "cto": {
                     "responsibility": "技术裁决",
-                    "agent_definition_ref": "workspace/cowd/direct@1"
+                    "agent_definition_ref": {"workspace/cowd/direct": 1}
                 }
             },
             "role_display_names": {
@@ -746,9 +801,15 @@ mod tests {
         normalize_template_proposal(&mut value);
         let roles = value["roles"].as_array().expect("roles array");
         assert_eq!(roles.len(), 2);
-        assert!(roles.iter().any(
-            |role| role["role_id"] == "business_expert" && role["responsibility"] == "业务分析"
-        ));
+        assert!(roles.iter().any(|role| {
+            role["role_id"] == "business_expert"
+                && role["responsibility"] == "业务分析"
+                && role["agent_definition_ref"] == "workspace/cowd/explore@1"
+                && role["grant_ceiling"] == serde_json::json!(["read"])
+                && role["acceptance"] == serde_json::json!(["findings"])
+        }));
+        assert!(roles.iter().any(|role| role["role_id"] == "cto"
+            && role["agent_definition_ref"] == "workspace/cowd/direct@1"));
         let displays = value["role_display_names"]
             .as_array()
             .expect("display names array");
