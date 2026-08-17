@@ -247,6 +247,10 @@ pub enum ModelTemplateDependencies {
     GroupArray(Vec<std::collections::BTreeMap<String, serde_json::Value>>),
     /// Object keyed by group label -> member role ids (or nested group labels).
     Groups(std::collections::BTreeMap<String, serde_json::Value>),
+    /// Array of `from->to` / `from:to` strings.
+    Strings(Vec<String>),
+    /// A single `from->to` / `from:to` string.
+    String(String),
 }
 
 /// Structured AI-authored Team template proposal for operation=propose_template.
@@ -457,6 +461,23 @@ mod tests {
         assert!(matches!(
             group_array.dependencies,
             Some(ModelTemplateDependencies::GroupArray(_))
+        ));
+        let strings: ModelTemplateProposal = serde_json::from_value(base(serde_json::json!([
+            "business_expert -> synthesizer",
+            "synthesizer : convergence"
+        ])))
+        .expect("string-array shape");
+        assert!(matches!(
+            strings.dependencies,
+            Some(ModelTemplateDependencies::Strings(_))
+        ));
+        let single: ModelTemplateProposal = serde_json::from_value(base(serde_json::json!(
+            "business_expert -> synthesizer"
+        )))
+        .expect("single-string shape");
+        assert!(matches!(
+            single.dependencies,
+            Some(ModelTemplateDependencies::String(_))
         ));
     }
 

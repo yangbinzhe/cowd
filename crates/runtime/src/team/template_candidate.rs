@@ -715,6 +715,15 @@ fn normalize_dependencies(
                 groups.insert(label.clone(), members_to_vec(members, &label)?);
             }
         }
+        serde_json::Value::String(raw) => {
+            let (from, to) = raw
+                .split_once("->")
+                .or_else(|| raw.split_once(':'))
+                .ok_or_else(|| {
+                    format!("dependency string `{raw}` must use `from->to` or `from:to`")
+                })?;
+            pair_edges.push((from.trim().to_string(), to.trim().to_string()));
+        }
         other => {
             return Err(format!(
                 "dependencies must be an array or object, got {}",
