@@ -451,6 +451,7 @@ mod tests {
             deadline_at_ms: u64::MAX,
             managed_invocation: None,
             resource_scopes: vec!["read:crates/runtime".to_string()],
+            allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
         }

@@ -2068,9 +2068,13 @@ fn resource_path_is_authorized(
         if (write && mode != "write") || (!write && mode != "read" && mode != "write") {
             return false;
         }
-        if matches!(allowed.trim(), "." | "./") {
-            return false;
-        }
+        // `read:.` / `write:.` are whole-workspace leases issued only to
+        // full-trust (YOLO / danger-full-access) Teams. The Team
+        // instantiation contract gates them behind
+        // `allow_whole_workspace_scope`, so reaching this point with a `.`
+        // scope already proves the Runtime authorized the entire workspace.
+        // The workspace identity check below still bounds them to this
+        // workspace and never to absolute or traversing paths.
         let allowed = if mode == "write" {
             resolver.resolve_planned_file(allowed)
         } else {
@@ -3821,7 +3825,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_root_alias_never_expands_a_write_lease() {
+    fn whole_workspace_lease_bounds_to_workspace_but_never_escapes() {
         let root = tempfile::tempdir().expect("workspace");
         let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
             .expect("path identities");
@@ -3841,12 +3845,16 @@ mod tests {
         .expect("normalize workspace root");
         let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
         assert_eq!(normalized["path"], ".");
-        assert!(!resource_path_is_authorized(
+        // `write:.` is a whole-workspace lease issued only to full-trust
+        // Teams; it authorizes any path inside the workspace.
+        assert!(resource_path_is_authorized(
             &resolver,
             "evidence/new-report.html",
             &["write:.".to_string()],
             true,
         ));
+        // Traversal outside the workspace is never authorized, even under a
+        // whole-workspace lease.
         assert!(!resource_path_is_authorized(
             &resolver,
             "../outside.html",

@@ -263,6 +263,13 @@ pub struct TeamInstantiationRequest {
     pub managed_invocation: Option<crate::managed_agent::ManagedAgentInvocationFence>,
     #[serde(default)]
     pub resource_scopes: Vec<String>,
+    /// Full-trust (YOLO / danger-full-access) sessions may authorize the
+    /// whole workspace as a bounded-in-name-only lease (`read:.` / `write:.`).
+    /// This flag is set exclusively by the Runtime from the session's
+    /// permission ceiling; model input can never enable it. When false, the
+    /// historical bounded-relative-lease contract stays fully enforced.
+    #[serde(default)]
+    pub allow_whole_workspace_scope: bool,
     /// Runtime-verified evidence committed by predecessor root-graph nodes.
     #[serde(default)]
     pub upstream_evidence_refs: Vec<EvidenceAccessRef>,
@@ -405,17 +412,19 @@ impl TeamInstantiationRequest {
             });
         }
         if self.resource_scopes.iter().any(|scope| {
-            matches!(
+            let whole_workspace_form = matches!(
                 scope.as_str(),
                 "workspace" | "read:." | "write:." | "worktree:."
-            ) || scope.starts_with('/')
+            );
+            (whole_workspace_form && !self.allow_whole_workspace_scope)
+                || scope.starts_with('/')
                 || scope.contains(":\\")
                 || scope.split('/').any(|part| part == "..")
                 || scope.split_once(':').is_some_and(|(mode, path)| {
                     matches!(mode, "read" | "write" | "worktree") && {
                         let path = path.trim().replace('\\', "/");
                         path.is_empty()
-                            || path == "."
+                            || (path == "." && !self.allow_whole_workspace_scope)
                             || path.starts_with('/')
                             || path.split('/').any(|part| part == "..")
                     }
@@ -694,6 +703,7 @@ mod tests {
             deadline_at_ms: u64::MAX,
             managed_invocation: None,
             resource_scopes: vec!["read:crates/runtime".to_string()],
+            allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
         }
@@ -743,6 +753,35 @@ mod tests {
             assert!(
                 request.validate().is_err(),
                 "unsafe scope must fail: {scope}"
+            );
+        }
+    }
+
+    #[test]
+    fn whole_workspace_scope_requires_the_runtime_full_trust_flag() {
+        for scope in ["workspace", "read:.", "write:.", "worktree:."] {
+            let mut request = request();
+            request.resource_scopes = vec![scope.to_string(), "session:session-1".to_string()];
+            assert!(
+                request.validate().is_err(),
+                "whole-workspace scope must fail without the full-trust flag: {scope}"
+            );
+            request.allow_whole_workspace_scope = true;
+            request
+                .validate()
+                .unwrap_or_else(|error| panic!("full-trust scope must pass: {scope}: {error}"));
+        }
+    }
+
+    #[test]
+    fn absolute_and_traversing_scopes_are_rejected_even_under_full_trust() {
+        for scope in ["read:/etc", "write:../outside", "read:C:\\secret"] {
+            let mut request = request();
+            request.allow_whole_workspace_scope = true;
+            request.resource_scopes = vec![scope.to_string(), "session:session-1".to_string()];
+            assert!(
+                request.validate().is_err(),
+                "unsafe scope must fail even under full trust: {scope}"
             );
         }
     }

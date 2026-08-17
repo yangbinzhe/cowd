@@ -53,6 +53,7 @@ fn request(mission_id: &str) -> TeamInstantiationRequest {
             "read:crates/runtime".to_string(),
             "session:working-state-commit".to_string(),
         ],
+        allow_whole_workspace_scope: false,
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
     }

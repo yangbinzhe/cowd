@@ -569,6 +569,11 @@ fn resource_scopes_overlap(left: &str, right: &str) -> bool {
     let (Some(left), Some(right)) = (normalize(left), normalize(right)) else {
         return left == right;
     };
+    // A whole-workspace lease (`read:.` / `write:.`) normalizes to an empty
+    // path; it overlaps every other scope in the same workspace.
+    if left.is_empty() || right.is_empty() {
+        return true;
+    }
     let contains = |ancestor: &str, descendant: &str| {
         descendant == ancestor
             || descendant

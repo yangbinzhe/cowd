@@ -494,6 +494,10 @@ fn compile_team_subgraph_node(
         deadline_at_ms,
         managed_invocation: None,
         resource_scopes: semantic.resource_scopes.clone(),
+        allow_whole_workspace_scope: request
+            .constraints
+            .permission_ceiling
+            .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
     };

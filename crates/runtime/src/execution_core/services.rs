@@ -6263,6 +6263,9 @@ impl RuntimeServices {
                         },
                     ),
                     resource_scopes: definition.resource_scopes.clone(),
+                    allow_whole_workspace_scope: definition
+                        .permission_ceiling
+                        .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
                     upstream_evidence_refs: Vec::new(),
                     upstream_artifact_refs: Vec::new(),
                 };
@@ -7001,6 +7004,7 @@ fn evolution_team_request(
         deadline_at_ms,
         managed_invocation: None,
         resource_scopes: scenario.resource_scopes.clone(),
+        allow_whole_workspace_scope: false,
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
     }
@@ -10068,6 +10072,7 @@ mod tests {
             } else {
                 "read:crates/runtime".to_string()
             }],
+            allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
         }

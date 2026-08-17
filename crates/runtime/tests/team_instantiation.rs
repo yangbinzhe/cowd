@@ -54,6 +54,7 @@ fn request(template_id: &str, mission_id: &str) -> TeamInstantiationRequest {
             "read:crates/runtime".to_string(),
             "session:session-team-instantiation".to_string(),
         ],
+        allow_whole_workspace_scope: false,
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
     }
@@ -207,7 +208,33 @@ fn builtin_template_default_pointer_resolves_the_verified_stable_release() {
         instantiated.template_ref.template_id.as_str(),
         "builtin/cowd/parallel-research-synthesis"
     );
-    assert_eq!(instantiated.template_ref.revision, 1);
+    assert_eq!(instantiated.template_ref.revision, 2);
+}
+
+#[test]
+fn whole_workspace_scope_requires_the_full_trust_flag_and_plans_when_granted() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let mut request = request(
+        "cowd/execute-review",
+        services.mission_runtime().default_mission_id(),
+    );
+    request.permission_ceiling =
+        harness_contract::policy::PermissionMode::DangerFullAccess;
+    request.resource_scopes = vec![
+        "write:.".to_string(),
+        "session:session-team-instantiation".to_string(),
+    ];
+    assert!(
+        services.team_runtime().plan(request.clone()).is_err(),
+        "whole-workspace scope must be rejected without the Runtime full-trust flag"
+    );
+    request.allow_whole_workspace_scope = true;
+    let instantiated = services
+        .team_runtime()
+        .plan(request)
+        .expect("full-trust whole-workspace Team must plan");
+    assert!(!instantiated.graph.nodes.is_empty());
+    assert!(instantiated.graph.id.contains("team"));
 }
 
 #[test]
