@@ -123,6 +123,14 @@ pub struct TeamRoleBindingOverride {
     pub grant_ceiling: Vec<AgentCapability>,
 }
 
+/// Display-only override for one role's human-facing name. Never affects
+/// behavior, permissions or acceptance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleDisplayOverride {
+    pub role_id: String,
+    pub display_name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamRoleCardinalityOverride {
     pub role_id: String,
@@ -228,6 +236,12 @@ pub struct TeamInstantiationRequest {
     pub risk: Option<TaskRisk>,
     #[serde(default)]
     pub role_binding_overrides: Vec<TeamRoleBindingOverride>,
+    /// Optional human-facing team display name (user request / model proposal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// Optional per-role display name overrides (user request / model proposal).
+    #[serde(default)]
+    pub role_display_overrides: Vec<RoleDisplayOverride>,
     #[serde(default)]
     pub cardinality_overrides: Vec<TeamRoleCardinalityOverride>,
     #[serde(default)]
@@ -663,6 +677,8 @@ mod tests {
             acceptance: vec!["summary".to_string()],
             risk: None,
             role_binding_overrides: Vec::new(),
+            display_name: None,
+            role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
             permission_ceiling: PermissionMode::ReadOnly,

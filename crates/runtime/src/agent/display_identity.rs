@@ -13,6 +13,8 @@ pub fn compile_agent_display_identity(
     binding: &AgentBindingSnapshot,
     role: &TeamRoleBindingSnapshot,
     agent_id: &str,
+    role_id: &str,
+    role_display_name: Option<&str>,
     agent_name: &str,
     agent_description: &str,
 ) -> AgentDisplayIdentity {
@@ -33,6 +35,8 @@ pub fn compile_agent_display_identity(
     );
     AgentDisplayIdentity {
         agent_id: agent_id.to_string(),
+        role_id: role_id.to_string(),
+        role_display_name: role_display_name.map(str::to_owned),
         label,
         role_label,
         focus_label,
@@ -122,6 +126,8 @@ mod tests {
             &binding(),
             &role("Implementer"),
             "agent:implementer:1",
+            "implementer",
+            Some("执行智能体"),
             "Execute",
             "Executes",
         );
@@ -129,10 +135,14 @@ mod tests {
             &binding(),
             &role("实现者"),
             "agent:implementer:1",
+            "implementer",
+            Some("实现智能体"),
             "执行者",
             "执行有界变更",
         );
         assert_eq!(english.agent_id, "agent:implementer:1");
+        assert_eq!(english.role_id, "implementer");
+        assert_eq!(english.role_display_name.as_deref(), Some("执行智能体"));
         assert_eq!(english.role_label, "Implementer");
         assert_eq!(chinese.role_label, "实现者");
         assert_ne!(english.digest, chinese.digest);

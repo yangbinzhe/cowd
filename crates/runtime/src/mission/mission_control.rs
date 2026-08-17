@@ -653,6 +653,7 @@ fn team_nodes(
             Some(MissionControlTeamNode {
                 team_id: value_string(team, "team_id")?,
                 graph_id,
+                display_label: value_string(team, "display_label"),
                 mission_id: binding.map(|(mission_id, _)| mission_id.clone()),
                 task_id: binding.map(|(_, task_id)| task_id.clone()),
                 session_id: value_string(team, "session_id"),
@@ -682,6 +683,8 @@ fn agent_nodes(
                 agent_id,
                 harness_contract::team::AgentDisplayIdentity {
                     agent_id: display["agent_id"].as_str().unwrap_or_default().to_string(),
+                    role_id: display["role_id"].as_str().unwrap_or_default().to_string(),
+                    role_display_name: display["role_display_name"].as_str().map(str::to_owned),
                     label: display["label"].as_str().unwrap_or_default().to_string(),
                     role_label: display["role_label"]
                         .as_str()
@@ -727,7 +730,12 @@ fn agent_nodes(
                     backend: None,
                     detail: trace.clone(),
                     display_label: display.map(|display| display.label.clone()),
-                    display_role_label: display.map(|display| display.role_label.clone()),
+                    display_role_label: display.map(|display| {
+                        display
+                            .role_display_name
+                            .clone()
+                            .unwrap_or_else(|| display.role_label.clone())
+                    }),
                     display_focus_label: display.and_then(|display| display.focus_label.clone()),
                     display_provenance: display.map(|display| display.provenance.clone()),
                     display_digest: display.map(|display| display.digest.clone()),
@@ -767,7 +775,12 @@ fn agent_nodes(
                 backend: value_string(agent, "backend"),
                 detail: agent.clone(),
                 display_label: display.map(|display| display.label.clone()),
-                display_role_label: display.map(|display| display.role_label.clone()),
+                display_role_label: display.map(|display| {
+                    display
+                        .role_display_name
+                        .clone()
+                        .unwrap_or_else(|| display.role_label.clone())
+                }),
                 display_focus_label: display.and_then(|display| display.focus_label.clone()),
                 display_provenance: display.map(|display| display.provenance.clone()),
                 display_digest: display.map(|display| display.digest.clone()),
@@ -1028,7 +1041,7 @@ fn mission_graph(
                 execution_id: Some(team.graph_id.clone()),
                 team_id: Some(team.team_id.clone()),
                 agent_id: None,
-                display_label: None,
+                display_label: team.display_label.clone(),
                 display_role_label: None,
                 display_focus_label: None,
                 display_provenance: None,
@@ -1533,6 +1546,7 @@ mod tests {
         let teams = vec![MissionControlTeamNode {
             team_id: "team-1".to_string(),
             graph_id: "team-graph:team-1".to_string(),
+            display_label: None,
             mission_id: Some("mission-1".to_string()),
             task_id: Some("task-team-1".to_string()),
             session_id: Some("session-1".to_string()),
@@ -1584,6 +1598,25 @@ mod tests {
             .find(|node| node.agent_id == "instance:agent:s1")
             .expect("synthesizer node");
         assert_eq!(synthesizer.display_label, None);
+    }
+
+    #[test]
+    fn team_nodes_carry_display_label() {
+        let teams = team_nodes(
+            &serde_json::json!({
+                "teams": [{
+                    "team_id": "team-1",
+                    "graph_id": "team-graph:team-1",
+                    "session_id": "session-1",
+                    "status": "running",
+                    "display_label": "业务团队",
+                    "agents": []
+                }]
+            }),
+            &BTreeMap::new(),
+        );
+        assert_eq!(teams.len(), 1);
+        assert_eq!(teams[0].display_label.as_deref(), Some("业务团队"));
     }
 
     #[test]

@@ -150,8 +150,15 @@ fn compile_display_identity(
         .map(|role| role.role_name.clone())
         .unwrap_or_else(|| manifest.name.clone());
     let focus_label = roles.iter().find_map(|role| role.focus.clone());
+    let team_display_name = request.display_name.clone().or_else(|| {
+        manifest
+            .display
+            .as_ref()
+            .and_then(|display| display.team_display_name.clone())
+    });
     let display = TeamDisplayIdentity {
         label: manifest.name.clone(),
+        team_display_name,
         role_label,
         focus_label,
         locale: "auto".to_string(),
@@ -163,8 +170,9 @@ fn compile_display_identity(
             "{:x}",
             Sha256::digest(
                 format!(
-                    "{}|{}|{}|{}|{}",
+                    "{}|{}|{}|{}|{}|{}",
                     display.label,
+                    display.team_display_name.as_deref().unwrap_or_default(),
                     display.role_label,
                     display.focus_label.as_deref().unwrap_or_default(),
                     display.locale,
@@ -387,6 +395,8 @@ mod tests {
     use harness_contract::agent::{
         AgentBindingSnapshot, AgentDataLease, AgentDefinitionRevisionRef, AgentInstanceRef,
     };
+    use harness_contract::team::definition::{RoleDisplayName, TeamTemplateDisplay};
+    use harness_contract::team::instantiation::RoleDisplayOverride;
     use harness_contract::team::{
         RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamTemplateDefinitionId,
         TeamTopologyContract,
@@ -424,6 +434,8 @@ mod tests {
             acceptance: vec!["summary".to_string(), "evidence".to_string()],
             risk: None,
             role_binding_overrides: Vec::new(),
+            display_name: None,
+            role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
@@ -454,6 +466,7 @@ mod tests {
             .unwrap(),
             revision: 1,
             name: "Test Team".to_string(),
+            display: None,
             lifecycle: harness_contract::agent::RevisionLifecycle::Published,
             topology: TeamTopologyContract {
                 protocol_ref: "review_fix@1".to_string(),
@@ -462,6 +475,7 @@ mod tests {
             },
             roles: vec![TeamRoleDefinition {
                 role_id: "implementer".to_string(),
+                display_name: None,
                 responsibility: "Implement the bounded change.".to_string(),
                 agent_definition_id: harness_contract::agent::AgentDefinitionId::new(
                     harness_contract::agent::DefinitionScope::Builtin,
@@ -602,6 +616,54 @@ mod tests {
         )
         .expect("binding recompiles");
         assert_eq!(binding.binding_digest, again.binding_digest);
+    }
+
+    #[test]
+    fn display_identity_uses_request_and_manifest_display_names() {
+        let mut request = request();
+        request.display_name = Some("业务团队".to_string());
+        request.role_display_overrides = vec![RoleDisplayOverride {
+            role_id: "implementer".to_string(),
+            display_name: "供应链专家".to_string(),
+        }];
+        let mut manifest = manifest();
+        manifest.display = Some(TeamTemplateDisplay {
+            team_display_name: Some("技术团队".to_string()),
+            role_display_names: vec![RoleDisplayName {
+                role_id: "implementer".to_string(),
+                display_name: "技术专家".to_string(),
+            }],
+        });
+        let roles = vec![TeamRoleBindingSnapshot {
+            role_id: "implementer".to_string(),
+            slot: 1,
+            focus: Some("supply-chain".to_string()),
+            role_name: "Implement".to_string(),
+            role_description: "Implement".to_string(),
+            behavior: Vec::new(),
+            agent_definition_ref: "builtin/cowd/execute".to_string(),
+            agent_name: "Execute".to_string(),
+            agent_description: "Executes".to_string(),
+            agent_definition_digest: "digest".to_string(),
+            responsibility: "Implement".to_string(),
+            cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
+            partition: RolePartitionPolicy::Single,
+            task_contract_ref: "task/implementer@1".to_string(),
+            acceptance: Vec::new(),
+            team_markdown_fragment: None,
+        }];
+        let identity = compile_display_identity(&request, &manifest, &roles, "# Team");
+        // Request wins over manifest for the team display name.
+        assert_eq!(identity.team_display_name.as_deref(), Some("业务团队"));
+        // The resolved role display override is request-first; the manifest
+        // value must never replace it.
+        let override_ = request
+            .role_display_overrides
+            .iter()
+            .find(|item| item.role_id == "implementer")
+            .expect("override");
+        assert_eq!(override_.display_name, "供应链专家");
+        assert!(!identity.digest.is_empty());
     }
 
     #[test]

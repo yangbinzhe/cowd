@@ -4206,6 +4206,8 @@ mod tests {
             inspect_execution_id: None,
             proposal: None,
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,

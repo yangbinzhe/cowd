@@ -936,6 +936,7 @@ pub(crate) mod tests_support {
                 .unwrap(),
             revision,
             name: "Implementation review".to_string(),
+            display: None,
             lifecycle,
             topology: TeamTopologyContract {
                 protocol_ref: "team/implementation-review@1".to_string(),
@@ -944,6 +945,7 @@ pub(crate) mod tests_support {
             },
             roles: vec![TeamRoleDefinition {
                 role_id: "reviewer".to_string(),
+                display_name: None,
                 responsibility: "Review implementation evidence".to_string(),
                 agent_definition_id: AgentDefinitionId::new(scope, "cowd/reviewer").unwrap(),
                 agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },

@@ -753,6 +753,7 @@ mod tests {
                     template_id: template_id.clone(),
                     revision: 1,
                     name: "Review team".to_string(),
+                    display: None,
                     lifecycle: RevisionLifecycle::Published,
                     topology: TeamTopologyContract {
                         protocol_ref: "review_fix@1".to_string(),
@@ -761,6 +762,7 @@ mod tests {
                     },
                     roles: vec![TeamRoleDefinition {
                         role_id: "reviewer".to_string(),
+                        display_name: None,
                         responsibility: "Review implementation evidence".to_string(),
                         agent_definition_id: reviewer,
                         agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },

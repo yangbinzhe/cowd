@@ -13,6 +13,7 @@ pub enum RuntimeOrchestrationOperation {
     #[default]
     Inspect,
     Propose,
+    ProposeTemplate,
     Revise,
     Control,
     RouteInput,
@@ -24,6 +25,7 @@ impl RuntimeOrchestrationOperation {
         match self {
             Self::Inspect => "inspect",
             Self::Propose => "propose",
+            Self::ProposeTemplate => "propose_template",
             Self::Revise => "revise",
             Self::Control => "control",
             Self::RouteInput => "route_input",
@@ -189,6 +191,9 @@ pub struct ModelRuntimeOrchestrationInput {
     pub inspect_execution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ModelGraphMutationProposal>,
+    /// Structured AI-authored Team template proposal (operation=propose_template).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_proposal: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ModelRuntimeControlRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +234,7 @@ impl ModelRuntimeOrchestrationInput {
                 completion: ExecutionCompletionContract::default(),
                 reason: "The objective requires an independently verified result".to_string(),
             }),
+            template_proposal: None,
             control: None,
             input_disposition: None,
             evidence_refs: Vec::new(),

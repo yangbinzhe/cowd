@@ -73,6 +73,7 @@ where
         // instead of colliding with installations that already stored v1.
         revision: 2,
         name: "Execute and Review".to_string(),
+        display: None,
         lifecycle: RevisionLifecycle::Published,
         topology: TeamTopologyContract {
             protocol_ref: "review_fix@1".to_string(),
@@ -82,6 +83,7 @@ where
         roles: vec![
             TeamRoleDefinition {
                 role_id: "implementer".to_string(),
+                display_name: None,
                 responsibility: "Plan, implement, and provide source-level verification evidence"
                     .to_string(),
                 agent_definition_id: execute.clone(),
@@ -103,6 +105,7 @@ where
             },
             TeamRoleDefinition {
                 role_id: "reviewer".to_string(),
+                display_name: None,
                 responsibility: "Review the implementation evidence and identify remaining risk"
                     .to_string(),
                 agent_definition_id: direct.clone(),
@@ -222,6 +225,7 @@ fn additional_builtin_team_manifests(
                          partition: RolePartitionPolicy,
                          acceptance: &[&str]| TeamRoleDefinition {
         role_id: role_id.to_string(),
+        display_name: None,
         responsibility: responsibility.to_string(),
         agent_definition_id: agent,
         agent_selector: RevisionSelector::ExactApprovedRevision {
@@ -272,6 +276,7 @@ fn additional_builtin_team_manifests(
                 template_id,
                 revision: 1,
                 name: name.to_string(),
+                display: None,
                 lifecycle: RevisionLifecycle::Published,
                 topology: TeamTopologyContract {
                     protocol_ref: protocol_ref.to_string(),
@@ -517,6 +522,7 @@ mod tests {
         let agent = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap();
         let role = |responsibility: &str| TeamRoleDefinition {
             role_id: "implementer".to_string(),
+            display_name: None,
             responsibility: responsibility.to_string(),
             agent_definition_id: agent.clone(),
             agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },

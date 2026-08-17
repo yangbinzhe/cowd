@@ -464,6 +464,8 @@ fn compile_team_subgraph_node(
                 "Team orchestration requires canonical execution lineage".to_string(),
             )
         })?,
+        display_name: None,
+        role_display_overrides: Vec::new(),
         parent_execution: Some(ExecutionParentBinding {
             execution_id: graph_id.to_string(),
             node_id: node_id.to_string(),

@@ -28,13 +28,19 @@ pub fn validate_request(
     let mut status = match request.operation {
         RuntimeOrchestrationOperation::Inspect => "planned",
         RuntimeOrchestrationOperation::Propose
+        | RuntimeOrchestrationOperation::ProposeTemplate
         | RuntimeOrchestrationOperation::Revise
         | RuntimeOrchestrationOperation::Control => "accepted",
         RuntimeOrchestrationOperation::RouteInput => "rejected",
     }
     .to_string();
 
-    if !execution.executable && request.operation != RuntimeOrchestrationOperation::Inspect {
+    if !execution.executable
+        && !matches!(
+            request.operation,
+            RuntimeOrchestrationOperation::Inspect | RuntimeOrchestrationOperation::ProposeTemplate
+        )
+    {
         reject(&mut status, &mut findings, "strategy_resources_unavailable");
         findings.extend(execution.blocked_reasons.iter().cloned());
     }
@@ -94,7 +100,10 @@ pub fn validate_request(
         );
     }
     if request.intent.trim().is_empty()
-        && request.operation != RuntimeOrchestrationOperation::Control
+        && !matches!(
+            request.operation,
+            RuntimeOrchestrationOperation::Control | RuntimeOrchestrationOperation::ProposeTemplate
+        )
     {
         reject(&mut status, &mut findings, "empty_intent_rejected");
     }
@@ -246,6 +255,19 @@ fn validate_operation_shape(
                 .is_some_and(|proposal| proposal.target_execution_id.is_some())
             {
                 reject(status, findings, "propose_rejects_existing_graph_target");
+            }
+        }
+        RuntimeOrchestrationOperation::ProposeTemplate => {
+            if request.template_proposal.is_none()
+                || request.proposal.is_some()
+                || request.control.is_some()
+                || request.input_disposition.is_some()
+            {
+                reject(
+                    status,
+                    findings,
+                    "propose_template_requires_only_template_proposal",
+                );
             }
         }
         RuntimeOrchestrationOperation::Revise => {
@@ -644,6 +666,7 @@ fn push_gate(gates: &mut Vec<ExecutionPolicyGate>, gate: ExecutionPolicyGate) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RuntimeOrchestrationConstraints;
 
     #[test]
     fn parallel_ceiling_finding_gets_retryable_hint() {
@@ -684,5 +707,43 @@ mod tests {
         assert!(findings
             .iter()
             .any(|finding| finding == "model_proposal_conflicts_with_strategy_lease"));
+    }
+
+    #[test]
+    fn propose_template_shape_accepts_only_template_proposal() {
+        let command = RuntimeOrchestrationCommand {
+            intent: "起草业务/技术双团队研讨模板".to_string(),
+            model_lease: None,
+            session_id: None,
+            lineage: None,
+            mission_id: None,
+            operation: RuntimeOrchestrationOperation::ProposeTemplate,
+            inspect_execution_id: None,
+            proposal: None,
+            template_proposal: Some(serde_json::json!({
+                "template_id": "cowd/business-tech-deliberation",
+                "name": "业务/技术双团队研讨",
+                "roles": []
+            })),
+            control: None,
+            input_disposition: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints::default(),
+            surface: None,
+        };
+        let mut status = "accepted".to_string();
+        let mut findings = Vec::new();
+        validate_operation_shape(&command, &mut status, &mut findings);
+        assert!(findings.is_empty());
+
+        let mut missing = command;
+        missing.template_proposal = None;
+        let mut status = "accepted".to_string();
+        let mut findings = Vec::new();
+        validate_operation_shape(&missing, &mut status, &mut findings);
+        assert!(findings.contains(&"propose_template_requires_only_template_proposal".to_string()));
     }
 }

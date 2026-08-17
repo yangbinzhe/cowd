@@ -29,6 +29,7 @@ fn manifest(revision: u64, name: &str) -> TeamTemplateManifest {
             .unwrap(),
         revision,
         name: name.to_string(),
+        display: None,
         lifecycle: RevisionLifecycle::Draft,
         topology: TeamTopologyContract {
             protocol_ref: "team/review@1".to_string(),
@@ -37,6 +38,7 @@ fn manifest(revision: u64, name: &str) -> TeamTemplateManifest {
         },
         roles: vec![TeamRoleDefinition {
             role_id: "reviewer".to_string(),
+            display_name: None,
             responsibility: "Inspect evidence.".to_string(),
             agent_definition_id: AgentDefinitionId::new(
                 DefinitionScope::Workspace,

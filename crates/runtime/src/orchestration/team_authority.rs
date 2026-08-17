@@ -1617,6 +1617,8 @@ mod tests {
                 reason: "model requested write despite read-only intent".to_string(),
             }),
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
@@ -1881,6 +1883,8 @@ mod tests {
                 reason: "mixed research and write".to_string(),
             }),
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
@@ -2028,6 +2032,8 @@ mod tests {
                 reason: "explicit direct Teams".to_string(),
             }),
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
@@ -2141,6 +2147,8 @@ mod tests {
                 reason: "independent review".to_string(),
             }),
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
@@ -2211,6 +2219,8 @@ mod tests {
                 reason: "session lease test".to_string(),
             }),
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,

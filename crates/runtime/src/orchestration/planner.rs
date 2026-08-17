@@ -325,6 +325,8 @@ mod tests {
                 reason: "two independent Agent roles".to_string(),
             }),
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
@@ -370,6 +372,8 @@ mod tests {
                 reason: "three independent teams".to_string(),
             }),
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,

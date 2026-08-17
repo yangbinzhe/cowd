@@ -1272,6 +1272,7 @@ mod tests {
             strategy_turn_ref: String::new(),
             display_identity: TeamDisplayIdentity {
                 label: "Test".to_string(),
+                team_display_name: None,
                 role_label: "实现者".to_string(),
                 focus_label: Some("focus-1".to_string()),
                 locale: "auto".to_string(),

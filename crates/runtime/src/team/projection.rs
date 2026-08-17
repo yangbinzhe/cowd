@@ -5,7 +5,7 @@ use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeKind, Execu
 use harness_contract::team::{AgentDisplayIdentity, TeamRunResult, TeamTaskTrace};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentRuntime, ExecutionGraphStateStore};
+use crate::{AgentRuntime, ExecutionGraphStateStore, RuntimeEventStore};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamProjection {
@@ -14,6 +14,9 @@ pub struct TeamProjection {
     pub graph_id: String,
     pub graph_revision: u64,
     pub status: String,
+    /// Human-facing team display name from the frozen Binding, when declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
     pub tasks: Vec<TeamTaskTrace>,
     pub terminal_result: Option<TeamRunResult>,
     /// Frozen Agent Binding digests of every Team node. Surfaces use these as
@@ -49,12 +52,20 @@ pub struct TeamProjectionPage {
 /// Read-only Team facade. The graph and AgentRuntime are the sources of truth.
 pub struct TeamProjectionReader {
     graphs: ExecutionGraphStateStore,
+    binding_store: Option<Arc<RuntimeEventStore>>,
 }
 
 impl TeamProjectionReader {
     #[must_use]
-    pub fn new(graphs: ExecutionGraphStateStore, _agents: Arc<AgentRuntime>) -> Self {
-        Self { graphs }
+    pub fn new(
+        graphs: ExecutionGraphStateStore,
+        _agents: Arc<AgentRuntime>,
+        binding_store: Option<Arc<RuntimeEventStore>>,
+    ) -> Self {
+        Self {
+            graphs,
+            binding_store,
+        }
     }
 
     pub fn project(&self, graph_id: &str) -> Result<TeamProjection, String> {
@@ -268,6 +279,8 @@ impl TeamProjectionReader {
                     .clone()
                     .unwrap_or_else(|| AgentDisplayIdentity {
                         agent_id: packet.agent_id().to_string(),
+                        role_id: packet.assignment.role_id.clone(),
+                        role_display_name: None,
                         label: binding.definition_ref.definition_id.as_str().to_string(),
                         role_label: binding
                             .instance
@@ -344,12 +357,27 @@ impl TeamProjectionReader {
             "running"
         }
         .to_string();
+        let display_label = self
+            .binding_store
+            .as_ref()
+            .and_then(|store| {
+                crate::team_binding::load_binding(store, &graph.id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|binding| {
+                binding
+                    .display_identity
+                    .team_display_name
+                    .unwrap_or(binding.display_identity.label)
+            });
         Ok(TeamProjection {
             team_id,
             session_id,
             graph_id: graph.id,
             graph_revision: graph.revision,
             status,
+            display_label,
             tasks,
             terminal_result,
             binding_digests,
@@ -455,7 +483,7 @@ mod tests {
             Arc::clone(&store),
             Arc::new(crate::ProviderRegistry::empty()),
         ));
-        TeamProjectionReader::new(crate::ExecutionGraphStateStore::new(store), agents)
+        TeamProjectionReader::new(crate::ExecutionGraphStateStore::new(store), agents, None)
     }
 
     fn agent_node(id: &str, run_id: &str) -> ExecutionNodeSpec {

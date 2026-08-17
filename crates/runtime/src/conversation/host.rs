@@ -2377,6 +2377,8 @@ where
             ),
         }),
         control: None,
+        template_proposal: None,
+
         input_disposition: None,
         selection_mode: Some(selection_mode),
         strategy_binding: Some(harness_contract::team::TeamStrategyBinding {

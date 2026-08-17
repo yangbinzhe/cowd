@@ -771,6 +771,8 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             acceptance: vec!["summary".to_string(), "evidence".to_string()],
             risk: None,
             role_binding_overrides: Vec::new(),
+            display_name: None,
+            role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,

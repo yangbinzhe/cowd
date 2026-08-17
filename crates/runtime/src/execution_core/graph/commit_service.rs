@@ -2123,6 +2123,8 @@ mod tests {
             acceptance: Vec::new(),
             risk: None,
             role_binding_overrides: Vec::new(),
+            display_name: None,
+            role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,

@@ -1643,6 +1643,8 @@ pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
         inspect_execution_id: None,
         proposal: Some(proposal),
         control: None,
+        template_proposal: None,
+
         input_disposition: None,
         selection_mode: None,
         strategy_binding: None,

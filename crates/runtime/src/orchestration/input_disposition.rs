@@ -510,6 +510,7 @@ async fn materialize_graph(
             operation: RuntimeOrchestrationOperation::Propose,
             inspect_execution_id: None,
             proposal: Some(proposal),
+            template_proposal: None,
             control: None,
             input_disposition: None,
             evidence_refs: input_ids

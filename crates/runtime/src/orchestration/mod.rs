@@ -235,6 +235,9 @@ async fn submit_runtime_orchestration_request_with_mode(
             )
             .await
         }
+        RuntimeOrchestrationOperation::ProposeTemplate => {
+            propose_template(&request_id, &request, services).await
+        }
         RuntimeOrchestrationOperation::Revise => {
             revise(&request_id, &request, &plan, services, cancellation).await
         }
@@ -265,6 +268,80 @@ async fn submit_runtime_orchestration_request_with_mode(
             result_without_runtime_with_id(&request_id, &request, decision)
         }
     }
+}
+
+async fn propose_template(
+    request_id: &str,
+    request: &RuntimeOrchestrationCommand,
+    services: &RuntimeServices,
+) -> Result<OperationOutcome, String> {
+    let proposal_value = request
+        .template_proposal
+        .as_ref()
+        .ok_or_else(|| "template_proposal_missing".to_string())?;
+    let proposal: crate::team_template_candidate::TeamTemplateProposal =
+        serde_json::from_value(proposal_value.clone())
+            .map_err(|error| format!("invalid_template_proposal:{error}"))?;
+    let candidate = crate::team_template_candidate::TemplateCandidateCompiler::compile(
+        services.definition_registry(),
+        &proposal,
+        request.constraints.permission_ceiling,
+    )?;
+    let stored = services
+        .definition_registry()
+        .teams()
+        .store_revision(candidate.manifest, &proposal.instructions)
+        .map_err(|error| format!("template_publish_failed:{error}"))?;
+    let template_id = stored
+        .revision
+        .revision_ref
+        .template_id
+        .as_str()
+        .to_string();
+    let payload = json!({
+        "template_id": template_id,
+        "revision": stored.revision.revision_ref.revision,
+        "digest": stored.revision.content_digest,
+        "preview": candidate.preview,
+    });
+    let event_refs = vec![crate::RuntimeEventRef {
+        kind: "team_template".to_string(),
+        id: template_id.clone(),
+    }];
+    let stream_id = format!("definition-template:{template_id}");
+    let _ = services.event_store().append(crate::RuntimeEventInput {
+        stream_id: stream_id.clone(),
+        scope: crate::RuntimeEventScope::Mission,
+        kind: "definition.template.candidate_compiled.v1".to_string(),
+        status: Some("compiled".to_string()),
+        actor: Some(request_id.to_string()),
+        refs: event_refs.clone(),
+        payload: payload.clone(),
+    });
+    let _ = services.event_store().append(crate::RuntimeEventInput {
+        stream_id,
+        scope: crate::RuntimeEventScope::Mission,
+        kind: "definition.template.published.v1".to_string(),
+        status: Some("published".to_string()),
+        actor: Some(request_id.to_string()),
+        refs: event_refs,
+        payload,
+    });
+    Ok(OperationOutcome {
+        status: "completed".to_string(),
+        execution: json!({
+            "kind": "runtime.template_candidate",
+            "status": "published",
+            "template_id": template_id,
+            "revision": stored.revision.revision_ref.revision,
+            "content_digest": stored.revision.content_digest,
+            "preview": candidate.preview,
+        }),
+        evidence: json!({ "refs": [] }),
+        guidance:
+            "Template published; it is part of the runnable team catalog and can be selected by template_id."
+                .to_string(),
+    })
 }
 
 #[derive(Debug)]
@@ -1653,6 +1730,8 @@ mod tests {
                 reason: "parallel evidence lanes".to_string(),
             }),
             control: None,
+            template_proposal: None,
+
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,

@@ -241,6 +241,10 @@ impl TeamRoleTaskContract {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamRoleDefinition {
     pub role_id: String,
+    /// Human-facing display name for this role (e.g. "供应链专家").
+    /// Display-only: never participates in behavior, permissions or acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub responsibility: String,
     pub agent_definition_id: AgentDefinitionId,
     pub agent_selector: RevisionSelector,
@@ -248,6 +252,23 @@ pub struct TeamRoleDefinition {
     pub partition: RolePartitionPolicy,
     pub grant_ceiling: Vec<AgentCapability>,
     pub task_contract: TeamRoleTaskContract,
+}
+
+/// One role's human-facing display name, declared by a template author or
+/// proposed by the model. Never used for behavior decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleDisplayName {
+    pub role_id: String,
+    pub display_name: String,
+}
+
+/// Optional human-facing display metadata for a Team Template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTemplateDisplay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_display_name: Option<String>,
+    #[serde(default)]
+    pub role_display_names: Vec<RoleDisplayName>,
 }
 
 impl TeamRoleDefinition {
@@ -332,6 +353,9 @@ pub struct TeamTemplateManifest {
     pub template_id: TeamTemplateDefinitionId,
     pub revision: u64,
     pub name: String,
+    /// Optional display-only metadata (team name + per-role readable names).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<TeamTemplateDisplay>,
     pub lifecycle: RevisionLifecycle,
     pub topology: TeamTopologyContract,
     pub roles: Vec<TeamRoleDefinition>,
@@ -539,6 +563,7 @@ mod tests {
     fn role(role_id: &str) -> TeamRoleDefinition {
         TeamRoleDefinition {
             role_id: role_id.to_string(),
+            display_name: None,
             responsibility: format!("{role_id} responsibility"),
             agent_definition_id: AgentDefinitionId::try_from("workspace/cowd/reviewer").unwrap(),
             agent_selector: RevisionSelector::ExactApprovedRevision { revision: 2 },
@@ -559,6 +584,7 @@ mod tests {
                 .unwrap(),
             revision: 1,
             name: "Implementation Review".to_string(),
+            display: None,
             lifecycle: RevisionLifecycle::Published,
             topology: TeamTopologyContract {
                 protocol_ref: "review_fix@1".to_string(),

@@ -520,6 +520,8 @@ pub struct MissionControlTeamNode {
     pub team_id: String,
     pub graph_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<String>,
@@ -581,7 +583,7 @@ pub struct MissionControlGraphNode {
     pub team_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
-    /// Immutable human-facing agent display name (Definition name).
+    /// Team display name when this node is a team.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -308,6 +308,8 @@ pub mod team_projection;
 pub mod team_result_reducer;
 #[path = "team/team_runtime.rs"]
 pub mod team_runtime;
+#[path = "team/template_candidate.rs"]
+pub mod team_template_candidate;
 #[path = "team/working_state.rs"]
 pub mod team_working_state;
 #[path = "tooling/tool_dispatch.rs"]

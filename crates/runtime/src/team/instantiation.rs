@@ -715,10 +715,29 @@ impl TeamInstantiationService {
             let Some(role) = roles_by_slot.get(&role_slot_id) else {
                 continue;
             };
+            let role_display_name = request
+                .role_display_overrides
+                .iter()
+                .find(|override_| override_.role_id == role.role_id)
+                .map(|override_| override_.display_name.clone())
+                .or_else(|| {
+                    manifest
+                        .display
+                        .as_ref()
+                        .and_then(|display| {
+                            display
+                                .role_display_names
+                                .iter()
+                                .find(|name| name.role_id == role.role_id)
+                        })
+                        .map(|name| name.display_name.clone())
+                });
             agent_binding.display = Some(crate::display_identity::compile_agent_display_identity(
                 agent_binding,
                 role,
                 &agent_id,
+                &role.role_id,
+                role_display_name.as_deref(),
                 &role.agent_name,
                 &role.agent_description,
             ));
@@ -1633,6 +1652,7 @@ mod acceptance_contract_tests {
 
         let role = TeamRoleDefinition {
             role_id: "researcher".to_string(),
+            display_name: None,
             responsibility: "investigate one bounded focus".to_string(),
             agent_definition_id: harness_contract::agent::AgentDefinitionId::new(
                 harness_contract::agent::DefinitionScope::Builtin,
@@ -1747,6 +1767,7 @@ mod acceptance_contract_tests {
     fn single_role_consumes_its_runtime_planned_focus() {
         let role = TeamRoleDefinition {
             role_id: "reviewer".to_string(),
+            display_name: None,
             responsibility: "review committed output".to_string(),
             agent_definition_id: harness_contract::agent::AgentDefinitionId::new(
                 harness_contract::agent::DefinitionScope::Builtin,

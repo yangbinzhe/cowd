@@ -46,6 +46,8 @@ pub struct TeamRoleBindingSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamDisplayIdentity {
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_display_name: Option<String>,
     pub role_label: String,
     pub focus_label: Option<String>,
     pub locale: String,
@@ -61,6 +63,12 @@ pub struct AgentDisplayIdentity {
     /// graph nodes; it is never a display title.
     #[serde(default)]
     pub agent_id: String,
+    /// Typed role id (researcher/synthesizer/...). Display-only join key.
+    #[serde(default)]
+    pub role_id: String,
+    /// Human-facing role description (e.g. "供应链专家"), when declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_display_name: Option<String>,
     pub label: String,
     pub role_label: String,
     pub focus_label: Option<String>,
