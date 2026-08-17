@@ -2123,6 +2123,11 @@ where
         }
         return Ok(true);
     }
+    // AI-authored orchestration owns NEW Team launches. Runtime never
+    // substitutes a builtin Team before the model can publish and start its
+    // own template; the final-answer acceptance gate re-prompts the model
+    // when it finishes without a verified Team execution.
+    return Ok(false);
     let (model_lease, parent_requires_write, permission_mode) = {
         let runtime = runtime.lock().await;
         (
@@ -5113,20 +5118,17 @@ where
                         if verified_team_executions < required_team_executions {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            if crate::conversation::objective_names_custom_team_roles(
-                                &state.content,
-                            ) && state.team_orchestration_requests < 2
-                            {
+                            if state.team_orchestration_requests < 2 {
                                 state.team_orchestration_requests =
                                     state.team_orchestration_requests.saturating_add(1);
                                 let reason = format!(
-                                    "自定义团队编排尚未完成：用户点名了具体团队/角色（如 CTO、业务专家、供应链专家、工程师），但当前还没有已验证的自定义模板发布和团队执行。请立即调用 runtime_orchestrate(operation=propose_template, template_proposal=...) 发布定制模板并确认返回 published，然后调用 runtime_capabilities(detail=team_templates) 复制 catalog 中的精确 template_id，再用 runtime_orchestrate(operation=propose) 引用该模板启动团队。禁止只输出总结文本，继续执行（尝试 {}）。",
+                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。请继续自行编排：如用户点名了具体团队/角色，先调用 runtime_orchestrate(operation=propose_template, template_proposal=...) 发布定制模板并确认返回 published，再调用 runtime_capabilities(detail=team_templates) 复制 catalog 中的精确 template_id，最后用 runtime_orchestrate(operation=propose) 引用该模板启动团队；若用户没有点名具体角色，也可以直接使用 catalog 中的协作模板。禁止只输出总结文本，继续执行（尝试 {}）。",
                                     state.team_orchestration_requests
                                 );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&reason);
                                 let mut item = ContextItem::new(
-                                    format!("custom-team-replan:{}", ticket.node_id),
+                                    format!("team-orchestration-replan:{}", ticket.node_id),
                                     ContextSourceKind::Task,
                                     ContextRole::Instruction,
                                     reason.clone(),
@@ -5150,46 +5152,11 @@ where
                                 break 'final_answer vec![dynamic_node(
                                     ticket,
                                     state.iterations,
-                                    "custom-team-replan-model",
+                                    "team-orchestration-replan-model",
                                     ExecutionNodeKind::InlineModel,
                                     "inline_model",
                                     "inline_model",
                                 )];
-                            }
-                            if state.team_orchestration_requests == 0
-                                && !state.nested_orchestration_forbidden
-                            {
-                                state.team_orchestration_requests = 1;
-                                let call = crate::conversation::required_team_orchestration_call_with_understanding(
-                                    &state.content,
-                                    task_understanding.as_ref().ok_or_else(|| {
-                                        NodeExecutorError::Poll {
-                                            node_id: ticket.node_id.clone(),
-                                            reason: "turn strategy understanding missing during Team repair"
-                                                .to_string(),
-                                        }
-                                    })?,
-                                );
-                                let nodes = tool_nodes_for_calls(
-                                    ticket,
-                                    state.iterations,
-                                    &state.session_id,
-                                    vec![call],
-                                    self.services.workspace_root(),
-                                )?;
-                                model_intervention =
-                                    Some(harness_contract::goal::RuntimeIntervention {
-                                        goal_id: state.goal_id.clone(),
-                                        kind: RuntimeInterventionKind::Replan,
-                                        reason: "the final answer did not include a required Team execution; Runtime is issuing the canonical Team proposal now instead of asking the model to guess again"
-                                            .to_string(),
-                                        evidence_refs: vec![format!(
-                                            "execution_node:{}",
-                                            ticket.node_id
-                                        )],
-                                        expected_graph_revision: None,
-                                    });
-                                break 'final_answer nodes;
                             }
                             let reason = format!(
                                 "explicit Team acceptance is incomplete: verified {verified_team_executions} of {required_team_executions} required Team execution(s)"
@@ -14490,7 +14457,6 @@ mod tests {
             .agent_runtime()
             .register_observation_authority_backend(Arc::new(CompletedHostTeamBackend));
         let bus = crate::CowdEventBus::new();
-        let mut visible_events = bus.subscribe();
         let mut runtime = crate::ConversationRuntime::new(
             Session::new(),
             FinalAnswerClient,
@@ -14510,114 +14476,37 @@ mod tests {
             test_execution_lineage(),
         )
         .await;
-        let summary = result.expect("Host-selected Team must complete");
+        let summary = result.expect("turn must complete");
         let events = services
             .event_store()
             .all_events(500)
             .expect("strategy events");
         assert!(
-            summary.final_answer.contains("fixture finding"),
-            "unexpected terminal answer: {}; strategy events: {:?}",
-            summary.final_answer,
+            !summary.final_answer.trim().is_empty(),
+            "turn must surface a terminal answer; strategy events: {:?}",
             events
                 .iter()
                 .filter(|event| event.kind.contains("strategy") || event.kind.contains("team"))
                 .map(|event| (&event.kind, &event.status, &event.payload))
                 .collect::<Vec<_>>()
         );
-        let mut streamed_text = String::new();
-        let mut team_terminal_has_causal_identity = false;
-        while let Ok(event) = visible_events.try_recv() {
-            if let CowdEvent::TextDelta { text } = event.domain_event() {
-                streamed_text.push_str(text);
-                team_terminal_has_causal_identity |= event.causal_identity().is_some();
-            }
-        }
-        assert!(
-            streamed_text.contains("fixture finding"),
-            "a precommitted Team terminal must be visible on the parent stream: {streamed_text:?}"
-        );
-        assert!(
-            team_terminal_has_causal_identity,
-            "a precommitted Team terminal must use the canonical causal item envelope"
-        );
-
-        let selected = events
-            .iter()
-            .find(|event| event.kind == "runtime.strategy.selected")
-            .expect("selected event");
         let outcome = events
             .iter()
             .find(|event| event.kind == "runtime.strategy.outcome")
             .expect("outcome event");
         assert_eq!(
-            selected.payload["decision_id"],
-            outcome.payload["decision_id"]
-        );
-        assert_eq!(selected.payload["selected_candidate"], "team");
-        assert_eq!(
             outcome
                 .payload
-                .pointer("/outcome/working_state_verified")
-                .and_then(serde_json::Value::as_bool),
-            Some(false),
-            "a verified child Team must not masquerade as the root Goal verdict"
-        );
-        assert_eq!(
-            outcome
-                .payload
-                .pointer("/collaboration_receipt/working_state_verified")
-                .and_then(serde_json::Value::as_bool),
-            Some(true),
-            "the selected Team receipt must retain its own verified working state"
-        );
-        assert_eq!(
-            outcome
-                .payload
-                .pointer("/outcome/parent_merge_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(1)
-        );
-        assert_eq!(
-            outcome
-                .payload
-                .pointer("/outcome/max_tool_concurrency_observed")
-                .and_then(serde_json::Value::as_u64),
-            Some(3),
-            "child Agent concurrency must survive Team reduction and parent merge"
+                .get("status")
+                .and_then(serde_json::Value::as_str),
+            Some("partial"),
+            "a Team-required turn that the model did not complete must stay honestly partial"
         );
         assert!(
-            outcome
-                .payload
-                .pointer("/outcome/parallel_tool_batches")
-                .and_then(serde_json::Value::as_u64)
-                .is_some_and(|value| value >= 4),
-            "both Team Agent packets must contribute their parallel batches"
-        );
-        let root_graph_id = outcome.payload["execution_graph_ref"]
-            .as_str()
-            .expect("root graph id");
-        let mission_links = services
-            .graph_state_store()
-            .child_links(root_graph_id)
-            .expect("Mission graph link");
-        assert_eq!(mission_links.len(), 1);
-        let team_links = services
-            .graph_state_store()
-            .child_links(&mission_links[0].child_execution_id)
-            .expect("Team subgraph link");
-        assert_eq!(team_links.len(), 1);
-        let team_graph = services
-            .graph_state_store()
-            .load(&team_links[0].child_execution_id)
-            .expect("Team graph");
-        assert!(
-            team_graph
-                .nodes
+            !events
                 .iter()
-                .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-                .count()
-                >= 2
+                .any(|event| event.payload.to_string().contains("selected-team")),
+            "admission must not auto-start a builtin Team; team/role names are model-authored"
         );
     }
 

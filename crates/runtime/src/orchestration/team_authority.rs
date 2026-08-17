@@ -998,7 +998,7 @@ fn explicit_workspace_paths(
         })
         .map(|token| token.trim_matches(['`', '\'', '"']))
         .filter(|token| !is_definition_like_token(workspace_root, token))
-        .filter(|token| is_probable_workspace_path_token(token))
+        .filter(|token| is_probable_workspace_path_token(workspace_root, token))
         .filter(|token| {
             token.starts_with('/')
                 || token.starts_with("./")
@@ -1042,13 +1042,36 @@ fn explicit_workspace_paths(
     paths
 }
 
-/// Tokens are only treated as workspace paths when they are explicit (`/…`
-/// or `./…`) or ASCII. Non-ASCII slash-containing tokens are prose such as
-/// template names (“业务/技术双团队研讨”), never filesystem paths in this
-/// workspace; parsing them as paths breaks resource acquisition with
-/// “workspace path does not exist”.
-fn is_probable_workspace_path_token(token: &str) -> bool {
-    token.starts_with('/') || token.starts_with("./") || token.is_ascii()
+/// Tokens are only treated as workspace paths when they are:
+/// - explicit (`/…` or `./…`), or
+/// - an existing path on disk (workspace root or process cwd), or
+/// - a planned artifact carrying a file extension (`docs/report.md`).
+/// Everything else is prose: field lists such as `summary/evidence`,
+/// template names (“业务/技术双团队研讨”), and definition ids
+/// (`cowd/biz-tech-dual-team-deliberation`) are never filesystem paths;
+/// parsing them as paths breaks resource acquisition with “workspace path
+/// does not exist”.
+fn is_probable_workspace_path_token(workspace_root: &Path, token: &str) -> bool {
+    if token.starts_with('/') || token.starts_with("./") {
+        return true;
+    }
+    if !token.is_ascii() {
+        return false;
+    }
+    if workspace_root.join(token).exists()
+        || std::env::current_dir()
+            .map(|cwd| cwd.join(token).exists())
+            .unwrap_or(false)
+    {
+        return true;
+    }
+    token.rsplit('/').next().is_some_and(|leaf| {
+        leaf.rsplit_once('.').is_some_and(|(name, extension)| {
+            !name.is_empty()
+                && !extension.is_empty()
+                && extension.chars().all(|character| character.is_ascii_alphanumeric())
+        })
+    })
 }
 
 /// Template/Agent Definition references such as
