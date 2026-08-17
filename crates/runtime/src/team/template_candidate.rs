@@ -618,9 +618,27 @@ fn normalize_dependencies(
                     .map(str::to_string)
             })
     };
-    let edges = match dependencies {
+    let mut pair_edges = Vec::new();
+    let mut groups = std::collections::BTreeMap::new();
+    let members_to_vec = |members: serde_json::Value, label: &str| -> Result<Vec<String>, String> {
+        match members {
+            serde_json::Value::String(raw) => Ok(vec![raw]),
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .map(|item| {
+                    item.as_str().map(str::to_string).ok_or_else(|| {
+                        format!("dependency group `{label}` members must be strings")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>(),
+            other => Err(format!(
+                "dependency group `{label}` must map to a string or array of strings, got {}",
+                json_type_name(&other)
+            )),
+        }
+    };
+    match dependencies {
         serde_json::Value::Array(items) => {
-            let mut edges = Vec::new();
             for item in items {
                 match item {
                     serde_json::Value::Object(mut map) => {
@@ -630,7 +648,7 @@ fn normalize_dependencies(
                             (
                                 Some(serde_json::Value::String(from)),
                                 Some(serde_json::Value::String(to)),
-                            ) => edges.push((from, to)),
+                            ) => pair_edges.push((from, to)),
                             (Some(from), Some(to)) => {
                                 return Err(format!(
                                     "dependency from/to must be strings, got {}/{}",
@@ -638,9 +656,13 @@ fn normalize_dependencies(
                                     json_type_name(&to)
                                 ))
                             }
+                            (None, None) if map.len() == 1 => {
+                                let (label, members) = map.into_iter().next().unwrap_or_default();
+                                groups.insert(label.clone(), members_to_vec(members, &label)?);
+                            }
                             _ => {
                                 return Err(
-                                    "dependency object requires from and to (or source and target)"
+                                    "dependency object requires from and to (or source and target), or a single group key"
                                         .to_string(),
                                 )
                             }
@@ -656,7 +678,7 @@ fn normalize_dependencies(
                         let to = to.as_str().ok_or_else(|| {
                             "dependency pair second element must be a string".to_string()
                         })?;
-                        edges.push((from.to_string(), to.to_string()));
+                        pair_edges.push((from.to_string(), to.to_string()));
                     }
                     serde_json::Value::String(raw) => {
                         let (from, to) = raw
@@ -667,7 +689,7 @@ fn normalize_dependencies(
                                     "dependency string `{raw}` must use `from->to` or `from:to`"
                                 )
                             })?;
-                        edges.push((from.trim().to_string(), to.trim().to_string()));
+                        pair_edges.push((from.trim().to_string(), to.trim().to_string()));
                     }
                     other => {
                         return Err(format!(
@@ -677,67 +699,11 @@ fn normalize_dependencies(
                     }
                 }
             }
-            edges
         }
         serde_json::Value::Object(map) => {
-            let mut groups = std::collections::BTreeMap::new();
             for (label, members) in map {
-                let members = match members {
-                    serde_json::Value::String(raw) => vec![raw],
-                    serde_json::Value::Array(items) => items
-                        .into_iter()
-                        .map(|item| {
-                            item.as_str().map(str::to_string).ok_or_else(|| {
-                                format!("dependency group `{label}` members must be strings")
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                    other => {
-                        return Err(format!(
-                            "dependency group `{label}` must map to a string or array of strings, got {}",
-                            json_type_name(&other)
-                        ))
-                    }
-                };
-                groups.insert(label, members);
+                groups.insert(label.clone(), members_to_vec(members, &label)?);
             }
-            let mut edges = Vec::new();
-            for (label, members) in &groups {
-                let is_role_label = role_ids.iter().any(|role_id| role_id == label);
-                let all_members_are_roles = members
-                    .iter()
-                    .all(|member| role_ids.iter().any(|role_id| role_id == member));
-                if is_role_label && all_members_are_roles {
-                    for member in members {
-                        edges.push((label.clone(), member.clone()));
-                    }
-                } else if !all_members_are_roles {
-                    let consumers = resolve_consumer_roles(label, &role_ids, &team_of);
-                    if consumers.is_empty() {
-                        return Err(format!(
-                            "dependency group `{label}` does not resolve to any role_id or team"
-                        ));
-                    }
-                    let mut sources = Vec::new();
-                    let mut seen = std::collections::BTreeSet::new();
-                    for member in members {
-                        sources.extend(resolve_member_roles(
-                            member, &role_ids, &groups, &mut seen,
-                        )?);
-                    }
-                    for source in sources {
-                        for consumer in &consumers {
-                            if &source != consumer {
-                                edges.push((source.clone(), consumer.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-            if !edges.is_empty() {
-                notes.push("normalized object-shaped dependencies into role-level edges".to_string());
-            }
-            edges
         }
         other => {
             return Err(format!(
@@ -745,7 +711,45 @@ fn normalize_dependencies(
                 json_type_name(&other)
             ))
         }
-    };
+    }
+    let mut group_edges = Vec::new();
+    for (label, members) in &groups {
+        let is_role_label = role_ids.iter().any(|role_id| role_id == label);
+        let all_members_are_roles = members
+            .iter()
+            .all(|member| role_ids.iter().any(|role_id| role_id == member));
+        if is_role_label && all_members_are_roles {
+            for member in members {
+                group_edges.push((label.clone(), member.clone()));
+            }
+        } else if !all_members_are_roles {
+            let consumers = resolve_consumer_roles(label, &role_ids, &team_of);
+            if consumers.is_empty() {
+                return Err(format!(
+                    "dependency group `{label}` does not resolve to any role_id or team"
+                ));
+            }
+            let mut sources = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for member in members {
+                sources.extend(resolve_member_roles(
+                    member, &role_ids, &groups, &mut seen,
+                )?);
+            }
+            for source in sources {
+                for consumer in &consumers {
+                    if &source != consumer {
+                        group_edges.push((source.clone(), consumer.clone()));
+                    }
+                }
+            }
+        }
+    }
+    if !group_edges.is_empty() {
+        notes.push("normalized object/group-shaped dependencies into role-level edges".to_string());
+    }
+    let mut edges = pair_edges;
+    edges.extend(group_edges);
     let mut canonical = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for (from, to) in edges {
@@ -875,6 +879,7 @@ impl TemplateCandidateCompiler {
         let mut role_ids = std::collections::BTreeSet::new();
         let mut roles = Vec::with_capacity(proposal.roles.len());
         let mut clipped_capabilities = Vec::new();
+        let mut defaulted_agent_refs = Vec::new();
         for role in &proposal.roles {
             if role.role_id.trim().is_empty() {
                 return Err("every proposed role needs a non-empty role_id".to_string());
@@ -882,19 +887,52 @@ impl TemplateCandidateCompiler {
             if !role_ids.insert(role.role_id.as_str()) {
                 return Err(format!("duplicate role_id `{}`", role.role_id));
             }
-            let (definition_id, revision) = parse_agent_ref(&role.agent_definition_ref)?;
+            let (mut definition_id, mut revision) = parse_agent_ref(&role.agent_definition_ref)?;
             // The Definition must exist in the registry; AI cannot invent one.
-            registry
+            if registry
                 .resolve_agent(
                     &definition_id,
                     RevisionSelector::ExactApprovedRevision { revision },
                 )
-                .map_err(|error| {
-                    format!(
-                        "role `{}` references unknown Agent Definition `{}`: {error}",
-                        role.role_id, role.agent_definition_ref
+                .is_err()
+            {
+                // Bounded auto-repair for a nonexistent/invented Agent
+                // Definition: bind the safe builtin matching the requested
+                // capability profile (same rule as a missing ref) and record
+                // the exact substitution in the audit preview. Grant ceilings
+                // are still clipped to the caller's permission ceiling below.
+                let default_ref = if role
+                    .grant_ceiling
+                    .iter()
+                    .any(|name| matches!(name.as_str(), "write" | "test"))
+                {
+                    "builtin/cowd/execute@1"
+                } else if role.grant_ceiling.iter().any(|name| name == "network") {
+                    "builtin/cowd/explore@2"
+                } else {
+                    "builtin/cowd/explore@1"
+                };
+                let (default_id, default_revision) = parse_agent_ref(default_ref)?;
+                registry
+                    .resolve_agent(
+                        &default_id,
+                        RevisionSelector::ExactApprovedRevision {
+                            revision: default_revision,
+                        },
                     )
-                })?;
+                    .map_err(|error| {
+                        format!(
+                            "role `{}` references unknown Agent Definition `{}` and the safe builtin fallback `{default_ref}` is unavailable: {error}",
+                            role.role_id, role.agent_definition_ref
+                        )
+                    })?;
+                defaulted_agent_refs.push(format!(
+                    "{}: {} -> {default_ref}",
+                    role.role_id, role.agent_definition_ref
+                ));
+                definition_id = default_id;
+                revision = default_revision;
+            }
             let mut grant_ceiling = Vec::new();
             for name in &role.grant_ceiling {
                 let capability = capability_from_name(name).ok_or_else(|| {
@@ -1026,6 +1064,7 @@ impl TemplateCandidateCompiler {
             })).collect::<Vec<_>>(),
             "result_fields": manifest.result_contract.required_fields,
             "clipped_capabilities": clipped_capabilities,
+            "defaulted_agent_refs": defaulted_agent_refs,
             "risk_notes": {
                 "requires_write": manifest.roles.iter().any(|role| role.grant_ceiling.contains(&AgentCapability::Write)),
                 "requires_network": manifest.roles.iter().any(|role| role.grant_ceiling.contains(&AgentCapability::Network)),
@@ -1216,17 +1255,30 @@ mod tests {
     }
 
     #[test]
-    fn clips_over_ceiling_grants_and_rejects_unknown_definitions() {
+    fn clips_over_ceiling_grants_and_defaults_unknown_definitions() {
         let (_temp, registry) = registry();
         publish_agent(&registry, "cowd/explore");
         publish_agent(&registry, "cowd/direct");
         let mut proposal = business_tech_proposal();
         proposal.roles[0].agent_definition_ref =
             "workspace/cowd/not-a-real-definition@1".to_string();
-        assert!(
-            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
-                .is_err()
+        let candidate = TemplateCandidateCompiler::compile(
+            &registry,
+            &proposal,
+            PermissionMode::ReadOnly,
+        )
+        .expect("unknown definition falls back to a safe builtin");
+        assert_eq!(
+            candidate.manifest.roles[0]
+                .agent_definition_id
+                .as_str(),
+            "builtin/cowd/explore"
         );
+        assert!(candidate
+            .preview
+            .get("defaulted_agent_refs")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|defaulted| defaulted.len() == 1));
         proposal = business_tech_proposal();
         proposal.roles[0].grant_ceiling = vec!["write".to_string()];
         let candidate =
@@ -1673,5 +1725,67 @@ mod tests {
             .store_revision(candidate.manifest, &proposal.instructions)
             .expect("CRLF instructions must publish");
         assert_eq!(stored.revision.revision_ref.revision, 1);
+    }
+
+    #[test]
+    fn normalize_dependencies_accepts_group_objects_inside_arrays() {
+        let mut value = serde_json::json!({
+            "template_id": "cowd/test",
+            "name": "测试",
+            "roles": [
+                {"role_id": "business_expert", "responsibility": "x"},
+                {"role_id": "cto", "responsibility": "y"},
+                {
+                    "role_id": "convergence_arbiter",
+                    "team": "convergence",
+                    "responsibility": "z"
+                }
+            ],
+            "dependencies": [
+                {"business_team": ["business_expert"]},
+                {"technical_team": ["cto"]},
+                {"convergence": ["business_team", "technical_team"]}
+            ]
+        });
+        normalize_template_proposal(&mut value).expect("normalize");
+        let dependencies = value["dependencies"].as_array().expect("dependencies array");
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.iter().any(|dependency| {
+            dependency["from"] == "business_expert"
+                && dependency["to"] == "convergence_arbiter"
+        }));
+        assert!(dependencies.iter().any(|dependency| {
+            dependency["from"] == "cto" && dependency["to"] == "convergence_arbiter"
+        }));
+    }
+
+    #[test]
+    fn unknown_agent_definition_refs_fall_back_to_safe_builtins_with_audit() {
+        let (_temp, registry) = registry();
+        let mut proposal = business_tech_proposal();
+        proposal.roles[0].agent_definition_ref = "builtin/cowd/researcher@1".to_string();
+        proposal.roles[1].agent_definition_ref = "builtin/cowd/cto@1".to_string();
+        let candidate = TemplateCandidateCompiler::compile(
+            &registry,
+            &proposal,
+            PermissionMode::ReadOnly,
+        )
+        .expect("unknown agent refs fall back to safe builtins");
+        let defaulted = candidate.preview["defaulted_agent_refs"]
+            .as_array()
+            .expect("defaulted agent refs audit");
+        assert_eq!(defaulted.len(), 2);
+        assert_eq!(
+            candidate.manifest.roles[0]
+                .agent_definition_id
+                .as_str(),
+            "builtin/cowd/explore"
+        );
+        assert_eq!(
+            candidate.manifest.roles[1]
+                .agent_definition_id
+                .as_str(),
+            "builtin/cowd/explore"
+        );
     }
 }
