@@ -299,8 +299,11 @@ pub struct ModelRuntimeOrchestrationInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ModelGraphMutationProposal>,
     /// Structured AI-authored Team template proposal (operation=propose_template).
+    /// The runtime embeds the typed `ModelTemplateProposal` schema into this
+    /// property for model guidance, but accepts tolerant variants (wrapped
+    /// JSON, map/array roles, string ceilings) at execution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub template_proposal: Option<ModelTemplateProposal>,
+    pub template_proposal: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ModelRuntimeControlRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -386,10 +389,9 @@ mod tests {
 
     #[test]
     fn template_proposal_schema_is_structured_for_the_model() {
-        let schema = serde_json::to_string(&schemars::schema_for!(ModelRuntimeOrchestrationInput))
+        let schema = serde_json::to_string(&schemars::schema_for!(ModelTemplateProposal))
             .expect("serialize schema");
         for needle in [
-            "ModelTemplateProposal",
             "\"template_id\"",
             "\"team_display_name\"",
             "\"role_display_names\"",

@@ -339,10 +339,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
             description: Some(
                 "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution. max_parallel_agents limits simultaneously runnable instances, not total graph nodes. Shared network/resource infrastructure is valid when focus objectives and evidence responsibilities remain distinct. Use runtime_capabilities(detail=orchestration_options) first when effective limits or templates are uncertain.".to_string(),
             ),
-            input_schema: serde_json::to_value(schemars::schema_for!(
-                harness_contract::orchestration::ModelRuntimeOrchestrationInput
-            ))
-            .expect("runtime orchestration model contract schema must serialize"),
+            input_schema: runtime_orchestration_input_schema(),
             required_permission: ToolPermissionMode::ReadOnly,
             effect_resolver: runtime_effect_resolver("runtime.orchestration"),
         },
@@ -394,6 +391,23 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
             effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
     ]
+}
+
+fn runtime_orchestration_input_schema() -> serde_json::Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(
+        harness_contract::orchestration::ModelRuntimeOrchestrationInput
+    ))
+    .expect("runtime orchestration model contract schema must serialize");
+    // The template_proposal wire field stays tolerant (the Runtime normalizer
+    // accepts wrapped JSON, map/array roles, string ceilings, etc.), but the
+    // model still receives the full typed field-level contract as guidance so
+    // it never has to guess shapes.
+    let proposal_schema = serde_json::to_value(schemars::schema_for!(
+        harness_contract::orchestration::ModelTemplateProposal
+    ))
+    .expect("template proposal model contract schema must serialize");
+    schema["properties"]["template_proposal"] = proposal_schema;
+    schema
 }
 
 pub(crate) fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -607,6 +621,11 @@ mod tests {
                     .any(|variant| { variant["properties"]["mode"]["const"] == "quorum" }))
         );
         assert_eq!(semantic_node["cancellation_group"]["type"][0], "string");
+        assert!(
+            orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]["roles"]
+                .is_object(),
+            "the model must receive the typed Team template proposal contract"
+        );
 
         let evidence_tool = tools
             .iter()
