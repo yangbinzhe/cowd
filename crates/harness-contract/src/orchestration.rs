@@ -186,14 +186,12 @@ pub enum ModelGrantCapability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ModelRoleDisplayName {
     pub role_id: String,
     pub display_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ModelProposedRole {
     pub role_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,7 +230,6 @@ pub struct ModelProposedRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ModelProposedDependency {
     pub from: String,
     pub to: String,
@@ -260,7 +257,6 @@ pub enum ModelTemplateDependencies {
 /// wrapped JSON) as a safety net, but the schema below is the source of truth
 /// the model is expected to follow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct ModelTemplateProposal {
     #[schemars(
         description = "Publish-local template id. Scope prefixes (cowd/, workspace/, user/) are accepted and normalized; example: biz-tech-dual-team-deliberation"
@@ -482,18 +478,34 @@ mod tests {
     }
 
     #[test]
-    fn model_template_proposal_rejects_unknown_fields_instead_of_guessing() {
+    fn model_template_proposal_tolerates_extra_fields_for_guidance() {
         let invalid = serde_json::json!({
             "template_id": "t",
             "name": "n",
             "roles": [],
             "instructions": "i",
-            "mystery_field": "the model should not be able to sneak this in"
+            "protocol": "democratic_centralism@1",
+            "summary": "extra prose the model likes to include"
         });
-        assert!(
-            serde_json::from_value::<ModelTemplateProposal>(invalid).is_err(),
-            "deny_unknown_fields must surface a typed error instead of silently ignoring model guesses"
-        );
+        let parsed = serde_json::from_value::<ModelTemplateProposal>(invalid)
+            .expect("the model-facing contract stays tolerant; runtime validation owns strictness");
+        assert_eq!(parsed.template_id, "t");
+    }
+
+    #[test]
+    fn model_template_proposal_guidance_never_blocks_dependency_strings() {
+        let parsed = serde_json::from_value::<ModelTemplateProposal>(serde_json::json!({
+            "template_id": "t",
+            "name": "n",
+            "roles": [],
+            "instructions": "i",
+            "dependencies": "business_expert -> convergence_arbiter"
+        }))
+        .expect("single-string dependencies are part of the guidance union");
+        assert!(matches!(
+            parsed.dependencies,
+            Some(ModelTemplateDependencies::String(_))
+        ));
     }
 
     #[test]

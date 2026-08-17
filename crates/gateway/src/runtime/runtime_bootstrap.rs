@@ -407,6 +407,15 @@ fn runtime_orchestration_input_schema() -> serde_json::Value {
     ))
     .expect("template proposal model contract schema must serialize");
     schema["properties"]["template_proposal"] = proposal_schema;
+    // The dependencies union is intentionally shown as a relaxed shape so a
+    // model never refuses to call the tool because of a strict oneOf/anyOf.
+    // Runtime normalization accepts pairs, group objects, group arrays,
+    // string arrays, and single strings; validation happens after admission.
+    schema["properties"]["template_proposal"]["properties"]["dependencies"] =
+        serde_json::json!({
+            "description": "Role-level edges or group memberships. Accepted forms: [{from, to}], [{\"group\": [role_id, ...]}], {\"group\": [role_id, ...]}, [\"from -> to\"], or \"from -> to\". Runtime normalizes every form.",
+            "type": ["array", "object", "string"]
+        });
     schema
 }
 
@@ -625,6 +634,11 @@ mod tests {
             orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]["roles"]
                 .is_object(),
             "the model must receive the typed Team template proposal contract"
+        );
+        assert_eq!(
+            orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]["dependencies"]["type"],
+            serde_json::json!(["array", "object", "string"]),
+            "dependency guidance must stay relaxed so models never refuse the tool"
         );
 
         let evidence_tool = tools
