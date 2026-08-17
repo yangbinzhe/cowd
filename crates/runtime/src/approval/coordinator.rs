@@ -167,6 +167,7 @@ impl ApprovalCoordinator {
         &self,
         source: ApprovalSource,
         mut context: ApprovalContext,
+        autonomy_profile: Option<harness_contract::policy::AutonomyProfileId>,
         descriptor: &ToolEffectDescriptor,
         input: &str,
         cancellation: CancellationToken,
@@ -240,8 +241,12 @@ impl ApprovalCoordinator {
             Some(now_ms().saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))),
         )?;
 
-        let router_profile =
-            crate::approval_router::ApprovalRouter::profile_for_approval_profile(approval_profile);
+        let router_profile = autonomy_profile
+            .unwrap_or_else(|| {
+                crate::approval_router::ApprovalRouter::profile_for_approval_profile(
+                    approval_profile,
+                )
+            });
         let router_decision = crate::approval_router::ApprovalRouter::resolve(
             router_profile,
             ApprovalDomain::Execution,
@@ -301,54 +306,6 @@ impl ApprovalCoordinator {
                 .queue
                 .grant_for_approval(&request.approval_id)
                 .ok_or_else(|| "steward approval did not create a grant".to_string())?;
-            return Ok(ApprovalResolution::Approved {
-                approval_id: receipt.approval_id,
-                grant,
-            });
-        }
-
-        if !explicit_ask && deterministic_policy_can_approve(descriptor, risk) {
-            let receipt = self.queue.decide_internal(ApprovalDecisionCommand {
-                approval_id: request.approval_id.clone(),
-                approved: true,
-                skip: false,
-                reason: "known low-risk effect allowed by deterministic Runtime policy".to_string(),
-                scope: ApprovalGrantScope::Once,
-                actor: ApprovalDecisionActor {
-                    kind: ApprovalDecisionActorKind::Policy,
-                    actor_id: "runtime-low-risk-policy".to_string(),
-                },
-                evidence_refs: vec!["approval.policy.known_low_risk".to_string()],
-            })?;
-            self.notify_decision(&request.approval_id);
-            let grant = self
-                .queue
-                .grant_for_approval(&request.approval_id)
-                .ok_or_else(|| "approved request did not create a grant".to_string())?;
-            return Ok(ApprovalResolution::Approved {
-                approval_id: receipt.approval_id,
-                grant,
-            });
-        }
-
-        if !explicit_ask && steward_can_approve(approval_profile, descriptor, risk) {
-            let receipt = self.queue.decide_internal(ApprovalDecisionCommand {
-                approval_id: request.approval_id.clone(),
-                approved: true,
-                skip: false,
-                reason: "bounded Steward policy approved a known reversible effect".to_string(),
-                scope: ApprovalGrantScope::Once,
-                actor: ApprovalDecisionActor {
-                    kind: ApprovalDecisionActorKind::StewardAgent,
-                    actor_id: "runtime-approval-steward".to_string(),
-                },
-                evidence_refs: vec!["approval.steward.eligible".to_string()],
-            })?;
-            self.notify_decision(&request.approval_id);
-            let grant = self
-                .queue
-                .grant_for_approval(&request.approval_id)
-                .ok_or_else(|| "approved request did not create a grant".to_string())?;
             return Ok(ApprovalResolution::Approved {
                 approval_id: receipt.approval_id,
                 grant,
@@ -518,23 +475,6 @@ fn steward_can_approve(
         )
 }
 
-fn deterministic_policy_can_approve(descriptor: &ToolEffectDescriptor, risk: TaskRisk) -> bool {
-    risk == TaskRisk::Low
-        && matches!(
-            descriptor.effect_kind,
-            ToolEffectKind::Read | ToolEffectKind::Network
-        )
-        && !descriptor.mutates_system
-        && !descriptor.mutates_packages
-        && descriptor.assessment.data_sensitivity != DataClassification::Secret
-        && !matches!(
-            descriptor.assessment.externality,
-            EffectExternality::ExternalMutation
-                | EffectExternality::System
-                | EffectExternality::Unknown
-        )
-}
-
 #[must_use]
 pub fn task_risk_for_effect(descriptor: &ToolEffectDescriptor) -> TaskRisk {
     if descriptor.approval_class == ToolApprovalClass::Administrator
@@ -674,6 +614,7 @@ mod tests {
             .resolve_tool(
                 source(),
                 context("read-low"),
+                None,
                 &descriptor(ToolEffectKind::Read),
                 r#"{"path":"README.md"}"#,
                 CancellationToken::new(),
@@ -708,6 +649,7 @@ mod tests {
                 .resolve_tool(
                     source(),
                     context("read-secret"),
+                    None,
                     &secret,
                     r#"{"path":"secret.txt"}"#,
                     CancellationToken::new(),

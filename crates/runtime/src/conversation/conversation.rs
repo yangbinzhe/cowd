@@ -8969,6 +8969,7 @@ where
                 .resolve_tool(
                     source,
                     context,
+                    Some(execution_policy.autonomy_profile),
                     &effective.descriptor,
                     input,
                     self.cancellation_token(),

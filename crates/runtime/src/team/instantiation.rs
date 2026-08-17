@@ -467,15 +467,36 @@ impl TeamInstantiationService {
                         ]
                     }))
                     .collect(),
-                    context_refs: focus_partition
-                        .capability_cropped_refs
-                        .iter()
-                        .cloned()
-                        .chain(request.upstream_artifact_refs.iter().cloned())
-                        .collect(),
+                    context_refs: {
+                        // Deterministic ordering keeps the shared context
+                        // prefix byte-stable across every role consuming the
+                        // same team evidence, maximizing provider cache reuse.
+                        let mut refs = focus_partition
+                            .capability_cropped_refs
+                            .iter()
+                            .cloned()
+                            .chain(request.upstream_artifact_refs.iter().cloned())
+                            .collect::<Vec<_>>();
+                        refs.sort();
+                        refs.dedup();
+                        refs
+                    },
                     // A resource lease authorizes discovery but is not itself
                     // evidence. Durable tool audits populate result evidence.
-                    evidence_refs: request.upstream_evidence_refs.clone(),
+                    evidence_refs: {
+                        let mut refs = request.upstream_evidence_refs.clone();
+                        refs.sort_by(|left, right| {
+                            left.evidence_ref
+                                .ref_type
+                                .cmp(&right.evidence_ref.ref_type)
+                                .then_with(|| left.evidence_ref.id.cmp(&right.evidence_ref.id))
+                        });
+                        refs.dedup_by(|left, right| {
+                            left.evidence_ref.ref_type == right.evidence_ref.ref_type
+                                && left.evidence_ref.id == right.evidence_ref.id
+                        });
+                        refs
+                    },
                     resource_scopes,
                     // Runtime derives normal role tools from the immutable
                     // capability grant. Evaluation may only narrow that set;

@@ -166,6 +166,32 @@ async fn submit_runtime_orchestration_request_with_mode(
         }),
         "orchestration bound semantic authority"
     );
+    // Shared-context occupancy prediction for strategy/projection (toggle via
+    // RUST_LOG=runtime::orchestration=debug). Display-only; never admits or
+    // rejects execution.
+    if let Some(proposal) = request.proposal.as_ref() {
+        let window = u64::from(provider::model_context_window(
+            request.model_lease.as_deref().unwrap_or("unknown"),
+        ));
+        for node in proposal
+            .nodes
+            .iter()
+            .filter(|node| node.recipe == CapabilityRecipeId::Team)
+        {
+            let chars = node
+                .objective
+                .chars()
+                .count()
+                .saturating_add(node.resource_scopes.iter().map(|scope| scope.len()).sum::<usize>());
+            let estimate =
+                crate::context_occupancy::estimate_role_occupancy(&node.node_id, chars, 0, 0, window);
+            tracing::debug!(
+                node = %node.node_id,
+                occupancy_bp = estimate.utilization_bp,
+                "predicted team node context occupancy"
+            );
+        }
+    }
     let trust_all_session = session_is_trust_all(services, request.session_id.as_deref());
     let requires_orchestration_approval =
         request.constraints.risk.as_deref() == Some("critical") || trust_all_session;
