@@ -130,7 +130,9 @@ pub(crate) fn parse_frame_with_provider(
 #[cfg(test)]
 mod tests {
     use super::{parse_frame, SseParser};
-    use crate::types::{ContentBlockDelta, MessageDelta, OutputContentBlock, StreamEvent, Usage};
+    use crate::types::{
+        ContentBlockDelta, MessageDelta, MessageDeltaEvent, OutputContentBlock, StreamEvent, Usage,
+    };
 
     #[test]
     fn parses_single_frame() {
@@ -326,5 +328,25 @@ mod tests {
                 usage: Usage::default(),
             }))
         );
+    }
+
+    #[test]
+    fn message_delta_usage_parses_cache_fields_via_serde() {
+        let frame = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":30,\"output_tokens\":5}}\n\n"
+        );
+        let events = SseParser::new()
+            .push(frame.as_bytes())
+            .expect("frame should parse");
+        let usage = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::MessageDelta(MessageDeltaEvent { usage, .. }) => Some(usage),
+                _ => None,
+            })
+            .expect("usage should be present");
+        assert_eq!(usage.cache_creation_input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 30);
     }
 }

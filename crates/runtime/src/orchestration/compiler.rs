@@ -920,9 +920,11 @@ fn adaptive_team_execution_budget(
         expected_parallel_branches,
         expected_verification_passes,
     );
+    // Record-only meter: the ceiling is the complexity prediction, never a
+    // window-derived cumulative admission cap.
     crate::team_instantiation::bounded_parent_execution_budget(
         budget_id,
-        plan.subsystem_budget_tokens,
+        plan.team_total_budget.max(1),
         deadline_at_ms,
         max_parallel,
     )
