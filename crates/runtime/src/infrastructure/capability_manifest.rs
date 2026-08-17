@@ -411,11 +411,12 @@ impl RuntimeCapabilityManifest {
                 ),
                 capability(
                     "runtime_orchestration",
-                    "Model-visible semantic control plane for inspect, propose, revise, and control over Agent, Team, review, synthesis, and session-dispatch graph recipes.",
+                    "Model-visible semantic control plane for inspect, propose, propose_template, revise, and control over Agent, Team, review, synthesis, and session-dispatch graph recipes.",
                     &["runtime_capabilities", "runtime_orchestrate"],
                     &[
                         "Inspect current Runtime state before changing an existing graph.",
                         "Propose semantic nodes and dependencies; revise by exact graph revision; never provide executors or leases.",
+                        "When the user names specific teams/roles (e.g. 业务团队/技术团队/CTO/供应链专家), draft a structured Team template with propose_template and let approval publish it; do not force a builtin template.",
                     ],
                 ),
                 capability(
@@ -470,7 +471,7 @@ pub fn orchestration_lessons() -> Vec<Value> {
         }),
         json!({
             "failure": "calling route_input as if it were supported",
-            "correction": "route_input is unsupported; available operations are inspect, propose, revise, control",
+            "correction": "route_input is unsupported; available operations are inspect, propose, propose_template, revise, control",
             "source": "runtime_orchestrate contract"
         }),
         json!({
@@ -501,7 +502,7 @@ pub fn runtime_capability_primer() -> String {
     lines.extend([
         String::new(),
         "Runtime action contract:".to_string(),
-        "When higher-order execution is useful, inspect options through `runtime_capabilities`; use `runtime_orchestrate` only through inspect/propose/revise/control when its native schema is active.".to_string(),
+        "When higher-order execution is useful, inspect options through `runtime_capabilities`; use `runtime_orchestrate` through inspect/propose/propose_template/revise/control when its native schema is active.".to_string(),
     ]);
     for action in &catalog.action_contracts {
         lines.push(format!(
@@ -516,6 +517,10 @@ pub fn runtime_capability_primer() -> String {
     );
     lines.push(
         "TRIGGER RULE: if the user explicitly asks for teams, parallel agents, or multi-role collaboration, you MUST call `runtime_capabilities(detail=team_templates)` and then `runtime_orchestrate(propose)`. Do NOT answer such a request with web_fetch, bash, or ordinary tools; a team request is fulfilled only by a real Mission graph with the exact template_id and roles copied from the catalog."
+            .to_string(),
+    );
+    lines.push(
+        "TRIGGER RULE (custom teams): if the user names specific teams or roles (业务团队/技术团队, CTO, 供应链专家, 运维智能体, data scientist, AI expert, senior engineer...), call `runtime_orchestrate(propose_template)` with a structured template_proposal (template_id, name, team_display_name, roles[] with role_id/display_name/responsibility/agent_definition_ref/grant_ceiling/cardinality/acceptance, dependencies, result_fields, instructions). The runtime validates definitions, clips permissions to your ceiling, and routes the candidate through approval before publishing it as a reusable User-scope template. Do NOT silently fall back to the builtin template when the user named custom roles."
             .to_string(),
     );
     lines.push("- Before proposing a Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values.".to_string());
