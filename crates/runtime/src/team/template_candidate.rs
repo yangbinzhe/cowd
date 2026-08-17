@@ -74,6 +74,38 @@ pub struct TemplateCandidate {
     pub preview: serde_json::Value,
 }
 
+/// Normalizes common model-authoring shortcuts in a `template_proposal` JSON
+/// value so the strict contract only sees canonical shapes:
+/// - `roles` may be an object keyed by role_id (value = role fields) instead
+///   of an array; the role_id is injected when missing.
+/// - `role_display_names` may be an object keyed by role_id instead of an
+///   array of {role_id, display_name}.
+pub(crate) fn normalize_template_proposal(value: &mut serde_json::Value) {
+    if let Some(serde_json::Value::Object(roles)) = value.get_mut("roles") {
+        let roles: serde_json::Map<String, serde_json::Value> = std::mem::take(roles);
+        let normalized = roles
+            .into_iter()
+            .map(|(role_id, mut role): (String, serde_json::Value)| {
+                if role.is_object() && role.get("role_id").is_none() {
+                    role["role_id"] = serde_json::json!(role_id);
+                }
+                role
+            })
+            .collect::<Vec<_>>();
+        value["roles"] = serde_json::json!(normalized);
+    }
+    if let Some(serde_json::Value::Object(displays)) = value.get_mut("role_display_names") {
+        let displays: serde_json::Map<String, serde_json::Value> = std::mem::take(displays);
+        let normalized = displays
+            .into_iter()
+            .map(|(role_id, display_name): (String, serde_json::Value)| {
+                serde_json::json!({ "role_id": role_id, "display_name": display_name })
+            })
+            .collect::<Vec<_>>();
+        value["role_display_names"] = serde_json::json!(normalized);
+    }
+}
+
 fn capability_from_name(name: &str) -> Option<AgentCapability> {
     match name.to_ascii_lowercase().as_str() {
         "read" => Some(AgentCapability::Read),
@@ -687,5 +719,47 @@ mod tests {
                 .as_deref(),
             Some("业务技术研讨")
         );
+    }
+
+    #[test]
+    fn normalize_template_proposal_accepts_map_shaped_roles() {
+        let mut value = serde_json::json!({
+            "template_id": "cowd/test",
+            "name": "测试",
+            "roles": {
+                "business_expert": {
+                    "responsibility": "业务分析",
+                    "agent_definition_ref": "workspace/cowd/explore@1",
+                    "grant_ceiling": ["read"]
+                },
+                "cto": {
+                    "responsibility": "技术裁决",
+                    "agent_definition_ref": "workspace/cowd/direct@1"
+                }
+            },
+            "role_display_names": {
+                "business_expert": "供应链专家",
+                "cto": "CTO"
+            },
+            "instructions": "# 测试\n"
+        });
+        normalize_template_proposal(&mut value);
+        let roles = value["roles"].as_array().expect("roles array");
+        assert_eq!(roles.len(), 2);
+        assert!(roles.iter().any(
+            |role| role["role_id"] == "business_expert" && role["responsibility"] == "业务分析"
+        ));
+        let displays = value["role_display_names"]
+            .as_array()
+            .expect("display names array");
+        assert!(displays.iter().any(|item| {
+            item["role_id"] == "business_expert" && item["display_name"] == "供应链专家"
+        }));
+        let (_temp, registry) = registry();
+        publish_agent(&registry, "cowd/explore");
+        publish_agent(&registry, "cowd/direct");
+        let proposal: TeamTemplateProposal =
+            serde_json::from_value(value).expect("normalized proposal parses");
+        assert_eq!(proposal.roles.len(), 2);
     }
 }

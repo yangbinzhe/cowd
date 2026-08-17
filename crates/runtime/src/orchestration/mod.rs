@@ -280,8 +280,10 @@ async fn propose_template(
         .template_proposal
         .as_ref()
         .ok_or_else(|| "template_proposal_missing".to_string())?;
+    let mut normalized_proposal = proposal_value.clone();
+    crate::team_template_candidate::normalize_template_proposal(&mut normalized_proposal);
     let proposal: crate::team_template_candidate::TeamTemplateProposal =
-        serde_json::from_value(proposal_value.clone())
+        serde_json::from_value(normalized_proposal)
             .map_err(|error| format!("invalid_template_proposal:{error}"))?;
     let candidate = crate::team_template_candidate::TemplateCandidateCompiler::compile(
         services.definition_registry(),
