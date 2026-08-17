@@ -468,7 +468,12 @@ impl ContextBudgetLeaseRef {
     }
 }
 
-/// Immutable hard resource budget owned by one parent execution.
+/// Immutable usage-meter bounds owned by one parent execution.
+///
+/// These fields meter predicted/observed token and cost usage for projection
+/// and audit only. They are **not** admission ceilings: provider IO is never
+/// rejected from cumulative budget exhaustion (context window fit and
+/// deadline are the execution boundaries).
 ///
 /// Consumption is intentionally not carried here: Runtime persists every
 /// provider reservation/reconciliation behind `budget_id` with a CAS revision.

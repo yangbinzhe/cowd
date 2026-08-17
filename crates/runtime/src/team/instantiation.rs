@@ -249,7 +249,7 @@ impl TeamInstantiationService {
         let manifest = &template.revision.manifest;
         let binding_overrides = role_binding_overrides(&request, &manifest.roles)?;
         let cardinality_overrides = role_cardinality_overrides(&request, &manifest.roles)?;
-        let (focus_plans, focus_repairs) = focus_partition_plans(&request, &manifest.roles)?;
+        let (focus_plans, mut focus_repairs) = focus_partition_plans(&request, &manifest.roles)?;
         for plan in focus_plans.values() {
             for slot in &plan.slots {
                 for reference in &slot.capability_cropped_refs {
@@ -756,6 +756,42 @@ impl TeamInstantiationService {
             node.payload_ref = serde_json::to_string(&packet)
                 .map_err(|error| format!("encode Team role packet with display: {error}"))?;
         }
+
+        // Shared-context occupancy prediction (record/display only). Each role
+        // estimates base prompt + evidence + coordination against the meter
+        // window; these predictions are surfaced in the receipt repairs and
+        // never gate admission.
+        focus_repairs.extend(
+            manifest
+                .roles
+                .iter()
+                .map(|role| {
+                    let base_chars = role
+                        .responsibility
+                        .chars()
+                        .count()
+                        .saturating_add(request.objective.chars().count());
+                    let evidence_chars = role
+                        .task_contract
+                        .acceptance
+                        .iter()
+                        .map(|field| field.len())
+                        .sum::<usize>();
+                    crate::context_occupancy::estimate_role_occupancy(
+                        role.role_id.clone(),
+                        base_chars,
+                        evidence_chars,
+                        0,
+                        request.execution_budget.max_tokens,
+                    )
+                })
+                .map(|estimate| {
+                    format!(
+                        "predicted_occupancy:{}:{}bp",
+                        estimate.owner, estimate.utilization_bp
+                    )
+                }),
+        );
 
         Ok(TeamInstantiation {
             graph,

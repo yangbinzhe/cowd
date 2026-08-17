@@ -180,12 +180,20 @@ impl NodeExecutor for ApprovalNodeExecutor {
             (source.session_id.as_deref(), &self.session_policy_lookup)
         {
             if let Some(policy) = lookup(session_id) {
-                // Only the explicit trust-all approval profile may bypass a
-                // graph wait. DangerFullAccess is a permission ceiling, not
-                // approval authority; Autonomous still waits for critical
-                // human decisions.
+                // The global approval router is the single authority. YOLO and
+                // Autonomous auto-approve with an audit trail; lower levels
+                // keep the human graph wait.
+                let profile = crate::approval_router::ApprovalRouter::profile_for_approval_profile(
+                    policy.approval_profile,
+                );
                 auto_grant =
-                    policy.approval_profile == harness_contract::policy::ApprovalProfile::TrustAll;
+                    crate::approval_router::ApprovalRouter::resolve(
+                        profile,
+                        harness_contract::policy::ApprovalDomain::Execution,
+                        TaskRisk::High,
+                        true,
+                        false,
+                    ) == crate::approval_router::ApprovalDecision::AutoApprove;
                 approval_context = approval_context.with_execution_policy(&policy);
             }
         }
@@ -635,7 +643,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn autonomous_full_access_is_not_approval_authority() {
+    async fn autonomous_full_access_is_approval_authority_with_audit() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let queue = Arc::new(ApprovalQueue::new(store));
         let policy = SessionExecutionPolicy::from_profile(
@@ -672,8 +680,8 @@ mod tests {
         let request = queue
             .get(waiting.result_ref.as_deref().unwrap())
             .expect("durable approval request");
-        assert_eq!(waiting.status, ExecutionNodeStatus::WaitingApproval);
-        assert_eq!(request.status, GlobalApprovalStatus::Pending);
+        assert_eq!(waiting.status, ExecutionNodeStatus::Completed);
+        assert_eq!(request.status, GlobalApprovalStatus::Approved);
         assert_eq!(request.context.policy_revision, 10);
         assert_eq!(
             request.context.approval_profile,

@@ -24,6 +24,9 @@ use crate::{
     RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore,
     SubmitGlobalApprovalRequest,
 };
+use harness_contract::policy::{
+    ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand, ApprovalGrantScope,
+};
 
 pub type L4PromotionCandidate = KnowledgeCandidate;
 pub type L4CandidateLifecycle = KnowledgeCandidateState;
@@ -54,6 +57,8 @@ pub struct L4PromotionService {
     event_store: Arc<RuntimeEventStore>,
     approval_queue: Arc<ApprovalQueue>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
+    session_policy_lookup:
+        Option<Arc<dyn Fn(&str) -> Option<harness_contract::policy::SessionExecutionPolicy> + Send + Sync>>,
 }
 
 impl L4PromotionService {
@@ -62,11 +67,21 @@ impl L4PromotionService {
         event_store: Arc<RuntimeEventStore>,
         approval_queue: Arc<ApprovalQueue>,
         memory_manager: Option<Arc<memory::CognitiveContextManager>>,
+        session_policy_lookup: Option<
+            Arc<
+                dyn Fn(
+                        &str,
+                    ) -> Option<harness_contract::policy::SessionExecutionPolicy>
+                    + Send
+                    + Sync,
+            >,
+        >,
     ) -> Self {
         Self {
             event_store,
             approval_queue,
             memory_manager,
+            session_policy_lookup,
         }
     }
 
@@ -132,8 +147,9 @@ impl L4PromotionService {
         if requires_approval(&candidate) {
             let approval_id = knowledge_approval_id(&candidate.candidate_id);
             let source = approval_source(&candidate);
+            let source_session_id = source.session_id.clone();
             let action = "knowledge.promote_l4".to_string();
-            let approval = self.approval_queue.submit_scoped(
+            let mut approval = self.approval_queue.submit_scoped(
                 approval_id.clone(),
                 SubmitGlobalApprovalRequest {
                     context: harness_contract::policy::ApprovalContext::owned(
@@ -160,6 +176,77 @@ impl L4PromotionService {
                     timeout_policy: ApprovalTimeoutPolicy::Pending,
                 },
             )?;
+            if approval.status == GlobalApprovalStatus::Pending {
+                let decision = source_session_id
+                    .as_deref()
+                    .and_then(|session_id| {
+                        self.session_policy_lookup
+                            .as_ref()
+                            .and_then(|lookup| lookup(session_id))
+                    })
+                    .map(|policy| {
+                        crate::approval_router::ApprovalRouter::resolve(
+                            policy.autonomy_profile,
+                            harness_contract::policy::ApprovalDomain::Knowledge,
+                            candidate.risk,
+                            false,
+                            false,
+                        )
+                    })
+                    .unwrap_or(crate::approval_router::ApprovalDecision::Human);
+                match decision {
+                    crate::approval_router::ApprovalDecision::AutoApprove
+                    | crate::approval_router::ApprovalDecision::StewardApprove => {
+                        self.approval_queue.decide_internal(ApprovalDecisionCommand {
+                            approval_id: approval_id.clone(),
+                            approved: true,
+                            skip: false,
+                            reason: format!(
+                                "approval router {decision:?} for knowledge promotion"
+                            ),
+                            scope: ApprovalGrantScope::Once,
+                            actor: ApprovalDecisionActor {
+                                kind: if decision
+                                    == crate::approval_router::ApprovalDecision::StewardApprove
+                                {
+                                    ApprovalDecisionActorKind::StewardAgent
+                                } else {
+                                    ApprovalDecisionActorKind::Policy
+                                },
+                                actor_id: if decision
+                                    == crate::approval_router::ApprovalDecision::StewardApprove
+                                {
+                                    "runtime-approval-steward".to_string()
+                                } else {
+                                    "approval-router-auto".to_string()
+                                },
+                            },
+                            evidence_refs: vec![
+                                "approval.router.auto".to_string(),
+                                format!("approval.router.decision:{decision:?}"),
+                            ],
+                        })?;
+                        approval = self
+                            .approval_queue
+                            .get(&approval_id)
+                            .ok_or_else(|| "knowledge approval missing after router decision".to_string())?;
+                    }
+                    crate::approval_router::ApprovalDecision::ContinueAlternative => {
+                        self.append_state(
+                            &candidate,
+                            KnowledgeCandidateState::Rejected,
+                            Some(&approval_id),
+                            None,
+                            Some(
+                                "approval router continued alternative for non-blocking knowledge promotion",
+                            ),
+                        )?;
+                        return self.require_projection(&candidate.candidate_id);
+                    }
+                    crate::approval_router::ApprovalDecision::Human
+                    | crate::approval_router::ApprovalDecision::Deny => {}
+                }
+            }
             match approval.status {
                 GlobalApprovalStatus::Pending => {
                     self.append_state(

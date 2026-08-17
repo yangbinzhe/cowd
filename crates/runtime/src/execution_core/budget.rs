@@ -86,16 +86,23 @@ impl ParentExecutionBudgetLedger {
         input_reserve_tokens: u64,
         requested_output_tokens: u64,
     ) -> Result<DurableProviderBudgetReservation, String> {
+        // Record-only budget: this reservation meters provider usage for
+        // projection and audit. It never rejects Provider IO based on
+        // cumulative token/cost ceilings; context window fit is the only
+        // admission boundary and lives in provider preflight.
         child.validate().map_err(str::to_string)?;
         self.validate_child(child)?;
         if model.trim().is_empty() || input_reserve_tokens == 0 || requested_output_tokens == 0 {
             return Err("provider budget reservation input is incomplete".to_string());
         }
-        let pricing = crate::pricing_for_model(model).ok_or_else(|| {
-            format!(
-                "finite execution cost budget cannot admit model `{model}` without canonical pricing"
-            )
-        })?;
+        let pricing = crate::pricing_for_model(model).unwrap_or_else(|| {
+            tracing::debug!(
+                model,
+                budget_id = %self.budget.budget_id,
+                "execution budget has no canonical pricing; using conservative default for recording"
+            );
+            ModelPricing::default_sonnet_tier()
+        });
         let reservation_id = reservation_id.into();
         if reservation_id.trim().is_empty() {
             return Err("provider budget reservation id is empty".to_string());
@@ -133,16 +140,12 @@ impl ParentExecutionBudgetLedger {
             let token_capacity = parent_tokens_left;
             let cost_capacity = parent_cost_left / cost_rate.max(1);
             let capacity = token_capacity.min(cost_capacity);
-            if guarded_input >= capacity {
-                return Err(format!(
-                    "execution budget `{}` has no provider output capacity after reserving {guarded_input} guarded input tokens",
-                    self.budget.budget_id
-                ));
-            }
-            let granted_output_tokens = requested_output_tokens.min(capacity - guarded_input);
-            if granted_output_tokens == 0 {
-                return Err("execution budget has no provider output capacity".to_string());
-            }
+            // Record-only budget: capacity exhaustion is metered, never an
+            // admission rejection. The provider step always proceeds; the
+            // projection reports the overage.
+            let budget_exceeded = guarded_input >= capacity
+                || requested_output_tokens > capacity.saturating_sub(guarded_input);
+            let granted_output_tokens = requested_output_tokens;
             let reserved_tokens = guarded_input.saturating_add(granted_output_tokens);
             let reserved_cost_microusd = reserved_tokens.saturating_mul(cost_rate);
             let mut events = Vec::with_capacity(2);
@@ -173,6 +176,7 @@ impl ParentExecutionBudgetLedger {
                             || child_totals.reserved_cost_microusd
                                 .saturating_add(reserved_cost_microusd)
                                 > child.max_cost_microusd,
+                        "budget_exceeded": budget_exceeded,
                     }),
                 },
                 idempotency_key: Some(format!("provider-reserve:{reservation_id}")),
@@ -293,13 +297,12 @@ impl DurableProviderBudgetReservation {
             .saturating_add(u64::from(usage.output_tokens))
             .saturating_add(u64::from(usage.cache_creation_input_tokens))
             .saturating_add(u64::from(usage.cache_read_input_tokens));
-        if actual_tokens == 0 {
-            return Err(format!(
-                "provider `{}` returned no usage for finite execution budget `{}`; the full conservative reservation remains charged",
-                self.model, self.child.parent_budget_id
-            ));
-        }
-        let actual_cost_microusd = exact_cost_microusd(usage, self.pricing);
+        let missing_usage = actual_tokens == 0;
+        let actual_cost_microusd = if missing_usage {
+            0
+        } else {
+            exact_cost_microusd(usage, self.pricing)
+        };
         for _ in 0..MAX_BUDGET_CAS_RETRIES {
             let stream_revision = self
                 .ledger
@@ -319,17 +322,20 @@ impl DurableProviderBudgetReservation {
                     event: RuntimeEventInput {
                         stream_id: self.ledger.stream_id(),
                         scope: RuntimeEventScope::Team,
-                        kind: "execution_budget.provider_reconciled".to_string(),
-                        status: Some(
-                            if actual_tokens <= self.reserved_tokens
-                                && actual_cost_microusd <= self.reserved_cost_microusd
-                            {
-                                "settled"
-                            } else {
-                                "breached"
-                            }
-                            .to_string(),
-                        ),
+                        kind: if missing_usage {
+                            "execution_budget.usage_missing".to_string()
+                        } else {
+                            "execution_budget.provider_reconciled".to_string()
+                        },
+                        status: Some(if missing_usage {
+                            "missing".to_string()
+                        } else if actual_tokens <= self.reserved_tokens
+                            && actual_cost_microusd <= self.reserved_cost_microusd
+                        {
+                            "settled".to_string()
+                        } else {
+                            "breached".to_string()
+                        }),
                         actor: Some("runtime-provider-budget".to_string()),
                         refs: Vec::new(),
                         payload: serde_json::json!({
@@ -349,14 +355,6 @@ impl DurableProviderBudgetReservation {
             match self.ledger.event_store.append_transaction(request) {
                 Ok(_) => {
                     self.reconciled = true;
-                    if actual_tokens > self.reserved_tokens
-                        || actual_cost_microusd > self.reserved_cost_microusd
-                    {
-                        return Err(format!(
-                            "provider usage exceeded durable reservation: tokens {actual_tokens}/{}, cost {actual_cost_microusd}/{} microusd",
-                            self.reserved_tokens, self.reserved_cost_microusd
-                        ));
-                    }
                     return Ok(());
                 }
                 Err(RuntimeEventStoreError::StaleRevision { .. }) => continue,
@@ -587,11 +585,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_usage_and_unknown_pricing_fail_closed() {
+    fn unknown_usage_and_unknown_pricing_are_recorded_not_blocking() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let parent = parent();
         let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
-        assert!(ledger
+        let unknown_pricing = ledger
             .reserve_provider(
                 &child(&parent, 0),
                 "unknown-pricing",
@@ -599,8 +597,9 @@ mod tests {
                 10,
                 100,
             )
-            .is_err());
-        assert_eq!(ledger.snapshot().unwrap().reserved_tokens, 0);
+            .expect("record-only budget must admit providers without canonical pricing");
+        assert!(unknown_pricing.reserved_tokens > 0);
+        assert!(ledger.snapshot().unwrap().reserved_tokens > 0);
         let mut reservation = ledger
             .reserve_provider(
                 &child(&parent, 0),
@@ -611,8 +610,10 @@ mod tests {
             )
             .unwrap();
         let reserved = reservation.reserved_tokens;
-        assert!(reservation.reconcile(TokenUsage::default()).is_err());
-        assert_eq!(ledger.snapshot().unwrap().reserved_tokens, reserved);
+        reservation
+            .reconcile(TokenUsage::default())
+            .expect("missing usage must be recorded, not block the provider step");
+        assert!(ledger.snapshot().unwrap().reserved_tokens >= reserved);
     }
 
     #[test]

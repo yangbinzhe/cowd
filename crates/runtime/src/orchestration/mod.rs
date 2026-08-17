@@ -409,30 +409,55 @@ async fn propose_template(
             "preview": candidate.preview,
         }),
     });
-    let trust_all = session_is_trust_all(services, session_id.as_deref());
-    if !trust_all {
-        tracing::warn!(
-            session_id = ?session_id,
-            policy = ?services.session_execution_policy(session_id.as_deref().unwrap_or("")),
-            "propose_template trust-all auto-approval is inactive"
-        );
-    }
-    if trust_all {
+    let session_policy = session_id
+        .as_deref()
+        .and_then(|session_id| services.session_execution_policy(session_id));
+    let router_profile = session_policy
+        .as_ref()
+        .map(|policy| policy.autonomy_profile)
+        .unwrap_or(harness_contract::policy::AutonomyProfileId::Cautious);
+    let router_decision = crate::approval_router::ApprovalRouter::resolve(
+        router_profile,
+        harness_contract::policy::ApprovalDomain::System,
+        risk,
+        false,
+        true,
+    );
+    if matches!(
+        router_decision,
+        crate::approval_router::ApprovalDecision::AutoApprove
+            | crate::approval_router::ApprovalDecision::StewardApprove
+    ) {
         services
             .approval_queue()
             .decide_internal(ApprovalDecisionCommand {
                 approval_id: approval_id.clone(),
                 approved: true,
                 skip: false,
-                reason: "yolo trust-all approval; audit only".to_string(),
+                reason: format!("approval router {router_decision:?} for template publish"),
                 scope: ApprovalGrantScope::Global,
                 actor: ApprovalDecisionActor {
-                    kind: ApprovalDecisionActorKind::Policy,
-                    actor_id: "yolo-trust-all".to_string(),
+                    kind: if router_decision
+                        == crate::approval_router::ApprovalDecision::StewardApprove
+                    {
+                        ApprovalDecisionActorKind::StewardAgent
+                    } else {
+                        ApprovalDecisionActorKind::Policy
+                    },
+                    actor_id: if router_decision
+                        == crate::approval_router::ApprovalDecision::StewardApprove
+                    {
+                        "runtime-approval-steward".to_string()
+                    } else {
+                        "approval-router-auto".to_string()
+                    },
                 },
-                evidence_refs: vec!["approval.yolo_trust_all".to_string()],
+                evidence_refs: vec![
+                    "approval.router.auto".to_string(),
+                    format!("approval.router.decision:{router_decision:?}"),
+                ],
             })
-            .map_err(|error| format!("template_trust_all_approval_failed:{error}"))?;
+            .map_err(|error| format!("template_router_approval_failed:{error}"))?;
         let published = services.publish_approved_template_candidate(&approval_id)?;
         return Ok(OperationOutcome {
             status: "completed".to_string(),
@@ -1519,24 +1544,69 @@ fn submit_approval(
             timeout_policy: ApprovalTimeoutPolicy::Pending,
         },
     )?;
-    // Only explicit TrustAll is approval authority. DangerFullAccess merely
-    // defines the maximum executable permission and cannot approve critical
-    // orchestration on behalf of an Autonomous user.
-    let trust_all_session = session_is_trust_all(services, request.session_id.as_deref());
-    if trust_all_session {
+    // The global approval router is the single authority. Autonomous and YOLO
+    // auto-approve with an audit trail; lower levels queue for humans.
+    let session_policy = request
+        .session_id
+        .as_deref()
+        .and_then(|session_id| services.session_execution_policy(session_id));
+    let profile = session_policy
+        .as_ref()
+        .map(|policy| policy.autonomy_profile)
+        .unwrap_or(harness_contract::policy::AutonomyProfileId::Cautious);
+    let decision = crate::approval_router::ApprovalRouter::resolve(
+        profile,
+        harness_contract::policy::ApprovalDomain::Execution,
+        request
+            .constraints
+            .risk
+            .as_deref()
+            .and_then(|risk| serde_json::from_str::<TaskRisk>(&format!("\"{risk}\"")).ok())
+            .unwrap_or(TaskRisk::Critical),
+        true,
+        false,
+    );
+    if matches!(
+        decision,
+        crate::approval_router::ApprovalDecision::AutoApprove
+            | crate::approval_router::ApprovalDecision::StewardApprove
+    ) {
         services
             .approval_queue()
             .decide_internal(ApprovalDecisionCommand {
                 approval_id: approval_id.clone(),
                 approved: true,
                 skip: false,
-                reason: "trust-all session policy auto-approves Runtime orchestration".to_string(),
+                reason: match decision {
+                    crate::approval_router::ApprovalDecision::AutoApprove => {
+                        "session policy auto-approves Runtime orchestration".to_string()
+                    }
+                    crate::approval_router::ApprovalDecision::StewardApprove => {
+                        "bounded Steward policy approved Runtime orchestration".to_string()
+                    }
+                    _ => unreachable!("non-approval decision reached approval branch"),
+                },
                 scope: ApprovalGrantScope::Once,
                 actor: ApprovalDecisionActor {
-                    kind: ApprovalDecisionActorKind::Policy,
-                    actor_id: "autonomous-session-policy".to_string(),
+                    kind: if decision
+                        == crate::approval_router::ApprovalDecision::StewardApprove
+                    {
+                        ApprovalDecisionActorKind::StewardAgent
+                    } else {
+                        ApprovalDecisionActorKind::Policy
+                    },
+                    actor_id: if decision
+                        == crate::approval_router::ApprovalDecision::StewardApprove
+                    {
+                        "runtime-approval-steward".to_string()
+                    } else {
+                        "session-policy".to_string()
+                    },
                 },
-                evidence_refs: vec!["approval.policy.auto_grant".to_string()],
+                evidence_refs: vec![
+                    "approval.policy.auto_grant".to_string(),
+                    format!("approval.router:{decision:?}"),
+                ],
             })?;
     }
     request.constraints.approval_id = Some(approval_id);

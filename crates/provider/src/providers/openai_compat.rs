@@ -753,8 +753,8 @@ impl StreamState {
         if let Some(usage) = chunk.usage {
             self.usage = Some(Usage {
                 input_tokens: usage.normalized_input_tokens(),
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: usage.normalized_cache_creation_tokens(),
+                cache_read_input_tokens: usage.normalized_cache_read_tokens(),
                 output_tokens: usage.normalized_output_tokens(),
             });
         }
@@ -1250,12 +1250,31 @@ struct OpenAiUsage {
     input_tokens: u32,
     #[serde(default)]
     output_tokens: u32,
+    // DeepSeek-style cache split: prompt_tokens = hit + miss.
+    #[serde(default)]
+    prompt_cache_hit_tokens: u32,
+    #[serde(default)]
+    prompt_cache_miss_tokens: u32,
+    // OpenAI Responses-style cache split.
+    #[serde(default)]
+    cached_input_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    // OpenAI Chat Completions style: prompt_tokens_details.cached_tokens.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 impl OpenAiUsage {
-    const fn normalized_input_tokens(&self) -> u32 {
+    fn normalized_input_tokens(&self) -> u32 {
         if self.input_tokens > 0 {
+            // OpenAI Responses: input_tokens already excludes cached tokens.
             self.input_tokens
+        } else if self.prompt_cache_miss_tokens > 0 {
+            self.prompt_cache_miss_tokens
+        } else if let Some(details) = &self.prompt_tokens_details {
+            // OpenAI Chat Completions: prompt_tokens includes cached tokens.
+            self.prompt_tokens.saturating_sub(details.cached_tokens)
         } else {
             self.prompt_tokens
         }
@@ -1268,6 +1287,36 @@ impl OpenAiUsage {
             self.completion_tokens
         }
     }
+
+    fn normalized_cache_creation_tokens(&self) -> u32 {
+        // OpenAI-compatible providers bill cache writes at the miss rate and
+        // already exclude cached tokens from `input_tokens`. Only an explicit
+        // separate cache-write field is reported here; deriving it from the
+        // miss would double-count the same tokens.
+        if self.cache_creation_input_tokens > 0 {
+            self.cache_creation_input_tokens
+        } else {
+            0
+        }
+    }
+
+    fn normalized_cache_read_tokens(&self) -> u32 {
+        if self.prompt_cache_hit_tokens > 0 {
+            self.prompt_cache_hit_tokens
+        } else if self.cached_input_tokens > 0 {
+            self.cached_input_tokens
+        } else if let Some(details) = &self.prompt_tokens_details {
+            details.cached_tokens
+        } else {
+            0
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2057,8 +2106,14 @@ fn normalize_chat_completion_response(
                 .usage
                 .as_ref()
                 .map_or(0, OpenAiUsage::normalized_input_tokens),
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: response
+                .usage
+                .as_ref()
+                .map_or(0, OpenAiUsage::normalized_cache_creation_tokens),
+            cache_read_input_tokens: response
+                .usage
+                .as_ref()
+                .map_or(0, OpenAiUsage::normalized_cache_read_tokens),
             output_tokens: response
                 .usage
                 .as_ref()
@@ -2124,8 +2179,8 @@ fn normalize_responses_response(model: &str, response: ResponsesApiResponse) -> 
             .as_ref()
             .map_or_else(Usage::default, |usage| Usage {
                 input_tokens: usage.normalized_input_tokens(),
-                cache_creation_input_tokens: 0,
-                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: usage.normalized_cache_creation_tokens(),
+                cache_read_input_tokens: usage.normalized_cache_read_tokens(),
                 output_tokens: usage.normalized_output_tokens(),
             }),
         request_id: None,
@@ -3099,6 +3154,35 @@ mod tests {
                 .map(OpenAiUsage::normalized_output_tokens),
             Some(21)
         );
+    }
+
+    #[test]
+    fn openai_usage_parses_cache_split_without_double_counting() {
+        let deepseek: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"prompt_cache_hit_tokens":800,"prompt_cache_miss_tokens":200,"completion_tokens":50}"#,
+        )
+        .expect("deepseek usage");
+        assert_eq!(deepseek.normalized_input_tokens(), 200);
+        assert_eq!(deepseek.normalized_cache_creation_tokens(), 0);
+        assert_eq!(deepseek.normalized_cache_read_tokens(), 800);
+        assert_eq!(deepseek.normalized_output_tokens(), 50);
+
+        let chat_completions: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"prompt_tokens_details":{"cached_tokens":700},"completion_tokens":50}"#,
+        )
+        .expect("chat completions usage");
+        assert_eq!(chat_completions.normalized_input_tokens(), 300);
+        assert_eq!(chat_completions.normalized_cache_creation_tokens(), 0);
+        assert_eq!(chat_completions.normalized_cache_read_tokens(), 700);
+
+        let responses: OpenAiUsage = serde_json::from_str(
+            r#"{"input_tokens":300,"cached_input_tokens":700,"output_tokens":50}"#,
+        )
+        .expect("responses usage");
+        assert_eq!(responses.normalized_input_tokens(), 300);
+        assert_eq!(responses.normalized_cache_creation_tokens(), 0);
+        assert_eq!(responses.normalized_cache_read_tokens(), 700);
+        assert_eq!(responses.normalized_output_tokens(), 50);
     }
 
     #[test]

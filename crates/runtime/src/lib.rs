@@ -51,6 +51,8 @@ pub mod wave;
 pub use green_contract::GreenLevel;
 #[path = "approval/coordinator.rs"]
 pub mod approval_coordinator;
+#[path = "approval/router.rs"]
+pub mod approval_router;
 #[path = "approval/approval_queue.rs"]
 pub mod approval_queue;
 #[path = "infrastructure/hooks.rs"]
@@ -62,6 +64,8 @@ pub use json::JsonValue;
 pub mod acceptance_evaluator;
 #[path = "context/adaptive_allocator.rs"]
 pub mod adaptive_context;
+#[path = "context/occupancy.rs"]
+pub mod context_occupancy;
 #[path = "context/budget_policy.rs"]
 pub mod budget_policy;
 #[path = "context/evidence/mod.rs"]

@@ -514,10 +514,11 @@ fn compile_team_subgraph_node(
         upstream_artifact_refs: Vec::new(),
     };
     // The first plan resolves the published template and exposes the real
-    // role-branch cardinality. A team with N template roles needs a budget
-    // sized for N branches; deriving it from `semantic.multiplicity` alone
-    // (1 for a custom template) under-provisions the cost ceiling and blocks
-    // later role batches with "no provider output capacity".
+    // role-branch cardinality. A team with N template roles needs a predicted
+    // budget sized for N branches; deriving it from `semantic.multiplicity`
+    // alone (1 for a custom template) under-provisions the prediction that is
+    // shown to operators. These values meter usage only; they never admit or
+    // reject provider IO.
     let role_branch_count = team_runtime
         .plan(team_request.clone())
         .map_err(OrchestrationCompileError::TeamInstantiation)?

@@ -1351,6 +1351,21 @@ fn usage_to_json(usage: TokenUsage) -> JsonValue {
         "cache_read_input_tokens".to_string(),
         JsonValue::Number(i64::from(usage.cache_read_input_tokens)),
     );
+    let billed_input = u64::from(usage.cache_read_input_tokens)
+        .saturating_add(u64::from(usage.cache_creation_input_tokens));
+    let cache_hit_ratio_bp = if billed_input == 0 {
+        0
+    } else {
+        (u64::from(usage.cache_read_input_tokens).saturating_mul(10_000) / billed_input) as i64
+    };
+    object.insert(
+        "cache_hit_ratio_bp".to_string(),
+        JsonValue::Number(cache_hit_ratio_bp),
+    );
+    object.insert(
+        "cache_saved_tokens".to_string(),
+        JsonValue::Number(i64::from(usage.cache_read_input_tokens)),
+    );
     JsonValue::Object(object)
 }
 

@@ -401,6 +401,7 @@ mod tests {
             Arc::clone(&events),
             Arc::clone(&approvals),
             Some(memory),
+            None,
         ));
         (root, events, approvals, promotion)
     }

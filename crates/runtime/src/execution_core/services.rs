@@ -1602,10 +1602,27 @@ impl RuntimeServices {
             Arc::downgrade(&team_runtime),
             Arc::downgrade(&execution_supervisor),
         )))?;
+        let l4_session_policy_lookup = {
+            let controls = Arc::clone(&session_execution_policy_controls);
+            Arc::new(move |session_id: &str| {
+                controls
+                    .read()
+                    .ok()
+                    .and_then(|map| map.get(session_id).cloned())
+                    .map(|control| control.snapshot())
+            }) as Arc<
+                dyn Fn(
+                        &str,
+                    ) -> Option<harness_contract::policy::SessionExecutionPolicy>
+                    + Send
+                    + Sync,
+            >
+        };
         let l4_promotion_service = Arc::new(crate::L4PromotionService::new(
             Arc::clone(&event_store),
             Arc::clone(&approval_queue),
             memory_manager.clone(),
+            Some(l4_session_policy_lookup),
         ));
         let knowledge_candidate_projector = Arc::new(crate::KnowledgeCandidateProjector::new(
             Arc::clone(&event_store),

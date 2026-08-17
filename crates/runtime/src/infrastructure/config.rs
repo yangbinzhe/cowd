@@ -445,7 +445,7 @@ pub struct ContextBudgetConfig {
 }
 
 const fn default_subsystem_budget_ratio_bp() -> u32 {
-    7000
+    8000
 }
 
 impl Default for ContextBudgetConfig {

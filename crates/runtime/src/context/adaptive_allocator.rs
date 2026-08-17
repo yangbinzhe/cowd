@@ -317,6 +317,14 @@ fn utility_density(item: &ContextItem) -> u64 {
         / item.token_estimate.max(1)
 }
 
+/// Marginal utility density (value per token) for the information-selection
+/// budget. Exposed for audit/projection; selection order already ranks by it
+/// among otherwise-equal candidates.
+#[must_use]
+pub fn marginal_utility_density(item: &ContextItem) -> u64 {
+    utility_density(item)
+}
+
 fn coverage_basis_points(selected: &[ContextItem], demand: &ContextDemand) -> u16 {
     if selected.is_empty() {
         return 0;
@@ -388,6 +396,13 @@ mod tests {
             2
         );
         assert!(allocation.report.borrowed_budget_tokens > 0);
+    }
+
+    #[test]
+    fn marginal_utility_density_rewards_value_per_token() {
+        let cheap = item("cheap", ContextSourceKind::Memory, 8.0, 100);
+        let expensive = item("expensive", ContextSourceKind::Memory, 9.0, 2_000);
+        assert!(marginal_utility_density(&cheap) > marginal_utility_density(&expensive));
     }
 
     #[test]

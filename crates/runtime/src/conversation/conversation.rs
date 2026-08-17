@@ -14583,7 +14583,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_reservation_set_rolls_back_global_when_delegated_admission_fails() {
+    fn provider_reservation_set_records_delegated_admission_instead_of_blocking() {
         let _guard = TOKEN_RESERVATION_TEST_LOCK.lock().unwrap();
         let _lease = install_evaluation_provider_token_lease("eval-rollback", 1_000)
             .expect("install evaluation budget");
@@ -14603,17 +14603,15 @@ mod tests {
         .unwrap();
         let delegated = (ledger.clone(), child);
         let mut request = token_reservation_request();
-        assert!(ProviderTokenReservationSet::acquire(
+        let reservation_set = ProviderTokenReservationSet::acquire(
             Some(&delegated),
             "claude-haiku-4-5-20251001",
-            &mut request
+            &mut request,
         )
-        .is_err());
-
-        let global = evaluation_provider_token_lease_snapshot().expect("evaluation snapshot");
-        assert_eq!(global.consumed, 0);
-        assert_eq!(global.outstanding, 0);
-        assert_eq!(ledger.snapshot().unwrap().reserved_tokens, 0);
+        .expect("record-only delegated budget must admit the provider");
+        assert!(reservation_set.delegated.is_some());
+        assert_eq!(request.budget.requested_output_tokens, 100);
+        assert!(ledger.snapshot().unwrap().reserved_tokens > 0);
     }
 
     #[test]

@@ -296,6 +296,7 @@ async fn cowd_full_capability_eval_covers_document_memory_fact_session_agents_an
         Arc::clone(&execution_events),
         Arc::clone(&approval_queue),
         Some(Arc::clone(&memory)),
+        None,
     );
     let execution_identity = ExecutionIdentity::for_task_graph(
         "agent-reviewer",

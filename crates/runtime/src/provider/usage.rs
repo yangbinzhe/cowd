@@ -56,6 +56,26 @@ impl UsageTracker {
         self.cumulative
     }
 
+    /// Cache hit ratio in basis points (0..=10000) over billed input tokens.
+    /// `0` means no cacheable input was observed yet.
+    #[must_use]
+    pub fn cache_hit_ratio_bp(&self) -> u32 {
+        let read = u64::from(self.cumulative.cache_read_input_tokens);
+        let creation = u64::from(self.cumulative.cache_creation_input_tokens);
+        let billed = read.saturating_add(creation);
+        if billed == 0 {
+            0
+        } else {
+            u32::try_from(read.saturating_mul(10_000) / billed).unwrap_or(0)
+        }
+    }
+
+    /// Tokens served from provider cache across the whole session.
+    #[must_use]
+    pub fn cache_saved_tokens(&self) -> u64 {
+        u64::from(self.cumulative.cache_read_input_tokens)
+    }
+
     #[must_use]
     pub fn turns(&self) -> u32 {
         self.turns
@@ -91,6 +111,23 @@ mod tests {
         assert_eq!(tracker.cumulative_usage().output_tokens, 10);
         assert_eq!(tracker.cumulative_usage().input_tokens, 30);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 48);
+    }
+
+    #[test]
+    fn cache_hit_ratio_and_saved_tokens_are_reported() {
+        let mut tracker = UsageTracker::new();
+        tracker.record(TokenUsage {
+            input_tokens: 8,
+            output_tokens: 4,
+            cache_creation_input_tokens: 2,
+            cache_read_input_tokens: 8,
+        });
+        assert_eq!(tracker.cache_hit_ratio_bp(), 8_000);
+        assert_eq!(tracker.cache_saved_tokens(), 8);
+
+        let empty = UsageTracker::new();
+        assert_eq!(empty.cache_hit_ratio_bp(), 0);
+        assert_eq!(empty.cache_saved_tokens(), 0);
     }
 
     #[test]

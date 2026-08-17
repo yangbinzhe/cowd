@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::context_runtime::ContextProfile;
-pub const DEFAULT_SUBSYSTEM_BUDGET_RATIO_BP: u32 = 7_000;
+pub const DEFAULT_SUBSYSTEM_BUDGET_RATIO_BP: u32 = 8_000;
 pub const MIN_CONTEXT_BUDGET_RATIO_BP: u32 = 1_000;
 pub const MAX_CONTEXT_BUDGET_RATIO_BP: u32 = 9_500;
 pub const FALLBACK_MODEL_CONTEXT_WINDOW: u32 = 128_000;
@@ -329,10 +329,10 @@ mod tests {
         let plan = RuntimeBudgetPlan::derive(RuntimeBudgetInputs::new(0, 4_096));
 
         assert_eq!(plan.model_context_window, 128_000);
-        assert_eq!(plan.subsystem_budget_tokens, 89_600);
-        assert!(plan.tool_result_budget.max_total_tokens < 89_600);
-        assert!(plan.subagent_default_budget <= 89_600);
-        assert!(plan.team_total_budget <= 89_600);
+        assert_eq!(plan.subsystem_budget_tokens, 102_400);
+        assert!(plan.tool_result_budget.max_total_tokens < 102_400);
+        assert!(plan.subagent_default_budget <= 102_400);
+        assert!(plan.team_total_budget <= 102_400);
     }
 
     #[test]

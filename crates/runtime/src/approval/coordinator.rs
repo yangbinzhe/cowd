@@ -240,24 +240,67 @@ impl ApprovalCoordinator {
             Some(now_ms().saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))),
         )?;
 
-        if approval_profile == ApprovalProfile::TrustAll {
+        let router_profile =
+            crate::approval_router::ApprovalRouter::profile_for_approval_profile(approval_profile);
+        let router_decision = crate::approval_router::ApprovalRouter::resolve(
+            router_profile,
+            ApprovalDomain::Execution,
+            risk,
+            true,
+            explicit_ask,
+        );
+        if router_decision == crate::approval_router::ApprovalDecision::AutoApprove {
             let receipt = self.queue.decide_internal(ApprovalDecisionCommand {
                 approval_id: request.approval_id.clone(),
                 approved: true,
                 skip: false,
-                reason: "yolo trust-all approval; audit only".to_string(),
+                reason: "approval router auto-approval; audit only".to_string(),
                 scope: ApprovalGrantScope::Once,
                 actor: ApprovalDecisionActor {
                     kind: ApprovalDecisionActorKind::Policy,
-                    actor_id: "yolo-trust-all".to_string(),
+                    actor_id: "approval-router-auto".to_string(),
                 },
-                evidence_refs: vec!["approval.yolo_trust_all".to_string()],
+                evidence_refs: vec![
+                    "approval.router.auto".to_string(),
+                    format!("approval.router.profile:{router_profile:?}"),
+                ],
             })?;
             self.notify_decision(&request.approval_id);
             let grant = self
                 .queue
                 .grant_for_approval(&request.approval_id)
-                .ok_or_else(|| "trust-all approval did not create a grant".to_string())?;
+                .ok_or_else(|| "approval router auto-approval did not create a grant".to_string())?;
+            return Ok(ApprovalResolution::Approved {
+                approval_id: receipt.approval_id,
+                grant,
+            });
+        }
+
+        if router_decision == crate::approval_router::ApprovalDecision::StewardApprove
+            && !explicit_ask
+            && steward_can_approve(approval_profile, descriptor, risk)
+        {
+            let receipt = self.queue.decide_internal(ApprovalDecisionCommand {
+                approval_id: request.approval_id.clone(),
+                approved: true,
+                skip: false,
+                reason: "approval router Steward approval for a known reversible effect"
+                    .to_string(),
+                scope: ApprovalGrantScope::Once,
+                actor: ApprovalDecisionActor {
+                    kind: ApprovalDecisionActorKind::StewardAgent,
+                    actor_id: "runtime-approval-steward".to_string(),
+                },
+                evidence_refs: vec![
+                    "approval.steward.eligible".to_string(),
+                    format!("approval.router.decision:{router_decision:?}"),
+                ],
+            })?;
+            self.notify_decision(&request.approval_id);
+            let grant = self
+                .queue
+                .grant_for_approval(&request.approval_id)
+                .ok_or_else(|| "steward approval did not create a grant".to_string())?;
             return Ok(ApprovalResolution::Approved {
                 approval_id: receipt.approval_id,
                 grant,
