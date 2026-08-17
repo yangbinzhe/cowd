@@ -3889,8 +3889,11 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
                 });
             }
             let _ = authorization_negotiator.take_transitions_for_persistence();
-            let authorization_stream_id = format!("session:{session_id}");
             for transition in authorization_negotiator.transitions_awaiting_persistence() {
+                // Per-lease stream: parallel agents and the parent model stream
+                // must not contend for the shared session event stream.
+                let authorization_stream_id =
+                    format!("authorization-lease:{}", transition.lease.lease_id);
                 if let Err(error) =
                     crate::authorization_negotiator::persist_authorization_transition(
                         services.event_store(),

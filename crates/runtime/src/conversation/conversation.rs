@@ -8762,11 +8762,14 @@ where
         let _ = self
             .authorization_negotiator
             .take_transitions_for_persistence();
-        let stream_id = format!("session:{}", self.session_id());
         for transition in self
             .authorization_negotiator
             .transitions_awaiting_persistence()
         {
+            // Authorization leases live on their own stream so parallel Team
+            // agents and early-tool grants never contend with session model
+            // events on the shared `session:<id>` stream.
+            let stream_id = format!("authorization-lease:{}", transition.lease.lease_id);
             if let Err(error) = crate::authorization_negotiator::persist_authorization_transition(
                 store,
                 &stream_id,

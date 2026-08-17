@@ -1117,59 +1117,66 @@ pub(crate) fn persist_authorization_transition(
     actor: &str,
     transition: &AuthorizationLeaseTransition,
 ) -> Result<(), String> {
-    let payload = serde_json::to_value(transition).map_err(|error| error.to_string())?;
-    for attempt in 0..3 {
-        if let Some(existing) = store
-            .event_by_idempotency_key(stream_id, &transition.transition_id)
-            .map_err(|error| error.to_string())?
-        {
-            if existing.kind == "authorization.lease_transition" && existing.payload == payload {
-                return Ok(());
+    // The whole read-revision-then-append window runs under the per-stream
+    // in-process lock. Parallel Team agents and the parent model stream no
+    // longer race the CAS revision; the bounded retry remains only as a
+    // safety net for cross-process writers.
+    store.with_stream_lock(stream_id, || {
+        let payload = serde_json::to_value(transition).map_err(|error| error.to_string())?;
+        for attempt in 0..3 {
+            if let Some(existing) = store
+                .event_by_idempotency_key(stream_id, &transition.transition_id)
+                .map_err(|error| error.to_string())?
+            {
+                if existing.kind == "authorization.lease_transition" && existing.payload == payload
+                {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "authorization transition idempotency collision: {}",
+                    transition.transition_id
+                ));
             }
-            return Err(format!(
-                "authorization transition idempotency collision: {}",
-                transition.transition_id
-            ));
-        }
-        let expected_revision = store
-            .stream_revision(stream_id)
-            .map_err(|error| error.to_string())?;
-        let request = crate::AppendTransactionRequest {
-            transaction_id: format!("authorization-transition:{}", transition.transition_id),
-            expected_streams: vec![crate::ExpectedStreamRevision {
-                stream_id: stream_id.to_string(),
-                expected_revision,
-            }],
-            events: vec![crate::RuntimeTransactionEventInput {
-                event: crate::RuntimeEventInput {
+            let expected_revision = store
+                .stream_revision(stream_id)
+                .map_err(|error| error.to_string())?;
+            let request = crate::AppendTransactionRequest {
+                transaction_id: format!("authorization-transition:{}", transition.transition_id),
+                expected_streams: vec![crate::ExpectedStreamRevision {
                     stream_id: stream_id.to_string(),
-                    scope: crate::RuntimeEventScope::Tool,
-                    kind: "authorization.lease_transition".to_string(),
-                    status: Some(format!("{:?}", transition.kind).to_ascii_lowercase()),
-                    actor: Some(actor.to_string()),
-                    refs: vec![crate::RuntimeEventRef {
-                        kind: "authorization_lease".to_string(),
-                        id: transition.lease.lease_id.clone(),
-                    }],
-                    payload: payload.clone(),
-                },
-                idempotency_key: Some(transition.transition_id.clone()),
-                schema_version: 1,
-            }],
-        };
-        match store.append_transaction(request) {
-            Ok(_) => return Ok(()),
-            Err(crate::RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => continue,
-            Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) if attempt < 2 => {
-                continue;
+                    expected_revision,
+                }],
+                events: vec![crate::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: stream_id.to_string(),
+                        scope: crate::RuntimeEventScope::Tool,
+                        kind: "authorization.lease_transition".to_string(),
+                        status: Some(format!("{:?}", transition.kind).to_ascii_lowercase()),
+                        actor: Some(actor.to_string()),
+                        refs: vec![crate::RuntimeEventRef {
+                            kind: "authorization_lease".to_string(),
+                            id: transition.lease.lease_id.clone(),
+                        }],
+                        payload: payload.clone(),
+                    },
+                    idempotency_key: Some(transition.transition_id.clone()),
+                    schema_version: 1,
+                }],
+            };
+            match store.append_transaction_locked(request) {
+                Ok(_) => return Ok(()),
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) if attempt < 2 => continue,
+                Err(crate::RuntimeEventStoreError::TransactionConflict { .. }) if attempt < 2 => {
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
             }
-            Err(error) => return Err(error.to_string()),
         }
-    }
-    Err(format!(
-        "authorization transition persistence retry budget exhausted: {}",
-        transition.transition_id
-    ))
+        Err(format!(
+            "authorization transition persistence retry budget exhausted: {}",
+            transition.transition_id
+        ))
+    })
 }
 
 fn transition_ends_hot_lease(transition: &AuthorizationLeaseTransition) -> bool {

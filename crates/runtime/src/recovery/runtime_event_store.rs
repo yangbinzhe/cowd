@@ -7,7 +7,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use rusqlite::{
@@ -935,6 +935,14 @@ pub trait RuntimeEventStoreBackend: std::fmt::Debug + Send + Sync {
 pub struct RuntimeEventStore {
     backend: Arc<dyn RuntimeEventStoreBackend>,
     commit_signal: tokio::sync::watch::Sender<u64>,
+    /// Per-stream serialization for the read-revision-then-append window.
+    /// One stream (for example `session:<id>`) is written by many Runtime
+    /// tasks (model events, early-tool authorizations, approval grants), so
+    /// the optimistic-CAS append can race with itself. A per-stream
+    /// in-process lock removes the TOCTOU window while keeping different
+    /// streams fully parallel. Guards are acquired in sorted stream order so
+    /// multi-stream transactions can never deadlock.
+    stream_locks: StdMutex<std::collections::HashMap<String, Arc<StdMutex<()>>>>,
 }
 
 impl RuntimeEventStore {
@@ -992,16 +1000,76 @@ impl RuntimeEventStore {
         Self {
             backend,
             commit_signal,
+            stream_locks: StdMutex::new(std::collections::HashMap::new()),
         }
     }
 
+    fn with_stream_locks<T>(&self, stream_ids: &[String], work: impl FnOnce() -> T) -> T {
+        let unique = stream_ids
+            .iter()
+            .filter(|stream_id| !stream_id.is_empty())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut locks = self
+            .stream_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        let arcs = unique
+            .into_iter()
+            .map(|stream_id| {
+                Arc::clone(
+                    locks
+                        .entry(stream_id)
+                        .or_insert_with(|| Arc::new(StdMutex::new(()))),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(locks);
+        let _guards = arcs
+            .iter()
+            .map(|arc| {
+                arc.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect::<Vec<_>>();
+        work()
+    }
+
+    /// Runs `work` while holding the per-stream in-process write lock. The
+    /// lock covers the whole read-revision-then-append window, so callers that
+    /// first read `stream_revision` and then append can never be interrupted
+    /// by another in-process writer on the same stream.
+    pub fn with_stream_lock<T>(&self, stream_id: &str, work: impl FnOnce() -> T) -> T {
+        self.with_stream_locks(&[stream_id.to_string()], work)
+    }
+
     pub fn append(&self, input: RuntimeEventInput) -> Result<DurableRuntimeEvent, String> {
-        let event = self.backend.append(input)?;
+        let stream_id = input.stream_id.clone();
+        let event = self.with_stream_lock(&stream_id, || self.backend.append(input))?;
         self.publish_commit(event.commit_cursor);
         Ok(event)
     }
 
     pub fn append_transaction(
+        &self,
+        request: AppendTransactionRequest,
+    ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
+        let stream_ids = request
+            .expected_streams
+            .iter()
+            .map(|stream| stream.stream_id.clone())
+            .collect::<Vec<_>>();
+        let receipt =
+            self.with_stream_locks(&stream_ids, || self.backend.append_transaction(request))?;
+        self.publish_commit(receipt.commit_cursor);
+        Ok(receipt)
+    }
+
+    /// Appends without acquiring the per-stream lock. Only callers that
+    /// already hold [`Self::with_stream_lock`] for every expected stream may
+    /// use this; it avoids a non-reentrant deadlock on the same stream.
+    pub(crate) fn append_transaction_locked(
         &self,
         request: AppendTransactionRequest,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
@@ -1015,9 +1083,15 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         terminal: SessionTerminalInput,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let receipt = self
-            .backend
-            .append_transaction_with_terminal(request, terminal)?;
+        let stream_ids = request
+            .expected_streams
+            .iter()
+            .map(|stream| stream.stream_id.clone())
+            .collect::<Vec<_>>();
+        let receipt = self.with_stream_locks(&stream_ids, || {
+            self.backend
+                .append_transaction_with_terminal(request, terminal)
+        })?;
         self.publish_commit(receipt.commit_cursor);
         Ok(receipt)
     }
@@ -1051,9 +1125,15 @@ impl RuntimeEventStore {
         request: AppendTransactionRequest,
         lease: &crate::VerifiedDecisionLease,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let receipt = self
-            .backend
-            .append_transaction_with_verified_decision_lease(request, lease)?;
+        let stream_ids = request
+            .expected_streams
+            .iter()
+            .map(|stream| stream.stream_id.clone())
+            .collect::<Vec<_>>();
+        let receipt = self.with_stream_locks(&stream_ids, || {
+            self.backend
+                .append_transaction_with_verified_decision_lease(request, lease)
+        })?;
         self.publish_commit(receipt.commit_cursor);
         Ok(receipt)
     }
@@ -1065,12 +1145,16 @@ impl RuntimeEventStore {
         transaction_id: impl Into<String>,
         events: Vec<RuntimeTransactionEventInput>,
     ) -> RuntimeEventStoreResult<AppendTransactionReceipt> {
-        let receipt = self.backend.append_batch_if_revision(
-            stream_id.into(),
-            expected_revision,
-            transaction_id.into(),
-            events,
-        )?;
+        let stream_id = stream_id.into();
+        let lock_stream_id = stream_id.clone();
+        let receipt = self.with_stream_lock(&lock_stream_id, || {
+            self.backend.append_batch_if_revision(
+                stream_id,
+                expected_revision,
+                transaction_id.into(),
+                events,
+            )
+        })?;
         self.publish_commit(receipt.commit_cursor);
         Ok(receipt)
     }
@@ -5303,6 +5387,50 @@ mod tests {
             );
         });
         assert_eq!(RuntimeEventStore::current_projection_work_class(), None);
+    }
+
+    #[test]
+    fn per_stream_lock_serializes_read_append_windows_without_stale_revision() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let threads = 8;
+        let iterations = 20;
+        let mut handles = Vec::new();
+        for thread in 0..threads {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for iteration in 0..iterations {
+                    let transaction_id = format!("race-{thread}-{iteration}");
+                    store.with_stream_lock("session:race", || {
+                        let expected_revision = store.stream_revision("session:race").unwrap();
+                        store
+                            .append_transaction_locked(AppendTransactionRequest {
+                                transaction_id,
+                                expected_streams: vec![ExpectedStreamRevision {
+                                    stream_id: "session:race".to_string(),
+                                    expected_revision,
+                                }],
+                                events: vec![RuntimeTransactionEventInput {
+                                    event: input(
+                                        "session:race",
+                                        RuntimeEventScope::Session,
+                                        "session.race_event",
+                                    ),
+                                    idempotency_key: Some(format!("race-{thread}-{iteration}")),
+                                    schema_version: 1,
+                                }],
+                            })
+                            .expect("locked read+append must never observe a stale revision");
+                    });
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("race thread");
+        }
+        assert_eq!(
+            store.stream_revision("session:race").unwrap(),
+            (threads * iterations) as u64
+        );
     }
 
     fn input(stream_id: &str, scope: RuntimeEventScope, kind: &str) -> RuntimeEventInput {
