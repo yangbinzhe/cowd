@@ -3291,7 +3291,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_non_thinking_keeps_explicit_tool_choice_on_the_wire() {
+    fn deepseek_v4_default_and_non_thinking_omit_explicit_tool_choice_on_the_wire() {
         let payload = build_chat_completion_request(
             &MessageRequest {
                 model: "deepseek-v4-flash".to_string(),
@@ -3308,7 +3308,10 @@ mod tests {
             OpenAiCompatConfig::deepseek(),
         );
 
-        assert_eq!(payload["tool_choice"], json!("auto"));
+        assert!(
+            payload.get("tool_choice").is_none(),
+            "DeepSeek v4 defaults to thinking mode and rejects tool_choice with 400"
+        );
     }
 
     #[test]

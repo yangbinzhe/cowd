@@ -130,18 +130,20 @@ impl ProviderCapabilityProfile {
         profile
     }
 
-    /// The single wire-boundary truth for "this exact model in this reasoning
-    /// mode must not receive an explicit `tool_choice` field". Both the
-    /// Runtime capability gate and the provider payload builders call this
-    /// helper so they cannot drift.
+    /// The single wire-boundary truth for "this exact model must not receive
+    /// an explicit `tool_choice` field". DeepSeek v4 endpoints enable
+    /// thinking by default and reject `tool_choice` with HTTP 400
+    /// (`Thinking mode does not support this tool_choice`) even when no
+    /// `reasoning_effort` is sent, so the field is omitted unconditionally
+    /// for the v4 family unless a configured capability tag explicitly
+    /// overrides it. Both the Runtime capability gate and the provider
+    /// payload builders call this helper so they cannot drift.
     #[must_use]
     pub fn explicit_tool_choice_known_unsupported(
         model: &str,
-        reasoning_effort: Option<&str>,
+        _reasoning_effort: Option<&str>,
     ) -> bool {
-        let thinking = reasoning_effort
-            .is_some_and(|effort| !effort.trim().is_empty() && effort.trim() != "none");
-        thinking && Self::is_deepseek_v4(model)
+        Self::is_deepseek_v4(model)
     }
 
     /// Exact DeepSeek v4 family check. It matches the canonical model id only;
@@ -212,7 +214,7 @@ mod tests {
             ProviderCapabilityProfile::resolve(ProviderProtocol::Completions, "deepseek-v4-flash");
         assert_eq!(
             completions.supports_explicit_tool_choice,
-            CapabilityFact::bundled(CapabilityState::Supported)
+            CapabilityFact::bundled(CapabilityState::Unsupported)
         );
 
         let mut configured = completions;
@@ -265,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_non_thinking_keeps_explicit_tool_choice_support() {
+    fn deepseek_v4_default_and_non_thinking_also_omit_explicit_tool_choice() {
         for reasoning in [None, Some("none")] {
             let profile = ProviderCapabilityProfile::resolve_for_reasoning_mode(
                 ProviderProtocol::Completions,
@@ -274,7 +276,8 @@ mod tests {
             );
             assert_eq!(
                 profile.supports_explicit_tool_choice.state,
-                CapabilityState::Supported
+                CapabilityState::Unsupported,
+                "DeepSeek v4 defaults to thinking mode and rejects tool_choice with 400"
             );
         }
     }

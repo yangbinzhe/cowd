@@ -1768,9 +1768,17 @@ mod tests {
             None,
         );
         assert_eq!(
+            non_thinking.supports_explicit_tool_choice.state,
+            CapabilityState::Unsupported
+        );
+        assert!(
             provider_tool_choice(true, true, non_thinking.supports_explicit_tool_choice.state)
+                .is_err()
+        );
+        assert_eq!(
+            provider_tool_choice(true, false, non_thinking.supports_explicit_tool_choice.state)
                 .unwrap(),
-            Some(ToolChoice::Any)
+            None
         );
     }
 
