@@ -29,7 +29,7 @@ use harness_contract::execution_graph::{
 };
 use harness_contract::policy::{
     ApprovalContext, ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand,
-    ApprovalDomain, ApprovalGrantScope, ApprovalProfile,
+    ApprovalDomain, ApprovalGrantScope,
 };
 use serde_json::{json, Value};
 
@@ -145,9 +145,10 @@ async fn submit_runtime_orchestration_request_with_mode(
         &understanding,
         services.workspace_root(),
     );
-    if request.constraints.risk.as_deref() == Some("critical")
-        && request.constraints.approval_id.is_none()
-    {
+    let trust_all_session = session_is_trust_all(services, request.session_id.as_deref());
+    let requires_orchestration_approval =
+        request.constraints.risk.as_deref() == Some("critical") || trust_all_session;
+    if requires_orchestration_approval && request.constraints.approval_id.is_none() {
         if let Err(error) = submit_approval(&mut request, services) {
             return unavailable_result(&request, format!("approval_submission_failed:{error}"));
         }
@@ -385,10 +386,7 @@ async fn propose_template(
             "preview": candidate.preview,
         }),
     });
-    let trust_all = session_id
-        .as_deref()
-        .and_then(|sid| services.session_execution_policy(sid))
-        .is_some_and(|policy| policy.approval_profile == ApprovalProfile::TrustAll);
+    let trust_all = session_is_trust_all(services, session_id.as_deref());
     if trust_all {
         services
             .approval_queue()
@@ -1479,7 +1477,12 @@ fn submit_approval(
             source,
             action,
             summary: request.intent.chars().take(512).collect(),
-            risk: TaskRisk::Critical,
+            risk: request
+                .constraints
+                .risk
+                .as_deref()
+                .and_then(|risk| serde_json::from_str::<TaskRisk>(&format!("\"{risk}\"")).ok())
+                .unwrap_or(TaskRisk::Critical),
             domain: harness_contract::policy::ApprovalDomain::Execution,
             blocks_execution: true,
             evidence_refs: request.evidence_refs.iter().take(64).cloned().collect(),
@@ -1489,13 +1492,7 @@ fn submit_approval(
     // Only explicit TrustAll is approval authority. DangerFullAccess merely
     // defines the maximum executable permission and cannot approve critical
     // orchestration on behalf of an Autonomous user.
-    let trust_all_session = request.session_id.as_deref().is_some_and(|session_id| {
-        services
-            .session_execution_policy(session_id)
-            .is_some_and(|policy| {
-                policy.approval_profile == harness_contract::policy::ApprovalProfile::TrustAll
-            })
-    });
+    let trust_all_session = session_is_trust_all(services, request.session_id.as_deref());
     if trust_all_session {
         services
             .approval_queue()
@@ -1553,6 +1550,19 @@ fn request_id(request: &RuntimeOrchestrationCommand) -> String {
         || format!("runtime-orch-{}", uuid::Uuid::new_v4()),
         |proposal| format!("runtime-orch-{}", proposal.mutation_id),
     )
+}
+
+fn session_is_trust_all(
+    services: &RuntimeServices,
+    session_id: Option<&str>,
+) -> bool {
+    session_id.is_some_and(|session_id| {
+        services
+            .session_execution_policy(session_id)
+            .is_some_and(|policy| {
+                policy.approval_profile == harness_contract::policy::ApprovalProfile::TrustAll
+            })
+    })
 }
 
 fn result_from_outcome(
@@ -1685,6 +1695,24 @@ mod tests {
     use super::*;
     use harness_contract::execution_graph::ExecutionCompletionContract;
     use harness_contract::policy::PermissionMode;
+
+    #[test]
+    fn trust_all_sessions_are_detected_for_orchestration_approval() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        assert!(!session_is_trust_all(&services, Some("session-1")));
+        services.publish_session_execution_policy(
+            "session-1",
+            crate::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Yolo,
+                    2,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
+        assert!(session_is_trust_all(&services, Some("session-1")));
+        assert!(!session_is_trust_all(&services, None));
+    }
 
     #[test]
     fn semantic_revision_retries_only_typed_stale_errors_and_at_most_three_attempts() {
