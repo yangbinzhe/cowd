@@ -5113,6 +5113,49 @@ where
                         if verified_team_executions < required_team_executions {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
+                            if crate::conversation::objective_names_custom_team_roles(
+                                &state.content,
+                            ) && state.team_orchestration_requests < 2
+                            {
+                                state.team_orchestration_requests =
+                                    state.team_orchestration_requests.saturating_add(1);
+                                let reason = format!(
+                                    "自定义团队编排尚未完成：用户点名了具体团队/角色（如 CTO、业务专家、供应链专家、工程师），但当前还没有已验证的自定义模板发布和团队执行。请立即调用 runtime_orchestrate(operation=propose_template, template_proposal=...) 发布定制模板并确认返回 published，然后调用 runtime_capabilities(detail=team_templates) 复制 catalog 中的精确 template_id，再用 runtime_orchestrate(operation=propose) 引用该模板启动团队。禁止只输出总结文本，继续执行（尝试 {}）。",
+                                    state.team_orchestration_requests
+                                );
+                                state.content.push_str("\n\n");
+                                state.content.push_str(&reason);
+                                let mut item = ContextItem::new(
+                                    format!("custom-team-replan:{}", ticket.node_id),
+                                    ContextSourceKind::Task,
+                                    ContextRole::Instruction,
+                                    reason.clone(),
+                                );
+                                item.authority = ContextAuthority::System;
+                                item.visibility = ContextVisibility::Private;
+                                item.evidence =
+                                    vec![format!("execution_node:{}", ticket.node_id)];
+                                next_model_context = Some(item);
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Replan,
+                                        reason,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                break 'final_answer vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "custom-team-replan-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )];
+                            }
                             if state.team_orchestration_requests == 0
                                 && !state.nested_orchestration_forbidden
                             {

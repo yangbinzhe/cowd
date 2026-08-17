@@ -786,6 +786,58 @@ pub(crate) fn required_team_orchestration_call_with_understanding(
     }
 }
 
+/// Whether the user named concrete professional roles for a Team
+/// (CTO/首席/专家/工程师/供应链/业务/技术/数据科学/AI 等). When true, a
+/// generic builtin research Team cannot satisfy the request: the model must
+/// publish a custom template first. This is routing intent, not a content
+/// contract; the model still authors the actual template.
+pub(crate) fn objective_names_custom_team_roles(objective: &str) -> bool {
+    const ROLE_MARKERS: &[&str] = &[
+        "cto",
+        "首席",
+        "专家",
+        "工程师",
+        "架构师",
+        "分析师",
+        "科学家",
+        "研究员",
+        "供应链",
+        "业务专家",
+        "技术专家",
+        "数据科学",
+        "数据专家",
+        "ai专家",
+        "ai 专家",
+        "算法",
+        "产品经理",
+        "项目经理",
+        "测试",
+        "运维",
+        "安全",
+        "法务",
+        "财务",
+        "运营",
+        "销售",
+        "市场",
+        "人事",
+        "人力资源",
+        "chief technology officer",
+        "chief technology officer",
+        "domain expert",
+        "data scientist",
+        "ai expert",
+        "senior engineer",
+        "architect",
+        "analyst",
+        "researcher",
+        "supply chain",
+    ];
+    let normalized = objective.to_ascii_lowercase();
+    ROLE_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
 #[cfg(test)]
 fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
     let understanding = understand(&StrategyInput::from_prompt(objective));
@@ -13667,7 +13719,8 @@ mod tests {
         provider_retry_is_fenced, provider_transport_policy, rate_per_second,
         required_team_orchestration_call, revalidate_context_binding,
         runtime_team_orchestration_count, turn_strategy_event_kind_allowed,
-        unexposed_model_tool_names, vision_tool_model_receipt, vision_user_message, ApiClient,
+        unexposed_model_tool_names, vision_tool_model_receipt, vision_user_message,
+        objective_names_custom_team_roles, ApiClient,
         ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken, CognitiveContextManager,
         ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture, EarlyToolDispatchResult,
         EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan,
@@ -14235,6 +14288,19 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "agent_helper");
         assert!(!calls.iter().any(is_runtime_team_orchestration_call));
+    }
+
+    #[test]
+    fn custom_role_objectives_are_detected_for_custom_template_reprompt() {
+        assert!(objective_names_custom_team_roles(
+            "业务团队：供应链专家、制造作业人员；技术团队：CTO、数据科学专家、AI专家"
+        ));
+        assert!(objective_names_custom_team_roles(
+            "请启动一个由首席架构师和运维专家组成的团队"
+        ));
+        assert!(!objective_names_custom_team_roles(
+            "启动两个研究团队并行核查公开技术标准"
+        ));
     }
 
     #[test]

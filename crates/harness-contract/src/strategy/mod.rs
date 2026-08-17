@@ -2447,6 +2447,12 @@ fn explicitly_forbids_collaboration(normalized: &str) -> bool {
             "不要团队",
             "不要启动团队",
             "不要启动协作",
+            "不要创建团队",
+            "不要创建任何团队",
+            "不要组建团队",
+            "不要新建团队",
+            "不要启动任何团队",
+            "禁止创建团队",
             "不启动团队",
             "无需团队",
             "不需要团队",
@@ -3568,6 +3574,14 @@ mod tests {
             .required_team_count,
             3
         );
+        let catalog_only = understand(&StrategyInput::from_prompt(
+            "第一步：只查看团队模板目录，不要创建团队，不要启动协作。",
+        ));
+        assert_eq!(
+            catalog_only.required_team_count, 0,
+            "viewing the team catalog while explicitly forbidding team creation must not force a Team"
+        );
+        assert!(catalog_only.forbids_team);
         let current = understand(&StrategyInput::from_prompt("启动两个团队核查"));
         let mut legacy = serde_json::to_value(&current).expect("serialize understanding");
         legacy
