@@ -217,6 +217,21 @@ impl WorkspacePathIdentityResolver {
         &self,
         raw_scope: &str,
     ) -> Result<EvidenceObligation, WorkspacePathIdentityError> {
+        self.compile_obligation_with_root_alias(raw_scope, false)
+    }
+
+    /// Compile an evidence obligation, optionally accepting the workspace
+    /// root alias (`read:.` / `write:.`) as a bounded identity.
+    ///
+    /// The root alias is only valid when the caller already proved a
+    /// whole-workspace lease through the full-trust Team contract
+    /// (`allow_whole_workspace_scope`). Every other caller keeps the strict
+    /// rejection so a broad obligation can never be minted by accident.
+    pub fn compile_obligation_with_root_alias(
+        &self,
+        raw_scope: &str,
+        allow_root_alias: bool,
+    ) -> Result<EvidenceObligation, WorkspacePathIdentityError> {
         let raw_scope = raw_scope.trim();
         if raw_scope == "network:*" {
             return Ok(EvidenceObligation {
@@ -230,7 +245,7 @@ impl WorkspacePathIdentityResolver {
         let (prefix, path) = raw_scope
             .split_once(':')
             .ok_or_else(|| WorkspacePathIdentityError::InvalidScope(raw_scope.to_string()))?;
-        if matches!(path.trim(), "." | "./") {
+        if matches!(path.trim(), "." | "./") && !allow_root_alias {
             return Err(WorkspacePathIdentityError::InvalidScope(format!(
                 "{raw_scope}; workspace root alias requires one explicit bound scope"
             )));
@@ -344,11 +359,34 @@ impl WorkspacePathIdentityResolver {
         criteria: &[String],
         raw_scopes: &[String],
     ) -> RequiredAcceptance {
+        self.compile_required_acceptance_with_root_alias(criteria, raw_scopes, false)
+    }
+
+    #[must_use]
+    pub fn compile_required_acceptance_with_root_alias(
+        &self,
+        criteria: &[String],
+        raw_scopes: &[String],
+        allow_root_alias: bool,
+    ) -> RequiredAcceptance {
         RequiredAcceptance {
             criteria: criteria.to_vec(),
             evidence_obligations: raw_scopes
                 .iter()
-                .map(|scope| self.compile_obligation_or_unresolved(scope))
+                .map(|scope| {
+                    self.compile_obligation_with_root_alias(scope, allow_root_alias)
+                        .map_or_else(
+                            |error| EvidenceObligation {
+                                obligation_id: obligation_id(scope),
+                                kind: obligation_kind(scope),
+                                target: EvidenceTargetIdentity::UnavailableWorkspace {
+                                    display_alias: scope.clone(),
+                                    reason: error.to_string(),
+                                },
+                            },
+                            |obligation| obligation,
+                        )
+                })
                 .collect(),
         }
     }
@@ -1047,6 +1085,25 @@ mod tests {
                 .target,
             EvidenceTargetIdentity::AmbiguousWorkspace { candidates, .. }
                 if candidates.len() == 2
+        ));
+    }
+
+    #[test]
+    fn whole_workspace_root_alias_requires_the_full_trust_flag() {
+        let root = tempfile::tempdir().unwrap();
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        assert!(
+            resolver.compile_obligation("write:.").is_err(),
+            "strict callers must never mint a whole-workspace obligation"
+        );
+        let allowed = resolver
+            .compile_obligation_with_root_alias("write:.", true)
+            .expect("full-trust root alias");
+        assert!(matches!(
+            allowed.target,
+            EvidenceTargetIdentity::Workspace { scope }
+                if scope.path.workspace_relative_path == "."
+                    && scope.access_mode == WorkspaceAccessMode::Write
         ));
     }
 

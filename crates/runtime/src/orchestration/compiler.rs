@@ -456,7 +456,13 @@ fn compile_team_subgraph_node(
     );
     let deadline_at_ms = crate::tool_invocation::now_ms()
         .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
-    let request = TeamInstantiationRequest {
+    tracing::debug!(
+        permission_ceiling = ?request.constraints.permission_ceiling,
+        scopes = ?semantic.resource_scopes,
+        template = ?template_id.as_str(),
+        "team orchestration compile scopes"
+    );
+    let team_request = TeamInstantiationRequest {
         request_id: format!("{}:{}:{}", request_id, semantic.node_id, instance_index),
         team_id: team_id.clone(),
         mission_id: request.mission_id.clone().ok_or_else(|| {
@@ -495,6 +501,7 @@ fn compile_team_subgraph_node(
             semantic,
             deadline_at_ms,
             request.constraints.max_parallel_agents.unwrap_or(32),
+            1,
         ),
         deadline_at_ms,
         managed_invocation: None,
@@ -506,10 +513,30 @@ fn compile_team_subgraph_node(
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
     };
+    // The first plan resolves the published template and exposes the real
+    // role-branch cardinality. A team with N template roles needs a budget
+    // sized for N branches; deriving it from `semantic.multiplicity` alone
+    // (1 for a custom template) under-provisions the cost ceiling and blocks
+    // later role batches with "no provider output capacity".
+    let role_branch_count = team_runtime
+        .plan(team_request.clone())
+        .map_err(OrchestrationCompileError::TeamInstantiation)?
+        .role_slots
+        .len()
+        .max(1);
+    let mut team_request = team_request;
+    team_request.execution_budget = adaptive_team_execution_budget(
+        format!("runtime-team-budget:{node_id}"),
+        request,
+        semantic,
+        deadline_at_ms,
+        request.constraints.max_parallel_agents.unwrap_or(32),
+        role_branch_count,
+    );
     team_runtime
-        .plan(request.clone())
+        .plan(team_request.clone())
         .map_err(OrchestrationCompileError::TeamInstantiation)?;
-    let payload_ref = serde_json::to_string(&request)
+    let payload_ref = serde_json::to_string(&team_request)
         .map_err(|error| OrchestrationCompileError::InvalidProposal(error.to_string()))?;
     let mut node = ExecutionNodeSpec::new(
         ExecutionNodeKind::Subgraph,
@@ -517,7 +544,7 @@ fn compile_team_subgraph_node(
         payload_ref,
     );
     node.id = node_id.to_string();
-    node.idempotency_key = format!("{}:{}", request.request_id, node_id);
+    node.idempotency_key = format!("{}:{}", request_id, node_id);
     node.resource_scopes = semantic.resource_scopes.clone();
     node.acceptance.criteria = semantic.evidence_contract.clone();
     node.acceptance.required_evidence = semantic.output_artifacts.clone();
@@ -884,10 +911,8 @@ fn adaptive_team_execution_budget(
     semantic: &GraphSemanticNode,
     deadline_at_ms: u64,
     max_parallel: usize,
+    expected_parallel_branches: usize,
 ) -> harness_contract::context::ParentExecutionBudget {
-    let expected_parallel_branches = usize::from(semantic.multiplicity.max(1))
-        .max(semantic.focuses.len())
-        .max(1);
     let expected_verification_passes = usize::from(!semantic.evidence_contract.is_empty());
     let plan = adaptive_runtime_budget_plan(
         request,

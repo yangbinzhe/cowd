@@ -435,6 +435,17 @@ impl GatewayToolExecutor {
         value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        if matches!(
+            tool_name,
+            "runtime_orchestrate" | "team_board" | "runtime_capabilities"
+        ) {
+            tracing::debug!(
+                tool = %tool_name,
+                session = ?binding.session_id,
+                fallback_ceiling = ?binding.permission_ceiling,
+                "runtime control tool binding ceiling"
+            );
+        }
         if matches!(tool_name, "lark_cli_read" | "lark_cli_write") {
             let input: LarkCliToolRequest = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
@@ -561,6 +572,12 @@ impl GatewayToolExecutor {
             .map_err(|error| ToolError::new(error.to_string()));
         }
         if tool_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
+            tracing::debug!(
+                tool = %tool_name,
+                session = ?binding.session_id,
+                binding_ceiling = ?binding.permission_ceiling,
+                "runtime_orchestrate entering gateway execution"
+            );
             let input = serde_json::from_value::<
                 harness_contract::orchestration::ModelRuntimeOrchestrationInput,
             >(value)

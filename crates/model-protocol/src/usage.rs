@@ -76,6 +76,33 @@ pub fn heuristic_pricing_for_model(model: &str) -> Option<ModelPricing> {
             cache_read_cost_per_million: 0.044,
         });
     }
+    // Configured fallbacks must stay budget-admissible. These rates are
+    // conservative public list prices so a finite execution budget can admit
+    // the fallback chain before Provider IO instead of hard-blocking.
+    if normalized == "qwen3.6-plus" {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.8,
+            output_cost_per_million: 2.0,
+            cache_creation_cost_per_million: 0.8,
+            cache_read_cost_per_million: 0.02,
+        });
+    }
+    if normalized == "step-3.7-flash" {
+        return Some(ModelPricing {
+            input_cost_per_million: 0.4,
+            output_cost_per_million: 1.2,
+            cache_creation_cost_per_million: 0.4,
+            cache_read_cost_per_million: 0.012,
+        });
+    }
+    if normalized == "glm-5.2" {
+        return Some(ModelPricing {
+            input_cost_per_million: 1.0,
+            output_cost_per_million: 4.0,
+            cache_creation_cost_per_million: 1.0,
+            cache_read_cost_per_million: 0.03,
+        });
+    }
     if normalized.contains("haiku") {
         return Some(ModelPricing {
             input_cost_per_million: 1.0,

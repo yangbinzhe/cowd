@@ -113,9 +113,20 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
         .nodes
         .iter()
         .map(|node| {
-            (node.recipe == CapabilityRecipeId::Team).then(|| {
+            let profile = (node.recipe == CapabilityRecipeId::Team).then(|| {
                 team_authority_profile(node, requires_write, understanding.requires_external_facts)
-            })
+            });
+            if node.recipe == CapabilityRecipeId::Team {
+                tracing::debug!(
+                    node = %node.node_id,
+                    template = ?node.template,
+                    output_artifacts = ?node.output_artifacts,
+                    requires_write,
+                    profile = ?profile,
+                    "team authority profile"
+                );
+            }
+            profile
         })
         .collect::<Vec<_>>();
     let mut profile_positions = BTreeMap::<TeamAuthorityProfile, usize>::new();
@@ -138,6 +149,13 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
                 && profile == TeamAuthorityProfile::WorkspaceRead
                 && template == "cowd/direct-executor"
                 && profile_count > 1;
+            // User/workspace templates own their role topology. Runtime
+            // derives the bounded resource lease but must not inject
+            // builtin-role focus partitions (researcher/implementer/...)
+            // that the custom template does not declare. Template roles
+            // then receive the node lease through their default focus slots.
+            let custom_template =
+                template.starts_with("workspace/") || template.starts_with("user/");
             // Each published research Team requires at least two independent
             // primary focuses.  Team nodes are separate collaboration units;
             // splitting fewer global slots across them must not invalidate the
@@ -147,6 +165,29 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
             } else {
                 requested_count.max(profile_count.saturating_mul(2))
             };
+            if custom_template {
+                let custom_scopes = bounded_workspace_focus_scopes(
+                    workspace_root,
+                    &request.intent,
+                    focus_count,
+                    node_requires_write,
+                    explicit_team,
+                );
+                tracing::debug!(
+                    node = %node.node_id,
+                    template,
+                    custom_scopes = ?custom_scopes,
+                    node_requires_write,
+                    "custom template bounded resource lease (no builtin focus partitions)"
+                );
+                node.focuses = Vec::new();
+                node.resource_scopes = custom_scopes;
+                node.resource_scopes.sort();
+                node.resource_scopes.dedup();
+                scopes.extend(node.resource_scopes.iter().cloned());
+                *team_position = team_position.saturating_add(1);
+                continue;
+            }
             let plans = derive_team_focus_partition_plans(
                 &request.intent,
                 workspace_root,
@@ -251,6 +292,8 @@ fn team_authority_profile(
         .as_deref()
         .unwrap_or_default()
         .trim_start_matches("builtin/");
+    let custom_template =
+        template.starts_with("workspace/") || template.starts_with("user/");
     if template == "cowd/external-research-synthesis" {
         return TeamAuthorityProfile::ExternalResearch;
     }
@@ -275,7 +318,11 @@ fn team_authority_profile(
     ) {
         return TeamAuthorityProfile::WorkspaceRead;
     }
-    if request_requires_write && node.template.is_none() {
+    // A user-authored/custom template is not covered by the builtin
+    // read-only family. When the admitted intent requires workspace writes,
+    // Runtime treats the Team as write-capable; the template's own role
+    // ceilings and the bounded focus scopes still crop the actual grants.
+    if request_requires_write && (custom_template || node.template.is_none()) {
         TeamAuthorityProfile::WorkspaceWrite
     } else if request_requires_external_facts {
         TeamAuthorityProfile::ExternalResearch
@@ -480,6 +527,13 @@ pub(crate) fn derive_team_focus_partition_plans(
     let scopes = if forced_scopes.is_empty() {
         let explicit_local_scopes =
             explicit_workspace_resource_scopes(workspace_root, objective, requires_write);
+        tracing::debug!(
+            workspace_root = ?workspace_root,
+            objective = ?objective.chars().take(200).collect::<String>(),
+            requires_write,
+            explicit_scopes = ?explicit_local_scopes,
+            "derive team focus scopes"
+        );
         if !explicit_local_scopes.is_empty() {
             explicit_local_scopes
         } else if external_research && !requires_write {
@@ -1748,6 +1802,89 @@ mod tests {
             .capabilities
             .iter()
             .all(|capability| !capability.contains("write:Moon")));
+    }
+
+    #[test]
+    fn custom_workspace_template_keeps_write_authority_when_intent_requires_write() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let node = GraphSemanticNode {
+            node_id: "cross-team-collaborative-decision".to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: "生成统一 HTML 决策报告并写入工作区".to_string(),
+            depends_on: Vec::new(),
+            multiplicity: 1,
+            focuses: Vec::new(),
+            template: Some("workspace/cross-team-collaborative-decision".to_string()),
+            target_session_id: None,
+            output_artifacts: vec!["unified-html-decision-report".to_string()],
+            evidence_contract: vec!["evidence".to_string()],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
+        };
+        let mut request = RuntimeOrchestrationCommand {
+            intent: format!(
+                "启动跨团队协同决策并写入 {}",
+                workspace.path().display()
+            ),
+            model_lease: None,
+            session_id: Some("session-1".to_string()),
+            lineage: None,
+            mission_id: None,
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "custom-write-team".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: vec![node],
+                completion: ExecutionCompletionContract::default(),
+                reason: "custom template write team".to_string(),
+            }),
+            control: None,
+            template_proposal: None,
+            input_disposition: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints {
+                max_parallel_agents: Some(3),
+                requires_write: Some(true),
+                permission_ceiling: harness_contract::policy::PermissionMode::DangerFullAccess,
+                ..RuntimeOrchestrationConstraints::default()
+            },
+            surface: None,
+        };
+
+        let mut understanding =
+            harness_contract::strategy::understand(&harness_contract::strategy::StrategyInput::from_prompt(
+                &request.intent,
+            ));
+        understanding.requires_write = true;
+        understanding.requests_multi_agent = true;
+        understanding.independent_workstreams = 3;
+        bind_semantic_resource_authority_with_understanding(
+            &mut request,
+            &understanding,
+            workspace.path(),
+        );
+
+        let team = &request.proposal.as_ref().expect("proposal").nodes[0];
+        assert_eq!(request.constraints.requires_write, Some(true));
+        assert!(
+            team.resource_scopes
+                .iter()
+                .any(|scope| scope == "write:."),
+            "custom write-capable template must receive a bounded workspace write lease: {:?}",
+            team.resource_scopes
+        );
+        assert!(
+            team.focuses.is_empty(),
+            "custom templates must keep their own role topology; Runtime must not inject builtin focus partitions"
+        );
     }
 
     #[test]

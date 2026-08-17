@@ -6765,6 +6765,13 @@ where
                 let mut auths = std::collections::HashMap::new();
                 let mut gaps = std::collections::HashMap::new();
                 for call in &calls {
+                    if call.name == "runtime_orchestrate" {
+                        tracing::debug!(
+                            call_id = %call.id,
+                            prepared = %prepared.iter().any(|invocation| invocation.invocation_id == call.id),
+                            "runtime_orchestrate authorization preparation"
+                        );
+                    }
                     if let Some(invocation) = prepared
                         .iter()
                         .find(|invocation| invocation.invocation_id == call.id)
@@ -6785,6 +6792,13 @@ where
                             Ok(crate::conversation::ToolAuthorizationDecision::Authorized(
                                 decision,
                             )) => {
+                                if call.name == "runtime_orchestrate" {
+                                    tracing::debug!(
+                                        call_id = %call.id,
+                                        lease_ceiling = ?decision.authorization.authorization_lease.ceiling,
+                                        "runtime_orchestrate authorization lease issued"
+                                    );
+                                }
                                 auths.insert(call.id.clone(), decision.authorization);
                             }
                             Ok(crate::conversation::ToolAuthorizationDecision::Gap {

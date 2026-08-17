@@ -63,6 +63,7 @@ fn compile_required_acceptance(
     criteria: &[String],
     contract: &[TeamAcceptanceRequirement],
     resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+    allow_whole_workspace_root: bool,
 ) -> harness_contract::context::RequiredAcceptance {
     let mut scopes = Vec::new();
     for requirement in contract {
@@ -100,7 +101,11 @@ fn compile_required_acceptance(
     }
     scopes.sort();
     scopes.dedup();
-    resolver.compile_required_acceptance(criteria, &scopes)
+    resolver.compile_required_acceptance_with_root_alias(
+        criteria,
+        &scopes,
+        allow_whole_workspace_root,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,6 +385,9 @@ impl TeamInstantiationService {
                     &slot_acceptance,
                     &acceptance_contract,
                     &self.path_identity_resolver,
+                    request
+                        .permission_ceiling
+                        .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
                 );
                 let objective_context = bounded_objective_context(&request.objective);
                 let intent = AgentTaskIntent {
@@ -1567,6 +1575,7 @@ mod acceptance_contract_tests {
                 },
             }],
             &resolver,
+            false,
         );
         assert!(matches!(
             required.evidence_obligations[0].target,

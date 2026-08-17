@@ -572,7 +572,14 @@ impl AuthorizationNegotiator {
                 } else {
                     AuthorizationPath::PolicyAutoGrant
                 };
-                let lease = self.issue_and_consume(request, required_mode, &fingerprint, path, now);
+                let lease = self.issue_and_consume(
+                    request,
+                    required_mode,
+                    active_ceiling,
+                    &fingerprint,
+                    path,
+                    now,
+                );
                 authorized_assessment(
                     request,
                     effective,
@@ -685,6 +692,7 @@ impl AuthorizationNegotiator {
         let mut lease = self.issue_and_consume(
             request,
             required_mode,
+            active_ceiling,
             &fingerprint,
             AuthorizationPath::HumanApproval,
             now,
@@ -1017,6 +1025,7 @@ impl AuthorizationNegotiator {
         &self,
         request: &AuthorizationRequest,
         required_mode: PermissionMode,
+        active_ceiling: PermissionMode,
         fingerprint: &str,
         path: AuthorizationPath,
         now: u64,
@@ -1038,7 +1047,7 @@ impl AuthorizationNegotiator {
             parent_lease_id: request.parent_lease_id.clone(),
             capability: request.capability.clone(),
             scopes: request.effect.scopes.clone(),
-            ceiling: required_mode,
+            ceiling: active_ceiling,
             issued_at_ms: now,
             expires_at_ms: now.saturating_add(ttl_ms),
             max_uses,
@@ -1761,6 +1770,33 @@ mod tests {
         assert_eq!(lease.max_uses, 1);
         assert!(lease.expires_at_ms > lease.issued_at_ms);
         assert!(!lease.signature.is_empty());
+    }
+
+    #[test]
+    fn full_trust_session_lease_carries_the_session_ceiling_not_the_effect_floor() {
+        let mut descriptor = effect(
+            PermissionMode::WorkspaceWrite,
+            EffectExternality::Workspace,
+        );
+        descriptor.tool_id = "runtime_orchestrate".to_string();
+        let mut request = request(descriptor);
+        request.capability = "runtime_orchestrate".to_string();
+        let assessment = AuthorizationNegotiator::new().assess(
+            &PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            &request,
+        );
+        let lease = assessment.lease.expect("full-trust lease");
+        assert_eq!(
+            lease.ceiling,
+            PermissionMode::DangerFullAccess,
+            "a YOLO/full-trust session must issue control-plane leases at the session ceiling, never the effect floor"
+        );
+        assert_eq!(
+            assessment.required_mode,
+            PermissionMode::WorkspaceWrite,
+            "the effect floor must remain visible on the assessment"
+        );
+        assert!(lease.permits("runtime_orchestrate", PermissionMode::WorkspaceWrite));
     }
 
     #[test]

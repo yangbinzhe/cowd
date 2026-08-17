@@ -145,6 +145,27 @@ async fn submit_runtime_orchestration_request_with_mode(
         &understanding,
         services.workspace_root(),
     );
+    tracing::debug!(
+        session = ?request.session_id,
+        ceiling = ?request.constraints.permission_ceiling,
+        requires_write = ?request.constraints.requires_write,
+        nodes = ?request.proposal.as_ref().map(|proposal| {
+            proposal
+                .nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.node_id.as_str(),
+                        format!("{:?}", node.recipe),
+                        node.template.as_deref().unwrap_or(""),
+                        node.output_artifacts.as_slice(),
+                        node.resource_scopes.as_slice(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }),
+        "orchestration bound semantic authority"
+    );
     let trust_all_session = session_is_trust_all(services, request.session_id.as_deref());
     let requires_orchestration_approval =
         request.constraints.risk.as_deref() == Some("critical") || trust_all_session;
