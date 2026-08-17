@@ -2070,6 +2070,84 @@ impl RuntimeServices {
         &self.definition_registry
     }
 
+    /// Publishes an approved AI-authored Team template candidate. The
+    /// candidate is read from the durable approval-bound event stream, so a
+    /// human approval can be completed long after the proposing turn ended.
+    /// Publishing is idempotent through the definition store's revision
+    /// semantics.
+    pub fn publish_approved_template_candidate(
+        &self,
+        approval_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let request = self
+            .approval_queue()
+            .get(approval_id)
+            .ok_or_else(|| format!("approval_not_found: {approval_id}"))?;
+        if request.action != "definition.template.publish" {
+            return Err(format!(
+                "approval `{approval_id}` is not a template publish approval"
+            ));
+        }
+        if request.status != harness_contract::policy::ApprovalStatus::Approved {
+            return Err(format!("approval `{approval_id}` is not approved"));
+        }
+        let stream_id = format!("definition-template-candidate:{approval_id}");
+        let candidate_event = self
+            .event_store()
+            .list_stream(&stream_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|event| event.kind == "definition.template.candidate.v1")
+            .ok_or_else(|| format!("template candidate missing for approval {approval_id}"))?;
+        let manifest = serde_json::from_value::<harness_contract::team::TeamTemplateManifest>(
+            candidate_event
+                .payload
+                .get("manifest")
+                .cloned()
+                .unwrap_or_default(),
+        )
+        .map_err(|error| format!("decode template candidate manifest: {error}"))?;
+        let instructions = candidate_event
+            .payload
+            .get("instructions")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let stored = self
+            .definition_registry()
+            .teams()
+            .store_revision(manifest, &instructions)
+            .map_err(|error| format!("template_publish_failed: {error}"))?;
+        let _ = self.event_store().append(crate::RuntimeEventInput {
+            stream_id,
+            scope: crate::RuntimeEventScope::Mission,
+            kind: "definition.template.published.v1".to_string(),
+            status: Some("published".to_string()),
+            actor: Some(approval_id.to_string()),
+            refs: vec![crate::RuntimeEventRef {
+                kind: "team_template".to_string(),
+                id: stored
+                    .revision
+                    .revision_ref
+                    .template_id
+                    .as_str()
+                    .to_string(),
+            }],
+            payload: serde_json::json!({
+                "approval_id": approval_id,
+                "template_id": stored.revision.revision_ref.template_id.as_str(),
+                "revision": stored.revision.revision_ref.revision,
+                "digest": stored.revision.content_digest,
+            }),
+        });
+        Ok(serde_json::json!({
+            "approval_id": approval_id,
+            "template_id": stored.revision.revision_ref.template_id.as_str(),
+            "revision": stored.revision.revision_ref.revision,
+            "content_digest": stored.revision.content_digest,
+        }))
+    }
+
     /// Rebuild the executable Agent index after a Definition release state
     /// changes. The operation replaces, rather than merges, cached entries so
     /// stopped or revoked Definitions cannot remain selectable.

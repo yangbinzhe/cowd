@@ -582,6 +582,11 @@ impl ApprovalService {
             serde_json::to_value(services.approval_queue().decide(principal, decision)?)
                 .map_err(|error| error.to_string())?
         };
+        if approved && !skip && request.action == "definition.template.publish" {
+            services
+                .publish_approved_template_candidate(id)
+                .map_err(|error| format!("template_publish_after_approval_failed: {error}"))?;
+        }
         services.approval_coordinator().notify_decision(id);
         if let Some(request) = services.approval_queue().get(id) {
             self.emit_approval_resolved(&request);

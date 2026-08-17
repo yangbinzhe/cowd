@@ -27,8 +27,9 @@ use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeStatus,
     ExecutionParentBinding, ExecutionUsage,
 };
-use harness_contract::policy::approval::{
-    ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand, ApprovalGrantScope,
+use harness_contract::policy::{
+    ApprovalContext, ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand,
+    ApprovalDomain, ApprovalGrantScope, ApprovalProfile,
 };
 use serde_json::{json, Value};
 
@@ -287,59 +288,145 @@ async fn propose_template(
         &proposal,
         request.constraints.permission_ceiling,
     )?;
-    let stored = services
-        .definition_registry()
-        .teams()
-        .store_revision(candidate.manifest, &proposal.instructions)
-        .map_err(|error| format!("template_publish_failed:{error}"))?;
-    let template_id = stored
-        .revision
-        .revision_ref
-        .template_id
-        .as_str()
-        .to_string();
-    let payload = json!({
-        "template_id": template_id,
-        "revision": stored.revision.revision_ref.revision,
-        "digest": stored.revision.content_digest,
-        "preview": candidate.preview,
-    });
-    let event_refs = vec![crate::RuntimeEventRef {
-        kind: "team_template".to_string(),
-        id: template_id.clone(),
-    }];
-    let stream_id = format!("definition-template:{template_id}");
+    let template_id = candidate.manifest.template_id.as_str().to_string();
+    let approval_id = format!("template-approval:{}", uuid::Uuid::new_v4());
+    let risk = if candidate.manifest.roles.iter().any(|role| {
+        role.grant_ceiling
+            .contains(&harness_contract::agent::AgentCapability::Network)
+    }) {
+        TaskRisk::High
+    } else if candidate.manifest.roles.iter().any(|role| {
+        role.grant_ceiling
+            .contains(&harness_contract::agent::AgentCapability::Write)
+    }) {
+        TaskRisk::Medium
+    } else {
+        TaskRisk::Low
+    };
+    let session_id = request.session_id.clone();
+    let context = ApprovalContext {
+        principal_id: format!(
+            "session:{}",
+            session_id.as_deref().unwrap_or("template-publisher")
+        ),
+        profile_id: "template-publish".to_string(),
+        approval_profile: None,
+        workspace_key: services.workspace_key().to_string(),
+        session_id: session_id.clone(),
+        turn_id: request
+            .lineage
+            .as_ref()
+            .map(|lineage| lineage.turn_id.clone()),
+        task_id: None,
+        capability: "definition.template.publish".to_string(),
+        invocation_id: Some(approval_id.clone()),
+        execution_id: None,
+        strategy_decision_ref: None,
+        source_surface: request.surface.clone(),
+        resource_targets: vec![template_id.clone()],
+        effect: None,
+        explicit_ask: true,
+        effective_sandbox_posture: None,
+        policy_revision: 0,
+        requested_sandbox_posture: None,
+    };
+    let source = crate::ApprovalSource {
+        kind: crate::ApprovalSourceKind::Session,
+        session_id: session_id.clone(),
+        agent_id: None,
+        team_id: None,
+        mission_id: request.mission_id.clone(),
+        resource_ref: Some(template_id.clone()),
+        review_ref: None,
+        application: None,
+    };
+    services
+        .approval_queue()
+        .submit_scoped_with_policy(
+            approval_id.clone(),
+            crate::SubmitGlobalApprovalRequest {
+                source,
+                context,
+                action: "definition.template.publish".to_string(),
+                summary: format!("发布 AI 编排团队模板：{}", proposal.name),
+                risk,
+                domain: ApprovalDomain::System,
+                blocks_execution: false,
+                evidence_refs: vec![format!("template-candidate:{}", candidate.digest)],
+                timeout_policy: crate::ApprovalTimeoutPolicy::Pending,
+            },
+            None,
+            false,
+            vec![ApprovalGrantScope::Once, ApprovalGrantScope::Global],
+        )
+        .map_err(|error| format!("template_approval_submit_failed:{error}"))?;
     let _ = services.event_store().append(crate::RuntimeEventInput {
-        stream_id: stream_id.clone(),
+        stream_id: format!("definition-template-candidate:{approval_id}"),
         scope: crate::RuntimeEventScope::Mission,
-        kind: "definition.template.candidate_compiled.v1".to_string(),
-        status: Some("compiled".to_string()),
+        kind: "definition.template.candidate.v1".to_string(),
+        status: Some("pending_approval".to_string()),
         actor: Some(request_id.to_string()),
-        refs: event_refs.clone(),
-        payload: payload.clone(),
-    });
-    let _ = services.event_store().append(crate::RuntimeEventInput {
-        stream_id,
-        scope: crate::RuntimeEventScope::Mission,
-        kind: "definition.template.published.v1".to_string(),
-        status: Some("published".to_string()),
-        actor: Some(request_id.to_string()),
-        refs: event_refs,
-        payload,
-    });
-    Ok(OperationOutcome {
-        status: "completed".to_string(),
-        execution: json!({
-            "kind": "runtime.template_candidate",
-            "status": "published",
-            "template_id": template_id,
-            "revision": stored.revision.revision_ref.revision,
-            "content_digest": stored.revision.content_digest,
+        refs: vec![crate::RuntimeEventRef {
+            kind: "team_template".to_string(),
+            id: template_id.clone(),
+        }],
+        payload: json!({
+            "approval_id": approval_id,
+            "manifest": candidate.manifest,
+            "instructions": proposal.instructions,
+            "digest": candidate.digest,
             "preview": candidate.preview,
         }),
-        evidence: json!({ "refs": [] }),
+    });
+    let trust_all = session_id
+        .as_deref()
+        .and_then(|sid| services.session_execution_policy(sid))
+        .is_some_and(|policy| policy.approval_profile == ApprovalProfile::TrustAll);
+    if trust_all {
+        services
+            .approval_queue()
+            .decide_internal(ApprovalDecisionCommand {
+                approval_id: approval_id.clone(),
+                approved: true,
+                skip: false,
+                reason: "yolo trust-all approval; audit only".to_string(),
+                scope: ApprovalGrantScope::Global,
+                actor: ApprovalDecisionActor {
+                    kind: ApprovalDecisionActorKind::Policy,
+                    actor_id: "yolo-trust-all".to_string(),
+                },
+                evidence_refs: vec!["approval.yolo_trust_all".to_string()],
+            })
+            .map_err(|error| format!("template_trust_all_approval_failed:{error}"))?;
+        let published = services.publish_approved_template_candidate(&approval_id)?;
+        return Ok(OperationOutcome {
+            status: "completed".to_string(),
+            execution: json!({
+                "kind": "runtime.template_candidate",
+                "status": "published",
+                "approval_id": approval_id,
+                "template_id": template_id,
+                "digest": published.get("content_digest").cloned().unwrap_or_default(),
+                "preview": candidate.preview,
+            }),
+            evidence: json!({ "refs": ["template-candidate"] }),
+            guidance: "Template approved and published; it is part of the runnable team catalog."
+                .to_string(),
+        });
+    }
+    Ok(OperationOutcome {
+        status: "pending_approval".to_string(),
+        execution: json!({
+            "kind": "runtime.template_candidate",
+            "status": "pending_approval",
+            "approval_id": approval_id,
+            "template_id": template_id,
+            "digest": candidate.digest,
+            "preview": candidate.preview,
+        }),
+        evidence: json!({ "refs": ["approval"] }),
         guidance:
-            "Template published; it is part of the runnable team catalog and can be selected by template_id."
+            "Template candidate awaits human approval; respond to the approval (definition.template.publish) to publish it."
                 .to_string(),
     })
 }

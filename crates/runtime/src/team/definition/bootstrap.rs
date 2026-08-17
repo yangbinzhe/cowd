@@ -6,6 +6,7 @@ use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, DefinitionScope, ReleaseAssignmentStatus,
     ReleaseAuthorization, ReleaseChannel, RevisionLifecycle, RevisionSelector,
 };
+use harness_contract::team::definition::{RoleDisplayName, TeamTemplateDisplay};
 use harness_contract::team::{
     RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDefinition,
     TeamRoleDependency, TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest,
@@ -20,6 +21,46 @@ use super::store::{
 use super::TeamReleaseAssignment;
 
 const RELEASE_ATTESTATION: &str = "embedded-release/cowd-runtime-v1";
+
+fn builtin_role_display_name(role_id: &str) -> &'static str {
+    match role_id {
+        "executor" => "执行智能体",
+        "planner" => "规划智能体",
+        "verifier" => "验证智能体",
+        "researcher" => "研究智能体",
+        "synthesizer" => "汇总智能体",
+        "implementer" => "实现智能体",
+        "reviewer" => "审查智能体",
+        "fixer" => "修复智能体",
+        "proposer" => "提案智能体",
+        "critic" => "批评智能体",
+        "arbiter" => "仲裁智能体",
+        "investigator" => "调查智能体",
+        "responder" => "响应智能体",
+        "commander" => "指挥智能体",
+        "scenario" => "场景智能体",
+        "comparator" => "对比智能体",
+        "workstream" => "工作流智能体",
+        "coordinator" => "协调智能体",
+        _ => "协作智能体",
+    }
+}
+
+fn builtin_team_display_name(name: &str) -> &'static str {
+    match name {
+        "Execute and Review" => "执行与评审",
+        "Direct Executor" => "直接执行",
+        "Planner Executor Verifier" => "计划执行验证",
+        "Parallel Research Synthesis" => "并行研究汇总",
+        "External Research Synthesis" => "外部研究汇总",
+        "Implementation Review Fix" => "实现评审修复",
+        "Debate Critic Arbiter" => "辩论裁决",
+        "Incident Response" => "事件响应",
+        "Matrix Scenario Ensemble" => "矩阵场景集成",
+        "Long-Running Workstreams" => "长任务工作流",
+        _ => "自定义团队",
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BuiltinTeamTrust {
@@ -73,7 +114,19 @@ where
         // instead of colliding with installations that already stored v1.
         revision: 2,
         name: "Execute and Review".to_string(),
-        display: None,
+        display: Some(TeamTemplateDisplay {
+            team_display_name: Some(builtin_team_display_name("Execute and Review").to_string()),
+            role_display_names: vec![
+                RoleDisplayName {
+                    role_id: "implementer".to_string(),
+                    display_name: builtin_role_display_name("implementer").to_string(),
+                },
+                RoleDisplayName {
+                    role_id: "reviewer".to_string(),
+                    display_name: builtin_role_display_name("reviewer").to_string(),
+                },
+            ],
+        }),
         lifecycle: RevisionLifecycle::Published,
         topology: TeamTopologyContract {
             protocol_ref: "review_fix@1".to_string(),
@@ -276,7 +329,16 @@ fn additional_builtin_team_manifests(
                 template_id,
                 revision: 1,
                 name: name.to_string(),
-                display: None,
+                display: Some(TeamTemplateDisplay {
+                    team_display_name: Some(builtin_team_display_name(name).to_string()),
+                    role_display_names: roles
+                        .iter()
+                        .map(|role| RoleDisplayName {
+                            role_id: role.role_id.clone(),
+                            display_name: builtin_role_display_name(&role.role_id).to_string(),
+                        })
+                        .collect(),
+                }),
                 lifecycle: RevisionLifecycle::Published,
                 topology: TeamTopologyContract {
                     protocol_ref: protocol_ref.to_string(),

@@ -171,6 +171,7 @@ impl TemplateCandidateCompiler {
         .map_err(|error| format!("invalid template_id: {error}"))?;
         let mut role_ids = std::collections::BTreeSet::new();
         let mut roles = Vec::with_capacity(proposal.roles.len());
+        let mut clipped_capabilities = Vec::new();
         for role in &proposal.roles {
             if role.role_id.trim().is_empty() {
                 return Err("every proposed role needs a non-empty role_id".to_string());
@@ -200,10 +201,11 @@ impl TemplateCandidateCompiler {
                     )
                 })?;
                 if !ceiling_allows(ceiling, capability) {
-                    return Err(format!(
-                        "role `{}` requests `{name}` which exceeds the caller permission ceiling {ceiling:?}",
-                        role.role_id
-                    ));
+                    // Bounded auto-repair: clip the over-ceiling capability and
+                    // record it in the preview so the audit trail shows the
+                    // exact compensation applied.
+                    clipped_capabilities.push(format!("{}:{}", role.role_id, name));
+                    continue;
                 }
                 grant_ceiling.push(capability);
             }
@@ -317,6 +319,7 @@ impl TemplateCandidateCompiler {
                 "to": dependency.to_role_id,
             })).collect::<Vec<_>>(),
             "result_fields": manifest.result_contract.required_fields,
+            "clipped_capabilities": clipped_capabilities,
             "risk_notes": {
                 "requires_write": manifest.roles.iter().any(|role| role.grant_ceiling.contains(&AgentCapability::Write)),
                 "requires_network": manifest.roles.iter().any(|role| role.grant_ceiling.contains(&AgentCapability::Network)),
@@ -333,13 +336,22 @@ impl TemplateCandidateCompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RuntimeDefinitionRegistry;
+    use crate::{
+        RuntimeDefinitionRegistry, RuntimeEventInput, RuntimeEventScope, RuntimeServices,
+        SubmitGlobalApprovalRequest,
+    };
     use harness_contract::agent::AgentExecutorPolicy;
     use harness_contract::agent::{
         AgentCapabilityContract, AgentCognitivePolicy, AgentDefinitionManifest,
         AgentEvaluationContract, AgentModelPolicy, AgentOutputContract, CognitiveReadScope,
         CognitiveWriteMode, ReleaseAssignment, ReleaseAssignmentStatus, ReleaseAuthorization,
         ReleaseChannel,
+    };
+    use harness_contract::core::TaskRisk;
+    use harness_contract::policy::{
+        ApprovalContext, ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand,
+        ApprovalDomain, ApprovalGrantScope, ApprovalSource, ApprovalSourceKind,
+        ApprovalTimeoutPolicy,
     };
 
     fn digest(value: &str) -> String {
@@ -498,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_definition_and_over_ceiling_grants() {
+    fn clips_over_ceiling_grants_and_rejects_unknown_definitions() {
         let (_temp, registry) = registry();
         publish_agent(&registry, "cowd/explore");
         publish_agent(&registry, "cowd/direct");
@@ -511,10 +523,19 @@ mod tests {
         );
         proposal = business_tech_proposal();
         proposal.roles[0].grant_ceiling = vec!["write".to_string()];
-        assert!(
+        let candidate =
             TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
-                .is_err()
-        );
+                .expect("over-ceiling grant is clipped, not rejected");
+        assert!(candidate
+            .manifest
+            .roles
+            .iter()
+            .all(|role| !role.grant_ceiling.contains(&AgentCapability::Write)));
+        assert!(candidate
+            .preview
+            .get("clipped_capabilities")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|clipped| clipped.len() == 1));
     }
 
     #[test]
@@ -539,6 +560,124 @@ mod tests {
         assert_eq!(reloaded.revision.manifest.name, "业务/技术双团队研讨");
         assert_eq!(
             reloaded
+                .revision
+                .manifest
+                .display
+                .as_ref()
+                .unwrap()
+                .team_display_name
+                .as_deref(),
+            Some("业务技术研讨")
+        );
+    }
+
+    #[test]
+    fn approval_gated_publish_roundtrip() {
+        let (_temp, registry) = registry();
+        publish_agent(&registry, "cowd/explore");
+        publish_agent(&registry, "cowd/direct");
+        let services = RuntimeServices::in_memory().expect("services");
+        let candidate = TemplateCandidateCompiler::compile(
+            &registry,
+            &business_tech_proposal(),
+            PermissionMode::ReadOnly,
+        )
+        .expect("candidate");
+        let approval_id = "template-approval:test-roundtrip";
+        services
+            .event_store()
+            .append(RuntimeEventInput {
+                stream_id: format!("definition-template-candidate:{approval_id}"),
+                scope: RuntimeEventScope::Mission,
+                kind: "definition.template.candidate.v1".to_string(),
+                status: Some("pending_approval".to_string()),
+                actor: None,
+                refs: vec![],
+                payload: serde_json::json!({
+                    "approval_id": approval_id,
+                    "manifest": candidate.manifest,
+                    "instructions": business_tech_proposal().instructions,
+                    "digest": candidate.digest,
+                    "preview": candidate.preview,
+                }),
+            })
+            .expect("candidate event");
+        assert!(services
+            .publish_approved_template_candidate(approval_id)
+            .is_err());
+        let context = ApprovalContext {
+            principal_id: "session:s".to_string(),
+            profile_id: "template-publish".to_string(),
+            approval_profile: None,
+            workspace_key: "w".to_string(),
+            session_id: Some("s".to_string()),
+            turn_id: None,
+            task_id: None,
+            capability: "definition.template.publish".to_string(),
+            invocation_id: None,
+            execution_id: None,
+            strategy_decision_ref: None,
+            source_surface: None,
+            resource_targets: vec![],
+            effect: None,
+            explicit_ask: true,
+            effective_sandbox_posture: None,
+            policy_revision: 0,
+            requested_sandbox_posture: None,
+        };
+        let source = ApprovalSource {
+            kind: ApprovalSourceKind::Session,
+            session_id: Some("s".to_string()),
+            agent_id: None,
+            team_id: None,
+            mission_id: None,
+            resource_ref: None,
+            review_ref: None,
+            application: None,
+        };
+        services
+            .approval_queue()
+            .submit_scoped(
+                approval_id,
+                SubmitGlobalApprovalRequest {
+                    source,
+                    context,
+                    action: "definition.template.publish".to_string(),
+                    summary: "publish test template".to_string(),
+                    risk: TaskRisk::Low,
+                    domain: ApprovalDomain::System,
+                    blocks_execution: false,
+                    evidence_refs: vec![],
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+            )
+            .expect("submit");
+        services
+            .approval_queue()
+            .decide_internal(ApprovalDecisionCommand {
+                approval_id: approval_id.to_string(),
+                approved: true,
+                skip: false,
+                reason: "test".to_string(),
+                scope: ApprovalGrantScope::Once,
+                actor: ApprovalDecisionActor {
+                    kind: ApprovalDecisionActorKind::Policy,
+                    actor_id: "test".to_string(),
+                },
+                evidence_refs: vec![],
+            })
+            .expect("decide");
+        let published = services
+            .publish_approved_template_candidate(approval_id)
+            .expect("publish after approval");
+        assert!(published.get("content_digest").is_some());
+        let stored = services
+            .definition_registry()
+            .teams()
+            .read_revision(&candidate.manifest.revision_ref())
+            .expect("reload published template");
+        assert_eq!(
+            stored
                 .revision
                 .manifest
                 .display
