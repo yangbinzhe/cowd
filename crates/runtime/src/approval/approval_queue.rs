@@ -28,6 +28,12 @@ pub type GlobalApprovalDecisionReceipt = ApprovalDecisionReceipt;
 type DeadlineWakeFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type DeadlineWake = Arc<dyn Fn(String) -> DeadlineWakeFuture + Send + Sync + 'static>;
 
+/// Policy actors that represent a session's explicit YOLO/trust-all approval
+/// authority. Only these exact identities may commit a Global approval
+/// without a human actor; every other policy/typed/timeout actor stays
+/// subject to `global_approval_requires_human_actor`.
+pub const TRUST_ALL_POLICY_ACTOR_IDS: &[&str] = &["yolo-trust-all", "autonomous-session-policy"];
+
 #[derive(Debug)]
 pub(crate) struct CanonicalGraphDecisionEvents {
     pub events: Vec<RuntimeTransactionEventInput>,
@@ -453,6 +459,9 @@ impl ApprovalQueue {
     ) -> Result<GlobalApprovalDecisionReceipt, String> {
         if decision.scope == ApprovalGrantScope::Global
             && decision.actor.kind != ApprovalDecisionActorKind::Human
+            && !(decision.actor.kind == ApprovalDecisionActorKind::Policy
+                && TRUST_ALL_POLICY_ACTOR_IDS
+                    .contains(&decision.actor.actor_id.as_str()))
         {
             return Err("global_approval_requires_human_actor".to_string());
         }
@@ -1938,6 +1947,53 @@ mod tests {
             "operator verified exact effect"
         );
         assert_eq!(events[1].event.payload["grant"]["scope"], "once");
+    }
+
+    #[test]
+    fn trust_all_policy_actor_can_decide_global_template_publish() {
+        let queue = queue();
+        let approval_id = "approval:template:trust-all";
+        queue
+            .submit_scoped_with_policy(
+                approval_id,
+                SubmitGlobalApprovalRequest {
+                    source: session_source(),
+                    context: approval_context(),
+                    domain: ApprovalDomain::System,
+                    blocks_execution: false,
+                    summary: "publish template".to_string(),
+                    action: "definition.template.publish".to_string(),
+                    risk: TaskRisk::Medium,
+                    evidence_refs: Vec::new(),
+                    timeout_policy: ApprovalTimeoutPolicy::Pending,
+                },
+                None,
+                false,
+                vec![ApprovalGrantScope::Once, ApprovalGrantScope::Global],
+            )
+            .expect("pending template approval");
+        let decision = ApprovalDecisionCommand {
+            approval_id: approval_id.to_string(),
+            approved: true,
+            skip: false,
+            reason: "yolo trust-all audit only".to_string(),
+            scope: ApprovalGrantScope::Global,
+            actor: ApprovalDecisionActor {
+                kind: ApprovalDecisionActorKind::Policy,
+                actor_id: "some-other-policy".to_string(),
+            },
+            evidence_refs: vec!["approval.yolo_trust_all".to_string()],
+        };
+        assert_eq!(
+            queue.decide_internal(decision.clone()).unwrap_err(),
+            "global_approval_requires_human_actor"
+        );
+        let mut trust_all = decision;
+        trust_all.actor.actor_id = "yolo-trust-all".to_string();
+        let receipt = queue
+            .decide_internal(trust_all)
+            .expect("trust-all policy actor may decide a Global approval");
+        assert_eq!(receipt.status, GlobalApprovalStatus::Approved);
     }
 
     #[tokio::test]
