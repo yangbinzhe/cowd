@@ -997,6 +997,7 @@ fn explicit_workspace_paths(
                 )
         })
         .map(|token| token.trim_matches(['`', '\'', '"']))
+        .filter(|token| !is_definition_like_token(workspace_root, token))
         .filter(|token| {
             token.starts_with('/')
                 || token.starts_with("./")
@@ -1038,6 +1039,33 @@ fn explicit_workspace_paths(
     paths.sort();
     paths.dedup();
     paths
+}
+
+/// Template/Agent Definition references such as
+/// `cowd/biz-tech-dual-team-deliberation`, `workspace/cowd/explore@1`, or
+/// `builtin/cowd/execute` are not filesystem paths and must never become Team
+/// resource leases. The first segment is a well-known definition namespace and
+/// the remaining segments carry no file extension, so a token that is also
+/// absent on disk is treated as a definition id instead of a planned file.
+fn is_definition_like_token(workspace_root: &Path, token: &str) -> bool {
+    const DEFINITION_NAMESPACES: &[&str] = &[
+        "agent", "app", "builtin", "cowd", "definition", "skill", "template", "user",
+        "workspace", "team",
+    ];
+    let Some((namespace, rest)) = token.split_once('/') else {
+        return false;
+    };
+    if !DEFINITION_NAMESPACES.contains(&namespace) {
+        return false;
+    }
+    if rest.is_empty() || rest.contains('.') {
+        return false;
+    }
+    let exists_anywhere = workspace_root.join(token).exists()
+        || std::env::current_dir()
+            .map(|cwd| cwd.join(token).exists())
+            .unwrap_or(false);
+    !exists_anywhere
 }
 
 fn workspace_relative_explicit_path(
@@ -1265,6 +1293,31 @@ mod tests {
             &["implementation", "source_verification", "evidence", "risks"]
         );
     }
+
+    #[test]
+    fn definition_references_are_not_derived_into_workspace_leases() {
+        let temporary = tempfile::TempDir::new().expect("temporary root");
+        let objective = format!(
+            "发布模板 cowd/biz-tech-dual-team-deliberation（template_id: cowd/biz-tech-dual-team-deliberation）并写入 {}",
+            temporary.path().display()
+        );
+        let scopes = explicit_workspace_resource_scopes(
+            temporary.path(),
+            &objective,
+            true,
+        );
+        assert!(
+            !scopes
+                .iter()
+                .any(|scope| scope.contains("biz-tech-dual-team-deliberation")),
+            "definition refs must not become workspace leases: {scopes:?}"
+        );
+        assert!(
+            scopes.iter().any(|scope| scope == "write:."),
+            "the real workspace write target must still be derived: {scopes:?}"
+        );
+    }
+
     use crate::orchestration::{
         GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationConstraints,
         RuntimeOrchestrationOperation,
