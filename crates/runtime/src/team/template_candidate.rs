@@ -75,86 +75,692 @@ pub struct TemplateCandidate {
 }
 
 /// Normalizes common model-authoring shortcuts in a `template_proposal` JSON
-/// value so the strict contract only sees canonical shapes:
-/// - `roles` may be an object keyed by role_id (value = role fields) instead
-///   of an array; the role_id is injected when missing.
-/// - `role_display_names` may be an object keyed by role_id instead of an
-///   array of {role_id, display_name}.
-pub(crate) fn normalize_template_proposal(value: &mut serde_json::Value) {
+/// value so the strict contract only sees canonical shapes. Returns audit
+/// notes describing every structural default/normalization that was applied.
+///
+/// The function is deliberately total: malformed model input produces a
+/// descriptive `Err` instead of a panic, and wrapped shapes (a JSON string
+/// containing the proposal, or a single-element array wrapping it) are
+/// unwrapped before validation.
+pub(crate) fn normalize_template_proposal(
+    value: &mut serde_json::Value,
+) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+    if let Some(encoded) = value.as_str() {
+        let decoded: serde_json::Value = serde_json::from_str(encoded).map_err(|error| {
+            format!("template_proposal is a JSON string that failed to parse: {error}")
+        })?;
+        notes.push("unwrapped string-encoded template_proposal".to_string());
+        *value = decoded;
+    } else if let Some(items) = value.as_array() {
+        if items.len() != 1 {
+            return Err(format!(
+                "template_proposal array must contain exactly one template object, got {} elements",
+                items.len()
+            ));
+        }
+        let mut inner = items[0].clone();
+        if let Some(encoded) = inner.as_str() {
+            inner = serde_json::from_str(encoded).map_err(|error| {
+                format!("template_proposal array element failed to parse as JSON: {error}")
+            })?;
+        }
+        notes.push("unwrapped single-element template_proposal array".to_string());
+        *value = inner;
+    }
+    if !value.is_object() {
+        return Err(format!(
+            "template_proposal must be a JSON object, got {}",
+            json_type_name(value)
+        ));
+    }
+    for key in ["template_id", "name", "team_display_name"] {
+        if let Some(raw) = value.get(key).cloned() {
+            if !raw.is_string() {
+                value[key] = serde_json::json!(raw.to_string());
+                notes.push(format!("stringified non-string `{key}`"));
+            }
+        }
+    }
     if value.get("instructions").is_none() {
         value["instructions"] =
             serde_json::json!("# 协作研讨\n\n分工调研、对抗质询并收敛为统一结论。\n");
+        notes.push("defaulted missing instructions".to_string());
     }
-    if let Some(serde_json::Value::String(field)) = value.get("result_fields").cloned() {
-        value["result_fields"] = serde_json::json!([field]);
-    }
-    if let Some(serde_json::Value::Object(roles)) = value.get_mut("roles") {
-        let roles: serde_json::Map<String, serde_json::Value> = std::mem::take(roles);
-        let normalized = roles
+    let Some(roles_value) = value.get("roles").cloned() else {
+        return Err("template_proposal is missing required field `roles`".to_string());
+    };
+    let role_items = match roles_value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(map) if map.contains_key("role_id") => {
+            vec![serde_json::Value::Object(map)]
+        }
+        serde_json::Value::Object(map) => map
             .into_iter()
-            .map(|(role_id, mut role): (String, serde_json::Value)| {
+            .map(|(role_id, mut role)| {
                 if role.is_object() && role.get("role_id").is_none() {
                     role["role_id"] = serde_json::json!(role_id);
                 }
-                normalize_proposed_role(&mut role);
                 role
             })
-            .collect::<Vec<_>>();
-        value["roles"] = serde_json::json!(normalized);
-    } else if let Some(serde_json::Value::Array(roles)) = value.get_mut("roles") {
-        for role in roles.iter_mut() {
-            normalize_proposed_role(role);
+            .collect::<Vec<_>>(),
+        other => {
+            return Err(format!(
+                "roles must be an array or object, got {}",
+                json_type_name(&other)
+            ))
         }
+    };
+    if role_items.is_empty() {
+        return Err("roles must contain at least one role".to_string());
     }
-    if let Some(serde_json::Value::Object(displays)) = value.get_mut("role_display_names") {
-        let displays: serde_json::Map<String, serde_json::Value> = std::mem::take(displays);
-        let normalized = displays
-            .into_iter()
-            .map(|(role_id, display_name): (String, serde_json::Value)| {
-                serde_json::json!({ "role_id": role_id, "display_name": display_name })
-            })
-            .collect::<Vec<_>>();
+    let mut normalized_roles = Vec::with_capacity(role_items.len());
+    for mut role in role_items {
+        normalize_proposed_role(&mut role, &mut notes)?;
+        normalized_roles.push(role);
+    }
+    value["roles"] = serde_json::json!(normalized_roles);
+    if let Some(displays) = value.get("role_display_names").cloned() {
+        let roles = value["roles"].as_array().cloned().unwrap_or_default();
+        let normalized = match displays {
+            serde_json::Value::Object(map) => map
+                .into_iter()
+                .map(|(role_id, display_name)| {
+                    let display_name = if display_name.is_string() {
+                        display_name
+                    } else {
+                        serde_json::json!(display_name.to_string())
+                    };
+                    serde_json::json!({ "role_id": role_id, "display_name": display_name })
+                })
+                .collect::<Vec<_>>(),
+            serde_json::Value::Array(items) => {
+                let mut out = Vec::new();
+                for (index, item) in items.into_iter().enumerate() {
+                    match item {
+                        serde_json::Value::String(display_name) => {
+                            let role_id = roles
+                                .get(index)
+                                .and_then(|role| role.get("role_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    format!("role_display_names[{index}] has no matching role_id")
+                                })?;
+                            out.push(serde_json::json!({
+                                "role_id": role_id,
+                                "display_name": display_name
+                            }));
+                        }
+                        serde_json::Value::Object(mut map) => {
+                            if map.get("role_id").is_none() {
+                                let role_id = roles
+                                    .get(index)
+                                    .and_then(|role| role.get("role_id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .ok_or_else(|| {
+                                        format!("role_display_names[{index}] has no matching role_id")
+                                    })?;
+                                map.insert("role_id".to_string(), serde_json::json!(role_id));
+                            }
+                            if map.get("display_name").is_none() {
+                                return Err(format!(
+                                    "role_display_names[{index}] is missing display_name"
+                                ));
+                            }
+                            out.push(serde_json::Value::Object(map));
+                        }
+                        other => {
+                            return Err(format!(
+                                "role_display_names items must be strings or objects, got {}",
+                                json_type_name(&other)
+                            ))
+                        }
+                    }
+                }
+                out
+            }
+            other => {
+                return Err(format!(
+                    "role_display_names must be an object or array, got {}",
+                    json_type_name(&other)
+                ))
+            }
+        };
         value["role_display_names"] = serde_json::json!(normalized);
+    }
+    if let Some(fields) = value.get("result_fields").cloned() {
+        let normalized = match fields {
+            serde_json::Value::String(raw) => serde_json::json!([raw]),
+            serde_json::Value::Object(map) => {
+                serde_json::json!(map.keys().cloned().collect::<Vec<_>>())
+            }
+            serde_json::Value::Array(_) => fields,
+            other => {
+                return Err(format!(
+                    "result_fields must be a string, array, or object, got {}",
+                    json_type_name(&other)
+                ))
+            }
+        };
+        value["result_fields"] = normalized;
+    }
+    normalize_dependencies(value, &mut notes)?;
+    Ok(notes)
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
-fn normalize_proposed_role(role: &mut serde_json::Value) {
-    let Some(fields) = role.as_object_mut() else {
-        return;
+fn truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(enabled) => *enabled,
+        serde_json::Value::String(raw) => matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "true" | "yes" | "1" | "enabled" | "on"
+        ),
+        serde_json::Value::Number(number) => {
+            number.as_u64().map(|number| number != 0).unwrap_or(true)
+        }
+        _ => true,
+    }
+}
+
+const KNOWN_CAPABILITIES: [&str; 5] = ["read", "search", "write", "test", "network"];
+
+fn revision_u64(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|raw| raw.trim().parse::<u64>().ok()))
+}
+
+fn capability_names_from_string(raw: &str) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for token in raw.split(|character: char| !character.is_ascii_alphanumeric()) {
+        let lower = token.to_ascii_lowercase();
+        if KNOWN_CAPABILITIES.contains(&lower.as_str()) && !names.contains(&lower) {
+            names.push(lower);
+        }
+    }
+    if names.is_empty() {
+        return Err(format!(
+            "grant_ceiling `{raw}` contains no known capability (read|search|write|test|network)"
+        ));
+    }
+    Ok(names)
+}
+
+fn normalize_ref_string(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("agent_definition_ref is empty".to_string());
+    }
+    let (path, revision) = match raw.split_once('@') {
+        Some((path, revision)) => (
+            path,
+            revision
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("agent_definition_ref `{raw}` has an invalid revision"))?,
+        ),
+        None => (raw, 1),
     };
-    if let Some(serde_json::Value::Object(reference)) = fields.get("agent_definition_ref").cloned()
-    {
-        let definition = reference
-            .get("definition")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .or_else(|| reference.keys().next().cloned());
-        let revision = reference
-            .get("revision")
-            .and_then(serde_json::Value::as_u64)
-            .or_else(|| {
-                reference
-                    .values()
-                    .next()
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .unwrap_or(1);
+    let path = match path.split('/').count() {
+        1 => format!("builtin/cowd/{path}"),
+        2 if path.starts_with("cowd/") => format!("builtin/{path}"),
+        _ => path.to_string(),
+    };
+    Ok(format!("{path}@{revision}"))
+}
+
+fn normalize_agent_definition_ref(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    ceiling_names: &[String],
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let role_id = fields
+        .get("role_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<role>");
+    let Some(value) = fields.get("agent_definition_ref").cloned() else {
+        let default_ref = if ceiling_names
+            .iter()
+            .any(|name| matches!(name.as_str(), "write" | "test"))
+        {
+            "builtin/cowd/execute@1"
+        } else if ceiling_names.iter().any(|name| name == "network") {
+            "builtin/cowd/explore@2"
+        } else {
+            "builtin/cowd/explore@1"
+        };
+        notes.push(format!(
+            "role `{role_id}`: defaulted agent_definition_ref to `{default_ref}`"
+        ));
         fields.insert(
             "agent_definition_ref".to_string(),
-            serde_json::json!(format!("{}@{}", definition.unwrap_or_default(), revision)),
+            serde_json::json!(default_ref),
         );
+        return Ok(());
+    };
+    let normalized = match value {
+        serde_json::Value::String(raw) => normalize_ref_string(&raw)?,
+        serde_json::Value::Object(reference) => {
+            let definition =
+                if let Some(value) = reference.get("definition").or_else(|| reference.get("name")) {
+                    value.as_str().map(str::to_string).ok_or_else(|| {
+                        format!(
+                            "role `{role_id}` agent_definition_ref definition must be a string"
+                        )
+                    })?
+                } else if reference.len() == 1 {
+                    reference.keys().next().cloned().unwrap_or_default()
+                } else {
+                    return Err(format!(
+                        "role `{role_id}` agent_definition_ref object requires `definition` (or a single key)"
+                    ));
+                };
+            let revision = reference
+                .get("revision")
+                .and_then(revision_u64)
+                .or_else(|| {
+                    reference
+                        .values()
+                        .find(|value| value.as_u64().is_some() || value.as_str().is_some())
+                        .and_then(revision_u64)
+                })
+                .unwrap_or(1);
+            format!("{}@{}", definition, revision)
+        }
+        serde_json::Value::Array(items) => match items.as_slice() {
+            [serde_json::Value::String(definition)] => format!("{definition}@1"),
+            [serde_json::Value::String(definition), revision] => {
+                let revision = revision_u64(revision).ok_or_else(|| {
+                    format!(
+                        "role `{role_id}` agent_definition_ref revision must be a non-negative integer"
+                    )
+                })?;
+                format!("{definition}@{revision}")
+            }
+            _ => {
+                return Err(format!(
+                    "role `{role_id}` agent_definition_ref array must be [\"definition\"] or [\"definition\", revision]"
+                ))
+            }
+        },
+        other => {
+            return Err(format!(
+                "role `{role_id}` agent_definition_ref must be a string, object, or array, got {}",
+                json_type_name(&other)
+            ))
+        }
+    };
+    let normalized = normalize_ref_string(&normalized)?;
+    fields.insert(
+        "agent_definition_ref".to_string(),
+        serde_json::json!(normalized),
+    );
+    Ok(())
+}
+
+fn normalize_proposed_role(
+    role: &mut serde_json::Value,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(fields) = role.as_object_mut() else {
+        return Err(format!("role must be an object, got {}", json_type_name(role)));
+    };
+    let role_id = fields
+        .get("role_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|role_id| !role_id.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "every proposed role needs a non-empty role_id".to_string())?;
+    if fields.get("display_name").is_none() {
+        fields.insert("display_name".to_string(), serde_json::json!(role_id));
+        notes.push(format!("role `{role_id}`: defaulted display_name to role_id"));
     }
-    if let Some(serde_json::Value::Object(ceiling)) = fields.get("grant_ceiling").cloned() {
-        let normalized = ceiling
-            .into_iter()
-            .filter(|(_, enabled)| enabled.as_bool().unwrap_or(true))
-            .map(|(capability, _)| serde_json::json!(capability))
-            .collect::<Vec<_>>();
-        fields.insert("grant_ceiling".to_string(), serde_json::json!(normalized));
+    if fields.get("responsibility").is_none() {
+        let display_name = fields
+            .get("display_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&role_id);
+        fields.insert(
+            "responsibility".to_string(),
+            serde_json::json!(format!("执行 {display_name} 的职责并产出可验证证据")),
+        );
+        notes.push(format!("role `{role_id}`: defaulted missing responsibility"));
     }
-    if let Some(serde_json::Value::String(acceptance)) = fields.get("acceptance").cloned() {
-        fields.insert("acceptance".to_string(), serde_json::json!([acceptance]));
+    let mut ceiling_names: Vec<String> = Vec::new();
+    match fields.get("grant_ceiling").cloned() {
+        None => {}
+        Some(serde_json::Value::String(raw)) => {
+            ceiling_names = capability_names_from_string(&raw)?;
+            fields.insert("grant_ceiling".to_string(), serde_json::json!(ceiling_names));
+        }
+        Some(serde_json::Value::Object(ceiling)) => {
+            let normalized = ceiling
+                .into_iter()
+                .filter(|(_, enabled)| truthy(enabled))
+                .map(|(capability, _)| serde_json::json!(capability))
+                .collect::<Vec<_>>();
+            fields.insert("grant_ceiling".to_string(), serde_json::json!(normalized));
+        }
+        Some(serde_json::Value::Array(items)) => {
+            let mut names = Vec::new();
+            for item in items {
+                match item {
+                    serde_json::Value::String(name) => names.push(name),
+                    serde_json::Value::Object(map) => {
+                        for (capability, enabled) in map {
+                            if truthy(&enabled) {
+                                names.push(capability);
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "role `{role_id}` grant_ceiling array items must be strings or objects"
+                        ))
+                    }
+                }
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for name in names {
+                let lower = name.to_ascii_lowercase();
+                if !KNOWN_CAPABILITIES.contains(&lower.as_str()) {
+                    return Err(format!(
+                        "role `{role_id}` grant_ceiling contains unknown capability `{name}` (read|search|write|test|network)"
+                    ));
+                }
+                if seen.insert(lower.clone()) {
+                    ceiling_names.push(lower);
+                }
+            }
+            fields.insert("grant_ceiling".to_string(), serde_json::json!(ceiling_names));
+        }
+        Some(other) => {
+            return Err(format!(
+                "role `{role_id}` grant_ceiling must be a string, array, or object, got {}",
+                json_type_name(&other)
+            ))
+        }
     }
+    if let Some(cardinality) = fields.get("cardinality").cloned() {
+        let count = revision_u64(&cardinality).ok_or_else(|| {
+            format!("role `{role_id}` cardinality must be a positive integer")
+        })?;
+        if count == 0 {
+            return Err(format!("role `{role_id}` cardinality must be > 0"));
+        }
+        fields.insert("fixed_count".to_string(), serde_json::json!(count));
+        notes.push(format!(
+            "role `{role_id}`: normalized cardinality {count} to fixed_count"
+        ));
+    }
+    normalize_agent_definition_ref(fields, &ceiling_names, notes)?;
+    if let Some(acceptance) = fields.get("acceptance").cloned() {
+        let normalized = match acceptance {
+            serde_json::Value::String(raw) => serde_json::json!([raw]),
+            serde_json::Value::Object(map) => {
+                serde_json::json!(map.keys().cloned().collect::<Vec<_>>())
+            }
+            serde_json::Value::Array(_) => acceptance,
+            serde_json::Value::Number(number) => serde_json::json!([number.to_string()]),
+            other => {
+                return Err(format!(
+                    "role `{role_id}` acceptance must be a string, array, or object, got {}",
+                    json_type_name(&other)
+                ))
+            }
+        };
+        fields.insert("acceptance".to_string(), normalized);
+    }
+    Ok(())
+}
+
+fn resolve_member_roles(
+    member: &str,
+    role_ids: &[String],
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+    seen: &mut std::collections::BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    if role_ids.iter().any(|role_id| role_id == member) {
+        return Ok(vec![member.to_string()]);
+    }
+    let Some(members) = groups.get(member) else {
+        return Err(format!(
+            "dependency member `{member}` is neither a role_id nor a dependency group"
+        ));
+    };
+    if !seen.insert(member.to_string()) {
+        return Err(format!("dependency group cycle detected at `{member}`"));
+    }
+    let mut resolved = Vec::new();
+    for nested in members {
+        resolved.extend(resolve_member_roles(nested, role_ids, groups, seen)?);
+    }
+    seen.remove(member);
+    Ok(resolved)
+}
+
+fn resolve_consumer_roles(
+    label: &str,
+    role_ids: &[String],
+    team_of: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    if role_ids.iter().any(|role_id| role_id == label) {
+        return vec![label.to_string()];
+    }
+    let team_hint = label.strip_suffix("_team").unwrap_or(label);
+    let by_team = role_ids
+        .iter()
+        .filter(|role_id| team_of(role_id).as_deref() == Some(team_hint))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !by_team.is_empty() {
+        return by_team;
+    }
+    let by_substring = role_ids
+        .iter()
+        .filter(|role_id| role_id.contains(label))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !by_substring.is_empty() {
+        return by_substring;
+    }
+    role_ids
+        .iter()
+        .filter(|role_id| {
+            team_of(role_id)
+                .map(|team| team.contains(label))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+fn normalize_dependencies(
+    value: &mut serde_json::Value,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(dependencies) = value.get("dependencies").cloned() else {
+        return Ok(());
+    };
+    let roles = value
+        .get("roles")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let role_ids = roles
+        .iter()
+        .filter_map(|role| {
+            role.get("role_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    let team_of = |role_id: &str| -> Option<String> {
+        roles
+            .iter()
+            .find(|role| {
+                role.get("role_id").and_then(serde_json::Value::as_str) == Some(role_id)
+            })
+            .and_then(|role| {
+                role.get("team")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+    };
+    let edges = match dependencies {
+        serde_json::Value::Array(items) => {
+            let mut edges = Vec::new();
+            for item in items {
+                match item {
+                    serde_json::Value::Object(mut map) => {
+                        let from = map.remove("from").or_else(|| map.remove("source"));
+                        let to = map.remove("to").or_else(|| map.remove("target"));
+                        match (from, to) {
+                            (
+                                Some(serde_json::Value::String(from)),
+                                Some(serde_json::Value::String(to)),
+                            ) => edges.push((from, to)),
+                            (Some(from), Some(to)) => {
+                                return Err(format!(
+                                    "dependency from/to must be strings, got {}/{}",
+                                    json_type_name(&from),
+                                    json_type_name(&to)
+                                ))
+                            }
+                            _ => {
+                                return Err(
+                                    "dependency object requires from and to (or source and target)"
+                                        .to_string(),
+                                )
+                            }
+                        }
+                    }
+                    serde_json::Value::Array(pair) if pair.len() == 2 => {
+                        let mut iter = pair.into_iter();
+                        let from = iter.next().unwrap_or_default();
+                        let to = iter.next().unwrap_or_default();
+                        let from = from.as_str().ok_or_else(|| {
+                            "dependency pair first element must be a string".to_string()
+                        })?;
+                        let to = to.as_str().ok_or_else(|| {
+                            "dependency pair second element must be a string".to_string()
+                        })?;
+                        edges.push((from.to_string(), to.to_string()));
+                    }
+                    serde_json::Value::String(raw) => {
+                        let (from, to) = raw
+                            .split_once("->")
+                            .or_else(|| raw.split_once(':'))
+                            .ok_or_else(|| {
+                                format!(
+                                    "dependency string `{raw}` must use `from->to` or `from:to`"
+                                )
+                            })?;
+                        edges.push((from.trim().to_string(), to.trim().to_string()));
+                    }
+                    other => {
+                        return Err(format!(
+                            "dependency items must be objects, pairs, or strings, got {}",
+                            json_type_name(&other)
+                        ))
+                    }
+                }
+            }
+            edges
+        }
+        serde_json::Value::Object(map) => {
+            let mut groups = std::collections::BTreeMap::new();
+            for (label, members) in map {
+                let members = match members {
+                    serde_json::Value::String(raw) => vec![raw],
+                    serde_json::Value::Array(items) => items
+                        .into_iter()
+                        .map(|item| {
+                            item.as_str().map(str::to_string).ok_or_else(|| {
+                                format!("dependency group `{label}` members must be strings")
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    other => {
+                        return Err(format!(
+                            "dependency group `{label}` must map to a string or array of strings, got {}",
+                            json_type_name(&other)
+                        ))
+                    }
+                };
+                groups.insert(label, members);
+            }
+            let mut edges = Vec::new();
+            for (label, members) in &groups {
+                let is_role_label = role_ids.iter().any(|role_id| role_id == label);
+                let all_members_are_roles = members
+                    .iter()
+                    .all(|member| role_ids.iter().any(|role_id| role_id == member));
+                if is_role_label && all_members_are_roles {
+                    for member in members {
+                        edges.push((label.clone(), member.clone()));
+                    }
+                } else if !all_members_are_roles {
+                    let consumers = resolve_consumer_roles(label, &role_ids, &team_of);
+                    if consumers.is_empty() {
+                        return Err(format!(
+                            "dependency group `{label}` does not resolve to any role_id or team"
+                        ));
+                    }
+                    let mut sources = Vec::new();
+                    let mut seen = std::collections::BTreeSet::new();
+                    for member in members {
+                        sources.extend(resolve_member_roles(
+                            member, &role_ids, &groups, &mut seen,
+                        )?);
+                    }
+                    for source in sources {
+                        for consumer in &consumers {
+                            if &source != consumer {
+                                edges.push((source.clone(), consumer.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            if !edges.is_empty() {
+                notes.push("normalized object-shaped dependencies into role-level edges".to_string());
+            }
+            edges
+        }
+        other => {
+            return Err(format!(
+                "dependencies must be an array or object, got {}",
+                json_type_name(&other)
+            ))
+        }
+    };
+    let mut canonical = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for (from, to) in edges {
+        if !role_ids.iter().any(|role_id| role_id == &from) {
+            return Err(format!("dependency source `{from}` is not a role_id"));
+        }
+        if !role_ids.iter().any(|role_id| role_id == &to) {
+            return Err(format!("dependency target `{to}` is not a role_id"));
+        }
+        if from != to && seen.insert((from.clone(), to.clone())) {
+            canonical.push(ProposedDependency { from, to });
+        }
+    }
+    value["dependencies"] = serde_json::json!(canonical);
+    Ok(())
 }
 
 fn capability_from_name(name: &str) -> Option<AgentCapability> {
@@ -798,7 +1404,8 @@ mod tests {
             },
             "instructions": "# 测试\n"
         });
-        normalize_template_proposal(&mut value);
+        let notes = normalize_template_proposal(&mut value).expect("normalized");
+        assert!(!notes.is_empty(), "defaulted display names should be recorded");
         let roles = value["roles"].as_array().expect("roles array");
         assert_eq!(roles.len(), 2);
         assert!(roles.iter().any(|role| {
@@ -822,5 +1429,190 @@ mod tests {
         let proposal: TeamTemplateProposal =
             serde_json::from_value(value).expect("normalized proposal parses");
         assert_eq!(proposal.roles.len(), 2);
+    }
+
+    #[test]
+    fn normalize_template_proposal_accepts_wrapped_json_string_and_array() {
+        let payload = serde_json::json!({
+            "template_id": "cowd/biz-tech-dual-team-deliberation",
+            "name": "业务/技术双团队民主集中研讨",
+            "team_display_name": "业务-技术双团队研讨组（民主集中制）",
+            "roles": [
+                {
+                    "role_id": "biz_manufacturing_expert",
+                    "display_name": "制造领域业务专家(1)",
+                    "team": "business",
+                    "cardinality": 1,
+                    "grant_ceiling": "workspace-read",
+                    "responsibility": "从制造现实出发评估约束",
+                    "acceptance": "交付制造约束清单"
+                },
+                {
+                    "role_id": "cto_supply_manufacturing",
+                    "display_name": "高级供应制造领域CTO",
+                    "team": "technical",
+                    "cardinality": 1,
+                    "grant_ceiling": "workspace-read-write",
+                    "responsibility": "总体架构决策"
+                },
+                {
+                    "role_id": "convergence_arbiter",
+                    "display_name": "集中收敛主持人/仲裁",
+                    "team": "convergence",
+                    "cardinality": 1,
+                    "grant_ceiling": "workspace-read-write",
+                    "responsibility": "主持收敛"
+                }
+            ],
+            "dependencies": {
+                "business_team": ["biz_manufacturing_expert"],
+                "technical_team": ["cto_supply_manufacturing"],
+                "convergence": ["business_team", "technical_team"]
+            },
+            "result_fields": ["summary", "evidence"],
+            "instructions": "# 研讨\n"
+        });
+        let encoded = serde_json::to_string(&payload).expect("encode");
+        let mut value = serde_json::json!([encoded]);
+        let notes =
+            normalize_template_proposal(&mut value).expect("normalize array-wrapped string");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("single-element template_proposal array"))
+        );
+        assert!(value.is_object());
+        let roles = value["roles"].as_array().expect("roles array");
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles[0]["grant_ceiling"], serde_json::json!(["read"]));
+        assert_eq!(
+            roles[1]["grant_ceiling"],
+            serde_json::json!(["read", "write"])
+        );
+        assert_eq!(roles[1]["fixed_count"], serde_json::json!(1));
+        assert_eq!(
+            roles[0]["agent_definition_ref"],
+            serde_json::json!("builtin/cowd/explore@1")
+        );
+        assert_eq!(
+            roles[1]["agent_definition_ref"],
+            serde_json::json!("builtin/cowd/execute@1")
+        );
+        let dependencies = value["dependencies"].as_array().expect("dependencies array");
+        assert_eq!(dependencies.len(), 2);
+        assert!(dependencies.iter().any(|dep| {
+            dep["from"] == "biz_manufacturing_expert" && dep["to"] == "convergence_arbiter"
+        }));
+        assert!(dependencies.iter().any(|dep| {
+            dep["from"] == "cto_supply_manufacturing" && dep["to"] == "convergence_arbiter"
+        }));
+        let mut value = serde_json::json!(encoded);
+        normalize_template_proposal(&mut value).expect("normalize raw JSON string");
+        assert!(value.is_object());
+    }
+
+    #[test]
+    fn normalize_template_proposal_rejects_non_object_without_panicking() {
+        let mut value = serde_json::json!(["a", "b"]);
+        let error =
+            normalize_template_proposal(&mut value).expect_err("two-element array must error");
+        assert!(error.contains("exactly one template object"));
+        let mut value = serde_json::json!(42);
+        let error = normalize_template_proposal(&mut value).expect_err("number must error");
+        assert!(error.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn normalize_template_proposal_rejects_unknown_grant_ceiling() {
+        let mut value = serde_json::json!({
+            "template_id": "cowd/test",
+            "name": "测试",
+            "roles": [{
+                "role_id": "r",
+                "responsibility": "x",
+                "grant_ceiling": "full-access"
+            }]
+        });
+        let error =
+            normalize_template_proposal(&mut value).expect_err("unknown ceiling must error");
+        assert!(error.contains("grant_ceiling"));
+    }
+
+    #[test]
+    fn normalize_dependencies_supports_role_keyed_upstream_edges() {
+        let mut value = serde_json::json!({
+            "template_id": "cowd/test",
+            "name": "测试",
+            "roles": [
+                {"role_id": "implementer", "responsibility": "x"},
+                {"role_id": "reviewer", "responsibility": "y"}
+            ],
+            "dependencies": {"implementer": ["reviewer"]}
+        });
+        normalize_template_proposal(&mut value).expect("normalize");
+        let dependencies = value["dependencies"].as_array().expect("dependencies array");
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0]["from"], "implementer");
+        assert_eq!(dependencies[0]["to"], "reviewer");
+    }
+
+    #[test]
+    fn compiles_normalized_model_payload_with_defaulted_agent_refs() {
+        let (_temp, registry) = registry();
+        let mut value = serde_json::json!({
+            "template_id": "cowd/biz-tech-dual-team-deliberation",
+            "name": "业务/技术双团队民主集中研讨",
+            "team_display_name": "业务-技术双团队研讨组",
+            "roles": [
+                {
+                    "role_id": "biz_expert",
+                    "display_name": "供应链专家",
+                    "grant_ceiling": "workspace-read",
+                    "responsibility": "分析供应制造约束",
+                    "acceptance": "findings"
+                },
+                {
+                    "role_id": "cto",
+                    "display_name": "CTO",
+                    "grant_ceiling": "workspace-read-write",
+                    "responsibility": "技术裁决"
+                },
+                {
+                    "role_id": "convergence_arbiter",
+                    "display_name": "集中收敛主持人",
+                    "team": "convergence",
+                    "grant_ceiling": "workspace-read-write",
+                    "responsibility": "汇总裁决"
+                }
+            ],
+            "dependencies": {
+                "business_team": ["biz_expert"],
+                "technical_team": ["cto"],
+                "convergence": ["business_team", "technical_team"]
+            },
+            "result_fields": ["summary", "evidence"],
+            "instructions": "# 研讨\n"
+        });
+        normalize_template_proposal(&mut value).expect("normalize");
+        let proposal: TeamTemplateProposal = serde_json::from_value(value).expect("parse");
+        let candidate = TemplateCandidateCompiler::compile(
+            &registry,
+            &proposal,
+            PermissionMode::DangerFullAccess,
+        )
+        .expect("compile with builtin defaults");
+        assert_eq!(candidate.manifest.roles.len(), 3);
+        assert!(candidate.manifest.dependencies.iter().any(|dependency| {
+            dependency.from_role_id == "biz_expert"
+                && dependency.to_role_id == "convergence_arbiter"
+        }));
+        assert!(candidate.manifest.dependencies.iter().any(|dependency| {
+            dependency.from_role_id == "cto" && dependency.to_role_id == "convergence_arbiter"
+        }));
+        assert!(candidate
+            .manifest
+            .roles
+            .iter()
+            .any(|role| role.grant_ceiling.contains(&AgentCapability::Write)));
     }
 }

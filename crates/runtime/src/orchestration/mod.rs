@@ -281,15 +281,20 @@ async fn propose_template(
         .as_ref()
         .ok_or_else(|| "template_proposal_missing".to_string())?;
     let mut normalized_proposal = proposal_value.clone();
-    crate::team_template_candidate::normalize_template_proposal(&mut normalized_proposal);
+    let normalization_notes =
+        crate::team_template_candidate::normalize_template_proposal(&mut normalized_proposal)
+            .map_err(|error| format!("invalid_template_proposal:{error}"))?;
     let proposal: crate::team_template_candidate::TeamTemplateProposal =
         serde_json::from_value(normalized_proposal)
             .map_err(|error| format!("invalid_template_proposal:{error}"))?;
-    let candidate = crate::team_template_candidate::TemplateCandidateCompiler::compile(
+    let mut candidate = crate::team_template_candidate::TemplateCandidateCompiler::compile(
         services.definition_registry(),
         &proposal,
         request.constraints.permission_ceiling,
     )?;
+    if !normalization_notes.is_empty() {
+        candidate.preview["normalization_notes"] = serde_json::json!(normalization_notes);
+    }
     let template_id = candidate.manifest.template_id.as_str().to_string();
     let approval_id = format!("template-approval:{}", uuid::Uuid::new_v4());
     let risk = if candidate.manifest.roles.iter().any(|role| {
