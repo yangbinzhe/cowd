@@ -2099,7 +2099,7 @@ impl RuntimeServices {
             .into_iter()
             .find(|event| event.kind == "definition.template.candidate.v1")
             .ok_or_else(|| format!("template candidate missing for approval {approval_id}"))?;
-        let manifest = serde_json::from_value::<harness_contract::team::TeamTemplateManifest>(
+        let mut manifest = serde_json::from_value::<harness_contract::team::TeamTemplateManifest>(
             candidate_event
                 .payload
                 .get("manifest")
@@ -2107,6 +2107,10 @@ impl RuntimeServices {
                 .unwrap_or_default(),
         )
         .map_err(|error| format!("decode template candidate manifest: {error}"))?;
+        // The candidate is compiled as Draft and becomes runnable only after
+        // this approval completes; the store refuses to resolve non-published
+        // revisions even with an active stable release assignment.
+        manifest.lifecycle = harness_contract::agent::RevisionLifecycle::Published;
         let instructions = candidate_event
             .payload
             .get("instructions")
@@ -2117,6 +2121,29 @@ impl RuntimeServices {
             .definition_registry()
             .teams()
             .store_revision(manifest, &instructions)
+            .map_err(|error| format!("template_publish_failed: {error}"))?;
+        let scope = stored.revision.revision_ref.template_id.scope();
+        let authorization = harness_contract::agent::ReleaseAuthorization::HumanApproval {
+            approval_ref: format!("approval/{approval_id}"),
+        };
+        self.definition_registry()
+            .teams()
+            .record_release_assignment(&crate::team_definition::TeamReleaseAssignment {
+                scope,
+                revision_ref: stored.revision.revision_ref.clone(),
+                channel: harness_contract::agent::ReleaseChannel::Stable,
+                status: harness_contract::agent::ReleaseAssignmentStatus::Active,
+                authorization: authorization.clone(),
+                content_digest: stored.revision.content_digest.clone(),
+            })
+            .map_err(|error| format!("template_publish_failed: {error}"))?;
+        self.definition_registry()
+            .teams()
+            .set_default_pointer(&crate::team_definition::TeamDefaultPointer::latest(
+                scope,
+                stored.revision.revision_ref.template_id.clone(),
+                authorization,
+            ))
             .map_err(|error| format!("template_publish_failed: {error}"))?;
         let _ = self.event_store().append(crate::RuntimeEventInput {
             stream_id,

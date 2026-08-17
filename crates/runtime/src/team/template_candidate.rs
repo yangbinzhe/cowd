@@ -1280,12 +1280,16 @@ mod tests {
     #[test]
     fn approval_gated_publish_roundtrip() {
         let (_temp, registry) = registry();
-        publish_agent(&registry, "cowd/explore");
-        publish_agent(&registry, "cowd/direct");
         let services = RuntimeServices::in_memory().expect("services");
+        // The publish target registry only carries builtin Agents, so the
+        // proposal must reference builtin definitions for the runnable
+        // catalog to resolve its role bindings.
+        let mut proposal = business_tech_proposal();
+        proposal.roles[0].agent_definition_ref = "builtin/cowd/explore@1".to_string();
+        proposal.roles[1].agent_definition_ref = "builtin/cowd/direct@1".to_string();
         let candidate = TemplateCandidateCompiler::compile(
             &registry,
-            &business_tech_proposal(),
+            &proposal,
             PermissionMode::ReadOnly,
         )
         .expect("candidate");
@@ -1302,7 +1306,9 @@ mod tests {
                 payload: serde_json::json!({
                     "approval_id": approval_id,
                     "manifest": candidate.manifest,
-                    "instructions": business_tech_proposal().instructions,
+                    "instructions": crate::team_template_candidate::normalized_team_instructions(
+                        &proposal.instructions,
+                    ),
                     "digest": candidate.digest,
                     "preview": candidate.preview,
                 }),
@@ -1392,6 +1398,20 @@ mod tests {
                 .team_display_name
                 .as_deref(),
             Some("业务技术研讨")
+        );
+        let catalog = services
+            .definition_registry()
+            .runnable_team_catalog()
+            .expect("runnable team catalog");
+        assert!(
+            catalog
+                .iter()
+                .any(|entry| entry.name == "业务/技术双团队研讨"),
+            "published template must be runnable: {:?}",
+            catalog
+                .iter()
+                .map(|entry| entry.revision_ref.template_id.as_str().to_string())
+                .collect::<Vec<_>>()
         );
     }
 

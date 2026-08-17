@@ -437,14 +437,19 @@ fn compile_team_subgraph_node(
             "template_bind:{requested_template}:{template_path}"
         ));
     }
-    let template_id = TeamTemplateDefinitionId::new(
-        harness_contract::agent::DefinitionScope::Builtin,
-        template_path
-            .trim()
-            .strip_prefix("builtin/")
-            .unwrap_or(&template_path),
-    )
-    .map_err(|error| OrchestrationCompileError::TeamInstantiation(error.to_string()))?;
+    let trimmed = template_path.trim();
+    let (scope, local) = if let Some(local) = trimmed.strip_prefix("workspace/") {
+        (harness_contract::agent::DefinitionScope::Workspace, local)
+    } else if let Some(local) = trimmed.strip_prefix("user/") {
+        (harness_contract::agent::DefinitionScope::User, local)
+    } else {
+        (
+            harness_contract::agent::DefinitionScope::Builtin,
+            trimmed.strip_prefix("builtin/").unwrap_or(trimmed),
+        )
+    };
+    let template_id = TeamTemplateDefinitionId::new(scope, local)
+        .map_err(|error| OrchestrationCompileError::TeamInstantiation(error.to_string()))?;
     let team_id = format!(
         "runtime-team:{}:{}:{}",
         request_id, semantic.node_id, instance_index
