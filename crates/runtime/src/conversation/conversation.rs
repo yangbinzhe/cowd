@@ -3322,6 +3322,11 @@ pub struct ConversationRuntime<C, T> {
     /// The narrowed tool set represents an already-admitted business
     /// obligation and one actual call is required on the next request.
     next_model_tool_required: AtomicBool,
+    /// Orchestration-phase gate: while a user explicitly requires Teams and
+    /// none are verified yet, only control-plane tools are exposed to the
+    /// root model so it cannot drift into manual file exploration before
+    /// publishing and starting the Teams.
+    next_model_orchestration_only: AtomicBool,
     /// A successful tool_search activation creates a one-request execution
     /// handoff. The following automatic provider request receives the newly
     /// activated schemas but temporarily hides tool_search so discovery cannot
@@ -3800,6 +3805,7 @@ where
             next_model_text_only: AtomicBool::new(false),
             next_model_tool_allowlist: std::sync::Mutex::new(None),
             next_model_tool_required: AtomicBool::new(false),
+            next_model_orchestration_only: AtomicBool::new(false),
             next_model_tool_activation_notice: std::sync::Mutex::new(None),
             next_model_reasoning_effort: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
@@ -4333,6 +4339,15 @@ where
     ) {
         self.require_next_model_tools(tool_ids);
         self.next_model_tool_required.store(true, Ordering::SeqCst);
+    }
+
+    /// Restrict the next provider request to the runtime control plane only
+    /// (`runtime_capabilities` + `runtime_orchestrate`). Used while a user
+    /// explicitly required Teams but no verified Team execution exists yet,
+    /// so the model physically cannot drift into manual file exploration
+    /// before publishing and starting the Teams.
+    pub(crate) fn require_next_model_orchestration_only(&self) {
+        self.next_model_orchestration_only.store(true, Ordering::SeqCst);
     }
 
     /// Override reasoning effort for exactly one provider request. Provider
@@ -6872,6 +6887,40 @@ where
         // catalog state for discovery/projection, while still sending an
         // explicit empty schema set for this provider request.
         if !text_only_response && !explicitly_forbids_tool_use && !one_shot_tool_overlay {
+            if let Ok(mut state) = self.tool_exposure_state.lock() {
+                *state = Some(exposure.clone());
+            }
+        }
+        // Orchestration-phase gate: a user-required Team has no verified
+        // execution yet, so the root model only sees the control plane. This
+        // is a mechanical tool-exposure bound, not a prose instruction: the
+        // model physically cannot read/search/write before publishing and
+        // starting the Teams it was asked for.
+        if self.next_model_orchestration_only.swap(false, Ordering::SeqCst)
+            && !text_only_response
+            && !explicitly_forbids_tool_use
+        {
+            let allowed: BTreeSet<String> = [
+                harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID.to_string(),
+                "runtime_capabilities".to_string(),
+            ]
+            .into_iter()
+            .collect();
+            exposure = ToolExposureState {
+                catalog_revision: exposure.catalog_revision,
+                bootstrap: Default::default(),
+                active: allowed.clone(),
+                deferred: available_tools
+                    .iter()
+                    .filter(|tool| !allowed.contains(*tool))
+                    .cloned()
+                    .collect(),
+                reason:
+                    "orchestration-phase gate: user-required Teams have no verified execution yet; only control-plane tools are exposed"
+                        .to_string(),
+                revision: exposure.revision.saturating_add(1),
+                fallback_full: false,
+            };
             if let Ok(mut state) = self.tool_exposure_state.lock() {
                 *state = Some(exposure.clone());
             }
@@ -17666,6 +17715,50 @@ mod tests {
         assert_eq!(metrics.activated_invocations, 1);
         assert_eq!(metrics.activation_precision_bp, Some(10_000));
         assert_eq!(metrics.activation_recall_bp, None);
+    }
+
+    #[tokio::test]
+    async fn orchestration_phase_gate_exposes_only_control_plane_tools() {
+        let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            ExposureRecordingApi {
+                projections: Arc::clone(&projections),
+            },
+            ExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::new(
+            RuntimeEventStore::try_open_in_memory().expect("event store"),
+        ));
+        runtime
+            .begin_turn_strategy("orchestration-gate-turn", "必须实际启动协作团队完成分析")
+            .expect("turn strategy admission");
+        runtime.require_next_model_orchestration_only();
+        runtime
+            .execute_model_step("必须实际启动协作团队完成分析", true)
+            .await
+            .expect("model step");
+        let recorded = projections.lock().expect("projections");
+        let projection = recorded.last().expect("exposure projection recorded");
+        let active = projection
+            .active_ids
+            .iter()
+            .chain(projection.bootstrap_ids.iter())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(active.contains("runtime_capabilities"));
+        assert!(active.contains("runtime_orchestrate"));
+        assert!(
+            !active.contains("grep_search"),
+            "orchestration-phase gate must hide general tools: {active:?}"
+        );
+        assert!(
+            !active.contains("tool_search"),
+            "orchestration-phase gate must hide discovery tools: {active:?}"
+        );
     }
 
     #[test]

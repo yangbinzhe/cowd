@@ -4262,6 +4262,18 @@ where
             )
         };
         let mut runtime = self.runtime.lock().await;
+        let orchestration_gate_active = {
+            let state = self.state.lock().await;
+            !state.execution_role.is_delegated_leaf()
+                && state
+                    .task_understanding
+                    .as_ref()
+                    .map_or(false, |value| value.required_team_count > 0)
+                && state.verified_team_ids.is_empty()
+        };
+        if orchestration_gate_active {
+            runtime.require_next_model_orchestration_only();
+        }
         for item in pending_next_model_context {
             runtime.push_next_model_context_item(item);
         }
