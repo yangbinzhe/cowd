@@ -5121,8 +5121,46 @@ where
                             if state.team_orchestration_requests < 2 {
                                 state.team_orchestration_requests =
                                     state.team_orchestration_requests.saturating_add(1);
+                                let catalog_hint = self
+                                    .services
+                                    .definition_registry()
+                                    .runnable_team_catalog()
+                                    .ok()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter(|entry| {
+                                        let id = entry.revision_ref.template_id.as_str();
+                                        id.starts_with("workspace/") || id.starts_with("user/")
+                                    })
+                                    .take(3)
+                                    .map(|entry| {
+                                        let roles = entry
+                                            .roles
+                                            .iter()
+                                            .filter_map(|role| {
+                                                role.display_name
+                                                    .as_deref()
+                                                    .or(Some(role.role_id.as_str()))
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("、");
+                                        format!(
+                                            "{}@{}（名称：{}；角色：{}）",
+                                            entry.revision_ref.template_id.as_str(),
+                                            entry.revision_ref.revision,
+                                            entry.name,
+                                            roles
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("；");
                                 let reason = format!(
-                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。请继续自行编排：如用户点名了具体团队/角色，先调用 runtime_orchestrate(operation=propose_template, template_proposal=...) 发布定制模板并确认返回 published，再调用 runtime_capabilities(detail=team_templates) 复制 catalog 中的精确 template_id，最后用 runtime_orchestrate(operation=propose) 引用该模板启动团队；若用户没有点名具体角色，也可以直接使用 catalog 中的协作模板。禁止只输出总结文本，继续执行（尝试 {}）。",
+                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请继续自行编排：先调用 runtime_capabilities(detail=team_templates) 复制 catalog 中的精确 template_id；若 catalog 中已有与用户要求匹配的用户模板，直接用该精确 ID 调用 runtime_orchestrate(operation=propose) 启动团队；若没有，先调用 runtime_orchestrate(operation=propose_template, template_proposal=...) 发布定制模板并确认返回 published，再按上述步骤启动团队。禁止只输出总结文本，继续执行（尝试 {}）。",
+                                    if catalog_hint.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("当前已发布的用户模板：{catalog_hint}。")
+                                    },
                                     state.team_orchestration_requests
                                 );
                                 state.content.push_str("\n\n");
