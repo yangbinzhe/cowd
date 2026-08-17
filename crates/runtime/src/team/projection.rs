@@ -263,22 +263,26 @@ impl TeamProjectionReader {
             });
             if let Some(binding) = packet.binding.as_ref() {
                 binding_digests.push(binding.binding_digest.clone());
-                let role_label = binding
-                    .instance
-                    .role_slot_id
+                let display = binding
+                    .display
                     .clone()
-                    .unwrap_or_else(|| packet.assignment.role_id.clone());
-                agent_displays.push(AgentDisplayIdentity {
-                    label: binding.definition_ref.definition_id.as_str().to_string(),
-                    role_label,
-                    focus_label: None,
-                    locale: "auto".to_string(),
-                    provenance: "runtime.agent-binding:unavailable-name".to_string(),
-                    digest: model_protocol::fingerprint::stable_hash_bytes(
-                        binding.binding_digest.as_bytes(),
-                    )
-                    .to_string(),
-                });
+                    .unwrap_or_else(|| AgentDisplayIdentity {
+                        agent_id: packet.agent_id().to_string(),
+                        label: binding.definition_ref.definition_id.as_str().to_string(),
+                        role_label: binding
+                            .instance
+                            .role_slot_id
+                            .clone()
+                            .unwrap_or_else(|| packet.assignment.role_id.clone()),
+                        focus_label: None,
+                        locale: "auto".to_string(),
+                        provenance: "runtime.agent-binding:unavailable-name".to_string(),
+                        digest: model_protocol::fingerprint::stable_hash_bytes(
+                            binding.binding_digest.as_bytes(),
+                        )
+                        .to_string(),
+                    });
+                agent_displays.push(display);
             }
         }
         let team_id = team_id.ok_or_else(|| format!("graph {} has no team AgentTask", graph.id))?;
@@ -577,6 +581,7 @@ mod tests {
             },
             release: None,
             evaluation: None,
+            display: None,
             binding_digest: "b".repeat(64),
         };
         binding.validate().expect("valid binding");

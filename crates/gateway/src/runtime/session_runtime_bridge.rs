@@ -2438,6 +2438,14 @@ fn classify_ingress_failure(error: &str) -> OutboxFailureClass {
         OutboxFailureClass::CorruptPayload
     } else if error.contains("invalid") || error.contains("unavailable until") {
         OutboxFailureClass::Permanent
+    } else if error.contains("no terminal turn result")
+        || error.contains("terminal without its durable session receipt")
+    {
+        // The execution graph is already terminal/cancelled; replaying the
+        // same request cannot produce a new result. Retrying only floods the
+        // ingress worker every retry interval, so the input must become
+        // Failed immediately instead of consuming the retry budget.
+        OutboxFailureClass::Permanent
     } else {
         OutboxFailureClass::Retryable
     }

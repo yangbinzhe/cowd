@@ -551,6 +551,17 @@ pub struct MissionControlAgentNode {
     pub backend: Option<String>,
     #[serde(default)]
     pub detail: Value,
+    /// Immutable human-facing agent display name (Definition name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_role_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_focus_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -570,6 +581,17 @@ pub struct MissionControlGraphNode {
     pub team_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Immutable human-facing agent display name (Definition name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_role_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_focus_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

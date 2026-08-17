@@ -16,7 +16,9 @@ use crate::{
     EvolutionCandidateSubject, EvolutionGovernanceService, EvolutionReleaseAssignment,
     RuntimeDefinitionRegistry,
 };
-use harness_contract::agent::{AgentDefinitionRevisionRef, AgentTaskIntent, RevisionSelector};
+use harness_contract::agent::{
+    AgentDefinitionRevisionRef, AgentTaskIntent, AgentTaskPacket, RevisionSelector,
+};
 use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
@@ -685,6 +687,48 @@ impl TeamInstantiationService {
             &role_slots,
             request.strategy_binding.as_ref(),
         )?;
+        // Phase C: freeze the immutable human-facing display identity into
+        // every Team-slot Binding before the graph is persisted. The display
+        // is compiled from the same frozen Team role snapshot and never
+        // participates in behavior, permission, or acceptance decisions.
+        let roles_by_slot = binding
+            .roles
+            .iter()
+            .map(|role| (format!("{}:{}", role.role_id, role.slot), role))
+            .collect::<BTreeMap<_, _>>();
+        for node in graph
+            .nodes
+            .iter_mut()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        {
+            let mut packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
+                .map_err(|error| format!("decode Team role packet for display: {error}"))?;
+            let agent_id = packet.agent_id().to_string();
+            let Some(agent_binding) = packet.binding.as_mut() else {
+                continue;
+            };
+            let role_slot_id = agent_binding
+                .instance
+                .role_slot_id
+                .clone()
+                .unwrap_or_else(|| packet.assignment.role_id.clone());
+            let Some(role) = roles_by_slot.get(&role_slot_id) else {
+                continue;
+            };
+            agent_binding.display = Some(crate::display_identity::compile_agent_display_identity(
+                agent_binding,
+                role,
+                &agent_id,
+                &role.agent_name,
+                &role.agent_description,
+            ));
+            agent_binding.binding_digest = crate::agent::binding::recompute_binding_digest(
+                agent_binding,
+            )
+            .map_err(|error| format!("recompute Team role packet display digest: {error}"))?;
+            node.payload_ref = serde_json::to_string(&packet)
+                .map_err(|error| format!("encode Team role packet with display: {error}"))?;
+        }
 
         Ok(TeamInstantiation {
             graph,

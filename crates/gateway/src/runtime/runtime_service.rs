@@ -1404,107 +1404,36 @@ impl RuntimeService {
         transition_id: &str,
         cancellation: &runtime::CancellationToken,
     ) -> Result<(), String> {
-        let grace = if cfg!(test) {
-            Duration::from_millis(50)
-        } else {
-            Duration::from_secs(30)
-        };
-        let grace_timer = tokio::time::sleep(grace);
-        tokio::pin!(grace_timer);
         let mut poll = tokio::time::interval(Duration::from_millis(50));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_active = None;
         loop {
             let changed = self.active_turns.changed.notified();
-            if self
+            let active = self
                 .active_attempts_for_policy_revision(session_id, revision)
-                .await?
-                == 0
-            {
+                .await?;
+            if active != last_active.unwrap_or(u64::MAX) {
+                last_active = Some(active);
+                self.record_policy_transition_blocker(
+                    session_id,
+                    transition_id,
+                    if active == 0 {
+                        "old policy revision drained; activating the requested revision"
+                            .to_string()
+                    } else {
+                        format!(
+                            "waiting for {active} attempt(s) bound to old policy revision {revision} to finish; the running turn keeps its bound policy and is never cancelled"
+                        )
+                    },
+                )
+                .await?;
+            }
+            if active == 0 {
                 return Ok(());
             }
             tokio::select! {
                 () = changed => {}
                 _ = poll.tick() => {}
-                () = &mut grace_timer => break,
-                () = cancellation.cancelled() => {
-                    return Err("policy transition supervisor was superseded or stopped".to_string());
-                }
-            }
-        }
-
-        let active = self
-            .active_attempts_for_policy_revision(session_id, revision)
-            .await?;
-        let turn_ids = self.active_turn_ids_for_policy_revision(session_id, revision);
-        self.record_policy_transition_blocker(
-            session_id,
-            transition_id,
-            format!(
-                "drain grace expired; cancellation requested for {} attempt(s) bound to old policy revision {revision}",
-                active
-            ),
-        )
-        .await?;
-        for turn_id in turn_ids {
-            let _ = self.cancel_active_turn_control(
-                &turn_id,
-                "Session execution policy drain grace expired",
-            );
-        }
-        self.runtime_services
-            .cancel_attempts_for_session_policy_revision(
-                session_id,
-                revision,
-                "Session execution policy drain grace expired",
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-
-        let acknowledgement_timer = tokio::time::sleep(grace);
-        tokio::pin!(acknowledgement_timer);
-        let mut acknowledgement_poll = tokio::time::interval(Duration::from_millis(50));
-        acknowledgement_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            let changed = self.active_turns.changed.notified();
-            let mut remaining = self
-                .active_attempts_for_policy_revision(session_id, revision)
-                .await?;
-            if remaining == 0 {
-                return Ok(());
-            }
-            // A Task that passed admission immediately before Freeze may finish
-            // graph registration while the first cancellation pass is in
-            // flight. Re-observe and cancel the exact old-revision graph on
-            // every bounded acknowledgement poll; Stable remains impossible
-            // until both durable Task and graph sets reach zero.
-            self.runtime_services
-                .cancel_attempts_for_session_policy_revision(
-                    session_id,
-                    revision,
-                    "Session execution policy drain grace expired",
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            remaining = self
-                .active_attempts_for_policy_revision(session_id, revision)
-                .await?;
-            if remaining == 0 {
-                return Ok(());
-            }
-            tokio::select! {
-                () = changed => {}
-                _ = acknowledgement_poll.tick() => {}
-                () = &mut acknowledgement_timer => {
-                    let blocker = format!(
-                        "{remaining} cancelled old-revision attempt(s) have not acknowledged termination; Session remains frozen"
-                    );
-                    self.record_policy_transition_blocker(
-                        session_id,
-                        transition_id,
-                        blocker.clone(),
-                    ).await?;
-                    return Err(blocker);
-                }
                 () = cancellation.cancelled() => {
                     return Err("policy transition supervisor was superseded or stopped".to_string());
                 }
@@ -6122,7 +6051,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_transition_drains_an_admitted_background_task_before_stable() {
+    async fn policy_transition_never_force_cancels_an_admitted_background_task() {
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let (service, _session_service) = test_bound_runtime_service(
             Arc::new(HotSessionPool::default()),
@@ -6211,6 +6140,39 @@ mod tests {
         assert_eq!(transition.old_revision_active_attempts, 1);
         assert_eq!(draining.permission_revision, Some(1));
 
+        // The old drain-grace force-cancel is removed: after a grace period
+        // that used to terminate the Task, it must still be running and the
+        // transition must still be draining.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            runtime_services
+                .task_aggregate_service()
+                .get("policy-background-task")
+                .expect("task read")
+                .expect("Task")
+                .status,
+            harness_contract::task::TaskStatus::Running
+        );
+        let pending = service
+            .session_execution_policy_value("policy-background-drain")
+            .await
+            .expect("policy read");
+        assert_eq!(pending.permission_revision, Some(1));
+        assert_eq!(
+            pending.transition.as_ref().unwrap().phase,
+            harness_contract::policy::PolicyTransitionPhase::Draining
+        );
+
+        // Only an explicit cancellation drains the old revision; then the
+        // desired policy becomes Stable.
+        runtime_services
+            .cancel_attempts_for_session_policy_revision(
+                "policy-background-drain",
+                1,
+                "explicit test cancellation",
+            )
+            .await
+            .expect("explicit old-revision cancellation");
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let response = service
@@ -6224,7 +6186,7 @@ mod tests {
             }
         })
         .await
-        .expect("background Task drain settles");
+        .expect("background Task drains only after explicit cancellation");
         assert_eq!(
             runtime_services
                 .task_aggregate_service()
@@ -6420,7 +6382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_deadline_cancels_only_the_old_revision_and_waits_for_ack_before_stable() {
+    async fn policy_transition_waits_for_the_active_turn_and_never_cancels_it() {
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let (service, _session_service) = test_bound_runtime_service(
             Arc::new(HotSessionPool::default()),
@@ -6433,7 +6395,7 @@ mod tests {
             runtime::SessionExecutionPolicyOrigin::SessionExplicit,
         );
         let now = chrono::Utc::now().to_rfc3339();
-        for session_id in ["policy-deadline", "policy-unrelated"] {
+        for session_id in ["policy-drain", "policy-unrelated"] {
             store
                 .create_session(&session::SessionRecord {
                     session_id: session_id.to_string(),
@@ -6461,33 +6423,49 @@ mod tests {
                 .unwrap()
                 .insert(session_id.to_string(), initial.clone());
         }
-        let (old_cancel, old_guard) = service
-            .install_active_turn_control("old-turn", "policy-deadline", None)
+        let (active_cancel, active_guard) = service
+            .install_active_turn_control("active-turn", "policy-drain", None)
             .unwrap();
         let (unrelated_cancel, unrelated_guard) = service
             .install_active_turn_control("other-turn", "policy-unrelated", None)
             .unwrap();
-        let old_task = tokio::spawn(async move {
-            old_cancel.cancelled().await;
-            drop(old_guard);
-        });
         let transition = service
             .set_session_execution_policy(
-                "policy-deadline",
-                runtime::AutonomyProfileId::Cautious,
+                "policy-drain",
+                runtime::AutonomyProfileId::Yolo,
                 1,
                 runtime::SessionExecutionPolicyOrigin::SurfaceCommand,
             )
             .await
             .unwrap();
+        let receipt = transition.transition.unwrap();
         assert_eq!(
-            transition.transition.unwrap().phase,
+            receipt.phase,
             harness_contract::policy::PolicyTransitionPhase::Draining
         );
+        assert_eq!(receipt.old_revision_active_attempts, 1);
+
+        // The old drain-grace deadline is removed: after a grace period that
+        // used to force-cancel the turn, the running turn must still be
+        // alive and the transition must still be draining.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!active_cancel.is_cancelled());
+        let value = service
+            .session_execution_policy_value("policy-drain")
+            .await
+            .unwrap();
+        assert_eq!(value.permission_revision, Some(1));
+        assert_eq!(
+            value.transition.as_ref().unwrap().phase,
+            harness_contract::policy::PolicyTransitionPhase::Draining
+        );
+
+        // The turn finishes on its own terms; only then does Stable activate.
+        drop(active_guard);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let value = service
-                    .session_execution_policy_value("policy-deadline")
+                    .session_execution_policy_value("policy-drain")
                     .await
                     .unwrap();
                 if value.permission_revision == Some(2)
@@ -6501,8 +6479,7 @@ mod tests {
             }
         })
         .await
-        .expect("deadline cancellation settles before Stable");
-        old_task.await.unwrap();
+        .expect("natural turn completion settles before Stable");
         assert!(!unrelated_cancel.is_cancelled());
         assert!(service.is_session_turn_active("policy-unrelated", "other-turn"));
         drop(unrelated_guard);

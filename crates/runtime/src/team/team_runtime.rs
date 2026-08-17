@@ -834,6 +834,7 @@ impl TeamRuntime {
                 "graph_revision": team.graph_revision,
                 "status": team.status,
                 "agents": team.tasks,
+                "agent_displays": team.agent_displays,
                 "terminal_result": team.terminal_result,
                 "working_state": self
                     .working_state_for_graph(&team.team_id, &team.graph_id)

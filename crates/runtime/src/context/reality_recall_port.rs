@@ -669,6 +669,7 @@ mod tests {
             },
             release: None,
             evaluation: None,
+            display: None,
             binding_digest: "b".repeat(64),
         }
     }

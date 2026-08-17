@@ -115,7 +115,7 @@ fn build_projection(
         .into_iter()
         .filter(|team| team.mission_id.as_deref() == Some(selected_mission_id.as_str()))
         .collect::<Vec<_>>();
-    let agents = agent_nodes(&agent_projection)
+    let agents = agent_nodes(&agent_projection, &teams)
         .into_iter()
         .filter(|agent| agent.mission_id.as_deref() == Some(selected_mission_id.as_str()))
         .collect::<Vec<_>>();
@@ -242,7 +242,7 @@ fn build_projection(
         title: "Mission Control".to_string(),
         active_session_id,
         session_count: sessions.len(),
-        running_agent_count: agent_nodes(&agent_projection)
+        running_agent_count: agent_nodes(&agent_projection, &teams)
             .iter()
             .filter(|agent| agent.status.as_deref() == Some("running"))
             .count(),
@@ -664,14 +664,89 @@ fn team_nodes(
         .collect()
 }
 
-fn agent_nodes(agent_projection: &serde_json::Value) -> Vec<MissionControlAgentNode> {
-    agent_projection["agents"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|agent| {
-            Some(MissionControlAgentNode {
-                agent_id: value_string(agent, "agent_id")?,
+fn agent_nodes(
+    agent_projection: &serde_json::Value,
+    teams: &[MissionControlTeamNode],
+) -> Vec<MissionControlAgentNode> {
+    let displays = teams
+        .iter()
+        .flat_map(|team| {
+            team.detail["agent_displays"]
+                .as_array()
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|display| {
+            let agent_id = display.get("agent_id")?.as_str()?.to_string();
+            Some((
+                agent_id,
+                harness_contract::team::AgentDisplayIdentity {
+                    agent_id: display["agent_id"].as_str().unwrap_or_default().to_string(),
+                    label: display["label"].as_str().unwrap_or_default().to_string(),
+                    role_label: display["role_label"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    focus_label: display["focus_label"].as_str().map(str::to_owned),
+                    locale: display["locale"].as_str().unwrap_or_default().to_string(),
+                    provenance: display["provenance"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    digest: display["digest"].as_str().unwrap_or_default().to_string(),
+                },
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut nodes = BTreeMap::<String, MissionControlAgentNode>::new();
+    for team in teams {
+        let Some(traces) = team.detail["agents"].as_array() else {
+            continue;
+        };
+        for trace in traces {
+            let Some(agent_id) = trace.get("agent_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let display = displays.get(agent_id);
+            nodes.insert(
+                agent_id.to_string(),
+                MissionControlAgentNode {
+                    agent_id: agent_id.to_string(),
+                    mission_id: team.mission_id.clone(),
+                    task_id: trace
+                        .get("task_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    execution_id: Some(team.graph_id.clone()),
+                    team_id: Some(team.team_id.clone()),
+                    session_id: team.session_id.clone(),
+                    status: trace
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
+                    backend: None,
+                    detail: trace.clone(),
+                    display_label: display.map(|display| display.label.clone()),
+                    display_role_label: display.map(|display| display.role_label.clone()),
+                    display_focus_label: display.and_then(|display| display.focus_label.clone()),
+                    display_provenance: display.map(|display| display.provenance.clone()),
+                    display_digest: display.map(|display| display.digest.clone()),
+                },
+            );
+        }
+    }
+    for agent in agent_projection["agents"].as_array().into_iter().flatten() {
+        let Some(agent_id) = value_string(agent, "agent_id") else {
+            continue;
+        };
+        if nodes.contains_key(&agent_id) {
+            continue;
+        }
+        let display = displays.get(&agent_id);
+        nodes.insert(
+            agent_id.clone(),
+            MissionControlAgentNode {
+                agent_id,
                 mission_id: agent
                     .pointer("/execution_identity/mission_id")
                     .and_then(serde_json::Value::as_str)
@@ -691,9 +766,15 @@ fn agent_nodes(agent_projection: &serde_json::Value) -> Vec<MissionControlAgentN
                 status: value_string(agent, "state").or_else(|| value_string(agent, "status")),
                 backend: value_string(agent, "backend"),
                 detail: agent.clone(),
-            })
-        })
-        .collect()
+                display_label: display.map(|display| display.label.clone()),
+                display_role_label: display.map(|display| display.role_label.clone()),
+                display_focus_label: display.and_then(|display| display.focus_label.clone()),
+                display_provenance: display.map(|display| display.provenance.clone()),
+                display_digest: display.map(|display| display.digest.clone()),
+            },
+        );
+    }
+    nodes.into_values().collect()
 }
 
 fn mission_graph(
@@ -733,6 +814,11 @@ fn mission_graph(
             execution_id: None,
             team_id: None,
             agent_id: None,
+            display_label: None,
+            display_role_label: None,
+            display_focus_label: None,
+            display_provenance: None,
+            display_digest: None,
         },
     );
 
@@ -751,6 +837,11 @@ fn mission_graph(
                 execution_id: None,
                 team_id: None,
                 agent_id: None,
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
     }
@@ -770,6 +861,11 @@ fn mission_graph(
                 execution_id: None,
                 team_id: None,
                 agent_id: None,
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
     }
@@ -842,6 +938,11 @@ fn mission_graph(
                 execution_id: Some(graph_id.clone()),
                 team_id: None,
                 agent_id: None,
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
         if let Some(graph) = graph {
@@ -867,6 +968,11 @@ fn mission_graph(
                         execution_id: Some(graph_id.clone()),
                         team_id: None,
                         agent_id: None,
+                        display_label: None,
+                        display_role_label: None,
+                        display_focus_label: None,
+                        display_provenance: None,
+                        display_digest: None,
                     });
                 insert_graph_edge(
                     &mut edges,
@@ -890,6 +996,11 @@ fn mission_graph(
                         execution_id: Some(graph_id.clone()),
                         team_id: None,
                         agent_id: None,
+                        display_label: None,
+                        display_role_label: None,
+                        display_focus_label: None,
+                        display_provenance: None,
+                        display_digest: None,
                     });
                 insert_graph_edge(
                     &mut edges,
@@ -917,6 +1028,11 @@ fn mission_graph(
                 execution_id: Some(team.graph_id.clone()),
                 team_id: Some(team.team_id.clone()),
                 agent_id: None,
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
     }
@@ -950,6 +1066,11 @@ fn mission_graph(
                 execution_id: agent.execution_id.clone(),
                 team_id: agent.team_id.clone(),
                 agent_id: Some(agent.agent_id.clone()),
+                display_label: agent.display_label.clone(),
+                display_role_label: agent.display_role_label.clone(),
+                display_focus_label: agent.display_focus_label.clone(),
+                display_provenance: agent.display_provenance.clone(),
+                display_digest: agent.display_digest.clone(),
             },
         );
     }
@@ -972,6 +1093,11 @@ fn mission_graph(
                 execution_id: None,
                 team_id: None,
                 agent_id: None,
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
     }
@@ -1004,6 +1130,11 @@ fn mission_graph(
                 execution_id: None,
                 team_id: None,
                 agent_id: None,
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
     }
@@ -1035,6 +1166,11 @@ fn mission_graph(
                 execution_id: None,
                 team_id: None,
                 agent_id: None,
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
     }
@@ -1057,6 +1193,11 @@ fn mission_graph(
                 execution_id: None,
                 team_id: None,
                 agent_id: None,
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
     }
@@ -1386,6 +1527,64 @@ fn value_string(value: &serde_json::Value, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::RuntimeEventInput;
+
+    #[test]
+    fn agent_nodes_carry_frozen_display_identity_from_team_projection() {
+        let teams = vec![MissionControlTeamNode {
+            team_id: "team-1".to_string(),
+            graph_id: "team-graph:team-1".to_string(),
+            mission_id: Some("mission-1".to_string()),
+            task_id: Some("task-team-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            status: Some("running".to_string()),
+            agent_count: 2,
+            detail: serde_json::json!({
+                "agents": [
+                    {"task_id": "task-r1", "agent_id": "instance:agent:r1", "status": "running"},
+                    {"task_id": "task-s1", "agent_id": "instance:agent:s1", "status": "planned"}
+                ],
+                "agent_displays": [
+                    {
+                        "agent_id": "instance:agent:r1",
+                        "label": "Explore",
+                        "role_label": "Investigate",
+                        "focus_label": "primary-sources",
+                        "locale": "auto",
+                        "provenance": "runtime.agent-binding:abc",
+                        "digest": "d1"
+                    }
+                ]
+            }),
+        }];
+        let nodes = agent_nodes(&serde_json::json!({ "agents": [] }), &teams);
+        assert_eq!(nodes.len(), 2);
+        let researcher = nodes
+            .iter()
+            .find(|node| node.agent_id == "instance:agent:r1")
+            .expect("researcher node");
+        assert_eq!(researcher.mission_id.as_deref(), Some("mission-1"));
+        assert_eq!(researcher.team_id.as_deref(), Some("team-1"));
+        assert_eq!(researcher.status.as_deref(), Some("running"));
+        assert_eq!(researcher.display_label.as_deref(), Some("Explore"));
+        assert_eq!(
+            researcher.display_role_label.as_deref(),
+            Some("Investigate")
+        );
+        assert_eq!(
+            researcher.display_focus_label.as_deref(),
+            Some("primary-sources")
+        );
+        assert_eq!(
+            researcher.display_provenance.as_deref(),
+            Some("runtime.agent-binding:abc")
+        );
+        assert_eq!(researcher.display_digest.as_deref(), Some("d1"));
+        let synthesizer = nodes
+            .iter()
+            .find(|node| node.agent_id == "instance:agent:s1")
+            .expect("synthesizer node");
+        assert_eq!(synthesizer.display_label, None);
+    }
 
     #[test]
     fn projection_uses_gateway_supplied_canonical_sessions() {

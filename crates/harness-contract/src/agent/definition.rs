@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{AgentOutputContract, AgentTaskIntent, AgentTaskPacket};
+use crate::team::AgentDisplayIdentity;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -675,6 +676,12 @@ pub struct AgentBindingSnapshot {
     /// hatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation: Option<AgentEvaluationBinding>,
+    /// Immutable human-facing display identity compiled from the frozen Team
+    /// role and Agent Definition. `None` on legacy or unbound packets; the
+    /// Runtime attaches it to every Team-slot Binding before the graph is
+    /// persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<AgentDisplayIdentity>,
     pub binding_digest: String,
 }
 

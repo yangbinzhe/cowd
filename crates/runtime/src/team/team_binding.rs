@@ -557,6 +557,7 @@ mod tests {
                 },
                 release: None,
                 evaluation: None,
+                display: None,
                 binding_digest: "binding-digest".to_string(),
             }),
             agent_name: "Execute".to_string(),

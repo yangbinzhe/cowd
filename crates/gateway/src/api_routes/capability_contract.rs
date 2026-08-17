@@ -1554,7 +1554,12 @@ fn mission_control_agent_node_schema() -> Value {
             "session_id": {"type": ["string", "null"]},
             "status": {"type": ["string", "null"]},
             "backend": {"type": ["string", "null"]},
-            "detail": {"type": "object", "additionalProperties": true}
+            "detail": {"type": "object", "additionalProperties": true},
+            "display_label": {"type": ["string", "null"]},
+            "display_role_label": {"type": ["string", "null"]},
+            "display_focus_label": {"type": ["string", "null"]},
+            "display_provenance": {"type": ["string", "null"]},
+            "display_digest": {"type": ["string", "null"]}
         },
         "additionalProperties": false
     })
@@ -1574,7 +1579,12 @@ fn mission_control_graph_node_schema() -> Value {
             "task_id": {"type": ["string", "null"]},
             "execution_id": {"type": ["string", "null"]},
             "team_id": {"type": ["string", "null"]},
-            "agent_id": {"type": ["string", "null"]}
+            "agent_id": {"type": ["string", "null"]},
+            "display_label": {"type": ["string", "null"]},
+            "display_role_label": {"type": ["string", "null"]},
+            "display_focus_label": {"type": ["string", "null"]},
+            "display_provenance": {"type": ["string", "null"]},
+            "display_digest": {"type": ["string", "null"]}
         },
         "additionalProperties": false
     })

@@ -56,6 +56,11 @@ pub struct TeamDisplayIdentity {
 /// Immutable human-facing agent display identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentDisplayIdentity {
+    /// Stable machine identity of the agent instance this display describes.
+    /// Surfaces use it to join display identity to agent activities and
+    /// graph nodes; it is never a display title.
+    #[serde(default)]
+    pub agent_id: String,
     pub label: String,
     pub role_label: String,
     pub focus_label: Option<String>,

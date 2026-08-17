@@ -357,6 +357,7 @@ impl AgentBindingCompiler {
             data_lease,
             release,
             evaluation: None,
+            display: None,
             binding_digest: String::new(),
         };
         snapshot.binding_digest = digest(
@@ -511,6 +512,17 @@ fn normalize_instructions(value: &str) -> String {
 
 fn digest(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
+/// Recompute the immutable Binding digest after the frozen Team-slot display
+/// identity is attached. The digest always covers the exact serialized
+/// Binding bytes so validation can never diverge from the persisted packet.
+pub(crate) fn recompute_binding_digest(
+    snapshot: &AgentBindingSnapshot,
+) -> Result<String, serde_json::Error> {
+    let mut unsigned = snapshot.clone();
+    unsigned.binding_digest.clear();
+    Ok(digest(&serde_json::to_string(&unsigned)?))
 }
 
 pub(crate) fn capability_required_by_tool_contract(tool_ref: &str) -> AgentCapability {

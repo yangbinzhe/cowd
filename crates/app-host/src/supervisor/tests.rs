@@ -374,8 +374,8 @@ async fn optional_resident_failure_is_isolated_but_required_failure_fails_startu
     .expect("supervisor");
     assert!(matches!(
         supervisor.start_resident().await,
-        Err(SupervisorError::RequiredResidentsFailed(ids))
-            if ids == vec![AppId("required-bad".to_owned())]
+        Err(SupervisorError::RequiredResidentsFailed { apps, .. })
+            if apps == vec![AppId("required-bad".to_owned())]
     ));
     wait_for_state(
         &supervisor,

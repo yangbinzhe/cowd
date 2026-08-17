@@ -262,7 +262,8 @@ fn project_single_execution_activities_from_events(
                 scope: root_scope.clone(),
                 kind: activity_kind(node.kind, &node.executor_kind),
                 node_id: Some(node.node_id.clone()),
-                display_label: node_display_label(node.kind, &node.executor_kind),
+                display_label: node_display_label(node.kind, &node.executor_kind)
+                    .or_else(|| agent_binding_display_label(&node_events)),
                 phase: Some(node_phase(node.kind).to_string()),
                 visibility: visibility(node.kind),
                 parent_activity_id: Some(root_id.clone()),
@@ -1234,6 +1235,8 @@ fn event_display_label(event: &DurableRuntimeEvent, kind: ExecutionActivityKind)
     .iter()
     .find_map(|key| value_string(&event.payload, key))
     .or_else(|| pointer_string(&event.payload, "/snapshot/display_name"))
+    .or_else(|| pointer_string(&event.payload, "/snapshot/binding/display/label"))
+    .or_else(|| pointer_string(&event.payload, "/snapshot/binding/display/role_label"))
     .or_else(|| pointer_string(&event.payload, "/snapshot/binding/instance/role_slot_id"))
     .or_else(|| match kind {
         ExecutionActivityKind::Team => event_team_run_id(event),
@@ -1246,6 +1249,17 @@ fn event_display_label(event: &DurableRuntimeEvent, kind: ExecutionActivityKind)
     })
     .and_then(|value| non_empty(&value))
     .map(|value| crop(&value, 120))
+}
+
+fn agent_binding_display_label(events: &[&DurableRuntimeEvent]) -> Option<String> {
+    events
+        .iter()
+        .filter_map(|event| {
+            pointer_string(&event.payload, "/snapshot/binding/display/label")
+                .or_else(|| pointer_string(&event.payload, "/snapshot/binding/display/role_label"))
+        })
+        .find_map(|value| non_empty(&value))
+        .map(|value| crop(&value, 120))
 }
 
 fn event_phase(event: &DurableRuntimeEvent) -> Option<String> {

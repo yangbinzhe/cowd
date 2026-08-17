@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 pub fn compile_agent_display_identity(
     binding: &AgentBindingSnapshot,
     role: &TeamRoleBindingSnapshot,
+    agent_id: &str,
     agent_name: &str,
     agent_description: &str,
 ) -> AgentDisplayIdentity {
@@ -31,6 +32,7 @@ pub fn compile_agent_display_identity(
         )
     );
     AgentDisplayIdentity {
+        agent_id: agent_id.to_string(),
         label,
         role_label,
         focus_label,
@@ -108,6 +110,7 @@ mod tests {
             },
             release: None,
             evaluation: None,
+            display: None,
             binding_digest: "binding-digest".to_string(),
         }
     }
@@ -115,10 +118,21 @@ mod tests {
     #[test]
     fn display_label_changes_digest_but_never_behavior() {
         let behavior = role("Implementer").behavior;
-        let english =
-            compile_agent_display_identity(&binding(), &role("Implementer"), "Execute", "Executes");
-        let chinese =
-            compile_agent_display_identity(&binding(), &role("实现者"), "执行者", "执行有界变更");
+        let english = compile_agent_display_identity(
+            &binding(),
+            &role("Implementer"),
+            "agent:implementer:1",
+            "Execute",
+            "Executes",
+        );
+        let chinese = compile_agent_display_identity(
+            &binding(),
+            &role("实现者"),
+            "agent:implementer:1",
+            "执行者",
+            "执行有界变更",
+        );
+        assert_eq!(english.agent_id, "agent:implementer:1");
         assert_eq!(english.role_label, "Implementer");
         assert_eq!(chinese.role_label, "实现者");
         assert_ne!(english.digest, chinese.digest);
