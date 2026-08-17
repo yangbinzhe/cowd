@@ -663,6 +663,7 @@ fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
         })
 }
 
+#[cfg(test)]
 fn runtime_team_orchestration_count(call: &ModelToolCall) -> usize {
     if !is_runtime_team_orchestration_call_name(&call.name) {
         return 0;
