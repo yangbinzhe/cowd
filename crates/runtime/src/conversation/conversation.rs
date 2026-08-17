@@ -607,14 +607,14 @@ fn enforce_explicit_team_requirement(
     );
 
     match intent {
-        ModelStepIntent::ToolCalls { mut calls } => {
-            ensure_explicit_team_cardinality(
-                objective,
-                &decision.strategy.understanding,
-                &mut calls,
-            );
-            ModelStepIntent::ToolCalls { calls }
-        }
+        // The first move belongs to the model. It may call
+        // runtime_capabilities, propose_template, or propose to self-
+        // orchestrate a custom team; injecting a builtin Team proposal into
+        // its first tool batch would preempt custom template publication and
+        // defeat AI-authored orchestration. The FinalAnswer/Replan gates
+        // below remain the last resort when the model tries to finish without
+        // any verified Team execution.
+        ModelStepIntent::ToolCalls { calls } => ModelStepIntent::ToolCalls { calls },
         ModelStepIntent::FinalAnswer { .. } => ModelStepIntent::ToolCalls {
             calls: vec![required_team_orchestration_call_with_understanding(
                 objective,
@@ -628,29 +628,6 @@ fn enforce_explicit_team_requirement(
             )],
         },
     }
-}
-
-fn ensure_explicit_team_cardinality(
-    objective: &str,
-    understanding: &harness_contract::strategy::TaskUnderstanding,
-    calls: &mut Vec<ModelToolCall>,
-) {
-    let required = usize::from(understanding.required_team_count.max(1));
-    let proposed = calls
-        .iter()
-        .map(runtime_team_orchestration_count)
-        .sum::<usize>();
-    if proposed >= required {
-        return;
-    }
-    // One canonical graph is easier to validate and observe than several
-    // provider-authored partial Team proposals. Preserve unrelated tool calls
-    // but replace incomplete Team topology with the Runtime-owned contract.
-    calls.retain(|call| !is_runtime_team_orchestration_call(call));
-    calls.push(required_team_orchestration_call_with_understanding(
-        objective,
-        understanding,
-    ));
 }
 
 fn apply_explicit_team_requirement(
@@ -14237,7 +14214,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_team_requirement_cannot_be_bypassed_by_agent_named_tool_calls() {
+    fn explicit_team_requirement_does_not_preempt_first_step_model_tool_calls() {
         let objective = "必须实际启动协作团队，再分析这些模块。";
         let decision = build_runtime_execution_decision(objective, None);
         let classified = classify_model_step_intent(
@@ -14252,10 +14229,11 @@ mod tests {
         let intent = enforce_explicit_team_requirement(objective, true, &decision, classified);
 
         let ModelStepIntent::ToolCalls { calls } = intent else {
-            panic!("provider-specific agent proposals must enter the canonical tool batch");
+            panic!("first-step tool calls must stay untouched");
         };
-        assert_eq!(calls.len(), 2);
-        assert!(calls.iter().any(is_runtime_team_orchestration_call));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "agent_helper");
+        assert!(!calls.iter().any(is_runtime_team_orchestration_call));
     }
 
     #[test]

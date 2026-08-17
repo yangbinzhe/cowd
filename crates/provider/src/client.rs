@@ -237,18 +237,26 @@ impl ProviderClient {
         }
     }
 
-    /// 规范化 OpenAI 兼容 API 的 base URL：确保以 /v1 结尾
+    /// 规范化 OpenAI 兼容 API 的 base URL。
+    /// 只有裸主机（无路径）才追加 `/v1`；带显式 API 路径的 base URL
+    /// （如 `/compatible-mode/v1`、`/api/paas/v4`）被视为完整 API 根，
+    /// 追加 `/v1` 会破坏路径（例如 zhipu `/api/paas/v4` 变成
+    /// `/v4/v1` 导致 404）。
     fn normalize_openai_url(base_url: &str) -> String {
         let trimmed = base_url.trim_end_matches('/');
         if trimmed.ends_with("/v1")
             || trimmed.ends_with("/responses")
             || trimmed.ends_with("/chat/completions")
         {
+            return trimmed.to_string();
+        }
+        let after_scheme = trimmed
+            .split_once("://")
+            .map_or(trimmed, |(_, rest)| rest);
+        if after_scheme.contains('/') {
             trimmed.to_string()
-        } else if base_url.ends_with('/') {
-            format!("{base_url}v1")
         } else {
-            format!("{base_url}/v1")
+            format!("{trimmed}/v1")
         }
     }
 
@@ -377,5 +385,33 @@ mod tests {
             }
             other => panic!("Expected ProviderClient::OpenAi for qwen-plus, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn openai_base_url_normalization_keeps_explicit_api_paths() {
+        assert_eq!(
+            ProviderClient::normalize_openai_url("https://api.example.com"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            ProviderClient::normalize_openai_url("https://api.example.com/"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            ProviderClient::normalize_openai_url("https://api.example.com/v1"),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            ProviderClient::normalize_openai_url(
+                "https://open.bigmodel.cn/api/paas/v4"
+            ),
+            "https://open.bigmodel.cn/api/paas/v4"
+        );
+        assert_eq!(
+            ProviderClient::normalize_openai_url(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            ),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
     }
 }
