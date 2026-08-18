@@ -272,6 +272,47 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
             }
         }
     }
+    // Full-trust Teams with a bounded write target still need a whole-workspace
+    // read lease to investigate sources; otherwise role agents are blocked on
+    // their first read/glob even though write is correctly bounded to the
+    // explicit artifact. Read never mutates and remains bounded by the
+    // danger-full-access ceiling.
+    if request
+        .constraints
+        .permission_ceiling
+        .permits(harness_contract::policy::PermissionMode::DangerFullAccess)
+    {
+        let workspace_read = "read:.".to_string();
+        for node in &mut proposal.nodes {
+            let has_write = node
+                .resource_scopes
+                .iter()
+                .any(|scope| scope.starts_with("write:"));
+            let missing_read = !node
+                .resource_scopes
+                .iter()
+                .any(|scope| scope.starts_with("read:"));
+            if has_write
+                && missing_read
+                && (node.recipe == CapabilityRecipeId::Team
+                    || matches!(
+                        node.recipe,
+                        CapabilityRecipeId::Agent
+                            | CapabilityRecipeId::Review
+                            | CapabilityRecipeId::Synthesis
+                    ))
+            {
+                node.resource_scopes.push(workspace_read.clone());
+                node.resource_scopes.sort();
+                node.resource_scopes.dedup();
+                if node.recipe == CapabilityRecipeId::Team {
+                    scopes.push(workspace_read.clone());
+                }
+            }
+        }
+        scopes.sort();
+        scopes.dedup();
+    }
     request
         .capabilities
         .retain(|value| !value.starts_with("resource:"));
@@ -1879,6 +1920,13 @@ mod tests {
                 .iter()
                 .any(|scope| scope == "write:."),
             "custom write-capable template must receive a bounded workspace write lease: {:?}",
+            team.resource_scopes
+        );
+        assert!(
+            team.resource_scopes
+                .iter()
+                .any(|scope| scope == "read:."),
+            "full-trust write teams must also receive a whole-workspace read lease: {:?}",
             team.resource_scopes
         );
         assert!(

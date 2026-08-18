@@ -1059,10 +1059,17 @@ fn run_checkpoint_restore(
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result<String, String> {
-    let fingerprint = scope_fingerprint(lease.path_policy(), input.path.as_deref())?;
-    let scope = directory_cache_scope(lease.path_policy(), input.path.as_deref())?;
+    // Empty/missing paths are normalized to the workspace root so models are
+    // not blocked on their first discovery call.
+    let resolved_path = input
+        .path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(".");
+    let fingerprint = scope_fingerprint(lease.path_policy(), Some(resolved_path))?;
+    let scope = directory_cache_scope(lease.path_policy(), Some(resolved_path))?;
     cached_json_tool(lease, "glob_search", &input, &fingerprint, &scope, || {
-        glob_search(lease.path_policy(), &input.pattern, input.path.as_deref())
+        glob_search(lease.path_policy(), &input.pattern, Some(resolved_path))
             .map_err(io_to_string)
     })
 }
