@@ -6318,12 +6318,26 @@ where
                 let intervention = if post_receipt_failure {
                     let already_synthesizing =
                         clean_terminal_synthesis || clean_terminal_synthesis_attempted;
-                    let kind =
-                        provider_failure_intervention_kind_after_receipt(already_synthesizing);
+                    // A tool-protocol violation inside the zero-tool synthesis
+                    // means the model emitted tool calls despite no exposed
+                    // schemas. Give that synthesis ONE strict text-only retry
+                    // before blocking, so a committed write receipt is not
+                    // lost to a single model protocol slip.
+                    let allow_protocol_synthesis_retry = protocol_failure
+                        && clean_terminal_synthesis_attempted
+                        && !clean_terminal_synthesis;
+                    let kind = if already_synthesizing && !allow_protocol_synthesis_retry {
+                        provider_failure_intervention_kind_after_receipt(already_synthesizing)
+                    } else {
+                        RuntimeInterventionKind::Synthesize
+                    };
                     harness_contract::goal::RuntimeIntervention {
                         goal_id: goal_id.clone(),
                         kind,
-                        reason: if kind == RuntimeInterventionKind::Synthesize {
+                        reason: if allow_protocol_synthesis_retry {
+                            "provider emitted tool calls during zero-tool synthesis; retry once with strict text-only output while preserving the committed receipt"
+                                .to_string()
+                        } else if kind == RuntimeInterventionKind::Synthesize {
                             "the provider failed after a committed tool receipt; preserve the receipt and synthesize once from retained evidence with zero tools instead of retrying the provider action"
                                 .to_string()
                         } else {
