@@ -304,9 +304,14 @@ fn provider_tool_choice(
         (true, _, CapabilityState::Unknown) => Err(RuntimeError::new(
             "provider explicit tool_choice capability is unknown; refusing to guess from its model name",
         )),
-        (true, true, CapabilityState::Unsupported) => Err(RuntimeError::new(
-            "provider does not support the explicit required tool_choice needed by this governed action",
-        )),
+        // Models with explicit tool_choice known-unsupported (DeepSeek v4)
+        // reject the field on the wire; omitting it is the supported path and
+        // the required intent is preserved by exposing only the single
+        // required tool schema. Never fail a governed synthesis on this.
+        (true, true, CapabilityState::Unsupported) => {
+            tracing::debug!("provider tool_choice omitted: explicit field unsupported on the wire");
+            Ok(None)
+        }
         (true, false, CapabilityState::Unsupported) => Ok(None),
         (true, true, CapabilityState::Supported) => Ok(Some(ToolChoice::Any)),
         (true, false, CapabilityState::Supported) => Ok(Some(ToolChoice::Auto)),
@@ -1730,9 +1735,10 @@ mod tests {
             provider_tool_choice(true, false, CapabilityState::Unsupported).unwrap(),
             None
         );
-        assert!(
-            provider_tool_choice(true, true, CapabilityState::Unsupported).is_err(),
-            "a required tool_choice must block before any network request"
+        assert_eq!(
+            provider_tool_choice(true, true, CapabilityState::Unsupported).unwrap(),
+            None,
+            "wire-unsupported tool_choice is omitted; the required intent is enforced by single-tool exposure"
         );
         assert!(provider_tool_choice(true, false, CapabilityState::Unknown).is_err());
         assert_eq!(
@@ -1743,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_v4_thinking_required_tool_choice_blocks_before_network() {
+    fn deepseek_v4_thinking_required_tool_choice_omits_before_network() {
         let thinking = ProviderCapabilityProfile::resolve_for_reasoning_mode(
             model_protocol::provider_config::ProviderProtocol::Completions,
             "deepseek-v4-flash",
@@ -1753,8 +1759,9 @@ mod tests {
             thinking.supports_explicit_tool_choice.state,
             CapabilityState::Unsupported
         );
-        assert!(
-            provider_tool_choice(true, true, thinking.supports_explicit_tool_choice.state).is_err()
+        assert_eq!(
+            provider_tool_choice(true, true, thinking.supports_explicit_tool_choice.state).unwrap(),
+            None
         );
         assert_eq!(
             provider_tool_choice(true, false, thinking.supports_explicit_tool_choice.state)
@@ -1771,9 +1778,14 @@ mod tests {
             non_thinking.supports_explicit_tool_choice.state,
             CapabilityState::Unsupported
         );
-        assert!(
-            provider_tool_choice(true, true, non_thinking.supports_explicit_tool_choice.state)
-                .is_err()
+        assert_eq!(
+            provider_tool_choice(
+                true,
+                true,
+                non_thinking.supports_explicit_tool_choice.state
+            )
+            .unwrap(),
+            None
         );
         assert_eq!(
             provider_tool_choice(true, false, non_thinking.supports_explicit_tool_choice.state)
