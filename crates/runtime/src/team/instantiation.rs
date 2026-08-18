@@ -953,8 +953,18 @@ pub(crate) fn team_acceptance_contract(
     allow_legacy_custom_contract: bool,
     upstream_synthesis_role: bool,
 ) -> Result<Vec<TeamAcceptanceRequirement>, String> {
+    let bounded = |scope: &String| {
+        // Whole-workspace aliases are tool-authorization leases, not verifiable
+        // acceptance obligations: `read:.` can never be "fully satisfied" and
+        // would block a role that already committed its real write target.
+        !matches!(
+            scope.trim(),
+            "read:." | "read:./" | "write:." | "write:./" | "workspace" | "workspace:."
+        )
+    };
     let workspace_scopes = resource_scopes
         .iter()
+        .filter(|scope| bounded(scope))
         .filter(|scope| {
             scope.starts_with("read:")
                 || scope.starts_with("write:")
@@ -964,6 +974,7 @@ pub(crate) fn team_acceptance_contract(
         .collect::<Vec<_>>();
     let evidence_scopes = resource_scopes
         .iter()
+        .filter(|scope| bounded(scope))
         .filter(|scope| {
             scope.starts_with("read:")
                 || scope.starts_with("write:")
@@ -979,6 +990,7 @@ pub(crate) fn team_acceptance_contract(
     let evidence_scopes = if evidence_scopes.is_empty() {
         resource_scopes
             .iter()
+            .filter(|scope| bounded(scope))
             .filter(|scope| scope.starts_with("session:"))
             .cloned()
             .collect::<Vec<_>>()
