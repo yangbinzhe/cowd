@@ -32,7 +32,13 @@ type DeadlineWake = Arc<dyn Fn(String) -> DeadlineWakeFuture + Send + Sync + 'st
 /// authority. Only these exact identities may commit a Global approval
 /// without a human actor; every other policy/typed/timeout actor stays
 /// subject to `global_approval_requires_human_actor`.
-pub const TRUST_ALL_POLICY_ACTOR_IDS: &[&str] = &["yolo-trust-all", "autonomous-session-policy"];
+pub const TRUST_ALL_POLICY_ACTOR_IDS: &[&str] = &[
+    "yolo-trust-all",
+    "autonomous-session-policy",
+    // Canonical actor emitted only when the global ApprovalRouter decides
+    // AutoApprove for Autonomous/YOLO (or workspace trust-all) profiles.
+    "approval-router-auto",
+];
 
 #[derive(Debug)]
 pub(crate) struct CanonicalGraphDecisionEvents {

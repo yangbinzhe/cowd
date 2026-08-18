@@ -449,11 +449,10 @@ async fn propose_template(
         false,
         true,
     );
-    if matches!(
-        router_decision,
-        crate::approval_router::ApprovalDecision::AutoApprove
-            | crate::approval_router::ApprovalDecision::StewardApprove
-    ) {
+    // Global template publication is committed by the canonical router actor
+    // only for Autonomous/YOLO. Steward decisions fall through to the pending
+    // human queue because a Global grant cannot be committed by a Steward.
+    if router_decision == crate::approval_router::ApprovalDecision::AutoApprove {
         services
             .approval_queue()
             .decide_internal(ApprovalDecisionCommand {
@@ -463,20 +462,8 @@ async fn propose_template(
                 reason: format!("approval router {router_decision:?} for template publish"),
                 scope: ApprovalGrantScope::Global,
                 actor: ApprovalDecisionActor {
-                    kind: if router_decision
-                        == crate::approval_router::ApprovalDecision::StewardApprove
-                    {
-                        ApprovalDecisionActorKind::StewardAgent
-                    } else {
-                        ApprovalDecisionActorKind::Policy
-                    },
-                    actor_id: if router_decision
-                        == crate::approval_router::ApprovalDecision::StewardApprove
-                    {
-                        "runtime-approval-steward".to_string()
-                    } else {
-                        "approval-router-auto".to_string()
-                    },
+                    kind: ApprovalDecisionActorKind::Policy,
+                    actor_id: "approval-router-auto".to_string(),
                 },
                 evidence_refs: vec![
                     "approval.router.auto".to_string(),
