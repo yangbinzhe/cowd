@@ -526,12 +526,26 @@ fn compile_team_subgraph_node(
         .len()
         .max(1);
     let mut team_request = team_request;
+    // A healthy, progressing Team must never be killed by a wall-clock
+    // deadline: slow-but-valid roles, long provider calls and genuinely long
+    // tasks are legitimate and may run for a very long time. There is no
+    // time budget at all; termination is driven by intelligent catastrophe
+    // detection only — dead loops (repeated identical tool batches with no
+    // new evidence), crashes and severe provider/framework faults. Long
+    // sessions surface periodic user warnings and a finalize command instead
+    // of a hard cut. Per-role budgets are metered for tokens, never for
+    // wall-clock admission.
+    let max_parallel = team_parallelism_ladder(role_branch_count)
+        .max(request.constraints.max_parallel_agents.unwrap_or(0))
+        .clamp(1, TEAM_PARALLELISM_HARD_CEILING);
+    let scaled_deadline = u64::MAX;
+    team_request.deadline_at_ms = scaled_deadline;
     team_request.execution_budget = adaptive_team_execution_budget(
         format!("runtime-team-budget:{node_id}"),
         request,
         semantic,
-        deadline_at_ms,
-        request.constraints.max_parallel_agents.unwrap_or(32),
+        scaled_deadline,
+        max_parallel,
         role_branch_count,
     );
     team_runtime
@@ -550,6 +564,25 @@ fn compile_team_subgraph_node(
     node.acceptance.criteria = semantic.evidence_contract.clone();
     node.acceptance.required_evidence = semantic.output_artifacts.clone();
     Ok(node)
+}
+
+/// Agent parallelism ladder for Team execution. The default starts at 8 and
+/// escalates with the team's role count (8 → 16 → 64 → 256) so a larger team
+/// is never serialized into an unnecessarily long wave chain. The ladder is
+/// a scheduling floor, not a cap: an explicit higher model request is honored
+/// up to `TEAM_PARALLELISM_HARD_CEILING`.
+const TEAM_PARALLELISM_HARD_CEILING: usize = 256;
+
+fn team_parallelism_ladder(role_count: usize) -> usize {
+    if role_count <= 8 {
+        8
+    } else if role_count <= 16 {
+        16
+    } else if role_count <= 64 {
+        64
+    } else {
+        256
+    }
 }
 
 fn focus_partition_plans(
@@ -899,6 +932,47 @@ pub(crate) fn materialize_completion(
     };
     materialized.required_node_ids.sort();
     materialized.required_node_ids.dedup();
+    // Required artifact kinds must be reachable by an authorized node. A model
+    // proposal may over-declare artifacts (for example a `*.json` terminal
+    // file) that no Team node's resource lease can actually write; keeping
+    // them in the completion contract makes the graph unsatisfiable even when
+    // every role delivered its real output. Path-like artifacts declared by a
+    // required Team node are retained only when at least one Team write scope
+    // covers them. Generic kinds (`terminal_synthesis`, `workspace_change`)
+    // and non-Team node artifacts keep the established semantics.
+    let mut retainable_artifacts = BTreeSet::<String>::new();
+    for node in semantic_nodes.iter().filter(|node| node.required) {
+        if node.recipe == CapabilityRecipeId::Team {
+            let write_paths = node
+                .resource_scopes
+                .iter()
+                .filter_map(|scope| scope.strip_prefix("write:"))
+                .map(|path| path.trim_end_matches('/'))
+                .collect::<BTreeSet<_>>();
+            for artifact in &node.output_artifacts {
+                // Generic kinds and artifacts covered by the Team's write
+                // lease stay; path-like artifacts the Team cannot write are
+                // dropped so the completion contract stays satisfiable.
+                let path_like = artifact.contains('.');
+                let covered = write_paths.iter().any(|path| {
+                    artifact == path
+                        || artifact.strip_prefix("./") == Some(path)
+                        || path.strip_prefix("./") == Some(artifact.as_str())
+                });
+                if !path_like || covered {
+                    retainable_artifacts.insert(artifact.clone());
+                }
+            }
+        } else {
+            // Non-Team node artifacts preserve the established semantics.
+            retainable_artifacts.extend(node.output_artifacts.iter().cloned());
+        }
+    }
+    if !retainable_artifacts.is_empty() {
+        materialized
+            .required_artifact_kinds
+            .retain(|artifact| retainable_artifacts.contains(artifact));
+    }
     materialized
 }
 

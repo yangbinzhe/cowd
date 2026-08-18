@@ -73,6 +73,13 @@ struct LiveExecutionRecord {
     own_model_usage: Option<crate::RunModelTelemetry>,
     #[serde(default)]
     descendant_model_usage: BTreeMap<String, crate::RunModelTelemetry>,
+    /// 30-minute warning buckets already surfaced for this execution. While a
+    /// healthy execution keeps progressing it is never cut by a wall-clock
+    /// deadline; instead the user is warned every 30 minutes and may choose to
+    /// continue or finalize (collect intermediate results and produce the
+    /// requested artifact).
+    #[serde(default)]
+    warning_buckets: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +125,7 @@ impl LiveExecutionRecord {
             reality_item_ids: BTreeSet::new(),
             own_model_usage: None,
             descendant_model_usage: BTreeMap::new(),
+            warning_buckets: 0,
         }
     }
 
@@ -815,6 +823,7 @@ impl ExecutionLiveStore {
         );
         let checkpoint_record = checkpoint.then(|| record.clone());
         let hot_record = changed.then(|| record.clone());
+        self.emit_long_running_warnings(expected_session_id, record);
         drop(records);
         if let Some(record) = checkpoint_record.as_ref() {
             let _ = self.persist_if_due(record, lifecycle_boundary);
@@ -828,6 +837,47 @@ impl ExecutionLiveStore {
         if let Some(parent_execution_id) = parent_execution_id {
             self.observe_descendant_event(&parent_execution_id, context, event);
         }
+    }
+
+    /// Healthy, progressing executions are never killed by a wall-clock
+    /// deadline. Every 30 minutes the Runtime surfaces a durable warning so
+    /// the user can either keep waiting for the final result or finalize
+    /// (collect intermediate results and produce the requested artifact).
+    fn emit_long_running_warnings(&self, session_id: &str, record: &mut LiveExecutionRecord) {
+        if matches!(
+            record.live.status,
+            ExecutionLiveStatus::Complete
+                | ExecutionLiveStatus::Error
+                | ExecutionLiveStatus::Cancelled
+        ) {
+            return;
+        }
+        let now = current_time_ms();
+        if now <= record.live.started_at_ms {
+            return;
+        }
+        let elapsed_minutes = (now - record.live.started_at_ms) / 60_000;
+        let buckets = elapsed_minutes / 30;
+        if buckets <= record.warning_buckets {
+            return;
+        }
+        for bucket in (record.warning_buckets + 1)..=buckets {
+            let minutes = bucket * 30;
+            let _ = self.event_store.append(crate::RuntimeEventInput {
+                stream_id: format!("session-live:{session_id}"),
+                scope: crate::RuntimeEventScope::Session,
+                kind: "runtime.long_running_warning".to_string(),
+                status: Some("active".to_string()),
+                actor: Some("runtime".to_string()),
+                payload: serde_json::json!({
+                    "execution_id": record.execution_id,
+                    "elapsed_minutes": minutes,
+                    "guidance": "执行仍在健康推进。可继续等待最终结果，或调用 finalize 立即回收中间成果并产出当前可交付产物。",
+                }),
+                refs: Vec::new(),
+            });
+        }
+        record.warning_buckets = buckets;
     }
 
     fn observe_descendant_event(

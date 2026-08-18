@@ -291,6 +291,39 @@ impl NodeExecutor for VerifyNodeExecutor {
                             satisfied_team_criteria.insert(criterion.to_ascii_lowercase());
                         }
                     }
+                    // Team result fields (e.g. `key_decisions` /
+                    // `unresolved_or_risks`) are owned by the Team contract,
+                    // not by any single role's acceptance list. A completed
+                    // role that actually materialized those fields in its
+                    // durable terminal JSON satisfies the corresponding Team
+                    // delivery criterion even when its own acceptance vector
+                    // does not enumerate them (the convergence role carries
+                    // the write obligation, not the full result contract).
+                    for required in &node.acceptance.criteria {
+                        let required_normalized = required.to_ascii_lowercase();
+                        if satisfied_team_criteria.contains(&required_normalized) {
+                            continue;
+                        }
+                        let summary = result.summary.as_deref().unwrap_or_default();
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(summary) {
+                            let Some(object) = value.as_object() else {
+                                continue;
+                            };
+                            let Some(field) = object.get(required.as_str()) else {
+                                continue;
+                            };
+                            let materialized = match field {
+                                serde_json::Value::Null => false,
+                                serde_json::Value::String(value) => !value.trim().is_empty(),
+                                serde_json::Value::Array(values) => !values.is_empty(),
+                                serde_json::Value::Object(values) => !values.is_empty(),
+                                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+                            };
+                            if materialized {
+                                satisfied_team_criteria.insert(required_normalized);
+                            }
+                        }
+                    }
                 }
             } else if team_verification {
                 invalid_team_slots.push(format!("{predecessor_id}:missing_committed_result"));

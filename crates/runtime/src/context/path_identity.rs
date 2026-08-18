@@ -929,6 +929,22 @@ pub fn observed_scope_satisfies(
     }
     let required_path = &required.path.workspace_relative_path;
     let observed_path = &observed.path.workspace_relative_path;
+    // The whole-workspace read alias (`read:.`) is a lease over every path in
+    // the workspace. Any Runtime-attested read observation — exact file reads,
+    // directory listings, glob discovery or recursive scans — proves access to
+    // that lease. Requiring an exact descendant read here made the obligation
+    // opaque to the model (a role globbing `.` was still told `read:.` was
+    // missing), which stalled convergence roles that were asked to write.
+    if required_path == "." {
+        return observed.access_mode == WorkspaceAccessMode::Read
+            && matches!(
+                observed.coverage,
+                EvidenceCoverageKind::ExactContent
+                    | EvidenceCoverageKind::RecursiveContent
+                    | EvidenceCoverageKind::GlobDiscovery
+                    | EvidenceCoverageKind::DirectoryListing
+            );
+    }
     match required.coverage {
         EvidenceCoverageKind::ExactContent => {
             observed.coverage == EvidenceCoverageKind::ExactContent

@@ -3078,6 +3078,107 @@ fn write_obligation_satisfied(
     })
 }
 
+#[cfg(test)]
+mod write_obligation_probe {
+    use super::*;
+
+    #[test]
+    fn root_read_alias_is_satisfied_by_descendant_exact_read() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("plan")).expect("dir");
+        std::fs::write(root.path().join("plan/doc.md"), "x").expect("doc");
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+                .expect("resolver");
+        let required = resolver
+            .compile_obligation_with_root_alias("read:.", true)
+            .expect("required read root");
+        let observed = resolver
+            .observe_tool_scope(
+                "read_file",
+                "read:plan/doc.md",
+                Some("abc"),
+                1,
+            )
+            .expect("observed read");
+        assert!(
+            crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
+                &required,
+                &[observed],
+            ),
+            "a descendant exact read must satisfy read:. root alias"
+        );
+        let glob = resolver
+            .observe_tool_scope("glob_search", "glob:plan", None, 2)
+            .expect("observed glob");
+        assert!(
+            crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
+                &required,
+                &[glob],
+            ),
+            "a workspace glob discovery must also satisfy the read:. lease"
+        );
+    }
+
+    #[test]
+    fn write_obligation_satisfied_matches_observed_write_receipt() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            root.path().join("cross-team-decision-report.html"),
+            "<html>report</html>",
+        )
+        .expect("report file");
+        let resolver =
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+                .expect("resolver");
+        let required =
+            resolver.compile_obligation("write:cross-team-decision-report.html")
+                .expect("required write");
+        let observed = resolver
+            .observe_tool_scope(
+                "write_file",
+                "write:cross-team-decision-report.html",
+                Some("d6340e8783fa57ad2c78f51b708e7e9f98f592fc3037a1003cb71fcbf343f108"),
+                7,
+            )
+            .expect("observed write receipt");
+        assert!(crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
+            &required,
+            &[observed.clone()],
+        ));
+        assert!(write_obligation_satisfied(
+            true,
+            &["write:cross-team-decision-report.html".to_string()],
+            &[observed],
+            false,
+            &resolver,
+        ));
+    }
+
+    #[test]
+    fn objective_absolute_path_extracts_relative_write_scope() {
+        let root = tempfile::tempdir().expect("workspace");
+        let canonical = root.path().canonicalize().expect("canonical root");
+        std::fs::write(
+            root.path().join("cross-team-decision-report.html"),
+            "<html>report</html>",
+        )
+        .expect("report file");
+        let objective = format!(
+            "必须先调用 write_file 把统一 HTML 决策报告写入 {}/cross-team-decision-report.html（覆盖 summary/evidence/key_decisions/unresolved_or_risks），写盘成功收据后再输出终态 JSON。",
+            canonical.display()
+        );
+        let scopes =
+            crate::orchestration::team_authority::explicit_workspace_resource_scopes(
+                root.path(),
+                &objective,
+                true,
+            );
+        println!("SCOPES_PROBE {scopes:?}");
+        assert!(scopes.iter().any(|scope| scope == "write:cross-team-decision-report.html"));
+    }
+}
+
 fn team_receipt_write_scopes(receipt: &serde_json::Value) -> BTreeSet<String> {
     receipt
         .get("write_attempt_paths")
@@ -11701,7 +11802,24 @@ fn typed_satisfied_focus_acceptance_scope_keys(
             concrete_focus_verification_scopes(&[(*raw).clone()], &all, resolver)
                 .into_iter()
                 .all(|concrete| {
-                    let required = resolver.compile_required_acceptance(&[], &[concrete]);
+                    // The whole-workspace read alias (`read:.`) is only minted
+                    // under a full-trust lease. Compile it with root-alias
+                    // tolerance so any Runtime-attested descendant exact read
+                    // satisfies it; the strict compiler would reject the root
+                    // alias and keep the obligation unsatisfiable forever.
+                    let root_alias = matches!(
+                        concrete.trim(),
+                        "read:." | "read:./" | "write:." | "write:./"
+                    );
+                    let required = if root_alias {
+                        resolver.compile_required_acceptance_with_root_alias(
+                            &[],
+                            &[concrete],
+                            true,
+                        )
+                    } else {
+                        resolver.compile_required_acceptance(&[], &[concrete])
+                    };
                     // Host uses the single Runtime acceptance evaluator; no
                     // second acceptance algorithm may mint root verdicts.
                     required.evidence_obligations.iter().all(|obligation| {

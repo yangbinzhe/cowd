@@ -64,7 +64,15 @@ pub fn validate_request(
     }
 
     let requested_risk = request.constraints.risk.as_deref();
-    if requested_risk.is_some_and(|risk| matches!(risk, "high" | "critical")) {
+    // Full-trust (YOLO) ceilings already pass every action through the
+    // auto-grant ApprovalRouter; a completion risk gate would add a manual
+    // resume that full-trust semantics explicitly forbid. Critical risk still
+    // requires (auto-approved) approval below.
+    let full_trust = request
+        .constraints
+        .permission_ceiling
+        .permits(PermissionMode::DangerFullAccess);
+    if requested_risk.is_some_and(|risk| matches!(risk, "high" | "critical")) && !full_trust {
         push_gate(&mut policy_gates, ExecutionPolicyGate::Risk);
         findings.push("risk_gate_required".to_string());
     }

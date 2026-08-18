@@ -760,6 +760,19 @@ impl TeamInstantiationService {
                                 .find(|name| name.role_id == role.role_id)
                         })
                         .map(|name| name.display_name.clone())
+                })
+                .or_else(|| {
+                    // Every role definition carries its own human-facing
+                    // display name (e.g. 供应链专家 / CTO). The centralized
+                    // `display.role_display_names` list is optional and empty
+                    // for many authored templates, so the role-level name is
+                    // the authoritative fallback. Display only: never used for
+                    // behavior, permissions or acceptance.
+                    manifest
+                        .roles
+                        .iter()
+                        .find(|role_definition| role_definition.role_id == role.role_id)
+                        .and_then(|role_definition| role_definition.display_name.clone())
                 });
             agent_binding.display = Some(crate::display_identity::compile_agent_display_identity(
                 agent_binding,
@@ -977,23 +990,43 @@ pub(crate) fn team_acceptance_contract(
         .filter(|scope| bounded(scope))
         .filter(|scope| {
             scope.starts_with("read:")
-                || scope.starts_with("write:")
                 || scope.starts_with("workspace:")
                 || scope.as_str() == "network:*"
+                // `write:` scopes are deliverable obligations, not evidence
+                // scopes. A role that merely shares a node-level write lease
+                // must not be forced to write the final artifact just because
+                // its acceptance includes an `evidence` criterion. Write
+                // obligations are minted only by explicit write criteria
+                // (implementation / mitigation / source_verification); a
+                // designated writer still receives them through those checks.
         })
         .cloned()
         .collect::<Vec<_>>();
-    // A Runtime-derived session evidence lease is a bounded evidence scope
-    // when no filesystem/network lease exists (read-only in-session research
-    // with no named files). It is never used when a real workspace or network
-    // scope is present, so it cannot widen an exact lease.
+    // A `session:` lease is authorization context, not verifiable evidence:
+    // no tool receipt can close a `session:` obligation, so a role that
+    // returns a terminal answer would be blocked after Focus acceptance
+    // recovery ("returned a second final answer"). Prefer the whole-workspace
+    // read alias already present in the lease: it compiles (under a
+    // full-trust ceiling) to a workspace-root ScopedContent obligation that
+    // any descendant exact read satisfies, so research roles close it with
+    // their first read_file receipt. `session:` remains only as a last-resort
+    // compile-time bound for legacy session-only fixtures.
     let evidence_scopes = if evidence_scopes.is_empty() {
-        resource_scopes
+        let workspace_read = resource_scopes
             .iter()
-            .filter(|scope| bounded(scope))
-            .filter(|scope| scope.starts_with("session:"))
+            .filter(|scope| matches!(scope.trim(), "read:." | "read:./"))
             .cloned()
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if !workspace_read.is_empty() {
+            workspace_read
+        } else {
+            resource_scopes
+                .iter()
+                .filter(|scope| bounded(scope))
+                .filter(|scope| scope.starts_with("session:"))
+                .cloned()
+                .collect::<Vec<_>>()
+        }
     } else {
         evidence_scopes
     };
@@ -1035,6 +1068,12 @@ pub(crate) fn team_acceptance_contract(
                 "plan" => structured(criterion, TeamStructuredOutputField::Plan),
                 "risks" => structured(criterion, TeamStructuredOutputField::Risks),
                 "unresolved" => structured(criterion, TeamStructuredOutputField::Unresolved),
+                "key_decisions" => {
+                    structured(criterion, TeamStructuredOutputField::KeyDecisions)
+                }
+                "unresolved_or_risks" => {
+                    structured(criterion, TeamStructuredOutputField::UnresolvedOrRisks)
+                }
                 "proposal" => structured(criterion, TeamStructuredOutputField::Proposal),
                 "critique" => structured(criterion, TeamStructuredOutputField::Critique),
                 "checkpoint" => structured(criterion, TeamStructuredOutputField::Checkpoint),
@@ -1692,14 +1731,17 @@ mod acceptance_contract_tests {
     }
 
     #[test]
-    fn session_evidence_lease_is_a_bounded_scope_only_without_workspace_scope() {
+    fn session_lease_is_authorization_context_not_verifiable_evidence() {
+        // A session-only lease keeps the legacy compile-time bound, but a
+        // whole-workspace read alias is preferred whenever it exists because
+        // it is satisfiable by real read receipts.
         let session_only = team_acceptance_contract(
             &["evidence".to_string()],
             &["session:session-1".to_string()],
             false,
             false,
         )
-        .expect("session lease satisfies the evidence bound when it is the only scope");
+        .expect("session lease remains the legacy last-resort bound");
         assert!(session_only.iter().any(|requirement| {
             requirement.criterion == "evidence"
                 && requirement.check
@@ -1708,13 +1750,34 @@ mod acceptance_contract_tests {
                     }
         }));
 
-        assert!(team_acceptance_contract(
+        let network = team_acceptance_contract(
             &["evidence".to_string()],
             &["session:session-1".to_string(), "network:*".to_string()],
             false,
             false,
         )
-        .is_ok());
+        .expect("network evidence contract");
+        assert!(network.iter().any(|requirement| {
+            requirement.criterion == "evidence"
+                && requirement.check
+                    == TeamAcceptanceCheck::ScopedEvidence {
+                        scopes: vec!["network:*".to_string()],
+                    }
+        }));
+        let workspace_root = team_acceptance_contract(
+            &["evidence".to_string()],
+            &["read:.".to_string(), "session:session-1".to_string()],
+            false,
+            false,
+        )
+        .expect("whole-workspace read alias keeps the evidence bound satisfiable");
+        assert!(workspace_root.iter().any(|requirement| {
+            requirement.criterion == "evidence"
+                && requirement.check
+                    == TeamAcceptanceCheck::ScopedEvidence {
+                        scopes: vec!["read:.".to_string()],
+                    }
+        }));
         assert!(team_acceptance_contract(&["evidence".to_string()], &[], false, false).is_err());
     }
 

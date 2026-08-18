@@ -2291,9 +2291,24 @@ fn runtime_evaluated_acceptance(
         } else {
             format!("read:{scope}")
         };
-        let required = tool_executor
-            .path_identity_resolver
-            .compile_obligation_or_unresolved(&raw);
+        // The whole-workspace read alias is only minted under a full-trust
+        // lease. Compile it with root-alias tolerance so any Runtime-attested
+        // descendant exact read satisfies it; the strict compiler would keep
+        // the obligation unsatisfiable and fail every Team role terminal.
+        let required = if matches!(raw.trim(), "read:." | "read:./") {
+            tool_executor
+                .path_identity_resolver
+                .compile_obligation_with_root_alias(&raw, true)
+                .unwrap_or_else(|_| {
+                    tool_executor
+                        .path_identity_resolver
+                        .compile_obligation_or_unresolved(&raw)
+                })
+        } else {
+            tool_executor
+                .path_identity_resolver
+                .compile_obligation_or_unresolved(&raw)
+        };
         crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
             &required,
             &owned_observed_evidence,
@@ -2720,7 +2735,12 @@ pub(crate) fn structured_agent_output(
         // terminal object. The terminal contract is the last matching object,
         // while exact whole-response JSON was already handled above.
         .filter_map(&contract_object)
-        .last()
+        // Nested rows inside the terminal object can individually match a
+        // contract field (for example an `unresolved_or_risks` item shaped as
+        // `{"id","title","mitigation"}`). Prefer the outermost terminal
+        // object: it carries the primary `summary` field and the largest
+        // field set, so a quoted or nested fragment never wins.
+        .max_by_key(|object| (object.contains_key("summary"), object.len()))
     {
         return Some(object);
     }
@@ -2906,6 +2926,42 @@ fn normalized_narrative_terminal_body(
         output.insert(field.as_str().to_string(), value);
     }
     serde_json::to_string(&output).ok()
+}
+
+#[cfg(test)]
+mod structured_output_probe {
+    use super::*;
+
+    #[test]
+    fn arbiter_terminal_text_extracts_key_decisions() {
+        let text = "Write and read-back verification complete: `cross-team-decision-report.html` confirmed on disk (215 lines, sha256 d6340e87…), covering summary / evidence / key_decisions (K1-K8) / unresolved_or_risks (U1-U7, R1-R10) with all six roles' evidence citations and arbitration reasons. Terminal synthesis follows.\n\n{\"summary\":\"convergence_arbiter 终态收敛完成\",\"evidence\":[\"tool://tool-raw-call_00_GPhgxF1uJefA7wiTBDTR0830-2b7d0e1f4574cf50（write_file 成功）\"],\"key_decisions\":[{\"id\":\"K1\",\"decision\":\"保持自研确定性 Rust 内核\"}],\"unresolved_or_risks\":[{\"id\":\"U1\",\"item\":\"无真实数据集\"}]}";
+        let parsed = structured_agent_output(text);
+        assert!(parsed.is_some(), "contract JSON must be extracted from prose+JSON terminal");
+        let object = parsed.expect("parsed");
+        assert!(object.contains_key("summary"));
+        assert!(object.contains_key("evidence"));
+        assert!(object.contains_key("key_decisions"));
+        assert!(object.contains_key("unresolved_or_risks"));
+        assert!(materialized_json_value(object.get("key_decisions").expect("kd")));
+        assert!(materialized_json_value(object.get("unresolved_or_risks").expect("ur")));
+    }
+
+    #[test]
+    fn real_arbiter_terminal_extracts_all_contract_fields() {
+        let Ok(text) = std::fs::read_to_string("/tmp/arbiter_final.txt") else {
+            return;
+        };
+        let parsed = structured_agent_output(&text);
+        assert!(parsed.is_some(), "real arbiter terminal must yield a contract object");
+        let object = parsed.expect("parsed");
+        for field in ["summary", "evidence", "key_decisions", "unresolved_or_risks"] {
+            assert!(
+                object.contains_key(field),
+                "missing {field}; keys={:?}",
+                object.keys().collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 fn normalized_scope(value: &str) -> &str {

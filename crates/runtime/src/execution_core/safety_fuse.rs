@@ -1,9 +1,11 @@
 //! Dynamic last-resort execution safety fuse.
 //!
 //! Goal acceptance and Runner synthesis decide business completion. This policy
-//! bounds the amount of model work a graph may perform before it must publish
-//! an honest terminal result. Progress influences intervention choice inside
-//! the lease, but never turns a declared maximum into an advisory threshold.
+//! stops a graph only when it stops making progress (a loop or stall) after a
+//! policy-sized minimum of model work. Legitimately long tasks that keep
+//! producing new evidence, tool calls or verified progress are never fused by
+//! a wall-clock or step ceiling: only genuine loops, crashes and severe
+//! provider/framework faults terminate them.
 
 use harness_contract::core::TaskComplexity;
 use serde::{Deserialize, Serialize};
@@ -55,14 +57,20 @@ impl SafetyFusePolicy {
     pub fn evaluate(
         lease: &ExecutionBudgetLease,
         model_steps: usize,
-        _made_progress: bool,
+        made_progress: bool,
     ) -> SafetyFuseDecision {
         if model_steps < lease.max_model_steps {
             return SafetyFuseDecision::Continue;
         }
+        if made_progress {
+            // The task is still advancing (new evidence, tool calls, verified
+            // gains). Long tasks are allowed to run for a very long time; the
+            // fuse only fires on a loop/stall without progress.
+            return SafetyFuseDecision::Continue;
+        }
         SafetyFuseDecision::Block {
             reason: format!(
-                "safety fuse exhausted after {model_steps} model steps at the absolute lease limit; {}",
+                "safety fuse fired after {model_steps} model steps without verified progress (possible loop/stall); {}",
                 lease.reason
             ),
         }
@@ -96,15 +104,26 @@ mod tests {
     }
 
     #[test]
-    fn reaching_the_lease_limit_blocks_even_when_the_latest_step_made_progress() {
+    fn lease_limit_blocks_only_on_missing_progress() {
         let lease = SafetyFusePolicy::derive(128_000, TaskComplexity::Complex, Some(3));
         assert_eq!(lease.max_model_steps, 3);
         assert_eq!(
             SafetyFusePolicy::evaluate(&lease, 2, true),
             SafetyFuseDecision::Continue
         );
-        assert!(matches!(
+        // Long tasks that keep producing verified progress must never be
+        // fused by a step ceiling.
+        assert_eq!(
             SafetyFusePolicy::evaluate(&lease, 3, true),
+            SafetyFuseDecision::Continue
+        );
+        assert_eq!(
+            SafetyFusePolicy::evaluate(&lease, 50, true),
+            SafetyFuseDecision::Continue
+        );
+        // A loop/stall without progress still fires the fuse.
+        assert!(matches!(
+            SafetyFusePolicy::evaluate(&lease, 3, false),
             SafetyFuseDecision::Block { .. }
         ));
     }

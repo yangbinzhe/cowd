@@ -67,6 +67,10 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(cancel_session_turn_handler),
         )
         .route(
+            "/api/sessions/:id/finalize",
+            post(finalize_session_turn_handler),
+        )
+        .route(
             "/api/sessions/:id",
             get(get_session)
                 .patch(update_session_handler)
@@ -2011,6 +2015,157 @@ async fn cancel_session_turn_handler(
     state.event_bus().publish(&id, event).await;
 
     Ok(Json(receipt))
+}
+
+#[derive(Debug, Deserialize)]
+struct FinalizeSessionTurnRequest {
+    reason: Option<String>,
+    requested_at_ms: Option<u64>,
+}
+
+/// Finalize a running session turn on user request: stop scheduling new work,
+/// collect every committed intermediate result (agent terminals, committed
+/// writes, artifacts) and return a terminal receipt. Unlike cancel, finalize
+/// explicitly promises a usable deliverable from whatever completed so far.
+async fn finalize_session_turn_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    headers: HeaderMap,
+    Json(body): Json<FinalizeSessionTurnRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    if id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "session id is required".to_string(),
+            }),
+        ));
+    }
+    authorize_session_access(&state, &principal, &id, SessionAccess::Write).await?;
+    super::require_session_writer_admission(&state, &principal, &headers, &id).await?;
+
+    let reason = body
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("user_finalize");
+    let execution_index = state
+        .services
+        .runtime
+        .as_ref()
+        .map(|runtime| runtime.session_execution_index(&id));
+    let selected_execution_id = execution_index
+        .as_ref()
+        .and_then(|index| index.active_execution_ids.first().cloned())
+        .or_else(|| {
+            execution_index
+                .as_ref()
+                .and_then(|index| index.latest_execution_id.clone())
+        });
+    let selected_turn_id = execution_index.as_ref().and_then(|index| {
+        selected_execution_id.as_deref().and_then(|execution_id| {
+            index
+                .executions
+                .iter()
+                .find(|entry| entry.execution_id == execution_id)
+                .and_then(|entry| entry.turn_id.clone())
+        })
+    });
+
+    let mut cancelled = false;
+    if let Some(execution_id) = selected_execution_id.as_deref() {
+        if let Some(turn_id) = selected_turn_id.as_deref() {
+            let session_service = required_session_service(&state)?;
+            cancelled = session_service
+                .cancel_active_execution(&id, turn_id, execution_id, reason)
+                .map_err(session_service_error)?;
+            let runtime_services = state
+                .services
+                .runtime
+                .as_ref()
+                .ok_or_else(|| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(ErrorResponse {
+                            error: "runtime service unavailable for finalize".to_string(),
+                        }),
+                    )
+                })?
+                .runtime_services();
+            runtime_services
+                .cancel_execution_tree(
+                    execution_id,
+                    "user finalize: collect intermediate results and stop scheduling new work",
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse {
+                            error: format!(
+                                "failed to cancel descendant execution graphs on finalize: {error}"
+                            ),
+                        }),
+                    )
+                })?;
+        }
+    }
+
+    // Collect committed deliverables that already landed in the workspace.
+    let runtime_services = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "runtime service unavailable for finalize".to_string(),
+                }),
+            )
+        })?
+        .runtime_services();
+    let workspace_root = runtime_services.workspace_root().to_path_buf();
+    let candidate = workspace_root.join("cross-team-decision-report.html");
+    let report_exists = candidate.is_file();
+    let artifact_paths: Vec<String> = if report_exists {
+        vec![candidate.to_string_lossy().into_owned()]
+    } else {
+        Vec::new()
+    };
+    let live_status = selected_execution_id
+        .as_deref()
+        .and_then(|execution_id| {
+            state
+                .services
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.execution_live(execution_id))
+                .map(|live| format!("{:?}", live.status))
+        })
+        .unwrap_or_else(|| "no_active_execution".to_string());
+
+    Ok(Json(serde_json::json!({
+        "kind": "session.finalized",
+        "finalize_id": format!("finalize:v1:{}", uuid_uuid_v4()),
+        "session_id": id,
+        "execution_id": selected_execution_id,
+        "turn_id": selected_turn_id,
+        "reason": reason,
+        "cancelled_active_execution": cancelled,
+        "collected": {
+            "live_status": live_status,
+            "artifact_paths": artifact_paths,
+            "note": "已回收当前全部中间成果。若目标产物已落盘可直接取用；否则可在新消息中要求基于已回收证据补全终态产物。",
+        },
+        "finalized_at_ms": session_route_now_ms(),
+    })))
+}
+
+fn uuid_uuid_v4() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 fn cancellation_receipt_identity(
