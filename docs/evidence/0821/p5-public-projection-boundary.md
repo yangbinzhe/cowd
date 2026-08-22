@@ -15,6 +15,13 @@ catch-up backlog. The measurements exercise 2,000 and 10,000 foreground
 samples respectively; they establish that projection work does not silently
 serialize foreground progress in those bounded scenarios.
 
+The signed reference Surface performance suite also passed: a 100-bundle
+catalog remains activation-free, Supervisor fairness was measured at active
+limits 1/4/16 with no orphan or duplicate spawn, 256 callers shared one
+activation, and the cold/hot Gateway/UDS plus stream-cancel/TTFB contract
+completed successfully. Its report was written under
+`/tmp/cowd-reference-performance-1787437989.json`.
+
 ## Checks
 
 ```text
@@ -27,6 +34,7 @@ cargo check -p runtime --all-targets
 cargo check -p gateway --all-targets
 cargo test --release -p runtime --lib paired_foreground_probe_with_and_without_projector_is_bounded -- --ignored --nocapture --test-threads=1
 cargo test --release -p runtime --lib paired_foreground_probe_during_projector_catchup_is_bounded -- --ignored --nocapture --test-threads=1
+scripts/test/reference-app-performance.sh
 cargo fmt --all -- --check
 git diff --check
 ```
