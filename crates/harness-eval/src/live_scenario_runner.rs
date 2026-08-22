@@ -238,13 +238,19 @@ impl LiveScenarioRunner {
             LiveScenarioSpec {
                 id: "live_single_architecture_baseline",
                 prompt: "请单独完成一次复杂架构审查，不要启动团队：分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并给出至少三个完整的 `crates/.../*.rs` 源码路径作为证据。只陈述本次实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。",
-                acceptance: LiveAcceptance::ArchitectureQuality { require_team: false },
+                acceptance: LiveAcceptance::ArchitectureQuality {
+                    minimum_teams: 0,
+                    minimum_claimed_cross_team_edges: 0,
+                },
                 timeout: LiveScenarioTimeout::team(),
             },
             LiveScenarioSpec {
                 id: "live_team_projection",
-                prompt: "这是复杂架构审查：必须自主选择并实际启动合适的协作团队，分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，再综合为结论。最终结论必须字面列出至少三个完整的 `crates/.../*.rs` 源码路径（不能只写文件名），只陈述团队实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。并且只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具；不要调用 bash 或任何写工具。",
-                acceptance: LiveAcceptance::ArchitectureQuality { require_team: true },
+                prompt: "这是复杂架构审查：必须实际启动三个协作 Team，不可用一个 Team 或模型文本替代。Team A 独立审查 runtime，Team B 独立审查 memory 与 gateway；两者可并行。Team C 必须在收到 A 和 B 的经过授权的证据/摘要后，汇合并审查跨组件边界，再综合最终结论。不得在 A/B 的事实交接完成前启动 Team C 的实质审查。最终结论必须字面列出至少三个完整的 `crates/.../*.rs` 源码路径（不能只写文件名），只陈述各 Team 实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具；不要调用 bash 或任何写工具。",
+                acceptance: LiveAcceptance::ArchitectureQuality {
+                    minimum_teams: 3,
+                    minimum_claimed_cross_team_edges: 2,
+                },
                 timeout: LiveScenarioTimeout::team(),
             },
         ]
@@ -1090,7 +1096,10 @@ struct TerminalWait {
 enum LiveAcceptance {
     Contains(&'static str),
     RequiresToolEvidence,
-    ArchitectureQuality { require_team: bool },
+    ArchitectureQuality {
+        minimum_teams: usize,
+        minimum_claimed_cross_team_edges: usize,
+    },
 }
 
 impl LiveAcceptance {
@@ -1126,20 +1135,27 @@ impl LiveAcceptance {
                     ],
                 }
             }
-            Self::ArchitectureQuality { require_team } => {
+            Self::ArchitectureQuality {
+                minimum_teams,
+                minimum_claimed_cross_team_edges,
+            } => {
                 let team_health = projected_team_health(projections);
+                let claimed_cross_team_edges = claimed_cross_team_edge_count(projections);
                 let checked_source_receipts = checked_source_receipt_count(timeline, projections);
                 let quality = architecture_quality(response, checked_source_receipts);
-                let team_projection = team_health.passed;
+                let team_projection = team_health.satisfies(minimum_teams);
+                let edges_satisfied = claimed_cross_team_edges >= minimum_claimed_cross_team_edges;
                 LiveAcceptanceResult {
                     passed: !response.trim().is_empty()
                         && quality.score >= quality.required
-                        && (!require_team || team_projection),
+                        && team_projection
+                        && edges_satisfied,
                     quality: Some(quality.clone()),
                     checks: vec![
                         json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                         json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
-                        json!({"name": "completed_evidence_team", "required": require_team, "passed": !require_team || team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
+                        json!({"name": "completed_evidence_team", "required": minimum_teams, "passed": team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
+                        json!({"name": "claimed_cross_team_edges", "required": minimum_claimed_cross_team_edges, "observed": claimed_cross_team_edges, "passed": edges_satisfied}),
                     ],
                 }
             }
@@ -1238,13 +1254,26 @@ fn architecture_quality(response: &str, checked_source_receipts: usize) -> Archi
 
 #[derive(Default)]
 struct ProjectedTeamHealth {
-    passed: bool,
     agent_count: usize,
     completed_agents: usize,
     failed_agents: usize,
     team_count: usize,
     completed_teams: usize,
     failed_teams: usize,
+}
+
+impl ProjectedTeamHealth {
+    fn satisfies(&self, minimum_teams: usize) -> bool {
+        if minimum_teams == 0 {
+            return true;
+        }
+        self.agent_count >= minimum_teams.saturating_mul(2)
+            && self.completed_agents == self.agent_count
+            && self.failed_agents == 0
+            && self.team_count >= minimum_teams
+            && self.completed_teams == self.team_count
+            && self.failed_teams == 0
+    }
 }
 
 fn projected_team_health(projections: &[Value]) -> ProjectedTeamHealth {
@@ -1340,12 +1369,6 @@ fn projected_team_health(projections: &[Value]) -> ProjectedTeamHealth {
         .filter(|team| projected_status_is_failure(team))
         .count();
     ProjectedTeamHealth {
-        passed: agents.len() >= 3
-            && completed_agents == agents.len()
-            && failed_agents == 0
-            && !teams.is_empty()
-            && completed_teams == teams.len()
-            && failed_teams == 0,
         agent_count: agents.len(),
         completed_agents,
         failed_agents,
@@ -1353,6 +1376,38 @@ fn projected_team_health(projections: &[Value]) -> ProjectedTeamHealth {
         completed_teams,
         failed_teams,
     }
+}
+
+/// Count only fully claimed typed Program edges. A delivered edge still leaves
+/// its consumer unauthorised to run, so it is not evidence of a real merge.
+/// The set key keeps repeated lineage projections from inflating the result.
+fn claimed_cross_team_edge_count(projections: &[Value]) -> usize {
+    let mut claimed = BTreeSet::new();
+    for projection in projections {
+        let graph_id = projection
+            .pointer("/graph/graph_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unidentified-graph");
+        for edge in projection
+            .pointer("/graph/orchestration/collaboration_program/edges")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if edge.get("state").and_then(Value::as_str) == Some("claimed")
+                && edge.get("delivery_receipt").is_some_and(Value::is_object)
+                && edge.get("claim_receipt").is_some_and(Value::is_object)
+            {
+                let edge_id = edge
+                    .get("edge_id")
+                    .or_else(|| edge.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unidentified-edge");
+                claimed.insert(format!("{graph_id}:{edge_id}"));
+            }
+        }
+    }
+    claimed.len()
 }
 
 fn projected_status(value: &Value) -> Option<&str> {
@@ -1525,25 +1580,37 @@ fn collaboration_comparison(scenarios: &[Value]) -> Value {
         .zip(team_wall)
         .is_some_and(|(single, team)| team <= single.saturating_mul(80) / 100)
         && quality_delta_pp.is_some_and(|delta| delta >= -2);
-    // Root scenario metrics intentionally describe the root graph only. A
-    // Team runs in a child graph, so its Agents are only guaranteed to be
-    // present in the acceptance check that walks every public execution
-    // projection. Re-reading root `metrics.agent_count` here would turn a
-    // passed, evidence-backed Team run into a false negative.
+    // Root scenario metrics intentionally describe the root graph only. Team
+    // work runs in child graphs, so the durable acceptance checks, rather than
+    // root metrics, are the source of truth for Team and merge evidence.
     let team_capability_passed = team.is_some_and(|scenario| {
         scenario.get("status").and_then(Value::as_str) == Some("passed")
             && scenario
                 .pointer("/acceptance/checks")
                 .and_then(Value::as_array)
                 .is_some_and(|checks| {
-                    checks.iter().any(|check| {
+                    let teams_completed = checks.iter().any(|check| {
                         check.get("name").and_then(Value::as_str) == Some("completed_evidence_team")
                             && check.get("passed").and_then(Value::as_bool) == Some(true)
                             && check
                                 .get("agents")
                                 .and_then(Value::as_u64)
-                                .is_some_and(|agents| agents >= 2)
-                    })
+                                .is_some_and(|agents| agents >= 6)
+                            && check
+                                .get("teams")
+                                .and_then(Value::as_u64)
+                                .is_some_and(|teams| teams >= 3)
+                    });
+                    let merge_claimed = checks.iter().any(|check| {
+                        check.get("name").and_then(Value::as_str)
+                            == Some("claimed_cross_team_edges")
+                            && check.get("passed").and_then(Value::as_bool) == Some(true)
+                            && check
+                                .get("observed")
+                                .and_then(Value::as_u64)
+                                .is_some_and(|edges| edges >= 2)
+                    });
+                    teams_completed && merge_claimed
                 })
     });
     // The live team scenario explicitly instructs the model to start a real
@@ -1572,7 +1639,7 @@ fn collaboration_comparison(scenarios: &[Value]) -> Value {
         },
         "team_capability": {
             "passed": team_capability_passed,
-            "requirement": "the explicit-team scenario has a terminal, evidence-backed result with at least two projected agents"
+            "requirement": "the explicit-team scenario has three completed Teams, at least six completed Agents, and two claimed typed cross-Team edges into its merge"
         },
         "efficiency_proven": efficiency_proven,
         "efficiency_note": if efficiency_proven {
@@ -1872,13 +1939,17 @@ mod tests {
             {"tool_name": "read_file", "is_error": false, "evidence_id": "read-1"},
             {"tool_name": "grep_search", "is_error": false, "evidence_id": "read-2"}
         ]});
-        let result = LiveAcceptance::ArchitectureQuality { require_team: true }.evaluate(
-            answer,
-            &receipts,
-            &[json!({"agents": [], "teams": []})],
-        );
+        let result = LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 1,
+            minimum_claimed_cross_team_edges: 0,
+        }
+        .evaluate(answer, &receipts, &[json!({"agents": [], "teams": []})]);
         assert!(!result.passed);
-        let result = LiveAcceptance::ArchitectureQuality { require_team: true }.evaluate(
+        let result = LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 1,
+            minimum_claimed_cross_team_edges: 0,
+        }
+        .evaluate(
             answer,
             &receipts,
             &[json!({
@@ -1896,7 +1967,11 @@ mod tests {
     #[test]
     fn architecture_acceptance_rejects_failed_team_and_evidence_disclaimer() {
         let answer = "runtime memory gateway canonical event risk crates/runtime/src/lib.rs crates/memory/src/lib.rs；但无法确认，因为没有任何文件内容的读取证据";
-        let result = LiveAcceptance::ArchitectureQuality { require_team: true }.evaluate(
+        let result = LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 1,
+            minimum_claimed_cross_team_edges: 0,
+        }
+        .evaluate(
             answer,
             &json!({"evidence": [
                 {"tool_name": "read_file", "is_error": false, "evidence_id": "read-1"},
@@ -1964,7 +2039,7 @@ mod tests {
 
         let health = projected_team_health(&[root, child]);
 
-        assert!(health.passed);
+        assert!(health.satisfies(1));
         assert_eq!(health.team_count, 1);
         assert_eq!(health.completed_teams, 1);
         assert_eq!(health.agent_count, 4);
@@ -1972,10 +2047,48 @@ mod tests {
     }
 
     #[test]
+    fn architecture_acceptance_requires_claimed_fan_in_for_multi_team_merge() {
+        let answer = "runtime memory gateway canonical event risk crates/runtime/src/lib.rs crates/memory/src/lib.rs";
+        let receipts = json!({"evidence": [
+            {"tool_name": "read_file", "is_error": false, "evidence_id": "read-1"},
+            {"tool_name": "grep_search", "is_error": false, "evidence_id": "read-2"}
+        ]});
+        let projection = json!({
+            "agents": [
+                {"id": "a-1", "status": "completed"}, {"id": "a-2", "status": "completed"},
+                {"id": "b-1", "status": "completed"}, {"id": "b-2", "status": "completed"},
+                {"id": "c-1", "status": "completed"}, {"id": "c-2", "status": "completed"}
+            ],
+            "teams": [
+                {"id": "team-a", "status": "completed"},
+                {"id": "team-b", "status": "completed"},
+                {"id": "team-c", "status": "completed"}
+            ],
+            "graph": {
+                "graph_id": "root",
+                "orchestration": {"collaboration_program": {"edges": [
+                    {"edge_id": "a-to-c", "state": "claimed", "delivery_receipt": {}, "claim_receipt": {}},
+                    {"edge_id": "b-to-c", "state": "claimed", "delivery_receipt": {}, "claim_receipt": {}}
+                ]}}
+            }
+        });
+
+        assert_eq!(claimed_cross_team_edge_count(&[projection.clone()]), 2);
+        let result = LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 3,
+            minimum_claimed_cross_team_edges: 2,
+        }
+        .evaluate(answer, &receipts, &[projection]);
+
+        assert!(result.passed);
+    }
+
+    #[test]
     fn architecture_acceptance_rejects_hallucinated_workspace_paths() {
         let answer = "runtime memory gateway canonical event risk crates/runtime/src/lib.rs crates/not-a-real-module/src/memory.rs";
         let result = LiveAcceptance::ArchitectureQuality {
-            require_team: false,
+            minimum_teams: 0,
+            minimum_claimed_cross_team_edges: 0,
         }
         .evaluate(
             answer,
@@ -2161,10 +2274,14 @@ mod tests {
                     "checks": [{
                         "name": "completed_evidence_team",
                         "passed": true,
-                        "agents": 4,
-                        "completed_agents": 4,
-                        "teams": 1,
-                        "completed_teams": 1
+                        "agents": 6,
+                        "completed_agents": 6,
+                        "teams": 3,
+                        "completed_teams": 3
+                    }, {
+                        "name": "claimed_cross_team_edges",
+                        "passed": true,
+                        "observed": 2
                     }]
                 }
             }),

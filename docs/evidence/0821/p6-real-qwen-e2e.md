@@ -81,3 +81,24 @@ cross-session continuation deny/allow, approval, PostgreSQL, or Surface gates.
 - Architecture evaluation rejects whole-answer claims of no source evidence
   while permitting a scoped open question when the answer contains actual
   checked source evidence.
+
+## 2026-08-23 merge-gate hardening
+
+The earlier live Team scenario was insufficiently strict: it accepted one
+completed Team with three Agents, so it could not distinguish a genuine
+cross-Team merge from an ordinary Team subgraph. The harness now requires its
+explicit collaboration scenario to produce all of the following from public
+execution projections:
+
+- at least three completed Teams and six completed Agents;
+- two fully claimed typed Program edges (both a delivery receipt and a consumer
+  claim receipt), which represent the two upstream facts entering the merge;
+- the same architecture-quality and source-evidence checks as before.
+
+`architecture_acceptance_requires_claimed_fan_in_for_multi_team_merge` covers
+the positive fan-in case. A merely delivered edge is deliberately rejected:
+until it is claimed by the consumer attempt it cannot prove that the merge Team
+was allowed to consume the fact. This makes the next real-Qwen run a meaningful
+A12 sub-gate instead of another one-Team increment. It has not yet been run
+against a provider at this candidate SHA, so this section records the stricter
+gate rather than a successful real-model result.
