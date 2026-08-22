@@ -1521,7 +1521,9 @@ fn evaluate_waiter(
             blocker: None,
         };
     }
-    if let Some(blocker) = same_class_fifo_blocker(state, position) {
+    if let Some(blocker) =
+        same_class_precedence_blocker(state, position, now, state.admission_policy.aging_interval)
+    {
         return AdmissionEvaluation::Deferred {
             wait_reason: ResourceWaitReason::ClassFifo,
             blocker: Some(blocker),
@@ -1537,7 +1539,7 @@ fn evaluate_waiter(
     let precedence = scheduling_precedence(waiter, now, state.admission_policy.aging_interval);
     let mut first_demand_owner_by_class =
         std::array::from_fn::<_, 4, _>(|_| HashMap::<ExecutionResourceKind, Uuid>::new());
-    let mut higher = None::<((usize, u64), Uuid)>;
+    let mut higher = None::<((usize, u8, u64), Uuid)>;
     for (other_position, other) in state.waiters.iter().enumerate() {
         let class_demands =
             &mut first_demand_owner_by_class[service_class_index(other.resolved_service_class)];
@@ -1582,8 +1584,17 @@ fn evaluate_waiter(
     }
 }
 
-fn same_class_fifo_blocker(state: &ManagerState, position: usize) -> Option<Uuid> {
+/// Service class and aging remain the first fairness axes. A requested
+/// priority only reorders conflicting waiters that resolve to the same class;
+/// it never changes demand weights, capacity, deadline, or class ceiling.
+fn same_class_precedence_blocker(
+    state: &ManagerState,
+    position: usize,
+    now: Instant,
+    aging_interval: Duration,
+) -> Option<Uuid> {
     let waiter = &state.waiters[position];
+    let precedence = scheduling_precedence(waiter, now, aging_interval);
     state
         .waiters
         .iter()
@@ -1591,6 +1602,7 @@ fn same_class_fifo_blocker(state: &ManagerState, position: usize) -> Option<Uuid
         .find(|earlier| {
             earlier.resolved_service_class == waiter.resolved_service_class
                 && demand_sets_overlap(&earlier.demands, &waiter.demands)
+                && scheduling_precedence(earlier, now, aging_interval) <= precedence
         })
         .map(|earlier| earlier.id)
 }
@@ -1621,11 +1633,12 @@ fn scheduling_precedence(
     waiter: &PendingResourceDemand,
     now: Instant,
     aging_interval: Duration,
-) -> (usize, u64) {
+) -> (usize, u8, u64) {
     let age_steps = duration_millis(now.saturating_duration_since(waiter.enqueued_at))
         / duration_millis(aging_interval).max(1);
     (
         service_class_index(waiter.resolved_service_class).saturating_sub(age_steps as usize),
+        u8::MAX.saturating_sub(waiter.requested_priority.unwrap_or(0)),
         waiter.enqueue_sequence,
     )
 }
@@ -2365,6 +2378,62 @@ mod tests {
         assert_eq!(second_receipt.enqueue_sequence, 2);
         assert!(second_receipt.wait_reason.is_some());
         drop(second_lease);
+    }
+
+    #[tokio::test]
+    async fn same_class_higher_requested_priority_runs_before_earlier_waiter() {
+        let manager = fair_manager(1, admission_policy(8, 4, 4));
+        let occupied = manager
+            .acquire(ExecutionResourceKind::Tool, None)
+            .await
+            .unwrap();
+        let low_priority = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit(
+                        ResourceAdmissionRequest::new(
+                            ExecutionServiceClass::Foreground,
+                            [(ExecutionResourceKind::Tool, 1)],
+                        )
+                        .with_priority(1)
+                        .with_fairness_key("session:low-priority"),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 1).await;
+        let high_priority = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit(
+                        ResourceAdmissionRequest::new(
+                            ExecutionServiceClass::Foreground,
+                            [(ExecutionResourceKind::Tool, 1)],
+                        )
+                        .with_priority(200)
+                        .with_fairness_key("session:high-priority"),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_pending(&manager, &ExecutionResourceKind::Tool, 2).await;
+        drop(occupied);
+        let (high_lease, high_receipt) = granted(
+            tokio::time::timeout(Duration::from_secs(1), high_priority)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(high_receipt.requested_priority, Some(200));
+        assert!(!low_priority.is_finished());
+        drop(high_lease);
+        let (low_lease, low_receipt) = granted(low_priority.await.unwrap());
+        assert_eq!(low_receipt.requested_priority, Some(1));
+        drop(low_lease);
     }
 
     #[tokio::test]
