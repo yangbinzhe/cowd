@@ -337,7 +337,7 @@ impl ExecutionGraphStateStore {
                         kind: node.kind,
                         status: graph.node_statuses[&node.id],
                         executor_kind: node.executor_kind.clone(),
-                        payload_ref: node.payload_ref.clone(),
+                        payload_ref: format!("execution-payload:{}", node.id),
                         acceptance: node.acceptance.clone(),
                         resource_scopes: node.resource_scopes.clone(),
                         result_ref: result.and_then(|result| result.result_ref.clone()),
@@ -577,5 +577,31 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "team.projection.quarantined");
+    }
+
+    #[test]
+    fn state_store_projection_keeps_node_payloads_opaque() {
+        let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let commit = ExecutionCommitService::new(Arc::clone(&event_store));
+        let mut graph = ExecutionGraph::new("opaque payload projection");
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "private-prompt-and-runtime-binding",
+        );
+        node.id = "opaque-node".to_string();
+        graph.nodes.push(node);
+        let registered = commit.register_graph(graph).expect("register graph").graph;
+        let projection = ExecutionGraphStateStore::new(event_store)
+            .projection(&registered.id)
+            .expect("public projection");
+        assert_eq!(
+            projection.nodes[0].payload_ref,
+            "execution-payload:opaque-node"
+        );
+        assert!(!serde_json::to_string(&projection)
+            .expect("serialize public projection")
+            .contains("private-prompt-and-runtime-binding"));
     }
 }

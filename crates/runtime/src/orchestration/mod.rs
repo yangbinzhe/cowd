@@ -1521,19 +1521,27 @@ fn assess_team_subgraphs(
         .count()
         .max(1);
     let per_team_summary_chars = (12_000 / completed_team_count).clamp(512, 6_000);
+    let parent_graph = services.graph_state_store().load(&projection.graph_id).ok();
     for node in projection.nodes.iter().filter(|node| {
         node.executor_kind == compiler::TEAM_SUBGRAPH_EXECUTOR
             && node.status == ExecutionNodeStatus::Completed
     }) {
         assessment.has_teams = true;
-        let request = match serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
-            &node.payload_ref,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
+        let payload_ref = parent_graph.as_ref().and_then(|graph| {
+            graph
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == node.node_id)
+                .map(|candidate| candidate.payload_ref.as_str())
+        });
+        let request = match payload_ref.and_then(|payload| {
+            serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(payload).ok()
+        }) {
+            Some(request) => request,
+            None => {
                 assessment.working_state_verified = false;
                 assessment.findings.push(format!(
-                    "team_subgraph_payload_invalid:{}:{error}",
+                    "team_subgraph_payload_unavailable:{}",
                     node.node_id
                 ));
                 continue;

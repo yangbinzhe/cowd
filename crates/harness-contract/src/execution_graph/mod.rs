@@ -281,6 +281,7 @@ mod tests {
         work.reasoning_effort = Some("private-reasoning-policy".to_string());
         work.required_evidence_refs = vec!["private-evidence-selector".to_string()];
         model.work = Some(work);
+        model.payload_ref = "private-model-prompt-and-binding".to_string();
         graph.nodes.push(model);
 
         let encoded = serde_json::to_string(&project_execution_graph(&graph)).expect("projection");
@@ -288,5 +289,7 @@ mod tests {
         assert!(!encoded.contains("private-provider-profile"));
         assert!(!encoded.contains("private-reasoning-policy"));
         assert!(!encoded.contains("private-evidence-selector"));
+        assert!(!encoded.contains("private-model-prompt-and-binding"));
+        assert!(encoded.contains("execution-payload:model"));
     }
 }

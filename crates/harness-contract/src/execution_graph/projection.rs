@@ -16,9 +16,9 @@ pub struct ExecutionNodeProjection {
     pub kind: ExecutionNodeKind,
     pub status: ExecutionNodeStatus,
     pub executor_kind: String,
-    /// Safe input identity for surfaces. The referenced payload and private
-    /// prompt remain Runtime-owned and must be resolved through governed
-    /// evidence or activity projections.
+    /// Safe opaque input identity for surfaces. The referenced payload and
+    /// private prompt remain Runtime-owned and must be resolved through
+    /// governed evidence or activity projections.
     #[serde(default)]
     pub payload_ref: String,
     #[serde(default)]
@@ -144,7 +144,7 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                         .copied()
                         .unwrap_or(ExecutionNodeStatus::Planned),
                     executor_kind: node.executor_kind.clone(),
-                    payload_ref: node.payload_ref.clone(),
+                    payload_ref: public_payload_ref(&node.id),
                     acceptance: node.acceptance.clone(),
                     resource_scopes: node.resource_scopes.clone(),
                     result_ref: result.and_then(|value| value.result_ref.clone()),
@@ -179,6 +179,10 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
         terminal_presentation: graph.terminal_presentation.clone(),
         work: project_work_graph(graph),
     }
+}
+
+fn public_payload_ref(node_id: &str) -> String {
+    format!("execution-payload:{node_id}")
 }
 
 #[must_use]
