@@ -1581,6 +1581,9 @@ impl ExecutionCommitService {
                     ))
                 })?;
             }
+            ExecutionGraphCommand::ApplyCrossTeamEdgePatch { patch, .. } => {
+                apply_cross_team_edge_patch(&mut next, patch)?;
+            }
             ExecutionGraphCommand::Replan { .. } => {
                 return Err(ExecutionCommitError::InvalidCommand(
                     "replan requires the graph compiler and cannot be applied as a status mutation"
@@ -2463,6 +2466,9 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::ClaimCrossTeamEdgeDelivery {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::ApplyCrossTeamEdgePatch {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::Replan {
             expected_revision, ..
         } => *expected_revision,
@@ -2488,6 +2494,9 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         }
         ExecutionGraphCommand::ClaimCrossTeamEdgeDelivery { .. } => {
             ("claim_cross_team_edge_delivery", None)
+        }
+        ExecutionGraphCommand::ApplyCrossTeamEdgePatch { .. } => {
+            ("apply_cross_team_edge_patch", None)
         }
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
     }
@@ -2526,6 +2535,147 @@ fn physical_node_for_team_instance(
                 "cross-Team edge has no physical Team node for `{instance_id}`"
             ))
         })
+}
+
+/// Apply the only currently-safe in-place Program mutation: replacing a
+/// pending cross-Team relation before either endpoint has started. The Program
+/// contract and its physical `CrossTeamHandoff` edge change together, so a
+/// recovery projection can never observe one without the other.
+fn apply_cross_team_edge_patch(
+    graph: &mut ExecutionGraph,
+    patch: &harness_contract::execution_graph::CollaborationIntentPatch,
+) -> Result<(), ExecutionCommitError> {
+    use harness_contract::execution_graph::{
+        CollaborationIntentPatchOperation, CrossTeamEdgeState, ExecutionEdgeKind,
+    };
+
+    patch
+        .validate()
+        .map_err(ExecutionCommitError::InvalidCommand)?;
+    let CollaborationIntentPatchOperation::ChangeEdge {
+        edge_id,
+        from_instance_id,
+        to_instance_id,
+        edge_kind,
+        input_contract,
+    } = &patch.operation
+    else {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "cross-Team edge command requires a change_edge patch".to_string(),
+        ));
+    };
+    let current = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(
+                "graph has no collaboration program control plane".to_string(),
+            )
+        })?;
+    if patch.program_id != current.program_id || patch.base_revision != current.revision {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "cross-Team edge patch program revision conflict".to_string(),
+        ));
+    }
+    if current.control.lifecycle.is_terminal() {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "cross-Team edge patch targets a terminal Program".to_string(),
+        ));
+    }
+    let edge_index = current
+        .edges
+        .iter()
+        .position(|edge| edge.edge_id == *edge_id)
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "cross-Team edge patch references unknown edge `{edge_id}`"
+            ))
+        })?;
+    let previous = &current.edges[edge_index];
+    if !matches!(
+        previous.state,
+        CrossTeamEdgeState::Pending | CrossTeamEdgeState::AwaitingProducer
+    ) {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "cross-Team edge `{edge_id}` is already {:?} and cannot be changed",
+            previous.state
+        )));
+    }
+    let old_from_node = physical_node_for_team_instance(current, &previous.from)?;
+    let old_to_node = physical_node_for_team_instance(current, &previous.to)?;
+    let new_from_node = physical_node_for_team_instance(current, from_instance_id)?;
+    let new_to_node = physical_node_for_team_instance(current, to_instance_id)?;
+    for node_id in [&old_from_node, &old_to_node, &new_from_node, &new_to_node] {
+        let status = graph.node_statuses.get(node_id).copied().ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "cross-Team edge patch node `{node_id}` is absent"
+            ))
+        })?;
+        if status != ExecutionNodeStatus::Planned {
+            return Err(ExecutionCommitError::InvalidCommand(format!(
+                "cross-Team edge patch requires planned endpoints; `{node_id}` is {status:?}"
+            )));
+        }
+    }
+
+    let mut candidate = current.clone();
+    candidate.edges[edge_index].from = from_instance_id.clone();
+    candidate.edges[edge_index].to = to_instance_id.clone();
+    candidate.edges[edge_index].kind = *edge_kind;
+    candidate.edges[edge_index].input_contract = input_contract.clone();
+    candidate.edges[edge_index].state = CrossTeamEdgeState::Pending;
+    candidate.edges[edge_index].delivery_receipt = None;
+    candidate.edges[edge_index].claim_receipt = None;
+    candidate.revision = candidate.revision.saturating_add(1);
+    if candidate.control.lifecycle
+        != harness_contract::execution_graph::CollaborationProgramLifecycle::Planning
+    {
+        candidate.control.resource_ledger.revision = candidate.revision;
+        for obligation in &mut candidate.control.obligations {
+            obligation.revision = candidate.revision;
+        }
+    }
+    candidate.validate().map_err(|error| {
+        ExecutionCommitError::InvalidCommand(format!(
+            "invalid cross-Team edge patch candidate: {error}"
+        ))
+    })?;
+
+    let old_pair_still_exists = candidate.edges.iter().enumerate().any(|(index, edge)| {
+        index != edge_index
+            && physical_node_for_team_instance(&candidate, &edge.from)
+                .is_ok_and(|from| from == old_from_node)
+            && physical_node_for_team_instance(&candidate, &edge.to)
+                .is_ok_and(|to| to == old_to_node)
+    });
+    if !old_pair_still_exists {
+        graph.edges.retain(|edge| {
+            !(edge.kind == ExecutionEdgeKind::CrossTeamHandoff
+                && edge.from == old_from_node
+                && edge.to == old_to_node)
+        });
+    }
+    if !graph.edges.iter().any(|edge| {
+        edge.kind == ExecutionEdgeKind::CrossTeamHandoff
+            && edge.from == new_from_node
+            && edge.to == new_to_node
+    }) {
+        graph.edges.push(ExecutionEdge {
+            from: new_from_node,
+            to: new_to_node,
+            kind: ExecutionEdgeKind::CrossTeamHandoff,
+        });
+    }
+    graph
+        .orchestration
+        .as_mut()
+        .and_then(|metadata| metadata.collaboration_program.as_mut())
+        .expect("current Program exists")
+        .clone_from(&candidate);
+    validate_execution_graph(graph)
+        .map(|_| ())
+        .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
 }
 
 /// Derive the immutable producer receipt as part of its terminal graph
@@ -3541,7 +3691,56 @@ mod tests {
                 },
             }),
         });
+        graph.edges = vec![ExecutionEdge {
+            from: "producer-team".to_string(),
+            to: "consumer-team".to_string(),
+            kind: harness_contract::execution_graph::ExecutionEdgeKind::CrossTeamHandoff,
+        }];
         let registered = service.register_graph(graph).expect("register graph").graph;
+        let registered = service
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::ApplyCrossTeamEdgePatch {
+                    expected_revision: registered.revision,
+                    patch: Box::new(
+                        harness_contract::execution_graph::CollaborationIntentPatch {
+                            program_id: "program-cross-team".to_string(),
+                            base_revision: 1,
+                            source_attempt: "producer-team:attempt:0".to_string(),
+                            reason: "review the same bounded producer result".to_string(),
+                            evidence_refs: Vec::new(),
+                            canonical_digest: "e".repeat(64),
+                            user_confirmation_ref: None,
+                            operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::ChangeEdge {
+                                edge_id: "producer:1->consumer:1".to_string(),
+                                from_instance_id: "producer:1".to_string(),
+                                to_instance_id: "consumer:1".to_string(),
+                                edge_kind: CollaborationEdgeKind::ReviewOf,
+                                input_contract: Default::default(),
+                            },
+                        },
+                    ),
+                },
+            )
+            .expect("pending edge patch commits atomically")
+            .graph;
+        let patched_edge = &registered
+            .orchestration
+            .as_ref()
+            .expect("metadata")
+            .collaboration_program
+            .as_ref()
+            .expect("program")
+            .edges[0];
+        assert_eq!(patched_edge.kind, CollaborationEdgeKind::ReviewOf);
+        assert_eq!(
+            registered
+                .edges
+                .iter()
+                .filter(|edge| edge.kind.is_dependency())
+                .count(),
+            1
+        );
         let ready = service
             .transition_node(
                 &registered,

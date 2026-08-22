@@ -1330,6 +1330,13 @@ pub enum ExecutionGraphCommand {
         consumer_node_id: String,
         consumer_attempt: u32,
     },
+    /// Coordinator-owned atomic replacement of one not-yet-started typed
+    /// cross-Team relation. The commit service updates the Program edge and
+    /// its matching `CrossTeamHandoff` execution edge in one graph revision.
+    ApplyCrossTeamEdgePatch {
+        expected_revision: u64,
+        patch: Box<CollaborationIntentPatch>,
+    },
     Replan {
         expected_revision: u64,
         reason: String,
