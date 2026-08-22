@@ -127,6 +127,7 @@ pub async fn submit_collaboration_intent_patch(
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::RetireTeam { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::NarrowObjective { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::SetParallelismHint { .. }
+            | harness_contract::execution_graph::CollaborationIntentPatchOperation::Reprioritize { .. }
     ) {
         return Err("collaboration_patch_operation_requires_attested_source_attempt".to_string());
     }
@@ -179,6 +180,9 @@ pub async fn submit_attested_collaboration_intent_patch(
             patch: Box::new(patch.clone()),
         },
         harness_contract::execution_graph::CollaborationIntentPatchOperation::SetParallelismHint {
+            ..
+        }
+        | harness_contract::execution_graph::CollaborationIntentPatchOperation::Reprioritize {
             ..
         } => ExecutionGraphCommand::ApplyCollaborationParallelismHint {
             expected_revision: graph.revision,

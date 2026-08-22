@@ -3000,10 +3000,10 @@ fn apply_collaboration_objective_narrowing(
         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
 }
 
-/// Apply a model-proposed soft parallelism hint only to unstarted Team work.
-/// The hint becomes a durable work scheduling priority; it deliberately does
-/// not change Team multiplicity, resource demands, permits, or the Program
-/// resource ledger.
+/// Apply a model-proposed soft parallelism hint or priority only to unstarted
+/// Team work. The value becomes a durable work scheduling priority; it
+/// deliberately does not change Team multiplicity, resource demands, permits,
+/// or the Program resource ledger.
 fn apply_collaboration_parallelism_hint(
     graph: &mut ExecutionGraph,
     patch: &harness_contract::execution_graph::CollaborationIntentPatch,
@@ -3015,14 +3015,23 @@ fn apply_collaboration_parallelism_hint(
     patch
         .validate()
         .map_err(ExecutionCommitError::InvalidCommand)?;
-    let CollaborationIntentPatchOperation::SetParallelismHint {
-        semantic_node_id,
-        parallelism_hint,
-    } = &patch.operation
-    else {
-        return Err(ExecutionCommitError::InvalidCommand(
-            "parallelism hint command requires a set_parallelism_hint patch".to_string(),
-        ));
+    let (semantic_node_id, priority) = match &patch.operation {
+        CollaborationIntentPatchOperation::SetParallelismHint {
+            semantic_node_id,
+            parallelism_hint,
+        } => (
+            semantic_node_id,
+            u8::try_from(*parallelism_hint).unwrap_or(u8::MAX),
+        ),
+        CollaborationIntentPatchOperation::Reprioritize {
+            semantic_node_id,
+            priority,
+        } => (semantic_node_id, *priority),
+        _ => {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "parallelism hint command requires a soft scheduling patch".to_string(),
+            ));
+        }
     };
     let current = graph
         .orchestration
@@ -3071,7 +3080,6 @@ fn apply_collaboration_parallelism_hint(
     candidate.validate().map_err(|error| {
         ExecutionCommitError::InvalidCommand(format!("invalid parallelism hint candidate: {error}"))
     })?;
-    let priority = u8::try_from(*parallelism_hint).unwrap_or(u8::MAX);
     for node in &mut graph.nodes {
         if node_ids.contains(&node.id) {
             if node.kind != ExecutionNodeKind::Subgraph {
@@ -4539,9 +4547,40 @@ mod tests {
             0,
             "soft priority must not become a resource reservation"
         );
+        let reprioritised = service
+            .apply_command(
+                &prioritised,
+                &ExecutionGraphCommand::ApplyCollaborationParallelismHint {
+                    expected_revision: prioritised.revision,
+                    patch: Box::new(harness_contract::execution_graph::CollaborationIntentPatch {
+                        program_id: "program-narrow-objective".to_string(),
+                        base_revision: 2,
+                        source_attempt: "child-team:attempt:0".to_string(),
+                        reason: "the verified evidence lane is now urgent".to_string(),
+                        evidence_refs: Vec::new(),
+                        canonical_digest: "r".repeat(64),
+                        user_confirmation_ref: None,
+                        escalation: None,
+                        operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::Reprioritize {
+                            semantic_node_id: "research".to_string(),
+                            priority: 240,
+                        },
+                    }),
+                },
+            )
+            .expect("planned Team reprioritizes atomically")
+            .graph;
+        assert_eq!(
+            reprioritised.nodes[0]
+                .work
+                .as_ref()
+                .expect("Team has a work contract")
+                .scheduling_priority,
+            240
+        );
         let patch = harness_contract::execution_graph::CollaborationIntentPatch {
             program_id: "program-narrow-objective".to_string(),
-            base_revision: 2,
+            base_revision: 3,
             source_attempt: "child-team:attempt:0".to_string(),
             reason: "the user constrained this branch to a single source".to_string(),
             evidence_refs: Vec::new(),
@@ -4555,9 +4594,9 @@ mod tests {
         };
         let narrowed = service
             .apply_command(
-                &prioritised,
+                &reprioritised,
                 &ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing {
-                    expected_revision: prioritised.revision,
+                    expected_revision: reprioritised.revision,
                     patch: Box::new(patch),
                 },
             )
@@ -4580,7 +4619,7 @@ mod tests {
                 .as_ref()
                 .expect("program")
                 .revision,
-            3
+            4
         );
         assert_eq!(
             narrowed.node_statuses["child-team"],

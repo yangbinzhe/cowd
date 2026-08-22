@@ -519,6 +519,13 @@ pub enum CollaborationIntentPatchOperation {
         semantic_node_id: String,
         parallelism_hint: u16,
     },
+    /// Reorder an unstarted workstream without changing its Team topology or
+    /// resource reservation. `priority` is deliberately a scheduler hint,
+    /// not an authority or capacity grant.
+    Reprioritize {
+        semantic_node_id: String,
+        priority: u8,
+    },
 }
 
 impl CollaborationIntentPatch {
@@ -581,6 +588,9 @@ impl CollaborationIntentPatch {
                     return Err("parallelism_hint is zero".to_string());
                 }
             }
+            CollaborationIntentPatchOperation::Reprioritize {
+                semantic_node_id, ..
+            } => require_patch_value("semantic_node_id", semantic_node_id)?,
         }
         Ok(())
     }
