@@ -510,6 +510,14 @@ pub enum CollaborationIntentPatchOperation {
     AddTeam {
         team: CollaborationPatchTeam,
     },
+    /// Replace one unstarted Team workstream with two or more independently
+    /// admitted workstreams. The Runtime derives the physical source node,
+    /// preserves its durable incoming/outgoing Program relations, and rejects
+    /// any source that has started a child graph or effectful execution.
+    SplitWorkstream {
+        source_instance_id: String,
+        teams: Vec<CollaborationPatchTeam>,
+    },
     RetireTeam {
         instance_id: String,
     },
@@ -564,6 +572,22 @@ impl CollaborationIntentPatch {
         }
         match &self.operation {
             CollaborationIntentPatchOperation::AddTeam { team } => validate_patch_team(team)?,
+            CollaborationIntentPatchOperation::SplitWorkstream {
+                source_instance_id,
+                teams,
+            } => {
+                require_patch_value("source_instance_id", source_instance_id)?;
+                if teams.len() < 2 {
+                    return Err("split patch requires at least two replacement Teams".to_string());
+                }
+                let mut semantic_ids = BTreeSet::new();
+                for team in teams {
+                    validate_patch_team(team)?;
+                    if !semantic_ids.insert(team.semantic_node_id.as_str()) {
+                        return Err("split patch reuses a replacement semantic Team id".to_string());
+                    }
+                }
+            }
             CollaborationIntentPatchOperation::RetireTeam { instance_id } => {
                 require_patch_value("instance_id", instance_id)?;
             }
@@ -1694,6 +1718,31 @@ mod dependency_policy_tests {
             ..patch.clone()
         };
         assert!(dispute.validate().is_ok());
+
+        let mut split_left = match &patch.operation {
+            CollaborationIntentPatchOperation::AddTeam { team } => team.clone(),
+            _ => unreachable!("fixture remains an AddTeam patch"),
+        };
+        split_left.semantic_node_id = "research-left".to_string();
+        let mut split_right = split_left.clone();
+        split_right.semantic_node_id = "research-right".to_string();
+        let split = CollaborationIntentPatch {
+            operation: CollaborationIntentPatchOperation::SplitWorkstream {
+                source_instance_id: "research:1".to_string(),
+                teams: vec![split_left, split_right],
+            },
+            ..patch.clone()
+        };
+        assert!(split.validate().is_ok());
+        let mut invalid_split = split;
+        let CollaborationIntentPatchOperation::SplitWorkstream { teams, .. } =
+            &mut invalid_split.operation
+        else {
+            unreachable!("fixture remains a split patch")
+        };
+        teams.pop();
+        assert!(invalid_split.validate().is_err());
+
         let mut invalid_dispute = dispute;
         let CollaborationIntentPatchOperation::ResolveDispute {
             disputed_instance_ids,

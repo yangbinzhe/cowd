@@ -124,6 +124,7 @@ pub async fn submit_collaboration_intent_patch(
     if matches!(
         &patch.operation,
         harness_contract::execution_graph::CollaborationIntentPatchOperation::ChangeEdge { .. }
+            | harness_contract::execution_graph::CollaborationIntentPatchOperation::SplitWorkstream { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::RetireTeam { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::NarrowObjective { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::SetParallelismHint { .. }
@@ -161,6 +162,19 @@ pub async fn submit_attested_collaboration_intent_patch(
         .await
         .map_err(|error| format!("patch_target_load_failed:{error}"))?;
     let command = match &patch.operation {
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::SplitWorkstream {
+            ..
+        } => {
+            let request = collaboration_coordinator::compile_collaboration_intent_patch(&graph, patch)?;
+            return Ok(submit_runtime_orchestration_request_controlled(
+                request,
+                None,
+                services,
+                graph.parent_execution,
+                None,
+            )
+            .await);
+        }
         harness_contract::execution_graph::CollaborationIntentPatchOperation::ChangeEdge {
             ..
         } => ExecutionGraphCommand::ApplyCrossTeamEdgePatch {
@@ -1284,6 +1298,35 @@ async fn revise(
             &mut revision_repairs,
         )
         .map_err(|error| format!("semantic_revision_compile_failed:{error}"))?;
+        if !proposal.retired_collaboration_instance_ids.is_empty() {
+            let existing_program = graph
+                .orchestration
+                .as_ref()
+                .and_then(|metadata| metadata.collaboration_program.as_ref())
+                .ok_or_else(|| "semantic_revision_split_target_has_no_program".to_string())?;
+            let replacement_node_ids = proposal
+                .nodes
+                .iter()
+                .filter(|node| node.recipe == CapabilityRecipeId::Team)
+                .flat_map(|node| {
+                    mutation
+                        .semantic_node_instances
+                        .get(&node.node_id)
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            mutation.edges.extend(
+                collaboration_coordinator::split_replacement_outgoing_graph_edges(
+                    &graph,
+                    existing_program,
+                    &proposal.retired_collaboration_instance_ids,
+                    &replacement_node_ids,
+                )
+                .map_err(|error| format!("semantic_revision_split_relations_failed:{error}"))?,
+            );
+        }
         if let Some(conflict) = mutation
             .nodes
             .iter()
@@ -1340,6 +1383,26 @@ async fn revise(
                 .as_ref()
                 .and_then(|metadata| metadata.collaboration_program.as_ref()),
         ) {
+            if !proposal.retired_collaboration_instance_ids.is_empty() {
+                let replacement_instance_ids = delta
+                    .team_instances
+                    .iter()
+                    .map(|instance| instance.instance_id.clone())
+                    .collect::<Vec<_>>();
+                for edge in collaboration_coordinator::split_replacement_outgoing_program_edges(
+                    existing,
+                    &proposal.retired_collaboration_instance_ids,
+                    &replacement_instance_ids,
+                ) {
+                    if !delta
+                        .edges
+                        .iter()
+                        .any(|candidate| candidate.edge_id == edge.edge_id)
+                    {
+                        delta.edges.push(edge);
+                    }
+                }
+            }
             // A patch may add a reviewer/aggregator that consumes a Team
             // already admitted by the root program. Represent that relation
             // explicitly instead of silently degrading it to a prose prompt
@@ -3527,10 +3590,41 @@ mod tests {
             } => team.clone(),
             _ => unreachable!("escalation creates an AddTeam patch"),
         };
+        let mut split_left = review.clone();
+        split_left.semantic_node_id = "research-left".to_string();
+        split_left.objective = "separate the first bounded research lane".to_string();
+        split_left.depends_on.clear();
+        let mut split_right = split_left.clone();
+        split_right.semantic_node_id = "research-right".to_string();
+        split_right.objective = "separate the second bounded research lane".to_string();
+        let mut split_patch = patch.clone();
+        split_patch.canonical_digest = "f".repeat(64);
+        split_patch.operation =
+            harness_contract::execution_graph::CollaborationIntentPatchOperation::SplitWorkstream {
+                source_instance_id: "research:1".to_string(),
+                teams: vec![split_left, split_right],
+            };
+        let split_request = collaboration_coordinator::compile_collaboration_intent_patch(
+            &registered,
+            &split_patch,
+        )
+        .expect("unstarted Team split compiles into one atomic replan");
+        let split_proposal = split_request
+            .proposal
+            .expect("split has a semantic proposal");
+        assert_eq!(split_proposal.nodes.len(), 2);
+        assert_eq!(
+            split_proposal.retired_collaboration_instance_ids,
+            vec!["research:1".to_string()]
+        );
+        assert_eq!(
+            split_proposal.completion.required_node_ids,
+            vec!["research-left".to_string(), "research-right".to_string()]
+        );
         let mut dispute_patch = patch.clone();
         dispute_patch.operation =
             harness_contract::execution_graph::CollaborationIntentPatchOperation::ResolveDispute {
-                review,
+                review: review.clone(),
                 disputed_instance_ids: vec!["research:1".to_string()],
             };
         let dispute_request = collaboration_coordinator::compile_collaboration_intent_patch(

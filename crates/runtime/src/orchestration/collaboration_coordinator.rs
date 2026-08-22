@@ -7,8 +7,9 @@
 use std::path::Path;
 
 use harness_contract::execution_graph::{
-    CollaborationProgram, CollaborationProgramControlState, CollaborationProgramLifecycle,
-    ExecutionGraph, ExecutionGraphCommand, TeamAdmissionObligation, TeamAdmissionState,
+    CollaborationProgram, CollaborationProgramControlState, CollaborationProgramEdge,
+    CollaborationProgramLifecycle, ExecutionEdge, ExecutionGraph, ExecutionGraphCommand,
+    TeamAdmissionObligation, TeamAdmissionState,
 };
 
 use crate::execution_core::ExecutionStateStoreError;
@@ -268,12 +269,9 @@ pub(crate) fn compile_conversation_program_intent(
     })
 }
 
-/// Convert a fenced additive Program patch to an internal semantic revision.
-/// `AddTeam`, `RequestReview`, and `ResolveDispute` are additive operations.
-/// The two verifier operations derive dependencies from named durable Team
-/// instances rather than trusting a free-form textual review target.
-/// Operations that mutate an existing node or edge deliberately need the
-/// separate atomic Program+Graph mutation path.
+/// Convert a fenced Program patch to an internal semantic revision. Additive
+/// operations and a split of an unstarted workstream both use this compiler;
+/// the latter carries Runtime-derived retirements into the same graph CAS.
 pub(crate) fn compile_collaboration_intent_patch(
     graph: &ExecutionGraph,
     patch: &harness_contract::execution_graph::CollaborationIntentPatch,
@@ -303,30 +301,40 @@ pub(crate) fn compile_collaboration_intent_patch(
             materialize_review_patch_team(program, review, reviewed_instance_ids)
         })
         .transpose()?;
-    let team = match &patch.operation {
+    let (teams, retired_instance_ids) = match &patch.operation {
         harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam { team } => {
-            team
+            (vec![team.clone()], Vec::new())
         }
         harness_contract::execution_graph::CollaborationIntentPatchOperation::RequestReview {
             ..
         }
         | harness_contract::execution_graph::CollaborationIntentPatchOperation::ResolveDispute {
             ..
-        } => review_team
-            .as_ref()
-            .expect("request-review operation materializes its review Team"),
+        } => (
+            vec![review_team.expect("request-review operation materializes its review Team")],
+            Vec::new(),
+        ),
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::SplitWorkstream {
+            source_instance_id,
+            teams,
+        } => (
+            materialize_split_patch_teams(graph, program, source_instance_id, teams)?,
+            vec![source_instance_id.clone()],
+        ),
         _ => {
             return Err("patch_operation_requires_atomic_program_graph_mutation".to_string());
         }
     };
-    if !team.behavior_facets.is_empty() && team.ephemeral_template.is_none() {
-        return Err("add_team_behavior_facets_require_ephemeral_template_snapshot".to_string());
-    }
-    if program
-        .semantic_node_instances
-        .contains_key(&team.semantic_node_id)
-    {
-        return Err("patch_team_semantic_id_already_exists".to_string());
+    for team in &teams {
+        if !team.behavior_facets.is_empty() && team.ephemeral_template.is_none() {
+            return Err("add_team_behavior_facets_require_ephemeral_template_snapshot".to_string());
+        }
+        if program
+            .semantic_node_instances
+            .contains_key(&team.semantic_node_id)
+        {
+            return Err("patch_team_semantic_id_already_exists".to_string());
+        }
     }
     let seed = graph
         .nodes
@@ -342,12 +350,45 @@ pub(crate) fn compile_collaboration_intent_patch(
     // case the parent Program's Team may itself be ephemeral, so attempting
     // to recover a reusable catalog selector from the seed would both fail
     // and reintroduce a mutable lookup that the snapshot deliberately avoids.
-    let template = team
-        .ephemeral_template
-        .is_none()
-        .then(|| template_path_from_seed(&seed))
-        .transpose()?;
     let mutation_id = format!("program-patch:{}", patch.canonical_digest);
+    let required_node_ids = teams
+        .iter()
+        .filter(|team| team.required)
+        .map(|team| team.semantic_node_id.clone())
+        .collect::<Vec<_>>();
+    let mut required_artifact_kinds = teams
+        .iter()
+        .flat_map(|team| team.output_artifacts.iter().cloned())
+        .collect::<Vec<_>>();
+    required_artifact_kinds.sort();
+    required_artifact_kinds.dedup();
+    let mut capabilities = teams
+        .iter()
+        .flat_map(|team| {
+            team.resource_scopes
+                .iter()
+                .map(|scope| format!("resource:{scope}"))
+        })
+        .collect::<Vec<_>>();
+    capabilities.sort();
+    capabilities.dedup();
+    let ephemeral_team_templates = teams
+        .iter()
+        .filter_map(|team| {
+            team.ephemeral_template
+                .as_ref()
+                .map(|snapshot| (team.semantic_node_id.clone(), snapshot.clone()))
+        })
+        .collect();
+    let templates = teams
+        .iter()
+        .map(|team| {
+            team.ephemeral_template
+                .is_none()
+                .then(|| template_path_from_seed(&seed))
+                .transpose()
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(RuntimeOrchestrationCommand {
         intent: patch.reason.clone(),
         model_lease: Some(seed.model_lease),
@@ -360,69 +401,54 @@ pub(crate) fn compile_collaboration_intent_patch(
             mutation_id,
             target_execution_id: Some(graph.id.clone()),
             expected_revision: Some(graph.revision),
-            nodes: vec![GraphSemanticNode {
-                node_id: team.semantic_node_id.clone(),
-                recipe: CapabilityRecipeId::Team,
-                objective: team.objective.clone(),
-                depends_on: team.depends_on.clone(),
-                // A patch hint controls only the later ResourceManager
-                // scheduling preference.  It is not permission to create
-                // extra Team instances (or to revise a durable resource
-                // ledger) while a Program is already running.
-                multiplicity: 1,
-                focuses: Vec::new(),
-                // Preserve the selected Team definition family from the
-                // already-admitted Program. A patch must not let the
-                // planner's current default silently replace the source
-                // Program's capability/acceptance contract.
-                template,
-                target_session_id: None,
-                output_artifacts: team.output_artifacts.clone(),
-                evidence_contract: team.evidence_contract.clone(),
-                required_evidence_refs: patch
-                    .evidence_refs
-                    .iter()
-                    .map(|reference| reference.evidence_ref.id.clone())
-                    .collect(),
-                resource_scopes: team.resource_scopes.clone(),
-                required: team.required,
-                dependency: Default::default(),
-                cancellation_group: None,
-            }],
+            nodes: teams
+                .iter()
+                .zip(templates)
+                .map(|(team, template)| {
+                    GraphSemanticNode {
+                        node_id: team.semantic_node_id.clone(),
+                        recipe: CapabilityRecipeId::Team,
+                        objective: team.objective.clone(),
+                        depends_on: team.depends_on.clone(),
+                        // A patch hint controls only later scheduling. It is
+                        // not authority to create extra Team instances.
+                        multiplicity: 1,
+                        focuses: Vec::new(),
+                        // Preserve the source Program's definition family;
+                        // a patch cannot silently select a current default.
+                        template,
+                        target_session_id: None,
+                        output_artifacts: team.output_artifacts.clone(),
+                        evidence_contract: team.evidence_contract.clone(),
+                        required_evidence_refs: patch
+                            .evidence_refs
+                            .iter()
+                            .map(|reference| reference.evidence_ref.id.clone())
+                            .collect(),
+                        resource_scopes: team.resource_scopes.clone(),
+                        required: team.required,
+                        dependency: Default::default(),
+                        cancellation_group: None,
+                    }
+                })
+                .collect(),
             completion: harness_contract::execution_graph::ExecutionCompletionContract {
-                required_node_ids: team
-                    .required
-                    .then(|| team.semantic_node_id.clone())
-                    .into_iter()
-                    .collect(),
-                required_artifact_kinds: team.output_artifacts.clone(),
+                required_node_ids,
+                required_artifact_kinds,
                 allow_unresolved_conflicts: false,
             },
             collaboration_program: None,
             collaboration_escalation: patch.escalation.clone(),
-            retired_collaboration_instance_ids: Vec::new(),
+            retired_collaboration_instance_ids: retired_instance_ids,
             reason: patch.reason.clone(),
         }),
         control: None,
         template_proposal: None,
-        ephemeral_team_templates: team
-            .ephemeral_template
-            .as_ref()
-            .map(|snapshot| {
-                std::collections::BTreeMap::from([(
-                    team.semantic_node_id.clone(),
-                    snapshot.clone(),
-                )])
-            })
-            .unwrap_or_default(),
+        ephemeral_team_templates,
         input_disposition: None,
         selection_mode: Some(seed.selection_mode),
         strategy_binding: seed.strategy_binding,
-        capabilities: team
-            .resource_scopes
-            .iter()
-            .map(|scope| format!("resource:{scope}"))
-            .collect(),
+        capabilities,
         evidence_refs: patch
             .evidence_refs
             .iter()
@@ -435,16 +461,131 @@ pub(crate) fn compile_collaboration_intent_patch(
             max_parallel_agents: None,
             risk: None,
             approval_id: None,
-            requires_write: Some(
+            requires_write: Some(teams.iter().any(|team| {
                 team.resource_scopes
                     .iter()
-                    .any(|scope| scope.starts_with("write:")),
-            ),
+                    .any(|scope| scope.starts_with("write:"))
+            })),
             surface_latency_sensitive: Some(false),
             permission_ceiling: seed.permission_ceiling,
         },
         surface: Some("collaboration_program_patch".to_string()),
     })
+}
+
+fn materialize_split_patch_teams(
+    graph: &ExecutionGraph,
+    program: &CollaborationProgram,
+    source_instance_id: &str,
+    teams: &[harness_contract::execution_graph::CollaborationPatchTeam],
+) -> Result<Vec<harness_contract::execution_graph::CollaborationPatchTeam>, String> {
+    if program.control.lifecycle.is_terminal() {
+        return Err("split_patch_program_is_terminal".to_string());
+    }
+    let source = program
+        .team_instances
+        .iter()
+        .find(|instance| instance.instance_id == source_instance_id)
+        .ok_or_else(|| "split_patch_source_instance_missing".to_string())?;
+    let source_node_id = node_id_for_instance(program, source_instance_id)?;
+    if graph.node_statuses.get(&source_node_id)
+        != Some(&harness_contract::execution_graph::ExecutionNodeStatus::Planned)
+    {
+        return Err("split_patch_source_is_not_unstarted".to_string());
+    }
+    if program
+        .control
+        .obligations
+        .iter()
+        .find(|obligation| obligation.instance_id == source_instance_id)
+        .is_some_and(|obligation| obligation.child_graph_ref.is_some())
+    {
+        return Err("split_patch_source_has_child_graph".to_string());
+    }
+    let instance_semantics = program
+        .team_instances
+        .iter()
+        .map(|instance| (&instance.instance_id, &instance.semantic_node_id))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let inherited_dependencies = program
+        .edges
+        .iter()
+        .filter(|edge| edge.to == source_instance_id)
+        .filter_map(|edge| instance_semantics.get(&edge.from).map(|id| (*id).clone()))
+        .collect::<std::collections::BTreeSet<_>>();
+    teams
+        .iter()
+        .cloned()
+        .map(|mut team| {
+            if team.semantic_node_id == source.semantic_node_id {
+                return Err("split_patch_reuses_source_semantic_id".to_string());
+            }
+            team.depends_on
+                .extend(inherited_dependencies.iter().cloned());
+            team.depends_on.sort();
+            team.depends_on.dedup();
+            Ok(team)
+        })
+        .collect()
+}
+
+/// Recreate the durable outgoing relations of an unstarted source Team for
+/// every Split replacement. The source node itself is removed later in the
+/// same graph transaction, so no intermediate graph can expose a dangling
+/// consumer or a copied effect receipt.
+pub(crate) fn split_replacement_outgoing_graph_edges(
+    graph: &ExecutionGraph,
+    program: &CollaborationProgram,
+    source_instance_ids: &[String],
+    replacement_node_ids: &[String],
+) -> Result<Vec<ExecutionEdge>, String> {
+    let source_node_ids = source_instance_ids
+        .iter()
+        .map(|instance_id| node_id_for_instance(program, instance_id))
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+    Ok(graph
+        .edges
+        .iter()
+        .filter(|edge| source_node_ids.contains(&edge.from))
+        .flat_map(|edge| {
+            replacement_node_ids
+                .iter()
+                .map(move |replacement| ExecutionEdge {
+                    from: replacement.clone(),
+                    to: edge.to.clone(),
+                    kind: edge.kind.clone(),
+                })
+        })
+        .collect())
+}
+
+/// Program edge receipts belong to the retired source, never to a
+/// replacement. Preserve only the typed contract and reset the delivery / claim
+/// state for each newly admitted Team instance.
+pub(crate) fn split_replacement_outgoing_program_edges(
+    program: &CollaborationProgram,
+    source_instance_ids: &[String],
+    replacement_instance_ids: &[String],
+) -> Vec<CollaborationProgramEdge> {
+    program
+        .edges
+        .iter()
+        .filter(|edge| source_instance_ids.contains(&edge.from))
+        .flat_map(|edge| {
+            replacement_instance_ids
+                .iter()
+                .map(move |replacement| CollaborationProgramEdge {
+                    edge_id: format!("{replacement}->{}", edge.to),
+                    from: replacement.clone(),
+                    to: edge.to.clone(),
+                    kind: edge.kind,
+                    input_contract: edge.input_contract.clone(),
+                    state: Default::default(),
+                    delivery_receipt: None,
+                    claim_receipt: None,
+                })
+        })
+        .collect()
 }
 
 fn materialize_review_patch_team(
@@ -1353,6 +1494,119 @@ mod tests {
         );
         assert!(
             materialize_review_patch_team(&program, &review, &["missing:1".to_string()]).is_err()
+        );
+    }
+
+    #[test]
+    fn split_replaces_only_an_unstarted_source_and_rebuilds_its_outgoing_relations() {
+        use harness_contract::execution_graph::{
+            CollaborationEdgeKind, CollaborationProgramEdge, CollaborationTeamInstance,
+            ExecutionEdge, ExecutionEdgeKind, ExecutionNodeStatus,
+        };
+
+        let mut graph = ExecutionGraph::new("split-root");
+        graph
+            .node_statuses
+            .insert("source-node".to_string(), ExecutionNodeStatus::Planned);
+        graph
+            .node_statuses
+            .insert("consumer-node".to_string(), ExecutionNodeStatus::Planned);
+        graph.edges.push(ExecutionEdge {
+            from: "source-node".to_string(),
+            to: "consumer-node".to_string(),
+            kind: ExecutionEdgeKind::CrossTeamHandoff,
+        });
+        let program = CollaborationProgram {
+            program_id: "program-split".to_string(),
+            revision: 4,
+            required_team_count: 2,
+            team_instances: vec![
+                CollaborationTeamInstance {
+                    instance_id: "source:1".to_string(),
+                    semantic_node_id: "source".to_string(),
+                    required: true,
+                },
+                CollaborationTeamInstance {
+                    instance_id: "consumer:1".to_string(),
+                    semantic_node_id: "consumer".to_string(),
+                    required: true,
+                },
+            ],
+            edges: vec![CollaborationProgramEdge {
+                edge_id: "source:1->consumer:1".to_string(),
+                from: "source:1".to_string(),
+                to: "consumer:1".to_string(),
+                kind: CollaborationEdgeKind::Handoff,
+                input_contract: Default::default(),
+                state: Default::default(),
+                delivery_receipt: None,
+                claim_receipt: None,
+            }],
+            semantic_node_instances: std::collections::BTreeMap::from([
+                ("source".to_string(), vec!["source-node".to_string()]),
+                ("consumer".to_string(), vec!["consumer-node".to_string()]),
+            ]),
+            control: Default::default(),
+        };
+        let team = harness_contract::execution_graph::CollaborationPatchTeam {
+            semantic_node_id: "split-a".to_string(),
+            objective: "first bounded replacement".to_string(),
+            depends_on: Vec::new(),
+            behavior_facets: Vec::new(),
+            ephemeral_template: None,
+            resource_scopes: vec!["read:src".to_string()],
+            output_artifacts: vec!["summary".to_string()],
+            evidence_contract: vec!["evidence".to_string()],
+            required: true,
+            parallelism_hint: 1,
+        };
+        let mut second = team.clone();
+        second.semantic_node_id = "split-b".to_string();
+        let replacements =
+            materialize_split_patch_teams(&graph, &program, "source:1", &[team, second])
+                .expect("planned source has no child graph or committed effect");
+        assert_eq!(replacements.len(), 2);
+        let source_ids = vec!["source:1".to_string()];
+        assert_eq!(
+            split_replacement_outgoing_graph_edges(
+                &graph,
+                &program,
+                &source_ids,
+                &["split-a-node".to_string(), "split-b-node".to_string()],
+            )
+            .expect("source node mapping resolves"),
+            vec![
+                ExecutionEdge {
+                    from: "split-a-node".to_string(),
+                    to: "consumer-node".to_string(),
+                    kind: ExecutionEdgeKind::CrossTeamHandoff,
+                },
+                ExecutionEdge {
+                    from: "split-b-node".to_string(),
+                    to: "consumer-node".to_string(),
+                    kind: ExecutionEdgeKind::CrossTeamHandoff,
+                },
+            ]
+        );
+        let edges = split_replacement_outgoing_program_edges(
+            &program,
+            &source_ids,
+            &["split-a:1".to_string(), "split-b:1".to_string()],
+        );
+        assert_eq!(edges.len(), 2);
+        assert!(edges.iter().all(|edge| {
+            edge.to == "consumer:1"
+                && edge.delivery_receipt.is_none()
+                && edge.claim_receipt.is_none()
+        }));
+
+        graph
+            .node_statuses
+            .insert("source-node".to_string(), ExecutionNodeStatus::Running);
+        assert_eq!(
+            materialize_split_patch_teams(&graph, &program, "source:1", &[])
+                .expect_err("a started Team is never split"),
+            "split_patch_source_is_not_unstarted"
         );
     }
 
