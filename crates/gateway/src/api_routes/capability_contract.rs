@@ -2735,6 +2735,12 @@ mod tests {
             "#/components/schemas/CollaborationEscalationReceipt",
             "execution projection must expose applied escalation receipts as typed facts"
         );
+        assert_eq!(
+            document["components"]["schemas"]["ExecutionWorkProjection"]["properties"]
+                ["scheduling_priority"]["type"],
+            "integer",
+            "execution projection must expose the durable soft scheduling priority"
+        );
         for field in ["control", "semantic_node_instances"] {
             assert!(
                 collaboration_program["properties"][field].is_object(),

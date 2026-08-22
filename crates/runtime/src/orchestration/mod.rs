@@ -3518,6 +3518,13 @@ mod tests {
         let mut patch_request =
             collaboration_coordinator::compile_collaboration_intent_patch(&registered, &patch)
                 .expect("fenced AddTeam patch compiles");
+        let patch_node = patch_request
+            .proposal
+            .as_ref()
+            .and_then(|proposal| proposal.nodes.first())
+            .expect("AddTeam patch has exactly one semantic Team node");
+        assert_eq!(patch_node.multiplicity, 1);
+        assert_eq!(patch_request.constraints.max_parallel_agents, None);
         team_authority::bind_semantic_resource_authority(
             &mut patch_request,
             None,

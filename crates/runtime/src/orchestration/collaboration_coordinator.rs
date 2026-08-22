@@ -357,7 +357,11 @@ pub(crate) fn compile_collaboration_intent_patch(
                 recipe: CapabilityRecipeId::Team,
                 objective: team.objective.clone(),
                 depends_on: team.depends_on.clone(),
-                multiplicity: team.parallelism_hint.max(1),
+                // A patch hint controls only the later ResourceManager
+                // scheduling preference.  It is not permission to create
+                // extra Team instances (or to revise a durable resource
+                // ledger) while a Program is already running.
+                multiplicity: 1,
                 focuses: Vec::new(),
                 // Preserve the selected Team definition family from the
                 // already-admitted Program. A patch must not let the
@@ -416,7 +420,10 @@ pub(crate) fn compile_collaboration_intent_patch(
             .map(|reference| reference.evidence_ref.id.clone())
             .collect(),
         constraints: RuntimeOrchestrationConstraints {
-            max_parallel_agents: Some(usize::from(team.parallelism_hint.max(1))),
+            // Preserve the resolved Team topology.  `parallelism_hint` is a
+            // soft scheduling signal and must not become a hidden hard
+            // ceiling for the newly admitted Team's role branches.
+            max_parallel_agents: None,
             risk: None,
             approval_id: None,
             requires_write: Some(
