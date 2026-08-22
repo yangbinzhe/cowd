@@ -1243,6 +1243,7 @@ mod tests {
                 evidence_obligations: Vec::new(),
             },
             observed_acceptance: harness_contract::context::ObservedAcceptance::default(),
+            acceptance_evaluation: None,
             outcome: String::new(),
             failure: Some("repeated evidence validation failure".to_string()),
             input_tokens: 10,

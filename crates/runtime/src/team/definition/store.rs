@@ -913,8 +913,9 @@ pub(crate) mod tests_support {
         RevisionLifecycle, RevisionSelector,
     };
     use harness_contract::team::{
-        RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDefinition,
-        TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest, TeamTopologyContract,
+        RoleBehaviorFacet, RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract,
+        TeamRoleDefinition, TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest,
+        TeamTopologyContract,
     };
     use tempfile::TempDir;
 
@@ -943,6 +944,7 @@ pub(crate) mod tests_support {
                 require_synthesis: true,
                 require_review: true,
             },
+            role_aliases: std::collections::BTreeMap::new(),
             roles: vec![TeamRoleDefinition {
                 role_id: "reviewer".to_string(),
                 display_name: None,
@@ -951,6 +953,7 @@ pub(crate) mod tests_support {
                 agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
                 cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
                 partition: RolePartitionPolicy::Single,
+                behavior: vec![RoleBehaviorFacet::TerminalCandidate { required: true }],
                 grant_ceiling: vec![AgentCapability::Read, AgentCapability::Search],
                 task_contract: TeamRoleTaskContract {
                     contract_ref: "task/review@1".to_string(),

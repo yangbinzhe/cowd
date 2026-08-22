@@ -4,10 +4,12 @@ use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
 use harness_contract::agent::{AgentCapability, AgentTaskIntent};
 use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::execution_graph::{
-    validate_execution_graph, DependencyPredicate, ExecutionDependencyPolicy, ExecutionEdge,
-    ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec,
-    ExecutionNodeStatus, ExecutionOrchestrationMetadata, ExecutionParentBinding,
-    ExecutionWorkContract, ExecutionWorkRole,
+    validate_execution_graph, CollaborationEdgeKind, CollaborationProgram,
+    CollaborationProgramEdge, CollaborationTeamInstance, DependencyPredicate,
+    ExecutionDependencyPolicy, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
+    ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+    ExecutionOrchestrationMetadata, ExecutionParentBinding, ExecutionWorkContract,
+    ExecutionWorkRole,
 };
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, TeamInstantiationRequest, TeamSelectionMode,
@@ -100,7 +102,7 @@ pub fn compile_orchestration(
         &graph_id,
         parent_execution.as_ref(),
         team_runtime.ok_or(OrchestrationCompileError::TeamRuntimeRequired)?,
-        &BTreeSet::new(),
+        &BTreeMap::new(),
         &mut repairs,
     )?;
     let mut graph = ExecutionGraph::new(request.intent.clone());
@@ -112,6 +114,8 @@ pub fn compile_orchestration(
     }
     graph.nodes = compiled.nodes;
     graph.edges = compiled.edges;
+    let collaboration_program =
+        collaboration_program_from_proposal(proposal, Some(&compiled.semantic_node_instances))?;
     graph.orchestration = Some(ExecutionOrchestrationMetadata {
         mutation_id: proposal.mutation_id.clone(),
         applied_mutation_ids: vec![proposal.mutation_id.clone()],
@@ -122,6 +126,7 @@ pub fn compile_orchestration(
             &compiled.semantic_node_instances,
             &proposal.nodes,
         ),
+        collaboration_program,
     });
     apply_strategy_estimates(&mut graph, plan);
     validate_execution_graph(&graph)
@@ -138,6 +143,114 @@ pub fn compile_orchestration(
         work_estimate,
         repairs,
     })
+}
+
+/// Derive the immutable collaboration obligations from the semantic proposal.
+///
+/// The runtime accepts arbitrary validated Team topology, but it never lets a
+/// Team count live only in prose or in a transient Host prompt.  A graph with
+/// Team nodes therefore carries one durable program descriptor.  This is a
+/// compiler artifact, not another scheduler or a role-name convention.
+pub(crate) fn collaboration_program_from_proposal(
+    proposal: &GraphMutationProposal,
+    semantic_node_instances: Option<&BTreeMap<String, Vec<String>>>,
+) -> Result<Option<CollaborationProgram>, OrchestrationCompileError> {
+    let team_nodes = proposal
+        .nodes
+        .iter()
+        .filter(|node| node.recipe == CapabilityRecipeId::Team)
+        .collect::<Vec<_>>();
+    if team_nodes.is_empty() {
+        if proposal.collaboration_program.is_some() {
+            return Err(OrchestrationCompileError::InvalidProposal(
+                "collaboration program cannot exist without Team nodes".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    let instances = team_nodes
+        .iter()
+        .flat_map(|node| {
+            (0..node.multiplicity).map(move |index| CollaborationTeamInstance {
+                instance_id: format!("{}:{}", node.node_id, index.saturating_add(1)),
+                semantic_node_id: node.node_id.clone(),
+                required: node.required,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut edges = Vec::new();
+    for consumer in &team_nodes {
+        for producer_id in &consumer.depends_on {
+            let Some(producer) = team_nodes.iter().find(|node| node.node_id == *producer_id) else {
+                // Dependencies on a non-Team semantic node remain ordinary
+                // graph edges; they are not cross-Team handoffs.
+                continue;
+            };
+            for from_index in 0..producer.multiplicity {
+                for to_index in 0..consumer.multiplicity {
+                    let from = format!("{}:{}", producer.node_id, from_index.saturating_add(1));
+                    let to = format!("{}:{}", consumer.node_id, to_index.saturating_add(1));
+                    edges.push(CollaborationProgramEdge {
+                        edge_id: format!("{from}->{to}"),
+                        from,
+                        to,
+                        kind: CollaborationEdgeKind::Handoff,
+                    });
+                }
+            }
+        }
+    }
+    let derived = CollaborationProgram {
+        program_id: format!("collaboration-program:{}", proposal.mutation_id),
+        revision: 1,
+        required_team_count: u16::try_from(instances.iter().filter(|team| team.required).count())
+            .map_err(|_| {
+            OrchestrationCompileError::InvalidProposal(
+                "collaboration program Team count exceeds u16".to_string(),
+            )
+        })?,
+        team_instances: instances,
+        edges,
+        semantic_node_instances: semantic_node_instances.map_or_else(BTreeMap::new, |instances| {
+            team_nodes
+                .iter()
+                .filter_map(|node| {
+                    instances
+                        .get(&node.node_id)
+                        .cloned()
+                        .map(|physical| (node.node_id.clone(), physical))
+                })
+                .collect()
+        }),
+    };
+    derived
+        .validate()
+        .map_err(OrchestrationCompileError::InvalidProposal)?;
+
+    if let Some(program) = proposal.collaboration_program.as_ref() {
+        program
+            .validate()
+            .map_err(OrchestrationCompileError::InvalidProposal)?;
+        let actual = program
+            .team_instances
+            .iter()
+            .map(|instance| (&instance.instance_id, &instance.semantic_node_id))
+            .collect::<BTreeSet<_>>();
+        let expected = derived
+            .team_instances
+            .iter()
+            .map(|instance| (&instance.instance_id, &instance.semantic_node_id))
+            .collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(OrchestrationCompileError::InvalidProposal(
+                "collaboration program Team instances do not match the semantic Team nodes"
+                    .to_string(),
+            ));
+        }
+        return Ok(Some(program.clone()));
+    }
+    Ok(Some(derived))
 }
 
 pub(crate) fn estimate_work_graph(
@@ -221,7 +334,7 @@ pub fn compile_graph_mutation(
     graph_id: &str,
     root_parent: Option<&ExecutionParentBinding>,
     team_runtime: &TeamRuntime,
-    existing_node_ids: &BTreeSet<String>,
+    existing_semantic_node_instances: &BTreeMap<String, Vec<String>>,
     repairs: &mut Vec<String>,
 ) -> Result<CompiledGraphMutation, OrchestrationCompileError> {
     let semantic_ids = proposal
@@ -258,11 +371,7 @@ pub fn compile_graph_mutation(
             let providers = semantic_node_instances
                 .get(dependency)
                 .cloned()
-                .or_else(|| {
-                    existing_node_ids
-                        .contains(dependency)
-                        .then(|| vec![dependency.clone()])
-                })
+                .or_else(|| existing_semantic_node_instances.get(dependency).cloned())
                 .ok_or_else(|| {
                     OrchestrationCompileError::InvalidProposal(format!(
                         "semantic dependency `{dependency}` is absent"
@@ -454,6 +563,9 @@ fn compile_team_subgraph_node(
         "runtime-team:{}:{}:{}",
         request_id, semantic.node_id, instance_index
     );
+    // This provisional value only lets `TeamRuntime::plan` resolve the
+    // published template.  The durable Team request is rebuilt below from
+    // the resolved topology, rather than from a fixed one-Team timeout.
     let deadline_at_ms = crate::tool_invocation::now_ms()
         .saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
     tracing::debug!(
@@ -526,19 +638,25 @@ fn compile_team_subgraph_node(
         .len()
         .max(1);
     let mut team_request = team_request;
-    // A healthy, progressing Team must never be killed by a wall-clock
-    // deadline: slow-but-valid roles, long provider calls and genuinely long
-    // tasks are legitimate and may run for a very long time. There is no
-    // time budget at all; termination is driven by intelligent catastrophe
-    // detection only — dead loops (repeated identical tool batches with no
-    // new evidence), crashes and severe provider/framework faults. Long
-    // sessions surface periodic user warnings and a finalize command instead
-    // of a hard cut. Per-role budgets are metered for tokens, never for
-    // wall-clock admission.
-    let max_parallel = team_parallelism_ladder(role_branch_count)
-        .max(request.constraints.max_parallel_agents.unwrap_or(0))
-        .clamp(1, TEAM_PARALLELISM_HARD_CEILING);
-    let scaled_deadline = u64::MAX;
+    // The model may propose a narrower parallelism hint.  When it does not,
+    // the only useful default is the resolved Team topology itself.  Global
+    // tenant/device capacity is deliberately *not* duplicated here: the
+    // ResourceManager remains its single admission owner.
+    let max_parallel = request
+        .constraints
+        .max_parallel_agents
+        .unwrap_or(role_branch_count)
+        .max(1);
+    // A Team deadline is a durable liveness budget, not a template-specific
+    // fixed timeout and not an unbounded sentinel.  It expands with the
+    // actual number of scheduled waves and the contract's verification work.
+    // This preserves room for genuinely complex, serialized work while
+    // guaranteeing that a stalled Team reaches a typed terminal state.
+    let scaled_deadline = adaptive_team_deadline_at_ms(
+        role_branch_count,
+        max_parallel,
+        !semantic.evidence_contract.is_empty(),
+    );
     team_request.deadline_at_ms = scaled_deadline;
     team_request.execution_budget = adaptive_team_execution_budget(
         format!("runtime-team-budget:{node_id}"),
@@ -566,23 +684,29 @@ fn compile_team_subgraph_node(
     Ok(node)
 }
 
-/// Agent parallelism ladder for Team execution. The default starts at 8 and
-/// escalates with the team's role count (8 → 16 → 64 → 256) so a larger team
-/// is never serialized into an unnecessarily long wave chain. The ladder is
-/// a scheduling floor, not a cap: an explicit higher model request is honored
-/// up to `TEAM_PARALLELISM_HARD_CEILING`.
-const TEAM_PARALLELISM_HARD_CEILING: usize = 256;
-
-fn team_parallelism_ladder(role_count: usize) -> usize {
-    if role_count <= 8 {
-        8
-    } else if role_count <= 16 {
-        16
-    } else if role_count <= 64 {
-        64
-    } else {
-        256
-    }
+/// Derive a liveness window from the *compiled* Team topology.
+///
+/// A Team may contain independent branches, serialized waves, and a final
+/// verification/synthesis phase.  Each of those phases receives the normal
+/// Runtime-issued delegated-work window.  This is a complexity prediction,
+/// not a provider billing limit; live capacity remains governed by the
+/// ResourceManager and the user can still pause/cancel/finalize the graph.
+fn adaptive_team_deadline_at_ms(
+    role_branch_count: usize,
+    max_parallel: usize,
+    requires_verification: bool,
+) -> u64 {
+    let branches = role_branch_count.max(1);
+    let lanes = max_parallel.max(1);
+    let execution_waves = branches.div_ceil(lanes);
+    // One terminal synthesis phase always follows the Agent waves.  A
+    // contract with evidence also reserves a verification phase.
+    let phases = execution_waves
+        .saturating_add(1)
+        .saturating_add(usize::from(requires_verification));
+    let duration = harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS
+        .saturating_mul(u64::try_from(phases).unwrap_or(u64::MAX));
+    crate::tool_invocation::now_ms().saturating_add(duration)
 }
 
 fn focus_partition_plans(
@@ -750,6 +874,7 @@ fn compile_agent_node(
             )
         })?,
         team_id: None,
+        team_role_identity: None,
         graph_id: graph_id.to_string(),
         node_id: node_id.to_string(),
         attempt: 1,
@@ -761,17 +886,10 @@ fn compile_agent_node(
         },
         output_acceptance: Vec::new(),
         acceptance: semantic.evidence_contract.clone(),
-        constraints: focus
-            .map(|focus| {
-                vec![
-                    format!("focus_partition:{}", focus.focus_id),
-                    format!(
-                        "focus_evidence_responsibility:{}",
-                        focus.evidence_responsibilities.join(",")
-                    ),
-                ]
-            })
-            .unwrap_or_default(),
+        // The bounded objective, resource scopes and typed acceptance are
+        // already persisted fields.  Do not smuggle semantic focus through
+        // free-form constraints that a restarted worker may parse differently.
+        constraints: Vec::new(),
         context_refs: resolved_context_refs(request, semantic),
         evidence_refs: Vec::new(),
         resource_scopes: resource_scopes.clone(),
@@ -791,7 +909,6 @@ fn compile_agent_node(
             node_id,
             "runtime_agent",
             budget_tokens,
-            budget_tokens.saturating_mul(75),
             deadline_at_ms,
             1,
         ),
@@ -1002,10 +1119,7 @@ fn adaptive_team_execution_budget(
         deadline_at_ms,
         max_parallel,
     )
-    .with_prediction(
-        plan.team_total_budget,
-        plan.team_total_budget.saturating_mul(75),
-    )
+    .with_prediction(plan.team_total_budget)
 }
 
 fn adaptive_runtime_budget_plan(
@@ -1049,6 +1163,38 @@ pub fn guidance_for_compile_result(compiled: bool) -> String {
 mod tests {
     use super::*;
     use crate::orchestration::request::SemanticFocus;
+
+    #[test]
+    fn team_deadline_scales_with_compiled_waves_not_template_name_or_magic_ladder() {
+        let base = harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS;
+        let before = crate::tool_invocation::now_ms();
+        let parallel = adaptive_team_deadline_at_ms(3, 3, true);
+        let serial = adaptive_team_deadline_at_ms(3, 1, true);
+
+        // 3 parallel roles + verify + synthesis = 3 liveness phases.
+        assert!(parallel >= before.saturating_add(base.saturating_mul(3)));
+        // The same topology in one lane has three Agent waves plus verify and
+        // synthesis, so it receives a larger durable window without creating
+        // an unbounded deadline.
+        assert!(serial >= before.saturating_add(base.saturating_mul(5)));
+        assert!(serial > parallel);
+        assert_ne!(parallel, u64::MAX);
+        assert_ne!(serial, u64::MAX);
+    }
+
+    #[test]
+    fn team_deadline_normalizes_invalid_zero_parallelism_without_unbounded_sentinel() {
+        let before = crate::tool_invocation::now_ms();
+        let deadline = adaptive_team_deadline_at_ms(1, 0, false);
+        assert!(
+            deadline
+                >= before.saturating_add(
+                    harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS
+                        .saturating_mul(2)
+                )
+        );
+        assert_ne!(deadline, u64::MAX);
+    }
 
     #[test]
     fn review_nodes_default_to_evidence_ready_predicate_not_status_all() {
@@ -1164,5 +1310,62 @@ mod tests {
         assert!(!plans[0].shared_baseline[0].contains("secret-b"));
         let bounded = bounded_team_node_objective(&semantic);
         assert!(!bounded.contains("merge both"));
+    }
+
+    #[test]
+    fn team_semantic_topology_becomes_durable_program_without_forcing_serial_work() {
+        let team = |id: &str, depends_on: Vec<String>| GraphSemanticNode {
+            node_id: id.to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: format!("{id} workstream"),
+            depends_on,
+            multiplicity: 1,
+            focuses: Vec::new(),
+            template: None,
+            target_session_id: None,
+            output_artifacts: vec!["terminal_synthesis".to_string()],
+            evidence_contract: Vec::new(),
+            required_evidence_refs: Vec::new(),
+            resource_scopes: vec!["read:src".to_string()],
+            required: true,
+            dependency: ExecutionDependencyPolicy::default(),
+            cancellation_group: None,
+        };
+        let independent = GraphMutationProposal {
+            mutation_id: "independent-team-program".to_string(),
+            target_execution_id: None,
+            expected_revision: None,
+            nodes: vec![
+                team("research", Vec::new()),
+                team("implementation", Vec::new()),
+            ],
+            completion: Default::default(),
+            collaboration_program: None,
+            reason: "independent workstreams".to_string(),
+        };
+        let program = collaboration_program_from_proposal(&independent, None)
+            .expect("derive program")
+            .expect("Team program");
+        assert_eq!(program.required_team_count, 2);
+        assert!(program.edges.is_empty());
+
+        let dependent = GraphMutationProposal {
+            mutation_id: "review-after-research".to_string(),
+            target_execution_id: None,
+            expected_revision: None,
+            nodes: vec![
+                team("research", Vec::new()),
+                team("review", vec!["research".to_string()]),
+            ],
+            completion: Default::default(),
+            collaboration_program: None,
+            reason: "review consumes research evidence".to_string(),
+        };
+        let program = collaboration_program_from_proposal(&dependent, None)
+            .expect("derive program")
+            .expect("Team program");
+        assert_eq!(program.edges.len(), 1);
+        assert_eq!(program.edges[0].from, "research:1");
+        assert_eq!(program.edges[0].to, "review:1");
     }
 }

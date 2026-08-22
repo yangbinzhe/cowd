@@ -7,6 +7,7 @@ use harness_contract::agent::{
     AgentCommandRequest, AgentInput, AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus,
 };
 use harness_contract::turn::{InputSourceKind, SessionInputEnvelope};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ContextProfile, PermissionMode, PermissionPolicy, RuntimeExecutionHost, RuntimeServices,
@@ -292,6 +293,31 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     packet.session_id()
                 )
             })?;
+        let commit_service = crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(
+            services.event_store(),
+        ));
+        let durable_agent_receipts = commit_service
+            .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt)
+            .map_err(|error| {
+                format!(
+                    "delegated Agent tool receipt recovery is invalid for {}:{}:{}: {error}",
+                    packet.graph_id(),
+                    packet.node_id(),
+                    packet.attempt
+                )
+            })?;
+        let recovered_tool_receipt_count = durable_agent_receipts.len();
+        let recovered_tool_receipt_prompt =
+            recovered_agent_tool_receipt_prompt(&durable_agent_receipts);
+        let durable_receipts = durable_agent_receipts
+            .into_iter()
+            .map(scoped_receipt_from_durable)
+            .collect::<Vec<_>>();
+        let recovered_sequence = durable_receipts
+            .iter()
+            .map(|receipt| receipt.sequence)
+            .max()
+            .unwrap_or(0);
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
             host,
             allowed_tools: allowed_tools.clone(),
@@ -302,13 +328,15 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             model_lease: selection.model.clone(),
             execution_id: packet.graph_id().to_string(),
             node_id: packet.node_id().to_string(),
+            attempt: packet.attempt,
             workspace_root: services.workspace_root().to_path_buf(),
             path_identity_resolver: Arc::clone(services.path_identity_resolver()),
             scope_locks: Arc::clone(services.scope_locks()),
+            commit_service: Some(commit_service),
             resource_scopes: packet.team_id().map(|_| packet.resource_scopes.clone()),
             managed_invocation: packet.managed_invocation.clone(),
-            next_receipt_sequence: AtomicU64::new(0),
-            receipts: Mutex::new(Vec::new()),
+            next_receipt_sequence: AtomicU64::new(recovered_sequence),
+            receipts: Mutex::new(durable_receipts),
         });
         if packet.policy_revision != 0 && packet.policy_revision != live_session_policy.revision {
             return Err(format!(
@@ -416,6 +444,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         };
         let mut prompt_segments = system_prompt(&packet, services.workspace_root(), &tool_names);
         prompt_segments.extend(team_markdown_fragment);
+        if let Some(receipt_prompt) = recovered_tool_receipt_prompt {
+            prompt_segments.push(receipt_prompt);
+        }
         let host = StandardRuntimeHost::new(StandardRuntimeHostConfig {
             runtime_services: Arc::clone(&services),
             session: child_session,
@@ -458,6 +489,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 node_id: packet.node_id().to_string(),
             }),
             execution_role: crate::TurnExecutionRole::DelegatedLeaf,
+            recovered_tool_receipt_count,
         });
         let mut runtime = match host {
             Ok(runtime) => runtime,
@@ -625,14 +657,20 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        let (acceptance, runtime_change_receipts) =
-            runtime_evaluated_acceptance(&packet, &summary, &evidence_refs, &tool_executor);
+        let (acceptance, runtime_change_receipts) = derive_receipt_backed_satisfied_criteria(
+            &packet,
+            &summary,
+            &evidence_refs,
+            &tool_executor,
+        );
         // `submit_turn` is the delegated child terminal boundary. From this
-        // point onward Runtime performs only deterministic parsing and receipt
-        // evaluation: it never asks a Provider to rewrite, normalize, or repair
-        // the terminal answer. Missing structured fields remain missing so the
-        // canonical Agent validator/Team reducer can degrade or reject the
-        // result without polluting the parent turn with hidden model work.
+        // point onward Runtime performs only deterministic presentation
+        // normalization and receipt evaluation: it never asks a Provider to
+        // rewrite or repair the terminal answer. Receipt-backed technical
+        // prose may be carried into a presentation field, while missing
+        // risk/unresolved declarations remain missing so the canonical Agent
+        // validator/Team reducer can degrade or reject without hidden model
+        // work.
         // Dropping the host drops the provider callback sender. The bounded
         // reporter owns no runtime state beyond the lifecycle projection, so
         // it can be joined before the terminal Agent result is committed.
@@ -659,7 +697,11 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .iter()
             .flat_map(|receipt| receipt.observed_evidence.iter().cloned())
             .collect::<Vec<_>>();
-        let required_acceptance = packet.required_acceptance.clone();
+        let required_acceptance =
+            crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
+                &packet.required_acceptance,
+                &packet.acceptance,
+            );
         let terminal_structured_fields = structured_agent_output(&summary.final_answer)
             .map(|object| object.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
@@ -670,11 +712,12 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             terminal_completion = ?summary.terminal_completion,
             "delegated Agent terminal carrier prepared"
         );
-        let observed_acceptance = crate::path_identity::evaluate_observed_acceptance(
-            &required_acceptance,
-            acceptance.clone(),
-            observed_evidence,
-        );
+        let (observed_acceptance, acceptance_evaluation) =
+            crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
+                &required_acceptance,
+                acceptance.clone(),
+                observed_evidence,
+            );
         let changes = runtime_change_receipts
             .iter()
             .map(|receipt| receipt.path.clone())
@@ -711,7 +754,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             })
             .collect::<Vec<_>>();
         let contract_criteria = packet_acceptance_contract(&packet)
-            .unwrap_or_default()
             .into_iter()
             .map(|requirement| requirement.criterion)
             .collect::<Vec<_>>();
@@ -772,6 +814,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             outcome: summary.final_answer,
             answer_candidate: None,
             observed_acceptance,
+            acceptance_evaluation: Some(acceptance_evaluation),
             acceptance,
             evidence_refs,
             changes,
@@ -949,13 +992,8 @@ fn delegated_child_session(
 
 fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
     packet
-        .constraints
-        .iter()
-        .find_map(|constraint| {
-            constraint
-                .strip_prefix("focus_novelty_target_bp:")
-                .and_then(|value| value.parse::<u16>().ok())
-        })
+        .team_role_assignment()
+        .map(|assignment| assignment.identity.novelty_target_bp)
         .unwrap_or(0)
         .min(10_000)
 }
@@ -974,7 +1012,6 @@ fn packet_focus_acceptance_scopes(packet: &AgentTaskPacket) -> Vec<String> {
 
 fn packet_required_output_fields(packet: &AgentTaskPacket) -> Vec<String> {
     let mut fields = packet_acceptance_contract(packet)
-        .unwrap_or_default()
         .into_iter()
         .filter_map(|requirement| match requirement.check {
             harness_contract::team::TeamAcceptanceCheck::StructuredField { field }
@@ -1056,9 +1093,14 @@ struct ScopedRuntimeToolExecutor {
     model_lease: String,
     execution_id: String,
     node_id: String,
+    attempt: u32,
     workspace_root: std::path::PathBuf,
     path_identity_resolver: Arc<crate::path_identity::WorkspacePathIdentityResolver>,
     scope_locks: Arc<ScopeLockManager>,
+    /// Production instances persist every canonical ToolHost receipt before
+    /// exposing it to the child terminal evaluator. Unit fixtures may omit
+    /// this ledger because they do not model a durable RuntimeServices host.
+    commit_service: Option<crate::execution_core::graph::ExecutionCommitService>,
     /// `Some` marks a Team child and is always enforced. An empty list means
     /// no workspace authority; it never expands to the whole repository.
     resource_scopes: Option<Vec<String>>,
@@ -1076,6 +1118,68 @@ struct ScopedToolExecutionReceipt {
     prior_states: BTreeMap<String, harness_contract::context::WorkspacePriorState>,
     after_digests: BTreeMap<String, Option<String>>,
     observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
+}
+
+fn scoped_receipt_from_durable(
+    receipt: crate::execution_core::graph::DurableAgentToolReceipt,
+) -> ScopedToolExecutionReceipt {
+    let mut paths = Vec::new();
+    let mut prior_states = BTreeMap::new();
+    let mut after_digests = BTreeMap::new();
+    for evidence in &receipt.outcome.observed_evidence {
+        let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
+            &evidence.target
+        else {
+            continue;
+        };
+        let path = scope.path.workspace_relative_path.clone();
+        if !paths.contains(&path) {
+            paths.push(path.clone());
+        }
+        if let Some(state) = evidence.workspace_prior_state.clone() {
+            prior_states.insert(path.clone(), state);
+        }
+        after_digests.insert(path, scope.path.observed_revision_or_digest.clone());
+    }
+    paths.sort();
+    ScopedToolExecutionReceipt {
+        sequence: receipt.sequence,
+        effect_kind: receipt.effect_kind,
+        resource_scopes: receipt.authorized_scopes,
+        paths,
+        prior_states,
+        after_digests,
+        observed_evidence: receipt.outcome.observed_evidence,
+    }
+}
+
+/// Bound, Runtime-attested recovery context for a delegated attempt that
+/// crashed after ToolHost committed effects. It deliberately contains only
+/// the canonical receipt outputs and evidence the Agent already holds under
+/// its role lease; it never reads the live workspace or asks the model to
+/// reconstruct a side effect.
+fn recovered_agent_tool_receipt_prompt(
+    receipts: &[crate::execution_core::graph::DurableAgentToolReceipt],
+) -> Option<String> {
+    if receipts.is_empty() {
+        return None;
+    }
+    let evidence = receipts
+        .iter()
+        .map(|receipt| {
+            serde_json::json!({
+                "sequence": receipt.sequence,
+                "effect_kind": receipt.effect_kind,
+                "authorized_scopes": receipt.authorized_scopes,
+                "outcome": receipt.outcome,
+            })
+        })
+        .collect::<Vec<_>>();
+    let serialized = serde_json::to_string(&evidence).ok()?;
+    let bounded = serialized.chars().take(48_000).collect::<String>();
+    Some(format!(
+        "# Durable tool-receipt recovery\nA previous process already committed the following Runtime ToolHost receipts for this exact Agent attempt. They are authoritative. Do not call tools, retry an action, or infer new workspace state. Produce one concise terminal response grounded only in these retained receipts; state any unresolved requirement plainly.\n\n{bounded}"
+    ))
 }
 
 #[async_trait::async_trait]
@@ -1352,6 +1456,7 @@ impl ScopedRuntimeToolExecutor {
                 execution_id: self.execution_id.clone(),
                 node_id: self.node_id.clone(),
             }),
+            parent_execution_attempt: Some(self.attempt),
             execution_decision: None,
             // An Agent evaluation Binding is candidate provenance, not the
             // tool-free Judge surface. The exact Team resource ceiling above
@@ -1420,6 +1525,7 @@ impl ScopedRuntimeToolExecutor {
                 execution_id: self.execution_id.clone(),
                 node_id: self.node_id.clone(),
             }),
+            parent_execution_attempt: Some(self.attempt),
             execution_decision: None,
             evaluation_isolated: false,
             managed_invocation: None,
@@ -1594,9 +1700,13 @@ impl ScopedRuntimeToolExecutor {
             .as_ref()
             .and_then(|value| value.idempotency_key.clone())
             .unwrap_or_else(|| {
-                format!(
-                    "agent-tool:{tool_name}:{}",
-                    crate::tool_invocation::now_ms()
+                deterministic_scoped_tool_idempotency_key(
+                    &self.execution_id,
+                    &self.node_id,
+                    self.attempt,
+                    sequence,
+                    tool_name,
+                    input,
                 )
             });
         let request = RuntimeToolExecutionRequest {
@@ -1604,7 +1714,10 @@ impl ScopedRuntimeToolExecutor {
             governed_plan_revision: sequence,
             observation_wave_sequence: sequence,
             idempotency_key,
-            tool_use_id: format!("agent-tool:{}", uuid::Uuid::new_v4()),
+            tool_use_id: format!(
+                "agent-tool:{}:{}:{}:{tool_name}",
+                self.node_id, self.attempt, sequence
+            ),
             tool_name: tool_name.to_string(),
             input: input.to_string(),
             category: crate::ToolSafetyCategory::from_effect(&descriptor),
@@ -1619,6 +1732,7 @@ impl ScopedRuntimeToolExecutor {
                 execution_id: self.execution_id.clone(),
                 node_id: self.node_id.clone(),
             }),
+            parent_execution_attempt: Some(self.attempt),
             execution_decision: None,
             // Candidate-evaluation provenance does not make the child a
             // Judge. ScopedRuntimeToolExecutor already enforces the exact
@@ -1627,7 +1741,54 @@ impl ScopedRuntimeToolExecutor {
             managed_invocation: self.managed_invocation.clone(),
             tool_progress: crate::ToolProgressSink::default(),
         };
-        let outcome = self.host.execute_runtime_tool(&request).await;
+        let effect_state = self
+            .commit_service
+            .as_ref()
+            .map(|service| service.begin_tool_effect(&request, &descriptor))
+            .transpose()
+            .map_err(|error| {
+                ToolError::new(format!(
+                    "tool `{tool_name}` durable effect admission failed: {error}"
+                ))
+            })?
+            .unwrap_or(crate::execution_core::graph::ToolEffectState::Fresh);
+        let (outcome, fresh_execution) = match effect_state {
+            crate::execution_core::graph::ToolEffectState::Completed(mut outcome) => {
+                outcome.tool_use_id.clone_from(&request.tool_use_id);
+                outcome.tool_name.clone_from(&request.tool_name);
+                outcome.category = request.category;
+                for evidence in &mut outcome.observed_evidence {
+                    evidence.provenance =
+                        harness_contract::context::ObservedEvidenceProvenance::RetainedReplay;
+                }
+                (outcome, false)
+            }
+            crate::execution_core::graph::ToolEffectState::Uncertain => {
+                return Err(ToolError::new(
+                    "tool effect is uncertain; non-idempotent execution was not replayed",
+                ));
+            }
+            crate::execution_core::graph::ToolEffectState::Fresh
+            | crate::execution_core::graph::ToolEffectState::NotRequired => {
+                (self.host.execute_runtime_tool(&request).await, true)
+            }
+        };
+        if fresh_execution {
+            if let Some(commit_service) = &self.commit_service {
+                let committed =
+                    if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read {
+                        commit_service
+                            .commit_readonly_tool_receipts(&[(request.clone(), outcome.clone())])
+                    } else {
+                        commit_service.commit_tool_effect(&request, &descriptor, &outcome)
+                    };
+                if let Err(error) = committed {
+                    return Err(ToolError::new(format!(
+                        "tool `{tool_name}` completed but durable receipt commit failed: {error}"
+                    )));
+                }
+            }
+        }
         match outcome.status {
             RuntimeToolExecutionStatus::Executed => {
                 let observed_evidence = outcome.observed_evidence.clone();
@@ -1709,6 +1870,18 @@ impl ScopedRuntimeToolExecutor {
             )),
         }
     }
+}
+
+fn deterministic_scoped_tool_idempotency_key(
+    execution_id: &str,
+    node_id: &str,
+    attempt: u32,
+    sequence: u64,
+    tool_name: &str,
+    input: &str,
+) -> String {
+    let input_sha256 = format!("{:x}", Sha256::digest(input.as_bytes()));
+    format!("agent-tool:{execution_id}:{node_id}:{attempt}:{sequence}:{tool_name}:{input_sha256}")
 }
 
 fn normalize_delegated_resource_paths(
@@ -2180,7 +2353,8 @@ fn system_prompt(
         prompt.push(format!("Acceptance: {}", packet.acceptance.join("; ")));
     }
     let mut required_write_scopes = Vec::new();
-    if let Some(contract) = packet_acceptance_contract(packet) {
+    let contract = packet_acceptance_contract(packet);
+    if !contract.is_empty() {
         required_write_scopes.extend(contract.iter().flat_map(
             |requirement| match &requirement.check {
                 harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { scopes, .. } => {
@@ -2212,7 +2386,7 @@ fn system_prompt(
         fields.sort();
         fields.dedup();
         prompt.push(format!(
-            "Return exactly one JSON object without markdown fences. Populate every required structured field with a non-empty value: {}. Runtime derives acceptance from committed tool receipts, change paths, upstream evidence bindings, and this exact schema; repeating acceptance text does not satisfy it.",
+            "Give a concise terminal answer. When practical, label these presentation fields: {}. Native structured output, a JSON object, Markdown headings, and `Field: value` labels are all understood. Runtime derives acceptance from committed tool receipts, change paths, and upstream evidence bindings; prose never substitutes for those facts.",
             fields.join(", ")
         ));
     }
@@ -2256,7 +2430,10 @@ fn agent_evidence_refs(
     refs
 }
 
-fn runtime_evaluated_acceptance(
+/// Derive structured-field criteria from the terminal answer and canonical
+/// ToolHost receipts.  Obligation matching itself remains exclusively owned
+/// by `AcceptanceEvaluator::evaluate_required` at the terminal boundary.
+fn derive_receipt_backed_satisfied_criteria(
     packet: &AgentTaskPacket,
     summary: &crate::TurnSummary,
     evidence_refs: &[harness_contract::context::EvidenceAccessRef],
@@ -2335,7 +2512,6 @@ fn runtime_evaluated_acceptance(
         .iter()
         .any(crate::agent_result_validator::is_materialized_durable_evidence);
     let acceptance = packet_acceptance_contract(packet)
-        .unwrap_or_default()
         .into_iter()
         .filter(|requirement| match &requirement.check {
             harness_contract::team::TeamAcceptanceCheck::StructuredField { field } => {
@@ -2351,14 +2527,14 @@ fn runtime_evaluated_acceptance(
                     && scopes.iter().all(|scope| scope_observed(scope))
             }
             harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, scopes } => {
-                produced_evidence && field_present(*field) && changes_in_scopes(scopes)
+                produced_evidence && field_present(*field) && changes_in_scopes(&scopes)
             }
             harness_contract::team::TeamAcceptanceCheck::SourceVerification { scopes } => {
                 produced_evidence
                     && field_present(
                         harness_contract::team::TeamStructuredOutputField::SourceVerification,
                     )
-                    && changes_in_scopes(scopes)
+                    && changes_in_scopes(&scopes)
                     && changes.iter().all(|change| {
                         has_matching_pre_write_evidence(change, &receipts)
                             && has_matching_read_receipt(change, &receipts, true)
@@ -2395,13 +2571,9 @@ fn packet_upstream_change_receipts(
     packet: &AgentTaskPacket,
 ) -> Vec<harness_contract::agent::AgentChangeReceipt> {
     let mut changes = packet
-        .constraints
+        .evidence_refs
         .iter()
-        .filter_map(|constraint| constraint.strip_prefix("upstream_change_scope:"))
-        .filter_map(|value| {
-            serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(value).ok()
-        })
-        .chain(packet.evidence_refs.iter().filter_map(|evidence| {
+        .filter_map(|evidence| {
             (crate::agent_result_validator::is_materialized_durable_evidence(evidence)
                 && evidence.evidence_ref.ref_type == "runtime_change")
                 .then(|| {
@@ -2411,7 +2583,7 @@ fn packet_upstream_change_receipts(
                     .ok()
                 })
                 .flatten()
-        }))
+        })
         .collect::<Vec<_>>();
     changes.sort_by(|left, right| {
         left.path
@@ -2558,17 +2730,8 @@ fn has_matching_pre_write_evidence(
 
 fn packet_acceptance_contract(
     packet: &AgentTaskPacket,
-) -> Option<Vec<harness_contract::team::TeamAcceptanceRequirement>> {
-    if !packet.output_acceptance.is_empty() {
-        return Some(packet.output_acceptance.clone());
-    }
-    // One rolling migration boundary for durable pre-typed packets. Newly
-    // compiled work never recovers acceptance authority from a string.
-    packet
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
-        .and_then(|value| serde_json::from_str(value).ok())
+) -> Vec<harness_contract::team::TeamAcceptanceRequirement> {
+    packet.output_acceptance.clone()
 }
 
 fn materialized_json_value(value: &serde_json::Value) -> bool {
@@ -2847,24 +3010,16 @@ fn normalize_verified_narrative_terminal(
     if !has_typed_receipt && !has_upstream_evidence {
         return;
     }
-    let required_fields = packet_acceptance_contract(packet)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|requirement| match requirement.check {
-            harness_contract::team::TeamAcceptanceCheck::StructuredField { field } => Some(field),
-            _ => None,
-        })
+    let mut required_fields = packet_acceptance_contract(packet)
+        .iter()
+        .filter_map(narrative_field_for_requirement)
         .collect::<Vec<_>>();
+    required_fields.sort_by_key(|field| field.as_str());
+    required_fields.dedup();
     if required_fields.is_empty()
-        || !required_fields.iter().all(|field| {
-            matches!(
-                field,
-                harness_contract::team::TeamStructuredOutputField::Findings
-                    | harness_contract::team::TeamStructuredOutputField::Summary
-                    | harness_contract::team::TeamStructuredOutputField::Unresolved
-                    | harness_contract::team::TeamStructuredOutputField::Risks
-            )
-        })
+        || !required_fields
+            .iter()
+            .all(|field| narrative_field_can_be_normalized(*field))
     {
         return;
     }
@@ -2877,20 +3032,61 @@ fn normalize_verified_narrative_terminal(
     summary.final_answer = normalized;
 }
 
+/// Maps only presentation-bearing checks to the field which accompanies the
+/// Runtime-owned fact.  The fact itself is still checked independently below:
+/// write/change checks require receipts, source verification requires the
+/// pre/post read chain, and reviews require durable upstream evidence.
+fn narrative_field_for_requirement(
+    requirement: &harness_contract::team::TeamAcceptanceRequirement,
+) -> Option<harness_contract::team::TeamStructuredOutputField> {
+    match &requirement.check {
+        harness_contract::team::TeamAcceptanceCheck::StructuredField { field }
+        | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
+            Some(*field)
+        }
+        harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => {
+            Some(harness_contract::team::TeamStructuredOutputField::SourceVerification)
+        }
+        harness_contract::team::TeamAcceptanceCheck::UpstreamReview => {
+            Some(harness_contract::team::TeamStructuredOutputField::Review)
+        }
+        harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
+        | harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
+        | harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { .. } => None,
+    }
+}
+
+/// A terminal answer may carry these presentation fields as natural language
+/// after Runtime has independently verified the corresponding facts.  The
+/// remaining fields represent a deliberate risk/unknown/legacy declaration;
+/// silently manufacturing one from generic prose would hide information and
+/// remains forbidden.
+const fn narrative_field_can_be_normalized(
+    field: harness_contract::team::TeamStructuredOutputField,
+) -> bool {
+    matches!(
+        field,
+        harness_contract::team::TeamStructuredOutputField::Findings
+            | harness_contract::team::TeamStructuredOutputField::Summary
+            | harness_contract::team::TeamStructuredOutputField::Plan
+            | harness_contract::team::TeamStructuredOutputField::Implementation
+            | harness_contract::team::TeamStructuredOutputField::SourceVerification
+            | harness_contract::team::TeamStructuredOutputField::Review
+            | harness_contract::team::TeamStructuredOutputField::Proposal
+            | harness_contract::team::TeamStructuredOutputField::Critique
+            | harness_contract::team::TeamStructuredOutputField::Mitigation
+            | harness_contract::team::TeamStructuredOutputField::Checkpoint
+    )
+}
+
 fn normalized_narrative_terminal_body(
     candidate: &str,
     fields: &[harness_contract::team::TeamStructuredOutputField],
 ) -> Option<String> {
     if fields.is_empty()
-        || !fields.iter().all(|field| {
-            matches!(
-                field,
-                harness_contract::team::TeamStructuredOutputField::Findings
-                    | harness_contract::team::TeamStructuredOutputField::Summary
-                    | harness_contract::team::TeamStructuredOutputField::Unresolved
-                    | harness_contract::team::TeamStructuredOutputField::Risks
-            )
-        })
+        || !fields
+            .iter()
+            .all(|field| narrative_field_can_be_normalized(*field))
     {
         return None;
     }
@@ -2919,9 +3115,26 @@ fn normalized_narrative_terminal_body(
                 .filter(|value| materialized_json_value(value))
                 .cloned()
                 .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
-            harness_contract::team::TeamStructuredOutputField::Unresolved
-            | harness_contract::team::TeamStructuredOutputField::Risks => return None,
-            _ => return None,
+            // These are presentation carriers, never independently trusted
+            // acceptance facts.  Copying the Agent's own terminal wording is
+            // safe only because callers have already established the
+            // corresponding receipt/upstream evidence chain.
+            harness_contract::team::TeamStructuredOutputField::Plan
+            | harness_contract::team::TeamStructuredOutputField::Implementation
+            | harness_contract::team::TeamStructuredOutputField::SourceVerification
+            | harness_contract::team::TeamStructuredOutputField::Review
+            | harness_contract::team::TeamStructuredOutputField::Proposal
+            | harness_contract::team::TeamStructuredOutputField::Critique
+            | harness_contract::team::TeamStructuredOutputField::Mitigation
+            | harness_contract::team::TeamStructuredOutputField::Checkpoint => {
+                serde_json::Value::String(body.to_string())
+            }
+            harness_contract::team::TeamStructuredOutputField::Risks
+            | harness_contract::team::TeamStructuredOutputField::Unresolved
+            | harness_contract::team::TeamStructuredOutputField::KeyDecisions
+            | harness_contract::team::TeamStructuredOutputField::UnresolvedOrRisks => {
+                return None;
+            }
         };
         output.insert(field.as_str().to_string(), value);
     }
@@ -2936,14 +3149,21 @@ mod structured_output_probe {
     fn arbiter_terminal_text_extracts_key_decisions() {
         let text = "Write and read-back verification complete: `cross-team-decision-report.html` confirmed on disk (215 lines, sha256 d6340e87…), covering summary / evidence / key_decisions (K1-K8) / unresolved_or_risks (U1-U7, R1-R10) with all six roles' evidence citations and arbitration reasons. Terminal synthesis follows.\n\n{\"summary\":\"convergence_arbiter 终态收敛完成\",\"evidence\":[\"tool://tool-raw-call_00_GPhgxF1uJefA7wiTBDTR0830-2b7d0e1f4574cf50（write_file 成功）\"],\"key_decisions\":[{\"id\":\"K1\",\"decision\":\"保持自研确定性 Rust 内核\"}],\"unresolved_or_risks\":[{\"id\":\"U1\",\"item\":\"无真实数据集\"}]}";
         let parsed = structured_agent_output(text);
-        assert!(parsed.is_some(), "contract JSON must be extracted from prose+JSON terminal");
+        assert!(
+            parsed.is_some(),
+            "contract JSON must be extracted from prose+JSON terminal"
+        );
         let object = parsed.expect("parsed");
         assert!(object.contains_key("summary"));
         assert!(object.contains_key("evidence"));
         assert!(object.contains_key("key_decisions"));
         assert!(object.contains_key("unresolved_or_risks"));
-        assert!(materialized_json_value(object.get("key_decisions").expect("kd")));
-        assert!(materialized_json_value(object.get("unresolved_or_risks").expect("ur")));
+        assert!(materialized_json_value(
+            object.get("key_decisions").expect("kd")
+        ));
+        assert!(materialized_json_value(
+            object.get("unresolved_or_risks").expect("ur")
+        ));
     }
 
     #[test]
@@ -2952,9 +3172,17 @@ mod structured_output_probe {
             return;
         };
         let parsed = structured_agent_output(&text);
-        assert!(parsed.is_some(), "real arbiter terminal must yield a contract object");
+        assert!(
+            parsed.is_some(),
+            "real arbiter terminal must yield a contract object"
+        );
         let object = parsed.expect("parsed");
-        for field in ["summary", "evidence", "key_decisions", "unresolved_or_risks"] {
+        for field in [
+            "summary",
+            "evidence",
+            "key_decisions",
+            "unresolved_or_risks",
+        ] {
             assert!(
                 object.contains_key(field),
                 "missing {field}; keys={:?}",
@@ -3102,6 +3330,8 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
+            team_role_identity: None,
+            team_role: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs,
@@ -3115,7 +3345,6 @@ mod tests {
                 "agent",
                 "agent",
                 1,
-                75,
                 u64::MAX,
                 1,
             ),
@@ -3503,12 +3732,14 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            attempt: 1,
             workspace_root: root.to_path_buf(),
             path_identity_resolver: Arc::new(
                 crate::path_identity::WorkspacePathIdentityResolver::discover(root)
                     .expect("path identities"),
             ),
             scope_locks,
+            commit_service: None,
             resource_scopes: None,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -3768,8 +3999,29 @@ mod tests {
     #[test]
     fn acceptance_contract_projects_materialized_output_fields_to_the_host() {
         let mut packet = test_agent_packet(Vec::new());
-        packet.constraints = vec![
-            "team_acceptance_contract:[{\"criterion\":\"evidence\",\"check\":{\"kind\":\"scoped_evidence\",\"scopes\":[\"read:fixtures/target.txt\"]}},{\"criterion\":\"review\",\"check\":{\"kind\":\"upstream_review\"}},{\"criterion\":\"risks\",\"check\":{\"kind\":\"structured_field\",\"field\":\"risks\"}},{\"criterion\":\"legacy\",\"check\":{\"kind\":\"legacy_evidence_bound\",\"scopes\":[\"read:fixtures/target.txt\"]}}]".to_string(),
+        packet.output_acceptance = vec![
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "evidence".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                    scopes: vec!["read:fixtures/target.txt".to_string()],
+                },
+            },
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "review".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::UpstreamReview,
+            },
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "risks".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::StructuredField {
+                    field: harness_contract::team::TeamStructuredOutputField::Risks,
+                },
+            },
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "legacy".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound {
+                    scopes: vec!["read:fixtures/target.txt".to_string()],
+                },
+            },
         ];
 
         assert_eq!(
@@ -4007,12 +4259,14 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            attempt: 1,
             workspace_root: root.path().to_path_buf(),
             path_identity_resolver: Arc::new(
                 crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
                     .expect("path identities"),
             ),
             scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
             resource_scopes: Some(vec!["read:crates/runtime".to_string()]),
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -4129,12 +4383,14 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            attempt: 1,
             workspace_root: root.path().to_path_buf(),
             path_identity_resolver: Arc::new(
                 crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
                     .expect("path identities"),
             ),
             scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
             resource_scopes: Some(vec!["read:fixtures/target.txt".to_string()]),
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -4198,12 +4454,14 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            attempt: 1,
             workspace_root: root.path().to_path_buf(),
             path_identity_resolver: Arc::new(
                 crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
                     .expect("path identities"),
             ),
             scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
             resource_scopes: Some(vec![
                 "read:crates/runtime".to_string(),
                 "write:crates/runtime".to_string(),
@@ -4239,6 +4497,7 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            attempt: 1,
             workspace_root: std::path::PathBuf::from("/workspace"),
             path_identity_resolver: Arc::new(
                 crate::path_identity::WorkspacePathIdentityResolver::discover(
@@ -4247,6 +4506,7 @@ mod tests {
                 .expect("path identities"),
             ),
             scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
             resource_scopes: None,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -4299,6 +4559,7 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            attempt: 1,
             workspace_root: std::path::PathBuf::from("/workspace"),
             path_identity_resolver: Arc::new(
                 crate::path_identity::WorkspacePathIdentityResolver::discover(
@@ -4307,6 +4568,7 @@ mod tests {
                 .expect("path identities"),
             ),
             scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
             resource_scopes: Some(vec![
                 "read:README.md".to_string(),
                 "write:fixtures/target.txt".to_string(),
@@ -4468,11 +4730,45 @@ mod tests {
             &[TeamStructuredOutputField::Findings],
         )
         .is_none());
-        assert!(normalized_narrative_terminal_body(
-            "reviewed",
-            &[TeamStructuredOutputField::Review],
+        assert!(
+            normalized_narrative_terminal_body("reviewed", &[TeamStructuredOutputField::Review],)
+                .is_some(),
+            "a verified review may use ordinary terminal prose"
+        );
+    }
+
+    #[test]
+    fn verified_narrative_terminal_accepts_technical_prose_but_not_risk_declarations() {
+        use harness_contract::team::TeamStructuredOutputField;
+
+        let prose = "Updated the parser and verified the changed file with a fresh read.";
+        let normalized = normalized_narrative_terminal_body(
+            prose,
+            &[
+                TeamStructuredOutputField::Implementation,
+                TeamStructuredOutputField::SourceVerification,
+                TeamStructuredOutputField::Review,
+            ],
         )
-        .is_none());
+        .expect("receipt-verified technical prose should not require JSON syntax");
+        let output = serde_json::from_str::<serde_json::Value>(&normalized).expect("JSON carrier");
+        assert_eq!(output["implementation"], prose);
+        assert_eq!(output["source_verification"], prose);
+        assert_eq!(output["review"], prose);
+
+        assert!(
+            normalized_narrative_terminal_body(prose, &[TeamStructuredOutputField::Risks],)
+                .is_none(),
+            "Runtime must not infer that risks were considered"
+        );
+        assert!(
+            normalized_narrative_terminal_body(
+                prose,
+                &[TeamStructuredOutputField::UnresolvedOrRisks],
+            )
+            .is_none(),
+            "Runtime must not infer unresolved work from generic prose"
+        );
     }
 
     #[test]
@@ -4500,6 +4796,7 @@ mod tests {
             model_lease: "model".to_string(),
             execution_id: "graph".to_string(),
             node_id: "node".to_string(),
+            attempt: 1,
             workspace_root: std::path::PathBuf::from("/workspace"),
             path_identity_resolver: Arc::new(
                 crate::path_identity::WorkspacePathIdentityResolver::discover(
@@ -4508,6 +4805,7 @@ mod tests {
                 .expect("path identities"),
             ),
             scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
             resource_scopes: None,
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
@@ -4560,6 +4858,8 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
+            team_role_identity: None,
+            team_role: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: vec![harness_contract::context::EvidenceAccessRef::durable(
@@ -4580,7 +4880,6 @@ mod tests {
                 "agent",
                 "agent",
                 1,
-                75,
                 u64::MAX,
                 1,
             ),
@@ -4822,6 +5121,8 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
+            team_role_identity: None,
+            team_role: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
@@ -4835,7 +5136,6 @@ mod tests {
                 "agent",
                 "agent",
                 1,
-                75,
                 u64::MAX,
                 1,
             ),
@@ -4856,9 +5156,13 @@ mod tests {
         assert!(scoped_prompt.contains("never bare Cargo.toml"));
 
         packet.objective = "update fixtures/target.txt".into();
-        packet.constraints = vec![
-            "team_acceptance_contract:[{\"criterion\":\"implementation\",\"check\":{\"kind\":\"workspace_change\",\"field\":\"implementation\",\"scopes\":[\"write:fixtures/target.txt\"]}}]".to_string(),
-        ];
+        packet.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+            criterion: "implementation".to_string(),
+            check: harness_contract::team::TeamAcceptanceCheck::WorkspaceChange {
+                field: harness_contract::team::TeamStructuredOutputField::Implementation,
+                scopes: vec!["write:fixtures/target.txt".to_string()],
+            },
+        }];
         let mutation_prompt = system_prompt(
             &packet,
             std::path::Path::new("/workspace"),
@@ -4868,6 +5172,8 @@ mod tests {
         assert!(mutation_prompt.contains("Read each target at most once before mutation"));
         assert!(mutation_prompt.contains("write:fixtures/target.txt"));
         assert!(mutation_prompt.contains("Repeated reads"));
+        assert!(mutation_prompt.contains("Native structured output"));
+        assert!(!mutation_prompt.contains("Return exactly one JSON object"));
     }
 
     #[test]
@@ -4900,5 +5206,61 @@ mod tests {
             3,
             "any digest change rebuilds the prefix; no stale prefix is reused"
         );
+    }
+
+    #[test]
+    fn scoped_tool_effect_key_is_stable_across_worker_recovery() {
+        let first = deterministic_scoped_tool_idempotency_key(
+            "graph-1",
+            "node-1",
+            2,
+            3,
+            "write_file",
+            r#"{\"path\":\"src/lib.rs\",\"content\":\"updated\"}"#,
+        );
+        let recovered = deterministic_scoped_tool_idempotency_key(
+            "graph-1",
+            "node-1",
+            2,
+            3,
+            "write_file",
+            r#"{\"path\":\"src/lib.rs\",\"content\":\"updated\"}"#,
+        );
+        let next_effect = deterministic_scoped_tool_idempotency_key(
+            "graph-1",
+            "node-1",
+            2,
+            4,
+            "write_file",
+            r#"{\"path\":\"src/lib.rs\",\"content\":\"updated\"}"#,
+        );
+
+        assert_eq!(first, recovered);
+        assert_ne!(first, next_effect);
+        assert!(first.contains("agent-tool:graph-1:node-1:2:3:write_file:"));
+    }
+
+    #[test]
+    fn recovered_receipt_context_is_bounded_and_explicitly_fences_tools() {
+        let receipt = crate::execution_core::graph::DurableAgentToolReceipt {
+            sequence: 7,
+            effect_kind: harness_contract::tool::ToolEffectKind::Write,
+            authorized_scopes: vec!["write:src/lib.rs".to_string()],
+            outcome: crate::RuntimeToolExecutionOutcome {
+                tool_use_id: "tool-7".to_string(),
+                tool_name: "write_file".to_string(),
+                status: crate::RuntimeToolExecutionStatus::Executed,
+                category: crate::ToolSafetyCategory::WriteLocal,
+                output: Some("committed output".to_string()),
+                error: None,
+                evidence_ref: "tool://receipt-7".to_string(),
+                observed_evidence: Vec::new(),
+            },
+        };
+
+        let prompt = recovered_agent_tool_receipt_prompt(&[receipt]).expect("recovery prompt");
+        assert!(prompt.contains("committed output"));
+        assert!(prompt.contains("Do not call tools"));
+        assert!(prompt.contains("ToolHost receipts"));
     }
 }

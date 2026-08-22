@@ -4,6 +4,7 @@ use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, AgentTaskIntent, DefinitionScope, RevisionSelector,
 };
 use harness_contract::context::ChildExecutionBudgetReservation;
+use harness_contract::team::TeamRoleIdentity;
 use runtime::{AgentBindingRequest, RuntimeServices};
 
 #[test]
@@ -64,6 +65,17 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                 session_id: "session:binding-test".to_string(),
                 mission_id: "mission:binding-test".to_string(),
                 team_id: Some("team:binding-test".to_string()),
+                team_role_identity: Some(TeamRoleIdentity {
+                    role_id: "researcher".to_string(),
+                    slot: 1,
+                    focus_id: "focus:shipment-delay".to_string(),
+                    focus_boundary: "leased shipment-delay facts".to_string(),
+                    evidence_responsibility: "collect bounded evidence".to_string(),
+                    focus_scope_hash: "scope:shipment-delay".to_string(),
+                    overlap_budget_bp: 0,
+                    novelty_target_bp: 10_000,
+                    output_acceptance: vec!["evidence".to_string()],
+                }),
                 graph_id: "graph:binding-test".to_string(),
                 node_id: "node:binding-test".to_string(),
                 attempt: 1,
@@ -88,7 +100,6 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                     "run:binding-test",
                     "agent_task",
                     4096,
-                    307_200,
                     u64::MAX,
                     1,
                 ),

@@ -5,6 +5,7 @@ use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalS
 use harness_contract::execution_graph::{
     ExecutionFailure, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus, ExecutionUsage,
 };
+use sha2::{Digest, Sha256};
 
 use crate::execution_core::graph::{
     ExecutionGraphStateStore, NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket,
@@ -211,17 +212,6 @@ impl NodeExecutor for AgentTaskExecutor {
             packet
                 .evidence_refs
                 .dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
-            if !upstream_changes.is_empty() {
-                // AgentRuntime materializes the canonical predecessor terminal
-                // outcomes exactly once when it starts this task. The graph
-                // executor only binds durable evidence and change scopes;
-                // copying summaries into the objective here duplicated the
-                // same JSON and increased reviewer prompt latency.
-                packet.constraints.push(format!(
-                    "upstream_committed_evidence_count:{}",
-                    packet.evidence_refs.len()
-                ));
-            }
             upstream_changes.sort();
             upstream_changes.dedup();
             if let Some(resolver) = self.path_identity_resolver.get() {
@@ -254,11 +244,6 @@ impl NodeExecutor for AgentTaskExecutor {
                     }
                 }
             }
-            packet.constraints.extend(
-                upstream_changes
-                    .into_iter()
-                    .map(|scope| format!("upstream_change_scope:{scope}")),
-            );
         }
         let backend = self
             .resolvers
@@ -271,7 +256,7 @@ impl NodeExecutor for AgentTaskExecutor {
                 executor_kind: Self::KIND.into(),
                 node_id: ticket.node_id.clone(),
             })?;
-        let returned =
+        let mut returned =
             backend
                 .execute(packet.clone())
                 .await
@@ -279,28 +264,47 @@ impl NodeExecutor for AgentTaskExecutor {
                     node_id: ticket.node_id.clone(),
                     reason,
                 })?;
-        validate_agent_return(&packet, &returned).map_err(|reason| {
-            let missing_acceptance = packet
-                .acceptance
-                .iter()
-                .filter(|criterion| {
-                    !returned
-                        .observed_acceptance
-                        .satisfied_criteria
-                        .contains(criterion)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            NodeExecutorError::Poll {
-                node_id: ticket.node_id.clone(),
-                reason: format!(
-                    "{reason}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_evidence_count={}; unresolved_obligations={:?}",
-                    returned.runtime_change_receipts.len(),
-                    returned.observed_acceptance.observed_evidence.len(),
-                    returned.observed_acceptance.unresolved_obligation_ids,
-                ),
-            }
-        })?;
+        if returned.acceptance_evaluation.is_none() {
+            // Direct graph backends used by deterministic evaluators still
+            // terminate at this governed node boundary.  Normalize their
+            // typed facts once here so the persisted node result always has
+            // the same canonical verdict carrier as AgentRuntime-backed
+            // execution.
+            let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
+                &packet.required_acceptance,
+                &packet.acceptance,
+            );
+            let (observed, evaluation) =
+                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
+                    &required,
+                    returned.observed_acceptance.satisfied_criteria.clone(),
+                    returned.observed_acceptance.observed_evidence.clone(),
+                );
+            returned.observed_acceptance = observed;
+            returned.acceptance_evaluation = Some(evaluation);
+        }
+        if let Err(reason) = validate_agent_return(&packet, &returned) {
+            // Contract rejection is a terminal Runtime fact, not a transport
+            // error.  Preserve every receipt/evidence/artifact carried by the
+            // backend response so recovery and Team reduction can inspect the
+            // same truth after this node is durably failed.
+            let (_, mut evaluation) =
+                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
+                    &packet.required_acceptance,
+                    returned.observed_acceptance.satisfied_criteria.clone(),
+                    returned.observed_acceptance.observed_evidence.clone(),
+                );
+            evaluation.verdict = harness_contract::acceptance::AcceptanceVerdict::FrameworkInvalid;
+            returned.acceptance_evaluation = Some(evaluation);
+            returned.status = AgentTerminalStatus::Failed;
+            returned.outcome.clear();
+            returned.failure = Some(format!(
+                "Runtime rejected Agent terminal result: {reason}; runtime_change_receipts={}; observed_evidence_count={}; unresolved_obligations={:?}",
+                returned.runtime_change_receipts.len(),
+                returned.observed_acceptance.observed_evidence.len(),
+                returned.observed_acceptance.unresolved_obligation_ids,
+            ));
+        }
         let unresolved_tolerated = packet
             .constraints
             .iter()
@@ -315,17 +319,20 @@ impl NodeExecutor for AgentTaskExecutor {
                 retryable: false,
                 evidence_refs: returned.evidence_refs.clone(),
             });
-        let usage = agent_execution_usage(&returned, &packet.required_acceptance);
+        let effective_required =
+            crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
+                &packet.required_acceptance,
+                &packet.acceptance,
+            );
+        let usage = agent_execution_usage(&returned, &effective_required);
         let mut evidence_refs = returned.evidence_refs;
         evidence_refs.extend(returned.observed_acceptance.satisfied_criteria.iter().map(
             |criterion| {
-                harness_contract::context::EvidenceAccessRef::unavailable(
-                    harness_contract::context::EvidenceRef::observed(
-                        "runtime_acceptance",
-                        acceptance_marker_id(packet.node_id(), criterion),
-                    ),
+                durable_terminal_fact_ref(
+                    &packet,
+                    "runtime_acceptance",
+                    acceptance_marker_id(packet.node_id(), criterion),
                     "application/vnd.cowd.runtime-acceptance+json",
-                    format!("execution-node:{}", packet.node_id()),
                 )
             },
         ));
@@ -335,10 +342,11 @@ impl NodeExecutor for AgentTaskExecutor {
                 .iter()
                 .filter_map(|receipt| {
                     let encoded = serde_json::to_string(receipt).ok()?;
-                    Some(harness_contract::context::EvidenceAccessRef::unavailable(
-                        harness_contract::context::EvidenceRef::observed("runtime_change", encoded),
+                    Some(durable_terminal_fact_ref(
+                        &packet,
+                        "runtime_change",
+                        encoded,
                         "application/vnd.cowd.runtime-change+json",
-                        format!("execution-node:{}", packet.node_id()),
                     ))
                 }),
         );
@@ -433,6 +441,7 @@ fn agent_execution_usage(
     ExecutionUsage {
         required_acceptance: required_acceptance.clone(),
         observed_acceptance: returned.observed_acceptance.clone(),
+        acceptance_evaluation: returned.acceptance_evaluation.clone(),
         model: (!returned.model.trim().is_empty()).then(|| returned.model.clone()),
         input_tokens: returned.input_tokens,
         output_tokens: returned.output_tokens,
@@ -450,6 +459,31 @@ fn agent_execution_usage(
 #[must_use]
 pub(crate) fn acceptance_marker_id(node_id: &str, criterion: &str) -> String {
     format!("{node_id}:{criterion}")
+}
+
+/// Facts emitted with a graph node terminal are part of the same durable graph
+/// transition.  The selector names that graph-owned source of truth; the
+/// evidence payload remains in the typed reference rather than a process-local
+/// worker vector, so a successor or recovery pass can replay it after restart.
+fn durable_terminal_fact_ref(
+    packet: &AgentTaskPacket,
+    ref_type: &str,
+    id: String,
+    media_type: &str,
+) -> harness_contract::context::EvidenceAccessRef {
+    let sha256 = format!("sha256:{:x}", Sha256::digest(id.as_bytes()));
+    harness_contract::context::EvidenceAccessRef::durable(
+        harness_contract::context::EvidenceRef::observed(ref_type, id.clone()),
+        sha256,
+        id.len() as u64,
+        media_type,
+        format!(
+            "runtime-event:execution-node:{}:{}",
+            packet.graph_id(),
+            packet.node_id()
+        ),
+        format!("session:{}", packet.session_id()),
+    )
 }
 
 fn bounded_semantic_summary(value: &str) -> String {
@@ -497,6 +531,9 @@ fn validate_packet(packet: &AgentTaskPacket) -> Result<(), String> {
     if packet.deadline_at_ms == 0 {
         return Err("AgentTaskPacket has no Runtime-issued absolute deadline".into());
     }
+    packet
+        .validate_team_role_binding()
+        .map_err(str::to_string)?;
     packet.budget_lease.validate().map_err(str::to_string)?;
     if packet.budget_lease.deadline_at_ms != packet.deadline_at_ms {
         return Err("AgentTaskPacket deadline differs from its parent execution budget".into());
@@ -507,6 +544,7 @@ fn validate_packet(packet: &AgentTaskPacket) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use harness_contract::context::ChildExecutionBudgetReservation;
+    use harness_contract::team::{TeamRoleAssignment, TeamRoleIdentity};
 
     use super::*;
 
@@ -530,6 +568,8 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: vec!["reviewed".into()],
+            team_role_identity: None,
+            team_role: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
@@ -543,7 +583,6 @@ mod tests {
                 "agent-1",
                 "agent",
                 1_000,
-                75_000,
                 u64::MAX,
                 1,
             ),
@@ -574,6 +613,13 @@ mod tests {
                 observed_evidence: Vec::new(),
                 unresolved_obligation_ids: Vec::new(),
             },
+            acceptance_evaluation: Some(harness_contract::acceptance::AcceptanceEvaluation {
+                evaluator_revision: crate::acceptance_evaluator::AcceptanceEvaluator::REVISION,
+                contract_digest: "fixture-contract".to_string(),
+                receipt_set_digest: "fixture-receipts".to_string(),
+                derived_obligations: Vec::new(),
+                verdict: harness_contract::acceptance::AcceptanceVerdict::Satisfied,
+            }),
             acceptance: vec!["reviewed".into()],
             evidence_refs: Vec::new(),
             changes: Vec::new(),
@@ -596,6 +642,37 @@ mod tests {
     }
 
     #[test]
+    fn team_packet_requires_an_exact_frozen_role_assignment() {
+        let mut packet = task();
+        packet.assignment.team_run_id = Some("team-fixture".to_string());
+        assert!(validate_packet(&packet).is_err());
+
+        let identity = TeamRoleIdentity {
+            role_id: "reviewer".to_string(),
+            slot: 1,
+            focus_id: "review-source".to_string(),
+            focus_boundary: "review only the committed source".to_string(),
+            evidence_responsibility: "independent review evidence".to_string(),
+            focus_scope_hash: "a".repeat(64),
+            overlap_budget_bp: 0,
+            novelty_target_bp: 0,
+            output_acceptance: Vec::new(),
+        };
+        packet.assignment.role_id = identity.role_id.clone();
+        packet.team_role_identity = Some(identity.clone());
+        packet.team_role = Some(TeamRoleAssignment {
+            team_binding_id: "team-binding:fixture".to_string(),
+            team_binding_digest: "b".repeat(64),
+            identity,
+            behavior: Vec::new(),
+        });
+        validate_packet(&packet).expect("exact frozen Team role is executable");
+
+        packet.team_role.as_mut().unwrap().identity.slot = 2;
+        assert!(validate_packet(&packet).is_err());
+    }
+
+    #[test]
     fn rejects_return_packet_with_stale_graph_binding() {
         let task = task();
         let mut returned = returned(&task);
@@ -610,6 +687,26 @@ mod tests {
     fn accepts_complete_bound_return_packet() {
         let task = task();
         validate_agent_return(&task, &returned(&task)).expect("valid return packet");
+    }
+
+    #[test]
+    fn terminal_fact_reference_is_durable_and_bound_to_its_graph_node() {
+        let packet = task();
+        let reference = durable_terminal_fact_ref(
+            &packet,
+            "runtime_change",
+            "{\"path\":\"src/lib.rs\"}".to_string(),
+            "application/vnd.cowd.runtime-change+json",
+        );
+
+        assert!(reference.is_durable());
+        assert_eq!(reference.evidence_ref.ref_type, "runtime_change");
+        assert!(reference.sha256.starts_with("sha256:"));
+        assert_eq!(
+            reference.retrieval_selector,
+            "runtime-event:execution-node:graph-1:node-1"
+        );
+        assert_eq!(reference.visibility_scope, "session:session-1");
     }
 
     #[test]

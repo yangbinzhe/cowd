@@ -99,11 +99,22 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
     // silently rewriting a write goal into read-only work creates a false
     // success contract.
     request.constraints.requires_write = Some(requires_write);
+    // The understanding is the semantic authority for collaboration width.
+    // An explicit user/model count wins; otherwise use the inferred number
+    // of independent workstreams.  `max_parallel_agents` is only a caller
+    // supplied resource ceiling, never a hidden request to create 2–6 roles.
+    // ResourceManager still owns live admission after this topology is frozen.
+    let semantic_requested_count = usize::from(
+        understanding
+            .required_team_count
+            .max(understanding.independent_workstreams)
+            .max(1),
+    );
     let requested_count = request
         .constraints
         .max_parallel_agents
-        .unwrap_or_else(|| usize::from(understanding.independent_workstreams.max(2)))
-        .clamp(2, 6);
+        .map(|ceiling| semantic_requested_count.min(ceiling.max(1)))
+        .unwrap_or(semantic_requested_count);
     let explicit_team = understanding.requests_multi_agent
         || proposal
             .nodes
@@ -156,15 +167,10 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
             // then receive the node lease through their default focus slots.
             let custom_template =
                 template.starts_with("workspace/") || template.starts_with("user/");
-            // Each published research Team requires at least two independent
-            // primary focuses.  Team nodes are separate collaboration units;
-            // splitting fewer global slots across them must not invalidate the
-            // template cardinality before execution starts.
-            let focus_count = if node_requires_write {
-                requested_count
-            } else {
-                requested_count.max(profile_count.saturating_mul(2))
-            };
+            // Do not manufacture a minimum number of role slots.  Template
+            // cardinality and the AI-authored semantic plan decide topology;
+            // this authority layer only partitions the already granted scope.
+            let focus_count = requested_count.max(profile_count);
             if custom_template {
                 let custom_scopes = bounded_workspace_focus_scopes(
                     workspace_root,
@@ -333,8 +339,7 @@ fn team_authority_profile(
         .as_deref()
         .unwrap_or_default()
         .trim_start_matches("builtin/");
-    let custom_template =
-        template.starts_with("workspace/") || template.starts_with("user/");
+    let custom_template = template.starts_with("workspace/") || template.starts_with("user/");
     if template == "cowd/external-research-synthesis" {
         return TeamAuthorityProfile::ExternalResearch;
     }
@@ -401,54 +406,12 @@ fn authorized_focuses_for_team(
     let mut primary_index = 0_usize;
     let mut selected = Vec::new();
     for focus in focuses {
-        if is_reducer_focus(focus) {
-            selected.push(focus.clone());
-        } else {
-            if primary_index % team_count == team_index {
-                selected.push(focus.clone());
-            }
-            primary_index = primary_index.saturating_add(1);
-        }
-    }
-    // Published parallel research templates require two primary instances.
-    // If a caller supplied fewer distinct partitions than all requested Teams
-    // need, reuse only already-authorized focuses deterministically. This
-    // preserves the template contract without inventing or widening scope;
-    // overlap remains visible to the existing evidence-overlap accounting.
-    let minimum_primary = focuses
-        .iter()
-        .filter(|focus| !is_reducer_focus(focus))
-        .count()
-        .min(2);
-    for focus in focuses.iter().filter(|focus| !is_reducer_focus(focus)) {
-        if selected
-            .iter()
-            .filter(|candidate| !is_reducer_focus(candidate))
-            .count()
-            >= minimum_primary
-        {
-            break;
-        }
-        if !selected
-            .iter()
-            .any(|candidate| candidate.focus_id == focus.focus_id)
-        {
+        if primary_index % team_count == team_index {
             selected.push(focus.clone());
         }
+        primary_index = primary_index.saturating_add(1);
     }
     selected
-}
-
-/// Reducer/terminal roles are identified by their compiled output contract,
-/// never by a global role-name map. Renaming a role (including localization)
-/// therefore cannot change focus authority or reducer eligibility.
-fn is_reducer_focus(focus: &SemanticFocus) -> bool {
-    focus.output_contract.iter().any(|field| {
-        matches!(
-            field.as_str(),
-            "review" | "summary" | "risks" | "arbitration" | "decision"
-        )
-    })
 }
 
 fn direct_executor_focus_for_team(
@@ -463,10 +426,7 @@ fn direct_executor_focus_for_team(
         .map(|path| format!("read:{path}"))
         .collect::<Vec<_>>();
     if scopes.is_empty() {
-        let primary = authorized_focuses
-            .iter()
-            .filter(|focus| !is_reducer_focus(focus))
-            .collect::<Vec<_>>();
+        let primary = authorized_focuses.iter().collect::<Vec<_>>();
         for (index, focus) in primary.iter().enumerate() {
             if index % team_count == team_index {
                 scopes.extend(focus.resource_scopes.iter().cloned());
@@ -683,13 +643,17 @@ fn external_research_focus_partition_plans(requested_count: usize) -> Vec<FocusP
             "Cross-check the strongest claims against independent current sources",
         ),
     ];
-    let slots = FOCUSES
-        .iter()
-        .take(requested_count.clamp(2, FOCUSES.len()))
-        .map(|(focus_id, boundary)| {
+    let slots = (0..requested_count.max(1))
+        .map(|index| {
+            let (base_focus_id, boundary) = FOCUSES[index % FOCUSES.len()];
+            let focus_id = if index < FOCUSES.len() {
+                base_focus_id.to_string()
+            } else {
+                format!("{base_focus_id}-{}", index + 1)
+            };
             let scopes = vec!["network:*".to_string()];
             FocusPartitionSlot {
-                focus_id: (*focus_id).to_string(),
+                focus_id,
                 scope_hash: harness_contract::team::focus_scope_hash(
                     "researcher",
                     boundary,
@@ -907,11 +871,7 @@ pub(crate) fn bounded_workspace_focus_scopes(
     });
     let normalized = objective.to_ascii_lowercase();
     let broad = requests_broad_workspace_scope(&normalized);
-    let required = if requires_write {
-        requested_count.clamp(1, 6)
-    } else {
-        requested_count.clamp(2, 6)
-    };
+    let required = requested_count.max(1);
     let explicitly_named_files = candidates
         .iter()
         .filter(|(score, path)| *score > 0 && workspace_root.join(path).is_file())
@@ -1164,7 +1124,9 @@ fn is_probable_workspace_path_token(workspace_root: &Path, token: &str) -> bool 
         leaf.rsplit_once('.').is_some_and(|(name, extension)| {
             !name.is_empty()
                 && !extension.is_empty()
-                && extension.chars().all(|character| character.is_ascii_alphanumeric())
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
         })
     })
 }
@@ -1177,8 +1139,16 @@ fn is_probable_workspace_path_token(workspace_root: &Path, token: &str) -> bool 
 /// absent on disk is treated as a definition id instead of a planned file.
 fn is_definition_like_token(workspace_root: &Path, token: &str) -> bool {
     const DEFINITION_NAMESPACES: &[&str] = &[
-        "agent", "app", "builtin", "cowd", "definition", "skill", "template", "user",
-        "workspace", "team",
+        "agent",
+        "app",
+        "builtin",
+        "cowd",
+        "definition",
+        "skill",
+        "template",
+        "user",
+        "workspace",
+        "team",
     ];
     let Some((namespace, rest)) = token.split_once('/') else {
         return false;
@@ -1429,11 +1399,7 @@ mod tests {
             "发布模板 cowd/biz-tech-dual-team-deliberation（template_id: cowd/biz-tech-dual-team-deliberation）并写入 {}",
             temporary.path().display()
         );
-        let scopes = explicit_workspace_resource_scopes(
-            temporary.path(),
-            &objective,
-            true,
-        );
+        let scopes = explicit_workspace_resource_scopes(temporary.path(), &objective, true);
         assert!(
             !scopes
                 .iter()
@@ -1491,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_read_teams_preserve_minimum_primary_cardinality_and_shared_reducer() {
+    fn independent_read_teams_partition_every_authorized_focus_without_role_inference() {
         let focuses = vec![
             focus("runtime", "researcher"),
             focus("gateway", "researcher"),
@@ -1500,25 +1466,23 @@ mod tests {
         ];
         let left = authorized_focuses_for_team(&focuses, 0, 2, false);
         let right = authorized_focuses_for_team(&focuses, 1, 2, false);
-        let primary_ids = |items: &[SemanticFocus]| {
+        let focus_ids = |items: &[SemanticFocus]| {
             items
                 .iter()
-                .filter(|focus| focus.role_id == "researcher")
                 .map(|focus| focus.focus_id.clone())
                 .collect::<std::collections::BTreeSet<_>>()
         };
 
-        let left_primary = primary_ids(&left);
-        let right_primary = primary_ids(&right);
-        assert_eq!(left_primary.len(), 2);
-        assert_eq!(right_primary.len(), 2);
-        assert_eq!(left_primary.union(&right_primary).count(), 3);
-        assert!(left.iter().any(|focus| focus.focus_id == "synthesis"));
-        assert!(right.iter().any(|focus| focus.focus_id == "synthesis"));
+        let left_ids = focus_ids(&left);
+        let right_ids = focus_ids(&right);
+        assert_eq!(left_ids.len() + right_ids.len(), 4);
+        assert!(left_ids.len().abs_diff(right_ids.len()) <= 1);
+        assert_eq!(left_ids.union(&right_ids).count(), 4);
+        assert!(left_ids.is_disjoint(&right_ids));
     }
 
     #[test]
-    fn reducer_authority_uses_output_contract_not_role_name() {
+    fn partitioning_does_not_treat_output_contract_as_role_behavior() {
         let mut reviewer = focus("review-1", "实现者");
         reviewer.output_contract = vec![
             "review".to_string(),
@@ -1531,23 +1495,18 @@ mod tests {
 
         let left = authorized_focuses_for_team(&focuses, 0, 2, false);
         let right = authorized_focuses_for_team(&focuses, 1, 2, false);
-        assert!(
-            left.iter().any(|focus| focus.focus_id == "review-1")
-                && right.iter().any(|focus| focus.focus_id == "review-1"),
-            "a renamed reducer role stays shared through its typed output contract"
-        );
-        assert!(is_reducer_focus(
-            left.iter()
-                .find(|focus| focus.focus_id == "review-1")
-                .expect("reviewer focus")
-        ));
-        assert!(
-            !is_reducer_focus(
-                left.iter()
-                    .find(|focus| focus.focus_id == "research-1")
-                    .expect("research focus")
-            ),
-            "a role named synthesizer without a reducer contract is never treated as a reducer"
+        assert_eq!(left.len(), 1);
+        assert_eq!(right.len(), 1);
+        assert_eq!(left[0].focus_id, "review-1");
+        assert_eq!(right[0].focus_id, "research-1");
+        assert_eq!(
+            left[0].output_contract,
+            vec![
+                "review".to_string(),
+                "evidence".to_string(),
+                "risks".to_string()
+            ],
+            "the output schema remains data, never a hidden scheduling hint"
         );
     }
 
@@ -1813,6 +1772,7 @@ mod tests {
                     cancellation_group: None,
                 }],
                 completion: ExecutionCompletionContract::default(),
+                collaboration_program: None,
                 reason: "model requested write despite read-only intent".to_string(),
             }),
             control: None,
@@ -1866,10 +1826,7 @@ mod tests {
             cancellation_group: None,
         };
         let mut request = RuntimeOrchestrationCommand {
-            intent: format!(
-                "启动跨团队协同决策并写入 {}",
-                workspace.path().display()
-            ),
+            intent: format!("启动跨团队协同决策并写入 {}", workspace.path().display()),
             model_lease: None,
             session_id: Some("session-1".to_string()),
             lineage: None,
@@ -1882,6 +1839,7 @@ mod tests {
                 expected_revision: None,
                 nodes: vec![node],
                 completion: ExecutionCompletionContract::default(),
+                collaboration_program: None,
                 reason: "custom template write team".to_string(),
             }),
             control: None,
@@ -1900,10 +1858,9 @@ mod tests {
             surface: None,
         };
 
-        let mut understanding =
-            harness_contract::strategy::understand(&harness_contract::strategy::StrategyInput::from_prompt(
-                &request.intent,
-            ));
+        let mut understanding = harness_contract::strategy::understand(
+            &harness_contract::strategy::StrategyInput::from_prompt(&request.intent),
+        );
         understanding.requires_write = true;
         understanding.requests_multi_agent = true;
         understanding.independent_workstreams = 3;
@@ -1916,16 +1873,12 @@ mod tests {
         let team = &request.proposal.as_ref().expect("proposal").nodes[0];
         assert_eq!(request.constraints.requires_write, Some(true));
         assert!(
-            team.resource_scopes
-                .iter()
-                .any(|scope| scope == "write:."),
+            team.resource_scopes.iter().any(|scope| scope == "write:."),
             "custom write-capable template must receive a bounded workspace write lease: {:?}",
             team.resource_scopes
         );
         assert!(
-            team.resource_scopes
-                .iter()
-                .any(|scope| scope == "read:."),
+            team.resource_scopes.iter().any(|scope| scope == "read:."),
             "full-trust write teams must also receive a whole-workspace read lease: {:?}",
             team.resource_scopes
         );
@@ -2169,6 +2122,7 @@ mod tests {
                     ),
                 ],
                 completion: ExecutionCompletionContract::default(),
+                collaboration_program: None,
                 reason: "mixed research and write".to_string(),
             }),
             control: None,
@@ -2192,14 +2146,12 @@ mod tests {
 
         let nodes = &request.proposal.as_ref().expect("proposal").nodes;
         for research in &nodes[..2] {
-            assert_eq!(
+            assert!(
                 research
                     .focuses
                     .iter()
-                    .filter(|focus| focus.role_id == "researcher")
-                    .count(),
-                2,
-                "each research Team must satisfy the published adaptive cardinality",
+                    .any(|focus| focus.role_id == "researcher"),
+                "authority assigns real scoped focuses without padding to a hard-coded minimum",
             );
             assert!(research
                 .focuses
@@ -2318,6 +2270,7 @@ mod tests {
                     ),
                 ],
                 completion: ExecutionCompletionContract::default(),
+                collaboration_program: None,
                 reason: "explicit direct Teams".to_string(),
             }),
             control: None,
@@ -2433,6 +2386,7 @@ mod tests {
                     cancellation_group: None,
                 }],
                 completion: ExecutionCompletionContract::default(),
+                collaboration_program: None,
                 reason: "independent review".to_string(),
             }),
             control: None,
@@ -2505,6 +2459,7 @@ mod tests {
                     cancellation_group: None,
                 }],
                 completion: ExecutionCompletionContract::default(),
+                collaboration_program: None,
                 reason: "session lease test".to_string(),
             }),
             control: None,

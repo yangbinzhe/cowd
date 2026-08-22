@@ -808,6 +808,7 @@ impl RuntimeExecutionSupervisor {
         reason: String,
         mutation_id: String,
         completion: harness_contract::execution_graph::ExecutionCompletionContract,
+        collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
     ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
         let graph = self
             .runner
@@ -819,6 +820,7 @@ impl RuntimeExecutionSupervisor {
                 reason,
                 mutation_id,
                 completion,
+                collaboration_program,
             )
             .await?;
         let receipt = self.receipt(&graph, "semantic-mutation", now_ms());

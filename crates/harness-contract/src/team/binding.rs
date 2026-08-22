@@ -20,6 +20,38 @@ pub enum RoleBehaviorFacet {
     UpstreamConsumption { required: bool },
 }
 
+impl RoleBehaviorFacet {
+    /// Stable semantic key used when validating a published role contract.
+    ///
+    /// A role may declare several distinct facets, but declaring the same
+    /// facet twice gives the runtime two conflicting sources for one behavior
+    /// decision.  The key intentionally ignores presentation text and role
+    /// identifiers: behavior is an immutable, typed part of the Template
+    /// revision itself.
+    #[must_use]
+    pub fn kind_key(&self) -> &'static str {
+        match self {
+            Self::Reducer { .. } => "reducer",
+            Self::Verification { .. } => "verification",
+            Self::ReacquireEvidence { .. } => "reacquire_evidence",
+            Self::TerminalCandidate { .. } => "terminal_candidate",
+            Self::UpstreamConsumption { .. } => "upstream_consumption",
+        }
+    }
+
+    /// Validate the facet's local contract.  The execution graph owns
+    /// topology validation; this only rejects an empty semantic mode before a
+    /// Template revision can be published.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Reducer { mode } | Self::Verification { mode } if mode.trim().is_empty() => {
+                Err("behavior facet mode must not be empty")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Immutable semantic role binding captured before graph registration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamRoleBindingSnapshot {
@@ -39,6 +71,67 @@ pub struct TeamRoleBindingSnapshot {
     pub task_contract_ref: String,
     pub acceptance: Vec<String>,
     pub team_markdown_fragment: Option<String>,
+}
+
+/// Typed semantic identity compiled for a concrete Team slot before an
+/// `AgentTaskPacket` is persisted.  It deliberately contains no display text:
+/// names/locales are presentation data, while this identity participates in
+/// execution, evidence and recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleIdentity {
+    pub role_id: String,
+    /// One-based slot number within the role's immutable cardinality.
+    pub slot: u32,
+    pub focus_id: String,
+    pub focus_boundary: String,
+    pub evidence_responsibility: String,
+    pub focus_scope_hash: String,
+    pub overlap_budget_bp: u16,
+    pub novelty_target_bp: u16,
+    #[serde(default)]
+    pub output_acceptance: Vec<String>,
+}
+
+impl TeamRoleIdentity {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.role_id.trim().is_empty()
+            || self.slot == 0
+            || self.focus_id.trim().is_empty()
+            || self.focus_boundary.trim().is_empty()
+            || self.evidence_responsibility.trim().is_empty()
+            || self.focus_scope_hash.trim().is_empty()
+        {
+            return Err("team role identity is incomplete");
+        }
+        if self.overlap_budget_bp > 10_000 || self.novelty_target_bp > 10_000 {
+            return Err("team role identity percentage is outside basis-point range");
+        }
+        Ok(())
+    }
+}
+
+/// The exact frozen Team binding fragment an executable Agent slot consumes.
+///
+/// `identity` is plan semantics and `behavior` is the only behavior dispatch
+/// carrier.  The binding id/digest fence this fragment to the Team snapshot
+/// that was persisted with the graph, so an active Agent can never infer its
+/// role from constraints, a node id, or a mutable template default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleAssignment {
+    pub team_binding_id: String,
+    pub team_binding_digest: String,
+    pub identity: TeamRoleIdentity,
+    #[serde(default)]
+    pub behavior: Vec<RoleBehaviorFacet>,
+}
+
+impl TeamRoleAssignment {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.team_binding_id.trim().is_empty() || self.team_binding_digest.trim().is_empty() {
+            return Err("team role assignment has no frozen Team binding reference");
+        }
+        self.identity.validate()
+    }
 }
 
 /// Immutable human-facing team display identity. Machine ids never serve as

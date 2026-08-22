@@ -154,6 +154,158 @@ pub struct ExecutionCompletionContract {
     pub allow_unresolved_conflicts: bool,
 }
 
+/// Typed relationship between two Team instances in one collaboration
+/// program.  It is an immutable planning fact; graph execution status and
+/// delivery remain the source of lifecycle truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationEdgeKind {
+    EvidenceFeed,
+    ReviewOf,
+    Handoff,
+    Aggregate,
+    Dispute,
+}
+
+/// One stable Team obligation compiled into a root execution graph.
+///
+/// `semantic_node_id` deliberately points to the planner's semantic node,
+/// rather than a presentation label or a mutable child graph id.  A Team can
+/// therefore be recovered or reprojected without turning its display name
+/// into an authority key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationTeamInstance {
+    pub instance_id: String,
+    pub semantic_node_id: String,
+    #[serde(default = "default_required_team_instance")]
+    pub required: bool,
+}
+
+const fn default_required_team_instance() -> bool {
+    true
+}
+
+/// Cross-Team relation compiled from the semantic proposal.  `from` and `to`
+/// are `CollaborationTeamInstance::instance_id` values; execution edges carry
+/// the physical graph-node relationship separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationProgramEdge {
+    pub edge_id: String,
+    pub from: String,
+    pub to: String,
+    pub kind: CollaborationEdgeKind,
+}
+
+/// Immutable, graph-owned description of the Team obligations for one root
+/// execution.  It is not a second scheduler: the canonical `ExecutionGraph`
+/// remains responsible for admission, recovery, effects and terminal state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationProgram {
+    pub program_id: String,
+    pub revision: u64,
+    pub required_team_count: u16,
+    #[serde(default)]
+    pub team_instances: Vec<CollaborationTeamInstance>,
+    #[serde(default)]
+    pub edges: Vec<CollaborationProgramEdge>,
+    /// Durable semantic-to-physical graph mapping. It lets a later program
+    /// patch add a typed handoff to an already admitted Team without parsing
+    /// a generated node id or consulting a mutable in-memory scheduler.
+    #[serde(default)]
+    pub semantic_node_instances: BTreeMap<String, Vec<String>>,
+}
+
+impl CollaborationProgram {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.program_id.trim().is_empty() {
+            return Err("collaboration program id is empty".to_string());
+        }
+        if self.required_team_count == 0 {
+            return Err("collaboration program requires at least one Team".to_string());
+        }
+        let required_instances = self
+            .team_instances
+            .iter()
+            .filter(|team| team.required)
+            .count();
+        if usize::from(self.required_team_count) != required_instances {
+            return Err(format!(
+                "collaboration program requires {} Team instances but carries {required_instances} required instances",
+                self.required_team_count
+            ));
+        }
+        let ids = self
+            .team_instances
+            .iter()
+            .map(|team| team.instance_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if ids.len() != self.team_instances.len()
+            || self.team_instances.iter().any(|team| {
+                team.instance_id.trim().is_empty() || team.semantic_node_id.trim().is_empty()
+            })
+        {
+            return Err("collaboration program Team identities are invalid".to_string());
+        }
+        let edge_ids = self
+            .edges
+            .iter()
+            .map(|edge| edge.edge_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if edge_ids.len() != self.edges.len()
+            || self.edges.iter().any(|edge| {
+                edge.edge_id.trim().is_empty()
+                    || edge.from == edge.to
+                    || !ids.contains(edge.from.as_str())
+                    || !ids.contains(edge.to.as_str())
+            })
+        {
+            return Err("collaboration program edges are invalid".to_string());
+        }
+        if self.semantic_node_instances.values().any(|instances| {
+            instances.is_empty() || instances.iter().any(|instance| instance.trim().is_empty())
+        }) {
+            return Err("collaboration program physical node mapping is invalid".to_string());
+        }
+        if !self.semantic_node_instances.is_empty()
+            && (self.team_instances.iter().any(|team| {
+                !self
+                    .semantic_node_instances
+                    .contains_key(&team.semantic_node_id)
+            }) || self.semantic_node_instances.keys().any(|semantic_id| {
+                !self
+                    .team_instances
+                    .iter()
+                    .any(|team| &team.semantic_node_id == semantic_id)
+            }))
+        {
+            return Err(
+                "collaboration program physical mapping does not match Team semantics".to_string(),
+            );
+        }
+        if !self.semantic_node_instances.is_empty() {
+            let mut mapped_nodes = std::collections::BTreeSet::new();
+            for (semantic_id, physical_nodes) in &self.semantic_node_instances {
+                let expected_instances = self
+                    .team_instances
+                    .iter()
+                    .filter(|team| &team.semantic_node_id == semantic_id)
+                    .count();
+                if physical_nodes.len() != expected_instances
+                    || !physical_nodes
+                        .iter()
+                        .all(|node_id| mapped_nodes.insert(node_id.as_str()))
+                {
+                    return Err(
+                        "collaboration program physical mapping is not one-to-one with Team instances"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionOrchestrationMetadata {
     pub mutation_id: String,
@@ -163,6 +315,11 @@ pub struct ExecutionOrchestrationMetadata {
     #[serde(default)]
     pub source_generation: u64,
     pub completion: ExecutionCompletionContract,
+    /// Present exactly when the graph contains Team obligations. The program
+    /// is immutable planning metadata; its lifecycle is derived from this
+    /// graph's nodes and delivery envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_program: Option<CollaborationProgram>,
 }
 
 /// Canonical business lineage attached before an execution graph is admitted.
@@ -325,6 +482,11 @@ pub struct ExecutionUsage {
     pub required_acceptance: crate::context::RequiredAcceptance,
     #[serde(default)]
     pub observed_acceptance: crate::context::ObservedAcceptance,
+    /// Immutable acceptance evaluation written by the terminal Runtime
+    /// producer. Dependency, verification, delivery and projection consumers
+    /// read this value; they never re-run a matcher over raw observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_evaluation: Option<crate::acceptance::AcceptanceEvaluation>,
     /// The provider model that actually produced this node result. This is
     /// distinct from a requested model because Runtime may use a configured
     /// fallback before any provider output is emitted.
@@ -440,6 +602,12 @@ pub struct ExecutionGraph {
     pub lineage: Option<ExecutionGraphLineage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<ExecutionOrchestrationMetadata>,
+    /// Immutable, authorization-checked source binding for a root that
+    /// continues a completed collaboration.  It is graph truth rather than
+    /// a prompt reconstruction: retries and recovery retain the exact
+    /// source Team set, durable result references and ingress idempotency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_binding: Option<crate::turn::CollaborationContinuationBinding>,
     pub nodes: Vec<ExecutionNodeSpec>,
     pub edges: Vec<ExecutionEdge>,
     pub node_statuses: BTreeMap<String, ExecutionNodeStatus>,
@@ -464,6 +632,7 @@ impl ExecutionGraph {
             parent_execution: None,
             lineage: None,
             orchestration: None,
+            continuation_binding: None,
             nodes: Vec::new(),
             edges: Vec::new(),
             node_statuses: BTreeMap::new(),
@@ -601,5 +770,82 @@ mod dependency_policy_tests {
             serde_json::from_value(encoded).expect("legacy graph remains readable");
         assert!(decoded.delivery_envelope.is_none());
         assert!(decoded.terminal_presentation.is_none());
+    }
+
+    #[test]
+    fn collaboration_program_requires_exact_team_obligations_and_bound_edges() {
+        let valid = CollaborationProgram {
+            program_id: "program-1".to_string(),
+            revision: 1,
+            required_team_count: 2,
+            team_instances: vec![
+                CollaborationTeamInstance {
+                    instance_id: "research:1".to_string(),
+                    semantic_node_id: "research".to_string(),
+                    required: true,
+                },
+                CollaborationTeamInstance {
+                    instance_id: "review:1".to_string(),
+                    semantic_node_id: "review".to_string(),
+                    required: true,
+                },
+            ],
+            edges: vec![CollaborationProgramEdge {
+                edge_id: "research:1->review:1".to_string(),
+                from: "research:1".to_string(),
+                to: "review:1".to_string(),
+                kind: CollaborationEdgeKind::ReviewOf,
+            }],
+            semantic_node_instances: BTreeMap::new(),
+        };
+        assert!(valid.validate().is_ok());
+
+        let mut invalid = valid;
+        invalid.required_team_count = 3;
+        assert!(invalid.validate().is_err());
+        invalid.required_team_count = 2;
+        invalid.edges[0].to = "unknown:1".to_string();
+        assert!(invalid.validate().is_err());
+        invalid.edges[0].to = "review:1".to_string();
+        invalid
+            .semantic_node_instances
+            .insert("unrelated".to_string(), vec!["graph-node".to_string()]);
+        assert!(invalid.validate().is_err());
+
+        let mut mapped = CollaborationProgram {
+            program_id: "program-2".to_string(),
+            revision: 1,
+            required_team_count: 2,
+            team_instances: vec![
+                CollaborationTeamInstance {
+                    instance_id: "research:1".to_string(),
+                    semantic_node_id: "research".to_string(),
+                    required: true,
+                },
+                CollaborationTeamInstance {
+                    instance_id: "research:2".to_string(),
+                    semantic_node_id: "research".to_string(),
+                    required: true,
+                },
+            ],
+            edges: Vec::new(),
+            semantic_node_instances: BTreeMap::from([(
+                "research".to_string(),
+                vec![
+                    "graph:research:1".to_string(),
+                    "graph:research:2".to_string(),
+                ],
+            )]),
+        };
+        assert!(mapped.validate().is_ok());
+        mapped
+            .semantic_node_instances
+            .get_mut("research")
+            .expect("mapping")
+            .pop();
+        assert!(
+            mapped.validate().is_err(),
+            "one Program instance cannot be left unmapped"
+        );
     }
 }

@@ -186,14 +186,13 @@ impl NodeExecutor for ApprovalNodeExecutor {
                 let profile = crate::approval_router::ApprovalRouter::profile_for_approval_profile(
                     policy.approval_profile,
                 );
-                auto_grant =
-                    crate::approval_router::ApprovalRouter::resolve(
-                        profile,
-                        harness_contract::policy::ApprovalDomain::Execution,
-                        TaskRisk::High,
-                        true,
-                        false,
-                    ) == crate::approval_router::ApprovalDecision::AutoApprove;
+                auto_grant = crate::approval_router::ApprovalRouter::resolve(
+                    profile,
+                    harness_contract::policy::ApprovalDomain::Execution,
+                    TaskRisk::High,
+                    true,
+                    false,
+                ) == crate::approval_router::ApprovalDecision::AutoApprove;
                 approval_context = approval_context.with_execution_policy(&policy);
             }
         }

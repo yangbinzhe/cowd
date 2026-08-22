@@ -41,7 +41,6 @@ fn record(session_id: &str) -> SessionRecord {
         metadata_json: None,
         input_tokens: 0,
         output_tokens: 0,
-        estimated_cost_usd: 0.0,
         status: "active".to_string(),
     }
 }

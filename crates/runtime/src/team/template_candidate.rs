@@ -12,9 +12,9 @@ use harness_contract::agent::{
 use harness_contract::policy::PermissionMode;
 use harness_contract::team::definition::{RoleDisplayName, TeamTemplateDisplay};
 use harness_contract::team::{
-    RoleCardinalityPolicy, RolePartitionPolicy, TeamEvaluationContract, TeamResultContract,
-    TeamRoleDefinition, TeamRoleDependency, TeamRoleTaskContract, TeamTemplateDefinitionId,
-    TeamTemplateManifest, TeamTopologyContract,
+    RoleBehaviorFacet, RoleCardinalityPolicy, RolePartitionPolicy, TeamEvaluationContract,
+    TeamResultContract, TeamRoleDefinition, TeamRoleDependency, TeamRoleTaskContract,
+    TeamTemplateDefinitionId, TeamTemplateManifest, TeamTopologyContract,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -59,6 +59,10 @@ pub struct ProposedRole {
     pub max_count: Option<u32>,
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// Typed behavior is authored explicitly by the model/template author.
+    /// The candidate compiler will never infer it from a role name, a graph
+    /// edge, or an output field.
+    pub behavior: Vec<RoleBehaviorFacet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,7 +202,9 @@ pub(crate) fn normalize_template_proposal(
                                     .and_then(|role| role.get("role_id"))
                                     .and_then(serde_json::Value::as_str)
                                     .ok_or_else(|| {
-                                        format!("role_display_names[{index}] has no matching role_id")
+                                        format!(
+                                            "role_display_names[{index}] has no matching role_id"
+                                        )
                                     })?;
                                 map.insert("role_id".to_string(), serde_json::json!(role_id));
                             }
@@ -276,9 +282,11 @@ fn truthy(value: &serde_json::Value) -> bool {
 const KNOWN_CAPABILITIES: [&str; 5] = ["read", "search", "write", "test", "network"];
 
 fn revision_u64(value: &serde_json::Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|raw| raw.trim().parse::<u64>().ok()))
+    value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+    })
 }
 
 fn capability_names_from_string(raw: &str) -> Result<Vec<String>, String> {
@@ -420,7 +428,10 @@ fn normalize_proposed_role(
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let Some(fields) = role.as_object_mut() else {
-        return Err(format!("role must be an object, got {}", json_type_name(role)));
+        return Err(format!(
+            "role must be an object, got {}",
+            json_type_name(role)
+        ));
     };
     let role_id = fields
         .get("role_id")
@@ -430,7 +441,9 @@ fn normalize_proposed_role(
         .ok_or_else(|| "every proposed role needs a non-empty role_id".to_string())?;
     if fields.get("display_name").is_none() {
         fields.insert("display_name".to_string(), serde_json::json!(role_id));
-        notes.push(format!("role `{role_id}`: defaulted display_name to role_id"));
+        notes.push(format!(
+            "role `{role_id}`: defaulted display_name to role_id"
+        ));
     }
     if fields.get("responsibility").is_none() {
         let display_name = fields
@@ -441,14 +454,19 @@ fn normalize_proposed_role(
             "responsibility".to_string(),
             serde_json::json!(format!("执行 {display_name} 的职责并产出可验证证据")),
         );
-        notes.push(format!("role `{role_id}`: defaulted missing responsibility"));
+        notes.push(format!(
+            "role `{role_id}`: defaulted missing responsibility"
+        ));
     }
     let mut ceiling_names: Vec<String> = Vec::new();
     match fields.get("grant_ceiling").cloned() {
         None => {}
         Some(serde_json::Value::String(raw)) => {
             ceiling_names = capability_names_from_string(&raw)?;
-            fields.insert("grant_ceiling".to_string(), serde_json::json!(ceiling_names));
+            fields.insert(
+                "grant_ceiling".to_string(),
+                serde_json::json!(ceiling_names),
+            );
         }
         Some(serde_json::Value::Object(ceiling)) => {
             let normalized = ceiling
@@ -489,7 +507,10 @@ fn normalize_proposed_role(
                     ceiling_names.push(lower);
                 }
             }
-            fields.insert("grant_ceiling".to_string(), serde_json::json!(ceiling_names));
+            fields.insert(
+                "grant_ceiling".to_string(),
+                serde_json::json!(ceiling_names),
+            );
         }
         Some(other) => {
             return Err(format!(
@@ -499,9 +520,8 @@ fn normalize_proposed_role(
         }
     }
     if let Some(cardinality) = fields.get("cardinality").cloned() {
-        let count = revision_u64(&cardinality).ok_or_else(|| {
-            format!("role `{role_id}` cardinality must be a positive integer")
-        })?;
+        let count = revision_u64(&cardinality)
+            .ok_or_else(|| format!("role `{role_id}` cardinality must be a positive integer"))?;
         if count == 0 {
             return Err(format!("role `{role_id}` cardinality must be > 0"));
         }
@@ -511,6 +531,7 @@ fn normalize_proposed_role(
         ));
     }
     normalize_agent_definition_ref(fields, &ceiling_names, notes)?;
+    normalize_role_behavior(fields, &role_id, notes)?;
     if let Some(acceptance) = fields.get("acceptance").cloned() {
         let normalized = match acceptance {
             serde_json::Value::String(raw) => serde_json::json!([raw]),
@@ -528,6 +549,74 @@ fn normalize_proposed_role(
         };
         fields.insert("acceptance".to_string(), normalized);
     }
+    Ok(())
+}
+
+/// Normalize only surface syntax for an explicitly supplied behavior
+/// contract.  This is intentionally not a behavior inference layer: missing
+/// behavior is rejected, and every accepted spelling maps to one typed facet
+/// that the published Template freezes.
+fn normalize_role_behavior(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    role_id: &str,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(raw) = fields.get("behavior").cloned() else {
+        return Err(format!(
+            "role `{role_id}` must declare explicit behavior; use typed facets such as {{kind: \"reducer\", mode: \"finally\"}} or {{kind: \"terminal_candidate\", required: true}}"
+        ));
+    };
+    let values = match raw {
+        serde_json::Value::Array(values) => values,
+        serde_json::Value::Object(_) => vec![raw],
+        serde_json::Value::String(raw) => {
+            let mut values = Vec::new();
+            for name in raw.split(|character: char| matches!(character, ',' | ';' | '|')) {
+                let kind = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+                if kind.is_empty() {
+                    continue;
+                }
+                let facet = match kind.as_str() {
+                    "reducer" | "synthesizer" => {
+                        serde_json::json!({ "kind": "reducer", "mode": "finally" })
+                    }
+                    "verification" | "verifier" => {
+                        serde_json::json!({ "kind": "verification", "mode": "independent" })
+                    }
+                    "reacquire_evidence" | "evidence" => {
+                        serde_json::json!({ "kind": "reacquire_evidence", "required": true })
+                    }
+                    "terminal_candidate" | "terminal" => {
+                        serde_json::json!({ "kind": "terminal_candidate", "required": true })
+                    }
+                    "upstream_consumption" | "upstream" => {
+                        serde_json::json!({ "kind": "upstream_consumption", "required": true })
+                    }
+                    _ => {
+                        return Err(format!(
+                            "role `{role_id}` has unknown behavior facet `{name}`"
+                        ))
+                    }
+                };
+                values.push(facet);
+            }
+            if values.is_empty() {
+                return Err(format!("role `{role_id}` behavior is empty"));
+            }
+            notes.push(format!("role `{role_id}`: normalized behavior shorthand"));
+            values
+        }
+        other => {
+            return Err(format!(
+                "role `{role_id}` behavior must be an object, array, or shorthand string, got {}",
+                json_type_name(&other)
+            ))
+        }
+    };
+    if values.is_empty() {
+        return Err(format!("role `{role_id}` behavior is empty"));
+    }
+    fields.insert("behavior".to_string(), serde_json::Value::Array(values));
     Ok(())
 }
 
@@ -615,9 +704,7 @@ fn normalize_dependencies(
     let team_of = |role_id: &str| -> Option<String> {
         roles
             .iter()
-            .find(|role| {
-                role.get("role_id").and_then(serde_json::Value::as_str) == Some(role_id)
-            })
+            .find(|role| role.get("role_id").and_then(serde_json::Value::as_str) == Some(role_id))
             .and_then(|role| {
                 role.get("team")
                     .and_then(serde_json::Value::as_str)
@@ -751,9 +838,7 @@ fn normalize_dependencies(
             let mut sources = Vec::new();
             let mut seen = std::collections::BTreeSet::new();
             for member in members {
-                sources.extend(resolve_member_roles(
-                    member, &role_ids, &groups, &mut seen,
-                )?);
+                sources.extend(resolve_member_roles(member, &role_ids, &groups, &mut seen)?);
             }
             for source in sources {
                 for consumer in &consumers {
@@ -993,6 +1078,7 @@ impl TemplateCandidateCompiler {
                 agent_selector: RevisionSelector::ExactApprovedRevision { revision },
                 cardinality,
                 partition,
+                behavior: role.behavior.clone(),
                 grant_ceiling,
                 task_contract: TeamRoleTaskContract {
                     contract_ref: format!("ai/team-role/{}@1", role.role_id),
@@ -1030,11 +1116,13 @@ impl TemplateCandidateCompiler {
             topology: TeamTopologyContract {
                 protocol_ref: AI_TEMPLATE_PROTOCOL.to_string(),
                 require_synthesis: true,
-                require_review: dependencies.iter().any(|dependency| {
-                    dependency.to_role_id.contains("review")
-                        || dependency.to_role_id.contains("critic")
+                require_review: roles.iter().any(|role| {
+                    role.behavior
+                        .iter()
+                        .any(|facet| matches!(facet, RoleBehaviorFacet::Verification { .. }))
                 }),
             },
+            role_aliases: std::collections::BTreeMap::new(),
             roles,
             dependencies,
             result_contract: TeamResultContract {
@@ -1076,6 +1164,7 @@ impl TemplateCandidateCompiler {
                 "role_id": role.role_id,
                 "display_name": role.display_name,
                 "responsibility": role.responsibility,
+                "behavior": role.behavior,
                 "grant_ceiling": role.grant_ceiling.iter().map(|capability| format!("{capability:?}").to_ascii_lowercase()).collect::<Vec<_>>(),
                 "cardinality": format!("{:?}", role.cardinality),
                 "acceptance": role.task_contract.acceptance,
@@ -1218,6 +1307,7 @@ mod tests {
                     min_count: None,
                     max_count: None,
                     acceptance: vec!["findings".to_string(), "evidence".to_string()],
+                    behavior: vec![RoleBehaviorFacet::ReacquireEvidence { required: true }],
                 },
                 ProposedRole {
                     role_id: "cto".to_string(),
@@ -1229,6 +1319,13 @@ mod tests {
                     min_count: None,
                     max_count: None,
                     acceptance: vec!["summary".to_string(), "evidence".to_string()],
+                    behavior: vec![
+                        RoleBehaviorFacet::Reducer {
+                            mode: "finally".to_string(),
+                        },
+                        RoleBehaviorFacet::UpstreamConsumption { required: true },
+                        RoleBehaviorFacet::TerminalCandidate { required: true },
+                    ],
                 },
             ],
             dependencies: vec![ProposedDependency {
@@ -1284,16 +1381,11 @@ mod tests {
         let mut proposal = business_tech_proposal();
         proposal.roles[0].agent_definition_ref =
             "workspace/cowd/not-a-real-definition@1".to_string();
-        let candidate = TemplateCandidateCompiler::compile(
-            &registry,
-            &proposal,
-            PermissionMode::ReadOnly,
-        )
-        .expect("unknown definition falls back to a safe builtin");
+        let candidate =
+            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
+                .expect("unknown definition falls back to a safe builtin");
         assert_eq!(
-            candidate.manifest.roles[0]
-                .agent_definition_id
-                .as_str(),
+            candidate.manifest.roles[0].agent_definition_id.as_str(),
             "builtin/cowd/explore"
         );
         assert!(candidate
@@ -1361,12 +1453,9 @@ mod tests {
         let mut proposal = business_tech_proposal();
         proposal.roles[0].agent_definition_ref = "builtin/cowd/explore@1".to_string();
         proposal.roles[1].agent_definition_ref = "builtin/cowd/direct@1".to_string();
-        let candidate = TemplateCandidateCompiler::compile(
-            &registry,
-            &proposal,
-            PermissionMode::ReadOnly,
-        )
-        .expect("candidate");
+        let candidate =
+            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
+                .expect("candidate");
         let approval_id = "template-approval:test-roundtrip";
         services
             .event_store()
@@ -1502,11 +1591,13 @@ mod tests {
                         "revision": 1
                     },
                     "grant_ceiling": {"read": true, "write": false},
-                    "acceptance": "findings"
+                    "acceptance": "findings",
+                    "behavior": "evidence"
                 },
                 "cto": {
                     "responsibility": "技术裁决",
-                    "agent_definition_ref": {"workspace/cowd/direct": 1}
+                    "agent_definition_ref": {"workspace/cowd/direct": 1},
+                    "behavior": "reducer, upstream, terminal"
                 }
             },
             "role_display_names": {
@@ -1516,7 +1607,10 @@ mod tests {
             "instructions": "# 测试\n"
         });
         let notes = normalize_template_proposal(&mut value).expect("normalized");
-        assert!(!notes.is_empty(), "defaulted display names should be recorded");
+        assert!(
+            !notes.is_empty(),
+            "defaulted display names should be recorded"
+        );
         let roles = value["roles"].as_array().expect("roles array");
         assert_eq!(roles.len(), 2);
         assert!(roles.iter().any(|role| {
@@ -1556,7 +1650,8 @@ mod tests {
                     "cardinality": 1,
                     "grant_ceiling": "workspace-read",
                     "responsibility": "从制造现实出发评估约束",
-                    "acceptance": "交付制造约束清单"
+                    "acceptance": "交付制造约束清单",
+                    "behavior": "evidence"
                 },
                 {
                     "role_id": "cto_supply_manufacturing",
@@ -1564,7 +1659,8 @@ mod tests {
                     "team": "technical",
                     "cardinality": 1,
                     "grant_ceiling": "workspace-read-write",
-                    "responsibility": "总体架构决策"
+                    "responsibility": "总体架构决策",
+                    "behavior": "evidence"
                 },
                 {
                     "role_id": "convergence_arbiter",
@@ -1572,7 +1668,8 @@ mod tests {
                     "team": "convergence",
                     "cardinality": 1,
                     "grant_ceiling": "workspace-read-write",
-                    "responsibility": "主持收敛"
+                    "responsibility": "主持收敛",
+                    "behavior": "reducer, upstream, terminal"
                 }
             ],
             "dependencies": {
@@ -1587,11 +1684,9 @@ mod tests {
         let mut value = serde_json::json!([encoded]);
         let notes =
             normalize_template_proposal(&mut value).expect("normalize array-wrapped string");
-        assert!(
-            notes
-                .iter()
-                .any(|note| note.contains("single-element template_proposal array"))
-        );
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("single-element template_proposal array")));
         assert!(value.is_object());
         let roles = value["roles"].as_array().expect("roles array");
         assert_eq!(roles.len(), 3);
@@ -1609,7 +1704,9 @@ mod tests {
             roles[1]["agent_definition_ref"],
             serde_json::json!("builtin/cowd/execute@1")
         );
-        let dependencies = value["dependencies"].as_array().expect("dependencies array");
+        let dependencies = value["dependencies"]
+            .as_array()
+            .expect("dependencies array");
         assert_eq!(dependencies.len(), 2);
         assert!(dependencies.iter().any(|dep| {
             dep["from"] == "biz_manufacturing_expert" && dep["to"] == "convergence_arbiter"
@@ -1650,18 +1747,36 @@ mod tests {
     }
 
     #[test]
+    fn normalize_template_proposal_rejects_behavior_inference() {
+        let mut value = serde_json::json!({
+            "template_id": "cowd/test",
+            "name": "测试",
+            "roles": [{
+                "role_id": "reviewer",
+                "responsibility": "review output",
+                "grant_ceiling": ["read"]
+            }]
+        });
+        let error = normalize_template_proposal(&mut value)
+            .expect_err("runtime must not infer terminal/reducer behavior from a role id");
+        assert!(error.contains("must declare explicit behavior"));
+    }
+
+    #[test]
     fn normalize_dependencies_supports_role_keyed_upstream_edges() {
         let mut value = serde_json::json!({
             "template_id": "cowd/test",
             "name": "测试",
             "roles": [
-                {"role_id": "implementer", "responsibility": "x"},
-                {"role_id": "reviewer", "responsibility": "y"}
+                {"role_id": "implementer", "responsibility": "x", "behavior": "evidence"},
+                {"role_id": "reviewer", "responsibility": "y", "behavior": "reducer, upstream, terminal"}
             ],
             "dependencies": {"implementer": ["reviewer"]}
         });
         normalize_template_proposal(&mut value).expect("normalize");
-        let dependencies = value["dependencies"].as_array().expect("dependencies array");
+        let dependencies = value["dependencies"]
+            .as_array()
+            .expect("dependencies array");
         assert_eq!(dependencies.len(), 1);
         assert_eq!(dependencies[0]["from"], "implementer");
         assert_eq!(dependencies[0]["to"], "reviewer");
@@ -1680,20 +1795,23 @@ mod tests {
                     "display_name": "供应链专家",
                     "grant_ceiling": "workspace-read",
                     "responsibility": "分析供应制造约束",
-                    "acceptance": "findings"
+                    "acceptance": "findings",
+                    "behavior": "evidence"
                 },
                 {
                     "role_id": "cto",
                     "display_name": "CTO",
                     "grant_ceiling": "workspace-read-write",
-                    "responsibility": "技术裁决"
+                    "responsibility": "技术裁决",
+                    "behavior": "evidence"
                 },
                 {
                     "role_id": "convergence_arbiter",
                     "display_name": "集中收敛主持人",
                     "team": "convergence",
                     "grant_ceiling": "workspace-read-write",
-                    "responsibility": "汇总裁决"
+                    "responsibility": "汇总裁决",
+                    "behavior": "reducer, upstream, terminal"
                 }
             ],
             "dependencies": {
@@ -1734,12 +1852,9 @@ mod tests {
         publish_agent(&registry, "cowd/direct");
         let mut proposal = business_tech_proposal();
         proposal.instructions = "第一行\r\n第二行\r\n".to_string();
-        let candidate = TemplateCandidateCompiler::compile(
-            &registry,
-            &proposal,
-            PermissionMode::ReadOnly,
-        )
-        .expect("candidate");
+        let candidate =
+            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
+                .expect("candidate");
         // store_revision normalizes CRLF before hashing; the manifest digest
         // must match that normalized text, not the raw proposal bytes.
         let stored = registry
@@ -1755,12 +1870,13 @@ mod tests {
             "template_id": "cowd/test",
             "name": "测试",
             "roles": [
-                {"role_id": "business_expert", "responsibility": "x"},
-                {"role_id": "cto", "responsibility": "y"},
+                {"role_id": "business_expert", "responsibility": "x", "behavior": "evidence"},
+                {"role_id": "cto", "responsibility": "y", "behavior": "evidence"},
                 {
                     "role_id": "convergence_arbiter",
                     "team": "convergence",
-                    "responsibility": "z"
+                    "responsibility": "z",
+                    "behavior": "reducer, upstream, terminal"
                 }
             ],
             "dependencies": [
@@ -1770,11 +1886,12 @@ mod tests {
             ]
         });
         normalize_template_proposal(&mut value).expect("normalize");
-        let dependencies = value["dependencies"].as_array().expect("dependencies array");
+        let dependencies = value["dependencies"]
+            .as_array()
+            .expect("dependencies array");
         assert_eq!(dependencies.len(), 2);
         assert!(dependencies.iter().any(|dependency| {
-            dependency["from"] == "business_expert"
-                && dependency["to"] == "convergence_arbiter"
+            dependency["from"] == "business_expert" && dependency["to"] == "convergence_arbiter"
         }));
         assert!(dependencies.iter().any(|dependency| {
             dependency["from"] == "cto" && dependency["to"] == "convergence_arbiter"
@@ -1787,26 +1904,19 @@ mod tests {
         let mut proposal = business_tech_proposal();
         proposal.roles[0].agent_definition_ref = "builtin/cowd/researcher@1".to_string();
         proposal.roles[1].agent_definition_ref = "builtin/cowd/cto@1".to_string();
-        let candidate = TemplateCandidateCompiler::compile(
-            &registry,
-            &proposal,
-            PermissionMode::ReadOnly,
-        )
-        .expect("unknown agent refs fall back to safe builtins");
+        let candidate =
+            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
+                .expect("unknown agent refs fall back to safe builtins");
         let defaulted = candidate.preview["defaulted_agent_refs"]
             .as_array()
             .expect("defaulted agent refs audit");
         assert_eq!(defaulted.len(), 2);
         assert_eq!(
-            candidate.manifest.roles[0]
-                .agent_definition_id
-                .as_str(),
+            candidate.manifest.roles[0].agent_definition_id.as_str(),
             "builtin/cowd/explore"
         );
         assert_eq!(
-            candidate.manifest.roles[1]
-                .agent_definition_id
-                .as_str(),
+            candidate.manifest.roles[1].agent_definition_id.as_str(),
             "builtin/cowd/explore"
         );
     }
@@ -1820,7 +1930,8 @@ mod tests {
                 "role_id": "cto",
                 "responsibility": "x",
                 "grant_ceiling": "workspace-read",
-                "agent_definition_ref": null
+                "agent_definition_ref": null,
+                "behavior": "terminal, evidence"
             }]
         });
         normalize_template_proposal(&mut value).expect("normalize");
@@ -1831,12 +1942,9 @@ mod tests {
         let (_temp, registry) = registry();
         let proposal: TeamTemplateProposal =
             serde_json::from_value(value).expect("parses after normalization");
-        let candidate = TemplateCandidateCompiler::compile(
-            &registry,
-            &proposal,
-            PermissionMode::ReadOnly,
-        )
-        .expect("compile with workspace-prefixed id and null agent ref");
+        let candidate =
+            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
+                .expect("compile with workspace-prefixed id and null agent ref");
         assert_eq!(
             candidate.manifest.template_id.as_str(),
             "workspace/biz-tech-dual-team-deliberation"

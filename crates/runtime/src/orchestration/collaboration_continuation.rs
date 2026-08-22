@@ -15,6 +15,7 @@ use crate::{
 };
 
 const CONTINUATION_CAS_STREAM: &str = "continuation-cas";
+const SESSION_HISTORY_PAGE: usize = 64;
 
 /// One eligible continuation source derived from durable history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +115,107 @@ pub fn compile_continuation_binding(
     Ok(binding)
 }
 
+/// Loads the newest *eligible* collaboration result from the exact Session
+/// strategy stream.  This deliberately reads durable strategy facts, not
+/// user/assistant text or a mutable Team projection.  The current turn is
+/// excluded so a retry cannot accidentally bind a root to itself.
+pub fn latest_same_session_candidate(
+    store: &RuntimeEventStore,
+    session_id: &str,
+    current_turn_id: &str,
+) -> Result<Option<(ContinuationCandidate, u64)>, String> {
+    if session_id.trim().is_empty() || current_turn_id.trim().is_empty() {
+        return Err("continuation lookup requires a session and turn identity".to_string());
+    }
+    let stream_id = format!("session:{session_id}");
+    let page = store.list_stream_page_desc(&stream_id, SESSION_HISTORY_PAGE, 0)?;
+    for event in page {
+        if event.kind != "runtime.strategy.outcome"
+            || event.status.as_deref() != Some("completed")
+            || event
+                .payload
+                .get("session_ref")
+                .and_then(serde_json::Value::as_str)
+                != Some(session_id)
+        {
+            continue;
+        }
+        let Some(source_turn_id) = event
+            .payload
+            .get("turn_ref")
+            .and_then(serde_json::Value::as_str)
+            .filter(|turn| !turn.trim().is_empty())
+        else {
+            continue;
+        };
+        if source_turn_id == current_turn_id {
+            continue;
+        }
+        let Some(source_root_id) = event
+            .payload
+            .get("execution_graph_ref")
+            .and_then(serde_json::Value::as_str)
+            .filter(|graph| !graph.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(receipt) = event
+            .payload
+            .get("collaboration_receipt")
+            .filter(|receipt| !receipt.is_null())
+        else {
+            continue;
+        };
+        if receipt
+            .get("degraded")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || receipt
+                .get("verified_team_executions")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                == 0
+        {
+            continue;
+        }
+        let Some(team_graph_id) = receipt
+            .pointer("/evidence/graph_id")
+            .or_else(|| receipt.pointer("/execution/graph_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|graph| !graph.trim().is_empty())
+        else {
+            continue;
+        };
+        let mut result_refs = vec![
+            format!("execution_graph:{source_root_id}"),
+            format!("team_graph:{team_graph_id}"),
+        ];
+        if let Some(envelope_id) = receipt
+            .pointer("/delivery_envelope/envelope_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            result_refs.push(format!("delivery_envelope:{envelope_id}"));
+        }
+        result_refs.sort();
+        result_refs.dedup();
+        return Ok(Some((
+            ContinuationCandidate {
+                source_session_id: session_id.to_string(),
+                source_turn_id: source_turn_id.to_string(),
+                source_root_id: source_root_id.to_string(),
+                team_set_ref: format!("team_graph:{team_graph_id}"),
+                // The Session event is the durable delivery revision.  A
+                // mutable graph revision is intentionally not consulted.
+                delivery_revision: event.sequence,
+                result_refs,
+            },
+            event.sequence,
+        )));
+    }
+    Ok(None)
+}
+
 fn continuation_digest(binding: &CollaborationContinuationBinding) -> Result<String, String> {
     let value = json!({
         "source_session_id": binding.source_session_id,
@@ -134,6 +236,74 @@ fn continuation_digest(binding: &CollaborationContinuationBinding) -> Result<Str
                 .map_err(|error| format!("encode continuation binding: {error}"))?
         )
     ))
+}
+
+fn continuation_claim_key(binding: &CollaborationContinuationBinding) -> String {
+    format!(
+        "continuation:{}:{}",
+        binding.current_ingress, binding.binding_digest
+    )
+}
+
+/// Domain event appended atomically with `ExecutionGraph::Planned`.  The
+/// graph and continuation claim therefore have one durable winner: a crash
+/// cannot leave a consumed continuation claim without its root graph.
+pub(crate) fn graph_continuation_claim_event(
+    binding: &CollaborationContinuationBinding,
+    root_graph_id: &str,
+) -> Result<RuntimeTransactionEventInput, String> {
+    if binding.binding_digest != continuation_digest(binding)? {
+        return Err("continuation binding digest does not match its authority fields".to_string());
+    }
+    if root_graph_id.trim().is_empty()
+        || binding.current_ingress.trim().is_empty()
+        || binding.source_session_id.trim().is_empty()
+        || binding.source_root_id.trim().is_empty()
+        || binding.team_set_ref.trim().is_empty()
+    {
+        return Err("continuation graph claim has an incomplete immutable binding".to_string());
+    }
+    let key = continuation_claim_key(binding);
+    Ok(RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: CONTINUATION_CAS_STREAM.to_string(),
+            scope: RuntimeEventScope::Relation,
+            kind: "team.continuation.root_claimed.v2".to_string(),
+            status: Some("claimed".to_string()),
+            actor: Some("execution_commit_service".to_string()),
+            refs: vec![
+                RuntimeEventRef {
+                    kind: "session".to_string(),
+                    id: binding.source_session_id.clone(),
+                },
+                RuntimeEventRef {
+                    kind: "execution_graph".to_string(),
+                    id: binding.source_root_id.clone(),
+                },
+                RuntimeEventRef {
+                    kind: "team_graph".to_string(),
+                    id: binding
+                        .team_set_ref
+                        .trim_start_matches("team_graph:")
+                        .to_string(),
+                },
+                RuntimeEventRef {
+                    kind: "execution_graph".to_string(),
+                    id: root_graph_id.to_string(),
+                },
+                RuntimeEventRef {
+                    kind: "session_input".to_string(),
+                    id: binding.current_ingress.clone(),
+                },
+            ],
+            payload: json!({
+                "root_graph_id": root_graph_id,
+                "binding": binding,
+            }),
+        },
+        idempotency_key: Some(key),
+        schema_version: 1,
+    })
 }
 
 /// Reauthorization gate. Revoked revisions fail closed; cross-session only
@@ -305,5 +475,109 @@ mod tests {
         assert!(
             claim_continuation_root(&store, "ingress-2", "digest-1").expect("different ingress")
         );
+    }
+
+    fn append_outcome(
+        store: &RuntimeEventStore,
+        session: &str,
+        turn: &str,
+        root: &str,
+        team_graph: &str,
+        verified_teams: u64,
+        degraded: bool,
+    ) -> Result<(), String> {
+        store
+            .append(RuntimeEventInput {
+                stream_id: format!("session:{session}"),
+                scope: RuntimeEventScope::Session,
+                kind: "runtime.strategy.outcome".to_string(),
+                status: Some("completed".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: json!({
+                    "session_ref": session,
+                    "turn_ref": turn,
+                    "execution_graph_ref": root,
+                    "collaboration_receipt": {
+                        "verified_team_executions": verified_teams,
+                        "degraded": degraded,
+                        "evidence": { "graph_id": team_graph },
+                        "delivery_envelope": { "envelope_id": format!("envelope:{team_graph}") },
+                    },
+                }),
+            })
+            .map(|_| ())
+    }
+
+    #[test]
+    fn same_session_continuation_uses_latest_verified_receipt_and_excludes_current_turn() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        append_outcome(
+            &store,
+            "session-a",
+            "turn-old",
+            "root-old",
+            "team-old",
+            2,
+            false,
+        )
+        .expect("old outcome");
+        append_outcome(
+            &store,
+            "session-a",
+            "turn-degraded",
+            "root-degraded",
+            "team-degraded",
+            2,
+            true,
+        )
+        .expect("degraded outcome");
+        append_outcome(
+            &store,
+            "session-a",
+            "turn-current",
+            "root-current",
+            "team-current",
+            2,
+            false,
+        )
+        .expect("current outcome");
+
+        let (candidate, revision) =
+            latest_same_session_candidate(&store, "session-a", "turn-current")
+                .expect("lookup")
+                .expect("eligible candidate");
+        assert_eq!(candidate.source_turn_id, "turn-old");
+        assert_eq!(candidate.source_root_id, "root-old");
+        assert_eq!(candidate.team_set_ref, "team_graph:team-old");
+        assert!(revision > 0);
+        assert_eq!(
+            candidate.result_refs[0],
+            "delivery_envelope:envelope:team-old"
+        );
+    }
+
+    #[test]
+    fn graph_claim_event_is_digest_checked_and_carries_exact_source_refs() {
+        let binding = compile_continuation_binding(
+            &candidate("session-1", "root-1", "turn-1"),
+            "ingress-1",
+            7,
+            ContinuationAuthorization::Authorized,
+            42,
+        )
+        .expect("binding");
+        let event = graph_continuation_claim_event(&binding, "root-new").expect("event");
+        assert_eq!(event.event.stream_id, CONTINUATION_CAS_STREAM);
+        assert_eq!(event.event.kind, "team.continuation.root_claimed.v2");
+        assert!(event
+            .event
+            .refs
+            .iter()
+            .any(|reference| reference.kind == "execution_graph" && reference.id == "root-new"));
+
+        let mut tampered = binding;
+        tampered.result_refs.push("unverified:ref".to_string());
+        assert!(graph_continuation_claim_event(&tampered, "root-new").is_err());
     }
 }

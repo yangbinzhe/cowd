@@ -163,7 +163,7 @@ assert data.get("receipt", {}).get("result", {}).get("mission", {}).get("mission
 PY
 curl -fsS "$BASE_URL/api/tasks/start" \
   -H 'content-type: application/json' \
-  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"origin_session_id\":\"$SESSION_ID\",\"origin_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"runtime surface scenario validates control plane\",\"yolo_mode\":true}" \
+  -d "{\"task_id\":\"$TASK_ID\",\"mission_id\":\"$MISSION_ID\",\"origin_session_id\":\"$SESSION_ID\",\"origin_turn_id\":\"$TASK_TURN_ID\",\"objective\":\"runtime surface scenario validates control plane\"}" \
   >"$TMP_DIR/start-task.json"
 python3 - "$TMP_DIR/start-task.json" "$TASK_ID" "$MISSION_ID" <<'PY'
 import json, sys

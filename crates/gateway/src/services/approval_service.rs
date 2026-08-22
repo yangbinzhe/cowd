@@ -226,11 +226,18 @@ impl ApprovalService {
                     "blocks_execution": filter.blocks_execution,
                 },
                 "pending": [],
+                "groups": [],
+                "pending_count": 0,
                 "approvals": serde_json::Value::Null,
             });
         };
         let mut requests = Vec::new();
-        for request in services.approval_queue().list() {
+        // This is a live work inbox, not an approval-history endpoint.  Reading
+        // the full event-sourced history on every browser refresh made the
+        // response grow with terminal records and duplicated recovery work.
+        // `refresh()` above synchronizes the bounded hot Pending projection;
+        // durable history is available from the dedicated paginated endpoint.
+        for request in services.approval_queue().pending() {
             if !self.approval_visible_to(&request, principal).await
                 || !filter.session_id.as_ref().is_none_or(|session_id| {
                     request.context.session_id.as_deref() == Some(session_id.as_str())
@@ -316,6 +323,7 @@ impl ApprovalService {
             },
             "pending": pending,
             "groups": groups,
+            "pending_count": pending_requests.len(),
             "approvals": projection,
         })
     }
@@ -1189,6 +1197,11 @@ mod tests {
         let reviewer = review_principal(&["approval.respond", "fulfillment.review"]);
         let pending = service.pending(&reviewer).await;
         assert_eq!(pending["pending"].as_array().unwrap().len(), 2);
+        assert_eq!(pending["pending_count"], serde_json::json!(2));
+        assert_eq!(
+            pending["approvals"]["requests"].as_array().unwrap().len(),
+            2
+        );
         assert!(
             pending["pending"][0]["deadline_elapsed"].is_boolean(),
             "every pending item carries the typed deadline_elapsed fact"
@@ -1198,6 +1211,29 @@ mod tests {
         assert_eq!(groups[0]["batch_decision_supported"], false);
         assert_eq!(groups[0]["count"], 2);
         assert!(groups[0]["batch_token"].as_str().is_some());
+
+        let terminal_id = services
+            .approval_queue()
+            .pending()
+            .into_iter()
+            .next()
+            .expect("first pending approval")
+            .approval_id;
+        services
+            .approval_queue()
+            .timeout(&terminal_id)
+            .expect("deadline terminalizes the first approval");
+        let after_timeout = service.pending(&reviewer).await;
+        assert_eq!(after_timeout["pending_count"], serde_json::json!(1));
+        assert_eq!(after_timeout["pending"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            after_timeout["approvals"]["requests"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1,
+            "the live inbox must not reproject terminal history"
+        );
     }
 
     #[tokio::test]

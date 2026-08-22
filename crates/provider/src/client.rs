@@ -250,9 +250,7 @@ impl ProviderClient {
         {
             return trimmed.to_string();
         }
-        let after_scheme = trimmed
-            .split_once("://")
-            .map_or(trimmed, |(_, rest)| rest);
+        let after_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
         if after_scheme.contains('/') {
             trimmed.to_string()
         } else {
@@ -402,9 +400,7 @@ mod tests {
             "https://api.example.com/v1"
         );
         assert_eq!(
-            ProviderClient::normalize_openai_url(
-                "https://open.bigmodel.cn/api/paas/v4"
-            ),
+            ProviderClient::normalize_openai_url("https://open.bigmodel.cn/api/paas/v4"),
             "https://open.bigmodel.cn/api/paas/v4"
         );
         assert_eq!(

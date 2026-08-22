@@ -8,9 +8,9 @@ use harness_contract::agent::{
 };
 use harness_contract::team::definition::{RoleDisplayName, TeamTemplateDisplay};
 use harness_contract::team::{
-    RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDefinition,
-    TeamRoleDependency, TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest,
-    TeamTemplateRevisionRef, TeamTopologyContract,
+    RoleBehaviorFacet, RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract,
+    TeamRoleDefinition, TeamRoleDependency, TeamRoleTaskContract, TeamTemplateDefinitionId,
+    TeamTemplateManifest, TeamTemplateRevisionRef, TeamTopologyContract,
 };
 use sha2::{Digest, Sha256};
 
@@ -133,6 +133,7 @@ where
             require_synthesis: true,
             require_review: true,
         },
+        role_aliases: std::collections::BTreeMap::new(),
         roles: vec![
             TeamRoleDefinition {
                 role_id: "implementer".to_string(),
@@ -143,6 +144,7 @@ where
                 agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
                 cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
                 partition: RolePartitionPolicy::Single,
+                behavior: vec![RoleBehaviorFacet::ReacquireEvidence { required: true }],
                 grant_ceiling: vec![
                     AgentCapability::Read,
                     AgentCapability::Search,
@@ -165,6 +167,14 @@ where
                 agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
                 cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
                 partition: RolePartitionPolicy::Single,
+                behavior: vec![
+                    RoleBehaviorFacet::Verification {
+                        mode: "independent".to_string(),
+                    },
+                    RoleBehaviorFacet::UpstreamConsumption { required: true },
+                    RoleBehaviorFacet::ReacquireEvidence { required: true },
+                    RoleBehaviorFacet::TerminalCandidate { required: true },
+                ],
                 grant_ceiling: vec![AgentCapability::Read],
                 task_contract: TeamRoleTaskContract {
                     contract_ref: "builtin/review@1".to_string(),
@@ -269,39 +279,86 @@ fn additional_builtin_team_manifests(
         evidence_required: fields.contains(&"evidence"),
         synthesis_required: fields.contains(&"summary"),
     };
-    let role_revision = |role_id: &str,
-                         responsibility: &str,
-                         agent: AgentDefinitionId,
-                         agent_revision: u64,
-                         grant_ceiling: Vec<AgentCapability>,
-                         cardinality: RoleCardinalityPolicy,
-                         partition: RolePartitionPolicy,
-                         acceptance: &[&str]| TeamRoleDefinition {
-        role_id: role_id.to_string(),
-        display_name: None,
-        responsibility: responsibility.to_string(),
-        agent_definition_id: agent,
-        agent_selector: RevisionSelector::ExactApprovedRevision {
-            revision: agent_revision,
-        },
-        cardinality,
-        partition,
-        grant_ceiling,
-        task_contract: TeamRoleTaskContract {
-            contract_ref: format!("builtin/team-role/{role_id}@1"),
-            acceptance: acceptance
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect(),
-        },
+    // These are published Template facts, not Runtime inference rules.  Each
+    // builtin call below chooses one explicitly; custom templates must supply
+    // their own typed behavior in the proposal contract.
+    let evidence_producer = || vec![RoleBehaviorFacet::ReacquireEvidence { required: true }];
+    let upstream_worker = || {
+        vec![
+            RoleBehaviorFacet::UpstreamConsumption { required: true },
+            RoleBehaviorFacet::ReacquireEvidence { required: true },
+        ]
     };
+    let independent_verifier = || {
+        vec![
+            RoleBehaviorFacet::Verification {
+                mode: "independent".to_string(),
+            },
+            RoleBehaviorFacet::UpstreamConsumption { required: true },
+            RoleBehaviorFacet::ReacquireEvidence { required: true },
+            RoleBehaviorFacet::TerminalCandidate { required: true },
+        ]
+    };
+    let terminal_worker = || {
+        vec![
+            RoleBehaviorFacet::UpstreamConsumption { required: true },
+            RoleBehaviorFacet::ReacquireEvidence { required: true },
+            RoleBehaviorFacet::TerminalCandidate { required: true },
+        ]
+    };
+    let terminal_reducer = || {
+        vec![
+            RoleBehaviorFacet::Reducer {
+                mode: "finally".to_string(),
+            },
+            RoleBehaviorFacet::UpstreamConsumption { required: true },
+            RoleBehaviorFacet::ReacquireEvidence { required: false },
+            RoleBehaviorFacet::TerminalCandidate { required: true },
+        ]
+    };
+    let direct_terminal = || {
+        vec![
+            RoleBehaviorFacet::ReacquireEvidence { required: true },
+            RoleBehaviorFacet::TerminalCandidate { required: true },
+        ]
+    };
+    let role_revision =
+        |role_id: &str,
+         responsibility: &str,
+         agent: AgentDefinitionId,
+         agent_revision: u64,
+         grant_ceiling: Vec<AgentCapability>,
+         cardinality: RoleCardinalityPolicy,
+         partition: RolePartitionPolicy,
+         acceptance: &[&str],
+         behavior: Vec<RoleBehaviorFacet>| TeamRoleDefinition {
+            role_id: role_id.to_string(),
+            display_name: None,
+            responsibility: responsibility.to_string(),
+            agent_definition_id: agent,
+            agent_selector: RevisionSelector::ExactApprovedRevision {
+                revision: agent_revision,
+            },
+            cardinality,
+            partition,
+            behavior,
+            grant_ceiling,
+            task_contract: TeamRoleTaskContract {
+                contract_ref: format!("builtin/team-role/{role_id}@1"),
+                acceptance: acceptance
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect(),
+            },
+        };
     let role = |role_id: &str,
                 responsibility: &str,
                 agent: AgentDefinitionId,
                 grant_ceiling: Vec<AgentCapability>,
                 cardinality: RoleCardinalityPolicy,
                 partition: RolePartitionPolicy,
-                acceptance: &[&str]| {
+                acceptance: &[&str],
+                behavior: Vec<RoleBehaviorFacet>| {
         role_revision(
             role_id,
             responsibility,
@@ -311,6 +368,7 @@ fn additional_builtin_team_manifests(
             cardinality,
             partition,
             acceptance,
+            behavior,
         )
     };
     let template = |local_id: &str,
@@ -343,11 +401,13 @@ fn additional_builtin_team_manifests(
                 topology: TeamTopologyContract {
                     protocol_ref: protocol_ref.to_string(),
                     require_synthesis: result_contract.synthesis_required,
-                    require_review: dependencies.iter().any(|dependency| {
-                        dependency.to_role_id.contains("review")
-                            || dependency.to_role_id.contains("critic")
+                    require_review: roles.iter().any(|role| {
+                        role.behavior
+                            .iter()
+                            .any(|facet| matches!(facet, RoleBehaviorFacet::Verification { .. }))
                     }),
                 },
+                role_aliases: std::collections::BTreeMap::new(),
                 roles,
                 dependencies,
                 result_contract,
@@ -374,6 +434,7 @@ fn additional_builtin_team_manifests(
                 fixed.clone(),
                 single.clone(),
                 &["summary", "evidence"],
+                direct_terminal(),
             )],
             Vec::new(),
             result(&["summary", "evidence"]),
@@ -384,9 +445,9 @@ fn additional_builtin_team_manifests(
             "Planner Executor Verifier",
             "review_fix@1",
             vec![
-                role("planner", "Establish an evidence-backed plan.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], fixed.clone(), single.clone(), &["plan", "evidence"]),
-                role("executor", "Execute the approved bounded plan.", execute.clone(), vec![AgentCapability::Read, AgentCapability::Search, AgentCapability::Write, AgentCapability::Test], fixed.clone(), single.clone(), &["implementation", "evidence"]),
-                role("verifier", "Verify outcomes and remaining risks.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "risks"]),
+                role("planner", "Establish an evidence-backed plan.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], fixed.clone(), single.clone(), &["plan", "evidence"], evidence_producer()),
+                role("executor", "Execute the approved bounded plan.", execute.clone(), vec![AgentCapability::Read, AgentCapability::Search, AgentCapability::Write, AgentCapability::Test], fixed.clone(), single.clone(), &["implementation", "evidence"], upstream_worker()),
+                role("verifier", "Verify outcomes and remaining risks.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "risks"], independent_verifier()),
             ],
             vec![
                 TeamRoleDependency { from_role_id: "planner".to_string(), to_role_id: "executor".to_string() },
@@ -400,8 +461,8 @@ fn additional_builtin_team_manifests(
             "Parallel Research Synthesis",
             "jps@1",
             vec![
-                role("researcher", "Investigate a non-overlapping focus partition with evidence.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["findings", "evidence"]),
-                role("synthesizer", "Reconcile research findings into a grounded synthesis.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "unresolved"]),
+                role("researcher", "Investigate a non-overlapping focus partition with evidence.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["findings", "evidence"], evidence_producer()),
+                role("synthesizer", "Reconcile research findings into a grounded synthesis.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "unresolved"], terminal_reducer()),
             ],
             vec![TeamRoleDependency { from_role_id: "researcher".to_string(), to_role_id: "synthesizer".to_string() }],
             result(&["summary", "evidence", "unresolved"]),
@@ -425,6 +486,7 @@ fn additional_builtin_team_manifests(
                     parallel.clone(),
                     focused.clone(),
                     &["findings", "evidence", "unresolved"],
+                    evidence_producer(),
                 ),
                 role(
                     "synthesizer",
@@ -434,6 +496,7 @@ fn additional_builtin_team_manifests(
                     fixed.clone(),
                     single.clone(),
                     &["summary", "evidence", "unresolved"],
+                    terminal_reducer(),
                 ),
             ],
             vec![TeamRoleDependency {
@@ -448,9 +511,9 @@ fn additional_builtin_team_manifests(
             "Implementation Review Fix",
             "review_fix@1",
             vec![
-                role("implementer", "Implement the bounded change and provide verification evidence.", execute.clone(), vec![AgentCapability::Read, AgentCapability::Search, AgentCapability::Write, AgentCapability::Test], fixed.clone(), single.clone(), &["implementation", "evidence"]),
-                role("reviewer", "Independently review implementation evidence and identify defects.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["review", "evidence", "risks"]),
-                role("fixer", "Address accepted review findings and report residual risk.", execute.clone(), vec![AgentCapability::Read, AgentCapability::Search, AgentCapability::Write, AgentCapability::Test], fixed.clone(), single.clone(), &["summary", "evidence", "risks"]),
+                role("implementer", "Implement the bounded change and provide verification evidence.", execute.clone(), vec![AgentCapability::Read, AgentCapability::Search, AgentCapability::Write, AgentCapability::Test], fixed.clone(), single.clone(), &["implementation", "evidence"], evidence_producer()),
+                role("reviewer", "Independently review implementation evidence and identify defects.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["review", "evidence", "risks"], vec![RoleBehaviorFacet::Verification { mode: "independent".to_string() }, RoleBehaviorFacet::UpstreamConsumption { required: true }, RoleBehaviorFacet::ReacquireEvidence { required: true }]),
+                role("fixer", "Address accepted review findings and report residual risk.", execute.clone(), vec![AgentCapability::Read, AgentCapability::Search, AgentCapability::Write, AgentCapability::Test], fixed.clone(), single.clone(), &["summary", "evidence", "risks"], terminal_worker()),
             ],
             vec![
                 TeamRoleDependency { from_role_id: "implementer".to_string(), to_role_id: "reviewer".to_string() },
@@ -464,9 +527,9 @@ fn additional_builtin_team_manifests(
             "Debate Critic Arbiter",
             "debate@1",
             vec![
-                role("proposer", "Develop an evidence-backed proposal for one focus.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["proposal", "evidence"]),
-                role("critic", "Challenge proposals for missing evidence and counterexamples.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["critique", "evidence", "risks"]),
-                role("arbiter", "Resolve conflicts while preserving unresolved uncertainty.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "unresolved"]),
+                role("proposer", "Develop an evidence-backed proposal for one focus.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["proposal", "evidence"], evidence_producer()),
+                role("critic", "Challenge proposals for missing evidence and counterexamples.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["critique", "evidence", "risks"], vec![RoleBehaviorFacet::Verification { mode: "adversarial".to_string() }, RoleBehaviorFacet::UpstreamConsumption { required: true }, RoleBehaviorFacet::ReacquireEvidence { required: true }]),
+                role("arbiter", "Resolve conflicts while preserving unresolved uncertainty.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "unresolved"], terminal_reducer()),
             ],
             vec![
                 TeamRoleDependency { from_role_id: "proposer".to_string(), to_role_id: "critic".to_string() },
@@ -480,9 +543,9 @@ fn additional_builtin_team_manifests(
             "Incident Response",
             "incident@1",
             vec![
-                role("investigator", "Establish the incident evidence and scope.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["findings", "evidence"]),
-                role("responder", "Apply a bounded mitigation plan when permissions allow.", execute.clone(), vec![AgentCapability::Read, AgentCapability::Search, AgentCapability::Write, AgentCapability::Test], fixed.clone(), single.clone(), &["mitigation", "evidence"]),
-                role("commander", "Synthesize status, decisions, and unresolved risk.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "risks"]),
+                role("investigator", "Establish the incident evidence and scope.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["findings", "evidence"], evidence_producer()),
+                role("responder", "Apply a bounded mitigation plan when permissions allow.", execute.clone(), vec![AgentCapability::Read, AgentCapability::Search, AgentCapability::Write, AgentCapability::Test], fixed.clone(), single.clone(), &["mitigation", "evidence"], upstream_worker()),
+                role("commander", "Synthesize status, decisions, and unresolved risk.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "risks"], terminal_reducer()),
             ],
             vec![
                 TeamRoleDependency { from_role_id: "investigator".to_string(), to_role_id: "responder".to_string() },
@@ -496,8 +559,8 @@ fn additional_builtin_team_manifests(
             "Matrix Scenario Ensemble",
             "matrix_scenario@1",
             vec![
-                role("scenario", "Evaluate one explicit scenario assumption set against leased Matrix snapshots.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["findings", "evidence"]),
-                role("comparator", "Compare simulation candidates without treating them as observed facts.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "unresolved"]),
+                role("scenario", "Evaluate one explicit scenario assumption set against leased Matrix snapshots.", explore.clone(), vec![AgentCapability::Read, AgentCapability::Search], parallel.clone(), focused.clone(), &["findings", "evidence"], evidence_producer()),
+                role("comparator", "Compare simulation candidates without treating them as observed facts.", direct.clone(), vec![AgentCapability::Read], fixed.clone(), single.clone(), &["summary", "evidence", "unresolved"], terminal_reducer()),
             ],
             vec![TeamRoleDependency { from_role_id: "scenario".to_string(), to_role_id: "comparator".to_string() }],
             result(&["summary", "evidence", "unresolved"]),
@@ -521,6 +584,7 @@ fn additional_builtin_team_manifests(
                     parallel,
                     focused,
                     &["checkpoint", "evidence", "unresolved"],
+                    evidence_producer(),
                 ),
                 role(
                     "coordinator",
@@ -530,6 +594,7 @@ fn additional_builtin_team_manifests(
                     fixed,
                     single,
                     &["summary", "evidence", "unresolved"],
+                    terminal_reducer(),
                 ),
             ],
             vec![TeamRoleDependency {
@@ -590,6 +655,7 @@ mod tests {
             agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
             cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
             partition: RolePartitionPolicy::Single,
+            behavior: vec![RoleBehaviorFacet::ReacquireEvidence { required: true }],
             grant_ceiling: vec![
                 AgentCapability::Read,
                 AgentCapability::Write,
@@ -607,6 +673,7 @@ mod tests {
         assert_eq!(english.agent_selector, chinese.agent_selector);
         assert_eq!(english.cardinality, chinese.cardinality);
         assert_eq!(english.partition, chinese.partition);
+        assert_eq!(english.behavior, chinese.behavior);
         assert_eq!(english.grant_ceiling, chinese.grant_ceiling);
         assert_eq!(english.task_contract, chinese.task_contract);
         assert_ne!(english.responsibility, chinese.responsibility);

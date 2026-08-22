@@ -29,7 +29,7 @@ pub enum TerminalFactKind {
 }
 
 /// Effect-derived acceptance evaluation with durable digest identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AcceptanceEvaluation {
     pub evaluator_revision: u64,
     pub contract_digest: String,

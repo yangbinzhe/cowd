@@ -246,7 +246,7 @@ run_release() {
     run_step clean_tmp bash scripts/release/clean-build-artifacts.sh --tmp
   fi
   run_step cargo_fmt cargo fmt --check
-  run_step cargo_build_debug cargo build -p cli --features full
+  run_step cargo_build_debug cargo build -p cli --features full -p managed-worker-launcher
   run_step install_debug bash -lc 'scripts/release/install-debug-to-ai.sh --current --print-path-only | tee "$0"' "$INSTALL_DIR_FILE"
   local install_dir
   install_dir="$(cat "$INSTALL_DIR_FILE")"

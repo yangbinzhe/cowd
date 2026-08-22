@@ -780,7 +780,6 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             execution_budget: harness_contract::context::ParentExecutionBudget::new(
                 format!("harness-eval-budget:{team_id}"),
                 65_536,
-                65_536 * 75,
                 deadline_at_ms,
                 32,
                 1,

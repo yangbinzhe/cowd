@@ -1416,7 +1416,6 @@ pub(crate) fn new_api_session_record(session_id: &str, model: Option<String>) ->
         metadata_json: Some(serde_json::json!({ "title": title }).to_string()),
         input_tokens: 0,
         output_tokens: 0,
-        estimated_cost_usd: 0.0,
         status: "active".to_string(),
     }
 }
@@ -4286,9 +4285,7 @@ pub(crate) mod tests {
                                 "execution_budget": {
                                     "budget_id": "mission-route-team-budget",
                                     "predicted_tokens": 32768,
-                                    "predicted_cost_microusd": 2457600,
                                     "max_tokens": 65536,
-                                    "max_cost_microusd": 4915200,
                                     "deadline_at_ms": u64::MAX,
                                     "max_parallel": 4,
                                     "revision": 1

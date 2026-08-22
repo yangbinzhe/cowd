@@ -360,6 +360,10 @@ pub(crate) fn terminal_working_state_event(
         return None;
     }
     let binding = packet.binding.as_ref()?;
+    // A terminal Team projection must be fenced to the role fragment frozen
+    // with the Team binding.  Node ids and string constraints are not an
+    // execution-time source of role semantics.
+    let role = packet.team_role_assignment()?;
     let (kind, summary, confidence_milli) = match status {
         ExecutionNodeStatus::Completed => {
             let semantic_summary = result
@@ -423,21 +427,17 @@ pub(crate) fn terminal_working_state_event(
     if status == ExecutionNodeStatus::Completed && refs.is_empty() {
         return None;
     }
-    let focus_boundary = packet_constraint(&packet, "focus_boundary:")
-        .unwrap_or_else(|| "role-local semantic result".to_string());
     let entry = TeamWorkingStateEntry {
         entry_id: format!("{}:{}:{}", graph.id, node_id, graph.revision),
         team_id: team_id.to_string(),
         graph_id: graph.id.clone(),
         node_id: node_id.to_string(),
         producer_instance_id: binding.instance.instance_id.clone(),
-        role_id: packet_constraint(&packet, "team_role:"),
-        focus_id: packet_constraint(&packet, "focus_partition:"),
-        focus_scope_hash: packet_constraint(&packet, "focus_scope_hash:"),
-        overlap_budget_bp: packet_constraint(&packet, "focus_overlap_budget_bp:")
-            .and_then(|value| value.parse::<u16>().ok()),
-        novelty_target_bp: packet_constraint(&packet, "focus_novelty_target_bp:")
-            .and_then(|value| value.parse::<u16>().ok()),
+        role_id: Some(role.identity.role_id.clone()),
+        focus_id: Some(role.identity.focus_id.clone()),
+        focus_scope_hash: Some(role.identity.focus_scope_hash.clone()),
+        overlap_budget_bp: Some(role.identity.overlap_budget_bp),
+        novelty_target_bp: Some(role.identity.novelty_target_bp),
         focus_resource_scopes: packet
             .resource_scopes
             .iter()
@@ -462,7 +462,8 @@ pub(crate) fn terminal_working_state_event(
         refs,
         artifact_refs: Vec::new(),
         boundary: format!(
-            "{focus_boundary}; runtime-terminal-projection; no raw chain-of-thought or raw tool output"
+            "{}; runtime-terminal-projection; no raw chain-of-thought or raw tool output",
+            role.identity.focus_boundary
         ),
         confidence_milli,
         graph_revision: graph.revision,
@@ -581,16 +582,6 @@ fn resource_scopes_overlap(left: &str, right: &str) -> bool {
                 .is_some_and(|suffix| suffix.starts_with('/'))
     };
     contains(&left, &right) || contains(&right, &left)
-}
-
-fn packet_constraint(packet: &AgentTaskPacket, prefix: &str) -> Option<String> {
-    packet
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix(prefix))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 #[cfg(test)]

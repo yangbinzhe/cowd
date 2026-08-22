@@ -52,9 +52,7 @@ impl ApprovalRouter {
         let non_blocking_background = !blocks_execution
             && matches!(
                 domain,
-                ApprovalDomain::Knowledge
-                    | ApprovalDomain::Evolution
-                    | ApprovalDomain::Skill
+                ApprovalDomain::Knowledge | ApprovalDomain::Evolution | ApprovalDomain::Skill
             );
         match profile {
             AutonomyProfileId::Cautious | AutonomyProfileId::Supervised => {
@@ -101,7 +99,12 @@ mod tests {
             ApprovalDomain::Evolution,
             ApprovalDomain::Skill,
         ] {
-            for risk in [TaskRisk::Low, TaskRisk::Medium, TaskRisk::High, TaskRisk::Critical] {
+            for risk in [
+                TaskRisk::Low,
+                TaskRisk::Medium,
+                TaskRisk::High,
+                TaskRisk::Critical,
+            ] {
                 assert_eq!(
                     resolve(AutonomyProfileId::Yolo, domain, risk, true),
                     ApprovalDecision::AutoApprove,
@@ -114,7 +117,12 @@ mod tests {
     #[test]
     fn autonomous_auto_approves_with_audit() {
         assert_eq!(
-            resolve(AutonomyProfileId::Autonomous, ApprovalDomain::Execution, TaskRisk::Critical, true),
+            resolve(
+                AutonomyProfileId::Autonomous,
+                ApprovalDomain::Execution,
+                TaskRisk::Critical,
+                true
+            ),
             ApprovalDecision::AutoApprove
         );
         assert_eq!(
@@ -131,11 +139,21 @@ mod tests {
     #[test]
     fn stewarded_uses_steward_for_medium_work() {
         assert_eq!(
-            resolve(AutonomyProfileId::Stewarded, ApprovalDomain::Execution, TaskRisk::Medium, true),
+            resolve(
+                AutonomyProfileId::Stewarded,
+                ApprovalDomain::Execution,
+                TaskRisk::Medium,
+                true
+            ),
             ApprovalDecision::StewardApprove
         );
         assert_eq!(
-            resolve(AutonomyProfileId::Stewarded, ApprovalDomain::Execution, TaskRisk::High, true),
+            resolve(
+                AutonomyProfileId::Stewarded,
+                ApprovalDomain::Execution,
+                TaskRisk::High,
+                true
+            ),
             ApprovalDecision::Human
         );
     }
@@ -143,11 +161,21 @@ mod tests {
     #[test]
     fn supervised_keeps_human_for_medium_and_up() {
         assert_eq!(
-            resolve(AutonomyProfileId::Supervised, ApprovalDomain::Execution, TaskRisk::Low, true),
+            resolve(
+                AutonomyProfileId::Supervised,
+                ApprovalDomain::Execution,
+                TaskRisk::Low,
+                true
+            ),
             ApprovalDecision::AutoApprove
         );
         assert_eq!(
-            resolve(AutonomyProfileId::Supervised, ApprovalDomain::Execution, TaskRisk::Medium, true),
+            resolve(
+                AutonomyProfileId::Supervised,
+                ApprovalDomain::Execution,
+                TaskRisk::Medium,
+                true
+            ),
             ApprovalDecision::Human
         );
     }

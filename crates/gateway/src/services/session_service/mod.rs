@@ -596,7 +596,6 @@ impl SessionService {
             metadata_json: Some(serde_json::Value::Object(metadata).to_string()),
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
         self.kernel()
@@ -815,7 +814,6 @@ impl SessionService {
             metadata_json: Some(metadata.to_string()),
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
         let created_at_ms = now.timestamp_millis().max(0) as u64;
@@ -3300,7 +3298,6 @@ mod tests {
             metadata_json: Some(metadata.to_string()),
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         }
     }

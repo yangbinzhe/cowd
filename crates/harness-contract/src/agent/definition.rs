@@ -750,6 +750,17 @@ impl AgentBindingSnapshot {
                     .to_string(),
             });
         }
+        if let Some(team_role_identity) = &intent.team_role_identity {
+            team_role_identity
+                .validate()
+                .map_err(|message| ValidationError::InvalidContract {
+                    message: message.to_string(),
+                })?;
+        } else if intent.team_id.is_some() {
+            return Err(ValidationError::InvalidContract {
+                message: "Team Agent intent requires a typed Team role identity".to_string(),
+            });
+        }
         if let Some(managed_invocation) = &intent.managed_invocation {
             managed_invocation.validate()?;
         }
@@ -767,15 +778,16 @@ impl AgentBindingSnapshot {
             }
             intent.required_acceptance.clone()
         };
+        let team_role_identity = intent.team_role_identity.clone();
         let assignment = super::AgentAssignment {
             execution_identity,
             definition_ref: self.definition_ref.clone(),
             instance_id: self.instance.instance_id.clone(),
             run_id: intent.run_id,
-            role_id: self
-                .instance
-                .role_slot_id
-                .clone()
+            role_id: team_role_identity
+                .as_ref()
+                .map(|identity| identity.role_id.clone())
+                .or_else(|| self.instance.role_slot_id.clone())
                 .unwrap_or_else(|| "agent".to_string()),
             task_id: intent.task_id,
             root_task_id: intent.root_task_id,
@@ -795,6 +807,8 @@ impl AgentBindingSnapshot {
             objective: intent.objective,
             required_acceptance,
             output_acceptance: intent.output_acceptance,
+            team_role_identity,
+            team_role: None,
             acceptance: intent.acceptance,
             constraints: intent.constraints,
             context_refs: intent.context_refs,

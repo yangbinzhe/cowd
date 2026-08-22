@@ -43,7 +43,6 @@ fn request(template_id: &str, mission_id: &str) -> TeamInstantiationRequest {
         execution_budget: harness_contract::context::ParentExecutionBudget::new(
             "team-instantiation-budget",
             65_536,
-            4_915_200,
             u64::MAX,
             32,
             1,
@@ -218,8 +217,7 @@ fn whole_workspace_scope_requires_the_full_trust_flag_and_plans_when_granted() {
         "cowd/execute-review",
         services.mission_runtime().default_mission_id(),
     );
-    request.permission_ceiling =
-        harness_contract::policy::PermissionMode::DangerFullAccess;
+    request.permission_ceiling = harness_contract::policy::PermissionMode::DangerFullAccess;
     request.resource_scopes = vec![
         "write:.".to_string(),
         "session:session-team-instantiation".to_string(),

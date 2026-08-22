@@ -1069,8 +1069,7 @@ fn run_glob_search(lease: &ToolHostLease, input: GlobSearchInputValue) -> Result
     let fingerprint = scope_fingerprint(lease.path_policy(), Some(resolved_path))?;
     let scope = directory_cache_scope(lease.path_policy(), Some(resolved_path))?;
     cached_json_tool(lease, "glob_search", &input, &fingerprint, &scope, || {
-        glob_search(lease.path_policy(), &input.pattern, Some(resolved_path))
-            .map_err(io_to_string)
+        glob_search(lease.path_policy(), &input.pattern, Some(resolved_path)).map_err(io_to_string)
     })
 }
 

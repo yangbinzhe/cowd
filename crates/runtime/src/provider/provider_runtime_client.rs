@@ -1779,17 +1779,17 @@ mod tests {
             CapabilityState::Unsupported
         );
         assert_eq!(
-            provider_tool_choice(
-                true,
-                true,
-                non_thinking.supports_explicit_tool_choice.state
-            )
-            .unwrap(),
+            provider_tool_choice(true, true, non_thinking.supports_explicit_tool_choice.state)
+                .unwrap(),
             None
         );
         assert_eq!(
-            provider_tool_choice(true, false, non_thinking.supports_explicit_tool_choice.state)
-                .unwrap(),
+            provider_tool_choice(
+                true,
+                false,
+                non_thinking.supports_explicit_tool_choice.state
+            )
+            .unwrap(),
             None
         );
     }

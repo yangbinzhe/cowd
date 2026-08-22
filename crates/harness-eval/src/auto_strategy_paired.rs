@@ -25,13 +25,12 @@ use crate::{measurement::start_first_delta_observer, session_actor::SessionActor
 
 pub const AUTO_STRATEGY_SEED: u64 = 20_260_716;
 pub const DEFAULT_MAX_TOKENS: u64 = 20_000_000;
-pub const DEFAULT_MAX_COST_USD_MILLI: u64 = 50_000;
 const BUSINESS_SAMPLE_TOKEN_LEASE: u64 = 128_000;
 const JUDGE_SAMPLE_TOKEN_LEASE: u64 = 32_000;
 const DEFAULT_CONDITION_CONCURRENCY: usize = 2;
 const TERMINAL_MESSAGE_VISIBILITY_GRACE: Duration = Duration::from_secs(5);
 const FROZEN_CORPUS_SHA256: &str =
-    "d8dc4ba671dacd7a12b41d0cbe17d1cb4f2d5f5055cb2b9e7cefab2bb8c22e3c";
+    "bba811f8b24d5d2b1e4d5f1d91b9622200606c34d271c7e9df3fe1a02a95a226";
 const FROZEN_RUBRIC_SHA256: &str =
     "3c2672ad0038c5b63abc6d6f724380d3a339e5921559dcb0b5c39e1a63039eba";
 
@@ -141,10 +140,7 @@ struct Sample {
     input_tokens: u64,
     output_tokens: u64,
     cached_tokens: u64,
-    cost_usd_milli: u64,
     usage_observed: bool,
-    cost_observed: bool,
-    cost_source: Option<String>,
     selected_candidate: Option<String>,
     models_used: Vec<String>,
     duplicate_tool_calls: u64,
@@ -181,9 +177,7 @@ struct Sample {
 #[derive(Debug, Clone, Copy, Default)]
 struct JudgeUsage {
     tokens: u64,
-    cost_usd_milli: u64,
     usage_observed: bool,
-    cost_observed: bool,
 }
 
 pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Value, String> {
@@ -209,10 +203,6 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         }
     }
     let max_tokens = lowered_budget("COWD_AUTO_STRATEGY_MAX_TOKENS", DEFAULT_MAX_TOKENS)?;
-    let max_cost_usd_milli = lowered_budget(
-        "COWD_AUTO_STRATEGY_MAX_COST_USD_MILLI",
-        DEFAULT_MAX_COST_USD_MILLI,
-    )?;
     let business_sample_token_lease = lowered_budget(
         "COWD_AUTO_STRATEGY_BUSINESS_SAMPLE_TOKEN_LEASE",
         BUSINESS_SAMPLE_TOKEN_LEASE,
@@ -251,8 +241,8 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "timeout_ms": u64::try_from(options.timeout.as_millis()).unwrap_or(u64::MAX),
         "poll_interval_ms": u64::try_from(options.poll_interval.as_millis()).unwrap_or(u64::MAX),
         "token_budget": max_tokens,
-        "cost_budget_usd_milli": max_cost_usd_milli,
         "business_sample_token_lease": business_sample_token_lease,
+        "business_sample_token_policy": "frozen-topology multiplier: direct=1, parallel_tools=2, team=4; paired conditions share the task envelope",
         "judge_sample_token_lease": judge_sample_token_lease,
         "condition_concurrency": condition_concurrency,
     });
@@ -278,8 +268,8 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         "warmup_per_task": 1,
         "order": "fixed Latin rotation by task index and repetition",
         "token_budget": max_tokens,
-        "cost_budget_usd_milli": max_cost_usd_milli,
         "business_sample_token_lease": business_sample_token_lease,
+        "business_sample_token_policy": "frozen-topology multiplier: direct=1, parallel_tools=2, team=4; paired conditions share the task envelope",
         "judge_sample_token_lease": judge_sample_token_lease,
         "condition_concurrency": condition_concurrency,
         "all_failures_retained": true,
@@ -332,7 +322,6 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut samples = Vec::new();
     let mut total_tokens = 0_u64;
-    let mut total_cost = 0_u64;
     let mut budget_observation_complete = true;
     let mut budget_stopped = false;
     let mut execution_isolation_stopped = false;
@@ -364,10 +353,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                         )
                     })
                     .collect::<Vec<_>>()
-            } else if budget_stopped
-                || total_tokens >= max_tokens
-                || total_cost >= max_cost_usd_milli
-            {
+            } else if budget_stopped || total_tokens >= max_tokens {
                 budget_stopped = true;
                 order
                     .iter()
@@ -382,8 +368,6 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                             condition,
                             total_tokens,
                             max_tokens,
-                            total_cost,
-                            max_cost_usd_milli,
                         )
                     })
                     .collect::<Vec<_>>()
@@ -394,11 +378,18 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                 // Provider 账户排队时无限占用评测样本的 900 秒业务租约。
                 // 预算按整组均分后预留，避免并发请求超卖全局硬上限。
                 let condition_count = u64::try_from(order.len()).unwrap_or(1).max(1);
+                // A Team task has a root orchestration turn plus independent
+                // child and synthesis turns.  Giving every frozen task the
+                // same small fixed lease makes a successful evidence-gathering
+                // run fail at its final synthesis merely because its topology
+                // needed more turns.  Predict the technical capacity from the
+                // frozen task topology, while giving its Direct / Parallel /
+                // Auto conditions the *same* lease for a fair comparison.
+                let expected_sample_token_limit =
+                    topology_aware_sample_token_lease(task, business_sample_token_lease);
                 let sample_token_limit = provider_admission_token_limit(
-                    &options.provider,
                     max_tokens.saturating_sub(total_tokens) / condition_count,
-                    max_cost_usd_milli.saturating_sub(total_cost) / condition_count,
-                    business_sample_token_lease,
+                    expected_sample_token_limit,
                 );
                 let Some(sample_token_limit) = sample_token_limit else {
                     budget_stopped = true;
@@ -412,8 +403,6 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                                 condition,
                                 total_tokens,
                                 max_tokens,
-                                total_cost,
-                                max_cost_usd_milli,
                             )
                         },
                     ));
@@ -482,30 +471,30 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                     .saturating_add(sample.input_tokens)
                     .saturating_add(sample.output_tokens)
                     .saturating_add(sample.cached_tokens);
-                total_cost = total_cost.saturating_add(sample.cost_usd_milli);
                 budget_observation_complete &= sample.usage_observed
-                    && sample.cost_observed
                     && sample.evaluation_budget_observed
                     && !sample.evaluation_budget_breached
-                    && sample.evaluation_token_limit == business_sample_token_lease
+                    && sample_uses_expected_business_lease(
+                        &corpus,
+                        sample,
+                        business_sample_token_lease,
+                    )
                     && sample.evaluation_tokens_consumed
                         == sample
                             .input_tokens
                             .saturating_add(sample.output_tokens)
                             .saturating_add(sample.cached_tokens);
-                if total_tokens > max_tokens || total_cost > max_cost_usd_milli {
+                if total_tokens > max_tokens {
                     budget_stopped = true;
                     sample.status = "budget_exceeded".to_string();
                     sample.error = Some(format!(
-                        "fail-closed budget exceeded tokens={total_tokens}/{max_tokens} cost_milli={total_cost}/{max_cost_usd_milli}"
+                        "technical token capacity exceeded tokens={total_tokens}/{max_tokens}"
                     ));
                 }
             }
             if !warmup && !budget_stopped && !execution_isolation_stopped {
                 if let Some(judge_token_limit) = provider_admission_token_limit(
-                    &options.judge_model,
                     max_tokens.saturating_sub(total_tokens),
-                    max_cost_usd_milli.saturating_sub(total_cost),
                     judge_sample_token_lease,
                 ) {
                     let judge_usage = apply_blind_judge(
@@ -518,16 +507,14 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
                         judge_token_limit,
                     );
                     total_tokens = total_tokens.saturating_add(judge_usage.tokens);
-                    total_cost = total_cost.saturating_add(judge_usage.cost_usd_milli);
-                    budget_observation_complete &=
-                        judge_usage.usage_observed && judge_usage.cost_observed;
+                    budget_observation_complete &= judge_usage.usage_observed;
                 } else {
                     budget_stopped = true;
                     for sample in &mut group {
                         sample.judge = json!({
                             "judge_run_status": "budget_not_run",
                             "judge_error": format!(
-                                "judge admission reservation unavailable tokens={total_tokens}/{max_tokens} cost_milli={total_cost}/{max_cost_usd_milli}"
+                                "judge admission reservation unavailable tokens={total_tokens}/{max_tokens}"
                             ),
                             "raw": null,
                             "judge_isolation_verified": false,
@@ -552,9 +539,7 @@ pub fn run_auto_strategy_paired(options: AutoStrategyPairedOptions) -> Result<Va
         samples,
         provenance,
         total_tokens,
-        total_cost,
         max_tokens,
-        max_cost_usd_milli,
         options.repetitions,
         budget_observation_complete,
         business_sample_token_lease,
@@ -723,27 +708,36 @@ fn parse_condition_concurrency(configured: Option<&str>) -> Result<usize, String
     Ok(concurrency)
 }
 
-fn provider_admission_token_limit(
-    model: &str,
-    remaining_tokens: u64,
-    remaining_cost_usd_milli: u64,
-    requested_limit: u64,
-) -> Option<u64> {
-    if remaining_tokens < requested_limit {
-        return None;
-    }
-    let pricing = model_protocol::model_registry::pricing_for_model(model)?;
-    let maximum_rate = pricing
-        .input_cost_per_million
-        .max(pricing.output_cost_per_million)
-        .max(pricing.cache_creation_cost_per_million)
-        .max(pricing.cache_read_cost_per_million);
-    if !maximum_rate.is_finite() || maximum_rate < 0.0 {
-        return None;
-    }
-    // USD per million tokens -> milli-USD for `requested_limit`.
-    let reserved_cost = ((requested_limit as f64 * maximum_rate) / 1_000.0).ceil() as u64;
-    (remaining_cost_usd_milli >= reserved_cost).then_some(requested_limit)
+fn provider_admission_token_limit(remaining_tokens: u64, requested_limit: u64) -> Option<u64> {
+    (remaining_tokens >= requested_limit).then_some(requested_limit)
+}
+
+/// Select a technical capacity envelope from the *declared execution
+/// topology*, not from model pricing or a guessed quality score.  It is an
+/// admission prediction: actual provider usage is still metered and remains
+/// bounded by the returned lease.  Conditions for the same task receive the
+/// same envelope, so the paired comparison stays fair.
+fn topology_aware_sample_token_lease(task: &AutoStrategyTask, base_lease: u64) -> u64 {
+    let multiplier = match task.expected_candidate.as_str() {
+        "team" => 4,
+        "parallel_tools" => 2,
+        _ => 1,
+    };
+    base_lease.saturating_mul(multiplier)
+}
+
+fn sample_uses_expected_business_lease(
+    corpus: &AutoStrategyCorpus,
+    sample: &Sample,
+    base_lease: u64,
+) -> bool {
+    corpus
+        .tasks
+        .iter()
+        .find(|task| task.task_id == sample.task_id)
+        .is_some_and(|task| {
+            sample.evaluation_token_limit == topology_aware_sample_token_lease(task, base_lease)
+        })
 }
 
 fn preregistered_schedule(corpus: &AutoStrategyCorpus, repetitions: usize) -> Value {
@@ -817,10 +811,7 @@ fn sample_shell(
         input_tokens: 0,
         output_tokens: 0,
         cached_tokens: 0,
-        cost_usd_milli: 0,
         usage_observed: false,
-        cost_observed: false,
-        cost_source: None,
         selected_candidate: None,
         models_used: Vec::new(),
         duplicate_tool_calls: 0,
@@ -864,13 +855,11 @@ fn budget_not_run_sample(
     condition: Condition,
     total_tokens: u64,
     max_tokens: u64,
-    total_cost: u64,
-    max_cost: u64,
 ) -> Sample {
     let mut sample = sample_shell(task, repetition, warmup, order_index, condition);
     sample.status = "budget_not_run".to_string();
     sample.error = Some(format!(
-        "hard budget stopped provider admission tokens={total_tokens}/{max_tokens} cost_milli={total_cost}/{max_cost}"
+        "technical token capacity stopped provider admission tokens={total_tokens}/{max_tokens}"
     ));
     sample
 }
@@ -1401,7 +1390,6 @@ fn run_sample(
             sample.usage_observed = sample.input_tokens > 0 || sample.output_tokens > 0;
         }
     }
-    apply_observed_cost(&mut sample, &options.provider);
     if let Some(prepared) = prepared_mutation.as_ref() {
         match verify_mutation_fixture(prepared) {
             Ok(changed) => {
@@ -1684,7 +1672,6 @@ fn apply_blind_judge(
     let mut judge_attempts = Vec::new();
     let mut judge_usage = JudgeUsage {
         usage_observed: true,
-        cost_observed: true,
         ..JudgeUsage::default()
     };
     let mut final_judge = None;
@@ -1722,11 +1709,7 @@ fn apply_blind_judge(
             judge_attempt_isolated(&judge, parsed.as_ref(), &options.judge_model, attempt_limit);
         let known_zero_usage = zero_provider_usage_proven(&judge, consumed);
         judge_usage.tokens = judge_usage.tokens.saturating_add(consumed);
-        judge_usage.cost_usd_milli = judge_usage
-            .cost_usd_milli
-            .saturating_add(judge.cost_usd_milli);
         judge_usage.usage_observed &= judge.usage_observed || known_zero_usage;
-        judge_usage.cost_observed &= judge.cost_observed || known_zero_usage;
         remaining_tokens = remaining_tokens.saturating_sub(consumed);
         judge_attempts.push(json!({
             "attempt": attempt,
@@ -1824,7 +1807,7 @@ fn apply_blind_judge(
 /// A governed Judge attempt may terminate before dispatching any provider
 /// request. That is a known zero, not missing usage, only when the complete
 /// Runtime projection and evaluation lease independently agree that no model
-/// ran and no token/cost was consumed. Failed polling or a partial projection
+/// ran and no token was consumed. Failed polling or a partial projection
 /// remains unobserved and therefore fail-closed.
 fn zero_provider_usage_proven(sample: &Sample, consumed: u64) -> bool {
     let Some(nodes) = sample
@@ -1838,7 +1821,6 @@ fn zero_provider_usage_proven(sample: &Sample, consumed: u64) -> bool {
         && sample.input_tokens == 0
         && sample.output_tokens == 0
         && sample.cached_tokens == 0
-        && sample.cost_usd_milli == 0
         && sample.models_used.is_empty()
         && sample.evaluation_control_observed
         && sample.evaluation_budget_observed
@@ -1927,9 +1909,7 @@ fn evaluate_samples(
     samples: Vec<Sample>,
     provenance: Value,
     total_tokens: u64,
-    total_cost: u64,
     max_tokens: u64,
-    max_cost: u64,
     repetitions: usize,
     budget_observation_complete: bool,
     business_sample_token_lease: u64,
@@ -2140,11 +2120,10 @@ fn evaluate_samples(
                 && sample.ttft_observed
                 && sample.critical_path_ms > 0
                 && sample.usage_observed
-                && sample.cost_observed
                 && sample.evaluation_control_observed
                 && sample.evaluation_budget_observed
                 && !sample.evaluation_budget_breached
-                && sample.evaluation_token_limit == business_sample_token_lease
+                && sample_uses_expected_business_lease(corpus, sample, business_sample_token_lease)
                 && sample.evaluation_tokens_consumed
                     == sample
                         .input_tokens
@@ -2208,7 +2187,7 @@ fn evaluate_samples(
         .all(|sample| {
             sample.evaluation_budget_observed
                 && !sample.evaluation_budget_breached
-                && sample.evaluation_token_limit == business_sample_token_lease
+                && sample_uses_expected_business_lease(corpus, sample, business_sample_token_lease)
                 && sample.evaluation_tokens_consumed
                     == sample
                         .input_tokens
@@ -2257,7 +2236,6 @@ fn evaluate_samples(
         && baseline_topology_isolation_gate
         && tool_topology_observation_gate
         && total_tokens <= max_tokens
-        && total_cost <= max_cost
         && channel_margin_ci
             .get("lower")
             .and_then(Value::as_i64)
@@ -2289,8 +2267,6 @@ fn evaluate_samples(
         "budget": {
             "tokens_used": total_tokens,
             "tokens_limit": max_tokens,
-            "cost_usd_milli_used": total_cost,
-            "cost_usd_milli_limit": max_cost,
             "judge_included": budget_observation_complete,
             "observation_complete": budget_observation_complete,
         },
@@ -2701,34 +2677,6 @@ fn binomial_coefficient(n: usize, k: usize) -> u128 {
     })
 }
 
-fn apply_observed_cost(sample: &mut Sample, requested_model: &str) {
-    if !sample.usage_observed || !exact_model_revisions(&sample.models_used, requested_model) {
-        return;
-    }
-    let Some(pricing) = model_protocol::model_registry::pricing_for_model(requested_model) else {
-        return;
-    };
-    // Cache counters are combined in the execution projection. Charge every
-    // cached token at the more expensive cache rate, making the hard budget a
-    // conservative upper bound rather than an optimistic estimate.
-    let cached_rate = pricing
-        .cache_creation_cost_per_million
-        .max(pricing.cache_read_cost_per_million);
-    let cost_usd_milli = ((sample.input_tokens as f64 * pricing.input_cost_per_million
-        + sample.output_tokens as f64 * pricing.output_cost_per_million
-        + sample.cached_tokens as f64 * cached_rate)
-        / 1_000.0)
-        .ceil();
-    if !cost_usd_milli.is_finite() || cost_usd_milli < 0.0 {
-        return;
-    }
-    sample.cost_usd_milli = cost_usd_milli as u64;
-    sample.cost_observed = true;
-    sample.cost_source = Some(
-        "model-registry pricing over observed tokens; cached tokens upper-bounded".to_string(),
-    );
-}
-
 fn exact_model_revisions(observed: &[String], requested: &str) -> bool {
     !observed.is_empty() && observed.iter().all(|model| model == requested)
 }
@@ -2819,6 +2767,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn checked_in_frozen_assets_match_the_registered_digests() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (_, corpus_digest) = load_corpus(&root.join("corpora/auto-strategy-v1.json"))
+            .expect("read checked-in auto strategy corpus");
+        let (_, rubric_digest) = load_rubric(&root.join("rubrics/auto-strategy-rubric-v1.json"))
+            .expect("read checked-in auto strategy rubric");
+
+        assert_eq!(corpus_digest, FROZEN_CORPUS_SHA256);
+        assert_eq!(rubric_digest, FROZEN_RUBRIC_SHA256);
+    }
+
+    #[test]
     fn latin_schedule_is_stable_and_balanced() {
         assert_eq!(
             condition_order(0, 0),
@@ -2835,28 +2795,47 @@ mod tests {
     }
 
     #[test]
-    fn hard_budgets_can_only_be_lowered() {
+    fn technical_token_capacity_can_only_be_lowered() {
         assert!(DEFAULT_MAX_TOKENS == 20_000_000);
-        assert!(DEFAULT_MAX_COST_USD_MILLI == 50_000);
         assert_eq!(
             provider_admission_token_limit(
-                "claude-opus-4-6",
                 BUSINESS_SAMPLE_TOKEN_LEASE.saturating_sub(1),
-                DEFAULT_MAX_COST_USD_MILLI,
                 BUSINESS_SAMPLE_TOKEN_LEASE,
             ),
             None,
             "a tiny remaining token budget must produce zero provider admission"
         );
         assert_eq!(
-            provider_admission_token_limit(
-                "claude-opus-4-6",
-                DEFAULT_MAX_TOKENS,
-                0,
-                BUSINESS_SAMPLE_TOKEN_LEASE,
-            ),
-            None,
-            "a zero remaining cost budget must produce zero provider admission"
+            provider_admission_token_limit(DEFAULT_MAX_TOKENS, BUSINESS_SAMPLE_TOKEN_LEASE,),
+            Some(BUSINESS_SAMPLE_TOKEN_LEASE),
+            "technical admission only depends on the remaining token capacity"
+        );
+    }
+
+    #[test]
+    fn sample_capacity_tracks_frozen_topology_without_biasing_conditions() {
+        let task = |expected_candidate: &str| AutoStrategyTask {
+            task_id: expected_candidate.to_string(),
+            expected_candidate: expected_candidate.to_string(),
+            prompt: "fixture".to_string(),
+            acceptance: vec!["fixture".to_string()],
+            workspace_fixture: "fixture".to_string(),
+            provider_constraint: "normal".to_string(),
+            mutation_fixture: None,
+            judge_only: false,
+        };
+
+        assert_eq!(
+            topology_aware_sample_token_lease(&task("direct"), BUSINESS_SAMPLE_TOKEN_LEASE),
+            BUSINESS_SAMPLE_TOKEN_LEASE
+        );
+        assert_eq!(
+            topology_aware_sample_token_lease(&task("parallel_tools"), BUSINESS_SAMPLE_TOKEN_LEASE,),
+            BUSINESS_SAMPLE_TOKEN_LEASE.saturating_mul(2)
+        );
+        assert_eq!(
+            topology_aware_sample_token_lease(&task("team"), BUSINESS_SAMPLE_TOKEN_LEASE),
+            BUSINESS_SAMPLE_TOKEN_LEASE.saturating_mul(4)
         );
     }
 

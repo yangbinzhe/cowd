@@ -1610,13 +1610,12 @@ impl RuntimeServices {
                     .ok()
                     .and_then(|map| map.get(session_id).cloned())
                     .map(|control| control.snapshot())
-            }) as Arc<
-                dyn Fn(
-                        &str,
-                    ) -> Option<harness_contract::policy::SessionExecutionPolicy>
-                    + Send
-                    + Sync,
-            >
+            })
+                as Arc<
+                    dyn Fn(&str) -> Option<harness_contract::policy::SessionExecutionPolicy>
+                        + Send
+                        + Sync,
+                >
         };
         let l4_promotion_service = Arc::new(crate::L4PromotionService::new(
             Arc::clone(&event_store),
@@ -4895,6 +4894,7 @@ impl RuntimeServices {
             attempt: 1,
             expected_graph_revision: 0,
             objective: scenario.objective.clone(),
+            team_role_identity: None,
             required_acceptance: harness_contract::context::RequiredAcceptance {
                 criteria: scenario.acceptance.clone(),
                 evidence_obligations: Vec::new(),
@@ -4917,7 +4917,6 @@ impl RuntimeServices {
                 run_id.clone(),
                 "evolution_evaluation",
                 65_536,
-                4_915_200,
                 deadline_at_ms,
                 1,
             ),
@@ -5008,6 +5007,14 @@ impl RuntimeServices {
         &self,
     ) -> Result<ExecutionStartupRecoveryReport, RuntimeServicesError> {
         self.ensure_mutation_allowed()?;
+        // A Team graph is not runnable until its frozen Binding and every
+        // inherited Task link are durably closed.  Finish that exact marker
+        // set before the ordinary graph recovery pump sees the graph; this
+        // closes the register→link crash window without adding a scheduler or
+        // rebuilding Team topology from mutable definitions.
+        self.team_runtime
+            .reconcile_preparing_bindings_on_startup(256)
+            .map_err(RuntimeServicesError::Mission)?;
         let mut managed_dispositions = BTreeMap::new();
         for invocation in self
             .managed_agents
@@ -6101,6 +6108,7 @@ impl RuntimeServices {
                     attempt: u32::from(invocation.attempt_no),
                     expected_graph_revision: 0,
                     objective: definition.objective.clone(),
+                    team_role_identity: None,
                     required_acceptance: harness_contract::context::RequiredAcceptance {
                         criteria: definition.acceptance.clone(),
                         evidence_obligations: Vec::new(),
@@ -6127,7 +6135,6 @@ impl RuntimeServices {
                         run_id.clone(),
                         "managed_agent",
                         65_536,
-                        4_915_200,
                         deadline_at_ms,
                         1,
                     ),
@@ -7953,6 +7960,76 @@ mod tests {
                 "artifact://art_runtime_services_packet",
                 format!("session:{}", packet.session_id()),
             ));
+            let mut evidence_obligations = packet
+                .required_acceptance
+                .evidence_obligations
+                .iter()
+                .collect::<Vec<_>>();
+            // Canonical ToolHost receipts are causally ordered: a committed
+            // write necessarily precedes its exact verification read. The
+            // test backend must preserve that invariant instead of inheriting
+            // an incidental lexical obligation order.
+            evidence_obligations.sort_by_key(|obligation| match obligation.kind {
+                harness_contract::context::EvidenceObligationKind::WriteEffect => 0,
+                harness_contract::context::EvidenceObligationKind::VerifyAfterWrite => 1,
+                _ => 2,
+            });
+            let observed_evidence = evidence_obligations
+                .into_iter()
+                .enumerate()
+                .map(|(index, obligation)| {
+                    let mut target = obligation.target.clone();
+                    if let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
+                        &mut target
+                    {
+                        if scope.coverage
+                            == harness_contract::context::EvidenceCoverageKind::ScopedContent
+                        {
+                            scope.coverage =
+                                harness_contract::context::EvidenceCoverageKind::ExactContent;
+                        }
+                        if matches!(
+                            scope.coverage,
+                            harness_contract::context::EvidenceCoverageKind::ExactContent
+                                | harness_contract::context::EvidenceCoverageKind::WriteEffect
+                        ) && scope.path.observed_revision_or_digest.is_none()
+                        {
+                            scope.path.observed_revision_or_digest = Some("a".repeat(64));
+                        }
+                    }
+                    harness_contract::context::ObservedEvidence {
+                        obligation_id: obligation.obligation_id.clone(),
+                        target,
+                        observed_at_sequence: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                        tool_name: "test_runtime_evidence".to_string(),
+                        provenance:
+                            harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
+                        evidence_ref: None,
+                        workspace_prior_state: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let runtime_change_receipts = packet
+                .acceptance
+                .iter()
+                .any(|criterion| matches!(criterion.as_str(), "implementation" | "mitigation"))
+                .then(|| {
+                    vec![harness_contract::agent::AgentChangeReceipt {
+                        path: packet
+                            .resource_scopes
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "fixture.txt".to_string()),
+                        before_sha256: Some("b".repeat(64)),
+                        after_sha256: "a".repeat(64),
+                        write_sequence: 1,
+                    }]
+                })
+                .unwrap_or_default();
+            let changes = runtime_change_receipts
+                .iter()
+                .map(|receipt| receipt.path.clone())
+                .collect();
             Ok(AgentReturnPacket {
                 run_id: packet.run_id().to_string(),
                 agent_id: packet.agent_id().to_string(),
@@ -7974,13 +8051,14 @@ mod tests {
                 answer_candidate: None,
                 observed_acceptance: harness_contract::context::ObservedAcceptance {
                     satisfied_criteria: packet.acceptance.clone(),
-                    observed_evidence: Vec::new(),
+                    observed_evidence,
                     unresolved_obligation_ids: Vec::new(),
                 },
+                acceptance_evaluation: None,
                 acceptance: packet.acceptance,
                 evidence_refs,
-                changes: Vec::new(),
-                runtime_change_receipts: Vec::new(),
+                changes,
+                runtime_change_receipts,
                 conflicts: Vec::new(),
                 unresolved: Vec::new(),
                 input_tokens: 5,
@@ -8054,6 +8132,7 @@ mod tests {
                     observed_evidence: Vec::new(),
                     unresolved_obligation_ids: Vec::new(),
                 },
+                acceptance_evaluation: None,
                 acceptance: packet.acceptance,
                 evidence_refs,
                 changes: Vec::new(),
@@ -8663,7 +8742,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -9088,6 +9166,7 @@ mod tests {
             attempt: 1,
             expected_graph_revision: 0,
             objective: "complete one graph-owned agent task".into(),
+            team_role_identity: None,
             required_acceptance: harness_contract::context::RequiredAcceptance {
                 criteria: vec!["completed".into()],
                 evidence_obligations: Vec::new(),
@@ -9107,7 +9186,6 @@ mod tests {
                 "agent-runtime-agent",
                 "agent",
                 1000,
-                75_000,
                 u64::MAX,
                 1,
             ),
@@ -9247,12 +9325,16 @@ mod tests {
                 parent_task_id: Some("binding-root-task".to_string()),
                 session_id: "binding-session".to_string(),
                 mission_id: services.mission_runtime().default_mission_id().to_string(),
-                team_id: Some("binding-team".to_string()),
+                // This is a fan-out of independent root-level Agent work;
+                // it intentionally is not a Team binding and therefore must
+                // not claim a Team id without a frozen typed role identity.
+                team_id: None,
                 graph_id: graph.id.clone(),
                 node_id: node_id.clone(),
                 attempt: 1,
                 expected_graph_revision: 0,
                 objective: format!("research isolated domain {index}"),
+                team_role_identity: None,
                 required_acceptance: harness_contract::context::RequiredAcceptance {
                     criteria: vec!["evidence".to_string()],
                     evidence_obligations: Vec::new(),
@@ -9264,7 +9346,7 @@ mod tests {
                     },
                 }],
                 acceptance: vec!["evidence".to_string()],
-                constraints: vec![format!("role_slot:researcher-{index}")],
+                constraints: Vec::new(),
                 context_refs: Vec::new(),
                 evidence_refs: Vec::new(),
                 resource_scopes: vec![format!("read:binding-domain-{index}")],
@@ -9277,7 +9359,6 @@ mod tests {
                     agent_id,
                     "agent",
                     2_000,
-                    150_000,
                     u64::MAX,
                     1,
                 ),
@@ -9316,11 +9397,7 @@ mod tests {
                             if scopes == &packet.resource_scopes
                     )
                 });
-            let legacy_constraint_is_absent = packet
-                .constraints
-                .iter()
-                .all(|constraint| !constraint.starts_with("team_acceptance_contract:"));
-            typed_acceptance_matches_lease && legacy_constraint_is_absent
+            typed_acceptance_matches_lease && packet.constraints.is_empty()
         }));
         let agent_ids = packets
             .iter()
@@ -9359,7 +9436,7 @@ mod tests {
         assert!(bindings.iter().all(|binding| {
             binding.definition_ref.definition_id.as_str() == "builtin/cowd/direct"
                 && binding.definition_ref.revision == 1
-                && binding.data_lease.team_id.as_deref() == Some("binding-team")
+                && binding.data_lease.team_id.is_none()
         }));
         let instances = bindings
             .iter()
@@ -9609,6 +9686,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(workspace.join("crates")).unwrap();
+        std::fs::write(workspace.join("crates/runtime"), "fixture before\n").unwrap();
         let providers = crate::config::ProvidersConfig {
             providers: std::collections::HashMap::from([(
                 "test".into(),
@@ -9645,22 +9724,27 @@ mod tests {
             .await
             .expect("team execution");
 
-        assert_eq!(projection.status, "partial");
+        assert_eq!(projection.status, "completed");
         assert_eq!(projection.tasks.len(), 2);
         let terminal = projection.terminal_result.expect("one terminal result");
         assert!(
             terminal.result_ref.starts_with("delivery-envelope: "),
-            "a backend without an explicit validated AnswerCandidate must use the mechanical delivery envelope"
+            "a backend without an explicit validated AnswerCandidate must use the mechanical delivery envelope: {terminal:?}"
         );
         assert!(!terminal.evidence_refs.is_empty());
         let graph = services
             .graph_state_store()
             .load(&projection.graph_id)
             .expect("canonical graph");
-        assert!(graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::Completed));
+        assert!(
+            graph
+                .node_statuses
+                .values()
+                .all(|status| *status == ExecutionNodeStatus::Completed),
+            "deterministic Team backend must terminalize every node: statuses={:?}; results={:?}",
+            graph.node_statuses,
+            graph.node_results
+        );
         let team_bindings = graph
             .nodes
             .iter()
@@ -9733,7 +9817,7 @@ mod tests {
             "fast",
             services.mission_runtime().default_mission_id(),
         );
-        let instantiated = services
+        let mut instantiated = services
             .team_runtime()
             .plan(request.clone())
             .expect("team plan");
@@ -9749,17 +9833,22 @@ mod tests {
                 .is_some(),
             "root task must be durable before the crash window"
         );
+        services
+            .team_runtime()
+            .bind_instantiated_task_policies(&mut instantiated)
+            .expect("freeze inherited Task policy before durable Preparing marker");
         let registered = services
             .commit_service()
             .register_graph(instantiated.graph.clone())
             .expect("graph registered in crash window");
-        crate::team_binding::persist_preparing(
+        crate::team_binding::persist_preparing_with_task_commands(
             services.event_store(),
             &registered.graph.id,
             instantiated
                 .binding
                 .as_ref()
                 .expect("compiled Team Binding"),
+            &instantiated.task_commands,
         )
         .expect("preparing marker persisted");
         assert!(
@@ -9767,13 +9856,21 @@ mod tests {
                 .expect("ready marker read"),
             "crash window has Preparing but no Ready marker"
         );
+        assert_eq!(
+            services
+                .team_runtime()
+                .reconcile_preparing_bindings_on_startup(256)
+                .expect("startup reconciliation closes the frozen Task link set"),
+            1,
+            "recovery must repair exactly this unready Team before any graph is driven"
+        );
 
         let projection = services
             .team_runtime()
             .instantiate_or_resume(request.clone())
             .await
             .expect("resume reconciles links and executes once");
-        assert_eq!(projection.status, "partial");
+        assert_eq!(projection.status, "unavailable");
         assert_eq!(projection.tasks.len(), 2);
         assert!(
             crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
@@ -9829,7 +9926,7 @@ mod tests {
             "fast",
             services.mission_runtime().default_mission_id(),
         );
-        let instantiated = services
+        let mut instantiated = services
             .team_runtime()
             .plan(request.clone())
             .expect("team plan");
@@ -9846,17 +9943,22 @@ mod tests {
                 .is_some(),
             "root task must be durable before the crash window"
         );
+        services
+            .team_runtime()
+            .bind_instantiated_task_policies(&mut instantiated)
+            .expect("freeze inherited Task policy before durable Preparing marker");
         let registered = services
             .commit_service()
             .register_graph(instantiated.graph.clone())
             .expect("graph registered");
-        crate::team_binding::persist_preparing(
+        crate::team_binding::persist_preparing_with_task_commands(
             services.event_store(),
             &registered.graph.id,
             instantiated
                 .binding
                 .as_ref()
                 .expect("compiled Team Binding"),
+            &instantiated.task_commands,
         )
         .expect("preparing marker persisted");
         // Simulate a crash after exactly the first Task link was committed.
@@ -9901,7 +10003,7 @@ mod tests {
             .instantiate_or_resume(request)
             .await
             .expect("resume completes the exact link set");
-        assert_eq!(projection.status, "partial");
+        assert_eq!(projection.status, "unavailable");
         assert_eq!(projection.tasks.len(), 2);
         assert!(
             crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
@@ -10056,7 +10158,7 @@ mod tests {
             })
             .await
             .expect("fanout team execution");
-        assert_eq!(projection.status, "partial");
+        assert_eq!(projection.status, "unavailable");
         assert!(max_active.load(Ordering::SeqCst) >= 2);
         assert!(max_active.load(Ordering::SeqCst) <= 3);
     }
@@ -10104,7 +10206,6 @@ mod tests {
             execution_budget: harness_contract::context::ParentExecutionBudget::new(
                 format!("service-team-budget:{team_id}"),
                 65_536,
-                4_915_200,
                 u64::MAX,
                 32,
                 1,

@@ -1,16 +1,6 @@
 use crate::session::Session;
 
-use model_protocol::usage::{ModelPricing, TokenUsage};
-
-/// Returns pricing metadata for a known model alias or family.
-///
-/// Delegates to the global [`ModelRegistry`] loaded from `~/.cowd/models.yaml`.
-/// Falls back to heuristic matching for Claude models when the registry is
-/// unavailable or the model is not found.
-#[must_use]
-pub fn pricing_for_model(model: &str) -> Option<ModelPricing> {
-    model_protocol::model_registry::pricing_for_model(model)
-}
+use model_protocol::usage::TokenUsage;
 
 /// Aggregates token usage across a running session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -85,9 +75,9 @@ impl UsageTracker {
 #[cfg(test)]
 mod tests {
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
-    use model_protocol::usage::{format_usd, TokenUsage};
+    use model_protocol::usage::TokenUsage;
 
-    use super::{pricing_for_model, UsageTracker};
+    use super::UsageTracker;
 
     #[test]
     fn tracks_true_cumulative_usage() {
@@ -131,62 +121,6 @@ mod tests {
     }
 
     #[test]
-    fn computes_cost_summary_lines() {
-        let usage = TokenUsage {
-            input_tokens: 1_000_000,
-            output_tokens: 500_000,
-            cache_creation_input_tokens: 100_000,
-            cache_read_input_tokens: 200_000,
-        };
-
-        let cost = usage.estimate_cost_usd();
-        assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
-        assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
-        let model_pricing =
-            pricing_for_model("claude-sonnet-4-6").expect("known model pricing should resolve");
-        let model_cost = usage.estimate_cost_usd_with_pricing(model_pricing);
-        let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-6"));
-        assert!(lines[0].contains(&format!(
-            "estimated_cost={}",
-            format_usd(model_cost.total_cost_usd())
-        )));
-        assert!(lines[0].contains("model=claude-sonnet-4-6"));
-        assert!(lines[1].contains(&format!(
-            "cache_read={}",
-            format_usd(model_cost.cache_read_cost_usd)
-        )));
-    }
-
-    #[test]
-    fn supports_model_specific_pricing() {
-        let usage = TokenUsage {
-            input_tokens: 1_000_000,
-            output_tokens: 500_000,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-
-        let haiku = pricing_for_model("claude-haiku-4-5-20251001").expect("haiku pricing");
-        let opus = pricing_for_model("claude-opus-4-6").expect("opus pricing");
-        let haiku_cost = usage.estimate_cost_usd_with_pricing(haiku);
-        let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
-        assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
-        assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
-    }
-
-    #[test]
-    fn marks_unknown_model_pricing_as_fallback() {
-        let usage = TokenUsage {
-            input_tokens: 100,
-            output_tokens: 100,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-        let lines = usage.summary_lines_for_model("usage", Some("custom-model"));
-        assert!(lines[0].contains("pricing=estimated-default"));
-    }
-
-    #[test]
     fn reconstructs_usage_from_session_messages() {
         let mut session = Session::new();
         session.replace_messages(vec![ConversationMessage {
@@ -205,13 +139,5 @@ mod tests {
         let tracker = UsageTracker::from_session(&session);
         assert_eq!(tracker.turns(), 1);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 8);
-    }
-
-    #[test]
-    fn pricing_for_model_still_works() {
-        // Verify money code is not broken by our changes
-        assert!(pricing_for_model("claude-sonnet-4-6-20250514").is_some());
-        assert!(pricing_for_model("claude-opus-4-6").is_some());
-        assert!(pricing_for_model("claude-haiku-4-5-20251213").is_some());
     }
 }

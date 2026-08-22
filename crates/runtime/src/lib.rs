@@ -51,10 +51,10 @@ pub mod wave;
 pub use green_contract::GreenLevel;
 #[path = "approval/coordinator.rs"]
 pub mod approval_coordinator;
-#[path = "approval/router.rs"]
-pub mod approval_router;
 #[path = "approval/approval_queue.rs"]
 pub mod approval_queue;
+#[path = "approval/router.rs"]
+pub mod approval_router;
 #[path = "infrastructure/hooks.rs"]
 mod hooks;
 #[path = "infrastructure/json.rs"]
@@ -64,14 +64,14 @@ pub use json::JsonValue;
 pub mod acceptance_evaluator;
 #[path = "context/adaptive_allocator.rs"]
 pub mod adaptive_context;
-#[path = "context/occupancy.rs"]
-pub mod context_occupancy;
 #[path = "context/budget_policy.rs"]
 pub mod budget_policy;
 #[path = "context/evidence/mod.rs"]
 pub mod context_evidence;
 #[path = "context/ledger/mod.rs"]
 pub mod context_ledger;
+#[path = "context/occupancy.rs"]
+pub mod context_occupancy;
 #[path = "context/context_profiler.rs"]
 pub mod context_profiler;
 #[path = "context/context_runtime.rs"]
@@ -817,7 +817,7 @@ pub use upgrade::{
     UpgradeInventory, UpgradeInventoryCollector, UpgradeMaintenanceSnapshot,
     LEGACY_EXECUTION_IMPORTED, UPGRADE_RECOVERY_REQUIRED,
 };
-pub use usage::{pricing_for_model, UsageTracker};
+pub use usage::UsageTracker;
 pub use wave::{
     DependencyGraph, ErrorPolicy, TaskContext, TaskId, TaskResult, TaskStatus, Wave, WaveConfig,
     WaveError, WaveExecutor, WaveOrchestrator, WaveResult, WaveStatus, WaveTask,

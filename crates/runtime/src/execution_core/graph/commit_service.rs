@@ -75,6 +75,102 @@ pub enum ToolEffectState {
     Uncertain,
 }
 
+/// Canonical ToolHost receipt indexed by the immutable delegated Agent
+/// attempt.  The effect stream remains the idempotency/fencing owner; this
+/// compact index only gives recovery an exact, bounded way to reload the
+/// receipt set that an acceptance verdict was based on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableAgentToolReceipt {
+    pub sequence: u64,
+    pub effect_kind: ToolEffectKind,
+    pub authorized_scopes: Vec<String>,
+    pub outcome: crate::RuntimeToolExecutionOutcome,
+}
+
+/// Merge an additive semantic revision into the graph-owned collaboration
+/// program. A replan can add Team obligations but cannot silently replace or
+/// delete already-admitted Team instances; destructive topology changes need
+/// a separately governed cancellation/replacement command.
+fn merge_collaboration_program(
+    current: &mut Option<harness_contract::execution_graph::CollaborationProgram>,
+    delta: Option<harness_contract::execution_graph::CollaborationProgram>,
+) -> Result<(), ExecutionCommitError> {
+    let Some(delta) = delta else {
+        return Ok(());
+    };
+    let Some(program) = current.as_mut() else {
+        delta
+            .validate()
+            .map_err(ExecutionCommitError::InvalidReplan)?;
+        *current = Some(delta);
+        return Ok(());
+    };
+
+    let existing_ids = program
+        .team_instances
+        .iter()
+        .map(|instance| instance.instance_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if delta
+        .team_instances
+        .iter()
+        .any(|instance| existing_ids.contains(instance.instance_id.as_str()))
+    {
+        return Err(ExecutionCommitError::InvalidReplan(
+            "collaboration revision reuses an existing Team instance id".to_string(),
+        ));
+    }
+    let existing_edge_ids = program
+        .edges
+        .iter()
+        .map(|edge| edge.edge_id.as_str())
+        .collect::<BTreeSet<_>>();
+    if delta
+        .edges
+        .iter()
+        .any(|edge| existing_edge_ids.contains(edge.edge_id.as_str()))
+    {
+        return Err(ExecutionCommitError::InvalidReplan(
+            "collaboration revision reuses an existing cross-Team edge id".to_string(),
+        ));
+    }
+    // Validate a complete candidate rather than the incoming delta alone:
+    // an additive review Team may legitimately consume a prior Team instance
+    // from the same durable program.
+    let mut candidate = program.clone();
+    candidate.team_instances.extend(delta.team_instances);
+    candidate.edges.extend(delta.edges);
+    for (semantic_id, physical_nodes) in delta.semantic_node_instances {
+        if candidate
+            .semantic_node_instances
+            .insert(semantic_id.clone(), physical_nodes)
+            .is_some()
+        {
+            return Err(ExecutionCommitError::InvalidReplan(format!(
+                "collaboration revision reuses semantic Team node `{semantic_id}`"
+            )));
+        }
+    }
+    candidate.required_team_count = u16::try_from(
+        candidate
+            .team_instances
+            .iter()
+            .filter(|team| team.required)
+            .count(),
+    )
+    .map_err(|_| {
+        ExecutionCommitError::InvalidReplan(
+            "collaboration revision exceeds u16 Team instance capacity".to_string(),
+        )
+    })?;
+    candidate.revision = candidate.revision.saturating_add(1);
+    candidate
+        .validate()
+        .map_err(ExecutionCommitError::InvalidReplan)?;
+    *program = candidate;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ExecutionCommitService {
     event_store: Arc<RuntimeEventStore>,
@@ -83,6 +179,53 @@ pub struct ExecutionCommitService {
 }
 
 impl ExecutionCommitService {
+    /// Reload the exact ToolHost receipts for one delegated Agent attempt.
+    /// The stream name is a durable parent graph/node/attempt key, so restart
+    /// never scans unrelated effect streams or reconstructs facts from the
+    /// live filesystem.
+    pub fn load_delegated_agent_tool_receipts(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        attempt: u32,
+    ) -> Result<Vec<DurableAgentToolReceipt>, ExecutionCommitError> {
+        let stream_id = format!("execution-agent-receipts:{graph_id}:{node_id}:{attempt}");
+        let mut receipts = self
+            .event_store
+            .list_stream(&stream_id)
+            .map_err(RuntimeEventStoreError::Corrupt)?
+            .into_iter()
+            .filter(|event| event.kind == "execution.agent_tool.receipt")
+            .map(|event| {
+                let sequence = event.payload["sequence"].as_u64().ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(
+                        "delegated Agent tool receipt has no sequence".to_string(),
+                    )
+                })?;
+                let effect_kind = serde_json::from_value(event.payload["effect_kind"].clone())?;
+                let authorized_scopes =
+                    serde_json::from_value(event.payload["authorized_scopes"].clone())?;
+                let outcome = serde_json::from_value(event.payload["outcome"].clone())?;
+                Ok(DurableAgentToolReceipt {
+                    sequence,
+                    effect_kind,
+                    authorized_scopes,
+                    outcome,
+                })
+            })
+            .collect::<Result<Vec<_>, ExecutionCommitError>>()?;
+        receipts.sort_by_key(|receipt| receipt.sequence);
+        if receipts
+            .windows(2)
+            .any(|window| window[0].sequence == window[1].sequence)
+        {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "delegated Agent receipt index contains duplicate causal sequence".to_string(),
+            ));
+        }
+        Ok(receipts)
+    }
+
     pub fn commit_readonly_tool_receipts(
         &self,
         receipts: &[(
@@ -93,8 +236,8 @@ impl ExecutionCommitService {
         if receipts.is_empty() {
             return Ok(());
         }
-        let mut expected_streams = Vec::with_capacity(receipts.len());
-        let mut events = Vec::with_capacity(receipts.len());
+        let mut expected_streams = BTreeMap::<String, u64>::new();
+        let mut events = Vec::with_capacity(receipts.len().saturating_mul(2));
         let mut receipt_keys = Vec::with_capacity(receipts.len());
         for (request, outcome) in receipts {
             let stream_id = format!("execution-effect:{}", request.idempotency_key);
@@ -106,10 +249,10 @@ impl ExecutionCommitService {
                 validate_readonly_tool_receipt(request, &existing.payload)?;
                 continue;
             }
-            expected_streams.push(ExpectedStreamRevision {
-                stream_id: stream_id.clone(),
-                expected_revision: self.event_store.stream_revision(&stream_id)?,
-            });
+            expected_streams.insert(
+                stream_id.clone(),
+                self.event_store.stream_revision(&stream_id)?,
+            );
             events.push(RuntimeTransactionEventInput {
                 event: RuntimeEventInput {
                     stream_id,
@@ -133,6 +276,15 @@ impl ExecutionCommitService {
                 idempotency_key: Some(receipt_key.clone()),
                 schema_version: 1,
             });
+            if let Some(agent_receipt) =
+                delegated_agent_receipt_event(request, ToolEffectKind::Read, outcome)
+            {
+                let agent_stream = agent_receipt.event.stream_id.clone();
+                expected_streams
+                    .entry(agent_stream.clone())
+                    .or_insert(self.event_store.stream_revision(&agent_stream)?);
+                events.push(agent_receipt);
+            }
             receipt_keys.push(receipt_key);
         }
         if events.is_empty() {
@@ -143,7 +295,13 @@ impl ExecutionCommitService {
         self.event_store
             .append_transaction(AppendTransactionRequest {
                 transaction_id: format!("readonly-tool-wave:{digest}"),
-                expected_streams,
+                expected_streams: expected_streams
+                    .into_iter()
+                    .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                        stream_id,
+                        expected_revision,
+                    })
+                    .collect(),
                 events,
             })?;
         Ok(())
@@ -248,34 +406,54 @@ impl ExecutionCommitService {
                 ))
             })?;
         validate_mutation_tool_fingerprint(request, effect, &intent.payload, "intent")?;
-        let revision = self.event_store.stream_revision(&stream_id)?;
-        self.event_store.append_batch_if_revision(
+        let mut expected_streams = BTreeMap::<String, u64>::new();
+        expected_streams.insert(
             stream_id.clone(),
-            revision,
-            format!("{}:receipt", request.idempotency_key),
-            vec![RuntimeTransactionEventInput {
-                event: RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::ExecutionNode,
-                    kind: "execution.effect.receipt".to_string(),
-                    status: Some("completed".to_string()),
-                    actor: Some("governed_tool".to_string()),
-                    refs: tool_effect_refs(request),
-                    payload: json!({
-                        "idempotency_key": request.idempotency_key,
-                        "tool_name": request.tool_name,
-                        "input_sha256": format!(
-                            "sha256:{:x}",
-                            Sha256::digest(request.input.as_bytes())
-                        ),
-                        "descriptor_hash": effect.descriptor_hash,
-                        "outcome": bounded_tool_effect_outcome(outcome),
-                    }),
-                },
-                idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
-                schema_version: 1,
-            }],
-        )?;
+            self.event_store.stream_revision(&stream_id)?,
+        );
+        let mut events = vec![RuntimeTransactionEventInput {
+            event: RuntimeEventInput {
+                stream_id: stream_id.clone(),
+                scope: RuntimeEventScope::ExecutionNode,
+                kind: "execution.effect.receipt".to_string(),
+                status: Some("completed".to_string()),
+                actor: Some("governed_tool".to_string()),
+                refs: tool_effect_refs(request),
+                payload: json!({
+                    "idempotency_key": request.idempotency_key,
+                    "tool_name": request.tool_name,
+                    "input_sha256": format!(
+                        "sha256:{:x}",
+                        Sha256::digest(request.input.as_bytes())
+                    ),
+                    "descriptor_hash": effect.descriptor_hash,
+                    "outcome": bounded_tool_effect_outcome(outcome),
+                }),
+            },
+            idempotency_key: Some(format!("{}:receipt", request.idempotency_key)),
+            schema_version: 1,
+        }];
+        if let Some(agent_receipt) =
+            delegated_agent_receipt_event(request, effect.effect_kind, outcome)
+        {
+            let agent_stream = agent_receipt.event.stream_id.clone();
+            expected_streams
+                .entry(agent_stream.clone())
+                .or_insert(self.event_store.stream_revision(&agent_stream)?);
+            events.push(agent_receipt);
+        }
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!("tool-effect-receipt:{}", request.idempotency_key),
+                expected_streams: expected_streams
+                    .into_iter()
+                    .map(|(stream_id, expected_revision)| ExpectedStreamRevision {
+                        stream_id,
+                        expected_revision,
+                    })
+                    .collect(),
+                events,
+            })?;
         Ok(())
     }
 
@@ -432,7 +610,39 @@ impl ExecutionCommitService {
             .parent_execution
             .as_ref()
             .map(|parent| execution_lineage_stream_id(&parent.execution_id));
-        let domain_events = lineage_event.into_iter().collect::<Vec<_>>();
+        let continuation_event = graph
+            .continuation_binding
+            .as_ref()
+            .map(|binding| {
+                crate::orchestration::collaboration_continuation::graph_continuation_claim_event(
+                    binding, &graph.id,
+                )
+                .map_err(ExecutionCommitError::InvalidCommand)
+            })
+            .transpose()?;
+        if let Some(event) = continuation_event.as_ref() {
+            let key = event.idempotency_key.as_deref().ok_or_else(|| {
+                ExecutionCommitError::MissingDomainIdempotency(event.event.stream_id.clone())
+            })?;
+            if self
+                .event_store
+                .event_by_idempotency_key(&event.event.stream_id, key)?
+                .is_some()
+            {
+                return Err(ExecutionCommitError::InvalidCommand(format!(
+                    "continuation binding `{}` has already claimed a root graph",
+                    graph
+                        .continuation_binding
+                        .as_ref()
+                        .map(|binding| binding.binding_digest.as_str())
+                        .unwrap_or_default()
+                )));
+            }
+        }
+        let domain_events = lineage_event
+            .into_iter()
+            .chain(continuation_event)
+            .collect::<Vec<_>>();
         let mut last_lineage_conflict = None;
         for _ in 0..8 {
             match self.append_graph_event(
@@ -523,7 +733,13 @@ impl ExecutionCommitService {
                     .map_err(ExecutionCommitError::InvalidCommand)?,
             );
         }
-        self.append_graph_event(&next, graph.revision, transaction_id, graph_event, events)
+        self.append_graph_event_retrying_lineage_conflicts(
+            &next,
+            graph.revision,
+            transaction_id,
+            graph_event,
+            events,
+        )
     }
 
     pub fn bind_and_start_node(
@@ -650,7 +866,7 @@ impl ExecutionCommitService {
                     .map_err(ExecutionCommitError::InvalidCommand)?,
             );
         }
-        self.append_graph_event(
+        self.append_graph_event_retrying_lineage_conflicts(
             &next,
             graph.revision,
             format!("{}:{}:{}:terminal-replan", graph.id, node_id, next.revision),
@@ -746,6 +962,7 @@ impl ExecutionCommitService {
         reason: String,
         mutation_id: String,
         completion: harness_contract::execution_graph::ExecutionCompletionContract,
+        collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         if mutation_id.trim().is_empty() {
             return Err(ExecutionCommitError::InvalidReplan(
@@ -769,6 +986,7 @@ impl ExecutionCommitService {
                 semantic_revision: 0,
                 source_generation: 0,
                 completion: Default::default(),
+                collaboration_program: None,
             }
         });
         if orchestration
@@ -801,6 +1019,10 @@ impl ExecutionCommitService {
         orchestration.completion.required_node_ids.dedup();
         orchestration.completion.required_artifact_kinds.sort();
         orchestration.completion.required_artifact_kinds.dedup();
+        merge_collaboration_program(
+            &mut orchestration.collaboration_program,
+            collaboration_program,
+        )?;
         validate_execution_graph(&next)
             .map_err(|error| ExecutionCommitError::InvalidReplan(error.to_string()))?;
         self.append_graph_event(
@@ -824,10 +1046,19 @@ impl ExecutionCommitService {
         reason: String,
         mutation_id: String,
         completion: harness_contract::execution_graph::ExecutionCompletionContract,
+        collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
-            service.replan_semantic(&graph, nodes, edges, reason, mutation_id, completion)
+            service.replan_semantic(
+                &graph,
+                nodes,
+                edges,
+                reason,
+                mutation_id,
+                completion,
+                collaboration_program,
+            )
         })
         .await
         .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
@@ -1329,6 +1560,58 @@ impl ExecutionCommitService {
         )
     }
 
+    /// A parent may admit several independent Subgraph nodes at once. Their
+    /// graph streams remain disjoint, while their lineage relation events
+    /// intentionally share the parent stream. Retrying that *domain-stream*
+    /// CAS is safe: the graph revision and every domain idempotency key stay
+    /// immutable, and the append transaction is atomic. Do not use this for
+    /// graph-stream conflicts — those are real competing graph mutations.
+    fn append_graph_event_retrying_lineage_conflicts(
+        &self,
+        graph: &ExecutionGraph,
+        expected_graph_revision: u64,
+        transaction_id: String,
+        graph_event: ExecutionGraphEvent,
+        domain_events: Vec<RuntimeTransactionEventInput>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        let lineage_streams = domain_events
+            .iter()
+            .map(|event| event.event.stream_id.as_str())
+            .filter(|stream_id| stream_id.starts_with("execution-lineage:"))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        if lineage_streams.is_empty() {
+            return self.append_graph_event(
+                graph,
+                expected_graph_revision,
+                transaction_id,
+                graph_event,
+                domain_events,
+            );
+        }
+        let mut last_conflict = None;
+        for _ in 0..8 {
+            match self.append_graph_event(
+                graph,
+                expected_graph_revision,
+                transaction_id.clone(),
+                graph_event.clone(),
+                domain_events.clone(),
+            ) {
+                Ok(receipt) => return Ok(receipt),
+                Err(error) if is_lineage_stream_conflict(&error, &lineage_streams) => {
+                    last_conflict = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_conflict.unwrap_or_else(|| {
+            ExecutionCommitError::InvalidReplan(
+                "lineage transition retry exhausted without a conflict receipt".to_string(),
+            )
+        }))
+    }
+
     fn append_graph_event_with_expected_domain_revisions(
         &self,
         graph: &ExecutionGraph,
@@ -1560,6 +1843,54 @@ fn tool_effect_refs(request: &crate::RuntimeToolExecutionRequest) -> Vec<Runtime
     refs
 }
 
+fn delegated_agent_receipt_stream_id(
+    request: &crate::RuntimeToolExecutionRequest,
+) -> Option<String> {
+    let parent = request.parent_execution.as_ref()?;
+    let attempt = request.parent_execution_attempt?;
+    Some(format!(
+        "execution-agent-receipts:{}:{}:{attempt}",
+        parent.execution_id, parent.node_id
+    ))
+}
+
+fn delegated_agent_receipt_key(request: &crate::RuntimeToolExecutionRequest) -> String {
+    format!("agent-tool-receipt:{}", request.idempotency_key)
+}
+
+fn delegated_agent_receipt_event(
+    request: &crate::RuntimeToolExecutionRequest,
+    effect_kind: ToolEffectKind,
+    outcome: &crate::RuntimeToolExecutionOutcome,
+) -> Option<RuntimeTransactionEventInput> {
+    let stream_id = delegated_agent_receipt_stream_id(request)?;
+    let mut refs = tool_effect_refs(request);
+    if let Some(attempt) = request.parent_execution_attempt {
+        refs.push(RuntimeEventRef {
+            kind: "agent_attempt".to_string(),
+            id: attempt.to_string(),
+        });
+    }
+    Some(RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id,
+            scope: RuntimeEventScope::ExecutionNode,
+            kind: "execution.agent_tool.receipt".to_string(),
+            status: Some("completed".to_string()),
+            actor: Some("governed_tool".to_string()),
+            refs,
+            payload: json!({
+                "sequence": request.observation_wave_sequence,
+                "effect_kind": effect_kind,
+                "authorized_scopes": request.authorized_scopes,
+                "outcome": bounded_tool_effect_outcome(outcome),
+            }),
+        },
+        idempotency_key: Some(delegated_agent_receipt_key(request)),
+        schema_version: 1,
+    })
+}
+
 fn bounded_tool_effect_outcome(
     outcome: &crate::RuntimeToolExecutionOutcome,
 ) -> crate::RuntimeToolExecutionOutcome {
@@ -1669,6 +2000,17 @@ fn is_lineage_registration_conflict(
             }),
             Some(expected_stream),
         ) if stream_id == expected_stream
+    )
+}
+
+fn is_lineage_stream_conflict(
+    error: &ExecutionCommitError,
+    lineage_streams: &BTreeSet<String>,
+) -> bool {
+    matches!(
+        error,
+        ExecutionCommitError::EventStore(RuntimeEventStoreError::StaleRevision { stream_id, .. })
+            if lineage_streams.contains(stream_id)
     )
 }
 
@@ -1987,6 +2329,7 @@ mod tests {
             memory_context: None,
             model_lease: None,
             parent_execution: None,
+            parent_execution_attempt: None,
             execution_decision: None,
             evaluation_isolated: false,
             managed_invocation: None,
@@ -2052,6 +2395,8 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
+            team_role_identity: None,
+            team_role: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
@@ -2065,7 +2410,6 @@ mod tests {
                 "agent-instance",
                 "agent",
                 1_000,
-                75_000,
                 u64::MAX,
                 1,
             ),
@@ -2132,7 +2476,6 @@ mod tests {
             execution_budget: harness_contract::context::ParentExecutionBudget::new(
                 "fixture-team-budget",
                 65_536,
-                4_915_200,
                 u64::MAX,
                 32,
                 1,
@@ -2175,6 +2518,56 @@ mod tests {
             .node_attempts
             .insert(node_id.to_string(), 1);
         graph
+    }
+
+    #[test]
+    fn planned_graph_and_continuation_claim_commit_in_one_transaction() {
+        let store = Arc::new(crate::RuntimeEventStore::try_open_in_memory().expect("store"));
+        let service = ExecutionCommitService::new(Arc::clone(&store));
+        let candidate = crate::ContinuationCandidate {
+            source_session_id: "session".to_string(),
+            source_turn_id: "turn-previous".to_string(),
+            source_root_id: "root-previous".to_string(),
+            team_set_ref: "team_graph:team-previous".to_string(),
+            delivery_revision: 9,
+            result_refs: vec!["team_graph:team-previous".to_string()],
+        };
+        let binding = crate::compile_continuation_binding(
+            &candidate,
+            "ingress-current",
+            9,
+            harness_contract::turn::ContinuationAuthorization::Authorized,
+            1,
+        )
+        .expect("binding");
+        let mut graph = ExecutionGraph::new("continue verified Team work");
+        graph.id = "root-current".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.continuation_binding = Some(binding.clone());
+
+        let receipt = service.register_graph(graph).expect("atomic registration");
+        assert_eq!(receipt.graph.continuation_binding, Some(binding));
+        let claim = store
+            .list_stream("continuation-cas")
+            .expect("claim stream")
+            .into_iter()
+            .next()
+            .expect("claim event");
+        let planned = store
+            .list_stream("root-current")
+            .expect("graph stream")
+            .into_iter()
+            .next()
+            .expect("planned graph");
+        assert_eq!(claim.transaction_id, planned.transaction_id);
+        assert_eq!(claim.commit_cursor, planned.commit_cursor);
+        assert_eq!(
+            claim
+                .payload
+                .pointer("/root_graph_id")
+                .and_then(serde_json::Value::as_str),
+            Some("root-current")
+        );
     }
 
     fn register_waiting_child_join(service: &ExecutionCommitService) -> ExecutionGraph {
@@ -2311,6 +2704,42 @@ mod tests {
     }
 
     #[test]
+    fn delegated_agent_receipts_are_indexed_atomically_and_reload_without_scanning_effects() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = ExecutionCommitService::new(Arc::clone(&store));
+        let request = crate::RuntimeToolExecutionRequest {
+            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: "graph-agent-receipts".to_string(),
+                node_id: "agent-node".to_string(),
+            }),
+            parent_execution_attempt: Some(3),
+            authorized_scopes: vec!["read:src/lib.rs".to_string()],
+            ..request("agent-receipt")
+        };
+        let outcome = outcome("agent-receipt", "durable observation");
+        service
+            .commit_readonly_tool_receipts(&[(request.clone(), outcome.clone())])
+            .expect("commit exact receipt and index atomically");
+
+        let index_stream = "execution-agent-receipts:graph-agent-receipts:agent-node:3";
+        let indexed = store.list_stream(index_stream).expect("indexed stream");
+        assert_eq!(indexed.len(), 1);
+        let effect = store
+            .list_stream(&format!("execution-effect:{}", request.idempotency_key))
+            .expect("effect stream");
+        assert_eq!(effect.len(), 1);
+        assert_eq!(indexed[0].transaction_id, effect[0].transaction_id);
+
+        let recovered = ExecutionCommitService::new(store)
+            .load_delegated_agent_tool_receipts("graph-agent-receipts", "agent-node", 3)
+            .expect("reload exact attempt receipts");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].sequence, request.observation_wave_sequence);
+        assert_eq!(recovered[0].authorized_scopes, request.authorized_scopes);
+        assert_eq!(recovered[0].outcome, outcome);
+    }
+
+    #[test]
     fn mutation_intent_blocks_uncertain_replay_and_completed_receipt_rehydrates() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let service = ExecutionCommitService::new(store);
@@ -2421,6 +2850,7 @@ mod tests {
                 semantic_revision: 1,
                 source_generation: 1,
                 completion: Default::default(),
+                collaboration_program: None,
             },
         );
         let registered = service.register_graph(graph).expect("register graph").graph;
@@ -2436,6 +2866,7 @@ mod tests {
                 "add bounded reviewer".to_string(),
                 "revision-2".to_string(),
                 Default::default(),
+                None,
             )
             .expect("semantic revision commits");
         assert_eq!(first.graph.revision, registered.revision + 1);
@@ -2457,6 +2888,7 @@ mod tests {
             "duplicate".to_string(),
             "revision-2".to_string(),
             Default::default(),
+            None,
         ) {
             Ok(_) => panic!("same mutation id cannot commit twice"),
             Err(error) => error,
@@ -2474,11 +2906,71 @@ mod tests {
             "stale proposal".to_string(),
             "revision-stale".to_string(),
             Default::default(),
+            None,
         ) {
             Ok(_) => panic!("stale graph revision cannot partially commit"),
             Err(error) => error,
         };
         assert!(matches!(stale, ExecutionCommitError::EventStore(_)));
+    }
+
+    #[test]
+    fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
+        use harness_contract::execution_graph::{
+            CollaborationEdgeKind, CollaborationProgram, CollaborationProgramEdge,
+            CollaborationTeamInstance,
+        };
+
+        let mut current = Some(CollaborationProgram {
+            program_id: "program-root".to_string(),
+            revision: 1,
+            required_team_count: 1,
+            team_instances: vec![CollaborationTeamInstance {
+                instance_id: "research:1".to_string(),
+                semantic_node_id: "research".to_string(),
+                required: true,
+            }],
+            edges: Vec::new(),
+            semantic_node_instances: BTreeMap::from([(
+                "research".to_string(),
+                vec!["graph:research:1".to_string()],
+            )]),
+        });
+        let delta = CollaborationProgram {
+            program_id: "ignored-delta-id".to_string(),
+            revision: 1,
+            required_team_count: 1,
+            team_instances: vec![CollaborationTeamInstance {
+                instance_id: "review:1".to_string(),
+                semantic_node_id: "review".to_string(),
+                required: true,
+            }],
+            edges: vec![CollaborationProgramEdge {
+                edge_id: "research:1->review:1".to_string(),
+                from: "research:1".to_string(),
+                to: "review:1".to_string(),
+                kind: CollaborationEdgeKind::ReviewOf,
+            }],
+            semantic_node_instances: BTreeMap::from([(
+                "review".to_string(),
+                vec!["graph:review:1".to_string()],
+            )]),
+        };
+        merge_collaboration_program(&mut current, Some(delta)).expect("merge additive revision");
+        let program = current.expect("program");
+        assert_eq!(program.program_id, "program-root");
+        assert_eq!(program.revision, 2);
+        assert_eq!(program.required_team_count, 2);
+        assert_eq!(program.edges.len(), 1);
+        assert_eq!(program.semantic_node_instances.len(), 2);
+        assert_eq!(
+            program
+                .team_instances
+                .iter()
+                .map(|team| team.instance_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["research:1", "review:1"])
+        );
     }
 
     #[test]

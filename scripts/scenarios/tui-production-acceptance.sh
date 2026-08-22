@@ -1363,12 +1363,12 @@ PRAGMA foreign_keys = ON;
 INSERT INTO sessions (
   session_id, platform, chat_id, user_id, model, created_at, last_activity,
   message_count, reset_policy, metadata_json, input_tokens, output_tokens,
-  estimated_cost_usd, status, created_at_ms, updated_at_ms
+  status, created_at_ms, updated_at_ms
 )
 SELECT
   '$SESSION_10K', platform, '$SESSION_10K', user_id, '$MODEL',
   created_at, last_activity, 10000, reset_policy, metadata_json,
-  500000, 500000, 0.0, 'active', created_at_ms, updated_at_ms
+  500000, 500000, 'active', created_at_ms, updated_at_ms
 FROM sessions
 WHERE session_id = '$OLD_SESSION_ID';
 

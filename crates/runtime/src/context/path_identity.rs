@@ -6,10 +6,12 @@
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(test)]
+use harness_contract::context::ObservedAcceptance;
 use harness_contract::context::{
     EvidenceCoverageKind, EvidenceObligation, EvidenceObligationKind, EvidenceTargetIdentity,
-    ObservedAcceptance, ObservedEvidence, RequiredAcceptance, WorkspaceAccessMode,
-    WorkspaceObjectKind, WorkspacePathIdentity, WorkspaceScopeIdentity,
+    ObservedEvidence, RequiredAcceptance, WorkspaceAccessMode, WorkspaceObjectKind,
+    WorkspacePathIdentity, WorkspaceScopeIdentity,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -741,25 +743,20 @@ pub fn fresh_novel_observed_evidence_fingerprints(
         .collect()
 }
 
+/// Historical test adapter. Production terminal owners must request the
+/// full `AcceptanceEvaluation` from `AcceptanceEvaluator::evaluate_terminal`.
+#[cfg(test)]
 #[must_use]
 pub fn evaluate_observed_acceptance(
     required: &RequiredAcceptance,
     satisfied_criteria: Vec<String>,
     observed_evidence: Vec<ObservedEvidence>,
 ) -> ObservedAcceptance {
-    let unresolved_obligation_ids = required
-        .evidence_obligations
-        .iter()
-        .filter(|obligation| {
-            !observed_evidence_collection_satisfies(obligation, &observed_evidence)
-        })
-        .map(|obligation| obligation.obligation_id.clone())
-        .collect();
-    ObservedAcceptance {
+    crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_required(
+        required,
         satisfied_criteria,
         observed_evidence,
-        unresolved_obligation_ids,
-    }
+    )
 }
 
 /// Match a required obligation against Runtime-attested evidence by canonical
@@ -832,7 +829,11 @@ fn scope_under(child: &WorkspaceScopeIdentity, parent: &WorkspaceScopeIdentity) 
     let parent_path = &parent.path.workspace_relative_path;
     child.path.workspace_id == parent.path.workspace_id
         && child.path.repository_id == parent.path.repository_id
-        && (child_path == parent_path
+        // The workspace-root identity has an empty relative path. It is a
+        // dynamic parent scope, not a file named "": every canonical child
+        // path in the same workspace/repository is below it.
+        && (parent_path.is_empty()
+            || child_path == parent_path
             || (child_path.starts_with(parent_path)
                 && child_path.as_bytes().get(parent_path.len()) == Some(&b'/')))
 }

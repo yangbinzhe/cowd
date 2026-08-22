@@ -5818,7 +5818,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -5923,7 +5922,6 @@ mod tests {
                 ),
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -6079,7 +6077,6 @@ mod tests {
                 metadata_json: Some(serde_json::json!({ "execution_policy": initial }).to_string()),
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -6228,7 +6225,6 @@ mod tests {
                 metadata_json: Some(serde_json::json!({ "execution_policy": initial }).to_string()),
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -6354,7 +6350,6 @@ mod tests {
                 ),
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -6412,7 +6407,6 @@ mod tests {
                     ),
                     input_tokens: 0,
                     output_tokens: 0,
-                    estimated_cost_usd: 0.0,
                     status: "active".to_string(),
                 })
                 .await
@@ -6532,7 +6526,6 @@ mod tests {
                 ),
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             };
         let default_owned = runtime::SessionExecutionPolicy::from_profile(
@@ -6666,7 +6659,6 @@ mod tests {
                 ),
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -6716,7 +6708,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -6825,7 +6816,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -7040,7 +7030,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -7327,7 +7316,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -7375,7 +7363,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -7849,7 +7836,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -7924,7 +7910,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await

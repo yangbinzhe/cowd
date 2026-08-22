@@ -42,7 +42,6 @@ fn request(mission_id: &str) -> TeamInstantiationRequest {
         execution_budget: harness_contract::context::ParentExecutionBudget::new(
             "working-state-team-budget",
             65_536,
-            4_915_200,
             u64::MAX,
             32,
             1,

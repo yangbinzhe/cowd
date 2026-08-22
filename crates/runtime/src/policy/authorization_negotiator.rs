@@ -1774,10 +1774,7 @@ mod tests {
 
     #[test]
     fn full_trust_session_lease_carries_the_session_ceiling_not_the_effect_floor() {
-        let mut descriptor = effect(
-            PermissionMode::WorkspaceWrite,
-            EffectExternality::Workspace,
-        );
+        let mut descriptor = effect(PermissionMode::WorkspaceWrite, EffectExternality::Workspace);
         descriptor.tool_id = "runtime_orchestrate".to_string();
         let mut request = request(descriptor);
         request.capability = "runtime_orchestrate".to_string();

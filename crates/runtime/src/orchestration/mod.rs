@@ -12,7 +12,7 @@ pub mod result;
 pub(crate) mod team_authority;
 pub mod validator;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::execution_core::graph::{ExecutionCommitError, ExecutionRunnerError};
 use crate::execution_core::{
@@ -178,13 +178,19 @@ async fn submit_runtime_orchestration_request_with_mode(
             .iter()
             .filter(|node| node.recipe == CapabilityRecipeId::Team)
         {
-            let chars = node
-                .objective
-                .chars()
-                .count()
-                .saturating_add(node.resource_scopes.iter().map(|scope| scope.len()).sum::<usize>());
-            let estimate =
-                crate::context_occupancy::estimate_role_occupancy(&node.node_id, chars, 0, 0, window);
+            let chars = node.objective.chars().count().saturating_add(
+                node.resource_scopes
+                    .iter()
+                    .map(|scope| scope.len())
+                    .sum::<usize>(),
+            );
+            let estimate = crate::context_occupancy::estimate_role_occupancy(
+                &node.node_id,
+                chars,
+                0,
+                0,
+                window,
+            );
             tracing::debug!(
                 node = %node.node_id,
                 occupancy_bp = estimate.utilization_bp,
@@ -909,6 +915,13 @@ async fn revise(
             .iter()
             .map(|node| node.id.clone())
             .collect::<BTreeSet<_>>();
+        let existing_semantic_node_instances = graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .map_or_else(BTreeMap::new, |program| {
+                program.semantic_node_instances.clone()
+            });
         let mut revision_repairs = Vec::new();
         let mut mutation = compiler::compile_graph_mutation(
             request_id,
@@ -918,7 +931,7 @@ async fn revise(
             graph_id,
             graph.parent_execution.as_ref(),
             services.team_runtime().as_ref(),
-            &existing_ids,
+            &existing_semantic_node_instances,
             &mut revision_repairs,
         )
         .map_err(|error| format!("semantic_revision_compile_failed:{error}"))?;
@@ -957,6 +970,58 @@ async fn revise(
             &mutation.semantic_node_instances,
             &proposal.nodes,
         );
+        let mut collaboration_program = compiler::collaboration_program_from_proposal(
+            proposal,
+            Some(&mutation.semantic_node_instances),
+        )
+        .map_err(|error| format!("semantic_revision_program_failed:{error}"))?;
+        if let (Some(delta), Some(existing)) = (
+            collaboration_program.as_mut(),
+            graph
+                .orchestration
+                .as_ref()
+                .and_then(|metadata| metadata.collaboration_program.as_ref()),
+        ) {
+            // A patch may add a reviewer/aggregator that consumes a Team
+            // already admitted by the root program. Represent that relation
+            // explicitly instead of silently degrading it to a prose prompt
+            // or a generic graph dependency.
+            for consumer in proposal
+                .nodes
+                .iter()
+                .filter(|node| node.recipe == CapabilityRecipeId::Team)
+            {
+                let consumers = delta
+                    .team_instances
+                    .iter()
+                    .filter(|instance| instance.semantic_node_id == consumer.node_id)
+                    .map(|instance| instance.instance_id.clone())
+                    .collect::<Vec<_>>();
+                for producer_semantic_id in &consumer.depends_on {
+                    let producers = existing
+                        .team_instances
+                        .iter()
+                        .filter(|instance| instance.semantic_node_id == *producer_semantic_id)
+                        .map(|instance| instance.instance_id.clone())
+                        .collect::<Vec<_>>();
+                    for from in &producers {
+                        for to in &consumers {
+                            let edge_id = format!("{from}->{to}");
+                            if !delta.edges.iter().any(|edge| edge.edge_id == edge_id) {
+                                delta.edges.push(
+                                    harness_contract::execution_graph::CollaborationProgramEdge {
+                                        edge_id,
+                                        from: from.clone(),
+                                        to: to.clone(),
+                                        kind: harness_contract::execution_graph::CollaborationEdgeKind::Handoff,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let run = services.execution_supervisor().revise_semantic_graph(
             graph_id,
             graph.revision,
@@ -965,6 +1030,7 @@ async fn revise(
             proposal.reason.clone(),
             proposal.mutation_id.clone(),
             completion,
+            collaboration_program,
         );
         let outcome = if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
@@ -1601,9 +1667,7 @@ fn submit_approval(
                 },
                 scope: ApprovalGrantScope::Once,
                 actor: ApprovalDecisionActor {
-                    kind: if decision
-                        == crate::approval_router::ApprovalDecision::StewardApprove
-                    {
+                    kind: if decision == crate::approval_router::ApprovalDecision::StewardApprove {
                         ApprovalDecisionActorKind::StewardAgent
                     } else {
                         ApprovalDecisionActorKind::Policy
@@ -1665,10 +1729,7 @@ fn request_id(request: &RuntimeOrchestrationCommand) -> String {
     )
 }
 
-fn session_is_trust_all(
-    services: &RuntimeServices,
-    session_id: Option<&str>,
-) -> bool {
+fn session_is_trust_all(services: &RuntimeServices, session_id: Option<&str>) -> bool {
     let trust_all = session_id.is_some_and(|session_id| {
         services
             .session_execution_policy(session_id)
@@ -1970,6 +2031,7 @@ mod tests {
                 expected_revision: None,
                 nodes,
                 completion: Default::default(),
+                collaboration_program: None,
                 reason: "parallel evidence lanes".to_string(),
             }),
             control: None,

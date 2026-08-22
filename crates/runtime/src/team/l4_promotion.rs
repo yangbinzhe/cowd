@@ -57,8 +57,9 @@ pub struct L4PromotionService {
     event_store: Arc<RuntimeEventStore>,
     approval_queue: Arc<ApprovalQueue>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
-    session_policy_lookup:
-        Option<Arc<dyn Fn(&str) -> Option<harness_contract::policy::SessionExecutionPolicy> + Send + Sync>>,
+    session_policy_lookup: Option<
+        Arc<dyn Fn(&str) -> Option<harness_contract::policy::SessionExecutionPolicy> + Send + Sync>,
+    >,
 }
 
 impl L4PromotionService {
@@ -69,9 +70,7 @@ impl L4PromotionService {
         memory_manager: Option<Arc<memory::CognitiveContextManager>>,
         session_policy_lookup: Option<
             Arc<
-                dyn Fn(
-                        &str,
-                    ) -> Option<harness_contract::policy::SessionExecutionPolicy>
+                dyn Fn(&str) -> Option<harness_contract::policy::SessionExecutionPolicy>
                     + Send
                     + Sync,
             >,
@@ -197,39 +196,39 @@ impl L4PromotionService {
                 match decision {
                     crate::approval_router::ApprovalDecision::AutoApprove
                     | crate::approval_router::ApprovalDecision::StewardApprove => {
-                        self.approval_queue.decide_internal(ApprovalDecisionCommand {
-                            approval_id: approval_id.clone(),
-                            approved: true,
-                            skip: false,
-                            reason: format!(
-                                "approval router {decision:?} for knowledge promotion"
-                            ),
-                            scope: ApprovalGrantScope::Once,
-                            actor: ApprovalDecisionActor {
-                                kind: if decision
-                                    == crate::approval_router::ApprovalDecision::StewardApprove
-                                {
-                                    ApprovalDecisionActorKind::StewardAgent
-                                } else {
-                                    ApprovalDecisionActorKind::Policy
+                        self.approval_queue
+                            .decide_internal(ApprovalDecisionCommand {
+                                approval_id: approval_id.clone(),
+                                approved: true,
+                                skip: false,
+                                reason: format!(
+                                    "approval router {decision:?} for knowledge promotion"
+                                ),
+                                scope: ApprovalGrantScope::Once,
+                                actor: ApprovalDecisionActor {
+                                    kind: if decision
+                                        == crate::approval_router::ApprovalDecision::StewardApprove
+                                    {
+                                        ApprovalDecisionActorKind::StewardAgent
+                                    } else {
+                                        ApprovalDecisionActorKind::Policy
+                                    },
+                                    actor_id: if decision
+                                        == crate::approval_router::ApprovalDecision::StewardApprove
+                                    {
+                                        "runtime-approval-steward".to_string()
+                                    } else {
+                                        "approval-router-auto".to_string()
+                                    },
                                 },
-                                actor_id: if decision
-                                    == crate::approval_router::ApprovalDecision::StewardApprove
-                                {
-                                    "runtime-approval-steward".to_string()
-                                } else {
-                                    "approval-router-auto".to_string()
-                                },
-                            },
-                            evidence_refs: vec![
-                                "approval.router.auto".to_string(),
-                                format!("approval.router.decision:{decision:?}"),
-                            ],
+                                evidence_refs: vec![
+                                    "approval.router.auto".to_string(),
+                                    format!("approval.router.decision:{decision:?}"),
+                                ],
+                            })?;
+                        approval = self.approval_queue.get(&approval_id).ok_or_else(|| {
+                            "knowledge approval missing after router decision".to_string()
                         })?;
-                        approval = self
-                            .approval_queue
-                            .get(&approval_id)
-                            .ok_or_else(|| "knowledge approval missing after router decision".to_string())?;
                     }
                     crate::approval_router::ApprovalDecision::ContinueAlternative => {
                         self.append_state(

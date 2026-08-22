@@ -1026,7 +1026,6 @@ impl SessionActivationCoordinator {
             metadata_json: Some(serde_json::Value::Object(metadata).to_string()),
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
         self.repository
@@ -1915,7 +1914,6 @@ mod tests {
             metadata_json: None,
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
         store.upsert_session(&record).await.unwrap();
@@ -2082,7 +2080,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             };
             store.upsert_session(&record).await.unwrap();
@@ -2120,7 +2117,6 @@ mod tests {
                 metadata_json: Some(r#"{"internal_context":true}"#.to_string()),
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             },
             SessionRecord {
@@ -2136,7 +2132,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             },
         ] {
@@ -2210,7 +2205,6 @@ mod tests {
             metadata_json: None,
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
         store.upsert_session(&record).await.unwrap();
@@ -2271,7 +2265,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -2340,7 +2333,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "deleted".to_string(),
             })
             .await
@@ -2405,7 +2397,6 @@ mod tests {
                     metadata_json: None,
                     input_tokens: 0,
                     output_tokens: 0,
-                    estimated_cost_usd: 0.0,
                     status: "active".to_string(),
                 })
                 .await
@@ -2468,7 +2459,6 @@ mod tests {
             metadata_json: None,
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
         store.upsert_session(&record).await.unwrap();
@@ -2526,7 +2516,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -2622,7 +2611,6 @@ mod tests {
                     metadata_json: None,
                     input_tokens: 0,
                     output_tokens: 0,
-                    estimated_cost_usd: 0.0,
                     status: "active".to_string(),
                 })
                 .await
@@ -2684,7 +2672,6 @@ mod tests {
             metadata_json: None,
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         };
         store.upsert_session(&record).await.unwrap();

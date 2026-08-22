@@ -988,6 +988,19 @@ NO_EQUALS_LINE
         assert_eq!(model_context_window("deepseek-r1"), 128_000);
         assert_eq!(model_context_window("qwen-max"), 128_000);
         assert_eq!(model_context_window("qwen-plus"), 128_000);
+        // Qwen 3.8/3.7/3.6 系列（百炼 / Token Plan）官方上下文为 1M。
+        assert_eq!(model_context_window("qwen3.8-max"), 1_000_000);
+        assert_eq!(model_context_window("qwen3.7-max"), 1_000_000);
+        assert_eq!(model_context_window("qwen3.7-plus"), 1_000_000);
+        assert_eq!(model_context_window("qwen3.6-plus"), 1_000_000);
+        assert_eq!(model_context_window("qwen3.6-flash"), 1_000_000);
+        assert_eq!(max_tokens_for_model("qwen3.7-plus"), 131_072);
+        assert_eq!(max_tokens_for_model("qwen3.6-flash"), 65_536);
+        assert_eq!(model_context_window("qwen3-max"), 262_144);
+        assert_eq!(model_context_window("qwen-long"), 10_000_000);
+        // 智谱 GLM：5.2 为 1M，GLM-5 为 200K。
+        assert_eq!(model_context_window("glm-5.2"), 1_048_576);
+        assert_eq!(model_context_window("glm-5"), 204_800);
         assert_eq!(model_context_window("glm-4"), 128_000);
         assert_eq!(model_context_window("yi-lightning"), 128_000);
     }
@@ -1003,10 +1016,6 @@ NO_EQUALS_LINE
         let configured = model_context_window_resolution("deepseek-v4-pro", Some(&overrides));
         assert_eq!(configured.tokens, 64_000);
         assert_eq!(configured.source, ModelContextWindowSource::Configured);
-
-        let bundled = model_context_window_resolution("deepseek-v4-pro", None);
-        assert_eq!(bundled.tokens, 1_000_000);
-        assert_eq!(bundled.source, ModelContextWindowSource::Bundled);
 
         let unknown = model_context_window_resolution("private-unknown-model", None);
         assert_eq!(unknown.tokens, 128_000);

@@ -520,7 +520,7 @@ pub fn runtime_capability_primer() -> String {
             .to_string(),
     );
     lines.push(
-        "TRIGGER RULE (custom teams): if the user names specific teams or roles (业务团队/技术团队, CTO, 供应链专家, 运维智能体, data scientist, AI expert, senior engineer...), call `runtime_orchestrate(propose_template)` with a structured template_proposal (template_id, name, team_display_name, roles[] with role_id/display_name/responsibility/agent_definition_ref/grant_ceiling/cardinality/acceptance, dependencies, result_fields, instructions). The runtime validates definitions, clips permissions to your ceiling, and routes the candidate through approval before publishing it as a reusable User-scope template. Do NOT silently fall back to the builtin template when the user named custom roles."
+        "TRIGGER RULE (custom teams): if the user names specific teams or roles (业务团队/技术团队, CTO, 供应链专家, 运维智能体, data scientist, AI expert, senior engineer...), call `runtime_orchestrate(propose_template)` with a structured template_proposal (template_id, name, team_display_name, roles[] with role_id/display_name/responsibility/behavior/agent_definition_ref/grant_ceiling/cardinality/acceptance, dependencies, result_fields, instructions). Each role MUST state typed behavior explicitly, for example evidence acquisition, upstream consumption, reducer, verification, or terminal-candidate; never encode behavior in the role name. The runtime validates definitions, clips permissions to your ceiling, and routes the candidate through approval before publishing it as a reusable User-scope template. Do NOT silently fall back to the builtin template when the user named custom roles."
             .to_string(),
     );
     lines.push("- Before proposing a Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values.".to_string());
@@ -1636,6 +1636,7 @@ pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
             required_artifact_kinds: Vec::new(),
             allow_unresolved_conflicts: false,
         },
+        collaboration_program: None,
         reason: "runtime preflight of the recommended orchestration proposal".to_string(),
     };
     let request = RuntimeOrchestrationCommand {

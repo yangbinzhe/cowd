@@ -68,6 +68,11 @@ pub struct AgentTaskIntent {
     pub session_id: String,
     pub mission_id: String,
     pub team_id: Option<String>,
+    /// Typed Team-slot identity supplied by the Team compiler. It replaces
+    /// semantic `team_role:` / `role_slot:` / `focus_*:` constraint strings.
+    /// Direct Agents leave it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_role_identity: Option<crate::team::TeamRoleIdentity>,
     pub graph_id: String,
     pub node_id: String,
     pub attempt: u32,
@@ -253,6 +258,17 @@ pub struct AgentTaskPacket {
     /// migrated fail-closed at the Runtime boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_acceptance: Vec<crate::team::TeamAcceptanceRequirement>,
+    /// The semantic role identity used while the Team compiler assembles the
+    /// graph.  Once the Team binding is frozen, `team_role` binds this exact
+    /// value to its immutable binding digest before persistence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_role_identity: Option<crate::team::TeamRoleIdentity>,
+    /// Frozen Team binding fragment for an executable Team Agent. It is
+    /// attached after all Team slots have been resolved and before the graph
+    /// is persisted. A Team-bound packet without this proof fails closed at
+    /// the Runtime boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_role: Option<crate::team::TeamRoleAssignment>,
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
@@ -287,6 +303,40 @@ pub struct AgentTaskPacket {
 }
 
 impl AgentTaskPacket {
+    #[must_use]
+    pub fn team_role_assignment(&self) -> Option<&crate::team::TeamRoleAssignment> {
+        self.team_role.as_ref()
+    }
+
+    /// Validate the immutable role fence for an executable Team slot.
+    ///
+    /// A Team id is not merely a display grouping: it means the packet is
+    /// governed by a frozen Team binding.  Therefore a live executor must
+    /// reject missing, substituted, or partially reconstructed role facts
+    /// instead of falling back to `team_role:` strings or a graph-node name.
+    pub fn validate_team_role_binding(&self) -> Result<(), &'static str> {
+        match (
+            self.team_id().is_some(),
+            self.team_role_identity.as_ref(),
+            self.team_role.as_ref(),
+        ) {
+            (false, None, None) => Ok(()),
+            (false, _, _) => Err("non-Team Agent packet carries Team role facts"),
+            (true, Some(identity), Some(assignment)) => {
+                identity.validate()?;
+                assignment.validate()?;
+                if assignment.identity != *identity {
+                    return Err("Team role assignment does not match packet identity");
+                }
+                if self.assignment.role_id != identity.role_id {
+                    return Err("Agent assignment role differs from Team role identity");
+                }
+                Ok(())
+            }
+            (true, _, _) => Err("Team Agent packet lacks its frozen role binding"),
+        }
+    }
+
     #[must_use]
     pub fn run_id(&self) -> &str {
         self.assignment.run_id.as_str()
@@ -351,6 +401,13 @@ pub struct AgentReturnPacket {
     /// required acceptance.
     #[serde(default)]
     pub observed_acceptance: crate::context::ObservedAcceptance,
+    /// The one Runtime-owned evaluation of the frozen acceptance contract and
+    /// receipt snapshot.  A return packet may carry raw observations, but no
+    /// downstream consumer is allowed to derive a second verdict from them.
+    /// Missing data is a legacy/untrusted carrier and must fail closed at a
+    /// governed graph boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_evaluation: Option<crate::acceptance::AcceptanceEvaluation>,
     pub acceptance: Vec<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,
     /// Legacy external-backend change hints. These are never sufficient for a

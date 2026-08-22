@@ -587,7 +587,7 @@ fn canonicalize_model_tool_names<T: ToolExecutor>(calls: &mut [ModelToolCall], t
 /// different execution pattern. Generic complex work remains model-directed
 /// and is never forced through this path.
 fn enforce_explicit_team_requirement(
-    objective: &str,
+    _objective: &str,
     first_step: bool,
     decision: &crate::execution_core::RuntimeExecutionDecision,
     intent: ModelStepIntent,
@@ -4347,7 +4347,8 @@ where
     /// so the model physically cannot drift into manual file exploration
     /// before publishing and starting the Teams.
     pub(crate) fn require_next_model_orchestration_only(&self) {
-        self.next_model_orchestration_only.store(true, Ordering::SeqCst);
+        self.next_model_orchestration_only
+            .store(true, Ordering::SeqCst);
     }
 
     /// Override reasoning effort for exactly one provider request. Provider
@@ -6896,7 +6897,9 @@ where
         // is a mechanical tool-exposure bound, not a prose instruction: the
         // model physically cannot read/search/write before publishing and
         // starting the Teams it was asked for.
-        if self.next_model_orchestration_only.swap(false, Ordering::SeqCst)
+        if self
+            .next_model_orchestration_only
+            .swap(false, Ordering::SeqCst)
             && !text_only_response
             && !explicitly_forbids_tool_use
         {
@@ -8150,6 +8153,7 @@ where
                     memory_context: Some(self.memory_turn_context()),
                     model_lease: None,
                     parent_execution: None,
+                    parent_execution_attempt: None,
                     execution_decision: None,
                     evaluation_isolated: false,
                     managed_invocation: None,
@@ -13772,7 +13776,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -14593,7 +14596,6 @@ mod tests {
             "agent-small",
             "agent",
             30,
-            1_000_000,
             u64::MAX,
             1,
         );
@@ -14625,7 +14627,6 @@ mod tests {
             "agent-untouched",
             "agent",
             1_000,
-            1_000_000,
             u64::MAX,
             1,
         );
@@ -14823,7 +14824,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -15385,7 +15385,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -16775,7 +16774,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -17543,7 +17541,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -17882,7 +17879,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -18021,7 +18017,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await
@@ -18073,7 +18068,6 @@ mod tests {
                 metadata_json: None,
                 input_tokens: 0,
                 output_tokens: 0,
-                estimated_cost_usd: 0.0,
                 status: "active".to_string(),
             })
             .await

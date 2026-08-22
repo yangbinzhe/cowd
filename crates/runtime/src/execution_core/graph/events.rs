@@ -30,6 +30,9 @@ pub struct ExecutionGraphDelta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<Option<ExecutionOrchestrationMetadata>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_binding:
+        Option<Option<harness_contract::turn::CollaborationContinuationBinding>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_envelope: Option<Option<harness_contract::outcome::DeliveryEnvelope>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_presentation: Option<Option<harness_contract::outcome::TerminalPresentation>>,
@@ -64,6 +67,8 @@ impl ExecutionGraphDelta {
                 .then(|| next.parent_execution.clone()),
             orchestration: (previous.orchestration != next.orchestration)
                 .then(|| next.orchestration.clone()),
+            continuation_binding: (previous.continuation_binding != next.continuation_binding)
+                .then(|| next.continuation_binding.clone()),
             delivery_envelope: (previous.delivery_envelope != next.delivery_envelope)
                 .then(|| next.delivery_envelope.clone()),
             terminal_presentation: (previous.terminal_presentation != next.terminal_presentation)
@@ -145,6 +150,9 @@ impl ExecutionGraphDelta {
         if let Some(orchestration) = &self.orchestration {
             graph.orchestration.clone_from(orchestration);
         }
+        if let Some(binding) = &self.continuation_binding {
+            graph.continuation_binding.clone_from(binding);
+        }
         if let Some(envelope) = &self.delivery_envelope {
             graph.delivery_envelope.clone_from(envelope);
         }
@@ -188,6 +196,17 @@ impl ExecutionGraphDelta {
     pub fn estimated_bytes(&self) -> u64 {
         let mut bytes = std::mem::size_of::<Self>()
             .saturating_add(self.objective.as_ref().map_or(0, String::len))
+            .saturating_add(self.continuation_binding.as_ref().map_or(0, |binding| {
+                binding.as_ref().map_or(0, |binding| {
+                    binding.source_session_id.len()
+                        + binding.source_turn_id.len()
+                        + binding.source_root_id.len()
+                        + binding.team_set_ref.len()
+                        + binding.binding_digest.len()
+                        + binding.current_ingress.len()
+                        + binding.result_refs.iter().map(String::len).sum::<usize>()
+                })
+            }))
             .saturating_add(self.delivery_envelope.as_ref().map_or(0, |value| {
                 value.as_ref().map_or(0, |envelope| {
                         envelope.envelope_id.len()

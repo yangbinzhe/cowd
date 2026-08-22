@@ -774,6 +774,7 @@ fn agent_intent_payload(graph_id: &str, node_id: &str, deadline_at_ms: u64) -> S
         attempt: 1,
         expected_graph_revision: 0,
         objective: format!("execute {node_id}"),
+        team_role_identity: None,
         required_acceptance: Default::default(),
         output_acceptance: Vec::new(),
         acceptance: Vec::new(),
@@ -790,7 +791,6 @@ fn agent_intent_payload(graph_id: &str, node_id: &str, deadline_at_ms: u64) -> S
             format!("agent:{node_id}"),
             "agent",
             1_000,
-            75_000,
             deadline_at_ms,
             1,
         ),
@@ -908,6 +908,7 @@ async fn two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota
             attempt: 1,
             expected_graph_revision: 0,
             objective: format!("execute root Team {index}"),
+            team_role_identity: None,
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
@@ -924,7 +925,6 @@ async fn two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota
                 format!("root-team-agent-{index}"),
                 "agent",
                 1_000,
-                75_000,
                 u64::MAX,
                 1,
             ),
@@ -1119,6 +1119,16 @@ async fn evidence_ready_reviewer_runs_on_failed_facts_and_never_rewrites_predece
                         observed_evidence: Vec::new(),
                         unresolved_obligation_ids: vec!["ok".to_string()],
                     },
+                    acceptance_evaluation: Some(
+                        harness_contract::acceptance::AcceptanceEvaluation {
+                            evaluator_revision:
+                                crate::acceptance_evaluator::AcceptanceEvaluator::REVISION,
+                            contract_digest: "fixture-contract".to_string(),
+                            receipt_set_digest: "fixture-receipts".to_string(),
+                            derived_obligations: Vec::new(),
+                            verdict: AcceptanceVerdict::Unsatisfied,
+                        },
+                    ),
                     ..ExecutionUsage::default()
                 },
                 finished_at_ms: 1,

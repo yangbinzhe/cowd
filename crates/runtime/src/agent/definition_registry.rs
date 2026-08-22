@@ -760,6 +760,7 @@ mod tests {
                         require_synthesis: true,
                         require_review: true,
                     },
+                    role_aliases: std::collections::BTreeMap::new(),
                     roles: vec![TeamRoleDefinition {
                         role_id: "reviewer".to_string(),
                         display_name: None,
@@ -768,6 +769,11 @@ mod tests {
                         agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
                         cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
                         partition: RolePartitionPolicy::Single,
+                        behavior: vec![
+                            harness_contract::team::RoleBehaviorFacet::TerminalCandidate {
+                                required: true,
+                            },
+                        ],
                         grant_ceiling: vec![AgentCapability::Read],
                         task_contract: TeamRoleTaskContract {
                             contract_ref: "task/review@1".to_string(),

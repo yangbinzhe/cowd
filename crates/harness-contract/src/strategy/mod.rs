@@ -1803,6 +1803,7 @@ impl StrategyRouter {
                     .to_string(),
             );
         }
+        let structural_team_obligation = automatic_team_is_structurally_required(&understanding);
         if !understanding.requests_multi_agent
             && candidate_estimates.iter().any(|estimate| {
                 estimate.candidate == ExecutionCandidateKind::Team
@@ -1811,10 +1812,13 @@ impl StrategyRouter {
                         || !estimate.quality_optimization_ready())
             })
         {
-            reasons.push(
-                "automatic Team requires calibrated or observed topology evidence; heuristic-only estimates are insufficient"
-                    .to_string(),
-            );
+            reasons.push(if structural_team_obligation {
+                "automatic Team is required by independently verifiable responsibility domains; historical calibration may tune capacity but cannot erase the current objective's ownership obligations"
+                    .to_string()
+            } else {
+                "automatic Team requires calibrated or observed topology evidence when the current objective does not itself require independent ownership"
+                    .to_string()
+            });
         }
         let selected_candidate = if matches!(source, StrategyDecisionSource::ExperienceAdapted) {
             candidate_for_pattern(pattern).unwrap_or_else(|| {
@@ -2191,8 +2195,22 @@ fn select_execution_candidate(
                 estimate.candidate
             });
     }
-    // Automatic Team selection requires a genuinely multi-domain topology and
-    // calibrated evidence. Duration and quality are evaluated in their own
+    // A current objective can itself require independent ownership.  In that
+    // case historical calibration may tune capacity, but it cannot erase the
+    // need to materialize the accountable workstreams.  This remains a
+    // semantic, data-derived decision: no Team name, template name, provider
+    // family, or price estimate participates in the predicate.
+    if automatic_team_is_structurally_required(understanding) {
+        if let Some(team) = estimates
+            .iter()
+            .find(|estimate| estimate.candidate == ExecutionCandidateKind::Team)
+            .filter(|estimate| estimate.eligible && estimate.expected_quality_lift_bp > 0)
+        {
+            return team.candidate;
+        }
+    }
+    // Otherwise automatic Team selection requires a genuinely multi-domain
+    // topology and calibrated evidence. Duration and quality remain separate
     // dimensions; neither is converted into a synthetic cross-unit score.
     if (matches!(
         understanding.complexity,
@@ -2251,6 +2269,27 @@ fn select_execution_candidate(
         .map_or(ExecutionCandidateKind::Direct, |estimate| {
             estimate.candidate
         })
+}
+
+/// A task with three or more independently verifiable responsibility domains
+/// cannot be truthfully reduced to one owner merely because this exact shape
+/// has not appeared in a historical benchmark.  The condition deliberately
+/// relies on normalized task semantics, not repository/product role names.
+/// Return whether the current objective itself requires independently
+/// accountable Team work, regardless of the availability of historical
+/// calibration samples.
+///
+/// This is deliberately part of the normalized strategy contract rather than
+/// a Router-local heuristic: every downstream decision that selects a Team
+/// template must consume this exact semantic predicate.  Otherwise a Team
+/// can be selected for independent evidence work and subsequently compiled
+/// with a topology that does not own those responsibilities.
+#[must_use]
+pub fn automatic_team_is_structurally_required(understanding: &TaskUnderstanding) -> bool {
+    !understanding.forbids_team
+        && understanding.required_team_count == 0
+        && understanding.independent_workstreams >= 3
+        && understanding.requires_tool_evidence
 }
 
 fn candidate_for_pattern(pattern: ExecutionPattern) -> Option<ExecutionCandidateKind> {
@@ -4202,7 +4241,7 @@ mod tests {
     #[test]
     fn every_candidate_records_integer_costs_and_snapshot_provenance() {
         let decision = decide_strategy(&StrategyInput::from_prompt(
-            "全面审查 runtime gateway frontend 三个独立责任域并综合",
+            "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
         ));
         assert_eq!(decision.candidate_estimates.len(), 3);
         assert_eq!(
@@ -4815,11 +4854,16 @@ mod tests {
     }
 
     #[test]
-    fn assumed_team_benefit_never_materializes_automatic_team() {
+    fn independent_evidence_obligation_materializes_automatic_team_without_history() {
         let decision = decide_strategy(&StrategyInput::from_prompt(
-            "全面审查 runtime gateway frontend 三个独立责任域并综合",
+            "全面审查 runtime gateway frontend 三个独立责任域，分别给出工具证据后综合",
         ));
-        assert_ne!(decision.selected_candidate, ExecutionCandidateKind::Team);
+        assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
+        assert_eq!(decision.pattern, ExecutionPattern::Collaborate);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| { reason.contains("independently verifiable responsibility domains") }));
         let team = decision
             .candidate_estimates
             .iter()

@@ -115,4 +115,8 @@ if [[ -z "$memory_id" ]]; then
 fi
 curl -fsS "$BASE_URL/api/memory/lifecycle/$memory_id" | rg -q '"events"'
 
-curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
+# This scenario intentionally configures an unreachable provider because it
+# exercises the local memory control plane only.  `/readyz` correctly remains
+# false when an external model dependency is unavailable; `/healthz` is the
+# Gateway-local health contract relevant to this test.
+curl -fsS "$BASE_URL/healthz" >/dev/null

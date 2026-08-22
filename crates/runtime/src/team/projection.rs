@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{ExecutionGraph, ExecutionNodeKind, ExecutionNodeStatus};
-use harness_contract::team::{AgentDisplayIdentity, TeamRunResult, TeamTaskTrace};
+use harness_contract::team::{
+    AgentDisplayIdentity, TeamLifecycleState, TeamRunResult, TeamTaskTrace,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentRuntime, ExecutionGraphStateStore, RuntimeEventStore};
@@ -13,7 +15,21 @@ pub struct TeamProjection {
     pub session_id: String,
     pub graph_id: String,
     pub graph_revision: u64,
+    /// Graph-derived lifecycle.  This is deliberately separate from the
+    /// terminal delivery status below: a failed/blocked branch must not make
+    /// a still-running Team appear partially complete.
+    pub lifecycle: TeamLifecycleState,
     pub status: String,
+    /// Exact node that currently determines a non-terminal wait, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_node_id: Option<String>,
+    /// Typed wait/terminal status for `blocking_node_id`; UI never has to
+    /// infer lifecycle from a free-form message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_node_status: Option<ExecutionNodeStatus>,
+    /// Bounded canonical failure kind, if the blocking node has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocking_reason_kind: Option<String>,
     /// Human-facing team display name from the frozen Binding, when declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_label: Option<String>,
@@ -247,9 +263,15 @@ impl TeamProjectionReader {
                 session_id = Some(packet.session_id().to_string());
             }
             let durable_result = graph.node_results.get(&node.id);
+            let role = packet.team_role_assignment().ok_or_else(|| {
+                format!(
+                    "Team AgentTask {} lacks its frozen typed role assignment",
+                    node.id
+                )
+            })?;
             tasks.push(TeamTaskTrace {
                 task_id: packet.task_id().to_string(),
-                role_id: node.id.rsplit(':').next().unwrap_or_default().to_string(),
+                role_id: role.identity.role_id.clone(),
                 agent_id: packet.agent_id().to_string(),
                 run_id: packet.run_id().to_string(),
                 node_id: node.id.clone(),
@@ -319,44 +341,8 @@ impl TeamProjectionReader {
         binding_digests.sort();
         binding_digests.dedup();
         agent_displays.sort_by(|left, right| left.label.cmp(&right.label));
-        let status = if !graph.nodes.is_empty()
-            && graph
-                .node_statuses
-                .values()
-                .all(|status| status.is_terminal())
-        {
-            graph
-                .delivery_envelope
-                .as_ref()
-                .map(|envelope| match envelope.delivery_status {
-                    harness_contract::outcome::DeliveryStatus::Satisfied => "completed",
-                    harness_contract::outcome::DeliveryStatus::Partial => "partial",
-                    harness_contract::outcome::DeliveryStatus::Unavailable => "unavailable",
-                    harness_contract::outcome::DeliveryStatus::Denied => "denied",
-                })
-                .unwrap_or_else(|| {
-                    if graph
-                        .node_statuses
-                        .values()
-                        .any(|status| *status == ExecutionNodeStatus::Failed)
-                    {
-                        "failed"
-                    } else {
-                        "completed"
-                    }
-                })
-        } else if graph
-            .node_statuses
-            .values()
-            .any(|status| *status == ExecutionNodeStatus::Blocked)
-        {
-            // A blocked lane while other lanes are still running is a
-            // non-terminal waiting state; it must never project as partial.
-            "waiting_dependency"
-        } else {
-            "running"
-        }
-        .to_string();
+        let (lifecycle, status, blocking_node_id, blocking_node_status, blocking_reason_kind) =
+            project_lifecycle(&graph);
         let display_label = self
             .binding_store
             .as_ref()
@@ -376,13 +362,152 @@ impl TeamProjectionReader {
             session_id,
             graph_id: graph.id,
             graph_revision: graph.revision,
+            lifecycle,
             status,
+            blocking_node_id,
+            blocking_node_status,
+            blocking_reason_kind,
             display_label,
             tasks,
             terminal_result,
             binding_digests,
             agent_displays,
         })
+    }
+}
+
+fn project_lifecycle(
+    graph: &ExecutionGraph,
+) -> (
+    TeamLifecycleState,
+    String,
+    Option<String>,
+    Option<ExecutionNodeStatus>,
+    Option<String>,
+) {
+    let terminal = !graph.nodes.is_empty()
+        && graph.nodes.iter().all(|node| {
+            graph
+                .node_statuses
+                .get(&node.id)
+                .copied()
+                .unwrap_or(ExecutionNodeStatus::Planned)
+                .is_terminal()
+        });
+    if terminal {
+        let status = graph
+            .delivery_envelope
+            .as_ref()
+            .map(|envelope| match envelope.delivery_status {
+                harness_contract::outcome::DeliveryStatus::Satisfied => "completed",
+                harness_contract::outcome::DeliveryStatus::Partial => "partial",
+                harness_contract::outcome::DeliveryStatus::Unavailable => "unavailable",
+                harness_contract::outcome::DeliveryStatus::Denied => "denied",
+            })
+            .unwrap_or_else(|| {
+                if graph
+                    .node_statuses
+                    .values()
+                    .any(|status| *status == ExecutionNodeStatus::Cancelled)
+                {
+                    "cancelled"
+                } else if graph
+                    .node_statuses
+                    .values()
+                    .any(|status| *status == ExecutionNodeStatus::Failed)
+                {
+                    "failed"
+                } else if graph
+                    .node_statuses
+                    .values()
+                    .any(|status| *status == ExecutionNodeStatus::Blocked)
+                {
+                    "blocked"
+                } else {
+                    "completed"
+                }
+            })
+            .to_string();
+        return (TeamLifecycleState::Terminal, status, None, None, None);
+    }
+
+    // The precedence is explicit and deterministic.  A wait is observable
+    // even while independent branches continue running, but it never changes
+    // terminal delivery semantics before the whole graph reaches terminal.
+    let priorities = [
+        (
+            ExecutionNodeStatus::Paused,
+            TeamLifecycleState::Paused,
+            "paused",
+        ),
+        (
+            ExecutionNodeStatus::WaitingInput,
+            TeamLifecycleState::WaitingInput,
+            "waiting_input",
+        ),
+        (
+            ExecutionNodeStatus::WaitingApproval,
+            TeamLifecycleState::WaitingApproval,
+            "waiting_approval",
+        ),
+        (
+            ExecutionNodeStatus::WaitingExternal,
+            TeamLifecycleState::WaitingExternal,
+            "waiting_external",
+        ),
+        (
+            ExecutionNodeStatus::Blocked,
+            TeamLifecycleState::WaitingDependency,
+            "waiting_dependency",
+        ),
+    ];
+    for (target_status, lifecycle, status) in priorities {
+        if let Some(node) = graph
+            .nodes
+            .iter()
+            .filter(|node| graph.node_statuses.get(&node.id) == Some(&target_status))
+            .min_by(|left, right| left.id.cmp(&right.id))
+        {
+            let reason = graph
+                .node_results
+                .get(&node.id)
+                .and_then(|result| result.failure.as_ref())
+                .map(|failure| failure.kind.clone());
+            return (
+                lifecycle,
+                status.to_string(),
+                Some(node.id.clone()),
+                Some(target_status),
+                reason,
+            );
+        }
+    }
+    let all_not_started = graph.nodes.iter().all(|node| {
+        matches!(
+            graph
+                .node_statuses
+                .get(&node.id)
+                .copied()
+                .unwrap_or(ExecutionNodeStatus::Planned),
+            ExecutionNodeStatus::Planned | ExecutionNodeStatus::Ready
+        )
+    });
+    if all_not_started {
+        (
+            TeamLifecycleState::Preparing,
+            "preparing".to_string(),
+            None,
+            None,
+            None,
+        )
+    } else {
+        (
+            TeamLifecycleState::Running,
+            "running".to_string(),
+            None,
+            None,
+            None,
+        )
     }
 }
 
@@ -393,7 +518,27 @@ mod tests {
     use harness_contract::context::ChildExecutionBudgetReservation;
     use harness_contract::execution_graph::ExecutionNodeSpec;
     use harness_contract::policy::PermissionMode;
+    use harness_contract::team::{TeamRoleAssignment, TeamRoleIdentity};
     use std::sync::Arc;
+
+    fn frozen_role(role_id: &str) -> TeamRoleAssignment {
+        TeamRoleAssignment {
+            team_binding_id: "team-binding:projection-fixture".to_string(),
+            team_binding_digest: "f".repeat(64),
+            identity: TeamRoleIdentity {
+                role_id: role_id.to_string(),
+                slot: 1,
+                focus_id: format!("{role_id}:focus"),
+                focus_boundary: "fixture role-local boundary".to_string(),
+                evidence_responsibility: "fixture evidence".to_string(),
+                focus_scope_hash: "a".repeat(64),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 0,
+                output_acceptance: Vec::new(),
+            },
+            behavior: Vec::new(),
+        }
+    }
 
     fn packet(node_id: &str, run_id: &str) -> AgentTaskPacket {
         let intent = AgentTaskIntent {
@@ -414,10 +559,11 @@ mod tests {
             attempt: 1,
             expected_graph_revision: 1,
             objective: "project".to_string(),
+            team_role_identity: Some(frozen_role("implementer").identity),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
-            constraints: vec!["team_role:implementer".to_string()],
+            constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
             resource_scopes: Vec::new(),
@@ -430,7 +576,6 @@ mod tests {
                 "agent",
                 "team",
                 100,
-                7_500,
                 u64::MAX,
                 1,
             ),
@@ -460,6 +605,8 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
+            team_role_identity: intent.team_role_identity.clone(),
+            team_role: Some(frozen_role("implementer")),
             constraints: intent.constraints,
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
@@ -534,6 +681,34 @@ mod tests {
             .project_graph(graph)
             .expect("projection with a failed sibling");
         assert_eq!(projection.status, "running");
+        assert_eq!(projection.lifecycle, TeamLifecycleState::Running);
+    }
+
+    #[test]
+    fn nonterminal_waits_are_typed_and_name_the_durable_blocking_node() {
+        let mut graph = ExecutionGraph::new("waiting approval");
+        graph.id = "team-graph:team-1".to_string();
+        graph.nodes = vec![
+            agent_node("n-running", "run"),
+            agent_node("n-approval", "wait"),
+        ];
+        graph
+            .node_statuses
+            .insert("n-running".to_string(), ExecutionNodeStatus::Running);
+        graph.node_statuses.insert(
+            "n-approval".to_string(),
+            ExecutionNodeStatus::WaitingApproval,
+        );
+
+        let projection = reader().project_graph(graph).expect("projection");
+        assert_eq!(projection.lifecycle, TeamLifecycleState::WaitingApproval);
+        assert_eq!(projection.status, "waiting_approval");
+        assert_eq!(projection.blocking_node_id.as_deref(), Some("n-approval"));
+        assert_eq!(
+            projection.blocking_node_status,
+            Some(ExecutionNodeStatus::WaitingApproval)
+        );
+        assert!(projection.blocking_reason_kind.is_none());
     }
 
     #[test]
@@ -550,6 +725,21 @@ mod tests {
         assert_eq!(
             reader().project_graph(failed).expect("failed").status,
             "failed"
+        );
+        assert_eq!(
+            reader()
+                .project_graph({
+                    let mut graph = ExecutionGraph::new("cancelled");
+                    graph.id = "team-graph:team-1".to_string();
+                    graph.nodes = vec![agent_node("n-a", "a")];
+                    graph
+                        .node_statuses
+                        .insert("n-a".to_string(), ExecutionNodeStatus::Cancelled);
+                    graph
+                })
+                .expect("cancelled")
+                .status,
+            "cancelled"
         );
 
         let completed = {

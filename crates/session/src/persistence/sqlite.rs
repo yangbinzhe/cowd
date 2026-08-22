@@ -122,7 +122,6 @@ pub struct SessionUsageBucket {
     pub message_count: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub estimated_cost_usd: f64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -131,7 +130,6 @@ pub struct SessionUsageSummary {
     pub message_count: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    pub estimated_cost_usd: f64,
     pub by_platform: std::collections::BTreeMap<String, SessionUsageBucket>,
     pub by_model: std::collections::BTreeMap<String, SessionUsageBucket>,
     pub recent_sessions: Vec<SessionRecord>,
@@ -995,7 +993,6 @@ fn init_schema(conn: &Connection) -> Result<()> {
             metadata_json TEXT,
             input_tokens  INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
-            estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
             status TEXT NOT NULL DEFAULT 'active',
             created_at_ms INTEGER NOT NULL DEFAULT 0,
             updated_at_ms INTEGER NOT NULL DEFAULT 0,
@@ -1124,13 +1121,6 @@ fn init_schema(conn: &Connection) -> Result<()> {
     if !existing_session_columns.contains("output_tokens") {
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
-            [],
-        )
-        .map_err(sql_err)?;
-    }
-    if !existing_session_columns.contains("estimated_cost_usd") {
-        conn.execute(
-            "ALTER TABLE sessions ADD COLUMN estimated_cost_usd REAL NOT NULL DEFAULT 0.0",
             [],
         )
         .map_err(sql_err)?;
@@ -2283,8 +2273,6 @@ pub struct SessionRecord {
     pub input_tokens: i64,
     /// Cumulative output tokens (completion).
     pub output_tokens: i64,
-    /// Estimated total cost in USD.
-    pub estimated_cost_usd: f64,
     /// Lifecycle status (`active`, `closed`, etc.).
     pub status: String,
 }
@@ -2307,8 +2295,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         metadata_json: row.get(9)?,
         input_tokens: row.get(10)?,
         output_tokens: row.get(11)?,
-        estimated_cost_usd: row.get(12)?,
-        status: row.get(13)?,
+        status: row.get(12)?,
     })
 }
 
@@ -3642,9 +3629,9 @@ impl SqliteSessionStore {
             r"INSERT OR IGNORE INTO sessions
                (session_id, platform, chat_id, user_id, model,
                 created_at, last_activity, message_count, reset_policy, metadata_json,
-                input_tokens, output_tokens, estimated_cost_usd, status,
+                input_tokens, output_tokens, status,
                 created_at_ms, updated_at_ms)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 session.session_id,
                 session.platform,
@@ -3658,7 +3645,6 @@ impl SqliteSessionStore {
                 session.metadata_json,
                 session.input_tokens,
                 session.output_tokens,
-                session.estimated_cost_usd,
                 session.status,
                 iso_to_ms(&session.created_at),
                 iso_to_ms(&session.last_activity),
@@ -3674,7 +3660,7 @@ impl SqliteSessionStore {
         conn.query_row(
             r"SELECT session_id, platform, chat_id, user_id, model,
                       created_at, last_activity, message_count, reset_policy, metadata_json,
-                      input_tokens, output_tokens, estimated_cost_usd, status
+                      input_tokens, output_tokens, status
                FROM sessions WHERE session_id = ?1",
             params![session_id],
             row_to_record,
@@ -3692,7 +3678,7 @@ impl SqliteSessionStore {
         let sql = format!(
             r"SELECT session_id, platform, chat_id, user_id, model,
                       created_at, last_activity, message_count, reset_policy, metadata_json,
-                      input_tokens, output_tokens, estimated_cost_usd, status
+                      input_tokens, output_tokens, status
                  FROM sessions
                 WHERE session_id IN ({placeholders})
                 ORDER BY session_id ASC"
@@ -4171,9 +4157,8 @@ impl SqliteSessionStore {
                metadata_json = ?9,
                input_tokens  = ?10,
                output_tokens = ?11,
-               estimated_cost_usd = ?12,
-               status = ?13,
-               updated_at_ms = ?14
+               status = ?12,
+               updated_at_ms = ?13
                WHERE session_id = ?1",
             params![
                 session.session_id,
@@ -4187,7 +4172,6 @@ impl SqliteSessionStore {
                 session.metadata_json,
                 session.input_tokens,
                 session.output_tokens,
-                session.estimated_cost_usd,
                 session.status,
                 iso_to_ms(&session.last_activity),
             ],
@@ -4206,9 +4190,9 @@ impl SqliteSessionStore {
             r"INSERT INTO sessions
                (session_id, platform, chat_id, user_id, model,
                 created_at, last_activity, message_count, reset_policy, metadata_json,
-                input_tokens, output_tokens, estimated_cost_usd, status,
+                input_tokens, output_tokens, status,
                 created_at_ms, updated_at_ms)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                ON CONFLICT(session_id) DO UPDATE SET
                  platform = excluded.platform,
                  chat_id = excluded.chat_id,
@@ -4221,7 +4205,6 @@ impl SqliteSessionStore {
                  metadata_json = excluded.metadata_json,
                  input_tokens = excluded.input_tokens,
                  output_tokens = excluded.output_tokens,
-                 estimated_cost_usd = excluded.estimated_cost_usd,
                  status = excluded.status,
                  created_at_ms = excluded.created_at_ms,
                  updated_at_ms = excluded.updated_at_ms",
@@ -4238,7 +4221,6 @@ impl SqliteSessionStore {
                 session.metadata_json,
                 session.input_tokens,
                 session.output_tokens,
-                session.estimated_cost_usd,
                 session.status,
                 iso_to_ms(&session.created_at),
                 iso_to_ms(&session.last_activity),
@@ -4530,8 +4512,8 @@ impl SqliteSessionStore {
                      platform=?2, chat_id=?3, user_id=?4, model=?5,
                      last_activity=?6, message_count=?7, reset_policy=?8,
                      metadata_json=?9, input_tokens=?10, output_tokens=?11,
-                     estimated_cost_usd=?12, status=?13, updated_at_ms=?14
-                   WHERE session_id=?1 AND input_generation=?15
+                     status=?12, updated_at_ms=?13
+                   WHERE session_id=?1 AND input_generation=?14
                      AND input_admission_open=0",
                 params![
                     request.record.session_id,
@@ -4545,7 +4527,6 @@ impl SqliteSessionStore {
                     request.record.metadata_json,
                     request.record.input_tokens,
                     request.record.output_tokens,
-                    request.record.estimated_cost_usd,
                     request.record.status,
                     request.transition.updated_at_ms as i64,
                     current.expected_generation.saturating_add(1) as i64,
@@ -4590,7 +4571,7 @@ impl SqliteSessionStore {
             .prepare(
                 r"SELECT session_id, platform, chat_id, user_id, model,
                           created_at, last_activity, message_count, reset_policy, metadata_json,
-                          input_tokens, output_tokens, estimated_cost_usd, status
+                          input_tokens, output_tokens, status
                    FROM sessions ORDER BY last_activity DESC",
             )
             .map_err(sql_err)?;
@@ -4624,7 +4605,7 @@ impl SqliteSessionStore {
         let page_sql = format!(
             r"SELECT session_id, platform, chat_id, user_id, model,
                       created_at, last_activity, message_count, reset_policy, metadata_json,
-                      input_tokens, output_tokens, estimated_cost_usd, status
+                      input_tokens, output_tokens, status
                  FROM sessions{where_sql}
                 ORDER BY {sort_expr} {sort_order}, session_id ASC
                 LIMIT ? OFFSET ?"
@@ -4648,22 +4629,13 @@ impl SqliteSessionStore {
 
     pub fn session_usage_summary(&self, recent_limit: usize) -> Result<SessionUsageSummary> {
         let conn = self.conn()?;
-        let (session_count, message_count, input_tokens, output_tokens, estimated_cost_usd) = conn
+        let (session_count, message_count, input_tokens, output_tokens) = conn
             .query_row(
                 "SELECT COUNT(*),COALESCE(SUM(message_count),0),
-                        COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),
-                        COALESCE(SUM(estimated_cost_usd),0)
+                        COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0)
                    FROM sessions WHERE status NOT IN ('deleted','deleting')",
                 [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(sql_err)?;
         let load_buckets =
@@ -4671,7 +4643,7 @@ impl SqliteSessionStore {
                 let sql = format!(
                     "SELECT COALESCE(NULLIF(TRIM({column}),''),'unknown'),COUNT(*),
                         COALESCE(SUM(message_count),0),COALESCE(SUM(input_tokens),0),
-                        COALESCE(SUM(output_tokens),0),COALESCE(SUM(estimated_cost_usd),0)
+                        COALESCE(SUM(output_tokens),0)
                    FROM sessions WHERE status NOT IN ('deleted','deleting')
                   GROUP BY 1 ORDER BY 1"
                 );
@@ -4685,7 +4657,6 @@ impl SqliteSessionStore {
                                 message_count: row.get(2)?,
                                 input_tokens: row.get(3)?,
                                 output_tokens: row.get(4)?,
-                                estimated_cost_usd: row.get(5)?,
                             },
                         ))
                     })
@@ -4708,7 +4679,6 @@ impl SqliteSessionStore {
             message_count,
             input_tokens,
             output_tokens,
-            estimated_cost_usd,
             by_platform: load_buckets("platform")?,
             by_model: load_buckets("model")?,
             recent_sessions,
@@ -4796,8 +4766,7 @@ impl SqliteSessionStore {
         let page_sql = format!(
             r"SELECT s.session_id, s.platform, s.chat_id, s.user_id, s.model,
                       s.created_at, s.last_activity, s.message_count, s.reset_policy,
-                      s.metadata_json, s.input_tokens, s.output_tokens,
-                      s.estimated_cost_usd, s.status
+                      s.metadata_json, s.input_tokens, s.output_tokens, s.status
                  {authority_clause}{query_clause}
                 ORDER BY s.last_activity DESC, s.session_id ASC
                 LIMIT ? OFFSET ?"
@@ -4825,7 +4794,7 @@ impl SqliteSessionStore {
             .prepare(
                 r"SELECT session_id, platform, chat_id, user_id, model,
                           created_at, last_activity, message_count, reset_policy, metadata_json,
-                          input_tokens, output_tokens, estimated_cost_usd, status
+                          input_tokens, output_tokens, status
                    FROM sessions WHERE platform = ?1 ORDER BY last_activity DESC",
             )
             .map_err(sql_err)?;
@@ -4853,7 +4822,7 @@ impl SqliteSessionStore {
             .prepare(
                 r"SELECT session_id, platform, chat_id, user_id, model,
                           created_at, last_activity, message_count, reset_policy, metadata_json,
-                          input_tokens, output_tokens, estimated_cost_usd, status
+                          input_tokens, output_tokens, status
                    FROM sessions
                   WHERE json_extract(metadata_json, '$.workspace_root') = ?1
                   ORDER BY last_activity DESC, session_id ASC",
@@ -5493,8 +5462,7 @@ impl SqliteSessionStore {
                 .query_row(
                     r"SELECT session_id, platform, chat_id, user_id, model,
                               created_at, last_activity, message_count, reset_policy,
-                              metadata_json, input_tokens, output_tokens,
-                              estimated_cost_usd, status
+                              metadata_json, input_tokens, output_tokens, status
                          FROM sessions WHERE session_id=?1",
                     params![request.target.session_id],
                     row_to_record,
@@ -5552,9 +5520,9 @@ impl SqliteSessionStore {
             r"INSERT INTO sessions
                (session_id, platform, chat_id, user_id, model,
                 created_at, last_activity, message_count, reset_policy, metadata_json,
-                input_tokens, output_tokens, estimated_cost_usd, status,
+                input_tokens, output_tokens, status,
                 created_at_ms, updated_at_ms)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, 0, 0, 0, ?10, ?11, ?12)",
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, 0, 0, ?10, ?11, ?12)",
             params![
                 request.target.session_id,
                 request.target.platform,
@@ -8929,7 +8897,6 @@ mod tests {
             metadata_json: None,
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         }
     }
@@ -9081,8 +9048,8 @@ mod tests {
                         r"INSERT INTO sessions
                            (session_id, platform, chat_id, user_id, model,
                             created_at, last_activity, message_count, reset_policy, metadata_json,
-                            input_tokens, output_tokens, estimated_cost_usd, status)
-                           VALUES (?1, 'api_server', ?1, NULL, ?2, ?3, ?3, ?4, 'none', ?5, 0, 0, 0.0, ?6)",
+                            input_tokens, output_tokens, status)
+                           VALUES (?1, 'api_server', ?1, NULL, ?2, ?3, ?3, ?4, 'none', ?5, 0, 0, ?6)",
                     )
                     .unwrap();
                 for i in 0..10_000 {
@@ -10221,7 +10188,6 @@ mod tests {
                 metadata_json TEXT,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
-                estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at_ms INTEGER NOT NULL DEFAULT 0,
                 updated_at_ms INTEGER NOT NULL DEFAULT 0
@@ -11050,7 +11016,6 @@ mod tests {
                     metadata_json TEXT,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
-                    estimated_cost_usd REAL NOT NULL DEFAULT 0.0,
                     status TEXT NOT NULL DEFAULT 'active',
                     created_at_ms INTEGER NOT NULL DEFAULT 0,
                     updated_at_ms INTEGER NOT NULL DEFAULT 0

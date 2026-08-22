@@ -101,7 +101,18 @@ runtime:
 # 只有 Provider 返回明确的、更小的数值上限时，当前 Runtime 才会临时校准并重试一次，
 # 不会改写此配置。未配置且无法识别的模型按 128K 上下文、64K 最大输出估算。
 # ~/.cowd/models.yaml 是进程级模型元数据，修改后需重启 Gateway 才会重建快照。
-model_context_windows: {}
+model_context_windows:
+  deepseek-v4-pro: 1000000
+  deepseek-v4-flash: 1000000
+  qwen3.8-max: 1000000
+  qwen3.7-max: 1000000
+  qwen3.7-plus: 1000000
+  qwen3.6-plus: 1000000
+  qwen3.6-flash: 1000000
+  qwen3-max: 262144
+  qwen-long: 10000000
+  glm-5.2: 1048576
+  glm-5: 204800
 # 示例:
 # model_context_windows:
 #   "my-custom-model": 32000

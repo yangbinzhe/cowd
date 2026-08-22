@@ -212,7 +212,11 @@ impl TeamRuntime {
                 }
                 self.ensure_root_task(&request)?;
                 self.reconcile_binding_markers(&graph_id, &request)?;
-                if projection.status == "running" {
+                // Lifecycle is the graph-derived execution authority. A
+                // recovered Team may legitimately be `preparing` or waiting
+                // when this process starts; delivery text must not suppress
+                // its one durable admission.
+                if projection.lifecycle != harness_contract::team::TeamLifecycleState::Terminal {
                     self.execution
                         .admit_registered(&graph_id)
                         .await
@@ -404,7 +408,12 @@ impl TeamRuntime {
         if crate::team_binding::has_ready_marker(&self.event_store, graph_id)? {
             return Ok(());
         }
-        crate::team_binding::persist_preparing(&self.event_store, graph_id, binding)?;
+        crate::team_binding::persist_preparing_with_task_commands(
+            &self.event_store,
+            graph_id,
+            binding,
+            task_commands,
+        )?;
         self.admit_tasks(task_commands, graph_id, graph_revision)?;
         crate::team_binding::persist_ready(&self.event_store, graph_id, &binding.binding_digest)
     }
@@ -437,6 +446,32 @@ impl TeamRuntime {
         if crate::team_binding::has_ready_marker(&self.event_store, graph_id)? {
             return Ok(());
         }
+        // A Preparing marker produced by the current admission protocol is
+        // already the immutable source of the Task link plan.  Never
+        // recompile it from a retried request: policy/template evolution in
+        // between a crash and recovery must not turn the same graph into a
+        // different Team.
+        if let Some(task_commands) =
+            crate::team_binding::load_prepared_task_commands(&self.event_store, graph_id)?
+        {
+            if task_commands.is_empty() {
+                return Err(format!(
+                    "Team graph `{graph_id}` Preparing Task link plan is empty"
+                ));
+            }
+            let binding = crate::team_binding::load_binding(&self.event_store, graph_id)?
+                .ok_or_else(|| format!("Team graph `{graph_id}` has no compiled Team Binding"))?;
+            let revision = self
+                .graphs
+                .load(graph_id)
+                .map_err(|error| error.to_string())?
+                .revision;
+            return self.persist_binding_markers(graph_id, &binding, &task_commands, revision);
+        }
+
+        // Old marker compatibility is deliberately confined to this live
+        // retry path. Startup reconciliation rejects markers without an
+        // immutable task plan rather than guessing from mutable state.
         let mut instantiated = self.plan(request.clone())?;
         self.bind_instantiated_task_policies(&mut instantiated)?;
         let TeamInstantiation {
@@ -454,7 +489,78 @@ impl TeamRuntime {
         self.persist_binding_markers(graph_id, &binding, &task_commands, revision)
     }
 
-    fn bind_instantiated_task_policies(
+    /// Complete durable Team admission markers left in `Preparing` by a
+    /// process crash.  The stored task plan was frozen with the Team Binding,
+    /// so this never re-selects a template, re-parses a prompt, or invents a
+    /// second Team.  The normal supervisor startup recovery owns execution
+    /// after this method has closed the Task link set.
+    pub(crate) fn reconcile_preparing_bindings_on_startup(
+        &self,
+        limit: usize,
+    ) -> Result<usize, String> {
+        let mut repaired = 0usize;
+        let mut cursor = None;
+        while repaired < limit {
+            let page = self
+                .graphs
+                .graph_ids_page(cursor.take(), limit.saturating_sub(repaired).max(1))
+                .map_err(|error| error.to_string())?;
+            if page.is_empty() {
+                break;
+            }
+            for (graph_id, _) in &page {
+                if repaired >= limit {
+                    break;
+                }
+                if crate::team_binding::has_ready_marker(&self.event_store, graph_id)? {
+                    continue;
+                }
+                let Some(binding) = crate::team_binding::load_binding(&self.event_store, graph_id)?
+                else {
+                    continue;
+                };
+                let graph = self
+                    .graphs
+                    .load(graph_id)
+                    .map_err(|error| error.to_string())?;
+                if !graph.nodes.iter().any(|node| {
+                    node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+                }) {
+                    continue;
+                }
+                let task_commands = crate::team_binding::load_prepared_task_commands(
+                    &self.event_store,
+                    graph_id,
+                )?
+                .ok_or_else(|| {
+                    format!(
+                        "Team graph `{graph_id}` has a Preparing binding without its durable Task link plan"
+                    )
+                })?;
+                if task_commands.is_empty() {
+                    return Err(format!(
+                        "Team graph `{graph_id}` Preparing Task link plan is empty"
+                    ));
+                }
+                self.admit_tasks(&task_commands, graph_id, graph.revision)?;
+                crate::team_binding::persist_ready(
+                    &self.event_store,
+                    graph_id,
+                    &binding.binding_digest,
+                )?;
+                repaired = repaired.saturating_add(1);
+            }
+            if page.len() < limit.saturating_sub(repaired).max(1) {
+                break;
+            }
+            cursor = page
+                .last()
+                .map(|(graph_id, commit_cursor)| (*commit_cursor, graph_id.clone()));
+        }
+        Ok(repaired)
+    }
+
+    pub(crate) fn bind_instantiated_task_policies(
         &self,
         instantiated: &mut crate::TeamInstantiation,
     ) -> Result<(), String> {
@@ -526,6 +632,9 @@ impl TeamRuntime {
             .binding
             .as_ref()
             .ok_or_else(|| "team board publish requires an immutable Agent Binding".to_string())?;
+        let role = packet.team_role_assignment().ok_or_else(|| {
+            "team board publish requires the frozen typed Team role assignment".to_string()
+        })?;
         let summary = request.summary.trim();
         if summary.is_empty() || summary.chars().count() > 16_000 {
             return Err("team board summary must contain 1..16000 characters".to_string());
@@ -590,13 +699,11 @@ impl TeamRuntime {
             graph_id: graph.id.clone(),
             node_id: request.node_id.clone(),
             producer_instance_id: binding.instance.instance_id.clone(),
-            role_id: packet_constraint(&packet, "team_role:"),
-            focus_id: packet_constraint(&packet, "focus_partition:"),
-            focus_scope_hash: packet_constraint(&packet, "focus_scope_hash:"),
-            overlap_budget_bp: packet_constraint(&packet, "focus_overlap_budget_bp:")
-                .and_then(|value| value.parse().ok()),
-            novelty_target_bp: packet_constraint(&packet, "focus_novelty_target_bp:")
-                .and_then(|value| value.parse().ok()),
+            role_id: Some(role.identity.role_id.clone()),
+            focus_id: Some(role.identity.focus_id.clone()),
+            focus_scope_hash: Some(role.identity.focus_scope_hash.clone()),
+            overlap_budget_bp: Some(role.identity.overlap_budget_bp),
+            novelty_target_bp: Some(role.identity.novelty_target_bp),
             focus_resource_scopes: packet.resource_scopes.clone(),
             observed_resource_scopes: Vec::new(),
             kind: request.kind,
@@ -679,12 +786,19 @@ impl TeamRuntime {
             .binding
             .as_ref()
             .ok_or_else(|| "team board read requires an immutable Agent Binding".to_string())?;
-        let role_id = packet_constraint(&packet, "team_role:");
+        let role_id = packet
+            .team_role_assignment()
+            .ok_or_else(|| {
+                "team board read requires the frozen typed Team role assignment".to_string()
+            })?
+            .identity
+            .role_id
+            .clone();
         let mut state = self.working_state_for_graph(team_id, &request.graph_id)?;
         state.entries.retain(|entry| {
             let visible = match entry.visibility {
                 TeamWorkingStateVisibility::Team => true,
-                TeamWorkingStateVisibility::Role => entry.role_id == role_id,
+                TeamWorkingStateVisibility::Role => entry.role_id.as_deref() == Some(&role_id),
                 TeamWorkingStateVisibility::Private => {
                     entry.producer_instance_id == binding.instance.instance_id
                 }
@@ -848,11 +962,4 @@ impl TeamRuntime {
             "quarantined": quarantined,
         })
     }
-}
-
-fn packet_constraint(packet: &AgentTaskPacket, prefix: &str) -> Option<String> {
-    packet
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix(prefix).map(str::to_string))
 }

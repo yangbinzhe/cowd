@@ -167,32 +167,21 @@ impl NodeExecutor for VerifyNodeExecutor {
                         .collect::<BTreeSet<_>>();
                     let produced_evidence =
                         produced_team_evidence(result, &packet.evidence_refs, &upstream_evidence);
-                    let completed_acceptance = packet.acceptance.iter().all(|criterion| {
-                        result.evidence_refs.iter().any(|reference| {
-                            reference.evidence_ref.ref_type == "runtime_acceptance"
-                                && reference.evidence_ref.id
-                                    == crate::execution_core::graph::executors::agent::acceptance_marker_id(
-                                        predecessor_id,
-                                        criterion,
-                                    )
-                        })
-                    });
+                    let completed_acceptance = result
+                        .usage
+                        .acceptance_evaluation
+                        .as_ref()
+                        .is_some_and(|evaluation| {
+                            evaluation.evaluator_revision
+                                == crate::acceptance_evaluator::AcceptanceEvaluator::REVISION
+                                && evaluation.verdict
+                                    == harness_contract::acceptance::AcceptanceVerdict::Satisfied
+                        });
+                    // The frozen packet is the contract. Reading a serialized
+                    // constraint here would let recovery and a live execution
+                    // disagree about the Team evidence obligation.
                     let typed_requirements = (!packet.output_acceptance.is_empty())
                         .then(|| packet.output_acceptance.clone())
-                        .or_else(|| {
-                            packet
-                                .constraints
-                                .iter()
-                                .find_map(|constraint| {
-                                    constraint.strip_prefix("team_acceptance_contract:")
-                                })
-                                .and_then(|value| {
-                                    serde_json::from_str::<
-                                        Vec<harness_contract::team::TeamAcceptanceRequirement>,
-                                    >(value)
-                                    .ok()
-                                })
-                        })
                         .filter(|requirements| {
                             requirements.len() == packet.acceptance.len()
                                 && requirements.iter().all(|requirement| {
@@ -236,11 +225,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                         });
                     let evidence_satisfied =
                         (requires_new_tool_evidence && produced_evidence) || retained_upstream;
-                    let role = packet_constraint(&packet, "team_role:");
-                    let focus = packet_constraint(&packet, "focus_partition:");
-                    let focus_hash = packet_constraint(&packet, "focus_scope_hash:");
-                    let evidence_responsibility =
-                        packet_constraint(&packet, "focus_evidence_responsibility:");
+                    let role = packet.team_role_assignment();
                     if requires_new_tool_evidence && result.usage.tool_calls == 0 {
                         invalid_team_slots.push(format!("{predecessor_id}:zero_tool_calls"));
                     }
@@ -258,11 +243,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                             "{predecessor_id}:missing_typed_acceptance_contract"
                         ));
                     }
-                    if role.is_none()
-                        || focus.is_none()
-                        || focus_hash.is_none()
-                        || evidence_responsibility.is_none()
-                    {
+                    if role.is_none() {
                         invalid_team_slots
                             .push(format!("{predecessor_id}:incomplete_role_focus_contract"));
                     }
@@ -279,15 +260,8 @@ impl NodeExecutor for VerifyNodeExecutor {
                     if evidence_satisfied {
                         satisfied_team_criteria.insert("evidence".to_string());
                     }
-                    for criterion in &packet.acceptance {
-                        if result.evidence_refs.iter().any(|reference| {
-                            reference.evidence_ref.ref_type == "runtime_acceptance"
-                                && reference.evidence_ref.id
-                                    == crate::execution_core::graph::executors::agent::acceptance_marker_id(
-                                        predecessor_id,
-                                        criterion,
-                                    )
-                        }) {
+                    if completed_acceptance {
+                        for criterion in &packet.acceptance {
                             satisfied_team_criteria.insert(criterion.to_ascii_lowercase());
                         }
                     }
@@ -416,19 +390,6 @@ impl NodeExecutor for VerifyNodeExecutor {
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
-}
-
-fn packet_constraint(
-    packet: &harness_contract::agent::AgentTaskPacket,
-    prefix: &str,
-) -> Option<String> {
-    packet
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix(prefix))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
 }
 
 fn produced_team_evidence(

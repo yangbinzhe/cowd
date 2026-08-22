@@ -56,7 +56,6 @@ pub struct EvolutionAnalysisModelOutput {
     pub suggested_candidate_kind: EvolutionAnalysisCandidateKind,
     pub acceptance_scenarios: Vec<String>,
     pub expected_value: String,
-    pub estimated_cost: String,
     pub risks: Vec<String>,
     pub unknowns: Vec<String>,
 }
@@ -65,8 +64,6 @@ pub struct EvolutionAnalysisModelOutput {
 pub struct EvolutionAnalysisUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
-    pub estimated_cost_microusd: Option<u64>,
-    pub pricing_observed: bool,
     pub stop_reason: Option<String>,
 }
 
@@ -136,7 +133,6 @@ mod tests {
             "suggested_candidate_kind": "architecture_plan",
             "acceptance_scenarios": ["scenario"],
             "expected_value": "value",
-            "estimated_cost": "cost",
             "risks": ["risk"],
             "unknowns": ["unknown"]
         });

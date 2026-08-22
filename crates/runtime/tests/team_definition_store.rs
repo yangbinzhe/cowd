@@ -4,8 +4,9 @@ use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, DefinitionScope, RevisionLifecycle, RevisionSelector,
 };
 use harness_contract::team::{
-    RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDefinition,
-    TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest, TeamTopologyContract,
+    RoleBehaviorFacet, RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract,
+    TeamRoleDefinition, TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest,
+    TeamTopologyContract,
 };
 use runtime::team_definition::{
     ScopedTeamTemplateLayout, TeamDefinitionStoreError, TeamTemplateDefinitionStore,
@@ -36,6 +37,7 @@ fn manifest(revision: u64, name: &str) -> TeamTemplateManifest {
             require_synthesis: true,
             require_review: true,
         },
+        role_aliases: std::collections::BTreeMap::new(),
         roles: vec![TeamRoleDefinition {
             role_id: "reviewer".to_string(),
             display_name: None,
@@ -48,6 +50,7 @@ fn manifest(revision: u64, name: &str) -> TeamTemplateManifest {
             agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
             cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
             partition: RolePartitionPolicy::Single,
+            behavior: vec![RoleBehaviorFacet::TerminalCandidate { required: true }],
             grant_ceiling: vec![AgentCapability::Read],
             task_contract: TeamRoleTaskContract {
                 contract_ref: "task/review@1".to_string(),

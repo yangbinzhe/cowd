@@ -11,8 +11,8 @@ mod state_store;
 pub mod resources;
 
 pub use commit_service::{
-    ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService, ExecutionEffectState,
-    ToolEffectState,
+    DurableAgentToolReceipt, ExecutionCommitError, ExecutionCommitReceipt, ExecutionCommitService,
+    ExecutionEffectState, ToolEffectState,
 };
 pub use compiler::{ExecutionCompileError, ExecutionCompileRequest, ExecutionGraphCompiler};
 pub use events::{ExecutionGraphEvent, ExecutionNodeBinding};

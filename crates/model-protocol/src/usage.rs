@@ -1,133 +1,14 @@
-const DEFAULT_INPUT_COST_PER_MILLION: f64 = 15.0;
-const DEFAULT_OUTPUT_COST_PER_MILLION: f64 = 75.0;
-const DEFAULT_CACHE_CREATION_COST_PER_MILLION: f64 = 18.75;
-const DEFAULT_CACHE_READ_COST_PER_MILLION: f64 = 1.5;
-
-/// Per-million-token pricing used for cost estimation.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelPricing {
-    pub input_cost_per_million: f64,
-    pub output_cost_per_million: f64,
-    pub cache_creation_cost_per_million: f64,
-    pub cache_read_cost_per_million: f64,
-}
-
-impl ModelPricing {
-    #[must_use]
-    pub const fn default_sonnet_tier() -> Self {
-        Self {
-            input_cost_per_million: DEFAULT_INPUT_COST_PER_MILLION,
-            output_cost_per_million: DEFAULT_OUTPUT_COST_PER_MILLION,
-            cache_creation_cost_per_million: DEFAULT_CACHE_CREATION_COST_PER_MILLION,
-            cache_read_cost_per_million: DEFAULT_CACHE_READ_COST_PER_MILLION,
-        }
-    }
-}
-
-/// Token counters accumulated for a conversation turn or session.
+/// Raw token counters reported by a provider for one completion.
+///
+/// These values are technical telemetry: context packing, output clipping,
+/// rate-limit observation, and performance diagnostics. They must never be
+/// converted into money, authorization, approval, or execution outcome.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub cache_creation_input_tokens: u32,
     pub cache_read_input_tokens: u32,
-}
-
-/// Estimated dollar cost derived from a [`TokenUsage`] sample.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct UsageCostEstimate {
-    pub input_cost_usd: f64,
-    pub output_cost_usd: f64,
-    pub cache_creation_cost_usd: f64,
-    pub cache_read_cost_usd: f64,
-}
-
-impl UsageCostEstimate {
-    #[must_use]
-    pub fn total_cost_usd(self) -> f64 {
-        self.input_cost_usd
-            + self.output_cost_usd
-            + self.cache_creation_cost_usd
-            + self.cache_read_cost_usd
-    }
-}
-
-#[must_use]
-pub fn heuristic_pricing_for_model(model: &str) -> Option<ModelPricing> {
-    let normalized = model.to_ascii_lowercase();
-    // DeepSeek publishes these exact model identifiers and per-million-token
-    // prices. Use the announced peak rates effective 2026-08-16 so the
-    // bundled fallback remains conservative across peak/off-peak periods and
-    // a finite delegated budget can admit the configured production model
-    // before Provider IO. Cache creation is charged at the cache-miss rate.
-    if normalized == "deepseek-v4-flash" {
-        return Some(ModelPricing {
-            input_cost_per_million: 0.44,
-            output_cost_per_million: 1.32,
-            cache_creation_cost_per_million: 0.44,
-            cache_read_cost_per_million: 0.014,
-        });
-    }
-    if normalized == "deepseek-v4-pro" {
-        return Some(ModelPricing {
-            input_cost_per_million: 1.32,
-            output_cost_per_million: 3.96,
-            cache_creation_cost_per_million: 1.32,
-            cache_read_cost_per_million: 0.044,
-        });
-    }
-    // Configured fallbacks must stay budget-admissible. These rates are
-    // conservative public list prices so a finite execution budget can admit
-    // the fallback chain before Provider IO instead of hard-blocking.
-    if normalized == "qwen3.6-plus" {
-        return Some(ModelPricing {
-            input_cost_per_million: 0.8,
-            output_cost_per_million: 2.0,
-            cache_creation_cost_per_million: 0.8,
-            cache_read_cost_per_million: 0.02,
-        });
-    }
-    if normalized == "step-3.7-flash" {
-        return Some(ModelPricing {
-            input_cost_per_million: 0.4,
-            output_cost_per_million: 1.2,
-            cache_creation_cost_per_million: 0.4,
-            cache_read_cost_per_million: 0.012,
-        });
-    }
-    if normalized == "glm-5.2" {
-        return Some(ModelPricing {
-            input_cost_per_million: 1.0,
-            output_cost_per_million: 4.0,
-            cache_creation_cost_per_million: 1.0,
-            cache_read_cost_per_million: 0.03,
-        });
-    }
-    if normalized.contains("haiku") {
-        return Some(ModelPricing {
-            input_cost_per_million: 1.0,
-            output_cost_per_million: 5.0,
-            cache_creation_cost_per_million: 1.25,
-            cache_read_cost_per_million: 0.1,
-        });
-    }
-    if normalized.contains("opus") {
-        return Some(ModelPricing {
-            input_cost_per_million: 15.0,
-            output_cost_per_million: 75.0,
-            cache_creation_cost_per_million: 18.75,
-            cache_read_cost_per_million: 1.5,
-        });
-    }
-    if normalized.contains("sonnet-4") {
-        return Some(ModelPricing {
-            input_cost_per_million: 3.0,
-            output_cost_per_million: 15.0,
-            cache_creation_cost_per_million: 3.75,
-            cache_read_cost_per_million: 0.30,
-        });
-    }
-    None
 }
 
 impl TokenUsage {
@@ -140,86 +21,24 @@ impl TokenUsage {
     }
 
     #[must_use]
-    pub fn estimate_cost_usd(self) -> UsageCostEstimate {
-        self.estimate_cost_usd_with_pricing(ModelPricing::default_sonnet_tier())
-    }
-
-    #[must_use]
-    pub fn estimate_cost_usd_with_pricing(self, pricing: ModelPricing) -> UsageCostEstimate {
-        UsageCostEstimate {
-            input_cost_usd: cost_for_tokens(self.input_tokens, pricing.input_cost_per_million),
-            output_cost_usd: cost_for_tokens(self.output_tokens, pricing.output_cost_per_million),
-            cache_creation_cost_usd: cost_for_tokens(
-                self.cache_creation_input_tokens,
-                pricing.cache_creation_cost_per_million,
-            ),
-            cache_read_cost_usd: cost_for_tokens(
-                self.cache_read_input_tokens,
-                pricing.cache_read_cost_per_million,
-            ),
-        }
-    }
-
-    #[must_use]
     pub fn summary_lines(self, label: &str) -> Vec<String> {
-        self.summary_lines_for_model(label, None)
+        vec![format!(
+            "{label}: total_tokens={} input={} output={} cache_write={} cache_read={}",
+            self.total_tokens(),
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+        )]
     }
-
-    #[must_use]
-    pub fn summary_lines_for_model(self, label: &str, model: Option<&str>) -> Vec<String> {
-        let pricing = model.and_then(heuristic_pricing_for_model);
-        let cost = pricing.map_or_else(
-            || self.estimate_cost_usd(),
-            |pricing| self.estimate_cost_usd_with_pricing(pricing),
-        );
-        let model_suffix =
-            model.map_or_else(String::new, |model_name| format!(" model={model_name}"));
-        let pricing_suffix = if pricing.is_some() {
-            ""
-        } else if model.is_some() {
-            " pricing=estimated-default"
-        } else {
-            ""
-        };
-        vec![
-            format!(
-                "{label}: total_tokens={} input={} output={} cache_write={} cache_read={} estimated_cost={}{}{}",
-                self.total_tokens(),
-                self.input_tokens,
-                self.output_tokens,
-                self.cache_creation_input_tokens,
-                self.cache_read_input_tokens,
-                format_usd(cost.total_cost_usd()),
-                model_suffix,
-                pricing_suffix,
-            ),
-            format!(
-                "  cost breakdown: input={} output={} cache_write={} cache_read={}",
-                format_usd(cost.input_cost_usd),
-                format_usd(cost.output_cost_usd),
-                format_usd(cost.cache_creation_cost_usd),
-                format_usd(cost.cache_read_cost_usd),
-            ),
-        ]
-    }
-}
-
-fn cost_for_tokens(tokens: u32, usd_per_million_tokens: f64) -> f64 {
-    f64::from(tokens) / 1_000_000.0 * usd_per_million_tokens
-}
-
-/// Formats a dollar-denominated value for display.
-#[must_use]
-pub fn format_usd(amount: f64) -> String {
-    format!("${amount:.4}")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{format_usd, heuristic_pricing_for_model, TokenUsage};
+    use super::TokenUsage;
 
     #[test]
-    fn computes_cost_summary_lines() {
+    fn summarizes_technical_token_usage_without_money() {
         let usage = TokenUsage {
             input_tokens: 1_000_000,
             output_tokens: 500_000,
@@ -227,62 +46,10 @@ mod tests {
             cache_read_input_tokens: 200_000,
         };
 
-        let cost = usage.estimate_cost_usd();
-        assert_eq!(format_usd(cost.input_cost_usd), "$15.0000");
-        assert_eq!(format_usd(cost.output_cost_usd), "$37.5000");
-        let model_pricing =
-            heuristic_pricing_for_model("claude-sonnet-4-6").expect("known model pricing");
-        let model_cost = usage.estimate_cost_usd_with_pricing(model_pricing);
-        let lines = usage.summary_lines_for_model("usage", Some("claude-sonnet-4-6"));
-        assert!(lines[0].contains(&format!(
-            "estimated_cost={}",
-            format_usd(model_cost.total_cost_usd())
-        )));
-        assert!(lines[0].contains("model=claude-sonnet-4-6"));
-        assert!(lines[1].contains(&format!(
-            "cache_read={}",
-            format_usd(model_cost.cache_read_cost_usd)
-        )));
-    }
-
-    #[test]
-    fn supports_model_specific_pricing() {
-        let usage = TokenUsage {
-            input_tokens: 1_000_000,
-            output_tokens: 500_000,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-
-        let haiku =
-            heuristic_pricing_for_model("claude-haiku-4-5-20251001").expect("haiku pricing");
-        let opus = heuristic_pricing_for_model("claude-opus-4-6").expect("opus pricing");
-        let haiku_cost = usage.estimate_cost_usd_with_pricing(haiku);
-        let opus_cost = usage.estimate_cost_usd_with_pricing(opus);
-        assert_eq!(format_usd(haiku_cost.total_cost_usd()), "$3.5000");
-        assert_eq!(format_usd(opus_cost.total_cost_usd()), "$52.5000");
-    }
-
-    #[test]
-    fn resolves_configured_deepseek_v4_pricing_for_finite_runtime_budgets() {
-        let flash = heuristic_pricing_for_model("deepseek-v4-flash").unwrap();
-        let pro = heuristic_pricing_for_model("deepseek-v4-pro").unwrap();
-        assert_eq!(flash.input_cost_per_million, 0.44);
-        assert_eq!(flash.output_cost_per_million, 1.32);
-        assert_eq!(pro.input_cost_per_million, 1.32);
-        assert_eq!(pro.output_cost_per_million, 3.96);
-        assert!(heuristic_pricing_for_model("deepseek-v4-future").is_none());
-    }
-
-    #[test]
-    fn marks_unknown_model_pricing_as_fallback() {
-        let usage = TokenUsage {
-            input_tokens: 100,
-            output_tokens: 100,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        };
-        let lines = usage.summary_lines_for_model("usage", Some("custom-model"));
-        assert!(lines[0].contains("pricing=estimated-default"));
+        let lines = usage.summary_lines("usage");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("total_tokens=1800000"));
+        assert!(!lines[0].contains("cost"));
+        assert!(!lines[0].contains('$'));
     }
 }

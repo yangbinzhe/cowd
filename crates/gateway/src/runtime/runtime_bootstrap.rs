@@ -429,7 +429,7 @@ fn runtime_orchestration_input_schema() -> serde_json::Value {
             },
             "roles": {
                 "type": "array",
-                "description": "One object per role. Recommended fields: role_id (string), display_name (string, shown in UI), team (business/technical/convergence), responsibility (string), grant_ceiling (array of read/search/write/test/network, or a string like workspace-read-write), agent_definition_ref (optional exact id from agent_catalog; omit/null for a safe default), fixed_count/min_count/max_count (positive integers), acceptance (array of strings). Extra fields are tolerated.",
+                "description": "One object per role. Required semantic fields: role_id, responsibility, behavior. behavior is one or more typed facets, for example [{kind:reacquire_evidence,required:true}] or [{kind:reducer,mode:finally},{kind:upstream_consumption,required:true},{kind:terminal_candidate,required:true}]. Runtime freezes those facets and never infers them from a role name, graph position, or result field. Other fields: display_name (UI only), team (business/technical/convergence), grant_ceiling (array of read/search/write/test/network, or a string like workspace-read-write), agent_definition_ref (optional exact id from agent_catalog; omit/null for a safe default), fixed_count/min_count/max_count (positive integers), acceptance (array of strings). Extra fields are tolerated.",
                 "items": {
                     "type": "object",
                     "additionalProperties": true
@@ -667,12 +667,14 @@ mod tests {
         );
         assert_eq!(semantic_node["cancellation_group"]["type"][0], "string");
         assert!(
-            orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]["roles"]
+            orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]
+                ["roles"]
                 .is_object(),
             "the model must receive the typed Team template proposal contract"
         );
         assert_eq!(
-            orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]["dependencies"]["type"],
+            orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]
+                ["dependencies"]["type"],
             serde_json::json!(["array", "object", "string"]),
             "dependency guidance must stay relaxed so models never refuse the tool"
         );

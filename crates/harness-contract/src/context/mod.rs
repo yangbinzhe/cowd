@@ -468,9 +468,9 @@ impl ContextBudgetLeaseRef {
     }
 }
 
-/// Immutable usage-meter bounds owned by one parent execution.
+/// Immutable technical resource bounds owned by one parent execution.
 ///
-/// These fields meter predicted/observed token and cost usage for projection
+/// These fields meter predicted/observed token capacity for projection
 /// and audit only. They are **not** admission ceilings: provider IO is never
 /// rejected from cumulative budget exhaustion (context window fit and
 /// deadline are the execution boundaries).
@@ -485,12 +485,9 @@ pub struct ParentExecutionBudget {
     /// is not a failure while aggregate safety capacity remains.
     #[serde(default)]
     pub predicted_tokens: u64,
-    #[serde(default)]
-    pub predicted_cost_microusd: u64,
     /// Aggregate safety ceilings. These protect the user/system from runaway
     /// work and must not be confused with the prediction above.
     pub max_tokens: u64,
-    pub max_cost_microusd: u64,
     pub deadline_at_ms: u64,
     pub max_parallel: usize,
     pub revision: u64,
@@ -501,7 +498,6 @@ impl ParentExecutionBudget {
     pub fn new(
         budget_id: impl Into<String>,
         max_tokens: u64,
-        max_cost_microusd: u64,
         deadline_at_ms: u64,
         max_parallel: usize,
         revision: u64,
@@ -509,9 +505,7 @@ impl ParentExecutionBudget {
         Self {
             budget_id: budget_id.into(),
             predicted_tokens: max_tokens,
-            predicted_cost_microusd: max_cost_microusd,
             max_tokens,
-            max_cost_microusd,
             deadline_at_ms,
             max_parallel,
             revision,
@@ -519,9 +513,8 @@ impl ParentExecutionBudget {
     }
 
     #[must_use]
-    pub fn with_prediction(mut self, tokens: u64, cost_microusd: u64) -> Self {
+    pub fn with_prediction(mut self, tokens: u64) -> Self {
         self.predicted_tokens = tokens.clamp(1, self.max_tokens);
-        self.predicted_cost_microusd = cost_microusd.clamp(1, self.max_cost_microusd);
         self
     }
 
@@ -535,24 +528,13 @@ impl ParentExecutionBudget {
     }
 
     #[must_use]
-    pub fn predicted_cost_microusd(&self) -> u64 {
-        if self.predicted_cost_microusd == 0 {
-            self.max_cost_microusd
-        } else {
-            self.predicted_cost_microusd.min(self.max_cost_microusd)
-        }
-    }
-
-    #[must_use]
     pub fn semantically_matches(&self, other: &Self) -> bool {
         self.budget_id == other.budget_id
             && self.max_tokens == other.max_tokens
-            && self.max_cost_microusd == other.max_cost_microusd
             && self.deadline_at_ms == other.deadline_at_ms
             && self.max_parallel == other.max_parallel
             && self.revision == other.revision
             && self.predicted_tokens() == other.predicted_tokens()
-            && self.predicted_cost_microusd() == other.predicted_cost_microusd()
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -562,10 +544,7 @@ impl ParentExecutionBudget {
         if self.max_tokens == 0 {
             return Err("parent execution token budget must be positive");
         }
-        if self.max_cost_microusd == 0 {
-            return Err("parent execution cost budget must be positive");
-        }
-        if self.predicted_tokens() == 0 || self.predicted_cost_microusd() == 0 {
+        if self.predicted_tokens() == 0 {
             return Err("parent execution budget prediction must be positive");
         }
         if self.deadline_at_ms == 0 {
@@ -583,7 +562,7 @@ impl ParentExecutionBudget {
 
 /// One deterministic child allocation target within a [`ParentExecutionBudget`].
 ///
-/// `max_tokens` and `max_cost_microusd` are the child's predicted initial
+/// `max_tokens` is the child's predicted initial
 /// share, not an isolated hard wall. Runtime may let a complex child borrow
 /// unused capacity from the durable parent pool. Only the parent ceiling,
 /// deadline, and parallelism remain hard safety limits. The token-shaped
@@ -601,7 +580,6 @@ pub struct ChildExecutionBudgetReservation {
     pub scope: String,
     pub max_tokens: u64,
     pub consumed_tokens: u64,
-    pub max_cost_microusd: u64,
     pub deadline_at_ms: u64,
     pub max_parallel: usize,
     pub revision: u64,
@@ -616,19 +594,12 @@ impl ChildExecutionBudgetReservation {
         owner_id: impl Into<String>,
         scope: impl Into<String>,
         max_tokens: u64,
-        max_cost_microusd: u64,
         deadline_at_ms: u64,
         revision: u64,
     ) -> Self {
         let lease_id = lease_id.into();
-        let parent_budget = ParentExecutionBudget::new(
-            lease_id.clone(),
-            max_tokens,
-            max_cost_microusd,
-            deadline_at_ms,
-            1,
-            revision,
-        );
+        let parent_budget =
+            ParentExecutionBudget::new(lease_id.clone(), max_tokens, deadline_at_ms, 1, revision);
         Self {
             parent_budget_id: lease_id.clone(),
             parent_budget,
@@ -637,7 +608,6 @@ impl ChildExecutionBudgetReservation {
             scope: scope.into(),
             max_tokens,
             consumed_tokens: 0,
-            max_cost_microusd,
             deadline_at_ms,
             max_parallel: 1,
             revision,
@@ -663,9 +633,6 @@ impl ChildExecutionBudgetReservation {
         if self.max_tokens == 0 || self.remaining_tokens() == 0 {
             return Err("child execution token reservation must be positive");
         }
-        if self.max_cost_microusd == 0 {
-            return Err("child execution cost reservation must be positive");
-        }
         if self.deadline_at_ms == 0 || self.max_parallel == 0 || self.revision == 0 {
             return Err("child execution resource reservation is incomplete");
         }
@@ -677,7 +644,6 @@ impl ChildExecutionBudgetReservation {
             || self.parent_budget.max_parallel != self.max_parallel
             || self.parent_budget.revision != self.revision
             || self.max_tokens > self.parent_budget.max_tokens
-            || self.max_cost_microusd > self.parent_budget.max_cost_microusd
         {
             return Err("child execution reservation does not match its parent budget");
         }
@@ -1646,21 +1612,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_parent_budget_defaults_prediction_to_its_safety_ceiling() {
-        let legacy = serde_json::json!({
+    fn parent_budget_defaults_prediction_to_its_safety_ceiling() {
+        let encoded = serde_json::json!({
             "budget_id": "legacy-budget",
             "max_tokens": 1000,
-            "max_cost_microusd": 5000,
             "deadline_at_ms": 99,
             "max_parallel": 2,
             "revision": 1
         });
         let decoded: ParentExecutionBudget =
-            serde_json::from_value(legacy).expect("legacy parent budget");
-        let canonical = ParentExecutionBudget::new("legacy-budget", 1000, 5000, 99, 2, 1);
+            serde_json::from_value(encoded).expect("parent budget");
+        let canonical = ParentExecutionBudget::new("legacy-budget", 1000, 99, 2, 1);
 
         assert_eq!(decoded.predicted_tokens(), 1000);
-        assert_eq!(decoded.predicted_cost_microusd(), 5000);
         assert!(decoded.semantically_matches(&canonical));
         assert!(decoded.validate().is_ok());
     }

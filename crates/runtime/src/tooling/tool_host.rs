@@ -78,6 +78,11 @@ pub struct RuntimeToolExecutionRequest {
     /// by the Runner, never parsed from model-generated tool JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution: Option<ExecutionParentBinding>,
+    /// Attempt fence for a delegated Agent tool receipt.  Together with the
+    /// parent graph/node it gives the durable receipt index an exact owner;
+    /// it is never inferred from a tool-use label during recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution_attempt: Option<u32>,
     /// Immutable execution decision for the owning conversation turn. Runtime
     /// supplies this lease so orchestration validation and Team identity never
     /// consult process-global Gateway state in concurrent sessions.
@@ -122,6 +127,7 @@ impl RuntimeToolExecutionRequest {
             memory_context: None,
             model_lease: None,
             parent_execution: None,
+            parent_execution_attempt: None,
             execution_decision: None,
             evaluation_isolated: false,
             managed_invocation: None,

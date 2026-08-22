@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use harness_contract::agent::{
     AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus, ReleaseChannel,
 };
-use harness_contract::context::{ObservedAcceptance, RequiredAcceptance};
+use harness_contract::{
+    acceptance::{AcceptanceEvaluation, AcceptanceVerdict},
+    context::{ObservedAcceptance, RequiredAcceptance},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -48,6 +51,8 @@ pub struct AgentRunEvaluation {
     pub required_acceptance: RequiredAcceptance,
     #[serde(default)]
     pub observed_acceptance: ObservedAcceptance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance_evaluation: Option<AcceptanceEvaluation>,
     pub outcome: String,
     pub failure: Option<String>,
     pub input_tokens: u64,
@@ -141,6 +146,7 @@ impl AgentRunEvaluation {
             terminal_status: returned.status,
             required_acceptance,
             observed_acceptance,
+            acceptance_evaluation: returned.acceptance_evaluation.clone(),
             outcome: returned.outcome.clone(),
             failure: returned.failure.clone(),
             input_tokens: returned.input_tokens,
@@ -160,15 +166,14 @@ impl AgentRunEvaluation {
         self.schema_revision == 1
             && self.terminal_status == AgentTerminalStatus::Completed
             && self.failure.is_none()
-            && self.required_acceptance.criteria.iter().all(|criterion| {
-                self.observed_acceptance
-                    .satisfied_criteria
-                    .contains(criterion)
-            })
             && self
-                .observed_acceptance
-                .unresolved_obligation_ids
-                .is_empty()
+                .acceptance_evaluation
+                .as_ref()
+                .is_some_and(|evaluation| {
+                    evaluation.evaluator_revision
+                        == crate::acceptance_evaluator::AcceptanceEvaluator::REVISION
+                        && evaluation.verdict == AcceptanceVerdict::Satisfied
+                })
     }
 }
 
@@ -180,33 +185,10 @@ pub(crate) fn required_acceptance_for_packet(
         return packet.required_acceptance.clone();
     }
     let mut scopes = Vec::new();
-    for constraint in &packet.constraints {
-        if let Some(value) = constraint.strip_prefix("focus_output_acceptance:") {
-            scopes.extend(
-                value
-                    .split(',')
-                    .filter_map(|criterion| criterion.trim().strip_prefix("evidence_scope:"))
-                    .filter(|scope| !scope.is_empty())
-                    .map(|scope| {
-                        if scope == "network:*" || scope.contains(':') {
-                            scope.to_string()
-                        } else {
-                            format!("read:{scope}")
-                        }
-                    }),
-            );
-        }
-    }
-    let requirements = if packet.output_acceptance.is_empty() {
-        packet
-            .constraints
-            .iter()
-            .find_map(|constraint| constraint.strip_prefix("team_acceptance_contract:"))
-            .and_then(|value| serde_json::from_str(value).ok())
-            .unwrap_or_default()
-    } else {
-        packet.output_acceptance.clone()
-    };
+    // `output_acceptance` is frozen inside the executable packet.  Do not
+    // reconstruct obligations from instruction strings: that creates a
+    // different evaluator after restart or after a template edit.
+    let requirements = packet.output_acceptance.clone();
     for requirement in requirements {
         use harness_contract::team::TeamAcceptanceCheck;
         match requirement.check {
@@ -236,13 +218,7 @@ pub(crate) fn required_acceptance_for_packet(
                     scopes.push(format!("verify_after_write:{path}"));
                 }
             }
-            TeamAcceptanceCheck::UpstreamReview => scopes.extend(
-                packet
-                    .constraints
-                    .iter()
-                    .filter_map(|value| value.strip_prefix("upstream_change_scope:"))
-                    .map(|value| format!("verify_upstream_change:{value}")),
-            ),
+            TeamAcceptanceCheck::UpstreamReview => {}
             TeamAcceptanceCheck::StructuredField { .. } | TeamAcceptanceCheck::UpstreamEvidence => {
             }
         }

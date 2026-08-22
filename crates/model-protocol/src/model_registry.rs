@@ -1,8 +1,8 @@
 //! Unified model alias resolver and dynamic model registry.
 //!
 //! Two concerns live side-by-side:
-//! * [`ModelRegistry`] — a dynamic, YAML-driven catalogue of 40+ models with
-//!   pricing, token limits, and capabilities. Lives at `~/.cowd/models.yaml`.
+//! * [`ModelRegistry`] — a dynamic, YAML-driven catalogue of models with
+//!   token limits and capabilities. Lives at `~/.cowd/models.yaml`.
 //! * [`ModelResolver`] — a config-first alias resolver that chains
 //!   user-defined aliases (`config.yaml aliases:`) with a small built-in
 //!   fallback table. Cycle detection with max 10 hops.
@@ -76,38 +76,6 @@ impl fmt::Display for CircularAliasError {
 
 impl std::error::Error for CircularAliasError {}
 
-// ── Pricing ────────────────────────────────────────────────────────────────
-
-/// Per-million-token pricing stored in the model registry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Pricing {
-    /// USD per 1M input tokens.
-    #[serde(rename = "input_per_1m")]
-    pub input_per_1m: f64,
-    /// USD per 1M output tokens.
-    #[serde(rename = "output_per_1m")]
-    pub output_per_1m: f64,
-    /// USD per 1M cache-write tokens (Anthropic-style prompt caching).
-    #[serde(default, rename = "cache_write_per_1m")]
-    pub cache_write_per_1m: Option<f64>,
-    /// USD per 1M cache-read tokens.
-    #[serde(default, rename = "cache_read_per_1m")]
-    pub cache_read_per_1m: Option<f64>,
-}
-
-impl Pricing {
-    /// Convert registry pricing into the runtime [`super::usage::ModelPricing`] type.
-    #[must_use]
-    pub fn to_model_pricing(&self) -> crate::usage::ModelPricing {
-        crate::usage::ModelPricing {
-            input_cost_per_million: self.input_per_1m,
-            output_cost_per_million: self.output_per_1m,
-            cache_creation_cost_per_million: self.cache_write_per_1m.unwrap_or(0.0),
-            cache_read_cost_per_million: self.cache_read_per_1m.unwrap_or(0.0),
-        }
-    }
-}
-
 // ── Model info ─────────────────────────────────────────────────────────────
 
 /// Metadata for a single model in the registry.
@@ -121,8 +89,6 @@ pub struct ModelInfo {
     pub context_window: u32,
     /// Maximum output tokens the model can generate.
     pub max_output_tokens: u32,
-    /// Per-million-token pricing.
-    pub pricing: Pricing,
     /// Capability tags (`text`, `vision`, `tool_use`, `reasoning`, …).
     pub capabilities: Vec<String>,
 }
@@ -152,7 +118,7 @@ impl ModelCapacitySource {
 }
 
 /// Capacity facts needed by request packing. This deliberately excludes
-/// pricing, marketing metadata and protocol capabilities.
+/// commercial metadata, marketing metadata and protocol capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCapacity {
     pub context_window_tokens: u32,
@@ -258,12 +224,6 @@ impl ModelRegistry {
         self.models.values().collect()
     }
 
-    /// Convenience: return pricing for a model.
-    #[must_use]
-    pub fn pricing_for(&self, name: &str) -> Option<&Pricing> {
-        self.get(name).map(|info| &info.pricing)
-    }
-
     /// Resolve W/P from explicit configuration, user metadata, bundled exact
     /// facts, then conservative unknown-model assumptions.
     #[must_use]
@@ -360,9 +320,33 @@ fn bundled_capacity(model: &str) -> Option<ModelCapacity> {
             context_window_tokens: 1_000_000,
             max_output_tokens: 384_000,
         }),
-        "glm-5.2" => Some(ModelCapacity {
+        // Qwen 3.8/3.7/3.6 series on Aliyun Bailian / Token Plan: 1M window,
+        // 991,808 max input. Max output differs by tier (Max/Plus 131,072;
+        // Plus-3.6/Flash 65,536). Source: help.aliyun.com/zh/model-studio.
+        "qwen3.8-max" | "qwen3.7-max" | "qwen3.7-plus" => Some(ModelCapacity {
             context_window_tokens: 1_000_000,
-            max_output_tokens: 128_000,
+            max_output_tokens: 131_072,
+        }),
+        "qwen3.6-plus" | "qwen3.6-flash" => Some(ModelCapacity {
+            context_window_tokens: 1_000_000,
+            max_output_tokens: 65_536,
+        }),
+        "qwen3-max" => Some(ModelCapacity {
+            context_window_tokens: 262_144,
+            max_output_tokens: 65_536,
+        }),
+        "qwen-long" => Some(ModelCapacity {
+            context_window_tokens: 10_000_000,
+            max_output_tokens: 8_192,
+        }),
+        // Zhipu GLM: 5.2 = 1M (1,048,576), GLM-5 = 200K (204,800).
+        "glm-5.2" => Some(ModelCapacity {
+            context_window_tokens: 1_048_576,
+            max_output_tokens: 131_072,
+        }),
+        "glm-5" => Some(ModelCapacity {
+            context_window_tokens: 204_800,
+            max_output_tokens: 131_072,
         }),
         _ => None,
     }
@@ -390,21 +374,6 @@ pub fn global_registry() -> &'static ModelRegistry {
         ModelRegistry::load().unwrap_or_else(|error| ModelRegistry::unavailable(&error))
     });
     &REGISTRY
-}
-
-/// Returns pricing metadata for a known model alias or family.
-///
-/// Uses the global YAML registry first and falls back to lightweight protocol
-/// heuristics for Claude-family models.
-#[must_use]
-pub fn pricing_for_model(model: &str) -> Option<crate::usage::ModelPricing> {
-    if let Some(pricing) = global_registry()
-        .pricing_for(model)
-        .map(|p| p.to_model_pricing())
-    {
-        return Some(pricing);
-    }
-    crate::usage::heuristic_pricing_for_model(model)
 }
 
 // ── Alias resolver ─────────────────────────────────────────────────────────
@@ -572,12 +541,6 @@ mod tests {
                 display_name: "Test Model".to_string(),
                 context_window: 128_000,
                 max_output_tokens: 16_000,
-                pricing: Pricing {
-                    input_per_1m: 1.0,
-                    output_per_1m: 5.0,
-                    cache_write_per_1m: None,
-                    cache_read_per_1m: None,
-                },
                 capabilities: vec!["text".to_string()],
             },
         );
@@ -591,18 +554,12 @@ mod tests {
         assert_eq!(info.context_window, 128_000);
         assert_eq!(info.max_output_tokens, 16_000);
         assert_eq!(info.provider, "test");
-
-        let pricing = registry
-            .pricing_for("test-model")
-            .expect("pricing should exist");
-        assert_eq!(pricing.input_per_1m, 1.0);
     }
 
     #[test]
     fn registry_get_missing() {
         let registry = ModelRegistry::empty();
         assert!(registry.get("nope").is_none());
-        assert!(registry.pricing_for("nope").is_none());
     }
 
     #[test]
@@ -622,8 +579,34 @@ mod tests {
         assert_eq!(deepseek.max_output_source, ModelCapacitySource::Bundled);
 
         let glm = registry.resolve_capacity("glm-5.2", None, None);
-        assert_eq!(glm.context_window_tokens, 1_000_000);
-        assert_eq!(glm.max_output_tokens, 128_000);
+        assert_eq!(glm.context_window_tokens, 1_048_576);
+        assert_eq!(glm.max_output_tokens, 131_072);
+
+        let glm5 = registry.resolve_capacity("glm-5", None, None);
+        assert_eq!(glm5.context_window_tokens, 204_800);
+        assert_eq!(glm5.max_output_tokens, 131_072);
+
+        // Qwen 3.8/3.7/3.6 系列（百炼 / Token Plan）为 1M 上下文；
+        // Max/Plus 输出 128K，Plus-3.6/Flash 输出 64K。
+        let qwen38 = registry.resolve_capacity("qwen3.8-max", None, None);
+        assert_eq!(qwen38.context_window_tokens, 1_000_000);
+        assert_eq!(qwen38.max_output_tokens, 131_072);
+
+        let qwen37plus = registry.resolve_capacity("qwen3.7-plus", None, None);
+        assert_eq!(qwen37plus.context_window_tokens, 1_000_000);
+        assert_eq!(qwen37plus.max_output_tokens, 131_072);
+
+        let qwen36flash = registry.resolve_capacity("qwen3.6-flash", None, None);
+        assert_eq!(qwen36flash.context_window_tokens, 1_000_000);
+        assert_eq!(qwen36flash.max_output_tokens, 65_536);
+
+        let qwen3max = registry.resolve_capacity("qwen3-max", None, None);
+        assert_eq!(qwen3max.context_window_tokens, 262_144);
+        assert_eq!(qwen3max.max_output_tokens, 65_536);
+
+        let qwenlong = registry.resolve_capacity("qwen-long", None, None);
+        assert_eq!(qwenlong.context_window_tokens, 10_000_000);
+        assert_eq!(qwenlong.max_output_tokens, 8_192);
     }
 
     #[test]
@@ -636,12 +619,6 @@ mod tests {
                 display_name: "Private DeepSeek".to_string(),
                 context_window: 256_000,
                 max_output_tokens: 24_000,
-                pricing: Pricing {
-                    input_per_1m: 0.0,
-                    output_per_1m: 0.0,
-                    cache_write_per_1m: None,
-                    cache_read_per_1m: None,
-                },
                 capabilities: Vec::new(),
             },
         );
@@ -670,33 +647,5 @@ mod tests {
             user_capacity.max_output_source,
             ModelCapacitySource::UserRegistry
         );
-    }
-
-    #[test]
-    fn pricing_to_model_pricing_conversion() {
-        let pricing = Pricing {
-            input_per_1m: 3.0,
-            output_per_1m: 15.0,
-            cache_write_per_1m: Some(3.75),
-            cache_read_per_1m: Some(0.30),
-        };
-        let mp = pricing.to_model_pricing();
-        assert_eq!(mp.input_cost_per_million, 3.0);
-        assert_eq!(mp.output_cost_per_million, 15.0);
-        assert_eq!(mp.cache_creation_cost_per_million, 3.75);
-        assert_eq!(mp.cache_read_cost_per_million, 0.30);
-    }
-
-    #[test]
-    fn pricing_to_model_pricing_missing_cache() {
-        let pricing = Pricing {
-            input_per_1m: 2.0,
-            output_per_1m: 8.0,
-            cache_write_per_1m: None,
-            cache_read_per_1m: None,
-        };
-        let mp = pricing.to_model_pricing();
-        assert_eq!(mp.cache_creation_cost_per_million, 0.0);
-        assert_eq!(mp.cache_read_cost_per_million, 0.0);
     }
 }

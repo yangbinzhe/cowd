@@ -27,6 +27,7 @@ pub type GlobalApprovalStatus = ApprovalStatus;
 pub type GlobalApprovalDecisionReceipt = ApprovalDecisionReceipt;
 type DeadlineWakeFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type DeadlineWake = Arc<dyn Fn(String) -> DeadlineWakeFuture + Send + Sync + 'static>;
+const APPROVAL_REFRESH_COMMIT_PAGE: usize = 256;
 
 /// Policy actors that represent a session's explicit YOLO/trust-all approval
 /// authority. Only these exact identities may commit a Global approval
@@ -65,6 +66,11 @@ pub struct ApprovalQueue {
     deadline_wake: Mutex<Option<DeadlineWake>>,
     deadline_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     deadline_cancellation: crate::CancellationToken,
+    /// Highest Runtime event-store commit incorporated into this hot approval
+    /// projection.  Browser/API refreshes are frequent, while durable
+    /// approval writes are not; this prevents a full approval-history replay
+    /// when nothing has changed.
+    last_refresh_commit: Mutex<u64>,
     event_store: Arc<RuntimeEventStore>,
 }
 
@@ -80,6 +86,10 @@ impl std::fmt::Debug for ApprovalQueue {
 impl ApprovalQueue {
     #[must_use]
     pub fn new(event_store: Arc<RuntimeEventStore>) -> Self {
+        // Read the head before the replay. If a commit races the replay, the
+        // older cursor deliberately forces one more refresh rather than
+        // claiming a snapshot that may have skipped a durable approval fact.
+        let initial_commit = *event_store.subscribe_commits().borrow();
         let (requests, grants) = restore_approval_state(&event_store);
         let requests = active_approval_requests(requests);
         let grants = active_approval_grants(grants);
@@ -94,6 +104,7 @@ impl ApprovalQueue {
             deadline_wake: Mutex::new(None),
             deadline_worker: Mutex::new(None),
             deadline_cancellation: crate::CancellationToken::new(),
+            last_refresh_commit: Mutex::new(initial_commit),
             event_store,
         }
     }
@@ -101,32 +112,83 @@ impl ApprovalQueue {
     /// Rebuild the in-memory read model after another commit owner appended
     /// approval events as part of a larger transaction.
     pub fn refresh(&self) {
-        let (requests, grants) = restore_approval_state(&self.event_store);
-        let requests = active_approval_requests(requests);
-        let grants = active_approval_grants(grants);
-        let request_indexes = approval_request_indexes(&requests);
-        let deadlines = approval_deadline_index(&requests);
-        *self
+        let mut last_refresh_commit = self
+            .last_refresh_commit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let observed_commit = *self.event_store.subscribe_commits().borrow();
+        if observed_commit <= *last_refresh_commit {
+            return;
+        }
+
+        // Every commit has a globally ordered cursor. Apply only the delta so
+        // a busy unrelated Runtime stream does not make the approval inbox
+        // replay all historic approval decisions. A recovery error falls back
+        // to the existing authoritative replay rather than serving stale
+        // authority data.
+        let mut requests = self
             .requests
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = requests;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut grants = self
+            .grants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cursor = *last_refresh_commit;
+        let incremental = (|| -> Result<(), String> {
+            loop {
+                let batches = self
+                    .event_store
+                    .events_after_cursor(cursor, APPROVAL_REFRESH_COMMIT_PAGE)
+                    .map_err(|error| error.to_string())?;
+                if batches.is_empty() {
+                    break;
+                }
+                for batch in &batches {
+                    for event in &batch.events {
+                        if event.scope == RuntimeEventScope::Approval {
+                            apply_approval_event(&mut requests, &mut grants, event);
+                        }
+                    }
+                    cursor = batch.commit_cursor;
+                }
+                if batches.len() < APPROVAL_REFRESH_COMMIT_PAGE {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        if incremental.is_err() {
+            let (durable_requests, durable_grants) = restore_approval_state(&self.event_store);
+            *requests = durable_requests;
+            *grants = durable_grants;
+            cursor = observed_commit;
+        }
+        requests.retain(|_, request| request.status == GlobalApprovalStatus::Pending);
+        grants.retain(|_, grant| {
+            grant.status == ApprovalGrantStatus::Active
+                && grant.expires_at_ms.is_none_or(|expires| expires > now_ms())
+        });
+        let request_indexes = approval_request_indexes(&requests);
+        let deadlines = approval_deadline_index(&requests);
+        drop(grants);
+        drop(requests);
         *self
             .request_indexes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = request_indexes;
         *self
-            .grants
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = grants;
-        *self
             .deadlines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = deadlines;
+        *last_refresh_commit = cursor.max(observed_commit);
     }
 
     /// T6: time injection so expiry/prune paths can be verified without
-    /// sleeping. The mutation is in-memory only and `refresh()` restores the
-    /// durable event-sourced timestamp, so it cannot corrupt production state.
+    /// sleeping. The mutation is in-memory only; the next refresh caused by a
+    /// durable commit restores the event-sourced timestamp, so it cannot
+    /// corrupt production state.
     #[doc(hidden)]
     pub fn backdate_created_at_for_test(
         &self,
@@ -466,8 +528,7 @@ impl ApprovalQueue {
         if decision.scope == ApprovalGrantScope::Global
             && decision.actor.kind != ApprovalDecisionActorKind::Human
             && !(decision.actor.kind == ApprovalDecisionActorKind::Policy
-                && TRUST_ALL_POLICY_ACTOR_IDS
-                    .contains(&decision.actor.actor_id.as_str()))
+                && TRUST_ALL_POLICY_ACTOR_IDS.contains(&decision.actor.actor_id.as_str()))
         {
             return Err("global_approval_requires_human_actor".to_string());
         }
@@ -521,14 +582,11 @@ impl ApprovalQueue {
             return Err("approval_scope_not_allowed_for_subject".to_string());
         }
         if request.status != GlobalApprovalStatus::Pending {
-            // TimedOut and Denied are re-decidable: the original decision is
-            // replaced and a new audit fact is appended, so a user can recover
-            // a previously blocked approval instead of it being permanently
-            // stuck in the queue.
-            if !matches!(
-                request.status,
-                GlobalApprovalStatus::TimedOut | GlobalApprovalStatus::Denied
-            ) {
+            // A timeout closes this exact approval authority.  Reusing it after
+            // the deadline would let a stale dialog resume an obsolete graph;
+            // callers that still need authority must submit a fresh, currently
+            // scoped request.  A human denial remains explicitly revisable.
+            if !matches!(request.status, GlobalApprovalStatus::Denied) {
                 let receipt = GlobalApprovalDecisionReceipt {
                     approval_id: request.approval_id.clone(),
                     status: request.status,
@@ -814,23 +872,23 @@ impl ApprovalQueue {
                 evidence_refs: vec!["approval.timeout.auto_approve_once".to_string()],
             });
         }
-        let next_status = match request.timeout_policy {
-            ApprovalTimeoutPolicy::Pending if request.blocks_execution => {
-                GlobalApprovalStatus::Pending
-            }
-            ApprovalTimeoutPolicy::Pending
-            | ApprovalTimeoutPolicy::AutoDeny
-            | ApprovalTimeoutPolicy::ContinueAlternative
-            | ApprovalTimeoutPolicy::AutoApproveOnce => GlobalApprovalStatus::TimedOut,
-        };
-        let resolved_at_ms = (next_status == GlobalApprovalStatus::TimedOut).then(now_ms);
+        // A durable deadline is a terminal contract, including for requests that
+        // were originally configured to wait for a person.  Leaving a blocking
+        // request Pending while removing its deadline made the execution wait
+        // forever and let Surfaces disagree about whether it was still actionable.
+        // Keep the original timeout policy as audit context, but close this
+        // particular request so a later continuation can create a fresh, scoped
+        // approval instead of reviving an expired one.
+        let next_status = GlobalApprovalStatus::TimedOut;
+        let resolved_at_ms = Some(now_ms());
         let receipt = GlobalApprovalDecisionReceipt {
             approval_id: request.approval_id.clone(),
             status: next_status,
             route_back: request.source.clone(),
             message: match request.timeout_policy {
                 ApprovalTimeoutPolicy::Pending if request.blocks_execution => {
-                    "approval remains pending".to_string()
+                    "approval timed out before a human decision; the blocked execution was released"
+                        .to_string()
                 }
                 ApprovalTimeoutPolicy::Pending => {
                     "non-blocking approval timed out; source should continue without promotion"
@@ -847,45 +905,33 @@ impl ApprovalQueue {
             },
             grant_id: None,
         };
-        let (event_kind, marker_key, marker_status, extra_payload) =
-            if next_status == GlobalApprovalStatus::Pending {
-                (
-                    "approval.deadline_elapsed.manual_hold",
-                    format!(
-                        "approval:{}:deadline_elapsed:manual_hold",
-                        request.approval_id
-                    ),
-                    "pending".to_string(),
-                    serde_json::json!({
-                        "expires_at_ms": request.expires_at_ms,
-                        "manual_hold": true,
-                    }),
-                )
-            } else {
-                (
-                    "approval.timed_out",
-                    format!("approval-timeout:{}", request.approval_id),
-                    next_status.as_str().to_string(),
-                    serde_json::json!({}),
-                )
-            };
+        let timeout_decision = ApprovalDecision {
+            approved: false,
+            reason: receipt.message.clone(),
+            scope: ApprovalGrantScope::Once,
+            actor: ApprovalDecisionActor {
+                kind: ApprovalDecisionActorKind::TimeoutPolicy,
+                actor_id: "approval-timeout-policy".to_string(),
+            },
+            evidence_refs: vec!["approval.timeout".to_string()],
+            decided_at_ms: resolved_at_ms.unwrap_or_else(now_ms),
+        };
+        let event_kind = "approval.timed_out";
+        let marker_key = format!("approval-timeout:{}", request.approval_id);
+        let marker_status = next_status.as_str().to_string();
         if self
             .event_store
             .event_by_idempotency_key(&stream_id, &marker_key)
             .map_err(|error| error.to_string())?
             .is_none()
         {
-            let mut payload = serde_json::json!({
+            let payload = serde_json::json!({
                 "schema_version": 2,
                 "timeout_policy": request.timeout_policy,
                 "message": receipt.message,
                 "resolved_at_ms": resolved_at_ms,
+                "decision": timeout_decision.clone(),
             });
-            if let serde_json::Value::Object(ref mut object) = payload {
-                if let serde_json::Value::Object(extra) = extra_payload {
-                    object.extend(extra);
-                }
-            }
             self.event_store
                 .append_batch_if_revision(
                     stream_id.clone(),
@@ -909,23 +955,10 @@ impl ApprovalQueue {
         }
         request.status = next_status;
         request.resolved_at_ms = resolved_at_ms;
-        request.decision =
-            (next_status == GlobalApprovalStatus::TimedOut).then(|| ApprovalDecision {
-                approved: false,
-                reason: receipt.message.clone(),
-                scope: ApprovalGrantScope::Once,
-                actor: ApprovalDecisionActor {
-                    kind: ApprovalDecisionActorKind::TimeoutPolicy,
-                    actor_id: "approval-timeout-policy".to_string(),
-                },
-                evidence_refs: vec!["approval.timeout".to_string()],
-                decided_at_ms: resolved_at_ms.unwrap_or_else(now_ms),
-            });
+        request.decision = Some(timeout_decision);
         let terminal_id = request.approval_id.clone();
         self.remove_active_deadline(&terminal_id);
-        if next_status != GlobalApprovalStatus::Pending {
-            requests.remove(&terminal_id);
-        }
+        requests.remove(&terminal_id);
         Ok(receipt)
     }
 
@@ -1668,97 +1701,105 @@ fn restore_approval_state(
         return (requests, grants);
     };
     for event in events {
-        match event.kind.as_str() {
-            "approval.submitted" => {
-                if let Some(request) = event
-                    .payload
-                    .get("request")
-                    .and_then(|value| serde_json::from_value(value.clone()).ok())
-                {
-                    let request: GlobalApprovalRequest = request;
-                    requests.insert(request.approval_id.clone(), request);
-                }
-            }
-            "approval.decided"
-            | "approval.decided.application"
-            | "approval.timed_out"
-            | "approval.cancelled"
-            | "approval.superseded" => {
-                let Some(approval_id) = event.stream_id.strip_prefix("approval:") else {
-                    continue;
-                };
-                let Some(request) = requests.get_mut(approval_id) else {
-                    continue;
-                };
-                request.status = match event.status.as_deref() {
-                    Some("approved") => GlobalApprovalStatus::Approved,
-                    Some("denied") => GlobalApprovalStatus::Denied,
-                    Some("skipped") => GlobalApprovalStatus::Skipped,
-                    Some("timed_out") => GlobalApprovalStatus::TimedOut,
-                    Some("cancelled") => GlobalApprovalStatus::Cancelled,
-                    Some("superseded") => GlobalApprovalStatus::Superseded,
-                    _ => request.status,
-                };
-                request.decision = event
-                    .payload
-                    .get("decision")
-                    .or_else(|| event.payload.get("decision_record"))
-                    .and_then(|value| serde_json::from_value(value.clone()).ok());
-                request.resolved_at_ms = if request.status == GlobalApprovalStatus::Pending {
-                    None
-                } else {
-                    event
-                        .payload
-                        .get("resolved_at_ms")
-                        .and_then(serde_json::Value::as_u64)
-                        .or(Some(event.created_at_ms))
-                };
-            }
-            "approval.grant_issued" => {
-                if let Some(grant) = event
-                    .payload
-                    .get("grant")
-                    .and_then(|value| serde_json::from_value::<ApprovalGrant>(value.clone()).ok())
-                {
-                    grants.insert(grant.grant_id.clone(), grant);
-                }
-            }
-            "approval.grant_revoked" | "approval.grant_consumed" => {
-                let Some(grant_id) = event
-                    .payload
-                    .get("grant_id")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-                let Some(grant) = grants.get_mut(grant_id) else {
-                    continue;
-                };
-                if event.kind == "approval.grant_revoked" {
-                    grant.status = ApprovalGrantStatus::Revoked;
-                    grant.revoked_at_ms = event
-                        .payload
-                        .get("revoked_at_ms")
-                        .and_then(serde_json::Value::as_u64)
-                        .or(Some(event.created_at_ms));
-                    grant.revoke_reason = event
-                        .payload
-                        .get("reason")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
-                } else {
-                    grant.status = ApprovalGrantStatus::Expired;
-                    grant.expires_at_ms = event
-                        .payload
-                        .get("consumed_at_ms")
-                        .and_then(serde_json::Value::as_u64)
-                        .or(Some(event.created_at_ms));
-                }
-            }
-            _ => {}
-        }
+        apply_approval_event(&mut requests, &mut grants, &event);
     }
     (requests, grants)
+}
+
+fn apply_approval_event(
+    requests: &mut BTreeMap<String, GlobalApprovalRequest>,
+    grants: &mut BTreeMap<String, ApprovalGrant>,
+    event: &crate::DurableRuntimeEvent,
+) {
+    match event.kind.as_str() {
+        "approval.submitted" => {
+            if let Some(request) = event
+                .payload
+                .get("request")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+            {
+                let request: GlobalApprovalRequest = request;
+                requests.insert(request.approval_id.clone(), request);
+            }
+        }
+        "approval.decided"
+        | "approval.decided.application"
+        | "approval.timed_out"
+        | "approval.cancelled"
+        | "approval.superseded" => {
+            let Some(approval_id) = event.stream_id.strip_prefix("approval:") else {
+                return;
+            };
+            let Some(request) = requests.get_mut(approval_id) else {
+                return;
+            };
+            request.status = match event.status.as_deref() {
+                Some("approved") => GlobalApprovalStatus::Approved,
+                Some("denied") => GlobalApprovalStatus::Denied,
+                Some("skipped") => GlobalApprovalStatus::Skipped,
+                Some("timed_out") => GlobalApprovalStatus::TimedOut,
+                Some("cancelled") => GlobalApprovalStatus::Cancelled,
+                Some("superseded") => GlobalApprovalStatus::Superseded,
+                _ => request.status,
+            };
+            request.decision = event
+                .payload
+                .get("decision")
+                .or_else(|| event.payload.get("decision_record"))
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+            request.resolved_at_ms = if request.status == GlobalApprovalStatus::Pending {
+                None
+            } else {
+                event
+                    .payload
+                    .get("resolved_at_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .or(Some(event.created_at_ms))
+            };
+        }
+        "approval.grant_issued" => {
+            if let Some(grant) = event
+                .payload
+                .get("grant")
+                .and_then(|value| serde_json::from_value::<ApprovalGrant>(value.clone()).ok())
+            {
+                grants.insert(grant.grant_id.clone(), grant);
+            }
+        }
+        "approval.grant_revoked" | "approval.grant_consumed" => {
+            let Some(grant_id) = event
+                .payload
+                .get("grant_id")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return;
+            };
+            let Some(grant) = grants.get_mut(grant_id) else {
+                return;
+            };
+            if event.kind == "approval.grant_revoked" {
+                grant.status = ApprovalGrantStatus::Revoked;
+                grant.revoked_at_ms = event
+                    .payload
+                    .get("revoked_at_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .or(Some(event.created_at_ms));
+                grant.revoke_reason = event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string);
+            } else {
+                grant.status = ApprovalGrantStatus::Expired;
+                grant.expires_at_ms = event
+                    .payload
+                    .get("consumed_at_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .or(Some(event.created_at_ms));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn restore_approval_request(
@@ -2197,7 +2238,41 @@ mod tests {
     }
 
     #[test]
-    fn timeout_policy_can_hold_or_release_pending_work() {
+    fn refresh_without_a_new_commit_keeps_the_hot_projection_without_replay() {
+        let queue = queue();
+        let request = queue
+            .submit(SubmitGlobalApprovalRequest {
+                source: session_source(),
+                context: approval_context(),
+                domain: ApprovalDomain::Execution,
+                blocks_execution: true,
+                action: "refresh-cursor".to_string(),
+                summary: "no event means no replay".to_string(),
+                risk: TaskRisk::Low,
+                evidence_refs: Vec::new(),
+                timeout_policy: ApprovalTimeoutPolicy::Pending,
+            })
+            .expect("approval submitted");
+        queue.refresh();
+        let injected_timestamp = 7;
+        queue
+            .backdate_created_at_for_test(&request.approval_id, injected_timestamp)
+            .expect("test timestamp injected");
+
+        queue.refresh();
+
+        assert_eq!(
+            queue
+                .get(&request.approval_id)
+                .expect("hot request")
+                .created_at_ms,
+            injected_timestamp,
+            "unchanged event-store head must not replay full approval history"
+        );
+    }
+
+    #[test]
+    fn timeout_policy_always_closes_expired_work() {
         let queue = queue();
         let held = queue
             .submit(SubmitGlobalApprovalRequest {
@@ -2211,9 +2286,10 @@ mod tests {
                 evidence_refs: Vec::new(),
                 timeout_policy: ApprovalTimeoutPolicy::Pending,
             })
-            .expect("held approval");
-        let receipt = queue.timeout(&held.approval_id).expect("timeout held");
-        assert_eq!(receipt.status, GlobalApprovalStatus::Pending);
+            .expect("blocking approval");
+        let receipt = queue.timeout(&held.approval_id).expect("timeout blocking");
+        assert_eq!(receipt.status, GlobalApprovalStatus::TimedOut);
+        assert!(receipt.message.contains("blocked execution was released"));
 
         let alternative = queue
             .submit(SubmitGlobalApprovalRequest {
@@ -2236,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_hold_writes_typed_deadline_elapsed_marker_without_terminalizing() {
+    fn pending_timeout_writes_typed_terminal_marker_and_closes_request() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let queue = ApprovalQueue::new(store.clone());
         let held = queue
@@ -2246,7 +2322,7 @@ mod tests {
                 domain: ApprovalDomain::Execution,
                 blocks_execution: true,
                 action: "critical-hold".to_string(),
-                summary: "stays actionable after deadline".to_string(),
+                summary: "must close after deadline".to_string(),
                 risk: TaskRisk::Critical,
                 evidence_refs: Vec::new(),
                 timeout_policy: ApprovalTimeoutPolicy::Pending,
@@ -2254,35 +2330,65 @@ mod tests {
             .expect("held approval");
 
         let receipt = queue.timeout(&held.approval_id).expect("deadline passes");
-        assert_eq!(receipt.status, GlobalApprovalStatus::Pending);
+        assert_eq!(receipt.status, GlobalApprovalStatus::TimedOut);
         assert_eq!(
             queue
                 .get(&held.approval_id)
-                .expect("request remains hot")
+                .expect("terminal request remains durably queryable")
                 .status,
-            GlobalApprovalStatus::Pending
+            GlobalApprovalStatus::TimedOut
         );
         let stream_id = format!("approval:{}", held.approval_id);
         let marker = store
             .event_by_idempotency_key(
                 &stream_id,
-                &format!("approval:{}:deadline_elapsed:manual_hold", held.approval_id),
+                &format!("approval-timeout:{}", held.approval_id),
             )
             .expect("marker read")
-            .expect("typed manual-hold marker persisted");
-        assert_eq!(marker.kind, "approval.deadline_elapsed.manual_hold");
-        assert_eq!(marker.status.as_deref(), Some("pending"));
+            .expect("typed timeout marker persisted");
+        assert_eq!(marker.kind, "approval.timed_out");
+        assert_eq!(marker.status.as_deref(), Some("timed_out"));
+        assert_eq!(queue.active_deadline_count(), 0);
+        assert_eq!(queue.active_request_count(), 0);
+        queue.refresh();
+        let restored = queue
+            .get(&held.approval_id)
+            .expect("timeout must survive a durable reload");
+        assert_eq!(restored.status, GlobalApprovalStatus::TimedOut);
+        assert_eq!(
+            restored
+                .decision
+                .as_ref()
+                .map(|decision| decision.actor.kind),
+            Some(ApprovalDecisionActorKind::TimeoutPolicy)
+        );
+
+        let stale_dialog = queue
+            .decide(
+                &crate::security::test_human_interactive_principal(),
+                human_decision(held.approval_id.clone(), true, "too late"),
+            )
+            .expect("a stale dialog returns the durable terminal receipt");
+        assert_eq!(stale_dialog.status, GlobalApprovalStatus::TimedOut);
 
         let again = queue.timeout(&held.approval_id).expect("replay timeout");
-        assert_eq!(again.status, GlobalApprovalStatus::Pending);
+        assert_eq!(again.status, GlobalApprovalStatus::TimedOut);
         let events = store.list_stream(&stream_id).expect("stream");
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.kind == "approval.deadline_elapsed.manual_hold")
+                .filter(|event| event.kind == "approval.timed_out")
                 .count(),
             1,
-            "manual-hold marker must be idempotent across deadline replays"
+            "timeout marker must be idempotent across deadline replays"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "approval.decided")
+                .count(),
+            0,
+            "a stale dialog must not revive an expired approval"
         );
     }
 

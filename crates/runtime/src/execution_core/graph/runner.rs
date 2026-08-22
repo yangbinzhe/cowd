@@ -1135,8 +1135,10 @@ impl ExecutionGraphRunner {
                 // ToolBatch is a container. Each leaf invocation is admitted
                 // by ToolExecutionPlane; taking a second Tool lease here can
                 // deadlock a one-slot quota.
-                // The container contract must still be validated so malformed
-                // paths become durable blockers before any leaf can execute.
+                // Model-supplied paths deliberately do not become container
+                // scopes: the governed leaves validate their own exact path
+                // demand and record a per-call failure. That preserves valid
+                // sibling progress when one read path is mistyped.
                 for scope in &node.resource_scopes {
                     if let Some(path) = scope.strip_prefix("read:") {
                         let _ = self.scoped_resource_for_path(&node.id, path, false)?;
@@ -1598,6 +1600,7 @@ impl ExecutionGraphRunner {
         reason: String,
         mutation_id: String,
         completion: harness_contract::execution_graph::ExecutionCompletionContract,
+        collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
         self.ensure_mutation_allowed()?;
         let coordination = self.graph_coordination_without_command(graph_id).await;
@@ -1613,7 +1616,15 @@ impl ExecutionGraphRunner {
         self.registry.validate_nodes(&nodes)?;
         let graph = self
             .commit_service
-            .replan_semantic_async(graph, nodes, edges, reason, mutation_id, completion)
+            .replan_semantic_async(
+                graph,
+                nodes,
+                edges,
+                reason,
+                mutation_id,
+                completion,
+                collaboration_program,
+            )
             .await?
             .graph;
         drop(coordination);
@@ -1855,8 +1866,9 @@ fn evidence_ready_satisfaction(
     EvidenceReadyOutcome::Satisfied
 }
 
-/// Deterministic acceptance verdict read from persisted node-result facts.
-/// There is exactly one derivation; no second Runtime path mints a verdict.
+/// Read the single terminal acceptance verdict from persisted node-result
+/// facts.  The evaluator owns matching and digest construction at the
+/// terminal producer; Runner only consumes that immutable result.
 fn derived_acceptance_verdict(result: &ExecutionNodeResult) -> AcceptanceVerdict {
     // The Runtime contract-rejection terminal is the canonical
     // FrameworkInvalid marker: it preserves committed facts while reporting
@@ -1871,30 +1883,17 @@ fn derived_acceptance_verdict(result: &ExecutionNodeResult) -> AcceptanceVerdict
     if framework_invalid {
         return AcceptanceVerdict::FrameworkInvalid;
     }
-    let required = &result.usage.required_acceptance;
-    if required.is_empty() {
-        return AcceptanceVerdict::Satisfied;
-    }
-    let observed = &result.usage.observed_acceptance;
-    if observed.is_empty() {
-        return AcceptanceVerdict::Unresolved;
-    }
-    let obligations_satisfied = required.evidence_obligations.iter().all(|obligation| {
-        crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
-            obligation,
-            &observed.observed_evidence,
-        )
-    });
-    let criteria_satisfied = required
-        .criteria
-        .iter()
-        .all(|criterion| observed.satisfied_criteria.contains(criterion));
-    if obligations_satisfied && criteria_satisfied && observed.unresolved_obligation_ids.is_empty()
-    {
-        AcceptanceVerdict::Satisfied
-    } else {
-        AcceptanceVerdict::Unsatisfied
-    }
+    result
+        .usage
+        .acceptance_evaluation
+        .as_ref()
+        .filter(|evaluation| {
+            evaluation.evaluator_revision
+                == crate::acceptance_evaluator::AcceptanceEvaluator::REVISION
+        })
+        .map_or(AcceptanceVerdict::Unresolved, |evaluation| {
+            evaluation.verdict
+        })
 }
 
 fn has_terminal_fact_kind(result: &ExecutionNodeResult, kind: TerminalFactKind) -> bool {
@@ -2485,6 +2484,13 @@ mod dependency_policy_tests {
                     observed_evidence: Vec::new(),
                     unresolved_obligation_ids: vec!["ok".to_string()],
                 },
+                acceptance_evaluation: Some(harness_contract::acceptance::AcceptanceEvaluation {
+                    evaluator_revision: crate::acceptance_evaluator::AcceptanceEvaluator::REVISION,
+                    contract_digest: "fixture-contract".to_string(),
+                    receipt_set_digest: "fixture-receipts".to_string(),
+                    derived_obligations: Vec::new(),
+                    verdict: AcceptanceVerdict::Unsatisfied,
+                }),
                 ..ExecutionUsage::default()
             },
             finished_at_ms: 1,
@@ -2619,6 +2625,13 @@ mod dependency_policy_tests {
                     observed_evidence: Vec::new(),
                     unresolved_obligation_ids: vec!["ok".to_string()],
                 },
+                acceptance_evaluation: Some(harness_contract::acceptance::AcceptanceEvaluation {
+                    evaluator_revision: crate::acceptance_evaluator::AcceptanceEvaluator::REVISION,
+                    contract_digest: "fixture-contract".to_string(),
+                    receipt_set_digest: "fixture-receipts".to_string(),
+                    derived_obligations: Vec::new(),
+                    verdict: AcceptanceVerdict::Unsatisfied,
+                }),
                 ..ExecutionUsage::default()
             },
             finished_at_ms: 1,

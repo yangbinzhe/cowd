@@ -1,5 +1,4 @@
-use model_protocol::model_registry::pricing_for_model;
-use model_protocol::usage::{TokenUsage, UsageCostEstimate};
+use model_protocol::usage::TokenUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -283,15 +282,6 @@ impl Usage {
             cache_read_input_tokens: self.cache_read_input_tokens,
         }
     }
-
-    #[must_use]
-    pub fn estimated_cost_usd(&self, model: &str) -> UsageCostEstimate {
-        let usage = self.token_usage();
-        pricing_for_model(model).map_or_else(
-            || usage.estimate_cost_usd(),
-            |pricing| usage.estimate_cost_usd_with_pricing(pricing),
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -357,8 +347,6 @@ pub enum StreamEvent {
 
 #[cfg(test)]
 mod tests {
-    use model_protocol::usage::format_usd;
-
     use super::{InputContentBlock, InputMessage, MessageRequest, MessageResponse, Usage};
 
     #[test]
@@ -375,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn message_response_estimates_cost_from_model_usage() {
+    fn message_response_preserves_technical_token_usage() {
         let response = MessageResponse {
             id: "msg_cost".to_string(),
             kind: "message".to_string(),
@@ -393,8 +381,6 @@ mod tests {
             request_id: None,
         };
 
-        let cost = response.usage.estimated_cost_usd(&response.model);
-        assert_eq!(format_usd(cost.total_cost_usd()), "$10.9350");
         assert_eq!(response.total_tokens(), 1_800_000);
     }
 

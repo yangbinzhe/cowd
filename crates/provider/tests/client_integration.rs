@@ -247,7 +247,7 @@ async fn send_message_applies_request_profile_and_records_telemetry() {
                 && event.action == "message_usage"
                 && event.properties.get("request_id") == Some(&json!("req_profile_123"))
                 && event.properties.get("total_tokens") == Some(&json!(7))
-                && event.properties.get("estimated_cost_usd") == Some(&json!("$0.0001"))
+                && event.properties.get("model") == Some(&json!("claude-3-7-sonnet-latest"))
     ));
     assert!(matches!(
         &events[5],

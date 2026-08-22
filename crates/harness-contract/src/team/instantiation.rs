@@ -699,7 +699,6 @@ mod tests {
             execution_budget: ParentExecutionBudget::new(
                 "team-test-budget",
                 65_536,
-                4_915_200,
                 u64::MAX,
                 32,
                 1,

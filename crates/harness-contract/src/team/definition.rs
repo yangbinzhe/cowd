@@ -15,6 +15,8 @@ use crate::agent::{
     AgentCapability, AgentDefinitionId, DefinitionScope, RevisionLifecycle, RevisionSelector,
     ValidationError,
 };
+
+use super::binding::RoleBehaviorFacet;
 use crate::evaluation::EvaluationContract;
 
 /// A scope-qualified durable Team Template identifier, for example
@@ -250,6 +252,14 @@ pub struct TeamRoleDefinition {
     pub agent_selector: RevisionSelector,
     pub cardinality: RoleCardinalityPolicy,
     pub partition: RolePartitionPolicy,
+    /// Immutable, typed execution behavior declared by the Template author.
+    ///
+    /// Runtime freezes these facets into `TeamBindingSnapshot` and never
+    /// derives them from a role id, localized display string, graph position,
+    /// result field name, or mutable template default.  A published role must
+    /// make its behavior explicit so custom Teams remain flexible without
+    /// hidden runtime heuristics.
+    pub behavior: Vec<RoleBehaviorFacet>,
     pub grant_ceiling: Vec<AgentCapability>,
     pub task_contract: TeamRoleTaskContract,
 }
@@ -287,6 +297,25 @@ impl TeamRoleDefinition {
         }
         self.cardinality.validate()?;
         self.partition.validate(&self.cardinality)?;
+        if self.behavior.is_empty() {
+            return Err(ValidationError::MissingField {
+                field: "role.behavior".to_string(),
+            });
+        }
+        let mut behavior_kinds = BTreeSet::new();
+        for facet in &self.behavior {
+            facet
+                .validate()
+                .map_err(|message| ValidationError::InvalidContract {
+                    message: format!("role.behavior: {message}"),
+                })?;
+            if !behavior_kinds.insert(facet.kind_key()) {
+                return Err(ValidationError::DuplicateValue {
+                    field: "role.behavior".to_string(),
+                    value: facet.kind_key().to_string(),
+                });
+            }
+        }
         if self.grant_ceiling.is_empty() {
             return Err(ValidationError::MissingField {
                 field: "role.grant_ceiling".to_string(),
@@ -359,6 +388,11 @@ pub struct TeamTemplateManifest {
     pub lifecycle: RevisionLifecycle,
     pub topology: TeamTopologyContract,
     pub roles: Vec<TeamRoleDefinition>,
+    /// Optional template-published semantic aliases for model proposals.
+    /// Runtime never owns a global role-name synonym table: an alias is valid
+    /// only when this immutable template revision explicitly declares it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_aliases: BTreeMap<String, String>,
     #[serde(default)]
     pub dependencies: Vec<TeamRoleDependency>,
     pub result_contract: TeamResultContract,
@@ -398,6 +432,16 @@ impl TeamTemplateManifest {
                 return Err(ValidationError::DuplicateValue {
                     field: "roles.role_id".to_string(),
                     value: role.role_id.clone(),
+                });
+            }
+        }
+        for (alias, role_id) in &self.role_aliases {
+            validate_role_id(alias)?;
+            if !role_ids.contains(role_id.as_str()) {
+                return Err(ValidationError::InvalidContract {
+                    message: format!(
+                        "role alias `{alias}` points to unknown template role `{role_id}`"
+                    ),
                 });
             }
         }
@@ -569,6 +613,7 @@ mod tests {
             agent_selector: RevisionSelector::ExactApprovedRevision { revision: 2 },
             cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
             partition: RolePartitionPolicy::Single,
+            behavior: vec![RoleBehaviorFacet::TerminalCandidate { required: true }],
             grant_ceiling: vec![AgentCapability::Read, AgentCapability::Search],
             task_contract: TeamRoleTaskContract {
                 contract_ref: format!("task/{role_id}"),
@@ -592,6 +637,7 @@ mod tests {
                 require_review: true,
             },
             roles: vec![role("implementer"), role("reviewer")],
+            role_aliases: BTreeMap::new(),
             dependencies: vec![TeamRoleDependency {
                 from_role_id: "implementer".to_string(),
                 to_role_id: "reviewer".to_string(),
@@ -622,6 +668,19 @@ mod tests {
             revision.revision_ref.template_id.as_str(),
             "workspace/cowd/implementation-review"
         );
+    }
+
+    #[test]
+    fn role_behavior_is_required_and_cannot_be_implicitly_derived() {
+        let mut manifest = manifest();
+        manifest.roles[0].behavior.clear();
+        let error = manifest
+            .validate()
+            .expect_err("published Team role must declare its own behavior");
+        assert!(matches!(
+            error,
+            ValidationError::MissingField { field } if field == "role.behavior"
+        ));
     }
 
     #[test]

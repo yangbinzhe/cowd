@@ -952,7 +952,6 @@ mod tests {
         assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
         let mut limits = ResourceLimitsV1::default();
         limits.nofile = 64;
-        limits.nproc = 1024;
         limits.address_space_bytes = 1024 * 1024 * 1024;
         install_rlimits(&limits).expect("rlimits");
         let mut system_runtime_roots = ["/lib", "/lib64", "/usr/lib", "/usr/lib64"]

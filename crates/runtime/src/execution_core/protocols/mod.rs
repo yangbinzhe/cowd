@@ -146,6 +146,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
                     generation: request.budget_revision.max(1),
                 }),
                 orchestration: None,
+                continuation_binding: None,
                 nodes: Vec::new(),
                 edges: Vec::new(),
                 node_statuses: BTreeMap::new(),
@@ -258,6 +259,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 role_evidence_instruction(role.evidence_mode),
                 role_slot_focus(role, slot),
             ),
+            team_role_identity: None,
             required_acceptance: harness_contract::context::RequiredAcceptance {
                 criteria: acceptance.clone(),
                 evidence_obligations: Vec::new(),
@@ -277,7 +279,6 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 agent_id,
                 "protocol_agent",
                 self.request.budget_tokens,
-                self.request.budget_tokens.saturating_mul(75),
                 deadline_at_ms,
                 self.request.budget_revision,
             ),

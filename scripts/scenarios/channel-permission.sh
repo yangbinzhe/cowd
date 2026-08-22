@@ -97,6 +97,13 @@ if [[ "$gateway_ready" -ne 1 ]]; then
   exit 1
 fi
 
+# Committed connector execution is governed by the target Session's effective
+# policy.  Create that Session first so the scenario exercises the real
+# authorization path instead of a legacy policy-less preflight.
+curl -fsS "$BASE_URL/api/sessions/session-$SUFFIX/ensure" \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-sonnet-4-6"}' >/dev/null
+
 curl -fsS "$BASE_URL/api/cross-plane/grants" \
   -H 'content-type: application/json' \
   -d "{\"id\":\"$GRANT_ID\",\"principal_id\":\"$PRINCIPAL\",\"capability\":\"$CAPABILITY\",\"account_id\":null,\"target_ref\":null,\"resource_ref\":null,\"source_channel\":null,\"grant_type\":\"single_use\",\"expires_at\":null,\"remaining_uses\":null,\"created_by\":\"channel-permission\",\"approval_id\":null}" \
@@ -130,15 +137,7 @@ audit_json="$(curl -fsS "$BASE_URL/api/cross-plane/audit")"
 printf '%s' "$audit_json" | rg -q "\"consumed_grant_id\"\\s*:\\s*\"$GRANT_ID\""
 printf '%s' "$audit_json" | rg -q '"remaining_uses_after"\s*:\s*0'
 
-ready_json=""
-for _ in {1..100}; do
-  ready_json="$(curl -sS "$BASE_URL/readyz")"
-  if printf '%s' "$ready_json" | rg -q '"ready":true'; then
-    break
-  fi
-  sleep 0.25
-done
-if ! printf '%s' "$ready_json" | rg -q '"ready":true'; then
-  echo "channel permission gateway is not ready: $ready_json" >&2
-  exit 1
-fi
+# The scenario deliberately uses an unreachable Provider because it never
+# invokes a model.  Check Gateway-local health rather than global provider
+# readiness, which is correctly fail-closed for that fixture.
+curl -fsS "$BASE_URL/healthz" >/dev/null

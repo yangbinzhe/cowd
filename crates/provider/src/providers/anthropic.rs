@@ -10,7 +10,6 @@ use model_protocol::oauth::{
 use model_protocol::telemetry::{
     AnalyticsEvent, AnthropicRequestProfile, ClientIdentity, SessionTracer,
 };
-use model_protocol::usage::format_usd;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -335,15 +334,7 @@ impl AnthropicClient {
                             .map_or(Value::Null, Value::String),
                     )
                     .with_property("total_tokens", Value::from(response.total_tokens()))
-                    .with_property(
-                        "estimated_cost_usd",
-                        Value::String(format_usd(
-                            response
-                                .usage
-                                .estimated_cost_usd(&response.model)
-                                .total_cost_usd(),
-                        )),
-                    ),
+                    .with_property("model", Value::String(response.model.clone())),
             );
         }
         Ok(response)

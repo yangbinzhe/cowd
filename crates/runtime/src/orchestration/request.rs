@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use harness_contract::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy};
+use harness_contract::execution_graph::{
+    CollaborationProgram, ExecutionCompletionContract, ExecutionDependencyPolicy,
+};
 use harness_contract::input_disposition::ModelInputDispositionBatch;
 use harness_contract::orchestration::{
     ModelGraphMutationProposal, ModelGraphSemanticNode, ModelRuntimeOrchestrationConstraints,
@@ -94,6 +96,11 @@ pub struct GraphMutationProposal {
     pub expected_revision: Option<u64>,
     pub nodes: Vec<GraphSemanticNode>,
     pub completion: ExecutionCompletionContract,
+    /// Runtime-owned durable collaboration obligations. Model JSON cannot
+    /// populate this field directly; the compiler derives it from validated
+    /// Team semantic nodes when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_program: Option<CollaborationProgram>,
     pub reason: String,
 }
 
@@ -105,6 +112,7 @@ impl From<ModelGraphMutationProposal> for GraphMutationProposal {
             expected_revision: value.expected_revision,
             nodes: value.nodes.into_iter().map(Into::into).collect(),
             completion: value.completion,
+            collaboration_program: None,
             reason: value.reason,
         }
     }

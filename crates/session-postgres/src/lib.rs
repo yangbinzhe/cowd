@@ -100,7 +100,7 @@ pub fn export_sqlite_session_snapshot(
     source: &SqliteSessionStore,
 ) -> session::SessionResult<SessionMigrationSnapshot> {
     let connection = source.conn()?;
-    let sessions = sqlite_rows(&connection, "SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status FROM sessions ORDER BY session_id", sqlite_row_to_session)?;
+    let sessions = sqlite_rows(&connection, "SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,status FROM sessions ORDER BY session_id", sqlite_row_to_session)?;
     let input_admissions = sqlite_rows(
         &connection,
         "SELECT session_id,input_generation,input_admission_open FROM sessions ORDER BY session_id",
@@ -206,8 +206,7 @@ fn sqlite_row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
         metadata_json: row.get(9)?,
         input_tokens: row.get(10)?,
         output_tokens: row.get(11)?,
-        estimated_cost_usd: row.get(12)?,
-        status: row.get(13)?,
+        status: row.get(12)?,
     })
 }
 
@@ -383,7 +382,6 @@ const SESSION_MIGRATIONS: &[PostgresMigrationSpec] = &[PostgresMigrationSpec {
             metadata_json TEXT,
             input_tokens BIGINT NOT NULL DEFAULT 0,
             output_tokens BIGINT NOT NULL DEFAULT 0,
-            estimated_cost_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'active'
         )",
         "CREATE INDEX IF NOT EXISTS idx_session_records_activity
@@ -1535,9 +1533,9 @@ impl PostgresSessionStore {
                 "INSERT INTO session_records(
                     session_id, platform, chat_id, user_id, model, created_at,
                     last_activity, message_count, reset_policy, metadata_json,
-                    input_tokens, output_tokens, estimated_cost_usd, status,
+                    input_tokens, output_tokens, status,
                     created_at_ms, updated_at_ms
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
                     cowd_safe_session_epoch_ms($6), cowd_safe_session_epoch_ms($7))
                  ON CONFLICT(session_id) DO NOTHING",
                 &session_params(session),
@@ -1573,7 +1571,7 @@ impl PostgresSessionStore {
             .query(
                 "SELECT session_id, platform, chat_id, user_id, model,
                         created_at, last_activity, message_count, reset_policy, metadata_json,
-                        input_tokens, output_tokens, estimated_cost_usd, status
+                        input_tokens, output_tokens, status
                    FROM session_records
                   WHERE session_id = ANY($1)
                   ORDER BY session_id ASC",
@@ -2015,7 +2013,7 @@ impl PostgresSessionStore {
                 "UPDATE session_records SET
                     platform=$2, chat_id=$3, user_id=$4, model=$5, created_at=$6,
                     last_activity=$7, message_count=$8, reset_policy=$9, metadata_json=$10,
-                    input_tokens=$11, output_tokens=$12, estimated_cost_usd=$13, status=$14,
+                    input_tokens=$11, output_tokens=$12, status=$13,
                     created_at_ms=cowd_safe_session_epoch_ms($6),
                     updated_at_ms=cowd_safe_session_epoch_ms($7)
                  WHERE session_id=$1",
@@ -2032,9 +2030,9 @@ impl PostgresSessionStore {
                 "INSERT INTO session_records(
                     session_id, platform, chat_id, user_id, model, created_at,
                     last_activity, message_count, reset_policy, metadata_json,
-                    input_tokens, output_tokens, estimated_cost_usd, status,
+                    input_tokens, output_tokens, status,
                     created_at_ms, updated_at_ms
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
                     cowd_safe_session_epoch_ms($6), cowd_safe_session_epoch_ms($7))
                  ON CONFLICT(session_id) DO UPDATE SET
                     platform=EXCLUDED.platform, chat_id=EXCLUDED.chat_id,
@@ -2042,8 +2040,7 @@ impl PostgresSessionStore {
                     created_at=EXCLUDED.created_at, last_activity=EXCLUDED.last_activity,
                     message_count=EXCLUDED.message_count, reset_policy=EXCLUDED.reset_policy,
                     metadata_json=EXCLUDED.metadata_json, input_tokens=EXCLUDED.input_tokens,
-                    output_tokens=EXCLUDED.output_tokens,
-                    estimated_cost_usd=EXCLUDED.estimated_cost_usd, status=EXCLUDED.status,
+                    output_tokens=EXCLUDED.output_tokens, status=EXCLUDED.status,
                     created_at_ms=EXCLUDED.created_at_ms,
                     updated_at_ms=EXCLUDED.updated_at_ms",
                 &session_params(session),
@@ -2089,7 +2086,7 @@ impl PostgresSessionStore {
             .query(
                 "SELECT session_id, platform, chat_id, user_id, model, created_at,
                         last_activity, message_count, reset_policy, metadata_json,
-                        input_tokens, output_tokens, estimated_cost_usd, status
+                        input_tokens, output_tokens, status
                    FROM session_records ORDER BY last_activity DESC, session_id ASC",
                 &[],
             )
@@ -2106,7 +2103,7 @@ impl PostgresSessionStore {
         self.query_sessions(
             "SELECT session_id, platform, chat_id, user_id, model, created_at,
                     last_activity, message_count, reset_policy, metadata_json,
-                    input_tokens, output_tokens, estimated_cost_usd, status
+                    input_tokens, output_tokens, status
                FROM session_records WHERE platform=$1
                ORDER BY last_activity DESC, session_id ASC",
             &[&platform],
@@ -2120,7 +2117,7 @@ impl PostgresSessionStore {
         self.query_sessions(
             "SELECT session_id, platform, chat_id, user_id, model, created_at,
                     last_activity, message_count, reset_policy, metadata_json,
-                    input_tokens, output_tokens, estimated_cost_usd, status
+                    input_tokens, output_tokens, status
                FROM session_records
               WHERE metadata_json IS NOT NULL
                 AND metadata_json::jsonb ->> 'workspace_root' = $1
@@ -2196,7 +2193,7 @@ impl PostgresSessionStore {
                 &format!(
                     "SELECT session_id, platform, chat_id, user_id, model, created_at,
                             last_activity, message_count, reset_policy, metadata_json,
-                            input_tokens, output_tokens, estimated_cost_usd, status
+                            input_tokens, output_tokens, status
                        FROM session_records {where_clause}
                       ORDER BY {sort} {order}, session_id ASC LIMIT $8 OFFSET $9"
                 ),
@@ -2236,8 +2233,7 @@ impl PostgresSessionStore {
         let totals = connection
             .query_one(
                 "SELECT COUNT(*),COALESCE(SUM(message_count),0),
-                        COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),
-                        COALESCE(SUM(estimated_cost_usd),0)
+                        COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0)
                    FROM session_records
                   WHERE status NOT IN ('deleted','deleting')",
                 &[],
@@ -2252,8 +2248,7 @@ impl PostgresSessionStore {
                         &format!(
                             "SELECT COALESCE(NULLIF(BTRIM({column}),''),'unknown'),COUNT(*),
                                 COALESCE(SUM(message_count),0),COALESCE(SUM(input_tokens),0),
-                                COALESCE(SUM(output_tokens),0),
-                                COALESCE(SUM(estimated_cost_usd),0)
+                                COALESCE(SUM(output_tokens),0)
                            FROM session_records
                           WHERE status NOT IN ('deleted','deleting')
                           GROUP BY 1 ORDER BY 1"
@@ -2275,7 +2270,6 @@ impl PostgresSessionStore {
                                 message_count: row.try_get(2).map_err(postgres_error)?,
                                 input_tokens: row.try_get(3).map_err(postgres_error)?,
                                 output_tokens: row.try_get(4).map_err(postgres_error)?,
-                                estimated_cost_usd: row.try_get(5).map_err(postgres_error)?,
                             },
                         ))
                     })
@@ -2302,7 +2296,6 @@ impl PostgresSessionStore {
             message_count: totals.try_get(1).map_err(postgres_error)?,
             input_tokens: totals.try_get(2).map_err(postgres_error)?,
             output_tokens: totals.try_get(3).map_err(postgres_error)?,
-            estimated_cost_usd: totals.try_get(4).map_err(postgres_error)?,
             by_platform,
             by_model,
             recent_sessions,
@@ -2386,7 +2379,7 @@ impl PostgresSessionStore {
                     r"SELECT s.session_id, s.platform, s.chat_id, s.user_id, s.model,
                               s.created_at, s.last_activity, s.message_count, s.reset_policy,
                               s.metadata_json, s.input_tokens, s.output_tokens,
-                              s.estimated_cost_usd, s.status
+                              s.status
                          {authority_clause}
                         ORDER BY s.last_activity DESC, s.session_id ASC
                         LIMIT $3 OFFSET $4"
@@ -3025,7 +3018,7 @@ impl PostgresSessionStore {
                 .query_opt(
                     "SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,
                             message_count,reset_policy,metadata_json,input_tokens,output_tokens,
-                            estimated_cost_usd,status
+                            status
                        FROM session_records WHERE session_id=$1",
                     &[&existing.target_session_id],
                 )
@@ -3089,8 +3082,8 @@ impl PostgresSessionStore {
                 "INSERT INTO session_records(
                      session_id,platform,chat_id,user_id,model,created_at,last_activity,
                      message_count,reset_policy,metadata_json,input_tokens,output_tokens,
-                     estimated_cost_usd,status,created_at_ms,updated_at_ms
-                 ) VALUES($1,$2,$3,$4,$5,$6,$7,0,$8,$9,0,0,0,$10,
+                     status,created_at_ms,updated_at_ms
+                 ) VALUES($1,$2,$3,$4,$5,$6,$7,0,$8,$9,0,0,$10,
                      cowd_safe_session_epoch_ms($6),cowd_safe_session_epoch_ms($7))",
                 &[
                     &request.target.session_id,
@@ -4648,8 +4641,8 @@ impl PostgresSessionStore {
                 "UPDATE session_records SET
                      platform=$2,chat_id=$3,user_id=$4,model=$5,last_activity=$6,
                      message_count=$7,reset_policy=$8,metadata_json=$9,input_tokens=$10,
-                     output_tokens=$11,estimated_cost_usd=$12,status=$13,updated_at_ms=$14
-                   WHERE session_id=$1 AND input_generation=$15
+                     output_tokens=$11,status=$12,updated_at_ms=$13
+                   WHERE session_id=$1 AND input_generation=$14
                      AND input_admission_open=FALSE",
                 &[
                     &request.record.session_id,
@@ -4663,7 +4656,6 @@ impl PostgresSessionStore {
                     &request.record.metadata_json,
                     &request.record.input_tokens,
                     &request.record.output_tokens,
-                    &request.record.estimated_cost_usd,
                     &request.record.status,
                     &to_u64_i64(request.transition.updated_at_ms, "lifecycle tombstone time")?,
                     &to_u64_i64(
@@ -6218,7 +6210,7 @@ impl PostgresSessionStore {
     pub fn export_migration_snapshot(&self) -> session::SessionResult<SessionMigrationSnapshot> {
         let mut connection = self.executor.checkout_background().map_err(storage_error)?;
         let sessions = connection
-            .query("SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status FROM session_records ORDER BY session_id", &[])
+            .query("SELECT session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,reset_policy,metadata_json,input_tokens,output_tokens,status FROM session_records ORDER BY session_id", &[])
             .map_err(postgres_error)?
             .iter()
             .map(row_to_session)
@@ -6592,7 +6584,7 @@ fn prepare_legacy_session_usage_for_migration(
 const SESSION_SELECT_BY_ID: &str =
     "SELECT session_id, platform, chat_id, user_id, model, created_at,
     last_activity, message_count, reset_policy, metadata_json, input_tokens, output_tokens,
-    estimated_cost_usd, status FROM session_records WHERE session_id=$1";
+    status FROM session_records WHERE session_id=$1";
 
 const RUNTIME_OUTBOX_SELECT: &str =
     "SELECT input_id,request_id,turn_id,message_id,session_id,sequence,session_generation,
@@ -6601,7 +6593,7 @@ const RUNTIME_OUTBOX_SELECT: &str =
             revision,created_at_ms,updated_at_ms,terminal_at_ms,runtime_options_json,claim_fence_epoch,application_receipt_json
        FROM session_runtime_outbox WHERE request_id=$1";
 
-fn session_params(session: &SessionRecord) -> [&(dyn ToSql + Sync); 14] {
+fn session_params(session: &SessionRecord) -> [&(dyn ToSql + Sync); 13] {
     [
         &session.session_id,
         &session.platform,
@@ -6615,7 +6607,6 @@ fn session_params(session: &SessionRecord) -> [&(dyn ToSql + Sync); 14] {
         &session.metadata_json,
         &session.input_tokens,
         &session.output_tokens,
-        &session.estimated_cost_usd,
         &session.status,
     ]
 }
@@ -6627,16 +6618,16 @@ fn upsert_session_tx(
     transaction.execute(
         "INSERT INTO session_records(
             session_id,platform,chat_id,user_id,model,created_at,last_activity,message_count,
-            reset_policy,metadata_json,input_tokens,output_tokens,estimated_cost_usd,status,
+            reset_policy,metadata_json,input_tokens,output_tokens,status,
             created_at_ms,updated_at_ms
-         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+         ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
             cowd_safe_session_epoch_ms($6),cowd_safe_session_epoch_ms($7))
          ON CONFLICT(session_id) DO UPDATE SET
             platform=EXCLUDED.platform,chat_id=EXCLUDED.chat_id,user_id=EXCLUDED.user_id,
             model=EXCLUDED.model,created_at=EXCLUDED.created_at,last_activity=EXCLUDED.last_activity,
             message_count=EXCLUDED.message_count,reset_policy=EXCLUDED.reset_policy,
             metadata_json=EXCLUDED.metadata_json,input_tokens=EXCLUDED.input_tokens,
-            output_tokens=EXCLUDED.output_tokens,estimated_cost_usd=EXCLUDED.estimated_cost_usd,
+            output_tokens=EXCLUDED.output_tokens,
             status=EXCLUDED.status,created_at_ms=EXCLUDED.created_at_ms,
             updated_at_ms=EXCLUDED.updated_at_ms",
         &session_params(session),
@@ -7799,8 +7790,7 @@ fn row_to_session(row: &Row) -> session::SessionResult<SessionRecord> {
         metadata_json: row.try_get(9).map_err(postgres_error)?,
         input_tokens: row.try_get(10).map_err(postgres_error)?,
         output_tokens: row.try_get(11).map_err(postgres_error)?,
-        estimated_cost_usd: row.try_get(12).map_err(postgres_error)?,
-        status: row.try_get(13).map_err(postgres_error)?,
+        status: row.try_get(12).map_err(postgres_error)?,
     })
 }
 
@@ -9105,7 +9095,6 @@ mod tests {
             ),
             input_tokens: 0,
             output_tokens: 0,
-            estimated_cost_usd: 0.0,
             status: "active".to_string(),
         }
     }

@@ -114,10 +114,6 @@ pub(crate) fn verify_read_revision(
     Ok((revision, team_markdown))
 }
 
-
-
-
-
 pub(crate) fn ensure_same_revision_ref(
     expected: &TeamTemplateRevisionRef,
     actual: &TeamTemplateRevisionRef,

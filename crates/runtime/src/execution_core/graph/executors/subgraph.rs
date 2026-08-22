@@ -129,6 +129,25 @@ impl NodeExecutor for TeamSubgraphExecutor {
                 ));
             }
         }
+        if let Some(binding) = context.graph.continuation_binding.as_ref() {
+            if binding.source_session_id != request.lineage.session_id {
+                return Err(NodeExecutorError::Invalid {
+                    node_id: context.node.id.clone(),
+                    reason: "continuation source Session does not match the Team child lineage"
+                        .to_string(),
+                });
+            }
+            // The binding is immutable graph truth.  Give the child Team its
+            // exact durable result locators, never an old user transcript or
+            // a free-form reconstruction of the earlier Team prompt.
+            request
+                .upstream_artifact_refs
+                .extend(binding.result_refs.iter().cloned());
+            summaries.push(format!(
+                "continuation {} from {} ({})",
+                binding.team_set_ref, binding.source_root_id, binding.binding_digest
+            ));
+        }
         request.upstream_evidence_refs.sort_by(|left, right| {
             left.evidence_ref
                 .ref_type
@@ -189,13 +208,19 @@ impl NodeExecutor for TeamSubgraphExecutor {
                     node_id: ticket.node_id.clone(),
                     reason,
                 })?;
-        if projection.status == "running" {
+        // `TeamProjection.status` is a delivery string.  It deliberately has
+        // richer non-terminal values such as `preparing`, `waiting_approval`
+        // and `waiting_external`; treating every value other than `running`
+        // as a child terminal races the Team's own durable scheduler and
+        // turns a healthy second Team into a false parent Blocked result.
+        // Lifecycle is the typed graph-derived authority for this decision.
+        if projection.lifecycle != harness_contract::team::TeamLifecycleState::Terminal {
             return Ok(NodeExecutionOutcome::new(ExecutionNodeResult {
                 status: ExecutionNodeStatus::WaitingExternal,
                 result_ref: Some(format!("execution-graph:{child_graph_id}")),
                 summary: Some(format!(
-                    "Team `{}` was durably admitted and is running under the Runtime supervisor",
-                    projection.team_id
+                    "Team `{}` was durably admitted and is {} under the Runtime supervisor",
+                    projection.team_id, projection.status
                 )),
                 evidence_refs: Vec::new(),
                 failure: None,
@@ -487,7 +512,6 @@ mod tests {
             execution_budget: harness_contract::context::ParentExecutionBudget::new(
                 "subgraph-team-budget",
                 65_536,
-                4_915_200,
                 u64::MAX,
                 32,
                 1,

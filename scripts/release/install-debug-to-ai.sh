@@ -47,13 +47,13 @@ if [[ ! -x "$BIN" ]]; then
   echo "missing executable cowd binary at $BIN" >&2
   exit 1
 fi
-if [[ ! -x "$LAUNCHER_BIN" ]]; then
-  echo "missing managed-worker-launcher binary at $LAUNCHER_BIN" >&2
-  exit 1
-fi
 BIN_VERSION="$("$BIN" --version | awk '$1 == "Version" {print $2; exit}')"
 if [[ "$BIN_VERSION" != "$VERSION" ]]; then
   echo "cowd binary version mismatch: expected $VERSION, got ${BIN_VERSION:-unknown}" >&2
+  exit 1
+fi
+if [[ ! -x "$LAUNCHER_BIN" ]]; then
+  echo "missing managed-worker-launcher binary at $LAUNCHER_BIN" >&2
   exit 1
 fi
 mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/docs"

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use harness_contract::context::{ChildExecutionBudgetReservation, ParentExecutionBudget};
-use model_protocol::usage::{ModelPricing, TokenUsage};
+use model_protocol::usage::TokenUsage;
 
 use crate::runtime_event_store::{
     AppendTransactionRequest, ExpectedStreamRevision, RuntimeEventInput, RuntimeEventScope,
@@ -11,21 +11,21 @@ use crate::runtime_event_store::{
 
 const MAX_BUDGET_CAS_RETRIES: usize = 16;
 
+/// Durable technical-capacity telemetry for one parent execution.
+///
+/// It records context/output capacity reservations and reconciliation across a
+/// restart. It deliberately has no commercial model-rate dimension.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParentExecutionBudgetSnapshot {
     pub reserved_tokens: u64,
-    pub reserved_cost_microusd: u64,
     pub settled_tokens: u64,
-    pub settled_cost_microusd: u64,
     pub breached: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct DurableProviderCharge {
     reserved_tokens: u64,
-    reserved_cost_microusd: u64,
     actual_tokens: Option<u64>,
-    actual_cost_microusd: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -48,10 +48,7 @@ pub struct DurableProviderBudgetReservation {
     ledger: ParentExecutionBudgetLedger,
     child: ChildExecutionBudgetReservation,
     reservation_id: String,
-    model: String,
-    pricing: ModelPricing,
     pub reserved_tokens: u64,
-    pub reserved_cost_microusd: u64,
     pub granted_output_tokens: u64,
     reconciled: bool,
 }
@@ -86,68 +83,31 @@ impl ParentExecutionBudgetLedger {
         input_reserve_tokens: u64,
         requested_output_tokens: u64,
     ) -> Result<DurableProviderBudgetReservation, String> {
-        // Record-only budget: this reservation meters provider usage for
-        // projection and audit. It never rejects Provider IO based on
-        // cumulative token/cost ceilings; context window fit is the only
-        // admission boundary and lives in provider preflight.
         child.validate().map_err(str::to_string)?;
         self.validate_child(child)?;
         if model.trim().is_empty() || input_reserve_tokens == 0 || requested_output_tokens == 0 {
-            return Err("provider budget reservation input is incomplete".to_string());
+            return Err("provider capacity reservation input is incomplete".to_string());
         }
-        let pricing = crate::pricing_for_model(model).unwrap_or_else(|| {
-            tracing::debug!(
-                model,
-                budget_id = %self.budget.budget_id,
-                "execution budget has no canonical pricing; using conservative default for recording"
-            );
-            ModelPricing::default_sonnet_tier()
-        });
         let reservation_id = reservation_id.into();
         if reservation_id.trim().is_empty() {
-            return Err("provider budget reservation id is empty".to_string());
+            return Err("provider capacity reservation id is empty".to_string());
         }
-        // Cache accounting is provider-dependent and may be reported in
-        // addition to input_tokens. Reserve two input copies so an unknown
-        // cache split cannot escape the hard token or cost ceiling.
-        let guarded_input = input_reserve_tokens.saturating_mul(2);
-        let cost_rate = conservative_microusd_per_token(pricing);
+
+        // Cache accounting can be reported separately from ordinary input.
+        // Reserve two input copies so a provider's cache split does not evade
+        // context/output telemetry. This remains an observation, not a
+        // commercial gate or a cumulative execution kill switch.
+        let reserved_tokens = input_reserve_tokens
+            .saturating_mul(2)
+            .saturating_add(requested_output_tokens);
         for _ in 0..MAX_BUDGET_CAS_RETRIES {
             let (stream_revision, created, charges) = self.load_state()?;
             if charges.contains_key(&reservation_id) {
                 return Err(format!(
-                    "provider budget reservation `{reservation_id}` already exists"
+                    "provider capacity reservation `{reservation_id}` already exists"
                 ));
             }
-            let parent = snapshot_from_charges(charges.values());
-            // Child totals are reconstructed separately from durable payloads
-            // because the compact aggregate value stores accounting numbers,
-            // not ownership strings.
             let child_totals = self.child_snapshot(&child.lease_id)?;
-            let parent_tokens_left = self
-                .budget
-                .max_tokens
-                .saturating_sub(parent.reserved_tokens);
-            let parent_cost_left = self
-                .budget
-                .max_cost_microusd
-                .saturating_sub(parent.reserved_cost_microusd);
-            // Child allocations are complexity-informed starting targets, not
-            // isolated hard caps. Once a child reaches its target it may use
-            // otherwise idle parent capacity. This prevents one difficult
-            // evidence branch or terminal narrator from failing while the
-            // Team still has a safe aggregate token/cost envelope.
-            let token_capacity = parent_tokens_left;
-            let cost_capacity = parent_cost_left / cost_rate.max(1);
-            let capacity = token_capacity.min(cost_capacity);
-            // Record-only budget: capacity exhaustion is metered, never an
-            // admission rejection. The provider step always proceeds; the
-            // projection reports the overage.
-            let budget_exceeded = guarded_input >= capacity
-                || requested_output_tokens > capacity.saturating_sub(guarded_input);
-            let granted_output_tokens = requested_output_tokens;
-            let reserved_tokens = guarded_input.saturating_add(granted_output_tokens);
-            let reserved_cost_microusd = reserved_tokens.saturating_mul(cost_rate);
             let mut events = Vec::with_capacity(2);
             if !created {
                 events.push(self.created_event());
@@ -158,7 +118,7 @@ impl ParentExecutionBudgetLedger {
                     scope: RuntimeEventScope::Team,
                     kind: "execution_budget.provider_reserved".to_string(),
                     status: Some("reserved".to_string()),
-                    actor: Some("runtime-provider-budget".to_string()),
+                    actor: Some("runtime-provider-capacity".to_string()),
                     refs: Vec::new(),
                     payload: serde_json::json!({
                         "budget_id": self.budget.budget_id,
@@ -167,16 +127,14 @@ impl ParentExecutionBudgetLedger {
                         "reservation_id": reservation_id,
                         "model": model,
                         "reserved_tokens": reserved_tokens,
-                        "reserved_cost_microusd": reserved_cost_microusd,
                         "child_target_tokens": child.max_tokens,
-                        "child_target_cost_microusd": child.max_cost_microusd,
                         "child_tokens_before_reservation": child_totals.reserved_tokens,
-                        "borrowed_from_parent_pool": child_totals.reserved_tokens
-                            .saturating_add(reserved_tokens) > child.max_tokens
-                            || child_totals.reserved_cost_microusd
-                                .saturating_add(reserved_cost_microusd)
-                                > child.max_cost_microusd,
-                        "budget_exceeded": budget_exceeded,
+                        "borrowed_from_parent_pool": child_totals
+                            .reserved_tokens
+                            .saturating_add(reserved_tokens) > child.max_tokens,
+                        "capacity_prediction_exceeded": snapshot_from_charges(charges.values())
+                            .reserved_tokens
+                            .saturating_add(reserved_tokens) > self.budget.max_tokens,
                     }),
                 },
                 idempotency_key: Some(format!("provider-reserve:{reservation_id}")),
@@ -199,11 +157,8 @@ impl ParentExecutionBudgetLedger {
                         ledger: self.clone(),
                         child: child.clone(),
                         reservation_id,
-                        model: model.to_string(),
-                        pricing,
                         reserved_tokens,
-                        reserved_cost_microusd,
-                        granted_output_tokens,
+                        granted_output_tokens: requested_output_tokens,
                         reconciled: false,
                     });
                 }
@@ -212,7 +167,7 @@ impl ParentExecutionBudgetLedger {
             }
         }
         Err(format!(
-            "execution budget `{}` remained contended after {MAX_BUDGET_CAS_RETRIES} CAS attempts",
+            "execution capacity ledger `{}` remained contended after {MAX_BUDGET_CAS_RETRIES} CAS attempts",
             self.budget.budget_id
         ))
     }
@@ -224,7 +179,7 @@ impl ParentExecutionBudgetLedger {
                 scope: RuntimeEventScope::Team,
                 kind: "execution_budget.created".to_string(),
                 status: Some("active".to_string()),
-                actor: Some("runtime-provider-budget".to_string()),
+                actor: Some("runtime-provider-capacity".to_string()),
                 refs: Vec::new(),
                 payload: serde_json::to_value(&self.budget).unwrap_or_default(),
             },
@@ -243,7 +198,6 @@ impl ParentExecutionBudgetLedger {
             || child.deadline_at_ms != self.budget.deadline_at_ms
             || child.max_parallel != self.budget.max_parallel
             || child.max_tokens > self.budget.max_tokens
-            || child.max_cost_microusd > self.budget.max_cost_microusd
         {
             return Err("child execution budget does not match its immutable parent".to_string());
         }
@@ -298,11 +252,6 @@ impl DurableProviderBudgetReservation {
             .saturating_add(u64::from(usage.cache_creation_input_tokens))
             .saturating_add(u64::from(usage.cache_read_input_tokens));
         let missing_usage = actual_tokens == 0;
-        let actual_cost_microusd = if missing_usage {
-            0
-        } else {
-            exact_cost_microusd(usage, self.pricing)
-        };
         for _ in 0..MAX_BUDGET_CAS_RETRIES {
             let stream_revision = self
                 .ledger
@@ -329,23 +278,19 @@ impl DurableProviderBudgetReservation {
                         },
                         status: Some(if missing_usage {
                             "missing".to_string()
-                        } else if actual_tokens <= self.reserved_tokens
-                            && actual_cost_microusd <= self.reserved_cost_microusd
-                        {
+                        } else if actual_tokens <= self.reserved_tokens {
                             "settled".to_string()
                         } else {
                             "breached".to_string()
                         }),
-                        actor: Some("runtime-provider-budget".to_string()),
+                        actor: Some("runtime-provider-capacity".to_string()),
                         refs: Vec::new(),
                         payload: serde_json::json!({
                             "budget_id": self.child.parent_budget_id,
                             "budget_revision": self.child.revision,
                             "child_lease_id": self.child.lease_id,
                             "reservation_id": self.reservation_id,
-                            "model": self.model,
                             "actual_tokens": actual_tokens,
-                            "actual_cost_microusd": actual_cost_microusd,
                         }),
                     },
                     idempotency_key: Some(format!("provider-reconcile:{}", self.reservation_id)),
@@ -361,7 +306,7 @@ impl DurableProviderBudgetReservation {
                 Err(error) => return Err(error.to_string()),
             }
         }
-        Err("provider budget reconciliation remained CAS-contended".to_string())
+        Err("provider capacity reconciliation remained CAS-contended".to_string())
     }
 }
 
@@ -395,12 +340,7 @@ fn replay_charges(
                     reservation_id,
                     DurableProviderCharge {
                         reserved_tokens: required_u64(&event.payload, "reserved_tokens")?,
-                        reserved_cost_microusd: required_u64(
-                            &event.payload,
-                            "reserved_cost_microusd",
-                        )?,
                         actual_tokens: None,
-                        actual_cost_microusd: None,
                     },
                 );
             }
@@ -419,8 +359,6 @@ fn replay_charges(
                     format!("budget reconciliation `{reservation_id}` has no reservation")
                 })?;
                 charge.actual_tokens = Some(required_u64(&event.payload, "actual_tokens")?);
-                charge.actual_cost_microusd =
-                    Some(required_u64(&event.payload, "actual_cost_microusd")?);
             }
             _ => {}
         }
@@ -434,36 +372,13 @@ fn snapshot_from_charges<'a>(
     let mut snapshot = ParentExecutionBudgetSnapshot::default();
     for charge in charges {
         let tokens = charge.actual_tokens.unwrap_or(charge.reserved_tokens);
-        let cost = charge
-            .actual_cost_microusd
-            .unwrap_or(charge.reserved_cost_microusd);
         snapshot.reserved_tokens = snapshot.reserved_tokens.saturating_add(tokens);
-        snapshot.reserved_cost_microusd = snapshot.reserved_cost_microusd.saturating_add(cost);
         if charge.actual_tokens.is_some() {
             snapshot.settled_tokens = snapshot.settled_tokens.saturating_add(tokens);
-            snapshot.settled_cost_microusd = snapshot.settled_cost_microusd.saturating_add(cost);
         }
-        snapshot.breached |=
-            tokens > charge.reserved_tokens || cost > charge.reserved_cost_microusd;
+        snapshot.breached |= tokens > charge.reserved_tokens;
     }
     snapshot
-}
-
-fn conservative_microusd_per_token(pricing: ModelPricing) -> u64 {
-    pricing
-        .input_cost_per_million
-        .max(pricing.output_cost_per_million)
-        .max(pricing.cache_creation_cost_per_million)
-        .max(pricing.cache_read_cost_per_million)
-        .ceil()
-        .max(1.0) as u64
-}
-
-fn exact_cost_microusd(usage: TokenUsage, pricing: ModelPricing) -> u64 {
-    let cost = usage
-        .estimate_cost_usd_with_pricing(pricing)
-        .total_cost_usd();
-    (cost * 1_000_000.0).ceil().max(0.0).min(u64::MAX as f64) as u64
 }
 
 fn required_string(payload: &serde_json::Value, field: &str) -> Result<String, String> {
@@ -487,7 +402,7 @@ mod tests {
     use super::*;
 
     fn parent() -> ParentExecutionBudget {
-        ParentExecutionBudget::new("parent-budget", 4_000, 20_000, u64::MAX, 4, 1)
+        ParentExecutionBudget::new("parent-budget", 4_000, u64::MAX, 4, 1)
     }
 
     fn child(parent: &ParentExecutionBudget, slot_index: usize) -> ChildExecutionBudgetReservation {
@@ -499,7 +414,6 @@ mod tests {
             scope: "team_agent".to_string(),
             max_tokens: 1_000,
             consumed_tokens: 0,
-            max_cost_microusd: 5_000,
             deadline_at_ms: parent.deadline_at_ms,
             max_parallel: parent.max_parallel,
             revision: parent.revision,
@@ -509,7 +423,7 @@ mod tests {
     }
 
     #[test]
-    fn four_children_share_one_durable_token_and_cost_ceiling() {
+    fn four_children_share_one_durable_capacity_ledger() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let parent = parent();
         let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
@@ -519,16 +433,13 @@ mod tests {
                     .reserve_provider(
                         &child(&parent, slot),
                         format!("reservation-{slot}"),
-                        "claude-haiku-4-5-20251001",
+                        "capable-model",
                         10,
                         100,
                     )
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let reserved = ledger.snapshot().unwrap();
-        assert!(reserved.reserved_tokens <= parent.max_tokens);
-        assert!(reserved.reserved_cost_microusd <= parent.max_cost_microusd);
         for reservation in &mut reservations {
             reservation
                 .reconcile(TokenUsage {
@@ -544,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn complex_child_borrows_idle_parent_capacity_without_crossing_parent_ceiling() {
+    fn complex_child_borrows_idle_parent_capacity_without_a_commercial_gate() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let parent = parent();
         let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
@@ -553,19 +464,17 @@ mod tests {
             .reserve_provider(
                 &child,
                 "elastic-child-continuation",
-                "deepseek-v4-flash",
+                "private-model-without-commercial-rate",
                 10,
                 child.max_tokens + 200,
             )
-            .expect("unused parent capacity should remain available to a complex child");
+            .expect("capacity telemetry must never require a commercial rate");
 
         assert!(reservation.reserved_tokens > child.max_tokens);
-        assert!(reservation.reserved_tokens <= parent.max_tokens);
-        assert!(reservation.reserved_cost_microusd <= parent.max_cost_microusd);
     }
 
     #[test]
-    fn crash_restart_replays_the_full_unsettled_reservation() {
+    fn crash_restart_replays_the_full_unsettled_capacity_reservation() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let parent = parent();
         let ledger = ParentExecutionBudgetLedger::new(Arc::clone(&store), parent.clone()).unwrap();
@@ -573,7 +482,7 @@ mod tests {
             .reserve_provider(
                 &child(&parent, 0),
                 "crash-reservation",
-                "claude-haiku-4-5-20251001",
+                "capable-model",
                 10,
                 100,
             )
@@ -582,56 +491,5 @@ mod tests {
         drop(reservation);
         let recovered = ParentExecutionBudgetLedger::new(store, parent).unwrap();
         assert_eq!(recovered.snapshot().unwrap().reserved_tokens, before);
-    }
-
-    #[test]
-    fn unknown_usage_and_unknown_pricing_are_recorded_not_blocking() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
-        let parent = parent();
-        let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
-        let unknown_pricing = ledger
-            .reserve_provider(
-                &child(&parent, 0),
-                "unknown-pricing",
-                "private-model-without-pricing",
-                10,
-                100,
-            )
-            .expect("record-only budget must admit providers without canonical pricing");
-        assert!(unknown_pricing.reserved_tokens > 0);
-        assert!(ledger.snapshot().unwrap().reserved_tokens > 0);
-        let mut reservation = ledger
-            .reserve_provider(
-                &child(&parent, 0),
-                "unknown-usage",
-                "claude-haiku-4-5-20251001",
-                10,
-                100,
-            )
-            .unwrap();
-        let reserved = reservation.reserved_tokens;
-        reservation
-            .reconcile(TokenUsage::default())
-            .expect("missing usage must be recorded, not block the provider step");
-        assert!(ledger.snapshot().unwrap().reserved_tokens >= reserved);
-    }
-
-    #[test]
-    fn configured_deepseek_primary_is_admitted_by_a_finite_parent_budget() {
-        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
-        let parent = parent();
-        let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
-        let reservation = ledger
-            .reserve_provider(
-                &child(&parent, 0),
-                "configured-deepseek-primary",
-                "deepseek-v4-flash",
-                10,
-                100,
-            )
-            .expect("the configured production primary has canonical pricing");
-        assert_eq!(reservation.reserved_tokens, 120);
-        assert!(reservation.reserved_cost_microusd > 0);
-        assert!(reservation.reserved_cost_microusd <= parent.max_cost_microusd);
     }
 }

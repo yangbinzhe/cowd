@@ -29,10 +29,10 @@ use harness_contract::task::{
     TaskPhaseSpec, TaskSpec,
 };
 use harness_contract::team::{
-    FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, RolePartitionPolicy,
-    TeamAcceptanceCheck, TeamAcceptanceRequirement, TeamInstantiationRequest,
-    TeamRoleBindingOverride, TeamRoleDefinition, TeamRoleDependency, TeamStructuredOutputField,
-    TeamTemplateDefinitionId, TeamTemplateSelector,
+    FocusPartitionPlan, FocusPartitionSlot, RoleBehaviorFacet, RoleCardinalityPolicy,
+    RolePartitionPolicy, TeamAcceptanceCheck, TeamAcceptanceRequirement, TeamInstantiationRequest,
+    TeamRoleAssignment, TeamRoleBindingOverride, TeamRoleDefinition, TeamRoleIdentity,
+    TeamStructuredOutputField, TeamTemplateDefinitionId, TeamTemplateSelector,
 };
 
 /// Hard ceiling for AgentTask nodes in one immutable Team graph.
@@ -41,7 +41,6 @@ use harness_contract::team::{
 /// and queues nodes when the currently available capacity is insufficient.
 const MAX_TEAM_GRAPH_AGENT_NODES: usize = 32;
 pub(crate) const DEFAULT_PARENT_EXECUTION_TOKEN_BUDGET: u64 = 65_536;
-const CONSERVATIVE_MAX_COST_MICROUSD_PER_TOKEN: u64 = 75;
 
 pub(crate) fn bounded_parent_execution_budget(
     budget_id: impl Into<String>,
@@ -52,7 +51,6 @@ pub(crate) fn bounded_parent_execution_budget(
     harness_contract::context::ParentExecutionBudget::new(
         budget_id,
         max_tokens,
-        max_tokens.saturating_mul(CONSERVATIVE_MAX_COST_MICROUSD_PER_TOKEN),
         deadline_at_ms,
         max_parallel.min(MAX_TEAM_GRAPH_AGENT_NODES).max(1),
         1,
@@ -249,7 +247,8 @@ impl TeamInstantiationService {
         let manifest = &template.revision.manifest;
         let binding_overrides = role_binding_overrides(&request, &manifest.roles)?;
         let cardinality_overrides = role_cardinality_overrides(&request, &manifest.roles)?;
-        let (focus_plans, mut focus_repairs) = focus_partition_plans(&request, &manifest.roles)?;
+        let (focus_plans, mut focus_repairs) =
+            focus_partition_plans(&request, &manifest.roles, &manifest.role_aliases)?;
         for plan in focus_plans.values() {
             for slot in &plan.slots {
                 for reference in &slot.capability_cropped_refs {
@@ -297,7 +296,6 @@ impl TeamInstantiationService {
         validate_finite_team_budget_capacity(
             &request.execution_budget.budget_id,
             request.execution_budget.predicted_tokens(),
-            request.execution_budget.predicted_cost_microusd(),
             planned_agent_slots,
         )?;
         for role in &manifest.roles {
@@ -311,8 +309,17 @@ impl TeamInstantiationService {
                     .collect(),
                 evidence_duties: role.task_contract.acceptance.clone(),
             });
-            let upstream_only_reducer =
-                is_pure_upstream_reducer(&role.role_id, &manifest.dependencies);
+            let reducer_only_role = role
+                .behavior
+                .iter()
+                .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. }));
+            let requires_reacquisition = role.behavior.iter().any(|facet| {
+                matches!(
+                    facet,
+                    RoleBehaviorFacet::ReacquireEvidence { required: true }
+                )
+            });
+            let upstream_only_reducer = reducer_only_role && !requires_reacquisition;
             let role_allowed_tools = if upstream_only_reducer {
                 Vec::new()
             } else {
@@ -372,14 +379,7 @@ impl TeamInstantiationService {
                     &slot_acceptance,
                     &resource_scopes,
                     !role.task_contract.contract_ref.starts_with("builtin/"),
-                    manifest
-                        .dependencies
-                        .iter()
-                        .any(|dependency| dependency.to_role_id == role.role_id)
-                        && matches!(
-                            role.role_id.as_str(),
-                            "synthesizer" | "arbiter" | "commander" | "comparator" | "coordinator"
-                        ),
+                    reducer_only_role,
                 )?;
                 let required_acceptance = compile_required_acceptance(
                     &slot_acceptance,
@@ -403,6 +403,18 @@ impl TeamInstantiationService {
                     session_id: request.lineage.session_id.clone(),
                     mission_id: request.mission_id.clone(),
                     team_id: Some(request.team_id.clone()),
+                    team_role_identity: Some(TeamRoleIdentity {
+                        role_id: role.role_id.clone(),
+                        slot: u32::try_from(slot.saturating_add(1))
+                            .map_err(|_| "Team role slot overflows u32".to_string())?,
+                        focus_id: focus_partition.focus_id.clone(),
+                        focus_boundary: focus_partition.boundary.clone(),
+                        evidence_responsibility: focus_partition.evidence_responsibility.clone(),
+                        focus_scope_hash: focus_partition.scope_hash.clone(),
+                        overlap_budget_bp: focus_partition.overlap_budget_bp,
+                        novelty_target_bp: focus_partition.novelty_target_bp,
+                        output_acceptance: focus_partition.output_acceptance.clone(),
+                    }),
                     graph_id: graph.id.clone(),
                     node_id: node_id.clone(),
                     attempt: 1,
@@ -428,27 +440,6 @@ impl TeamInstantiationService {
                     acceptance: slot_acceptance,
                     constraints: vec![
                         format!("team_template:{}@{}", template.revision.revision_ref.template_id.as_str(), template.revision.revision_ref.revision),
-                        format!("team_role:{}", role.role_id),
-                        format!("role_slot:{}", slot + 1),
-                        format!("focus_partition:{}", focus_partition.focus_id),
-                        format!("focus_boundary:{}", focus_partition.boundary),
-                        format!(
-                            "focus_evidence_responsibility:{}",
-                            focus_partition.evidence_responsibility
-                        ),
-                        format!("focus_scope_hash:{}", focus_partition.scope_hash),
-                        format!(
-                            "focus_overlap_budget_bp:{}",
-                            focus_partition.overlap_budget_bp
-                        ),
-                        format!(
-                            "focus_novelty_target_bp:{}",
-                            focus_partition.novelty_target_bp
-                        ),
-                        format!(
-                            "focus_output_acceptance:{}",
-                            focus_partition.output_acceptance.join(", ")
-                        ),
                         "nested_orchestration:forbidden".to_string(),
                         "parent_merge:exactly_once".to_string(),
                         "team_working_state:visible".to_string(),
@@ -736,14 +727,29 @@ impl TeamInstantiationService {
             let Some(agent_binding) = packet.binding.as_mut() else {
                 continue;
             };
-            let role_slot_id = agent_binding
-                .instance
-                .role_slot_id
-                .clone()
-                .unwrap_or_else(|| packet.assignment.role_id.clone());
+            let role_slot_id = packet
+                .team_role_identity
+                .as_ref()
+                .map(|identity| format!("{}:{}", identity.role_id, identity.slot))
+                .ok_or_else(|| {
+                    format!(
+                        "Team AgentTask {} has no typed role identity before graph persistence",
+                        node.id
+                    )
+                })?;
             let Some(role) = roles_by_slot.get(&role_slot_id) else {
-                continue;
+                return Err(format!(
+                    "Team AgentTask {} role identity `{role_slot_id}` is absent from its frozen binding",
+                    node.id
+                ));
             };
+            let identity = packet.team_role_identity.clone().expect("checked above");
+            packet.team_role = Some(TeamRoleAssignment {
+                team_binding_id: binding.binding_id.clone(),
+                team_binding_digest: binding.binding_digest.clone(),
+                identity,
+                behavior: role.behavior.clone(),
+            });
             let role_display_name = request
                 .role_display_overrides
                 .iter()
@@ -938,13 +944,6 @@ impl TeamInstantiationService {
     }
 }
 
-fn is_pure_upstream_reducer(role_id: &str, dependencies: &[TeamRoleDependency]) -> bool {
-    role_id == "synthesizer"
-        && dependencies
-            .iter()
-            .any(|dependency| dependency.to_role_id == role_id)
-}
-
 fn ensure_static_graph_ceiling(
     existing_agent_nodes: usize,
     additional_agent_nodes: usize,
@@ -975,16 +974,6 @@ pub(crate) fn team_acceptance_contract(
             "read:." | "read:./" | "write:." | "write:./" | "workspace" | "workspace:."
         )
     };
-    let workspace_scopes = resource_scopes
-        .iter()
-        .filter(|scope| bounded(scope))
-        .filter(|scope| {
-            scope.starts_with("read:")
-                || scope.starts_with("write:")
-                || scope.starts_with("workspace:")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
     let evidence_scopes = resource_scopes
         .iter()
         .filter(|scope| bounded(scope))
@@ -992,13 +981,13 @@ pub(crate) fn team_acceptance_contract(
             scope.starts_with("read:")
                 || scope.starts_with("workspace:")
                 || scope.as_str() == "network:*"
-                // `write:` scopes are deliverable obligations, not evidence
-                // scopes. A role that merely shares a node-level write lease
-                // must not be forced to write the final artifact just because
-                // its acceptance includes an `evidence` criterion. Write
-                // obligations are minted only by explicit write criteria
-                // (implementation / mitigation / source_verification); a
-                // designated writer still receives them through those checks.
+            // `write:` scopes are deliverable obligations, not evidence
+            // scopes. A role that merely shares a node-level write lease
+            // must not be forced to write the final artifact just because
+            // its acceptance includes an `evidence` criterion. Write
+            // obligations are minted only by explicit write criteria
+            // (implementation / mitigation / source_verification); a
+            // designated writer still receives them through those checks.
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -1030,9 +1019,19 @@ pub(crate) fn team_acceptance_contract(
     } else {
         evidence_scopes
     };
-    let write_scopes = workspace_scopes
+    // A full-trust `write:.` lease is dynamic rather than an unbounded
+    // acceptance claim: the canonical ToolHost receipts determine the exact
+    // paths that were actually changed.  Keep it as a root write obligation
+    // so the evaluator can derive one terminal verification per committed
+    // file, instead of rejecting a legitimate adaptive implementation Team
+    // before it can plan.
+    let write_scopes = resource_scopes
         .iter()
-        .filter(|scope| scope.starts_with("write:") || scope.starts_with("workspace:"))
+        .filter(|scope| {
+            (scope.starts_with("write:") || scope.starts_with("workspace:"))
+                && (bounded(scope)
+                    || matches!(scope.trim(), "write:." | "write:./" | "workspace:."))
+        })
         .cloned()
         .collect::<Vec<_>>();
     // A downstream reviewer must independently observe the implementation
@@ -1068,9 +1067,7 @@ pub(crate) fn team_acceptance_contract(
                 "plan" => structured(criterion, TeamStructuredOutputField::Plan),
                 "risks" => structured(criterion, TeamStructuredOutputField::Risks),
                 "unresolved" => structured(criterion, TeamStructuredOutputField::Unresolved),
-                "key_decisions" => {
-                    structured(criterion, TeamStructuredOutputField::KeyDecisions)
-                }
+                "key_decisions" => structured(criterion, TeamStructuredOutputField::KeyDecisions),
                 "unresolved_or_risks" => {
                     structured(criterion, TeamStructuredOutputField::UnresolvedOrRisks)
                 }
@@ -1199,19 +1196,10 @@ fn role_cardinality_overrides<'a>(
     Ok(overrides)
 }
 
-/// Curated role aliases for common model guesses. Only same-intent synonyms
-/// are allowed; everything else stays a structured compile failure.
-pub(crate) fn role_alias(alias: &str) -> Option<&'static str> {
-    match alias {
-        "researcher" | "analyst" | "research" => Some("solution"),
-        "synthesizer" | "decision_synthesis" | "finalizer" => Some("decision_synthesis"),
-        _ => None,
-    }
-}
-
 fn focus_partition_plans<'a>(
     request: &'a TeamInstantiationRequest,
     roles: &[TeamRoleDefinition],
+    role_aliases: &BTreeMap<String, String>,
 ) -> Result<(BTreeMap<String, FocusPartitionPlan>, Vec<String>), String> {
     let known = roles
         .iter()
@@ -1221,13 +1209,14 @@ fn focus_partition_plans<'a>(
     let mut repairs = Vec::new();
     for plan in &request.focus_partition_plans {
         if !known.contains(plan.role_id.as_str()) {
-            if let Some(canonical) =
-                role_alias(&plan.role_id).filter(|candidate| known.contains(candidate))
+            if let Some(canonical) = role_aliases
+                .get(&plan.role_id)
+                .filter(|candidate| known.contains(candidate.as_str()))
             {
                 let mut repaired = plan.clone();
-                repaired.role_id = canonical.to_string();
+                repaired.role_id = canonical.clone();
                 repairs.push(format!("role_alias:{}:{}", plan.role_id, canonical));
-                plans.insert(canonical.to_string(), repaired);
+                plans.insert(canonical.clone(), repaired);
                 continue;
             }
             let mut sorted = known.iter().copied().collect::<Vec<_>>();
@@ -1311,12 +1300,16 @@ fn resolve_focuses(
         ));
     }
     let planned = plan.map(|plan| plan.slots.clone()).unwrap_or_default();
+    let minimum_slots = requested.min().max(role.cardinality.min());
     let requested_count = match &role.partition {
         RolePartitionPolicy::Single => 1,
         RolePartitionPolicy::Explicit { partitions } => u16::try_from(partitions.len())
             .map_err(|_| format!("role `{}` has too many explicit partitions", role.role_id))?,
-        RolePartitionPolicy::ByFocus { .. } if !planned.is_empty() => u16::try_from(planned.len())
-            .map_err(|_| format!("role `{}` has too many focus partitions", role.role_id))?,
+        RolePartitionPolicy::ByFocus { .. } if !planned.is_empty() => {
+            let planned_count = u16::try_from(planned.len())
+                .map_err(|_| format!("role `{}` has too many focus partitions", role.role_id))?;
+            planned_count.max(minimum_slots)
+        }
         RolePartitionPolicy::ByFocus { .. } => requested.preferred(),
     };
     if !requested.permits(requested_count) || !role.cardinality.permits(requested_count) {
@@ -1380,7 +1373,45 @@ fn resolve_focuses(
                 output_acceptance: role.task_contract.acceptance.clone(),
             })
             .collect(),
-        RolePartitionPolicy::ByFocus { .. } => planned,
+        RolePartitionPolicy::ByFocus { .. } => {
+            let mut expanded = planned;
+            // The authority may intentionally provide fewer distinct resource
+            // partitions than this published role's cardinality requires.  Do
+            // not let it invent unrelated paths merely to satisfy an old
+            // runtime minimum.  Instead, the immutable Template contract
+            // expands the existing authorized partition deterministically and
+            // marks the overlap in the typed focus facts.
+            let target = usize::from(resolved_count);
+            if !expanded.is_empty() && expanded.len() < target {
+                let originals = expanded.clone();
+                for index in expanded.len()..target {
+                    let source = &originals[index % originals.len()];
+                    let replica_index = index + 1;
+                    let boundary = format!(
+                        "{} (Template-required replica {replica_index}; no additional authority)",
+                        source.boundary
+                    );
+                    expanded.push(FocusPartitionSlot {
+                        focus_id: format!("{}:replica:{replica_index}", source.focus_id),
+                        boundary: boundary.clone(),
+                        evidence_responsibility: source.evidence_responsibility.clone(),
+                        capability_cropped_refs: source.capability_cropped_refs.clone(),
+                        scope_hash: harness_contract::team::focus_scope_hash(
+                            &role.role_id,
+                            &boundary,
+                            &source.capability_cropped_refs,
+                        ),
+                        // The replica intentionally overlaps its source; this
+                        // is visible to the downstream novelty/evidence gates.
+                        overlap_budget_bp: 10_000,
+                        novelty_target_bp: source.novelty_target_bp,
+                        output_contract: source.output_contract.clone(),
+                        output_acceptance: source.output_acceptance.clone(),
+                    });
+                }
+            }
+            expanded
+        }
     };
     focuses.truncate(usize::from(resolved_count));
     let reason =
@@ -1499,11 +1530,6 @@ fn slot_budget_lease(
             slot_index,
         ),
         consumed_tokens: 0,
-        max_cost_microusd: partition_initial_budget_target(
-            request.execution_budget.max_cost_microusd,
-            total_slots,
-            slot_index,
-        ),
         deadline_at_ms: request.execution_budget.deadline_at_ms,
         max_parallel: request.execution_budget.max_parallel,
         revision: request.execution_budget.revision,
@@ -1524,12 +1550,11 @@ fn partition_initial_budget_target(limit: u64, total_slots: usize, slot_index: u
 fn validate_finite_team_budget_capacity(
     lease_id: &str,
     remaining_tokens: u64,
-    remaining_cost_microusd: u64,
     total_slots: usize,
 ) -> Result<(), String> {
-    if remaining_tokens < total_slots as u64 || remaining_cost_microusd < total_slots as u64 {
+    if remaining_tokens < total_slots as u64 {
         return Err(format!(
-            "Team budget lease `{lease_id}` has {remaining_tokens} tokens and {remaining_cost_microusd} microusd for {total_slots} Agent slots; every reservation must be positive"
+            "Team resource lease `{lease_id}` has {remaining_tokens} tokens for {total_slots} Agent slots; every reservation must be positive"
         ));
     }
     Ok(())
@@ -1546,8 +1571,8 @@ mod acceptance_contract_tests {
             .collect::<Vec<_>>();
         assert_eq!(reservations, vec![2_501, 2_501, 2_501, 2_500]);
         assert_eq!(reservations.iter().sum::<u64>(), 10_003);
-        assert!(validate_finite_team_budget_capacity("finite", 3, 4, 4).is_err());
-        assert!(validate_finite_team_budget_capacity("finite", 4, 4, 4).is_ok());
+        assert!(validate_finite_team_budget_capacity("finite", 3, 4).is_err());
+        assert!(validate_finite_team_budget_capacity("finite", 4, 4).is_ok());
         assert_eq!(partition_initial_budget_target(10_003, 4, 4), 0);
     }
 
@@ -1809,6 +1834,9 @@ mod acceptance_contract_tests {
             partition: RolePartitionPolicy::ByFocus {
                 partition_key: "investigation".to_string(),
             },
+            behavior: vec![
+                harness_contract::team::RoleBehaviorFacet::ReacquireEvidence { required: true },
+            ],
             grant_ceiling: vec![harness_contract::agent::AgentCapability::Read],
             task_contract: harness_contract::team::TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/researcher@1".to_string(),
@@ -1835,21 +1863,74 @@ mod acceptance_contract_tests {
     }
 
     #[test]
-    fn upstream_synthesizer_consumes_predecessor_evidence_without_reacquisition() {
-        assert!(is_pure_upstream_reducer(
-            "synthesizer",
-            &[TeamRoleDependency {
-                from_role_id: "researcher".to_string(),
-                to_role_id: "synthesizer".to_string(),
+    fn template_cardinality_expands_an_authorized_focus_without_authority_widening() {
+        let role = TeamRoleDefinition {
+            role_id: "researcher".to_string(),
+            display_name: None,
+            responsibility: "investigate one bounded focus".to_string(),
+            agent_definition_id: harness_contract::agent::AgentDefinitionId::new(
+                harness_contract::agent::DefinitionScope::Builtin,
+                "cowd/explore",
+            )
+            .expect("agent definition"),
+            agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
+            cardinality: RoleCardinalityPolicy::Adaptive {
+                min: 2,
+                target: 2,
+                max: 4,
+            },
+            partition: RolePartitionPolicy::ByFocus {
+                partition_key: "investigation".to_string(),
+            },
+            behavior: vec![
+                harness_contract::team::RoleBehaviorFacet::ReacquireEvidence { required: true },
+            ],
+            grant_ceiling: vec![harness_contract::agent::AgentCapability::Read],
+            task_contract: harness_contract::team::TeamRoleTaskContract {
+                contract_ref: "builtin/team-role/researcher@1".to_string(),
+                acceptance: vec!["evidence".to_string()],
+            },
+        };
+        let plan = FocusPartitionPlan {
+            role_id: role.role_id.clone(),
+            shared_baseline: Vec::new(),
+            slots: vec![FocusPartitionSlot {
+                focus_id: "actual-authorized-scope".to_string(),
+                boundary: "inspect one declared scope".to_string(),
+                evidence_responsibility: "collect evidence".to_string(),
+                capability_cropped_refs: vec!["read:crates/runtime".to_string()],
+                scope_hash: "scope-1".to_string(),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 2_500,
+                output_contract: vec!["findings".to_string()],
+                output_acceptance: vec!["evidence".to_string()],
             }],
-        ));
-        assert!(!is_pure_upstream_reducer(
-            "researcher",
-            &[TeamRoleDependency {
-                from_role_id: "researcher".to_string(),
-                to_role_id: "synthesizer".to_string(),
-            }],
-        ));
+        };
+        let (focuses, resolution) =
+            resolve_focuses(&role, None, Some(&plan)).expect("resolve Template role");
+        assert_eq!(resolution.resolved_count, 2);
+        assert_eq!(focuses.len(), 2);
+        assert_eq!(
+            focuses[1].capability_cropped_refs,
+            vec!["read:crates/runtime".to_string()],
+            "Template expansion must not widen resource authority"
+        );
+        assert_eq!(focuses[1].overlap_budget_bp, 10_000);
+        assert!(focuses[1].focus_id.contains("replica"));
+    }
+
+    #[test]
+    fn typed_reducer_behavior_consumes_predecessor_evidence_without_reacquisition() {
+        let reducer = vec![RoleBehaviorFacet::Reducer {
+            mode: "finally".to_string(),
+        }];
+        let evidence_producer = vec![RoleBehaviorFacet::ReacquireEvidence { required: true }];
+        assert!(reducer
+            .iter()
+            .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. })));
+        assert!(!evidence_producer
+            .iter()
+            .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. })));
         let contract = team_acceptance_contract(
             &[
                 "summary".to_string(),
@@ -1918,6 +1999,9 @@ mod acceptance_contract_tests {
             agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
             cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
             partition: RolePartitionPolicy::Single,
+            behavior: vec![
+                harness_contract::team::RoleBehaviorFacet::TerminalCandidate { required: true },
+            ],
             grant_ceiling: vec![harness_contract::agent::AgentCapability::Read],
             task_contract: harness_contract::team::TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/reviewer@1".to_string(),
@@ -1948,14 +2032,5 @@ mod acceptance_contract_tests {
             focuses[0].capability_cropped_refs,
             vec!["read:evidence/report.html"]
         );
-    }
-
-    #[test]
-    fn role_alias_resolves_common_model_guesses() {
-        assert_eq!(role_alias("researcher"), Some("solution"));
-        assert_eq!(role_alias("analyst"), Some("solution"));
-        assert_eq!(role_alias("synthesizer"), Some("decision_synthesis"));
-        assert_eq!(role_alias("executor"), None);
-        assert_eq!(role_alias("decision_synthesis"), Some("decision_synthesis"));
     }
 }

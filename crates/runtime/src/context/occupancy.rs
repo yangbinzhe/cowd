@@ -74,13 +74,7 @@ mod tests {
 
     #[test]
     fn role_occupancy_sums_components_and_reports_utilization() {
-        let estimate = estimate_role_occupancy(
-            "cto",
-            4_000,
-            8_000,
-            2_000,
-            100_000,
-        );
+        let estimate = estimate_role_occupancy("cto", 4_000, 8_000, 2_000, 100_000);
         assert_eq!(estimate.base_prompt_tokens, 3_000);
         assert_eq!(estimate.evidence_tokens, 6_000);
         assert_eq!(estimate.coordination_tokens, 1_500);

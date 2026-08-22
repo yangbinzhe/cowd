@@ -241,12 +241,9 @@ impl ApprovalCoordinator {
             Some(now_ms().saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX))),
         )?;
 
-        let router_profile = autonomy_profile
-            .unwrap_or_else(|| {
-                crate::approval_router::ApprovalRouter::profile_for_approval_profile(
-                    approval_profile,
-                )
-            });
+        let router_profile = autonomy_profile.unwrap_or_else(|| {
+            crate::approval_router::ApprovalRouter::profile_for_approval_profile(approval_profile)
+        });
         let router_decision = crate::approval_router::ApprovalRouter::resolve(
             router_profile,
             ApprovalDomain::Execution,
@@ -274,7 +271,9 @@ impl ApprovalCoordinator {
             let grant = self
                 .queue
                 .grant_for_approval(&request.approval_id)
-                .ok_or_else(|| "approval router auto-approval did not create a grant".to_string())?;
+                .ok_or_else(|| {
+                    "approval router auto-approval did not create a grant".to_string()
+                })?;
             return Ok(ApprovalResolution::Approved {
                 approval_id: receipt.approval_id,
                 grant,

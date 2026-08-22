@@ -5,7 +5,9 @@
 //! registry, RuntimeExecutionSupervisor, and Memory maintenance pipeline.
 
 use harness_contract::core::{ExecutionModifier, ExecutionPattern, TaskComplexity, TaskRisk};
-use harness_contract::strategy::{StrategyDecision, TaskDomain};
+use harness_contract::strategy::{
+    automatic_team_is_structurally_required, StrategyDecision, TaskDomain,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::definition_registry::RuntimeTeamTemplateCatalogEntry;
@@ -84,6 +86,19 @@ impl CollaborationTemplateMatcher {
             (
                 CollaborationTemplateId::IncidentResponse,
                 "critical or incident-like task needs typed triage and mitigation evidence",
+            )
+        } else if automatic_team_is_structurally_required(&strategy.understanding)
+            && !strategy.understanding.requires_write
+        {
+            // Candidate selection has already established that this objective
+            // needs independent, tool-backed ownership.  Preserve that same
+            // typed fact when choosing a topology: a broad code-domain label
+            // must not silently replace a read-only evidence Team with a
+            // write/review template whose role contract is incompatible with
+            // the generated focus plan.
+            (
+                CollaborationTemplateId::ParallelResearchSynthesis,
+                "independent evidence obligations require the parallel research topology",
             )
         } else if contains_any(
             &normalized,
@@ -275,6 +290,41 @@ mod tests {
                 .decide(prompt, &strategy)
                 .template_id,
             expected
+        );
+    }
+
+    #[test]
+    fn structurally_required_read_only_team_uses_the_matching_evidence_topology() {
+        let strategy = decide_strategy(
+            &StrategyInput::from_prompt("审视 runtime、gateway 和 webui 的独立证据职责")
+                .with_understanding(harness_contract::strategy::TaskUnderstanding {
+                    domain: TaskDomain::Backend,
+                    complexity: TaskComplexity::Complex,
+                    risk: TaskRisk::Medium,
+                    requires_write: false,
+                    requires_external_facts: false,
+                    requires_tool_evidence: true,
+                    requests_parallelism: false,
+                    requests_multi_agent: false,
+                    required_team_count: 0,
+                    forbids_team: false,
+                    requests_deep_plan: false,
+                    requests_deliberation: false,
+                    requests_background: false,
+                    likely_single_file: false,
+                    independent_workstreams: 3,
+                    uncertainty: 2,
+                    estimated_duration: harness_contract::strategy::TaskDuration::Extended,
+                    collaboration_reference: Default::default(),
+                }),
+        );
+
+        let decision = CollaborationTemplateMatcher
+            .decide("审视 runtime、gateway 和 webui 的独立证据职责", &strategy);
+
+        assert_eq!(
+            decision.template_id,
+            CollaborationTemplateId::ParallelResearchSynthesis
         );
     }
 

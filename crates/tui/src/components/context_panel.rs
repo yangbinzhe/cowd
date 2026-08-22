@@ -11,12 +11,11 @@ use serde_json::Value;
 use crate::app::App;
 use crate::components::{Component, EventResult, RenderContext};
 
-/// Context panel showing token usage, progress bar, and cost estimate.
+/// Context panel showing token usage and context pressure.
 ///
 /// Features:
 /// - Token count: used / context window
 /// - Progress bar: ████░░ 75%
-/// - Cost estimate in USD
 /// - Auto-updates from App state on sync
 pub struct ContextPanel {
     /// Token count used so far.
@@ -92,13 +91,6 @@ impl ContextPanel {
         } else {
             (self.token_count as f64 / self.context_window as f64 * 100.0).min(100.0)
         }
-    }
-
-    /// Estimate cost in USD based on token counts.
-    fn cost_estimate(&self) -> f64 {
-        let input_cost = self.token_count as f64 * 3.0 / 1_000_000.0;
-        let output_cost = self.turn_output_tokens as f64 * 15.0 / 1_000_000.0;
-        input_cost + output_cost
     }
 
     fn pressure_bp(envelope: &Value) -> u64 {
@@ -287,7 +279,6 @@ impl Component for ContextPanel {
     fn render(&mut self, ctx: &mut RenderContext, area: Rect) {
         let pct = self.usage_pct();
         let bar = Self::progress_bar(self.token_count, self.context_window, 12);
-        let cost = self.cost_estimate();
 
         let mut lines = Vec::new();
         lines.push(Line::from(Span::styled(
@@ -348,12 +339,6 @@ impl Component for ContextPanel {
         ]));
         lines.push(Line::raw(""));
 
-        // Cost
-        lines.push(Line::from(vec![
-            Span::styled("Cost:     ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("${:.4}", cost), Style::default().fg(Color::Yellow)),
-        ]));
-        lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "Runtime Envelope",
             Style::default()
@@ -760,15 +745,6 @@ mod tests {
         let bar = ContextPanel::progress_bar(100, 0, 12);
         assert_eq!(bar.chars().count(), 12, "bar should have 12 chars");
         assert!(bar.chars().all(|c| c == '░'), "zero window = empty bar");
-    }
-
-    #[test]
-    fn cost_estimate_non_zero() {
-        let mut panel = ContextPanel::new();
-        panel.token_count = 100_000;
-        panel.turn_output_tokens = 10_000;
-        let cost = panel.cost_estimate();
-        assert!(cost > 0.0, "Cost should be positive");
     }
 
     #[test]

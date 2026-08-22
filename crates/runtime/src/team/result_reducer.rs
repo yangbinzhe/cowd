@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,14 +11,17 @@ use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
 };
 #[cfg(test)]
-use harness_contract::outcome::PresentationModelAttempt;
 use harness_contract::outcome::{
     AnswerContentKind, AnswerObjectiveScope, AnswerOrigin, AnswerValidation,
-    AnswerValidationStatus, DeliveryBranchStatus, DeliveryBranchTerminal, DeliveryCoverage,
-    DeliveryEnvelope, DeliveryStatus, DeliveryUnresolved, PipelineStatus, TerminalPresentation,
-    TerminalPresentationState, UserAnswerContract, VerifiedDeliveryEffect,
+    AnswerValidationStatus, PresentationModelAttempt, TerminalPresentation,
+    TerminalPresentationState,
+};
+use harness_contract::outcome::{
+    DeliveryBranchStatus, DeliveryBranchTerminal, DeliveryCoverage, DeliveryEnvelope,
+    DeliveryStatus, DeliveryUnresolved, PipelineStatus, UserAnswerContract, VerifiedDeliveryEffect,
     VerifiedDeliveryReference, VerifiedEffectStatus,
 };
+#[cfg(test)]
 use harness_contract::team::{RoleBehaviorFacet, TeamBindingSnapshot};
 
 use crate::execution_core::graph::executors::{SynthesizeBackend, SynthesizeBackendResolver};
@@ -54,8 +59,6 @@ impl TeamResultReducer {
             .map_err(|error| error.to_string())?;
         let mut evidence = Vec::new();
         let mut usage = ExecutionUsage::default();
-        let terminal_agent_nodes = terminal_agent_node_ids(&graph);
-
         for node in graph.nodes.iter().filter(|node| {
             node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
         }) {
@@ -80,37 +83,15 @@ impl TeamResultReducer {
         usage.runtime_observed_resource_scopes.dedup();
 
         let envelope = build_delivery_envelope(&graph);
-        let positive_evidence_summary = aggregate_positive_evidence_summary(&graph);
-        let reusable = terminal_agent_nodes.iter().find_map(|node_id| {
-            let node = graph.nodes.iter().find(|node| node.id == *node_id)?;
-            let packet = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok()?;
-            let result = graph.node_results.get(node_id)?;
-            eligible_team_synthesizer_result(
-                result,
-                &packet,
-                &envelope,
-                positive_evidence_summary.as_deref(),
-                None,
-            )
-        });
-        let (result_ref, summary, terminal_presentation) = reusable.map_or_else(
-            || {
-                (
-                    Some(format!("delivery-envelope: {}", envelope.envelope_id)),
-                    Some(mechanical_delivery_summary(&envelope)),
-                    None,
-                )
-            },
-            |(answer, presentation)| {
-                (
-                    serde_json::to_string(&answer.text)
-                        .ok()
-                        .map(|text| format!("assistant_json:{text}")),
-                    Some(answer.text),
-                    Some(presentation),
-                )
-            },
-        );
+        // A graph reducer owns durable delivery facts, not user-facing model
+        // prose.  In particular, a completed reducer-role Agent summary is
+        // not an `AnswerCandidate`: the terminal Agent packet can be absent
+        // after restart and a summary has neither consumed the current
+        // envelope nor passed the root presentation gate.  Keep this result
+        // mechanical until that separately governed presentation owner emits
+        // an exact candidate.
+        let result_ref = Some(format!("delivery-envelope: {}", envelope.envelope_id));
+        let summary = Some(mechanical_delivery_summary(&envelope));
         let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
             // The reducer itself completed even when business delivery is
             // partial or unavailable. DeliveryEnvelope owns that distinction.
@@ -123,7 +104,6 @@ impl TeamResultReducer {
             finished_at_ms: crate::tool_invocation::now_ms(),
         });
         outcome.delivery_envelope = Some(envelope);
-        outcome.terminal_presentation = terminal_presentation;
         Ok(outcome)
     }
 }
@@ -133,6 +113,7 @@ impl TeamResultReducer {
 /// to appear first in the graph, and a useful plain-text result must not be
 /// discarded merely because the delegated model omitted an optional JSON
 /// wrapper.
+#[cfg(test)]
 fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String> {
     let mut branch_summaries = BTreeMap::new();
     for node in &graph.nodes {
@@ -142,15 +123,12 @@ fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String>
         let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref) else {
             continue;
         };
-        let role = packet
-            .constraints
-            .iter()
-            .find_map(|constraint| constraint.strip_prefix("team_role:"))
-            .map(str::trim);
-        if matches!(
-            role,
-            Some("synthesizer" | "decision_synthesis" | "finalizer")
-        ) {
+        if packet.team_role_assignment().is_some_and(|assignment| {
+            assignment
+                .behavior
+                .iter()
+                .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. }))
+        }) {
             continue;
         }
         let Some(result) = graph.node_results.get(&node.id) else {
@@ -323,10 +301,22 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
             &node.acceptance.required
         };
         let observed_acceptance = result.map(|result| &result.usage.observed_acceptance);
+        let acceptance_evaluation = result.and_then(|result| {
+            result
+                .usage
+                .acceptance_evaluation
+                .as_ref()
+                .filter(|evaluation| {
+                    evaluation.evaluator_revision
+                        == crate::acceptance_evaluator::AcceptanceEvaluator::REVISION
+                })
+        });
         for criterion in &required_acceptance.criteria {
             let id = format!("criterion:{}:{criterion}", node.id);
             required_obligation_ids.push(id.clone());
-            if observed_acceptance
+            if acceptance_evaluation.is_some_and(|evaluation| {
+                evaluation.verdict == harness_contract::acceptance::AcceptanceVerdict::Satisfied
+            }) && observed_acceptance
                 .is_some_and(|observed| observed.satisfied_criteria.contains(criterion))
             {
                 satisfied_obligation_ids.push(id);
@@ -335,11 +325,16 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
         for obligation in &required_acceptance.evidence_obligations {
             let id = format!("evidence:{}:{}", node.id, obligation.obligation_id);
             required_obligation_ids.push(id.clone());
-            let satisfied = observed_acceptance.is_some_and(|acceptance| {
-                crate::path_identity::observed_evidence_collection_satisfies(
-                    obligation,
-                    &acceptance.observed_evidence,
-                )
+            // The terminal evaluator already matched the evidence set.  The
+            // reducer reads its unresolved-id footprint instead of invoking a
+            // second path matcher over raw observations.
+            let satisfied = acceptance_evaluation.is_some_and(|evaluation| {
+                evaluation.verdict == harness_contract::acceptance::AcceptanceVerdict::Satisfied
+                    && !observed_acceptance.is_some_and(|acceptance| {
+                        acceptance
+                            .unresolved_obligation_ids
+                            .contains(&obligation.obligation_id)
+                    })
             });
             if satisfied {
                 satisfied_obligation_ids.push(id.clone());
@@ -480,62 +475,6 @@ fn stable_effect_id(node_id: &str, path: &str) -> String {
     format!("effect:{node_id}:{digest:016x}")
 }
 
-fn eligible_team_synthesizer_result(
-    result: &ExecutionNodeResult,
-    packet: &AgentTaskPacket,
-    envelope: &DeliveryEnvelope,
-    positive_evidence_summary: Option<&str>,
-    binding: Option<&TeamBindingSnapshot>,
-) -> Option<(
-    harness_contract::outcome::AnswerCandidate,
-    TerminalPresentation,
-)> {
-    if result.status != ExecutionNodeStatus::Completed || !is_synthesizer_role(packet, binding) {
-        return None;
-    }
-    let text = positive_evidence_summary?.trim();
-    if text.is_empty() {
-        return None;
-    }
-    let mut candidate = harness_contract::outcome::AnswerCandidate {
-        candidate_id: format!("team-terminal-candidate:{}", packet.run_id()),
-        origin: AnswerOrigin::TerminalDelegate,
-        objective_scope: AnswerObjectiveScope::Root,
-        source_execution_id: packet.run_id().to_string(),
-        consumed_envelope_revision: Some(envelope.revision),
-        model: result.usage.model.clone(),
-        provider: None,
-        completed_at_ms: result.finished_at_ms,
-        text: text.to_string(),
-        content_kind: AnswerContentKind::UserText,
-        terminal_delegate: true,
-        validation: AnswerValidation {
-            status: AnswerValidationStatus::Valid,
-            findings: Vec::new(),
-            envelope_revision: Some(envelope.revision),
-        },
-    };
-    candidate.origin = AnswerOrigin::TeamSynthesizer;
-    candidate.validation.status = AnswerValidationStatus::Pending;
-    let presentation = TerminalPresentation {
-        presentation_id: format!("team-presentation:{}", candidate.candidate_id),
-        attempt_id: candidate.candidate_id.clone(),
-        envelope_id: envelope.envelope_id.clone(),
-        envelope_revision: envelope.revision,
-        state: TerminalPresentationState::Validating,
-        answer_origin: AnswerOrigin::TeamSynthesizer,
-        source_execution_id: Some(packet.run_id().to_string()),
-        narrator_model: result.usage.model.clone(),
-        narrator_provider: None,
-        models_attempted: Vec::new(),
-        validation: candidate.validation.clone(),
-        fallback_reason: None,
-        generated_at_ms: result.finished_at_ms,
-        committed_at_ms: None,
-    };
-    Some((candidate, presentation))
-}
-
 #[cfg(test)]
 fn eligible_team_synthesizer(
     returned: &harness_contract::agent::AgentReturnPacket,
@@ -547,48 +486,8 @@ fn eligible_team_synthesizer(
     harness_contract::outcome::AnswerCandidate,
     TerminalPresentation,
 )> {
-    let synthesized_candidate = (returned.answer_candidate.is_none()
-        && returned.status == AgentTerminalStatus::Completed
-        && is_synthesizer_role(packet, binding))
-    .then(|| {
-        let text = positive_evidence_summary.map(str::to_string).or_else(|| {
-            crate::agent_in_process_worker::structured_agent_output(&returned.outcome)
-                .filter(|object| {
-                    object
-                        .get("unresolved")
-                        .is_none_or(|value| positive_field_text(value).is_none())
-                })
-                .and_then(|object| {
-                    object
-                        .get("summary")
-                        .or_else(|| object.get("findings"))
-                        .and_then(positive_field_text)
-                })
-        })?;
-        Some(harness_contract::outcome::AnswerCandidate {
-            candidate_id: format!("team-terminal-candidate:{}", returned.run_id),
-            origin: AnswerOrigin::TerminalDelegate,
-            objective_scope: AnswerObjectiveScope::Root,
-            source_execution_id: returned.run_id.clone(),
-            consumed_envelope_revision: Some(envelope.revision),
-            model: (!returned.model.is_empty()).then(|| returned.model.clone()),
-            provider: (!returned.provider.is_empty()).then(|| returned.provider.clone()),
-            completed_at_ms: crate::tool_invocation::now_ms(),
-            text,
-            content_kind: AnswerContentKind::UserText,
-            terminal_delegate: true,
-            validation: AnswerValidation {
-                status: AnswerValidationStatus::Valid,
-                findings: Vec::new(),
-                envelope_revision: Some(envelope.revision),
-            },
-        })
-    })
-    .flatten();
-    let candidate = returned
-        .answer_candidate
-        .as_ref()
-        .or(synthesized_candidate.as_ref())?;
+    let _ = positive_evidence_summary;
+    let candidate = returned.answer_candidate.as_ref()?;
     if returned.status != AgentTerminalStatus::Completed
         || !is_synthesizer_role(packet, binding)
         || candidate.source_execution_id != returned.run_id
@@ -649,29 +548,20 @@ fn eligible_team_synthesizer(
 
 /// Synthesizer eligibility is driven by typed `RoleBehaviorFacet::Reducer`
 /// facts from the frozen Team Binding, never by a role-name heuristic. The
-/// constraint-string fallback remains only for legacy graphs without a
-/// Binding.
-fn is_synthesizer_role(packet: &AgentTaskPacket, binding: Option<&TeamBindingSnapshot>) -> bool {
-    if let Some(binding) = binding {
-        return binding.roles.iter().any(|role| {
-            role.role_id == packet.assignment.role_id
-                && role
-                    .behavior
-                    .iter()
-                    .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. }))
-        });
-    }
-    let role = packet
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix("team_role:"))
-        .map(str::trim);
-    matches!(
-        role,
-        Some("synthesizer" | "decision_synthesis" | "finalizer")
-    )
+/// helper exists only for deterministic reducer tests; production never
+/// promotes an Agent result to a user answer without an explicit governed
+/// answer candidate.
+#[cfg(test)]
+fn is_synthesizer_role(packet: &AgentTaskPacket, _binding: Option<&TeamBindingSnapshot>) -> bool {
+    packet.team_role_assignment().is_some_and(|assignment| {
+        assignment
+            .behavior
+            .iter()
+            .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. }))
+    })
 }
 
+#[cfg(test)]
 fn positive_field_text(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(text) => {
@@ -755,6 +645,7 @@ impl SynthesizeBackend for TeamResultReducer {
     }
 }
 
+#[cfg(test)]
 fn terminal_agent_node_ids(
     graph: &harness_contract::execution_graph::ExecutionGraph,
 ) -> BTreeSet<String> {
@@ -792,12 +683,48 @@ mod tests {
         AnswerCandidate, AnswerContentKind, AnswerObjectiveScope, AnswerOrigin, AnswerValidation,
         AnswerValidationStatus, DeliveryStatus, VerifiedEffectStatus,
     };
+    use harness_contract::team::RoleBehaviorFacet;
 
     use super::{
         aggregate_positive_evidence_summary, build_delivery_envelope, eligible_team_synthesizer,
-        eligible_team_synthesizer_result, is_synthesizer_role, mechanical_delivery_summary,
-        terminal_agent_node_ids,
+        is_synthesizer_role, mechanical_delivery_summary, terminal_agent_node_ids,
     };
+
+    fn frozen_role(
+        role_id: &str,
+        behavior: Vec<harness_contract::team::RoleBehaviorFacet>,
+    ) -> harness_contract::team::TeamRoleAssignment {
+        use harness_contract::team::{TeamRoleAssignment, TeamRoleIdentity};
+
+        TeamRoleAssignment {
+            team_binding_id: "team-binding:fixture".to_string(),
+            team_binding_digest: "f".repeat(64),
+            identity: TeamRoleIdentity {
+                role_id: role_id.to_string(),
+                slot: 1,
+                focus_id: format!("{role_id}:focus"),
+                focus_boundary: "fixture role-local boundary".to_string(),
+                evidence_responsibility: "fixture evidence".to_string(),
+                focus_scope_hash: "a".repeat(64),
+                overlap_budget_bp: 0,
+                novelty_target_bp: 0,
+                output_acceptance: Vec::new(),
+            },
+            behavior,
+        }
+    }
+
+    fn set_frozen_role(
+        packet: &mut AgentTaskPacket,
+        role_id: &str,
+        behavior: Vec<harness_contract::team::RoleBehaviorFacet>,
+    ) {
+        let role = frozen_role(role_id, behavior);
+        packet.assignment.role_id = role.identity.role_id.clone();
+        packet.team_role_identity = Some(role.identity.clone());
+        packet.team_role = Some(role);
+        packet.constraints.clear();
+    }
 
     fn result(status: ExecutionNodeStatus, usage: ExecutionUsage) -> ExecutionNodeResult {
         ExecutionNodeResult {
@@ -870,7 +797,22 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
-            constraints: vec!["team_role:synthesizer".to_string()],
+            team_role_identity: Some(
+                frozen_role(
+                    "synthesizer",
+                    vec![RoleBehaviorFacet::Reducer {
+                        mode: "finally".to_string(),
+                    }],
+                )
+                .identity,
+            ),
+            team_role: Some(frozen_role(
+                "synthesizer",
+                vec![RoleBehaviorFacet::Reducer {
+                    mode: "finally".to_string(),
+                }],
+            )),
+            constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
             resource_scopes: Vec::new(),
@@ -883,7 +825,6 @@ mod tests {
                 "agent-1",
                 "agent",
                 1_000,
-                75_000,
                 u64::MAX,
                 1,
             ),
@@ -927,6 +868,7 @@ mod tests {
                 },
             }),
             observed_acceptance: Default::default(),
+            acceptance_evaluation: None,
             acceptance: Vec::new(),
             evidence_refs: Vec::new(),
             changes: Vec::new(),
@@ -955,7 +897,7 @@ mod tests {
         structured: bool,
     ) {
         let mut packet = synthesizer_packet();
-        packet.constraints = vec!["team_role:researcher".to_string()];
+        set_frozen_role(&mut packet, "researcher", Vec::new());
         let mut node = ExecutionNodeSpec::new(
             ExecutionNodeKind::AgentTask,
             "agent_task",
@@ -1078,6 +1020,13 @@ mod tests {
             ..ExecutionUsage::default()
         };
         usage.observed_acceptance.observed_evidence.push(observed);
+        usage.acceptance_evaluation = Some(harness_contract::acceptance::AcceptanceEvaluation {
+            evaluator_revision: crate::acceptance_evaluator::AcceptanceEvaluator::REVISION,
+            contract_digest: "fixture-contract".to_string(),
+            receipt_set_digest: "fixture-receipts".to_string(),
+            derived_obligations: vec![required.obligation_id.clone()],
+            verdict: harness_contract::acceptance::AcceptanceVerdict::Satisfied,
+        });
         graph.node_results.insert(
             node.id.clone(),
             result(ExecutionNodeStatus::Completed, usage),
@@ -1156,31 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_terminal_result_can_publish_without_agent_hot_state() {
-        let mut graph = ExecutionGraph::new("durable candidate");
-        add_agent(&mut graph, "agent-a", ExecutionNodeStatus::Completed);
-        add_verify(&mut graph, true);
-        let envelope = build_delivery_envelope(&graph);
-        let packet = synthesizer_packet();
-        let mut durable = result(ExecutionNodeStatus::Completed, ExecutionUsage::default());
-        durable.finished_at_ms = 42;
-        let (candidate, presentation) = eligible_team_synthesizer_result(
-            &durable,
-            &packet,
-            &envelope,
-            Some("all durable branch facts"),
-            None,
-        )
-        .expect("durable graph result is sufficient");
-        assert_eq!(candidate.text, "all durable branch facts");
-        assert_eq!(
-            presentation.source_execution_id.as_deref(),
-            Some(packet.run_id())
-        );
-    }
-
-    #[test]
-    fn verified_terminal_synthesizer_can_publish_normalized_narrative_without_child_candidate() {
+    fn terminal_summary_without_an_explicit_candidate_is_not_a_user_answer() {
         let mut graph = ExecutionGraph::new("normalized narrative candidate");
         add_agent(&mut graph, "agent-a", ExecutionNodeStatus::Completed);
         add_verify(&mut graph, true);
@@ -1194,17 +1119,14 @@ mod tests {
         })
         .to_string();
 
-        let (candidate, presentation) =
-            eligible_team_synthesizer(&returned, &packet, &envelope, None, None)
-                .expect("verified terminal narrative should become the root candidate");
-
-        assert_eq!(candidate.text, "Team one verified the runtime manifest.");
-        assert_eq!(candidate.origin, AnswerOrigin::TeamSynthesizer);
-        assert_eq!(presentation.answer_origin, AnswerOrigin::TeamSynthesizer);
+        assert!(
+            eligible_team_synthesizer(&returned, &packet, &envelope, None, None).is_none(),
+            "a summary is evidence, not a validated envelope-consuming answer candidate"
+        );
     }
 
     #[test]
-    fn unresolved_synthesizer_meta_commentary_falls_back_to_verified_positive_finding() {
+    fn verified_evidence_does_not_upgrade_an_absent_candidate() {
         let mut graph = ExecutionGraph::new("positive evidence fallback");
         add_agent(&mut graph, "agent-a", ExecutionNodeStatus::Completed);
         add_verify(&mut graph, true);
@@ -1218,15 +1140,17 @@ mod tests {
         })
         .to_string();
 
-        let (candidate, _) = eligible_team_synthesizer(
-            &returned,
-            &packet,
-            &envelope,
-            Some("Verified manifest finding."),
-            None,
-        )
-        .expect("verified positive finding should replace meta commentary");
-        assert_eq!(candidate.text, "Verified manifest finding.");
+        assert!(
+            eligible_team_synthesizer(
+                &returned,
+                &packet,
+                &envelope,
+                Some("Verified manifest finding."),
+                None,
+            )
+            .is_none(),
+            "verified evidence belongs in the envelope until a governed narrator produces a candidate"
+        );
     }
 
     #[test]
@@ -1283,15 +1207,20 @@ mod tests {
         };
 
         let mut packet = synthesizer_packet();
-        packet.assignment.role_id = "implementer".to_string();
-        packet.constraints = vec!["team_role:implementer".to_string()];
+        set_frozen_role(
+            &mut packet,
+            "implementer",
+            vec![RoleBehaviorFacet::Reducer {
+                mode: "finally".to_string(),
+            }],
+        );
         assert!(
             is_synthesizer_role(&packet, Some(&binding)),
             "typed Reducer facet makes the role eligible regardless of its name"
         );
         assert!(
-            !is_synthesizer_role(&packet, None),
-            "without a Binding the legacy name fallback must not guess"
+            is_synthesizer_role(&packet, None),
+            "the packet carries the frozen behavior, so no mutable Binding lookup is needed"
         );
 
         let mut renamed = binding.clone();
@@ -1302,10 +1231,9 @@ mod tests {
             "display label changes never affect behavior eligibility"
         );
 
-        let mut non_reducer = binding;
-        non_reducer.roles[0].behavior.clear();
+        set_frozen_role(&mut packet, "implementer", Vec::new());
         assert!(
-            !is_synthesizer_role(&packet, Some(&non_reducer)),
+            !is_synthesizer_role(&packet, Some(&binding)),
             "a role without the typed Reducer facet is never a synthesizer"
         );
     }

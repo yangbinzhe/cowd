@@ -126,40 +126,20 @@ pub(crate) fn request_for_intent(
         intent.session_id.clone(),
         intent.task_id.clone(),
     );
-    request.role_slot_id = intent
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix("role_slot:").map(str::to_string));
-    let role_id = intent
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix("team_role:").map(str::trim))
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let (parsed_role_id, slot_index) = request
-        .role_slot_id
-        .as_deref()
-        .map(parse_role_slot_id)
-        .transpose()?
-        .unwrap_or((None, None));
-    if intent.team_id.is_some() && role_id.is_none() && parsed_role_id.is_none() {
+    let team_role = intent.team_role_identity.as_ref();
+    if intent.team_id.is_some() && team_role.is_none() {
         return Err(AgentBindingError::InvalidRequest(
-            "Team Agent intent must carry a typed `team_role:` identity".to_string(),
+            "Team Agent intent must carry a typed Team role identity".to_string(),
         ));
     }
-    if role_id.is_some() && parsed_role_id.is_some() && role_id != parsed_role_id {
-        return Err(AgentBindingError::InvalidRequest(format!(
-            "Team role identity mismatch: `team_role:{role_id:?}` vs `role_slot:{parsed_role_id:?}`"
-        )));
+    if let Some(team_role) = team_role {
+        team_role
+            .validate()
+            .map_err(|error| AgentBindingError::InvalidRequest(error.to_string()))?;
+        request.role_id = Some(team_role.role_id.clone());
+        request.slot_index = Some(team_role.slot);
+        request.focus = Some(team_role.focus_id.clone());
     }
-    request.role_id = role_id.or(parsed_role_id);
-    request.slot_index = slot_index;
-    request.focus = intent
-        .constraints
-        .iter()
-        .find_map(|constraint| constraint.strip_prefix("focus_partition:").map(str::trim))
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
     request.team_id = intent.team_id.clone();
     request.granted_capabilities = granted_capabilities;
     request.allowed_tool_contract_refs = intent.allowed_tools.clone();
@@ -183,21 +163,6 @@ pub(crate) fn request_for_intent(
         .collect();
     request.team_working_state_visible = intent.team_id.is_some();
     Ok(request)
-}
-
-fn parse_role_slot_id(value: &str) -> Result<(Option<String>, Option<u32>), AgentBindingError> {
-    let Some((role_id, slot)) = value.rsplit_once(':') else {
-        // A bare numeric value is the slot-only carrier used by the Team
-        // compiler (`role_slot:1`); a bare name is a legacy role carrier.
-        return match value.parse::<u32>() {
-            Ok(index) => Ok((None, Some(index))),
-            Err(_) => Ok((Some(value.to_string()), None)),
-        };
-    };
-    let slot_index = slot.parse::<u32>().map_err(|_| {
-        AgentBindingError::InvalidRequest(format!("role_slot `{value}` has a non-numeric slot"))
-    })?;
-    Ok((Some(role_id.to_string()), Some(slot_index)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,6 +584,7 @@ mod tests {
     };
     use harness_contract::context::ChildExecutionBudgetReservation;
     use harness_contract::policy::PermissionMode;
+    use harness_contract::team::TeamRoleIdentity;
     use tempfile::TempDir;
 
     use super::*;
@@ -655,6 +621,7 @@ mod tests {
             attempt: 1,
             expected_graph_revision: 1,
             objective: "typed role slot".to_string(),
+            team_role_identity: Some(team_identity("implementer", 1, "focus-default")),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
@@ -671,13 +638,26 @@ mod tests {
                 "agent",
                 "team",
                 100,
-                7_500,
                 u64::MAX,
                 1,
             ),
             deadline_at_ms: u64::MAX,
             managed_invocation: None,
             idempotency_key: "agent:1".to_string(),
+        }
+    }
+
+    fn team_identity(role_id: &str, slot: u32, focus_id: &str) -> TeamRoleIdentity {
+        TeamRoleIdentity {
+            role_id: role_id.to_string(),
+            slot,
+            focus_id: focus_id.to_string(),
+            focus_boundary: "fixture role-local boundary".to_string(),
+            evidence_responsibility: "fixture evidence".to_string(),
+            focus_scope_hash: "a".repeat(64),
+            overlap_budget_bp: 0,
+            novelty_target_bp: 0,
+            output_acceptance: Vec::new(),
         }
     }
 
@@ -727,10 +707,11 @@ mod tests {
         let temp = TempDir::new().expect("temporary root");
         let compiler = AgentBindingCompiler::new(registry(&temp));
         let mut intent = team_intent();
+        intent.team_role_identity = Some(team_identity("implementer", 2, "focus-alpha"));
         intent.constraints = vec![
-            "team_role:implementer".to_string(),
-            "role_slot:implementer:2".to_string(),
-            "focus_partition:focus-alpha".to_string(),
+            "team_role:wrong-legacy-role".to_string(),
+            "role_slot:wrong-legacy-role:99".to_string(),
+            "focus_partition:wrong-legacy-focus".to_string(),
         ];
         let request = request_for_intent(&intent, None).expect("typed request");
         assert_eq!(request.role_id.as_deref(), Some("implementer"));
@@ -754,13 +735,14 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_role_identity_is_rejected_before_binding_compilation() {
+    fn legacy_constraint_role_identity_cannot_override_typed_binding() {
         let mut intent = team_intent();
         intent.constraints = vec![
             "team_role:implementer".to_string(),
             "role_slot:reviewer:1".to_string(),
         ];
-        let error = request_for_intent(&intent, None).expect_err("mismatch fails closed");
-        assert!(error.to_string().contains("role identity mismatch"));
+        let request = request_for_intent(&intent, None).expect("typed identity wins");
+        assert_eq!(request.role_id.as_deref(), Some("implementer"));
+        assert_eq!(request.slot_index, Some(1));
     }
 }

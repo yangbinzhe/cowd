@@ -365,11 +365,15 @@ fn read_process_result(
     // A child process may report business output, but it cannot mint Runtime
     // observation truth. Until its tool effects cross the canonical ToolHost
     // receipt boundary, all typed evidence obligations remain unresolved.
-    terminal.observed_acceptance = crate::path_identity::evaluate_observed_acceptance(
-        &packet.required_acceptance,
-        Vec::new(),
-        Vec::new(),
-    );
+    let (observed, evaluation) =
+        crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
+            &packet.required_acceptance,
+            Vec::new(),
+            Vec::new(),
+        );
+    terminal.observed_acceptance = observed;
+    terminal.acceptance_evaluation = Some(evaluation);
+    terminal.acceptance.clear();
     terminal.runtime_observed_resource_scopes.clear();
     Ok(terminal)
 }
@@ -399,6 +403,8 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: Vec::new(),
+            team_role_identity: None,
+            team_role: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
@@ -412,7 +418,6 @@ mod tests {
                 "process-agent-1",
                 "agent",
                 1000,
-                75_000,
                 u64::MAX,
                 1,
             ),
@@ -454,6 +459,7 @@ mod tests {
                 }],
                 unresolved_obligation_ids: Vec::new(),
             },
+            acceptance_evaluation: None,
             acceptance: vec!["must-be-runtime-verified".to_string()],
             evidence_refs: Vec::new(),
             changes: Vec::new(),

@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EDGE_ROOT="${COWD_FRONTEND_REPO:-${ROOT}/../cowd-edge}"
 TARGET_ROOT="${CARGO_TARGET_DIR:-${ROOT}/target}"
 COWD_BIN="${COWD_BIN:-${TARGET_ROOT}/debug/cowd}"
 EVAL_BIN="${COWD_HARNESS_EVAL_BIN:-${TARGET_ROOT}/debug/harness-eval}"
-MODEL="${COWD_AUTO_STRATEGY_MODEL:-claude-sonnet-4-6}"
-JUDGE_MODEL="${COWD_AUTO_STRATEGY_JUDGE_MODEL:-${MODEL}}"
-PROVIDER_ID="${COWD_AUTO_STRATEGY_PROVIDER_ID:-anthropic}"
-PROVIDER_PROTOCOL="${COWD_AUTO_STRATEGY_PROVIDER_PROTOCOL:-anthropic}"
-PROVIDER_BASE_URL="${COWD_AUTO_STRATEGY_PROVIDER_BASE_URL:-${ANTHROPIC_BASE_URL:-https://api.anthropic.com/v1}}"
-PROVIDER_API_KEY="${COWD_AUTO_STRATEGY_PROVIDER_API_KEY:-${ANTHROPIC_API_KEY:-}}"
-PROVIDER_ACCOUNT_REF="${COWD_EVAL_PROVIDER_ACCOUNT_REF:-${PROVIDER_ID}-default}"
-MODEL_INPUT_USD_PER_MILLION="${COWD_AUTO_STRATEGY_INPUT_USD_PER_MILLION:-}"
-MODEL_OUTPUT_USD_PER_MILLION="${COWD_AUTO_STRATEGY_OUTPUT_USD_PER_MILLION:-}"
-MODEL_CACHE_WRITE_USD_PER_MILLION="${COWD_AUTO_STRATEGY_CACHE_WRITE_USD_PER_MILLION:-0}"
-MODEL_CACHE_READ_USD_PER_MILLION="${COWD_AUTO_STRATEGY_CACHE_READ_USD_PER_MILLION:-0}"
-MODEL_CONTEXT_WINDOW="${COWD_AUTO_STRATEGY_CONTEXT_WINDOW:-128000}"
-MODEL_MAX_OUTPUT_TOKENS="${COWD_AUTO_STRATEGY_MAX_OUTPUT_TOKENS:-64000}"
+# Real-model evaluation is isolated from user state, but its route must be a
+# snapshot of the installed Cowd route.  Do not default a model to another
+# provider account: that makes a successful interactive configuration and its
+# evaluation exercise different products.
+SOURCE_CONFIG_HOME="${COWD_AUTO_STRATEGY_SOURCE_CONFIG_HOME:-${COWD_CONFIG_HOME:-${HOME}/.cowd}}"
+SOURCE_CONFIG_FILE="${SOURCE_CONFIG_HOME}/config.yaml"
+SOURCE_MODELS_FILE="${SOURCE_CONFIG_HOME}/models.yaml"
+MODEL="${COWD_AUTO_STRATEGY_MODEL:-}"
+JUDGE_MODEL="${COWD_AUTO_STRATEGY_JUDGE_MODEL:-}"
+PROVIDER_ID="${COWD_AUTO_STRATEGY_PROVIDER_ID:-}"
+PROVIDER_PROTOCOL="${COWD_AUTO_STRATEGY_PROVIDER_PROTOCOL:-}"
+PROVIDER_BASE_URL="${COWD_AUTO_STRATEGY_PROVIDER_BASE_URL:-}"
+PROVIDER_API_KEY="${COWD_AUTO_STRATEGY_PROVIDER_API_KEY:-}"
+PROVIDER_ACCOUNT_REF="${COWD_EVAL_PROVIDER_ACCOUNT_REF:-}"
+MODEL_CONTEXT_WINDOW="${COWD_AUTO_STRATEGY_CONTEXT_WINDOW:-}"
+MODEL_MAX_OUTPUT_TOKENS="${COWD_AUTO_STRATEGY_MAX_OUTPUT_TOKENS:-}"
 DIAGNOSTIC_TASK_ID="${COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID:-}"
 API_TOKEN="${COWD_API_TOKEN:-auto-strategy-$$_credential}"
 SCENARIO_ID="auto-strategy-paired-$$-$(date +%s)"
-SCENARIO_ROOT="${TMPDIR:-/tmp}/${SCENARIO_ID}"
+# Gateway sidecars bind Unix sockets underneath `config/app-runtime`; keep
+# this runtime root short enough for every supported Unix socket limit. The
+# longer Scenario id remains in artifacts/reports, where it cannot affect IPC.
+SCENARIO_ROOT="${COWD_AUTO_STRATEGY_SCENARIO_ROOT:-${TMPDIR:-/tmp}/csp-$$-$(date +%s)}"
 ARTIFACT_DIR="${COWD_AUTO_STRATEGY_ARTIFACT_DIR:-${ROOT}/target/acceptance/${SCENARIO_ID}}"
 REPORT="${ARTIFACT_DIR}/auto-strategy-paired.json"
 POINTER="${ROOT}/target/acceptance/latest-auto-strategy.json"
@@ -34,21 +41,6 @@ FRONTEND_SOURCE_ARCHIVE_SHA256=""
 PORTS=(18652 18653 18654)
 CONDITIONS=(direct parallel_tools auto)
 PIDS=()
-
-case "${MODEL}" in
-  *haiku*)
-    MODEL_INPUT_USD_PER_MILLION="${MODEL_INPUT_USD_PER_MILLION:-1}"
-    MODEL_OUTPUT_USD_PER_MILLION="${MODEL_OUTPUT_USD_PER_MILLION:-5}"
-    ;;
-  *opus*)
-    MODEL_INPUT_USD_PER_MILLION="${MODEL_INPUT_USD_PER_MILLION:-15}"
-    MODEL_OUTPUT_USD_PER_MILLION="${MODEL_OUTPUT_USD_PER_MILLION:-75}"
-    ;;
-  *sonnet-4*)
-    MODEL_INPUT_USD_PER_MILLION="${MODEL_INPUT_USD_PER_MILLION:-3}"
-    MODEL_OUTPUT_USD_PER_MILLION="${MODEL_OUTPUT_USD_PER_MILLION:-15}"
-    ;;
-esac
 
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
@@ -76,6 +68,88 @@ for command in awk cp curl git jq rg sha256sum ss tar; do
     exit 1
   }
 done
+
+yaml_model_field() {
+  local file="$1"
+  local model="$2"
+  local field="$3"
+  awk -v target="${model}" -v key="${field}" '
+    function scalar(line, pos, value) {
+      pos = index(line, ":")
+      value = substr(line, pos + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      sub(/^\047/, "", value); sub(/\047$/, "", value)
+      sub(/^\"/, "", value); sub(/\"$/, "", value)
+      return value
+    }
+    $0 ~ "^[[:space:]]*" target ":[[:space:]]*$" { matched = 1; next }
+    matched && $0 ~ "^[[:space:]]{2}[^[:space:]]" { exit }
+    matched && $0 ~ "^[[:space:]]{4}" key ":[[:space:]]*" { print scalar($0); exit }
+  ' "${file}"
+}
+
+yaml_provider_field() {
+  local file="$1"
+  local provider="$2"
+  local field="$3"
+  awk -v target="${provider}" -v key="${field}" '
+    function scalar(line, pos, value) {
+      pos = index(line, ":")
+      value = substr(line, pos + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      sub(/^\047/, "", value); sub(/\047$/, "", value)
+      sub(/^\"/, "", value); sub(/\"$/, "", value)
+      return value
+    }
+    /^providers:[[:space:]]*$/ { providers = 1; next }
+    providers && $0 ~ "^[[:space:]]{2}" target ":[[:space:]]*$" { matched = 1; next }
+    providers && matched && $0 ~ "^[^[:space:]]" { exit }
+    providers && matched && $0 ~ "^[[:space:]]{2}[^[:space:]]" { exit }
+    providers && matched && $0 ~ "^[[:space:]]{4}" key ":[[:space:]]*" { print scalar($0); exit }
+  ' "${file}"
+}
+
+resolve_installed_provider_route() {
+  [[ -f "${SOURCE_CONFIG_FILE}" && -f "${SOURCE_MODELS_FILE}" ]] || {
+    echo "real-model evaluation requires ${SOURCE_CONFIG_FILE} and ${SOURCE_MODELS_FILE}, or explicit COWD_AUTO_STRATEGY_* route overrides" >&2
+    exit 1
+  }
+
+  if [[ -z "${MODEL}" ]]; then
+    MODEL="$(awk '/^model:[[:space:]]*/ { value = $0; sub(/^model:[[:space:]]*/, "", value); sub(/[[:space:]]+#.*$/, "", value); gsub(/^\"|\"$/, "", value); gsub(/^\047|\047$/, "", value); print value; exit }' "${SOURCE_CONFIG_FILE}")"
+  fi
+  [[ -n "${MODEL}" ]] || {
+    echo "real-model evaluation cannot resolve the installed default model; set COWD_AUTO_STRATEGY_MODEL explicitly" >&2
+    exit 1
+  }
+
+  PROVIDER_ID="${PROVIDER_ID:-$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" provider)}"
+  MODEL_CONTEXT_WINDOW="${MODEL_CONTEXT_WINDOW:-$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" context_window)}"
+  MODEL_MAX_OUTPUT_TOKENS="${MODEL_MAX_OUTPUT_TOKENS:-$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" max_output_tokens)}"
+  [[ -n "${PROVIDER_ID}" && -n "${MODEL_CONTEXT_WINDOW}" && -n "${MODEL_MAX_OUTPUT_TOKENS}" ]] || {
+    echo "model ${MODEL} must have provider, context_window, and max_output_tokens in ${SOURCE_MODELS_FILE}" >&2
+    exit 1
+  }
+
+  PROVIDER_PROTOCOL="${PROVIDER_PROTOCOL:-$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" protocol)}"
+  PROVIDER_BASE_URL="${PROVIDER_BASE_URL:-$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" base_url)}"
+  PROVIDER_API_KEY="${PROVIDER_API_KEY:-$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" api_key)}"
+  [[ -n "${PROVIDER_PROTOCOL}" && -n "${PROVIDER_BASE_URL}" && -n "${PROVIDER_API_KEY}" ]] || {
+    echo "provider ${PROVIDER_ID} must have protocol, base_url, and api_key in ${SOURCE_CONFIG_FILE}; use explicit COWD_AUTO_STRATEGY_* overrides if its secret is externally referenced" >&2
+    exit 1
+  }
+  if [[ "${PROVIDER_API_KEY}" == file:* || "${PROVIDER_API_KEY}" == env:* ]]; then
+    echo "provider ${PROVIDER_ID} uses an external secret reference; pass COWD_AUTO_STRATEGY_PROVIDER_API_KEY explicitly for the isolated evaluation" >&2
+    exit 1
+  fi
+
+  JUDGE_MODEL="${JUDGE_MODEL:-${MODEL}}"
+  PROVIDER_ACCOUNT_REF="${PROVIDER_ACCOUNT_REF:-${PROVIDER_ID}-default}"
+}
+
+resolve_installed_provider_route
 git -C "${EDGE_ROOT}" rev-parse --show-toplevel >/dev/null 2>&1 || {
   echo "COWD frontend repository is required for the frozen cross-surface fixture: ${EDGE_ROOT}" >&2
   exit 1
@@ -110,31 +184,19 @@ done
 BIN_SHA256="$(sha256sum "${COWD_BIN}" | awk '{print $1}')"
 
 mkdir -p "${SCENARIO_ROOT}" "${ARTIFACT_DIR}"
-if [[ "${COWD_AUTO_STRATEGY_ALLOW_REAL_MODEL:-0}" == "1" ]] \
-  && { [[ -z "${MODEL_INPUT_USD_PER_MILLION}" ]] || [[ -z "${MODEL_OUTPUT_USD_PER_MILLION}" ]]; }; then
-  echo "real-model evaluation requires explicit input/output USD-per-million pricing for ${MODEL}" >&2
-  exit 1
-fi
 EVAL_HOME="${SCENARIO_ROOT}/evaluator-home"
 mkdir -p "${EVAL_HOME}/.cowd"
-if [[ -n "${MODEL_INPUT_USD_PER_MILLION}" && -n "${MODEL_OUTPUT_USD_PER_MILLION}" ]]; then
-  {
-    echo 'version: "1"'
-    echo "updated_at: \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
-    echo 'models:'
-    echo "  \"${MODEL}\":"
-    echo "    provider: \"${PROVIDER_ID}\""
-    echo "    display_name: \"${MODEL}\""
-    echo "    context_window: ${MODEL_CONTEXT_WINDOW}"
-    echo "    max_output_tokens: ${MODEL_MAX_OUTPUT_TOKENS}"
-    echo '    pricing:'
-    echo "      input_per_1m: ${MODEL_INPUT_USD_PER_MILLION}"
-    echo "      output_per_1m: ${MODEL_OUTPUT_USD_PER_MILLION}"
-    echo "      cache_write_per_1m: ${MODEL_CACHE_WRITE_USD_PER_MILLION}"
-    echo "      cache_read_per_1m: ${MODEL_CACHE_READ_USD_PER_MILLION}"
-    echo '    capabilities: ["text", "tool_use", "reasoning"]'
-  } >"${EVAL_HOME}/.cowd/models.yaml"
-fi
+{
+  echo 'version: "1"'
+  echo "updated_at: \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+  echo 'models:'
+  echo "  \"${MODEL}\":"
+  echo "    provider: \"${PROVIDER_ID}\""
+  echo "    display_name: \"${MODEL}\""
+  echo "    context_window: ${MODEL_CONTEXT_WINDOW}"
+  echo "    max_output_tokens: ${MODEL_MAX_OUTPUT_TOKENS}"
+  echo '    capabilities: ["text", "tool_use", "reasoning"]'
+} >"${EVAL_HOME}/.cowd/models.yaml"
 for index in 0 1 2; do
   condition="${CONDITIONS[$index]}"
   port="${PORTS[$index]}"
@@ -222,7 +284,6 @@ fi
   exec env \
     COWD_API_TOKEN="${API_TOKEN}" \
     COWD_AUTO_STRATEGY_MAX_TOKENS="${COWD_AUTO_STRATEGY_MAX_TOKENS:-20000000}" \
-    COWD_AUTO_STRATEGY_MAX_COST_USD_MILLI="${COWD_AUTO_STRATEGY_MAX_COST_USD_MILLI:-50000}" \
     COWD_EVAL_BINARY_SHA256="${BIN_SHA256}" \
     COWD_EVAL_WORKSPACE_REVISION="${WORKSPACE_REVISION}" \
     COWD_EVAL_FRONTEND_WORKSPACE_REVISION="${FRONTEND_WORKSPACE_REVISION}" \

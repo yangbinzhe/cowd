@@ -225,7 +225,9 @@ pub struct ModelProposedRole {
     #[schemars(range(min = 1))]
     pub max_count: Option<u32>,
     #[serde(default)]
-    #[schemars(description = "Acceptance criteria the role must satisfy before its evidence is trusted.")]
+    #[schemars(
+        description = "Acceptance criteria the role must satisfy before its evidence is trusted."
+    )]
     pub acceptance: Vec<String>,
 }
 
@@ -467,10 +469,9 @@ mod tests {
             strings.dependencies,
             Some(ModelTemplateDependencies::Strings(_))
         ));
-        let single: ModelTemplateProposal = serde_json::from_value(base(serde_json::json!(
-            "business_expert -> synthesizer"
-        )))
-        .expect("single-string shape");
+        let single: ModelTemplateProposal =
+            serde_json::from_value(base(serde_json::json!("business_expert -> synthesizer")))
+                .expect("single-string shape");
         assert!(matches!(
             single.dependencies,
             Some(ModelTemplateDependencies::String(_))

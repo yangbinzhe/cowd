@@ -833,12 +833,45 @@ impl AgentRuntime {
             // Extension/process backends may return business output, but they
             // cannot mint Runtime observation truth. Only the crate-private
             // canonical ToolHost-backed registration path has that authority.
-            returned.observed_acceptance = crate::path_identity::evaluate_observed_acceptance(
+            // Keep the same legacy-to-typed terminal bridge as the trusted
+            // path: an empty typed carrier does not erase a frozen legacy
+            // criterion from an older packet. Otherwise an externally
+            // registered backend could turn a required acceptance contract
+            // into an empty (and therefore satisfied) one merely by lacking
+            // the typed field.
+            let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
                 &packet.required_acceptance,
-                Vec::new(),
-                Vec::new(),
+                &packet.acceptance,
             );
+            let (observed, evaluation) =
+                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
+                    &required,
+                    Vec::new(),
+                    Vec::new(),
+                );
+            returned.observed_acceptance = observed;
+            returned.acceptance_evaluation = Some(evaluation);
+            returned.acceptance.clear();
             returned.runtime_observed_resource_scopes.clear();
+        }
+        if returned.acceptance_evaluation.is_none() {
+            // The Runtime terminal boundary is the only compatibility bridge
+            // for older in-process/test backends.  It consumes the already
+            // returned typed facts and writes the same canonical evaluator
+            // envelope; no downstream graph, reducer or projection may do
+            // this work again.
+            let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
+                &packet.required_acceptance,
+                &packet.acceptance,
+            );
+            let (observed, evaluation) =
+                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
+                    &required,
+                    returned.observed_acceptance.satisfied_criteria.clone(),
+                    returned.observed_acceptance.observed_evidence.clone(),
+                );
+            returned.observed_acceptance = observed;
+            returned.acceptance_evaluation = Some(evaluation);
         }
         // A cancel/shutdown command is durable lifecycle truth. Backends may
         // observe the interruption as a transport/process error, but they may
@@ -875,6 +908,10 @@ impl AgentRuntime {
             // survive the verdict. They are never rewritten to empty.
             returned.status = AgentTerminalStatus::Failed;
             returned.outcome.clear();
+            if let Some(evaluation) = returned.acceptance_evaluation.as_mut() {
+                evaluation.verdict =
+                    harness_contract::acceptance::AcceptanceVerdict::FrameworkInvalid;
+            }
             returned.failure = Some(format!(
                 "Runtime rejected Agent terminal result: {error}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_evidence_count={}; unresolved_obligations={:?}",
                 returned.runtime_change_receipts.len(),
@@ -1261,14 +1298,9 @@ impl AgentRuntime {
                 )
             })?;
             let role = predecessor_packet
-                .constraints
-                .iter()
-                .find_map(|constraint| {
-                    constraint
-                        .strip_prefix("team_role:")
-                        .or_else(|| constraint.strip_prefix("protocol_role:"))
-                })
-                .unwrap_or(predecessor_packet.agent_id());
+                .team_role_assignment()
+                .map(|assignment| assignment.identity.role_id.as_str())
+                .unwrap_or(&predecessor_packet.assignment.role_id);
             let available = remaining.saturating_sub(96);
             if available == 0 {
                 break;
@@ -2289,6 +2321,7 @@ fn return_packet(
         outcome,
         answer_candidate: None,
         observed_acceptance: Default::default(),
+        acceptance_evaluation: None,
         acceptance: Vec::new(),
         evidence_refs: Vec::new(),
         changes: Vec::new(),
@@ -2362,6 +2395,7 @@ mod tests {
                     observed_evidence: Vec::new(),
                     unresolved_obligation_ids: Vec::new(),
                 },
+                acceptance_evaluation: None,
                 acceptance: vec!["verified".into()],
                 evidence_refs: Vec::new(),
                 changes: Vec::new(),
@@ -2476,6 +2510,8 @@ mod tests {
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
             acceptance: vec!["verified".into()],
+            team_role_identity: None,
+            team_role: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
@@ -2489,7 +2525,6 @@ mod tests {
                 instance_id,
                 "agent",
                 1_000,
-                75_000,
                 u64::MAX,
                 1,
             ),
@@ -2579,7 +2614,7 @@ mod tests {
         assert!(returned
             .failure
             .as_deref()
-            .is_some_and(|failure| failure.contains("omitted acceptance evaluation")));
+            .is_some_and(|failure| failure.contains("non-satisfied Runtime acceptance verdict")));
     }
 
     #[tokio::test]
@@ -2589,16 +2624,12 @@ mod tests {
         runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
         let mut packet = team_task("invalid-acceptance", "team-1");
         packet.acceptance = vec!["evidence".to_string()];
-        packet.constraints.push(format!(
-            "team_acceptance_contract:{}",
-            serde_json::to_string(&vec![harness_contract::team::TeamAcceptanceRequirement {
-                criterion: "evidence".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
-                    scopes: vec!["read:src".to_string()],
-                },
-            },])
-            .expect("acceptance contract")
-        ));
+        packet.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+            criterion: "evidence".to_string(),
+            check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                scopes: vec!["read:src".to_string()],
+            },
+        }];
 
         let returned = runtime
             .execute_task(packet.clone())

@@ -6,10 +6,10 @@
 //! a `team.binding.ready` event after the exact link set is durable. Recovery
 //! reads these markers and refuses to drive an orphan graph.
 
+use harness_contract::task::TaskCreateCommand;
 use harness_contract::team::{
-    RoleBehaviorFacet, TeamBindingSnapshot, TeamDisplayIdentity, TeamInstantiationRequest,
-    TeamRoleBindingSnapshot, TeamRoleDefinition, TeamRoleDependency, TeamStrategyBinding,
-    TeamTemplateManifest,
+    TeamBindingSnapshot, TeamDisplayIdentity, TeamInstantiationRequest, TeamRoleBindingSnapshot,
+    TeamStrategyBinding, TeamTemplateManifest,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -74,11 +74,11 @@ pub fn compile_team_binding(
                 focus: Some(slot.focus_partition.focus_id.clone()),
                 role_name: role_definition.responsibility.clone(),
                 role_description: role_definition.responsibility.clone(),
-                behavior: compile_role_behavior(
-                    &slot.role_id,
-                    role_definition,
-                    &manifest.dependencies,
-                ),
+                // The manifest is the sole author of role behavior.  Binding
+                // compilation freezes that published fact; it never infers a
+                // reducer, terminal candidate, or evidence duty from graph
+                // topology, a role id, or result-field text.
+                behavior: role_definition.behavior.clone(),
                 agent_definition_ref: agent_binding
                     .definition_ref
                     .definition_id
@@ -185,44 +185,6 @@ fn compile_display_identity(
     }
 }
 
-fn compile_role_behavior(
-    role_id: &str,
-    role: &TeamRoleDefinition,
-    dependencies: &[TeamRoleDependency],
-) -> Vec<RoleBehaviorFacet> {
-    let mut facets = Vec::new();
-    if role_id == "synthesizer"
-        && dependencies
-            .iter()
-            .any(|dependency| dependency.to_role_id == role_id)
-    {
-        facets.push(RoleBehaviorFacet::Reducer {
-            mode: "finally".to_string(),
-        });
-    }
-    if dependencies
-        .iter()
-        .any(|dependency| dependency.to_role_id == role_id)
-    {
-        facets.push(RoleBehaviorFacet::UpstreamConsumption { required: true });
-    }
-    if role
-        .task_contract
-        .acceptance
-        .iter()
-        .any(|criterion| criterion == "evidence")
-    {
-        facets.push(RoleBehaviorFacet::ReacquireEvidence { required: true });
-    }
-    if !dependencies
-        .iter()
-        .any(|dependency| dependency.from_role_id == role_id)
-    {
-        facets.push(RoleBehaviorFacet::TerminalCandidate { required: true });
-    }
-    facets
-}
-
 fn binding_digest(binding: &TeamBindingSnapshot) -> Result<String, String> {
     let value = json!({
         "binding_id": binding.binding_id,
@@ -254,13 +216,46 @@ pub fn persist_preparing(
     graph_id: &str,
     binding: &TeamBindingSnapshot,
 ) -> Result<(), String> {
+    persist_preparing_with_task_commands(store, graph_id, binding, &[])
+}
+
+/// Persist the frozen binding and the exact Task link plan that belongs to
+/// this graph. The plan is data, not a second scheduler: startup recovery can
+/// finish a crash between graph registration and Task linking without
+/// recompiling from mutable templates or model text.
+pub fn persist_preparing_with_task_commands(
+    store: &RuntimeEventStore,
+    graph_id: &str,
+    binding: &TeamBindingSnapshot,
+    task_commands: &[TaskCreateCommand],
+) -> Result<(), String> {
     let stream = binding_stream(graph_id);
     let key = preparing_key(graph_id);
-    if store
+    if let Some(existing) = store
         .event_by_idempotency_key(&stream, &key)
         .map_err(|error| error.to_string())?
-        .is_some()
     {
+        let existing_binding: TeamBindingSnapshot =
+            serde_json::from_value(existing.payload.get("binding").cloned().unwrap_or_default())
+                .map_err(|error| format!("decode existing Team Binding: {error}"))?;
+        if existing_binding.binding_digest != binding.binding_digest {
+            return Err(format!(
+                "Team graph `{graph_id}` Preparing marker belongs to a different Binding"
+            ));
+        }
+        if !task_commands.is_empty() {
+            if let Some(value) = existing.payload.get("task_commands") {
+                let existing_commands: Vec<TaskCreateCommand> =
+                    serde_json::from_value(value.clone()).map_err(|error| {
+                        format!("decode existing Team Preparing task plan: {error}")
+                    })?;
+                if existing_commands != task_commands {
+                    return Err(format!(
+                        "Team graph `{graph_id}` Preparing marker has a different Task link plan"
+                    ));
+                }
+            }
+        }
         return Ok(());
     }
     let revision = store
@@ -282,7 +277,10 @@ pub fn persist_preparing(
                         kind: "execution_graph".to_string(),
                         id: graph_id.to_string(),
                     }],
-                    payload: json!({ "binding": binding }),
+                    payload: json!({
+                        "binding": binding,
+                        "task_commands": task_commands,
+                    }),
                 },
                 idempotency_key: Some(key),
                 schema_version: 1,
@@ -290,6 +288,27 @@ pub fn persist_preparing(
         )
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Load the exact durable Task plan attached to a Preparing binding marker.
+/// `None` distinguishes old/incomplete markers from a valid Team with no
+/// tasks, which is never a legal runtime admission.
+pub fn load_prepared_task_commands(
+    store: &RuntimeEventStore,
+    graph_id: &str,
+) -> Result<Option<Vec<TaskCreateCommand>>, String> {
+    let record = store
+        .event_by_idempotency_key(&binding_stream(graph_id), &preparing_key(graph_id))
+        .map_err(|error| error.to_string())?;
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let Some(value) = record.payload.get("task_commands") else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|error| format!("decode Team Preparing task plan: {error}"))
 }
 
 /// Mark the exact link set durable. `binding_digest` is part of the event
@@ -397,6 +416,7 @@ mod tests {
     };
     use harness_contract::team::definition::{RoleDisplayName, TeamTemplateDisplay};
     use harness_contract::team::instantiation::RoleDisplayOverride;
+    use harness_contract::team::{RoleBehaviorFacet, TeamRoleDefinition};
     use harness_contract::team::{
         RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamTemplateDefinitionId,
         TeamTopologyContract,
@@ -443,7 +463,6 @@ mod tests {
             execution_budget: ParentExecutionBudget::new(
                 "service-team-budget:team-1",
                 65_536,
-                4_915_200,
                 u64::MAX,
                 32,
                 1,
@@ -474,6 +493,7 @@ mod tests {
                 require_synthesis: true,
                 require_review: true,
             },
+            role_aliases: std::collections::BTreeMap::new(),
             roles: vec![TeamRoleDefinition {
                 role_id: "implementer".to_string(),
                 display_name: None,
@@ -488,6 +508,10 @@ mod tests {
                 },
                 cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
                 partition: RolePartitionPolicy::Single,
+                behavior: vec![
+                    RoleBehaviorFacet::ReacquireEvidence { required: true },
+                    RoleBehaviorFacet::TerminalCandidate { required: true },
+                ],
                 grant_ceiling: vec![harness_contract::agent::AgentCapability::Read],
                 task_contract: harness_contract::team::TeamRoleTaskContract {
                     contract_ref: "task/implementer@1".to_string(),
@@ -617,6 +641,32 @@ mod tests {
         )
         .expect("binding recompiles");
         assert_eq!(binding.binding_digest, again.binding_digest);
+    }
+
+    #[test]
+    fn terminal_behavior_is_frozen_from_the_published_role_contract() {
+        let mut template = manifest();
+        template.roles[0].role_id = "custom-convergence".to_string();
+        template.roles[0].behavior = vec![
+            RoleBehaviorFacet::Reducer {
+                mode: "finally".to_string(),
+            },
+            RoleBehaviorFacet::UpstreamConsumption { required: true },
+            RoleBehaviorFacet::TerminalCandidate { required: true },
+        ];
+        let role = &template.roles[0];
+        let mut resolved_slot = slot();
+        resolved_slot.role_id = "custom-convergence".to_string();
+        let binding = compile_team_binding(
+            &request(),
+            &template,
+            "template-digest",
+            "# Team\n\nReview.",
+            &[resolved_slot],
+            None,
+        )
+        .expect("binding compiles");
+        assert_eq!(binding.roles[0].behavior, role.behavior);
     }
 
     #[test]

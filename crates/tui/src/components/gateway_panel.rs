@@ -775,12 +775,8 @@ impl GatewayPanel {
                         .pointer("/output/expected_value")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unavailable");
-                    let cost = draft
-                        .pointer("/usage/estimated_cost_microusd")
-                        .and_then(serde_json::Value::as_u64)
-                        .map_or_else(|| "unknown".to_string(), |cost| format!("{cost}µUSD"));
                     self.evolution_analysis_summary = Some(format!(
-                        "case={case_id} hypotheses={hypotheses} candidate={candidate} experiment={experiment} value={value} cost={cost}"
+                        "case={case_id} hypotheses={hypotheses} candidate={candidate} experiment={experiment} value={value}"
                     ));
                 } else {
                     let state = payload
@@ -2524,8 +2520,7 @@ mod tests {
                     "suggested_candidate_kind": "architecture_plan",
                     "falsification_experiment": {"objective": "paired replay"},
                     "expected_value": "separate causes"
-                },
-                "usage": {"estimated_cost_microusd": 12}
+                }
             }
         })));
         assert!(panel
