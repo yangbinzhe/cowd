@@ -32,7 +32,7 @@ use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, RoleBehaviorFacet, RoleCardinalityPolicy,
     RolePartitionPolicy, TeamAcceptanceCheck, TeamAcceptanceRequirement, TeamInstantiationRequest,
     TeamRoleAssignment, TeamRoleBindingOverride, TeamRoleDefinition, TeamRoleIdentity,
-    TeamStructuredOutputField, TeamTemplateDefinitionId, TeamTemplateSelector,
+    TeamStructuredOutputField, TeamTemplateSelector,
 };
 
 /// Hard ceiling for AgentTask nodes in one immutable Team graph.
@@ -894,24 +894,10 @@ impl TeamInstantiationService {
                 return self.resolve_ephemeral_template(request, snapshot);
             }
             TeamTemplateSelector::Automatic => {
-                let template = if request
-                    .resource_scopes
-                    .iter()
-                    .any(|scope| scope == "network:*")
-                {
-                    "builtin/cowd/external-research-synthesis"
-                } else if request.permission_ceiling
-                    == harness_contract::policy::PermissionMode::WorkspaceWrite
-                {
-                    "builtin/cowd/execute-review"
-                } else {
-                    "builtin/cowd/parallel-research-synthesis"
-                };
-                (
-                    TeamTemplateDefinitionId::try_from(template)
-                        .map_err(|error| error.to_string())?,
-                    RevisionSelector::LatestApprovedStable,
-                )
+                return Err(
+                    "automatic Team template selection is retired; the Coordinator must bind an approved catalog revision or an ephemeral snapshot"
+                        .to_string(),
+                );
             }
         };
         let routing_identity = format!(
