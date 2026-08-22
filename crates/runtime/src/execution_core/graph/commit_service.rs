@@ -2809,6 +2809,24 @@ fn apply_collaboration_team_retirement(
             "Team retirement requires a planned Team; `{retired_node_id}` is {status:?}"
         )));
     }
+    let reservation = current
+        .control
+        .obligations
+        .iter()
+        .find(|obligation| obligation.instance_id == *instance_id)
+        .map(|obligation| obligation.reservation.clone())
+        .unwrap_or_default();
+    if current.control.lifecycle != CollaborationProgramLifecycle::Planning
+        && reservation == Default::default()
+        && (current.control.resource_ledger.context_reservation_tokens > 0
+            || current.control.resource_ledger.output_reservation_tokens > 0
+            || current.control.resource_ledger.parallel_demand > 0)
+    {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "Team retirement requires an exact durable resource reservation; legacy aggregate-only Programs are read-only"
+                .to_string(),
+        ));
+    }
 
     let mut candidate = current.clone();
     candidate
@@ -2821,6 +2839,21 @@ fn apply_collaboration_team_retirement(
         .control
         .obligations
         .retain(|obligation| obligation.instance_id != *instance_id);
+    candidate.control.resource_ledger.context_reservation_tokens = candidate
+        .control
+        .resource_ledger
+        .context_reservation_tokens
+        .saturating_sub(reservation.context_reservation_tokens);
+    candidate.control.resource_ledger.output_reservation_tokens = candidate
+        .control
+        .resource_ledger
+        .output_reservation_tokens
+        .saturating_sub(reservation.output_reservation_tokens);
+    candidate.control.resource_ledger.parallel_demand = candidate
+        .control
+        .resource_ledger
+        .parallel_demand
+        .saturating_sub(reservation.parallel_demand);
     let semantic_id = instance.semantic_node_id.clone();
     let remove_mapping = candidate
         .semantic_node_instances
@@ -3950,6 +3983,7 @@ mod tests {
                     state: TeamAdmissionState::Admitted,
                     child_graph_ref: Some("team-graph:research".to_string()),
                     reason_kind: None,
+                    reservation: Default::default(),
                     revision: 1,
                 }],
                 resource_ledger: ProgramResourceLedger {
@@ -3996,6 +4030,7 @@ mod tests {
                     state: TeamAdmissionState::Admitting,
                     child_graph_ref: None,
                     reason_kind: None,
+                    reservation: Default::default(),
                     revision: 1,
                 }],
                 resource_ledger: ProgramResourceLedger {

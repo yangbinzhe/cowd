@@ -1140,13 +1140,10 @@ fn admission_control(
         let binding = team_plan
             .binding
             .ok_or_else(|| format!("program_team_binding_missing:{node_id}"))?;
-        deadline_at_ms = deadline_at_ms.max(request.deadline_at_ms);
-        context_reservation_tokens =
-            context_reservation_tokens.saturating_add(request.execution_budget.predicted_tokens());
-        output_reservation_tokens =
-            output_reservation_tokens.saturating_add(request.execution_budget.max_tokens);
-        parallel_demand = parallel_demand.saturating_add(
-            u64::try_from(
+        let reservation = harness_contract::execution_graph::TeamAdmissionResourceReservation {
+            context_reservation_tokens: request.execution_budget.predicted_tokens(),
+            output_reservation_tokens: request.execution_budget.max_tokens,
+            parallel_demand: u16::try_from(
                 team_plan
                     .graph
                     .nodes
@@ -1156,14 +1153,21 @@ fn admission_control(
                     })
                     .count(),
             )
-            .unwrap_or(u64::MAX),
-        );
+            .unwrap_or(u16::MAX),
+        };
+        deadline_at_ms = deadline_at_ms.max(request.deadline_at_ms);
+        context_reservation_tokens =
+            context_reservation_tokens.saturating_add(reservation.context_reservation_tokens);
+        output_reservation_tokens =
+            output_reservation_tokens.saturating_add(reservation.output_reservation_tokens);
+        parallel_demand = parallel_demand.saturating_add(u64::from(reservation.parallel_demand));
         obligations.push(TeamAdmissionObligation {
             instance_id: instance.instance_id.clone(),
             binding_ref: format!("team-binding:sha256:{}", binding.binding_digest),
             state: TeamAdmissionState::Admitting,
             child_graph_ref: None,
             reason_kind: None,
+            reservation,
             revision: program.revision,
         });
     }

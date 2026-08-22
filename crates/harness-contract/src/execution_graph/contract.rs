@@ -242,7 +242,20 @@ pub struct TeamAdmissionObligation {
     pub child_graph_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_kind: Option<String>,
+    /// Exact technical capacity attributed to this immutable Team binding.
+    /// Keeping the contribution per obligation lets a topology replacement
+    /// release only the retired workstream instead of guessing from a shared
+    /// Program aggregate after restart.
+    #[serde(default)]
+    pub reservation: TeamAdmissionResourceReservation,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TeamAdmissionResourceReservation {
+    pub context_reservation_tokens: u64,
+    pub output_reservation_tokens: u64,
+    pub parallel_demand: u16,
 }
 
 /// State of a cross-Team delivery edge.  It is append-only receipt driven:
@@ -1605,6 +1618,7 @@ mod dependency_policy_tests {
                     state: TeamAdmissionState::Admitted,
                     child_graph_ref: Some("execution-graph:child".to_string()),
                     reason_kind: None,
+                    reservation: Default::default(),
                     revision: 7,
                 }],
                 resource_ledger: ProgramResourceLedger {
