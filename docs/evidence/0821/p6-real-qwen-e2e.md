@@ -45,6 +45,31 @@ hashes and performance evidence. The scenario above proves only the listed
 Gateway/harness increment. `completion-audit-2026-08-23.md` tracks the
 remaining authority gates and must be satisfied before claiming P6 closure.
 
+## 2026-08-23 repeat run
+
+The same isolated Gateway lane was repeated after the P4 continuation and
+resource-pressure fixes:
+
+```text
+COWD_EVAL_KEEP_GATEWAY_ARTIFACTS=1 COWD_EVAL_TIMEOUT_SECS=900 \
+  scripts/scenarios/harness-eval-real-qwen.sh
+```
+
+The run used `qwen3.7-plus`, completed with `status=passed`, and its report
+gate passed all 19 required checks. It recorded 36 real provider rounds and
+four complete live Gateway scenarios. The mandatory Team scenario projected
+one completed Team and four completed Agents, with no failed Team or Agent.
+
+```text
+/tmp/cowd-real-qwen-evidence.aGhGBN/runs/v0.9.703-1787436069-mission-harness-deep/report.json
+sha256 cdab5257610a746cbb2f6da38cc34e48a35dd9b8f599eb2bafb8574b47447187
+evidence-manifest sha256 5b5a9104eb387da6d070601dd7e8e45efe395e3f75f796c3bef09dd4e1719699
+```
+
+This repeat confirms the real-model increment, not P6 release closure: it did
+not exercise the required two-Team merge, escalation, same-session and
+cross-session continuation deny/allow, approval, PostgreSQL, or Surface gates.
+
 ## Regression coverage added for the final closure
 
 - `ProviderClient` resolves a configured `env:NAME` secret only at the
