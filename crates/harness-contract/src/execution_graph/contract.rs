@@ -271,6 +271,30 @@ pub struct CrossTeamInputContract {
     pub require_satisfied_acceptance: bool,
 }
 
+/// Runtime-derived producer receipt for one cross-Team delivery.  The
+/// Coordinator stores only stable graph/node/attempt identity, the terminal
+/// result locator, and already-authorized evidence references.  It never
+/// copies a prompt, tool input, or private model reasoning into another Team.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CrossTeamEdgeDeliveryReceipt {
+    pub receipt_ref: String,
+    pub producer_node_id: String,
+    pub producer_attempt: u32,
+    pub producer_result_ref: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+}
+
+/// Runtime-derived consumer acknowledgement for a delivered cross-Team edge.
+/// A claim is fenced by the consumer node attempt so a stale Team retry cannot
+/// overwrite the delivery state selected by the current graph revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CrossTeamEdgeClaimReceipt {
+    pub claim_ref: String,
+    pub consumer_node_id: String,
+    pub consumer_attempt: u32,
+}
+
 /// The narrow AddTeam delta a managed Agent may request at an effect-safe
 /// checkpoint.  It deliberately carries no graph identity, executor, lease,
 /// permission ceiling or arbitrary template: the parent Program compiler owns
@@ -700,6 +724,10 @@ pub struct CollaborationProgramEdge {
     pub input_contract: CrossTeamInputContract,
     #[serde(default)]
     pub state: CrossTeamEdgeState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_receipt: Option<CrossTeamEdgeDeliveryReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_receipt: Option<CrossTeamEdgeClaimReceipt>,
 }
 
 /// Immutable, graph-owned description of the Team obligations for one root
@@ -768,6 +796,39 @@ impl CollaborationProgram {
             })
         {
             return Err("collaboration program edges are invalid".to_string());
+        }
+        for edge in &self.edges {
+            let receipt_is_valid = edge.delivery_receipt.as_ref().is_none_or(|receipt| {
+                !receipt.receipt_ref.trim().is_empty()
+                    && !receipt.producer_node_id.trim().is_empty()
+                    && receipt.producer_attempt > 0
+                    && !receipt.producer_result_ref.trim().is_empty()
+            });
+            let claim_is_valid = edge.claim_receipt.as_ref().is_none_or(|claim| {
+                !claim.claim_ref.trim().is_empty()
+                    && !claim.consumer_node_id.trim().is_empty()
+                    && claim.consumer_attempt > 0
+            });
+            let receipt_state_is_valid = match edge.state {
+                CrossTeamEdgeState::Pending | CrossTeamEdgeState::AwaitingProducer => {
+                    edge.delivery_receipt.is_none() && edge.claim_receipt.is_none()
+                }
+                CrossTeamEdgeState::Delivered => {
+                    edge.delivery_receipt.is_some() && edge.claim_receipt.is_none()
+                }
+                CrossTeamEdgeState::Claimed => {
+                    edge.delivery_receipt.is_some() && edge.claim_receipt.is_some()
+                }
+                CrossTeamEdgeState::Blocked | CrossTeamEdgeState::Cancelled => {
+                    edge.delivery_receipt.is_none() && edge.claim_receipt.is_none()
+                }
+            };
+            if !receipt_is_valid || !claim_is_valid || !receipt_state_is_valid {
+                return Err(format!(
+                    "cross-Team edge `{}` receipt state is invalid",
+                    edge.edge_id
+                ));
+            }
         }
         if self.semantic_node_instances.values().any(|instances| {
             instances.is_empty() || instances.iter().any(|instance| instance.trim().is_empty())
@@ -1240,6 +1301,23 @@ pub enum ExecutionGraphCommand {
         expected_revision: u64,
         control: Box<CollaborationProgramControlState>,
     },
+    /// Coordinator-owned delivery transition for an authorized cross-Team
+    /// handoff. The commit service derives the receipt from the terminal
+    /// producer node; callers cannot supply free-form cross-Team context.
+    RecordCrossTeamEdgeDelivery {
+        expected_revision: u64,
+        edge_id: String,
+        producer_node_id: String,
+        producer_attempt: u32,
+    },
+    /// Coordinator-owned acknowledgement that the exact consumer node
+    /// accepted a previously delivered cross-Team receipt.
+    ClaimCrossTeamEdgeDelivery {
+        expected_revision: u64,
+        edge_id: String,
+        consumer_node_id: String,
+        consumer_attempt: u32,
+    },
     Replan {
         expected_revision: u64,
         reason: String,
@@ -1342,6 +1420,8 @@ mod dependency_policy_tests {
                 kind: CollaborationEdgeKind::ReviewOf,
                 input_contract: Default::default(),
                 state: Default::default(),
+                delivery_receipt: None,
+                claim_receipt: None,
             }],
             semantic_node_instances: BTreeMap::new(),
             control: Default::default(),

@@ -751,6 +751,14 @@ impl ExecutionCommitService {
         if to == ExecutionNodeStatus::Running {
             *node_attempt = node_attempt.saturating_add(1);
         }
+        // A cross-Team handoff becomes durable at the producer's terminal
+        // transition, not when a consumer happens to wake up later. Keeping
+        // this inside the same graph commit makes delivery restart-safe and
+        // prevents a completed producer from being observed without its
+        // corresponding edge disposition.
+        if to.is_terminal() {
+            record_terminal_cross_team_edge_deliveries(&mut next, node_id)?;
+        }
         let transaction_id = format!("{}:{}:{}:{}", graph.id, node_id, next.revision, to as u8);
         let graph_event = ExecutionGraphEvent::NodeTransitioned {
             node_id: node_id.to_string(),
@@ -1409,6 +1417,169 @@ impl ExecutionCommitService {
                     ))
                 })?;
                 program.control = (**control).clone();
+            }
+            ExecutionGraphCommand::RecordCrossTeamEdgeDelivery {
+                edge_id,
+                producer_node_id,
+                producer_attempt,
+                ..
+            } => {
+                let program = next
+                    .orchestration
+                    .as_mut()
+                    .and_then(|metadata| metadata.collaboration_program.as_mut())
+                    .ok_or_else(|| {
+                        ExecutionCommitError::InvalidCommand(
+                            "graph has no collaboration program control plane".to_string(),
+                        )
+                    })?;
+                let edge_index = program
+                    .edges
+                    .iter_mut()
+                    .position(|edge| edge.edge_id == *edge_id)
+                    .ok_or_else(|| {
+                        ExecutionCommitError::InvalidCommand(format!(
+                            "cross-Team edge `{edge_id}` does not exist"
+                        ))
+                    })?;
+                let edge = &program.edges[edge_index];
+                if !matches!(
+                    edge.state,
+                    harness_contract::execution_graph::CrossTeamEdgeState::Pending
+                        | harness_contract::execution_graph::CrossTeamEdgeState::AwaitingProducer
+                ) {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` cannot record a producer receipt from {:?}",
+                        edge.state
+                    )));
+                }
+                let expected_node = physical_node_for_team_instance(program, &edge.from)?;
+                if expected_node != *producer_node_id {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` producer node `{producer_node_id}` does not match `{expected_node}`"
+                    )));
+                }
+                let observed_attempt = next
+                    .recovery_cursor
+                    .node_attempts
+                    .get(producer_node_id)
+                    .copied()
+                    .unwrap_or_default();
+                if *producer_attempt == 0 || observed_attempt != *producer_attempt {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` producer attempt mismatch: expected {producer_attempt}, observed {observed_attempt}"
+                    )));
+                }
+                let status = next
+                    .node_statuses
+                    .get(producer_node_id)
+                    .copied()
+                    .ok_or_else(|| {
+                        ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` producer node `{producer_node_id}` is absent"
+                    ))
+                    })?;
+                let result = next.node_results.get(producer_node_id).ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` producer node `{producer_node_id}` has no terminal result"
+                    ))
+                })?;
+                if !status.is_terminal()
+                    || result.status != status
+                    || !cross_team_input_contract_is_satisfied(&edge.input_contract, result)
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` producer receipt does not satisfy its typed input contract"
+                    )));
+                }
+                let producer_result_ref = result
+                    .result_ref
+                    .clone()
+                    .unwrap_or_else(|| format!("execution-node:{producer_node_id}"));
+                let receipt = harness_contract::execution_graph::CrossTeamEdgeDeliveryReceipt {
+                    receipt_ref: format!(
+                        "cross-team-edge:{graph_id}:{edge_id}:producer:{producer_node_id}:attempt:{producer_attempt}",
+                        graph_id = graph.id,
+                    ),
+                    producer_node_id: producer_node_id.clone(),
+                    producer_attempt: *producer_attempt,
+                    producer_result_ref,
+                    evidence_refs: result.evidence_refs.clone(),
+                };
+                let edge = &mut program.edges[edge_index];
+                edge.delivery_receipt = Some(receipt);
+                edge.claim_receipt = None;
+                edge.state = harness_contract::execution_graph::CrossTeamEdgeState::Delivered;
+                program.validate().map_err(|error| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "invalid cross-Team edge delivery update: {error}"
+                    ))
+                })?;
+            }
+            ExecutionGraphCommand::ClaimCrossTeamEdgeDelivery {
+                edge_id,
+                consumer_node_id,
+                consumer_attempt,
+                ..
+            } => {
+                let program = next
+                    .orchestration
+                    .as_mut()
+                    .and_then(|metadata| metadata.collaboration_program.as_mut())
+                    .ok_or_else(|| {
+                        ExecutionCommitError::InvalidCommand(
+                            "graph has no collaboration program control plane".to_string(),
+                        )
+                    })?;
+                let edge_index = program
+                    .edges
+                    .iter_mut()
+                    .position(|edge| edge.edge_id == *edge_id)
+                    .ok_or_else(|| {
+                        ExecutionCommitError::InvalidCommand(format!(
+                            "cross-Team edge `{edge_id}` does not exist"
+                        ))
+                    })?;
+                let edge = &program.edges[edge_index];
+                if edge.state != harness_contract::execution_graph::CrossTeamEdgeState::Delivered {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` cannot be claimed from {:?}",
+                        edge.state
+                    )));
+                }
+                let expected_node = physical_node_for_team_instance(program, &edge.to)?;
+                if expected_node != *consumer_node_id {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` consumer node `{consumer_node_id}` does not match `{expected_node}`"
+                    )));
+                }
+                let observed_attempt = next
+                    .recovery_cursor
+                    .node_attempts
+                    .get(consumer_node_id)
+                    .copied()
+                    .unwrap_or_default();
+                if *consumer_attempt == 0 || observed_attempt != *consumer_attempt {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "cross-Team edge `{edge_id}` consumer attempt mismatch: expected {consumer_attempt}, observed {observed_attempt}"
+                    )));
+                }
+                let claim = harness_contract::execution_graph::CrossTeamEdgeClaimReceipt {
+                    claim_ref: format!(
+                        "cross-team-edge:{graph_id}:{edge_id}:consumer:{consumer_node_id}:attempt:{consumer_attempt}",
+                        graph_id = graph.id,
+                    ),
+                    consumer_node_id: consumer_node_id.clone(),
+                    consumer_attempt: *consumer_attempt,
+                };
+                let edge = &mut program.edges[edge_index];
+                edge.claim_receipt = Some(claim);
+                edge.state = harness_contract::execution_graph::CrossTeamEdgeState::Claimed;
+                program.validate().map_err(|error| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "invalid cross-Team edge claim update: {error}"
+                    ))
+                })?;
             }
             ExecutionGraphCommand::Replan { .. } => {
                 return Err(ExecutionCommitError::InvalidCommand(
@@ -2286,6 +2457,12 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::UpdateCollaborationProgramControl {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::RecordCrossTeamEdgeDelivery {
+            expected_revision, ..
+        }
+        | ExecutionGraphCommand::ClaimCrossTeamEdgeDelivery {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::Replan {
             expected_revision, ..
         } => *expected_revision,
@@ -2306,8 +2483,180 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         ExecutionGraphCommand::UpdateCollaborationProgramControl { .. } => {
             ("update_collaboration_program_control", None)
         }
+        ExecutionGraphCommand::RecordCrossTeamEdgeDelivery { .. } => {
+            ("record_cross_team_edge_delivery", None)
+        }
+        ExecutionGraphCommand::ClaimCrossTeamEdgeDelivery { .. } => {
+            ("claim_cross_team_edge_delivery", None)
+        }
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
     }
+}
+
+fn physical_node_for_team_instance(
+    program: &harness_contract::execution_graph::CollaborationProgram,
+    instance_id: &str,
+) -> Result<String, ExecutionCommitError> {
+    let instance = program
+        .team_instances
+        .iter()
+        .find(|instance| instance.instance_id == instance_id)
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "cross-Team edge references unknown Team instance `{instance_id}`"
+            ))
+        })?;
+    let sibling_index = program
+        .team_instances
+        .iter()
+        .filter(|candidate| candidate.semantic_node_id == instance.semantic_node_id)
+        .position(|candidate| candidate.instance_id == instance.instance_id)
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "cross-Team edge cannot derive physical Team mapping for `{instance_id}`"
+            ))
+        })?;
+    program
+        .semantic_node_instances
+        .get(&instance.semantic_node_id)
+        .and_then(|nodes| nodes.get(sibling_index))
+        .cloned()
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "cross-Team edge has no physical Team node for `{instance_id}`"
+            ))
+        })
+}
+
+/// Derive the immutable producer receipt as part of its terminal graph
+/// transition. A terminal result that fails the typed input contract records a
+/// `Blocked` edge instead of leaving an apparently-pending handoff that a
+/// consumer could mistake for recoverable work.
+fn record_terminal_cross_team_edge_deliveries(
+    graph: &mut ExecutionGraph,
+    producer_node_id: &str,
+) -> Result<(), ExecutionCommitError> {
+    let producer_attempt = graph
+        .recovery_cursor
+        .node_attempts
+        .get(producer_node_id)
+        .copied()
+        .unwrap_or_default();
+    let result = graph.node_results.get(producer_node_id).cloned();
+    let Some(program) = graph
+        .orchestration
+        .as_mut()
+        .and_then(|metadata| metadata.collaboration_program.as_mut())
+    else {
+        return Ok(());
+    };
+    let mut affected = Vec::new();
+    for (index, edge) in program.edges.iter().enumerate() {
+        if !matches!(
+            edge.state,
+            harness_contract::execution_graph::CrossTeamEdgeState::Pending
+                | harness_contract::execution_graph::CrossTeamEdgeState::AwaitingProducer
+        ) {
+            continue;
+        }
+        if physical_node_for_team_instance(program, &edge.from)? == producer_node_id {
+            affected.push(index);
+        }
+    }
+
+    for index in affected {
+        let edge = &mut program.edges[index];
+        edge.claim_receipt = None;
+        if producer_attempt > 0
+            && result.as_ref().is_some_and(|result| {
+                cross_team_input_contract_is_satisfied(&edge.input_contract, result)
+            })
+        {
+            let result = result.as_ref().expect("checked above");
+            edge.delivery_receipt = Some(
+                harness_contract::execution_graph::CrossTeamEdgeDeliveryReceipt {
+                    receipt_ref: format!(
+                        "cross-team-edge:{}:{}:producer:{}:attempt:{}",
+                        graph.id, edge.edge_id, producer_node_id, producer_attempt
+                    ),
+                    producer_node_id: producer_node_id.to_string(),
+                    producer_attempt,
+                    producer_result_ref: result
+                        .result_ref
+                        .clone()
+                        .unwrap_or_else(|| format!("execution-node:{producer_node_id}")),
+                    evidence_refs: result.evidence_refs.clone(),
+                },
+            );
+            edge.state = harness_contract::execution_graph::CrossTeamEdgeState::Delivered;
+        } else {
+            edge.delivery_receipt = None;
+            edge.state = harness_contract::execution_graph::CrossTeamEdgeState::Blocked;
+        }
+    }
+    program.validate().map_err(|error| {
+        ExecutionCommitError::InvalidCommand(format!(
+            "invalid automatic cross-Team edge delivery update: {error}"
+        ))
+    })
+}
+
+fn cross_team_input_contract_is_satisfied(
+    contract: &harness_contract::execution_graph::CrossTeamInputContract,
+    result: &ExecutionNodeResult,
+) -> bool {
+    use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
+
+    let has_fact = |kind| match kind {
+        TerminalFactKind::CommittedEffect => {
+            result
+                .usage
+                .observed_acceptance
+                .observed_evidence
+                .iter()
+                .any(|evidence| evidence.workspace_prior_state.is_some())
+                || result
+                    .evidence_refs
+                    .iter()
+                    .any(|reference| reference.evidence_ref.ref_type == "runtime_change")
+        }
+        TerminalFactKind::ObservedEvidence => {
+            !result
+                .usage
+                .observed_acceptance
+                .observed_evidence
+                .is_empty()
+                || result
+                    .evidence_refs
+                    .iter()
+                    .any(harness_contract::context::EvidenceAccessRef::is_durable)
+        }
+        TerminalFactKind::Artifact => result.evidence_refs.iter().any(|reference| {
+            reference.evidence_ref.ref_type == "artifact" || reference.is_durable()
+        }),
+        TerminalFactKind::AcceptanceVerdict => result
+            .usage
+            .acceptance_evaluation
+            .as_ref()
+            .is_some_and(|evaluation| evaluation.verdict != AcceptanceVerdict::Unresolved),
+    };
+    contract
+        .required_fact_kinds
+        .iter()
+        .all(|kind| has_fact(*kind))
+        && contract.required_artifact_kinds.iter().all(|kind| {
+            result
+                .evidence_refs
+                .iter()
+                .any(|reference| reference.evidence_ref.ref_type == *kind)
+        })
+        && (!contract.require_committed_effect || has_fact(TerminalFactKind::CommittedEffect))
+        && (!contract.require_satisfied_acceptance
+            || result
+                .usage
+                .acceptance_evaluation
+                .as_ref()
+                .is_some_and(|evaluation| evaluation.verdict == AcceptanceVerdict::Satisfied))
 }
 
 fn status_name(status: ExecutionNodeStatus) -> &'static str {
@@ -3049,6 +3398,8 @@ mod tests {
                 kind: CollaborationEdgeKind::ReviewOf,
                 input_contract: Default::default(),
                 state: Default::default(),
+                delivery_receipt: None,
+                claim_receipt: None,
             }],
             semantic_node_instances: BTreeMap::from([(
                 "review".to_string(),
@@ -3121,6 +3472,309 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["research:1", "review:1"])
         );
+    }
+
+    #[test]
+    fn cross_team_edge_delivery_and_claim_are_fenced_by_node_attempts() {
+        use harness_contract::execution_graph::{
+            CollaborationEdgeKind, CollaborationProgram, CollaborationProgramEdge,
+            CollaborationProgramLifecycle, CollaborationTeamInstance, ExecutionGraphCommand,
+            ExecutionOrchestrationMetadata,
+        };
+
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let service = ExecutionCommitService::new(store);
+        let mut graph = agent_task_graph();
+        graph.id = "cross-team-root".to_string();
+        let mut consumer = graph.nodes[0].clone();
+        consumer.id = "consumer-team".to_string();
+        consumer.idempotency_key = "consumer-team-key".to_string();
+        graph.nodes[0].id = "producer-team".to_string();
+        graph.nodes[0].idempotency_key = "producer-team-key".to_string();
+        graph.node_statuses.clear();
+        graph
+            .node_statuses
+            .insert("producer-team".to_string(), ExecutionNodeStatus::Planned);
+        graph
+            .node_statuses
+            .insert("consumer-team".to_string(), ExecutionNodeStatus::Planned);
+        graph.nodes.push(consumer);
+        graph.orchestration = Some(ExecutionOrchestrationMetadata {
+            mutation_id: "cross-team-test".to_string(),
+            applied_mutation_ids: Vec::new(),
+            semantic_revision: 1,
+            source_generation: 1,
+            completion: Default::default(),
+            collaboration_program: Some(CollaborationProgram {
+                program_id: "program-cross-team".to_string(),
+                revision: 1,
+                required_team_count: 2,
+                team_instances: vec![
+                    CollaborationTeamInstance {
+                        instance_id: "producer:1".to_string(),
+                        semantic_node_id: "producer".to_string(),
+                        required: true,
+                    },
+                    CollaborationTeamInstance {
+                        instance_id: "consumer:1".to_string(),
+                        semantic_node_id: "consumer".to_string(),
+                        required: true,
+                    },
+                ],
+                edges: vec![CollaborationProgramEdge {
+                    edge_id: "producer:1->consumer:1".to_string(),
+                    from: "producer:1".to_string(),
+                    to: "consumer:1".to_string(),
+                    kind: CollaborationEdgeKind::Handoff,
+                    input_contract: Default::default(),
+                    state: Default::default(),
+                    delivery_receipt: None,
+                    claim_receipt: None,
+                }],
+                semantic_node_instances: BTreeMap::from([
+                    ("producer".to_string(), vec!["producer-team".to_string()]),
+                    ("consumer".to_string(), vec!["consumer-team".to_string()]),
+                ]),
+                control: harness_contract::execution_graph::CollaborationProgramControlState {
+                    lifecycle: CollaborationProgramLifecycle::Planning,
+                    ..Default::default()
+                },
+            }),
+        });
+        let registered = service.register_graph(graph).expect("register graph").graph;
+        let ready = service
+            .transition_node(
+                &registered,
+                "producer-team",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("producer ready")
+            .graph;
+        let running = service
+            .transition_node(
+                &ready,
+                "producer-team",
+                ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .expect("producer running")
+            .graph;
+        let completed = service
+            .transition_node(
+                &running,
+                "producer-team",
+                ExecutionNodeStatus::Completed,
+                Some(ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Completed,
+                    result_ref: Some("artifact://producer-result".to_string()),
+                    summary: Some("durable producer outcome".to_string()),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                }),
+                Vec::new(),
+            )
+            .expect("producer completed")
+            .graph;
+        let delivered = completed;
+        let edge = &delivered
+            .orchestration
+            .as_ref()
+            .expect("metadata")
+            .collaboration_program
+            .as_ref()
+            .expect("program")
+            .edges[0];
+        assert_eq!(
+            edge.state,
+            harness_contract::execution_graph::CrossTeamEdgeState::Delivered
+        );
+        assert_eq!(
+            edge.delivery_receipt
+                .as_ref()
+                .map(|receipt| receipt.producer_result_ref.as_str()),
+            Some("artifact://producer-result")
+        );
+
+        let consumer_ready = service
+            .transition_node(
+                &delivered,
+                "consumer-team",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("consumer ready")
+            .graph;
+        let consumer_running = service
+            .transition_node(
+                &consumer_ready,
+                "consumer-team",
+                ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .expect("consumer running")
+            .graph;
+        let claimed = service
+            .apply_command(
+                &consumer_running,
+                &ExecutionGraphCommand::ClaimCrossTeamEdgeDelivery {
+                    expected_revision: consumer_running.revision,
+                    edge_id: "producer:1->consumer:1".to_string(),
+                    consumer_node_id: "consumer-team".to_string(),
+                    consumer_attempt: 1,
+                },
+            )
+            .expect("claim commits")
+            .graph;
+        let edge = &claimed
+            .orchestration
+            .as_ref()
+            .expect("metadata")
+            .collaboration_program
+            .as_ref()
+            .expect("program")
+            .edges[0];
+        assert_eq!(
+            edge.state,
+            harness_contract::execution_graph::CrossTeamEdgeState::Claimed
+        );
+        assert_eq!(
+            edge.claim_receipt
+                .as_ref()
+                .map(|receipt| receipt.consumer_attempt),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn terminal_producer_without_required_cross_team_facts_blocks_edge_durably() {
+        use harness_contract::acceptance::TerminalFactKind;
+        use harness_contract::execution_graph::{
+            CollaborationEdgeKind, CollaborationProgram, CollaborationProgramEdge,
+            CollaborationProgramLifecycle, CollaborationTeamInstance, CrossTeamInputContract,
+            ExecutionOrchestrationMetadata,
+        };
+
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let service = ExecutionCommitService::new(store);
+        let mut graph = agent_task_graph();
+        graph.id = "cross-team-blocked-root".to_string();
+        let mut consumer = graph.nodes[0].clone();
+        consumer.id = "consumer-team".to_string();
+        consumer.idempotency_key = "consumer-team-key".to_string();
+        graph.nodes[0].id = "producer-team".to_string();
+        graph.nodes[0].idempotency_key = "producer-team-key".to_string();
+        graph.nodes.push(consumer);
+        graph.node_statuses = BTreeMap::from([
+            ("producer-team".to_string(), ExecutionNodeStatus::Planned),
+            ("consumer-team".to_string(), ExecutionNodeStatus::Planned),
+        ]);
+        graph.orchestration = Some(ExecutionOrchestrationMetadata {
+            mutation_id: "cross-team-blocked-test".to_string(),
+            applied_mutation_ids: Vec::new(),
+            semantic_revision: 1,
+            source_generation: 1,
+            completion: Default::default(),
+            collaboration_program: Some(CollaborationProgram {
+                program_id: "program-cross-team-blocked".to_string(),
+                revision: 1,
+                required_team_count: 2,
+                team_instances: vec![
+                    CollaborationTeamInstance {
+                        instance_id: "producer:1".to_string(),
+                        semantic_node_id: "producer".to_string(),
+                        required: true,
+                    },
+                    CollaborationTeamInstance {
+                        instance_id: "consumer:1".to_string(),
+                        semantic_node_id: "consumer".to_string(),
+                        required: true,
+                    },
+                ],
+                edges: vec![CollaborationProgramEdge {
+                    edge_id: "producer:1->consumer:1".to_string(),
+                    from: "producer:1".to_string(),
+                    to: "consumer:1".to_string(),
+                    kind: CollaborationEdgeKind::Handoff,
+                    input_contract: CrossTeamInputContract {
+                        required_artifact_kinds: Vec::new(),
+                        required_fact_kinds: vec![TerminalFactKind::Artifact],
+                        require_committed_effect: false,
+                        require_satisfied_acceptance: false,
+                    },
+                    state: Default::default(),
+                    delivery_receipt: None,
+                    claim_receipt: None,
+                }],
+                semantic_node_instances: BTreeMap::from([
+                    ("producer".to_string(), vec!["producer-team".to_string()]),
+                    ("consumer".to_string(), vec!["consumer-team".to_string()]),
+                ]),
+                control: harness_contract::execution_graph::CollaborationProgramControlState {
+                    lifecycle: CollaborationProgramLifecycle::Planning,
+                    ..Default::default()
+                },
+            }),
+        });
+        let registered = service.register_graph(graph).expect("register graph").graph;
+        let ready = service
+            .transition_node(
+                &registered,
+                "producer-team",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("producer ready")
+            .graph;
+        let running = service
+            .transition_node(
+                &ready,
+                "producer-team",
+                ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .expect("producer running")
+            .graph;
+        let completed = service
+            .transition_node(
+                &running,
+                "producer-team",
+                ExecutionNodeStatus::Completed,
+                Some(ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Completed,
+                    result_ref: Some("artifact://producer-result".to_string()),
+                    summary: Some("producer omitted the required artifact fact".to_string()),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 1,
+                }),
+                Vec::new(),
+            )
+            .expect("producer completed")
+            .graph;
+        let edge = &completed
+            .orchestration
+            .as_ref()
+            .expect("metadata")
+            .collaboration_program
+            .as_ref()
+            .expect("program")
+            .edges[0];
+        assert_eq!(
+            edge.state,
+            harness_contract::execution_graph::CrossTeamEdgeState::Blocked
+        );
+        assert!(edge.delivery_receipt.is_none());
+        assert!(edge.claim_receipt.is_none());
     }
 
     #[test]

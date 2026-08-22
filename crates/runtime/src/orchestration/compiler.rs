@@ -5,11 +5,11 @@ use harness_contract::agent::{AgentCapability, AgentTaskIntent};
 use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::execution_graph::{
     validate_execution_graph, CollaborationEdgeKind, CollaborationProgram,
-    CollaborationProgramEdge, CollaborationTeamInstance, DependencyPredicate,
-    ExecutionDependencyPolicy, ExecutionEdge, ExecutionEdgeKind, ExecutionGraph,
-    ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
-    ExecutionOrchestrationMetadata, ExecutionParentBinding, ExecutionWorkContract,
-    ExecutionWorkRole,
+    CollaborationProgramEdge, CollaborationTeamInstance, CrossTeamInputContract,
+    DependencyPredicate, ExecutionDependencyPolicy, ExecutionEdge, ExecutionEdgeKind,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec,
+    ExecutionNodeStatus, ExecutionOrchestrationMetadata, ExecutionParentBinding,
+    ExecutionWorkContract, ExecutionWorkRole,
 };
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, TeamInstantiationRequest, TeamSelectionMode,
@@ -196,8 +196,18 @@ pub(crate) fn collaboration_program_from_proposal(
                         from,
                         to,
                         kind: CollaborationEdgeKind::Handoff,
-                        input_contract: Default::default(),
+                        input_contract: CrossTeamInputContract {
+                            required_artifact_kinds: producer.output_artifacts.clone(),
+                            required_fact_kinds: vec![
+                                TerminalFactKind::ObservedEvidence,
+                                TerminalFactKind::AcceptanceVerdict,
+                            ],
+                            require_committed_effect: false,
+                            require_satisfied_acceptance: false,
+                        },
                         state: Default::default(),
+                        delivery_receipt: None,
+                        claim_receipt: None,
                     });
                 }
             }
@@ -470,11 +480,11 @@ fn compile_semantic_node(
     work.dependency = semantic.dependency.clone();
     work.cancellation_group = semantic.cancellation_group.clone();
     work.required_evidence_refs = semantic.required_evidence_refs.clone();
-    work.dependency = default_review_dependency(
+    work.dependency = default_cross_team_dependency(
         semantic.recipe,
         work.dependency,
         &work.required_evidence_refs,
-        !semantic.depends_on.is_empty(),
+        semantic.depends_on.len(),
     );
     node.work = Some(work);
     Ok(node)
@@ -483,17 +493,19 @@ fn compile_semantic_node(
 /// Reviewer/CrossCheck edges consume terminal predecessor facts, not raw
 /// execution status. A failed or FrameworkInvalid predecessor with durable
 /// evidence stays reviewable; only the typed predicate decides readiness.
-fn default_review_dependency(
+fn default_cross_team_dependency(
     recipe: CapabilityRecipeId,
     dependency: ExecutionDependencyPolicy,
     required_evidence_refs: &[String],
-    has_predecessors: bool,
+    predecessor_count: usize,
 ) -> ExecutionDependencyPolicy {
-    if recipe == CapabilityRecipeId::Review
-        && dependency == ExecutionDependencyPolicy::All
-        && required_evidence_refs.is_empty()
-        && has_predecessors
+    if dependency != ExecutionDependencyPolicy::All
+        || !required_evidence_refs.is_empty()
+        || predecessor_count == 0
     {
+        return dependency;
+    }
+    if recipe == CapabilityRecipeId::Review {
         return ExecutionDependencyPolicy::EvidenceReady {
             predicate: DependencyPredicate::EvidenceReady {
                 minimum: 1,
@@ -503,6 +515,29 @@ fn default_review_dependency(
                 ],
                 accepted_execution_statuses: vec![
                     ExecutionNodeStatus::Failed,
+                    ExecutionNodeStatus::Completed,
+                ],
+                accepted_acceptance_verdicts: vec![
+                    AcceptanceVerdict::Satisfied,
+                    AcceptanceVerdict::Unsatisfied,
+                    AcceptanceVerdict::FrameworkInvalid,
+                ],
+                require_committed_effect: false,
+            },
+            cancel_remaining: false,
+        };
+    }
+    if recipe == CapabilityRecipeId::Team {
+        return ExecutionDependencyPolicy::EvidenceReady {
+            predicate: DependencyPredicate::EvidenceReady {
+                minimum: u16::try_from(predecessor_count).unwrap_or(u16::MAX),
+                required_fact_kinds: vec![
+                    TerminalFactKind::ObservedEvidence,
+                    TerminalFactKind::AcceptanceVerdict,
+                ],
+                accepted_execution_statuses: vec![
+                    ExecutionNodeStatus::Failed,
+                    ExecutionNodeStatus::Blocked,
                     ExecutionNodeStatus::Completed,
                 ],
                 accepted_acceptance_verdicts: vec![
@@ -1214,11 +1249,11 @@ mod tests {
 
     #[test]
     fn review_nodes_default_to_evidence_ready_predicate_not_status_all() {
-        let dependency = default_review_dependency(
+        let dependency = default_cross_team_dependency(
             CapabilityRecipeId::Review,
             ExecutionDependencyPolicy::All,
             &[],
-            true,
+            1,
         );
         let ExecutionDependencyPolicy::EvidenceReady { predicate, .. } = dependency else {
             panic!("Review edges must consume typed terminal facts");
@@ -1233,14 +1268,14 @@ mod tests {
         assert!(accepted_execution_statuses.contains(&ExecutionNodeStatus::Failed));
         assert!(accepted_acceptance_verdicts.contains(&AcceptanceVerdict::FrameworkInvalid));
 
-        let explicit = default_review_dependency(
+        let explicit = default_cross_team_dependency(
             CapabilityRecipeId::Review,
             ExecutionDependencyPolicy::Quorum {
                 minimum: 2,
                 cancel_remaining: false,
             },
             &[],
-            true,
+            1,
         );
         assert_eq!(
             explicit,
@@ -1251,24 +1286,43 @@ mod tests {
             "an explicit dependency contract is never overwritten"
         );
         assert_eq!(
-            default_review_dependency(
+            default_cross_team_dependency(
                 CapabilityRecipeId::Synthesis,
                 ExecutionDependencyPolicy::All,
                 &[],
-                true,
+                1,
             ),
             ExecutionDependencyPolicy::All
         );
         assert_eq!(
-            default_review_dependency(
+            default_cross_team_dependency(
                 CapabilityRecipeId::Review,
                 ExecutionDependencyPolicy::All,
                 &[],
-                false,
+                0,
             ),
             ExecutionDependencyPolicy::All,
             "a Review node without predecessors keeps the plain All dependency"
         );
+
+        let dependency = default_cross_team_dependency(
+            CapabilityRecipeId::Team,
+            ExecutionDependencyPolicy::All,
+            &[],
+            2,
+        );
+        let ExecutionDependencyPolicy::EvidenceReady { predicate, .. } = dependency else {
+            panic!("dependent Teams must consume typed terminal facts");
+        };
+        let DependencyPredicate::EvidenceReady {
+            minimum,
+            required_fact_kinds,
+            accepted_execution_statuses,
+            ..
+        } = predicate;
+        assert_eq!(minimum, 2);
+        assert!(required_fact_kinds.contains(&TerminalFactKind::ObservedEvidence));
+        assert!(accepted_execution_statuses.contains(&ExecutionNodeStatus::Failed));
     }
 
     #[test]
@@ -1383,5 +1437,16 @@ mod tests {
         assert_eq!(program.edges.len(), 1);
         assert_eq!(program.edges[0].from, "research:1");
         assert_eq!(program.edges[0].to, "review:1");
+        assert_eq!(
+            program.edges[0].input_contract.required_artifact_kinds,
+            vec!["terminal_synthesis".to_string()]
+        );
+        assert_eq!(
+            program.edges[0].input_contract.required_fact_kinds,
+            vec![
+                TerminalFactKind::ObservedEvidence,
+                TerminalFactKind::AcceptanceVerdict,
+            ]
+        );
     }
 }

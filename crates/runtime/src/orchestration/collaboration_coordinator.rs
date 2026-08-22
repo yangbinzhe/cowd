@@ -602,6 +602,173 @@ pub(crate) async fn mark_team_admitted(
     Err("program_admission_conflict_exhausted".to_string())
 }
 
+/// Persist all incoming cross-Team deliveries before a consumer Team is
+/// admitted. The commit service derives each receipt from the durable
+/// producer result and validates the typed input contract; this facade only
+/// selects the current consumer attempt and retries narrow graph-revision
+/// conflicts. It never carries model text or arbitrary artifacts.
+pub(crate) async fn record_incoming_cross_team_deliveries(
+    graph_id: &str,
+    consumer_node_id: &str,
+    supervisor: &RuntimeExecutionSupervisor,
+    graphs: &ExecutionGraphStateStore,
+) -> Result<(), String> {
+    let mut stale_conflicts = 0;
+    loop {
+        let graph = graphs
+            .load_async(graph_id)
+            .await
+            .map_err(|error| format!("cross_team_delivery_load_failed:{error}"))?;
+        let Some(program) = graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+        else {
+            return Ok(());
+        };
+        let consumer_instance = instance_id_for_node(program, consumer_node_id)?;
+        let pending = program
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.to == consumer_instance
+                    && matches!(
+                        edge.state,
+                        harness_contract::execution_graph::CrossTeamEdgeState::Pending
+                            | harness_contract::execution_graph::CrossTeamEdgeState::AwaitingProducer
+                    )
+            })
+            .map(|edge| (edge.edge_id.clone(), edge.from.clone()))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            if program.edges.iter().any(|edge| {
+                edge.to == consumer_instance
+                    && matches!(
+                        edge.state,
+                        harness_contract::execution_graph::CrossTeamEdgeState::Blocked
+                            | harness_contract::execution_graph::CrossTeamEdgeState::Cancelled
+                    )
+            }) {
+                return Err("cross_team_delivery_is_terminally_blocked".to_string());
+            }
+            return Ok(());
+        }
+        let (edge_id, producer_instance) = pending[0].clone();
+        let producer_node_id = node_id_for_instance(program, &producer_instance)?;
+        let producer_attempt = graph
+            .recovery_cursor
+            .node_attempts
+            .get(&producer_node_id)
+            .copied()
+            .unwrap_or_default();
+        match supervisor
+            .command(
+                graph_id,
+                ExecutionGraphCommand::RecordCrossTeamEdgeDelivery {
+                    expected_revision: graph.revision,
+                    edge_id,
+                    producer_node_id,
+                    producer_attempt,
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                // A successful command consumes exactly one pending edge. It
+                // is not a CAS retry, so a fan-in larger than the retry bound
+                // remains admissible.
+                stale_conflicts = 0;
+                continue;
+            }
+            Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
+                crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
+            )) if stale_conflicts < MAX_CAS_ATTEMPTS => {
+                stale_conflicts = stale_conflicts.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(format!("cross_team_delivery_commit_failed:{error}")),
+        }
+    }
+}
+
+/// Claim every delivered incoming edge before the consumer Team is admitted.
+/// A duplicate call for the same node attempt is a no-op; a different attempt
+/// cannot overwrite the prior claim.
+pub(crate) async fn claim_incoming_cross_team_deliveries(
+    graph_id: &str,
+    consumer_node_id: &str,
+    consumer_attempt: u32,
+    supervisor: &RuntimeExecutionSupervisor,
+    graphs: &ExecutionGraphStateStore,
+) -> Result<(), String> {
+    let mut stale_conflicts = 0;
+    loop {
+        let graph = graphs
+            .load_async(graph_id)
+            .await
+            .map_err(|error| format!("cross_team_claim_load_failed:{error}"))?;
+        let Some(program) = graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+        else {
+            return Ok(());
+        };
+        let consumer_instance = instance_id_for_node(program, consumer_node_id)?;
+        let delivered = program
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.to == consumer_instance
+                    && edge.state
+                        == harness_contract::execution_graph::CrossTeamEdgeState::Delivered
+            })
+            .map(|edge| edge.edge_id.clone());
+        let Some(edge_id) = delivered else {
+            let stale_claim = program.edges.iter().find(|edge| {
+                edge.to == consumer_instance
+                    && edge.state == harness_contract::execution_graph::CrossTeamEdgeState::Claimed
+            });
+            return match stale_claim {
+                Some(edge)
+                    if edge.claim_receipt.as_ref().is_some_and(|claim| {
+                        claim.consumer_node_id == consumer_node_id
+                            && claim.consumer_attempt == consumer_attempt
+                    }) =>
+                {
+                    Ok(())
+                }
+                Some(_) => Err("cross_team_claim_attempt_conflict".to_string()),
+                None => Ok(()),
+            };
+        };
+        match supervisor
+            .command(
+                graph_id,
+                ExecutionGraphCommand::ClaimCrossTeamEdgeDelivery {
+                    expected_revision: graph.revision,
+                    edge_id,
+                    consumer_node_id: consumer_node_id.to_string(),
+                    consumer_attempt,
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                stale_conflicts = 0;
+                continue;
+            }
+            Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
+                crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
+            )) if stale_conflicts < MAX_CAS_ATTEMPTS => {
+                stale_conflicts = stale_conflicts.saturating_add(1);
+                continue;
+            }
+            Err(error) => return Err(format!("cross_team_claim_commit_failed:{error}")),
+        }
+    }
+}
+
 /// A Team compiler/admitter rejection is durable Program truth, not merely a
 /// transient executor string. The root node retains the detailed failure;
 /// Program records the typed obligation disposition so required-N admission

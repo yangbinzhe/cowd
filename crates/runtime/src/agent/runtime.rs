@@ -2665,11 +2665,11 @@ mod tests {
                 .verdict,
             harness_contract::acceptance::AcceptanceVerdict::FrameworkInvalid
         );
-        assert!(returned
-            .observed_acceptance
-            .observed_evidence
-            .iter()
-            .any(|evidence| evidence.tool_name == "read_file"));
+        // This backend did not execute a governed tool, so the failed result
+        // must preserve that empty evidence set rather than fabricate the
+        // historical `read_file` fixture. The framework-invalid verdict and
+        // receipt snapshot above remain durable facts.
+        assert!(returned.observed_acceptance.observed_evidence.is_empty());
         assert_eq!(
             runtime
                 .get(packet.agent_id())

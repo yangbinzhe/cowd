@@ -207,6 +207,33 @@ impl NodeExecutor for TeamSubgraphExecutor {
                     executor_kind: Self::KIND.to_string(),
                     node_id: ticket.node_id.clone(),
                 })?;
+        crate::orchestration::collaboration_coordinator::record_incoming_cross_team_deliveries(
+            &ticket.graph_id,
+            &ticket.node_id,
+            supervisor.as_ref(),
+            teams.graph_state_store(),
+        )
+        .await
+        .map_err(|reason| NodeExecutorError::Poll {
+            node_id: ticket.node_id.clone(),
+            reason,
+        })?;
+        // Claim the exact delivered receipt before the child Team is admitted.
+        // `admit_or_resume` may start its child graph, so claiming afterwards
+        // would allow the consumer to execute before its authorized inputs
+        // were durably fenced.
+        crate::orchestration::collaboration_coordinator::claim_incoming_cross_team_deliveries(
+            &ticket.graph_id,
+            &ticket.node_id,
+            ticket.attempt,
+            supervisor.as_ref(),
+            teams.graph_state_store(),
+        )
+        .await
+        .map_err(|reason| NodeExecutorError::Poll {
+            node_id: ticket.node_id.clone(),
+            reason,
+        })?;
         let projection = match teams.admit_or_resume(request).await {
             Ok(projection) => projection,
             Err(reason) => {

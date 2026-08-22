@@ -74,7 +74,7 @@ mod tests {
         );
 
         let node = &project_execution_graph(&graph).nodes[0];
-        assert_eq!(node.payload_ref, "payload:inspect");
+        assert_eq!(node.payload_ref, "execution-payload:inspect");
         assert_eq!(node.acceptance.criteria, vec!["verified output"]);
         assert_eq!(node.resource_scopes, vec!["workspace:read"]);
         assert_eq!(node.summary.as_deref(), Some("inspection complete"));

@@ -1252,8 +1252,18 @@ async fn revise(
                                         from: from.clone(),
                                         to: to.clone(),
                                         kind: harness_contract::execution_graph::CollaborationEdgeKind::Handoff,
-                                        input_contract: Default::default(),
+                                        input_contract: harness_contract::execution_graph::CrossTeamInputContract {
+                                            required_artifact_kinds: Vec::new(),
+                                            required_fact_kinds: vec![
+                                                harness_contract::acceptance::TerminalFactKind::ObservedEvidence,
+                                                harness_contract::acceptance::TerminalFactKind::AcceptanceVerdict,
+                                            ],
+                                            require_committed_effect: false,
+                                            require_satisfied_acceptance: false,
+                                        },
                                         state: Default::default(),
+                                        delivery_receipt: None,
+                                        claim_receipt: None,
                                     },
                                 );
                             }
