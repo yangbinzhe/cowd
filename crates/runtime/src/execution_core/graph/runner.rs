@@ -3,12 +3,14 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
 
-use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
+use harness_contract::acceptance::{AcceptanceEvaluation, AcceptanceVerdict, TerminalFactKind};
+use harness_contract::context::{EvidenceAccessRef, EvidenceRef};
 use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
     ExecutionNodeResult, ExecutionNodeStatus,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{futures::OwnedNotified, Mutex, Notify, OwnedMutexGuard};
 
@@ -2251,11 +2253,26 @@ fn team_child_terminal_result(graph: &ExecutionGraph) -> ExecutionNodeResult {
                 })
             })
     };
+    let result_ref = synthesize_result
+        .and_then(|result| result.result_ref.clone())
+        .or_else(|| Some(format!("execution-graph:{}", graph.id)));
+    let mut usage = aggregate_team_leaf_usage(graph);
+    if status == ExecutionNodeStatus::Completed {
+        promote_completed_team_terminal_facts(
+            &mut usage,
+            &mut evidence_refs,
+            &graph.id,
+            graph.revision,
+            result_ref.as_deref(),
+            graph
+                .lineage
+                .as_ref()
+                .map_or("unknown", |lineage| lineage.session_id.as_str()),
+        );
+    }
     ExecutionNodeResult {
         status,
-        result_ref: synthesize_result
-            .and_then(|result| result.result_ref.clone())
-            .or_else(|| Some(format!("execution-graph:{}", graph.id))),
+        result_ref,
         summary: synthesize_result
             .and_then(|result| result.summary.clone())
             .or_else(|| {
@@ -2267,8 +2284,48 @@ fn team_child_terminal_result(graph: &ExecutionGraph) -> ExecutionNodeResult {
             }),
         evidence_refs,
         failure,
-        usage: aggregate_team_leaf_usage(graph),
+        usage,
         finished_at_ms: now_ms(),
+    }
+}
+
+/// Parent resolution bypasses `TeamSubgraphExecutor::poll_or_await`: the
+/// durable supervisor joins an already-terminal child directly. Promote the
+/// child terminal fact here so its parent node can satisfy a typed fan-in
+/// dependency and cross-Team delivery contract after restart as well.
+fn promote_completed_team_terminal_facts(
+    usage: &mut harness_contract::execution_graph::ExecutionUsage,
+    evidence_refs: &mut Vec<EvidenceAccessRef>,
+    child_graph_id: &str,
+    child_revision: u64,
+    result_ref: Option<&str>,
+    session_id: &str,
+) {
+    let terminal_id = format!(
+        "{child_graph_id}:revision:{child_revision}:{}",
+        result_ref.unwrap_or("terminal-result-unavailable")
+    );
+    if !evidence_refs
+        .iter()
+        .any(|reference| reference.evidence_ref.ref_type == "terminal_synthesis")
+    {
+        evidence_refs.push(EvidenceAccessRef::durable(
+            EvidenceRef::observed("terminal_synthesis", terminal_id.clone()),
+            format!("sha256:{:x}", Sha256::digest(terminal_id.as_bytes())),
+            terminal_id.len() as u64,
+            "application/vnd.cowd.team-terminal+json",
+            format!("runtime-event:execution-graph:{child_graph_id}:terminal"),
+            format!("session:{session_id}"),
+        ));
+    }
+    if usage.acceptance_evaluation.is_none() {
+        usage.acceptance_evaluation = Some(AcceptanceEvaluation {
+            evaluator_revision: crate::acceptance_evaluator::AcceptanceEvaluator::REVISION,
+            contract_digest: format!("team-child-terminal:{child_graph_id}:{child_revision}"),
+            receipt_set_digest: format!("sha256:{:x}", Sha256::digest(terminal_id.as_bytes())),
+            derived_obligations: vec![format!("team-child-terminal:{child_graph_id}")],
+            verdict: AcceptanceVerdict::Satisfied,
+        });
     }
 }
 
@@ -2932,5 +2989,45 @@ mod dependency_policy_tests {
         assert_eq!(terminal.status, ExecutionNodeStatus::Failed);
         assert_eq!(terminal.usage, aggregate);
         assert_eq!(terminal.failure.unwrap().kind, "provider_failure");
+    }
+
+    #[test]
+    fn completed_child_terminal_promotes_typed_handoff_facts() {
+        let mut graph = ExecutionGraph::new("completed child");
+        graph.id = "team-graph:alpha".to_string();
+        graph.revision = 7;
+        let mut synth = ExecutionNodeSpec::new(ExecutionNodeKind::Synthesize, "synth", "{}");
+        synth.id = "synth".to_string();
+        graph.nodes = vec![synth];
+        graph
+            .node_statuses
+            .insert("synth".to_string(), ExecutionNodeStatus::Completed);
+        graph.node_results.insert(
+            "synth".to_string(),
+            ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some("assistant_json:\"verified\"".to_string()),
+                summary: Some("verified".to_string()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: ExecutionUsage::default(),
+                finished_at_ms: 1,
+            },
+        );
+
+        let terminal = team_child_terminal_result(&graph);
+
+        assert_eq!(terminal.status, ExecutionNodeStatus::Completed);
+        assert_eq!(
+            terminal
+                .usage
+                .acceptance_evaluation
+                .as_ref()
+                .map(|evaluation| evaluation.verdict),
+            Some(AcceptanceVerdict::Satisfied)
+        );
+        assert!(terminal.evidence_refs.iter().any(|reference| {
+            reference.evidence_ref.ref_type == "terminal_synthesis" && reference.is_durable()
+        }));
     }
 }

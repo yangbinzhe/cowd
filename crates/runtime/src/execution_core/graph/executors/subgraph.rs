@@ -1,14 +1,11 @@
 use std::sync::Weak;
 
 use async_trait::async_trait;
-use harness_contract::acceptance::{AcceptanceEvaluation, AcceptanceVerdict};
-use harness_contract::context::{EvidenceAccessRef, EvidenceRef};
 use harness_contract::execution_graph::{
     ExecutionFailure, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
     ExecutionNodeStatus, ExecutionUsage,
 };
 use harness_contract::team::TeamInstantiationRequest;
-use sha2::{Digest, Sha256};
 
 use crate::execution_core::graph::{
     NodeExecutionContext, NodeExecutionOutcome, NodeExecutionTicket, NodeExecutor,
@@ -199,7 +196,6 @@ impl NodeExecutor for TeamSubgraphExecutor {
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
         let request = self.request(&ticket.node_id, &ticket.payload_ref)?;
-        let team_session_id = request.lineage.session_id.clone();
         let child_graph_id = format!("team-graph:{}", request.team_id);
         let teams = self
             .teams
@@ -297,7 +293,7 @@ impl NodeExecutor for TeamSubgraphExecutor {
             }));
         }
         let completed = projection.status == "completed" && projection.terminal_result.is_some();
-        let mut evidence_refs = projection
+        let evidence_refs = projection
             .terminal_result
             .as_ref()
             .map(|result| result.evidence_refs.clone())
@@ -325,7 +321,7 @@ impl NodeExecutor for TeamSubgraphExecutor {
             .as_ref()
             .map(|result| result.result_ref.clone())
             .or_else(|| Some(format!("execution-graph:{child_graph_id}")));
-        let mut usage = if completed {
+        let usage = if completed {
             let supervisor =
                 self.supervisor
                     .upgrade()
@@ -348,16 +344,6 @@ impl NodeExecutor for TeamSubgraphExecutor {
         } else {
             ExecutionUsage::default()
         };
-        if completed {
-            promote_completed_team_terminal_facts(
-                &mut usage,
-                &mut evidence_refs,
-                &child_graph_id,
-                projection.graph_revision,
-                result_ref.as_deref(),
-                &team_session_id,
-            );
-        }
         let summary = result_ref
             .as_deref()
             .and_then(decode_team_terminal_summary)
@@ -522,48 +508,6 @@ fn decode_team_terminal_summary(reference: &str) -> Option<String> {
     }
 }
 
-/// A completed child Team is a Runtime-verified terminal producer. Its parent
-/// subgraph node must carry that terminal fact explicitly so a dependent Team
-/// can consume the child through `EvidenceReady` and the typed handoff
-/// contract, rather than mistaking an otherwise complete child for an
-/// unresolved acceptance result.
-fn promote_completed_team_terminal_facts(
-    usage: &mut ExecutionUsage,
-    evidence_refs: &mut Vec<EvidenceAccessRef>,
-    child_graph_id: &str,
-    child_revision: u64,
-    result_ref: Option<&str>,
-    session_id: &str,
-) {
-    let terminal_id = format!(
-        "{child_graph_id}:revision:{child_revision}:{}",
-        result_ref.unwrap_or("terminal-result-unavailable")
-    );
-    if !evidence_refs
-        .iter()
-        .any(|reference| reference.evidence_ref.ref_type == "terminal_synthesis")
-    {
-        evidence_refs.push(EvidenceAccessRef::durable(
-            EvidenceRef::observed("terminal_synthesis", terminal_id.clone()),
-            format!("sha256:{:x}", Sha256::digest(terminal_id.as_bytes())),
-            terminal_id.len() as u64,
-            "application/vnd.cowd.team-terminal+json",
-            format!("runtime-event:execution-graph:{child_graph_id}:terminal"),
-            format!("session:{session_id}"),
-        ));
-    }
-    if usage.acceptance_evaluation.is_none() {
-        let receipt_set_digest = format!("sha256:{:x}", Sha256::digest(terminal_id.as_bytes()));
-        usage.acceptance_evaluation = Some(AcceptanceEvaluation {
-            evaluator_revision: crate::acceptance_evaluator::AcceptanceEvaluator::REVISION,
-            contract_digest: format!("team-child-terminal:{child_graph_id}:{child_revision}"),
-            receipt_set_digest,
-            derived_obligations: vec![format!("team-child-terminal:{child_graph_id}")],
-            verdict: AcceptanceVerdict::Satisfied,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,32 +533,6 @@ mod tests {
         assert!(summary.contains("Team terminal result truncated"));
         assert!(summary.chars().count() < 4_200);
         assert!(decode_team_terminal_summary("artifact:report").is_none());
-    }
-
-    #[test]
-    fn completed_team_terminal_is_promoted_to_typed_handoff_facts() {
-        let mut usage = ExecutionUsage::default();
-        let mut evidence = Vec::new();
-
-        promote_completed_team_terminal_facts(
-            &mut usage,
-            &mut evidence,
-            "team-graph:alpha",
-            7,
-            Some("assistant_json:\"verified\""),
-            "session-1",
-        );
-
-        assert_eq!(
-            usage
-                .acceptance_evaluation
-                .as_ref()
-                .map(|evaluation| evaluation.verdict),
-            Some(AcceptanceVerdict::Satisfied)
-        );
-        assert!(evidence.iter().any(|reference| {
-            reference.evidence_ref.ref_type == "terminal_synthesis" && reference.is_durable()
-        }));
     }
 
     #[tokio::test]
