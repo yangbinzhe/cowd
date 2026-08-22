@@ -51,6 +51,7 @@ pub struct ExecutionWorkProjection {
     pub expected_input_tokens: u64,
     pub expected_output_tokens: u64,
     pub expected_duration_ms: u64,
+    pub scheduling_priority: u8,
 }
 
 impl From<&ExecutionWorkContract> for ExecutionWorkProjection {
@@ -63,6 +64,7 @@ impl From<&ExecutionWorkContract> for ExecutionWorkProjection {
             expected_input_tokens: work.expected_input_tokens,
             expected_output_tokens: work.expected_output_tokens,
             expected_duration_ms: work.expected_duration_ms,
+            scheduling_priority: work.scheduling_priority,
         }
     }
 }

@@ -1956,6 +1956,7 @@ mod tests {
                 expected_input_tokens: 0,
                 expected_output_tokens: 0,
                 expected_duration_ms: 0,
+                scheduling_priority: 0,
             }),
         }
     }

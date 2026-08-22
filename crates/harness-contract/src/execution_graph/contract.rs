@@ -119,6 +119,10 @@ pub struct ExecutionWorkContract {
     pub expected_output_tokens: u64,
     #[serde(default)]
     pub expected_duration_ms: u64,
+    /// Soft scheduling preference for an unstarted work item. ResourceManager
+    /// still owns all permit, deadline and capacity decisions.
+    #[serde(default)]
+    pub scheduling_priority: u8,
 }
 
 const fn default_required_work() -> bool {
@@ -140,6 +144,7 @@ impl ExecutionWorkContract {
             expected_input_tokens: 0,
             expected_output_tokens: 0,
             expected_duration_ms: 0,
+            scheduling_priority: 0,
         }
     }
 }
@@ -1383,6 +1388,13 @@ pub enum ExecutionGraphCommand {
     /// Runtime rewrites only the matching durable Team request payloads and
     /// advances the Program revision in the same graph transaction.
     ApplyCollaborationObjectiveNarrowing {
+        expected_revision: u64,
+        patch: Box<CollaborationIntentPatch>,
+    },
+    /// Update the soft resource-admission priority for one not-yet-started
+    /// semantic Team. It cannot alter multiplicity, resource demands or
+    /// already-running work.
+    ApplyCollaborationParallelismHint {
         expected_revision: u64,
         patch: Box<CollaborationIntentPatch>,
     },

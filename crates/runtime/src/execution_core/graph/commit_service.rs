@@ -1620,6 +1620,9 @@ impl ExecutionCommitService {
             ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing { patch, .. } => {
                 apply_collaboration_objective_narrowing(&mut next, patch)?;
             }
+            ExecutionGraphCommand::ApplyCollaborationParallelismHint { patch, .. } => {
+                apply_collaboration_parallelism_hint(&mut next, patch)?;
+            }
             ExecutionGraphCommand::Replan { .. } => {
                 return Err(ExecutionCommitError::InvalidCommand(
                     "replan requires the graph compiler and cannot be applied as a status mutation"
@@ -2511,6 +2514,9 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::ApplyCollaborationParallelismHint {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::Replan {
             expected_revision, ..
         } => *expected_revision,
@@ -2545,6 +2551,9 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         }
         ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing { .. } => {
             ("apply_collaboration_objective_narrowing", None)
+        }
+        ExecutionGraphCommand::ApplyCollaborationParallelismHint { .. } => {
+            ("apply_collaboration_parallelism_hint", None)
         }
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
     }
@@ -2978,6 +2987,105 @@ fn apply_collaboration_objective_narrowing(
     for node in &mut graph.nodes {
         if let Some(payload_ref) = updated_payloads.remove(&node.id) {
             node.payload_ref = payload_ref;
+        }
+    }
+    graph
+        .orchestration
+        .as_mut()
+        .and_then(|metadata| metadata.collaboration_program.as_mut())
+        .expect("current Program exists")
+        .clone_from(&candidate);
+    validate_execution_graph(graph)
+        .map(|_| ())
+        .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
+}
+
+/// Apply a model-proposed soft parallelism hint only to unstarted Team work.
+/// The hint becomes a durable work scheduling priority; it deliberately does
+/// not change Team multiplicity, resource demands, permits, or the Program
+/// resource ledger.
+fn apply_collaboration_parallelism_hint(
+    graph: &mut ExecutionGraph,
+    patch: &harness_contract::execution_graph::CollaborationIntentPatch,
+) -> Result<(), ExecutionCommitError> {
+    use harness_contract::execution_graph::{
+        CollaborationIntentPatchOperation, CollaborationProgramLifecycle,
+    };
+
+    patch
+        .validate()
+        .map_err(ExecutionCommitError::InvalidCommand)?;
+    let CollaborationIntentPatchOperation::SetParallelismHint {
+        semantic_node_id,
+        parallelism_hint,
+    } = &patch.operation
+    else {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "parallelism hint command requires a set_parallelism_hint patch".to_string(),
+        ));
+    };
+    let current = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(
+                "graph has no collaboration program control plane".to_string(),
+            )
+        })?;
+    if patch.program_id != current.program_id || patch.base_revision != current.revision {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "parallelism hint patch program revision conflict".to_string(),
+        ));
+    }
+    if current.control.lifecycle.is_terminal() {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "parallelism hint patch targets a terminal Program".to_string(),
+        ));
+    }
+    let node_ids = current
+        .semantic_node_instances
+        .get(semantic_node_id)
+        .filter(|nodes| !nodes.is_empty())
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "parallelism hint patch references unknown Team semantic `{semantic_node_id}`"
+            ))
+        })?
+        .clone();
+    for node_id in &node_ids {
+        if graph.node_statuses.get(node_id) != Some(&ExecutionNodeStatus::Planned) {
+            return Err(ExecutionCommitError::InvalidCommand(format!(
+                "parallelism hint requires planned Team nodes; `{node_id}` is not planned"
+            )));
+        }
+    }
+    let mut candidate = current.clone();
+    candidate.revision = candidate.revision.saturating_add(1);
+    if candidate.control.lifecycle != CollaborationProgramLifecycle::Planning {
+        candidate.control.resource_ledger.revision = candidate.revision;
+        for obligation in &mut candidate.control.obligations {
+            obligation.revision = candidate.revision;
+        }
+    }
+    candidate.validate().map_err(|error| {
+        ExecutionCommitError::InvalidCommand(format!("invalid parallelism hint candidate: {error}"))
+    })?;
+    let priority = u8::try_from(*parallelism_hint).unwrap_or(u8::MAX);
+    for node in &mut graph.nodes {
+        if node_ids.contains(&node.id) {
+            if node.kind != ExecutionNodeKind::Subgraph {
+                return Err(ExecutionCommitError::InvalidCommand(format!(
+                    "parallelism hint node `{}` is not a Team subgraph",
+                    node.id
+                )));
+            }
+            let work = node.work.get_or_insert_with(|| {
+                harness_contract::execution_graph::ExecutionWorkContract::new(
+                    harness_contract::execution_graph::ExecutionWorkRole::EvidenceAnalyze,
+                )
+            });
+            work.scheduling_priority = priority;
         }
     }
     graph
@@ -4382,9 +4490,58 @@ mod tests {
             }),
         });
         let registered = service.register_graph(graph).expect("register graph").graph;
+        let prioritised = service
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::ApplyCollaborationParallelismHint {
+                    expected_revision: registered.revision,
+                    patch: Box::new(harness_contract::execution_graph::CollaborationIntentPatch {
+                        program_id: "program-narrow-objective".to_string(),
+                        base_revision: 1,
+                        source_attempt: "child-team:attempt:0".to_string(),
+                        reason: "the independent evidence lane should be scheduled first".to_string(),
+                        evidence_refs: Vec::new(),
+                        canonical_digest: "p".repeat(64),
+                        user_confirmation_ref: None,
+                        escalation: None,
+                        operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::SetParallelismHint {
+                            semantic_node_id: "research".to_string(),
+                            parallelism_hint: 200,
+                        },
+                    }),
+                },
+            )
+            .expect("planned Team soft priority updates atomically")
+            .graph;
+        assert_eq!(
+            prioritised.nodes[0]
+                .work
+                .as_ref()
+                .expect("Team has a work contract")
+                .scheduling_priority,
+            200
+        );
+        assert_eq!(
+            prioritised.node_statuses["child-team"],
+            ExecutionNodeStatus::Planned
+        );
+        assert_eq!(
+            prioritised
+                .orchestration
+                .as_ref()
+                .expect("metadata")
+                .collaboration_program
+                .as_ref()
+                .expect("Program")
+                .control
+                .resource_ledger
+                .parallel_demand,
+            0,
+            "soft priority must not become a resource reservation"
+        );
         let patch = harness_contract::execution_graph::CollaborationIntentPatch {
             program_id: "program-narrow-objective".to_string(),
-            base_revision: 1,
+            base_revision: 2,
             source_attempt: "child-team:attempt:0".to_string(),
             reason: "the user constrained this branch to a single source".to_string(),
             evidence_refs: Vec::new(),
@@ -4398,9 +4555,9 @@ mod tests {
         };
         let narrowed = service
             .apply_command(
-                &registered,
+                &prioritised,
                 &ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing {
-                    expected_revision: registered.revision,
+                    expected_revision: prioritised.revision,
                     patch: Box::new(patch),
                 },
             )
@@ -4423,7 +4580,7 @@ mod tests {
                 .as_ref()
                 .expect("program")
                 .revision,
-            2
+            3
         );
         assert_eq!(
             narrowed.node_statuses["child-team"],

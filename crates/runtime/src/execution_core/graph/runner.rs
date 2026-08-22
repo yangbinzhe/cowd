@@ -1205,6 +1205,13 @@ impl ExecutionGraphRunner {
             }
             let mut request = ResourceAdmissionRequest::new(graph.service_class, demands)
                 .with_fairness_key(format!("graph:{}", graph.id));
+            if let Some(work) = node
+                .work
+                .as_ref()
+                .filter(|work| work.scheduling_priority > 0)
+            {
+                request = request.with_priority(work.scheduling_priority);
+            }
             if let Some((kind, limit)) = parent_execution_limit {
                 request = request.with_ephemeral_limit(kind, limit);
             }
