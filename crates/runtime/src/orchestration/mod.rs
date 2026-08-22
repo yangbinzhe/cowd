@@ -1014,6 +1014,8 @@ async fn revise(
                                         from: from.clone(),
                                         to: to.clone(),
                                         kind: harness_contract::execution_graph::CollaborationEdgeKind::Handoff,
+                                        input_contract: Default::default(),
+                                        state: Default::default(),
                                     },
                                 );
                             }

@@ -843,36 +843,38 @@ impl AgentRuntime {
                 &packet.required_acceptance,
                 &packet.acceptance,
             );
+            let receipt_snapshot =
+                crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+                    required,
+                    Vec::new(),
+                    Vec::new(),
+                );
             let (observed, evaluation) =
-                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
-                    &required,
-                    Vec::new(),
-                    Vec::new(),
+                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_snapshot(
+                    receipt_snapshot,
                 );
             returned.observed_acceptance = observed;
             returned.acceptance_evaluation = Some(evaluation);
             returned.acceptance.clear();
             returned.runtime_observed_resource_scopes.clear();
         }
-        if returned.acceptance_evaluation.is_none() {
-            // The Runtime terminal boundary is the only compatibility bridge
-            // for older in-process/test backends.  It consumes the already
-            // returned typed facts and writes the same canonical evaluator
-            // envelope; no downstream graph, reducer or projection may do
-            // this work again.
-            let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
-                &packet.required_acceptance,
-                &packet.acceptance,
+        // The Runtime terminal boundary canonicalizes every backend return.
+        // Existing envelopes are treated as transport data only; facts are
+        // retained but an untrusted backend cannot mint a verdict.
+        let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
+            &packet.required_acceptance,
+            &packet.acceptance,
+        );
+        let receipt_snapshot =
+            crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+                required,
+                returned.observed_acceptance.satisfied_criteria.clone(),
+                returned.observed_acceptance.observed_evidence.clone(),
             );
-            let (observed, evaluation) =
-                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
-                    &required,
-                    returned.observed_acceptance.satisfied_criteria.clone(),
-                    returned.observed_acceptance.observed_evidence.clone(),
-                );
-            returned.observed_acceptance = observed;
-            returned.acceptance_evaluation = Some(evaluation);
-        }
+        let (observed, evaluation) =
+            crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_snapshot(receipt_snapshot);
+        returned.observed_acceptance = observed;
+        returned.acceptance_evaluation = Some(evaluation);
         // A cancel/shutdown command is durable lifecycle truth. Backends may
         // observe the interruption as a transport/process error, but they may
         // not overwrite a committed cancellation with `failed` or `completed`.
@@ -908,10 +910,22 @@ impl AgentRuntime {
             // survive the verdict. They are never rewritten to empty.
             returned.status = AgentTerminalStatus::Failed;
             returned.outcome.clear();
-            if let Some(evaluation) = returned.acceptance_evaluation.as_mut() {
-                evaluation.verdict =
-                    harness_contract::acceptance::AcceptanceVerdict::FrameworkInvalid;
-            }
+            let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
+                &packet.required_acceptance,
+                &packet.acceptance,
+            );
+            let receipt_snapshot =
+                crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+                    required,
+                    returned.observed_acceptance.satisfied_criteria.clone(),
+                    returned.observed_acceptance.observed_evidence.clone(),
+                );
+            let (observed, evaluation) =
+                crate::acceptance_evaluator::AcceptanceEvaluator::framework_invalid(
+                    receipt_snapshot,
+                );
+            returned.observed_acceptance = observed;
+            returned.acceptance_evaluation = Some(evaluation);
             returned.failure = Some(format!(
                 "Runtime rejected Agent terminal result: {error}; missing_acceptance={missing_acceptance:?}; runtime_change_receipts={}; observed_evidence_count={}; unresolved_obligations={:?}",
                 returned.runtime_change_receipts.len(),
@@ -2643,6 +2657,19 @@ mod tests {
             .is_some_and(|failure| failure.contains("Runtime rejected Agent terminal result")));
         assert_eq!(returned.input_tokens, 3);
         assert_eq!(returned.output_tokens, 2);
+        assert_eq!(
+            returned
+                .acceptance_evaluation
+                .as_ref()
+                .expect("terminal rejection retains evaluator output")
+                .verdict,
+            harness_contract::acceptance::AcceptanceVerdict::FrameworkInvalid
+        );
+        assert!(returned
+            .observed_acceptance
+            .observed_evidence
+            .iter()
+            .any(|evidence| evidence.tool_name == "read_file"));
         assert_eq!(
             runtime
                 .get(packet.agent_id())

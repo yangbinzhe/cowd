@@ -264,37 +264,44 @@ impl NodeExecutor for AgentTaskExecutor {
                     node_id: ticket.node_id.clone(),
                     reason,
                 })?;
-        if returned.acceptance_evaluation.is_none() {
-            // Direct graph backends used by deterministic evaluators still
-            // terminate at this governed node boundary.  Normalize their
-            // typed facts once here so the persisted node result always has
-            // the same canonical verdict carrier as AgentRuntime-backed
-            // execution.
-            let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
-                &packet.required_acceptance,
-                &packet.acceptance,
+        // Every graph terminal is canonicalized here, including results that
+        // arrived with an evaluator envelope. A backend may carry facts but
+        // can never mint a verdict that survives the governed Runtime node
+        // boundary.
+        let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
+            &packet.required_acceptance,
+            &packet.acceptance,
+        );
+        let receipt_snapshot =
+            crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+                required,
+                returned.observed_acceptance.satisfied_criteria.clone(),
+                returned.observed_acceptance.observed_evidence.clone(),
             );
-            let (observed, evaluation) =
-                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
-                    &required,
-                    returned.observed_acceptance.satisfied_criteria.clone(),
-                    returned.observed_acceptance.observed_evidence.clone(),
-                );
-            returned.observed_acceptance = observed;
-            returned.acceptance_evaluation = Some(evaluation);
-        }
+        let (observed, evaluation) =
+            crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_snapshot(receipt_snapshot);
+        returned.observed_acceptance = observed;
+        returned.acceptance_evaluation = Some(evaluation);
         if let Err(reason) = validate_agent_return(&packet, &returned) {
             // Contract rejection is a terminal Runtime fact, not a transport
             // error.  Preserve every receipt/evidence/artifact carried by the
             // backend response so recovery and Team reduction can inspect the
             // same truth after this node is durably failed.
-            let (_, mut evaluation) =
-                crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
-                    &packet.required_acceptance,
+            let required = crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
+                &packet.required_acceptance,
+                &packet.acceptance,
+            );
+            let receipt_snapshot =
+                crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+                    required,
                     returned.observed_acceptance.satisfied_criteria.clone(),
                     returned.observed_acceptance.observed_evidence.clone(),
                 );
-            evaluation.verdict = harness_contract::acceptance::AcceptanceVerdict::FrameworkInvalid;
+            let (observed, evaluation) =
+                crate::acceptance_evaluator::AcceptanceEvaluator::framework_invalid(
+                    receipt_snapshot,
+                );
+            returned.observed_acceptance = observed;
             returned.acceptance_evaluation = Some(evaluation);
             returned.status = AgentTerminalStatus::Failed;
             returned.outcome.clear();

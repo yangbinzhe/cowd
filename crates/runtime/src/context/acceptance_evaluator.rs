@@ -17,6 +17,50 @@ use crate::path_identity::WorkspacePathIdentityResolver;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AcceptanceEvaluator;
 
+/// The complete, canonical input to an acceptance decision.
+///
+/// It contains only immutable contract data and Runtime-attested receipt
+/// observations.  It deliberately excludes model prose, mutable workspace
+/// reads and lifecycle status: those are not evidence and cannot alter an
+/// acceptance verdict.  Its canonicalized projection is persisted in
+/// `ObservedAcceptance` and identified by `AcceptanceEvaluation` digests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptanceReceiptSnapshot {
+    required: RequiredAcceptance,
+    satisfied_criteria: Vec<String>,
+    observed_evidence: Vec<ObservedEvidence>,
+}
+
+impl AcceptanceReceiptSnapshot {
+    #[must_use]
+    pub fn from_terminal(
+        required: RequiredAcceptance,
+        mut satisfied_criteria: Vec<String>,
+        mut observed_evidence: Vec<ObservedEvidence>,
+    ) -> Self {
+        satisfied_criteria.sort();
+        satisfied_criteria.dedup();
+        observed_evidence.sort_by(|left, right| {
+            crate::path_identity::observed_evidence_fingerprint(left)
+                .cmp(&crate::path_identity::observed_evidence_fingerprint(right))
+        });
+        observed_evidence.dedup_by(|left, right| {
+            crate::path_identity::observed_evidence_fingerprint(left)
+                == crate::path_identity::observed_evidence_fingerprint(right)
+        });
+        Self {
+            required,
+            satisfied_criteria,
+            observed_evidence,
+        }
+    }
+
+    #[must_use]
+    pub fn required(&self) -> &RequiredAcceptance {
+        &self.required
+    }
+}
+
 impl AcceptanceEvaluator {
     /// Bump this only when the canonical matching semantics change.  A
     /// consumer may reject an unknown revision, but it must never silently
@@ -82,36 +126,41 @@ impl AcceptanceEvaluator {
     #[must_use]
     pub fn evaluate_terminal(
         required: &RequiredAcceptance,
-        mut satisfied_criteria: Vec<String>,
-        mut observed_evidence: Vec<ObservedEvidence>,
+        satisfied_criteria: Vec<String>,
+        observed_evidence: Vec<ObservedEvidence>,
     ) -> (ObservedAcceptance, AcceptanceEvaluation) {
-        satisfied_criteria.sort();
-        satisfied_criteria.dedup();
-        observed_evidence.sort_by(|left, right| {
-            crate::path_identity::observed_evidence_fingerprint(left)
-                .cmp(&crate::path_identity::observed_evidence_fingerprint(right))
-        });
-        observed_evidence.dedup_by(|left, right| {
-            crate::path_identity::observed_evidence_fingerprint(left)
-                == crate::path_identity::observed_evidence_fingerprint(right)
-        });
-        let unresolved_obligation_ids = required
+        Self::evaluate_snapshot(AcceptanceReceiptSnapshot::from_terminal(
+            required.clone(),
+            satisfied_criteria,
+            observed_evidence,
+        ))
+    }
+
+    /// The only algorithm that mints a Runtime acceptance verdict.
+    #[must_use]
+    pub fn evaluate_snapshot(
+        snapshot: AcceptanceReceiptSnapshot,
+    ) -> (ObservedAcceptance, AcceptanceEvaluation) {
+        let contract_digest = digest_json(snapshot.required());
+        let unresolved_obligation_ids = snapshot
+            .required
             .evidence_obligations
             .iter()
-            .filter(|obligation| !Self::evaluate(obligation, &observed_evidence))
+            .filter(|obligation| !Self::evaluate(obligation, &snapshot.observed_evidence))
             .map(|obligation| obligation.obligation_id.clone())
             .collect::<Vec<_>>();
         let observed = ObservedAcceptance {
-            satisfied_criteria,
-            observed_evidence,
+            satisfied_criteria: snapshot.satisfied_criteria,
+            observed_evidence: snapshot.observed_evidence,
             unresolved_obligation_ids,
         };
-        let criteria_satisfied = required
+        let criteria_satisfied = snapshot
+            .required
             .criteria
             .iter()
             .all(|criterion| observed.satisfied_criteria.contains(criterion));
         let obligations_satisfied = observed.unresolved_obligation_ids.is_empty();
-        let verdict = if required.is_empty() {
+        let verdict = if snapshot.required.is_empty() {
             AcceptanceVerdict::Satisfied
         } else if observed.is_empty() {
             // This is distinguishable from an evaluated, unsatisfied contract
@@ -123,18 +172,30 @@ impl AcceptanceEvaluator {
         } else {
             AcceptanceVerdict::Unsatisfied
         };
-        let derived_obligations = required
+        let derived_obligations = snapshot
+            .required
             .evidence_obligations
             .iter()
             .map(|obligation| obligation.obligation_id.clone())
             .collect::<Vec<_>>();
         let evaluation = AcceptanceEvaluation {
             evaluator_revision: Self::REVISION,
-            contract_digest: digest_json(required),
+            contract_digest,
             receipt_set_digest: digest_json(&observed),
             derived_obligations,
             verdict,
         };
+        (observed, evaluation)
+    }
+
+    /// A Runtime contract violation is a verdict about the same immutable
+    /// receipt snapshot, not a caller-side mutation of an existing verdict.
+    #[must_use]
+    pub fn framework_invalid(
+        snapshot: AcceptanceReceiptSnapshot,
+    ) -> (ObservedAcceptance, AcceptanceEvaluation) {
+        let (observed, mut evaluation) = Self::evaluate_snapshot(snapshot);
+        evaluation.verdict = AcceptanceVerdict::FrameworkInvalid;
         (observed, evaluation)
     }
 }
@@ -168,5 +229,21 @@ mod tests {
         assert_eq!(left, right);
         assert_eq!(left.verdict, AcceptanceVerdict::Satisfied);
         assert_eq!(left.evaluator_revision, AcceptanceEvaluator::REVISION);
+    }
+
+    #[test]
+    fn framework_invalid_preserves_the_same_canonical_receipt_facts() {
+        let snapshot = AcceptanceReceiptSnapshot::from_terminal(
+            RequiredAcceptance {
+                criteria: vec!["summary".to_string()],
+                evidence_obligations: Vec::new(),
+            },
+            vec!["summary".to_string()],
+            Vec::new(),
+        );
+        let (observed, evaluation) = AcceptanceEvaluator::framework_invalid(snapshot);
+        assert_eq!(observed.satisfied_criteria, vec!["summary".to_string()]);
+        assert_eq!(evaluation.verdict, AcceptanceVerdict::FrameworkInvalid);
+        assert_eq!(evaluation.evaluator_revision, AcceptanceEvaluator::REVISION);
     }
 }

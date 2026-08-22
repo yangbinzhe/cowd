@@ -6,6 +6,7 @@ pub enum AgentResultValidationError {
     BindingMismatch,
     MissingOutcome,
     MissingAcceptanceEvaluation,
+    UnknownAcceptanceEvaluator,
     MissingEvidence,
     MissingToolExecution,
     UnsatisfiedAcceptance,
@@ -18,6 +19,9 @@ impl std::fmt::Display for AgentResultValidationError {
             Self::MissingOutcome => "completed agent return has no outcome",
             Self::MissingAcceptanceEvaluation => {
                 "completed agent return omitted the Runtime acceptance evaluation"
+            }
+            Self::UnknownAcceptanceEvaluator => {
+                "completed agent return has an unknown Runtime acceptance evaluator revision"
             }
             Self::MissingEvidence => "completed agent return omitted required evidence",
             Self::MissingToolExecution => {
@@ -59,6 +63,11 @@ pub fn validate_agent_return(
             .acceptance_evaluation
             .as_ref()
             .ok_or(AgentResultValidationError::MissingAcceptanceEvaluation)?;
+        if evaluation.evaluator_revision
+            != crate::acceptance_evaluator::AcceptanceEvaluator::REVISION
+        {
+            return Err(AgentResultValidationError::UnknownAcceptanceEvaluator);
+        }
         if evaluation.verdict != AcceptanceVerdict::Satisfied {
             return Err(AgentResultValidationError::UnsatisfiedAcceptance);
         }
@@ -313,6 +322,21 @@ mod tests {
             Err(AgentResultValidationError::UnsatisfiedAcceptance)
         );
         assert_eq!(validate_agent_return(&task, &team_return(&task)), Ok(()));
+    }
+
+    #[test]
+    fn completed_return_rejects_an_unknown_evaluator_even_if_its_verdict_is_satisfied() {
+        let task = team_task();
+        let mut returned = team_return(&task);
+        returned
+            .acceptance_evaluation
+            .as_mut()
+            .expect("fixture carries the canonical evaluation")
+            .evaluator_revision = 0;
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::UnknownAcceptanceEvaluator)
+        );
     }
 
     #[test]

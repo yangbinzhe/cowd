@@ -15151,6 +15151,7 @@ mod tests {
                             "team".to_string(),
                             vec!["team-physical-1".to_string(), "team-physical-2".to_string()],
                         )]),
+                        control: Default::default(),
                     },
                 ),
             },

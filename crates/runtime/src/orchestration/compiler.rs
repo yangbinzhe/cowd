@@ -196,6 +196,8 @@ pub(crate) fn collaboration_program_from_proposal(
                         from,
                         to,
                         kind: CollaborationEdgeKind::Handoff,
+                        input_contract: Default::default(),
+                        state: Default::default(),
                     });
                 }
             }
@@ -223,6 +225,7 @@ pub(crate) fn collaboration_program_from_proposal(
                 })
                 .collect()
         }),
+        control: Default::default(),
     };
     derived
         .validate()

@@ -712,12 +712,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             terminal_completion = ?summary.terminal_completion,
             "delegated Agent terminal carrier prepared"
         );
-        let (observed_acceptance, acceptance_evaluation) =
-            crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
-                &required_acceptance,
+        let receipt_snapshot =
+            crate::acceptance_evaluator::AcceptanceReceiptSnapshot::from_terminal(
+                required_acceptance,
                 acceptance.clone(),
                 observed_evidence,
             );
+        let (observed_acceptance, acceptance_evaluation) =
+            crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_snapshot(receipt_snapshot);
         let changes = runtime_change_receipts
             .iter()
             .map(|receipt| receipt.path.clone())

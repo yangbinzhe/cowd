@@ -167,6 +167,171 @@ pub enum CollaborationEdgeKind {
     Dispute,
 }
 
+/// Program lifecycle is coordination truth, deliberately separate from node
+/// execution state and from acceptance/effect verdicts.  A program may be
+/// waiting for a resource while every already-admitted node remains healthy.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationProgramLifecycle {
+    #[default]
+    Planning,
+    AwaitingApproval,
+    AwaitingResource,
+    Admitting,
+    Running,
+    Reconciling,
+    Completed,
+    Partial,
+    Blocked,
+    Failed,
+    Cancelled,
+}
+
+impl CollaborationProgramLifecycle {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Partial | Self::Blocked | Self::Failed | Self::Cancelled
+        )
+    }
+}
+
+/// Durable disposition of one required Team instance.  This records an
+/// obligation, not a scheduler lease: the graph Supervisor remains the only
+/// executor and permit owner.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamAdmissionState {
+    #[default]
+    Pending,
+    AwaitingApproval,
+    AwaitingResource,
+    Admitting,
+    Admitted,
+    BlockedPolicy,
+    Cancelled,
+}
+
+impl TeamAdmissionState {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::BlockedPolicy | Self::Cancelled)
+    }
+}
+
+/// One exact Team admission obligation compiled from an accepted collaboration
+/// intent.  `binding_ref` is a frozen TeamBinding digest/ref; labels and role
+/// display names never participate in this authority identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TeamAdmissionObligation {
+    pub instance_id: String,
+    pub binding_ref: String,
+    #[serde(default)]
+    pub state: TeamAdmissionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_graph_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_kind: Option<String>,
+    pub revision: u64,
+}
+
+/// State of a cross-Team delivery edge.  It is append-only receipt driven:
+/// neither a model summary nor a consumer display state can mark an edge
+/// delivered.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CrossTeamEdgeState {
+    #[default]
+    Pending,
+    AwaitingProducer,
+    Delivered,
+    Claimed,
+    Blocked,
+    Cancelled,
+}
+
+/// Bounded input contract for a cross-Team edge.  Raw prompts, arbitrary tool
+/// inputs and private model reasoning cannot cross this boundary.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CrossTeamInputContract {
+    #[serde(default)]
+    pub required_artifact_kinds: Vec<String>,
+    #[serde(default)]
+    pub required_fact_kinds: Vec<crate::acceptance::TerminalFactKind>,
+    #[serde(default)]
+    pub require_committed_effect: bool,
+    #[serde(default)]
+    pub require_satisfied_acceptance: bool,
+}
+
+/// A bounded escalation proposed by a managed Team at an effect-safe
+/// checkpoint.  The coordinator validates its base revision and digest before
+/// applying a separate program command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationEscalationRequest {
+    pub source_attempt: String,
+    pub base_revision: u64,
+    pub request_kind: String,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+    pub digest: String,
+}
+
+/// Session/turn-bound custom Team template.  It is executable without global
+/// publication, but cannot outlive its terminal fence or become a catalog
+/// selection authority by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EphemeralTeamTemplateSnapshot {
+    pub session_id: String,
+    pub turn_id: String,
+    pub template_digest: String,
+    #[serde(default)]
+    pub role_ids: Vec<String>,
+    pub policy_ref: String,
+    pub expires_at_ms: u64,
+    pub terminal_fence: String,
+}
+
+/// Technical (not monetary) resource snapshot owned by the program revision.
+/// It is changed only on admission/revision/terminal boundaries; token streaming
+/// does not write a database ledger per chunk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProgramResourceLedger {
+    pub context_reservation_tokens: u64,
+    pub output_reservation_tokens: u64,
+    pub parallel_demand: u16,
+    pub deadline_at_ms: u64,
+    pub confidence_basis_points: u16,
+    pub revision: u64,
+}
+
+/// Durable control-plane state.  Existing pre-0821 graph metadata decodes as
+/// `Planning`; P1 is responsible for moving any new admitted program through
+/// a non-planning state together with exact obligations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationProgramControlState {
+    #[serde(default)]
+    pub lifecycle: CollaborationProgramLifecycle,
+    #[serde(default)]
+    pub obligations: Vec<TeamAdmissionObligation>,
+    #[serde(default)]
+    pub resource_ledger: ProgramResourceLedger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_relation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+}
+
 /// One stable Team obligation compiled into a root execution graph.
 ///
 /// `semantic_node_id` deliberately points to the planner's semantic node,
@@ -194,6 +359,10 @@ pub struct CollaborationProgramEdge {
     pub from: String,
     pub to: String,
     pub kind: CollaborationEdgeKind,
+    #[serde(default)]
+    pub input_contract: CrossTeamInputContract,
+    #[serde(default)]
+    pub state: CrossTeamEdgeState,
 }
 
 /// Immutable, graph-owned description of the Team obligations for one root
@@ -213,6 +382,8 @@ pub struct CollaborationProgram {
     /// a generated node id or consulting a mutable in-memory scheduler.
     #[serde(default)]
     pub semantic_node_instances: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub control: CollaborationProgramControlState,
 }
 
 impl CollaborationProgram {
@@ -300,6 +471,36 @@ impl CollaborationProgram {
                             .to_string(),
                     );
                 }
+            }
+        }
+        if !matches!(
+            self.control.lifecycle,
+            CollaborationProgramLifecycle::Planning
+        ) {
+            if self.control.resource_ledger.revision != self.revision
+                || self.control.resource_ledger.parallel_demand == 0
+                || self.control.resource_ledger.deadline_at_ms == 0
+            {
+                return Err("active collaboration program control state is incomplete".to_string());
+            }
+            if self.control.obligations.len() != self.team_instances.len() {
+                return Err(
+                    "active collaboration program has incomplete Team obligations".to_string(),
+                );
+            }
+            let obligation_ids = self
+                .control
+                .obligations
+                .iter()
+                .map(|obligation| obligation.instance_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if obligation_ids.len() != self.control.obligations.len()
+                || obligation_ids != ids
+                || self.control.obligations.iter().any(|obligation| {
+                    obligation.binding_ref.trim().is_empty() || obligation.revision != self.revision
+                })
+            {
+                return Err("active collaboration program obligations are invalid".to_string());
             }
         }
         Ok(())
@@ -795,8 +996,11 @@ mod dependency_policy_tests {
                 from: "research:1".to_string(),
                 to: "review:1".to_string(),
                 kind: CollaborationEdgeKind::ReviewOf,
+                input_contract: Default::default(),
+                state: Default::default(),
             }],
             semantic_node_instances: BTreeMap::new(),
+            control: Default::default(),
         };
         assert!(valid.validate().is_ok());
 
@@ -836,6 +1040,7 @@ mod dependency_policy_tests {
                     "graph:research:2".to_string(),
                 ],
             )]),
+            control: Default::default(),
         };
         assert!(mapped.validate().is_ok());
         mapped
@@ -847,5 +1052,62 @@ mod dependency_policy_tests {
             mapped.validate().is_err(),
             "one Program instance cannot be left unmapped"
         );
+    }
+
+    #[test]
+    fn active_program_control_requires_exact_obligations_and_technical_ledger() {
+        let mut program = CollaborationProgram {
+            program_id: "program-control".to_string(),
+            revision: 7,
+            required_team_count: 1,
+            team_instances: vec![CollaborationTeamInstance {
+                instance_id: "research:1".to_string(),
+                semantic_node_id: "research".to_string(),
+                required: true,
+            }],
+            edges: Vec::new(),
+            semantic_node_instances: BTreeMap::new(),
+            control: CollaborationProgramControlState {
+                lifecycle: CollaborationProgramLifecycle::Running,
+                obligations: vec![TeamAdmissionObligation {
+                    instance_id: "research:1".to_string(),
+                    binding_ref: "team-binding:sha256:abc".to_string(),
+                    state: TeamAdmissionState::Admitted,
+                    child_graph_ref: Some("execution-graph:child".to_string()),
+                    reason_kind: None,
+                    revision: 7,
+                }],
+                resource_ledger: ProgramResourceLedger {
+                    context_reservation_tokens: 4_000,
+                    output_reservation_tokens: 1_000,
+                    parallel_demand: 1,
+                    deadline_at_ms: 123,
+                    confidence_basis_points: 8_000,
+                    revision: 7,
+                },
+                waiting_relation: None,
+                blocker_ref: None,
+                next_action: None,
+            },
+        };
+        assert!(program.validate().is_ok());
+
+        program.control.obligations[0].binding_ref.clear();
+        assert!(program.validate().is_err());
+        program.control.obligations[0].binding_ref = "team-binding:sha256:abc".to_string();
+        program.control.resource_ledger.parallel_demand = 0;
+        assert!(program.validate().is_err());
+
+        let mut encoded = serde_json::to_value(&program).expect("program serializes");
+        let object = encoded.as_object_mut().expect("program object");
+        object.remove("control");
+        let legacy: CollaborationProgram =
+            serde_json::from_value(encoded).expect("legacy program remains readable");
+        assert_eq!(
+            legacy.control.lifecycle,
+            CollaborationProgramLifecycle::Planning,
+            "legacy metadata cannot impersonate an admitted program"
+        );
+        assert!(legacy.validate().is_ok());
     }
 }

@@ -2935,6 +2935,7 @@ mod tests {
                 "research".to_string(),
                 vec!["graph:research:1".to_string()],
             )]),
+            control: Default::default(),
         });
         let delta = CollaborationProgram {
             program_id: "ignored-delta-id".to_string(),
@@ -2950,11 +2951,14 @@ mod tests {
                 from: "research:1".to_string(),
                 to: "review:1".to_string(),
                 kind: CollaborationEdgeKind::ReviewOf,
+                input_contract: Default::default(),
+                state: Default::default(),
             }],
             semantic_node_instances: BTreeMap::from([(
                 "review".to_string(),
                 vec!["graph:review:1".to_string()],
             )]),
+            control: Default::default(),
         };
         merge_collaboration_program(&mut current, Some(delta)).expect("merge additive revision");
         let program = current.expect("program");
