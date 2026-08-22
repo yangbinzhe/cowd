@@ -896,6 +896,13 @@ pub enum ExecutionGraphCommand {
         expected_revision: u64,
         receipt: Box<ChildExecutionTerminalReceipt>,
     },
+    /// Coordinator-owned control-plane update. It carries the complete
+    /// revisioned state so a partial in-memory Team admission cannot be
+    /// mistaken for a durable Program transition after restart.
+    UpdateCollaborationProgramControl {
+        expected_revision: u64,
+        control: Box<CollaborationProgramControlState>,
+    },
     Replan {
         expected_revision: u64,
         reason: String,

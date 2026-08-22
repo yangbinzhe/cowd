@@ -200,14 +200,47 @@ impl NodeExecutor for TeamSubgraphExecutor {
                 executor_kind: Self::KIND.to_string(),
                 node_id: ticket.node_id.clone(),
             })?;
-        let projection =
-            teams
-                .admit_or_resume(request)
+        let supervisor =
+            self.supervisor
+                .upgrade()
+                .ok_or_else(|| NodeExecutorError::Unavailable {
+                    executor_kind: Self::KIND.to_string(),
+                    node_id: ticket.node_id.clone(),
+                })?;
+        let projection = match teams.admit_or_resume(request).await {
+            Ok(projection) => projection,
+            Err(reason) => {
+                crate::orchestration::collaboration_coordinator::mark_team_admission_rejected(
+                    &ticket.graph_id,
+                    &ticket.node_id,
+                    supervisor.as_ref(),
+                    teams.graph_state_store(),
+                )
                 .await
-                .map_err(|reason| NodeExecutorError::Poll {
+                .map_err(|mark_error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!(
+                        "team admission failed ({reason}); persist Program rejection failed: {mark_error}"
+                    ),
+                })?;
+                return Err(NodeExecutorError::Poll {
                     node_id: ticket.node_id.clone(),
                     reason,
-                })?;
+                });
+            }
+        };
+        crate::orchestration::collaboration_coordinator::mark_team_admitted(
+            &ticket.graph_id,
+            &ticket.node_id,
+            &child_graph_id,
+            supervisor.as_ref(),
+            teams.graph_state_store(),
+        )
+        .await
+        .map_err(|reason| NodeExecutorError::Poll {
+            node_id: ticket.node_id.clone(),
+            reason,
+        })?;
         // `TeamProjection.status` is a delivery string.  It deliberately has
         // richer non-terminal values such as `preparing`, `waiting_approval`
         // and `waiting_external`; treating every value other than `running`

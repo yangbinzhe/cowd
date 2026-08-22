@@ -1342,6 +1342,25 @@ impl ExecutionCommitService {
                     correlation_id.clone(),
                 ));
             }
+            ExecutionGraphCommand::UpdateCollaborationProgramControl { control, .. } => {
+                let program = next
+                    .orchestration
+                    .as_mut()
+                    .and_then(|metadata| metadata.collaboration_program.as_mut())
+                    .ok_or_else(|| {
+                        ExecutionCommitError::InvalidCommand(
+                            "graph has no collaboration program control plane".to_string(),
+                        )
+                    })?;
+                let mut candidate = program.clone();
+                candidate.control = (**control).clone();
+                candidate.validate().map_err(|error| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "invalid collaboration program control update: {error}"
+                    ))
+                })?;
+                program.control = (**control).clone();
+            }
             ExecutionGraphCommand::Replan { .. } => {
                 return Err(ExecutionCommitError::InvalidCommand(
                     "replan requires the graph compiler and cannot be applied as a status mutation"
@@ -2215,6 +2234,9 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::ResolveChildExecution {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::UpdateCollaborationProgramControl {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::Replan {
             expected_revision, ..
         } => *expected_revision,
@@ -2232,6 +2254,9 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         ExecutionGraphCommand::SubmitApproval { .. } => ("submit_approval", None),
         ExecutionGraphCommand::ResolveExternal { .. } => ("resolve_external", None),
         ExecutionGraphCommand::ResolveChildExecution { .. } => ("resolve_child_execution", None),
+        ExecutionGraphCommand::UpdateCollaborationProgramControl { .. } => {
+            ("update_collaboration_program_control", None)
+        }
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
     }
 }

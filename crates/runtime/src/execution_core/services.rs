@@ -1702,7 +1702,22 @@ impl RuntimeServices {
                 let outcome_store = outcome_projection_store.clone();
                 let outcome_service = Arc::clone(&settled_outcome_service);
                 let lineage_supervisor = Arc::clone(&settled_lineage_supervisor);
+                let coordinator_store = graph_store.clone();
+                let coordinator_supervisor = Arc::clone(&lineage_supervisor);
                 tokio::spawn(async move {
+                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_program_wait_state_with(
+                        &graph_id,
+                        coordinator_supervisor.as_ref(),
+                        &coordinator_store,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            graph_id,
+                            %error,
+                            "settled graph could not reconcile CollaborationProgram wait truth"
+                        );
+                    }
                     if let Err(error) = lineage_supervisor
                         .wake_parent_for_settled_child(&graph_id)
                         .await
@@ -1731,6 +1746,19 @@ impl RuntimeServices {
                             graph_id,
                             error,
                             "Team terminal Outcome projector could not reduce graph state"
+                        );
+                    }
+                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_terminal_program_with(
+                        &graph_id,
+                        coordinator_supervisor.as_ref(),
+                        &coordinator_store,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            graph_id,
+                            %error,
+                            "settled graph could not reconcile CollaborationProgram terminal truth"
                         );
                     }
                 });
@@ -5015,6 +5043,13 @@ impl RuntimeServices {
         self.team_runtime
             .reconcile_preparing_bindings_on_startup(256)
             .map_err(RuntimeServicesError::Mission)?;
+        crate::orchestration::collaboration_coordinator::reconcile_terminal_programs_on_startup(
+            self.execution_supervisor.as_ref(),
+            &self.graph_state_store,
+            256,
+        )
+        .await
+        .map_err(RuntimeServicesError::Invariant)?;
         let mut managed_dispositions = BTreeMap::new();
         for invocation in self
             .managed_agents

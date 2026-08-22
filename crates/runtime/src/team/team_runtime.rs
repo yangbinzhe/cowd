@@ -85,6 +85,10 @@ impl TeamRuntime {
         self.instantiation.instantiate(request)
     }
 
+    pub(crate) fn graph_state_store(&self) -> &ExecutionGraphStateStore {
+        &self.graphs
+    }
+
     pub(crate) fn ensure_root_task(
         &self,
         request: &TeamInstantiationRequest,

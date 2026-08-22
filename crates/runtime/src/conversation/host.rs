@@ -10,12 +10,10 @@ use crate::execution_core::{
     ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphReplan, NodeExecutionOutcome,
     NodeExecutionTicket, NodeExecutorError,
 };
+use crate::orchestration::team_authority::derive_team_focus_partition_plans;
 #[cfg(test)]
 use crate::orchestration::team_authority::{
     bounded_workspace_focus_scopes, write_focus_partition_plan,
-};
-use crate::orchestration::team_authority::{
-    derive_team_focus_partition_plans, explicit_team_node_contract, semantic_focuses_from_plans,
 };
 use crate::{
     model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
@@ -1411,7 +1409,7 @@ where
             .recover(&graph_id)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let collaboration_started = start_selected_strategy(
+            let collaboration_started = submit_selected_program_intent(
                 &runtime,
                 &state,
                 services.as_ref(),
@@ -1511,7 +1509,7 @@ where
                     },
                 });
             }
-            let collaboration_started = start_selected_strategy(
+            let collaboration_started = submit_selected_program_intent(
                 &runtime,
                 &state,
                 services.as_ref(),
@@ -2083,11 +2081,10 @@ fn structured_team_count(understanding: &harness_contract::strategy::TaskUnderst
     usize::from(understanding.required_team_count.max(1))
 }
 
-/// Materialize the admitted Team strategy before the parent graph asks the
-/// provider for its first step. The durable decision may have been proposed
-/// by the model and constrained by Runtime safety facts; once it is admitted,
-/// this function is its single execution boundary.
-async fn start_selected_strategy<C, T>(
+/// Submit the admitted Team strategy as a Coordinator-owned Program intent
+/// before the parent graph asks the provider for its first step. The Host
+/// consumes the resulting receipt but never constructs or drives its graph.
+async fn submit_selected_program_intent<C, T>(
     runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     turn_state: &Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: &crate::RuntimeServices,
@@ -2178,49 +2175,8 @@ where
     };
     let focus_count = selected_strategy_focus_count(strategy);
     let understanding = &strategy.decision.strategy.understanding;
-    let selection_mode = if understanding.requests_multi_agent {
-        harness_contract::team::TeamSelectionMode::Explicit
-    } else {
-        harness_contract::team::TeamSelectionMode::Automatic
-    };
-    let team_count = if selection_mode == harness_contract::team::TeamSelectionMode::Explicit {
-        structured_team_count(understanding)
-    } else {
-        1
-    };
     let team_owns_write = parent_requires_write
         && harness_contract::strategy::explicit_team_owns_persisted_artifact(objective);
-    let research_team_count = if team_owns_write {
-        team_count.saturating_sub(1)
-    } else {
-        team_count
-    };
-    let research_plans = (research_team_count > 0)
-        .then(|| {
-            derive_team_focus_partition_plans(
-                objective,
-                services.workspace_root(),
-                &[],
-                focus_count.max(research_team_count),
-                false,
-                selection_mode == harness_contract::team::TeamSelectionMode::Explicit,
-                understanding.requires_external_facts,
-            )
-        })
-        .unwrap_or_default();
-    let write_plans = team_owns_write
-        .then(|| {
-            derive_team_focus_partition_plans(
-                objective,
-                services.workspace_root(),
-                &[],
-                1,
-                true,
-                selection_mode == harness_contract::team::TeamSelectionMode::Explicit,
-                false,
-            )
-        })
-        .unwrap_or_default();
     let team_requires_write = team_owns_write;
     if team_requires_write
         && !matches!(
@@ -2234,138 +2190,6 @@ where
         )?;
         return Ok(false);
     }
-    let focus_partition_plans = research_plans
-        .iter()
-        .chain(&write_plans)
-        .cloned()
-        .collect::<Vec<_>>();
-    if focus_partition_plans.is_empty()
-        || focus_partition_plans
-            .iter()
-            .flat_map(|plan| &plan.slots)
-            .all(|slot| slot.capability_cropped_refs.is_empty())
-    {
-        runtime.lock().await.downgrade_turn_strategy(
-            best_non_team_strategy(strategy),
-            "Team was selected but Runtime could not derive at least one existing, bounded workspace resource scope from the parent authority",
-        )?;
-        return Ok(false);
-    }
-    let capabilities = focus_partition_plans
-        .iter()
-        .flat_map(|plan| &plan.slots)
-        .flat_map(|slot| &slot.capability_cropped_refs)
-        .map(|reference| format!("resource:{reference}"))
-        .collect::<Vec<_>>();
-    let research_focuses = semantic_focuses_from_plans(&research_plans);
-    let write_focuses = semantic_focuses_from_plans(&write_plans);
-    let team_node_ids = (0..team_count)
-        .map(|index| {
-            // Machine ids are scoped to the immutable strategy decision, not
-            // to a builtin role/template name. The Team binding supplies
-            // human-facing labels; this id only makes the exact N admission
-            // obligations stable across recovery and retries.
-            format!(
-                "collaboration-{}-team-{}",
-                strategy.decision_id,
-                index.saturating_add(1)
-            )
-        })
-        .collect::<Vec<_>>();
-    let team_nodes = team_node_ids
-        .iter()
-        .enumerate()
-        .map(|(index, node_id)| {
-            let writer = team_owns_write && index + 1 == team_count;
-            let explicit_contract = (selection_mode
-                == harness_contract::team::TeamSelectionMode::Explicit)
-                .then(|| {
-                    explicit_team_node_contract(
-                        index,
-                        team_count,
-                        team_owns_write,
-                        understanding.requires_external_facts,
-                    )
-                });
-            let template = explicit_contract
-                .as_ref()
-                .map(|contract| contract.template.to_string());
-            let focuses = if writer {
-                write_focuses.clone()
-            } else {
-                research_focuses.clone()
-            };
-            let mut resource_scopes = focuses
-                .iter()
-                .flat_map(|focus| focus.resource_scopes.iter().cloned())
-                .collect::<Vec<_>>();
-            resource_scopes.sort();
-            resource_scopes.dedup();
-            crate::GraphSemanticNode {
-                node_id: node_id.clone(),
-                recipe: crate::CapabilityRecipeId::Team,
-                objective: objective.to_string(),
-                depends_on: if writer && index > 0 {
-                    team_node_ids[..index].to_vec()
-                } else {
-                    Vec::new()
-                },
-                multiplicity: 1,
-                focuses,
-                template,
-                target_session_id: None,
-                output_artifacts: explicit_contract.as_ref().map_or_else(
-                    || {
-                        if writer {
-                            vec![
-                                "workspace_change".to_string(),
-                                "terminal_synthesis".to_string(),
-                            ]
-                        } else {
-                            vec!["terminal_synthesis".to_string()]
-                        }
-                    },
-                    |contract| {
-                        contract
-                            .output_artifacts
-                            .iter()
-                            .map(|value| (*value).to_string())
-                            .collect()
-                    },
-                ),
-                evidence_contract: explicit_contract.as_ref().map_or_else(
-                    || {
-                        if writer {
-                            vec![
-                                "implementation".to_string(),
-                                "source_verification".to_string(),
-                                "evidence".to_string(),
-                                "risks".to_string(),
-                            ]
-                        } else {
-                            vec![
-                                "summary".to_string(),
-                                "evidence".to_string(),
-                                "unresolved".to_string(),
-                            ]
-                        }
-                    },
-                    |contract| {
-                        contract
-                            .evidence_contract
-                            .iter()
-                            .map(|value| (*value).to_string())
-                            .collect()
-                    },
-                ),
-                required_evidence_refs: Vec::new(),
-                resource_scopes,
-                required: true,
-                dependency: Default::default(),
-                cancellation_group: None,
-            }
-        })
-        .collect::<Vec<_>>();
     let parent_lineage = services
         .graph_state_store()
         .load(parent_graph_id)
@@ -2396,68 +2220,46 @@ where
             .flatten()
             .map(|task| task.mission_id)
     });
-    let request = crate::RuntimeOrchestrationCommand {
-        intent: objective.to_string(),
-        model_lease: Some(model_lease),
-        session_id: Some(strategy.session_ref.clone()),
-        lineage: orchestration_lineage,
-        mission_id: orchestration_mission_id,
-        operation: crate::RuntimeOrchestrationOperation::Propose,
-        inspect_execution_id: None,
-        proposal: Some(crate::GraphMutationProposal {
-            mutation_id: format!("strategy-{}", strategy.decision_id),
-            target_execution_id: None,
-            expected_revision: None,
-            nodes: team_nodes,
-            completion: harness_contract::execution_graph::ExecutionCompletionContract {
-                required_node_ids: team_node_ids,
-                required_artifact_kinds: if team_owns_write {
-                    vec![
-                        "workspace_change".to_string(),
-                        "terminal_synthesis".to_string(),
-                    ]
-                } else {
-                    vec!["terminal_synthesis".to_string()]
+    let request =
+        crate::orchestration::collaboration_coordinator::compile_conversation_program_intent(
+            crate::orchestration::collaboration_coordinator::ConversationProgramIntent {
+                objective: objective.to_string(),
+                model_lease,
+                session_id: strategy.session_ref.clone(),
+                lineage: orchestration_lineage,
+                mission_id: orchestration_mission_id,
+                decision_id: strategy.decision_id.clone(),
+                decision_revision: strategy.revision,
+                decision_lease: strategy.decision_lease.clone(),
+                turn_ref: strategy.turn_ref.clone(),
+                requested_team_count: structured_team_count(understanding),
+                focus_count,
+                requests_multi_agent: understanding.requests_multi_agent,
+                requires_write: parent_requires_write,
+                requires_external_facts: understanding.requires_external_facts,
+                permission_ceiling: match permission_mode {
+                    crate::PermissionMode::WorkspaceWrite => {
+                        harness_contract::policy::PermissionMode::WorkspaceWrite
+                    }
+                    crate::PermissionMode::DangerFullAccess => {
+                        harness_contract::policy::PermissionMode::DangerFullAccess
+                    }
+                    _ => harness_contract::policy::PermissionMode::ReadOnly,
                 },
-                allow_unresolved_conflicts: false,
+                risk: format!("{:?}", understanding.risk).to_ascii_lowercase(),
             },
-            collaboration_program: None,
-            reason: format!(
-                "admitted strategy decision selected Team at conversation admission ({selection_mode:?})"
-            ),
-        }),
-        control: None,
-        template_proposal: None,
-
-        input_disposition: None,
-        selection_mode: Some(selection_mode),
-        strategy_binding: Some(harness_contract::team::TeamStrategyBinding {
-            decision_id: strategy.decision_id.clone(),
-            decision_revision: strategy.revision,
-            decision_lease: strategy.decision_lease.clone(),
-            turn_ref: strategy.turn_ref.clone(),
-        }),
-        capabilities,
-        evidence_refs: Vec::new(),
-        constraints: crate::RuntimeOrchestrationConstraints {
-            max_parallel_agents: Some(focus_count.saturating_mul(team_count)),
-            risk: Some(
-                format!("{:?}", strategy.decision.strategy.understanding.risk).to_ascii_lowercase(),
-            ),
-            approval_id: None,
-            requires_write: Some(team_requires_write),
-            surface_latency_sensitive: Some(false),
-            permission_ceiling: match permission_mode {
-                crate::PermissionMode::WorkspaceWrite => {
-                    harness_contract::policy::PermissionMode::WorkspaceWrite
-                }
-                crate::PermissionMode::DangerFullAccess => {
-                    harness_contract::policy::PermissionMode::DangerFullAccess
-                }
-                _ => harness_contract::policy::PermissionMode::ReadOnly,
-            },
-        },
-        surface: Some("conversation_runtime_host".to_string()),
+            services.workspace_root(),
+        );
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            let downgrade_reason = format!("Team Program intent rejected by Coordinator: {error}");
+            runtime
+                .lock()
+                .await
+                .downgrade_turn_strategy(best_non_team_strategy(strategy), &downgrade_reason)?;
+            return Ok(false);
+        }
     };
     let parent = harness_contract::execution_graph::ExecutionParentBinding {
         execution_id: parent_graph_id.to_string(),
@@ -2623,9 +2425,16 @@ where
                 .collect()
         },
     );
-    let required_program_team_count = collaboration_program
-        .as_ref()
-        .map_or(team_count, |progress| progress.required_team_count);
+    let required_program_team_count = collaboration_program.as_ref().map_or_else(
+        || {
+            if understanding.requests_multi_agent {
+                structured_team_count(understanding)
+            } else {
+                1
+            }
+        },
+        |progress| progress.required_team_count,
+    );
     let mut receipt = result.model_receipt();
     let child_usage = result.evidence.get("child_usage");
     let child_metric = |name: &str| {

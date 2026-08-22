@@ -648,9 +648,31 @@ impl RuntimeExecutionSupervisor {
         Ok(receipt)
     }
 
+    /// Foreground wait for a graph that was registered by a durable command
+    /// before scheduler admission (for example CollaborationProgram setup).
+    pub(crate) async fn admit_registered_and_wait_terminal(
+        &self,
+        graph_id: &str,
+    ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
+        let receipt = self.admit_registered(graph_id).await?;
+        let report = self.wait_for_terminal(graph_id).await?;
+        Ok((receipt, report))
+    }
+
     pub(crate) async fn notify_graph(&self, graph_id: &str) -> Result<(), ExecutionRunnerError> {
         let _ = self.enqueue(graph_id).await?;
         Ok(())
+    }
+
+    /// Apply a short, revision-fenced graph command without introducing a
+    /// second scheduler. Coordinator reactions use this same command lane as
+    /// every other durable graph transition.
+    pub(crate) async fn command(
+        &self,
+        graph_id: &str,
+        command: ExecutionGraphCommand,
+    ) -> Result<ExecutionGraph, ExecutionRunnerError> {
+        self.runner.command(graph_id, command).await
     }
 
     pub(crate) async fn wake_parent_for_settled_child(

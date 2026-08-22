@@ -4,6 +4,7 @@
 //! resolves definitions, executors, leases, physical identities and commands.
 
 pub mod collaboration_continuation;
+pub(crate) mod collaboration_coordinator;
 pub mod compiler;
 pub(crate) mod input_disposition;
 pub mod planner;
@@ -667,9 +668,13 @@ async fn propose(
         Err(ExecutionStateStoreError::NotFound(_)) => {}
         Err(error) => return Err(format!("proposal_identity_lookup_failed:{error}")),
     }
-    let graph = services
+    let mut graph = services
         .compile_graph_agent_intents(compiled.graph)
         .map_err(|error| format!("agent_binding_compilation_failed:{error}"))?;
+    collaboration_coordinator::prepare_program_admission(
+        &mut graph,
+        services.team_runtime().as_ref(),
+    )?;
     if submission_mode == OrchestrationSubmissionMode::AdmitBackground {
         let registered = services
             .execution_supervisor()
@@ -700,10 +705,16 @@ async fn propose(
                 .to_string(),
         });
     }
+    let registered = services
+        .execution_supervisor()
+        .register_graph(graph)
+        .await
+        .map_err(|error| format!("graph_registration_failed:{error}"))?;
     let run = services
         .execution_supervisor()
-        .submit_and_wait_terminal(graph, compiled.command);
+        .admit_registered_and_wait_terminal(&registered.id);
     let (_, report) = await_with_cancellation(run, cancellation, services, &graph_id).await?;
+    collaboration_coordinator::reconcile_terminal_program(&graph_id, services).await?;
     let projection = services
         .execution_supervisor()
         .projection(&graph_id)
@@ -2694,5 +2705,213 @@ mod tests {
             .await
             .expect_err("private reasoning trace must be rejected");
         assert!(private_reasoning.contains("not private reasoning traces"));
+    }
+
+    #[tokio::test]
+    async fn collaboration_coordinator_persists_every_compiled_team_obligation_before_admission() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
+        let mut first = node("research", CapabilityRecipeId::Team, Vec::new());
+        first.template = Some("cowd/parallel-research-synthesis".to_string());
+        let mut second = node("review", CapabilityRecipeId::Team, Vec::new());
+        second.template = Some("cowd/parallel-research-synthesis".to_string());
+        let mut request = proposal(vec![first, second]);
+        request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
+            decision_id: "coordinator-obligations".to_string(),
+            decision_revision: 1,
+            decision_lease: "coordinator-lease".to_string(),
+            turn_ref: "turn-v621".to_string(),
+        });
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut request);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "coordinator-obligations",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("team root compiles");
+        let mut graph = services
+            .compile_graph_agent_intents(compiled.graph)
+            .expect("agent intents compile");
+        collaboration_coordinator::prepare_program_admission(
+            &mut graph,
+            services.team_runtime().as_ref(),
+        )
+        .expect("program admission control compiles");
+        let program = graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .expect("Team graph has a Program");
+        assert_eq!(
+            program.control.lifecycle,
+            harness_contract::execution_graph::CollaborationProgramLifecycle::Admitting
+        );
+        assert_eq!(
+            program.control.obligations.len(),
+            program.team_instances.len(),
+            "every requested Team must be durable before the graph is registered"
+        );
+        assert!(program.control.obligations.iter().all(|obligation| {
+            obligation.binding_ref.starts_with("team-binding:sha256:")
+                && obligation.state
+                    == harness_contract::execution_graph::TeamAdmissionState::Admitting
+                && obligation.child_graph_ref.is_none()
+        }));
+        assert!(program.control.resource_ledger.context_reservation_tokens > 0);
+        assert!(program.control.resource_ledger.output_reservation_tokens > 0);
+        assert!(program.control.resource_ledger.parallel_demand >= 2);
+        assert!(program.control.resource_ledger.deadline_at_ms > 0);
+        program.validate().expect("active Program is complete");
+        let root_node_ids = program
+            .team_instances
+            .iter()
+            .map(|instance| {
+                let (semantic, ordinal) = instance
+                    .instance_id
+                    .rsplit_once(':')
+                    .expect("stable semantic instance id");
+                program.semantic_node_instances[semantic][ordinal
+                    .parse::<usize>()
+                    .expect("stable instance ordinal")
+                    .saturating_sub(1)]
+                .clone()
+            })
+            .collect::<Vec<_>>();
+        let registered = services
+            .execution_supervisor()
+            .register_graph(graph)
+            .await
+            .expect("register Program graph");
+        for node_id in &root_node_ids {
+            collaboration_coordinator::mark_team_admitted(
+                &registered.id,
+                node_id,
+                &format!("team-graph:{node_id}"),
+                services.execution_supervisor().as_ref(),
+                services.graph_state_store(),
+            )
+            .await
+            .expect("mark Team admitted");
+        }
+        collaboration_coordinator::mark_team_admitted(
+            &registered.id,
+            &root_node_ids[0],
+            &format!("team-graph:{}", root_node_ids[0]),
+            services.execution_supervisor().as_ref(),
+            services.graph_state_store(),
+        )
+        .await
+        .expect("duplicate admission is idempotent");
+        let stored = services
+            .graph_state_store()
+            .load_async(&registered.id)
+            .await
+            .expect("load registered Program");
+        let control = &stored
+            .orchestration
+            .as_ref()
+            .expect("metadata")
+            .collaboration_program
+            .as_ref()
+            .expect("Program")
+            .control;
+        assert_eq!(
+            control.lifecycle,
+            harness_contract::execution_graph::CollaborationProgramLifecycle::Running
+        );
+        assert!(control.obligations.iter().all(|obligation| {
+            obligation.state == harness_contract::execution_graph::TeamAdmissionState::Admitted
+                && obligation.child_graph_ref.is_some()
+        }));
+    }
+
+    #[tokio::test]
+    async fn collaboration_coordinator_records_rejected_team_admission_as_typed_program_truth() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
+        let mut team = node("rejected-team", CapabilityRecipeId::Team, Vec::new());
+        team.template = Some("cowd/parallel-research-synthesis".to_string());
+        let mut request = proposal(vec![team]);
+        request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
+            decision_id: "coordinator-rejection".to_string(),
+            decision_revision: 1,
+            decision_lease: "coordinator-rejection-lease".to_string(),
+            turn_ref: "turn-v621".to_string(),
+        });
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut request);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "coordinator-rejection",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("Team root compiles");
+        let mut graph = services
+            .compile_graph_agent_intents(compiled.graph)
+            .expect("agent intents compile");
+        collaboration_coordinator::prepare_program_admission(
+            &mut graph,
+            services.team_runtime().as_ref(),
+        )
+        .expect("Program admission control compiles");
+        let node_id = graph.nodes[0].id.clone();
+        let registered = services
+            .execution_supervisor()
+            .register_graph(graph)
+            .await
+            .expect("register Program graph");
+        collaboration_coordinator::mark_team_admission_rejected(
+            &registered.id,
+            &node_id,
+            services.execution_supervisor().as_ref(),
+            services.graph_state_store(),
+        )
+        .await
+        .expect("typed rejection commits");
+        let updated = services
+            .graph_state_store()
+            .load(&registered.id)
+            .expect("load rejected Program");
+        let control = &updated
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .expect("Program")
+            .control;
+        assert_eq!(
+            control.lifecycle,
+            harness_contract::execution_graph::CollaborationProgramLifecycle::Blocked
+        );
+        assert_eq!(
+            control.blocker_ref.as_deref(),
+            Some(format!("execution-node:{node_id}").as_str())
+        );
+        assert_eq!(
+            control.next_action.as_deref(),
+            Some("inspect_team_admission_failure")
+        );
+        assert_eq!(
+            control.obligations[0].state,
+            harness_contract::execution_graph::TeamAdmissionState::BlockedPolicy
+        );
+        assert_eq!(
+            control.obligations[0].reason_kind.as_deref(),
+            Some("team_admission_rejected")
+        );
     }
 }
