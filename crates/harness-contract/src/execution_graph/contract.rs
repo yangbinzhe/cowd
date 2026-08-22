@@ -1036,6 +1036,71 @@ impl CollaborationProgram {
             {
                 return Err("active collaboration program obligations are invalid".to_string());
             }
+            // A pre-0821 Program can have only an aggregate ledger, so it
+            // remains readable for recovery/migration.  Once even one
+            // obligation carries a reservation, however, the Program has
+            // opted into the exact-reservation contract: every Team must
+            // contribute one and the aggregate must be their lossless sum.
+            // Without this fence an additive replan can persist a graph
+            // whose durable ledger no longer describes its admitted Teams.
+            let has_exact_reservation = self.control.obligations.iter().any(|obligation| {
+                obligation.reservation != TeamAdmissionResourceReservation::default()
+            });
+            if has_exact_reservation {
+                if self.control.obligations.iter().any(|obligation| {
+                    obligation.reservation == TeamAdmissionResourceReservation::default()
+                }) {
+                    return Err(
+                        "active collaboration program mixes exact and aggregate-only resource reservations"
+                            .to_string(),
+                    );
+                }
+                let expected_context =
+                    self.control
+                        .obligations
+                        .iter()
+                        .try_fold(0u64, |total, obligation| {
+                            total
+                                .checked_add(obligation.reservation.context_reservation_tokens)
+                                .ok_or_else(|| {
+                                    "collaboration program context reservation overflows"
+                                        .to_string()
+                                })
+                        })?;
+                let expected_output =
+                    self.control
+                        .obligations
+                        .iter()
+                        .try_fold(0u64, |total, obligation| {
+                            total
+                                .checked_add(obligation.reservation.output_reservation_tokens)
+                                .ok_or_else(|| {
+                                    "collaboration program output reservation overflows".to_string()
+                                })
+                        })?;
+                let expected_parallel =
+                    self.control
+                        .obligations
+                        .iter()
+                        .try_fold(0u16, |total, obligation| {
+                            total
+                                .checked_add(obligation.reservation.parallel_demand)
+                                .ok_or_else(|| {
+                                    "collaboration program parallel reservation overflows"
+                                        .to_string()
+                                })
+                        })?;
+                let ledger = &self.control.resource_ledger;
+                if ledger.context_reservation_tokens != expected_context
+                    || ledger.output_reservation_tokens != expected_output
+                    || ledger.parallel_demand != expected_parallel
+                {
+                    return Err(
+                        "active collaboration program resource ledger does not match exact Team reservations"
+                            .to_string(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1680,7 +1745,11 @@ mod dependency_policy_tests {
                     state: TeamAdmissionState::Admitted,
                     child_graph_ref: Some("execution-graph:child".to_string()),
                     reason_kind: None,
-                    reservation: Default::default(),
+                    reservation: TeamAdmissionResourceReservation {
+                        context_reservation_tokens: 4_000,
+                        output_reservation_tokens: 1_000,
+                        parallel_demand: 1,
+                    },
                     revision: 7,
                 }],
                 resource_ledger: ProgramResourceLedger {
@@ -1703,6 +1772,11 @@ mod dependency_policy_tests {
         program.control.obligations[0].binding_ref = "team-binding:sha256:abc".to_string();
         program.control.resource_ledger.parallel_demand = 0;
         assert!(program.validate().is_err());
+        program.control.resource_ledger.parallel_demand = 1;
+        program.control.resource_ledger.context_reservation_tokens = 4_001;
+        assert!(program.validate().is_err());
+        program.control.resource_ledger.context_reservation_tokens = 4_000;
+        assert!(program.validate().is_ok());
 
         let mut encoded = serde_json::to_value(&program).expect("program serializes");
         let object = encoded.as_object_mut().expect("program object");

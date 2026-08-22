@@ -4194,7 +4194,8 @@ mod tests {
         use harness_contract::execution_graph::{
             CollaborationEdgeKind, CollaborationProgram, CollaborationProgramControlState,
             CollaborationProgramEdge, CollaborationProgramLifecycle, CollaborationTeamInstance,
-            ProgramResourceLedger, TeamAdmissionObligation, TeamAdmissionState,
+            ProgramResourceLedger, TeamAdmissionObligation, TeamAdmissionResourceReservation,
+            TeamAdmissionState,
         };
 
         let mut current = Some(CollaborationProgram {
@@ -4219,7 +4220,11 @@ mod tests {
                     state: TeamAdmissionState::Admitted,
                     child_graph_ref: Some("team-graph:research".to_string()),
                     reason_kind: None,
-                    reservation: Default::default(),
+                    reservation: TeamAdmissionResourceReservation {
+                        context_reservation_tokens: 100,
+                        output_reservation_tokens: 50,
+                        parallel_demand: 1,
+                    },
                     revision: 1,
                 }],
                 resource_ledger: ProgramResourceLedger {
@@ -4266,7 +4271,11 @@ mod tests {
                     state: TeamAdmissionState::Admitting,
                     child_graph_ref: None,
                     reason_kind: None,
-                    reservation: Default::default(),
+                    reservation: TeamAdmissionResourceReservation {
+                        context_reservation_tokens: 70,
+                        output_reservation_tokens: 30,
+                        parallel_demand: 1,
+                    },
                     revision: 1,
                 }],
                 resource_ledger: ProgramResourceLedger {
