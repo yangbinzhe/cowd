@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -4236,6 +4237,7 @@ where
                     focus_verification_tool_calls(
                         &state.focus_acceptance_pending_scopes,
                         state.iterations,
+                        self.services.workspace_root(),
                     )
                 })
                 .flatten();
@@ -5565,6 +5567,7 @@ where
                                 let verification_calls = focus_verification_tool_calls(
                                     &concrete_verification_scopes,
                                     state.iterations,
+                                    self.services.workspace_root(),
                                 );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
@@ -7417,9 +7420,12 @@ where
                 &state.focus_observed_evidence,
                 self.services.path_identity_resolver(),
             );
-            automatic_focus_verification =
-                focus_verification_tool_calls(&concrete_verification_scopes, followup_iteration)
-                    .map(|calls| (state.session_id.clone(), followup_iteration, calls));
+            automatic_focus_verification = focus_verification_tool_calls(
+                &concrete_verification_scopes,
+                followup_iteration,
+                self.services.workspace_root(),
+            )
+            .map(|calls| (state.session_id.clone(), followup_iteration, calls));
         }
         state
             .pending_transcript
@@ -11767,6 +11773,7 @@ fn record_write_attempt_paths(
 fn focus_verification_tool_calls(
     pending_scopes: &[String],
     iteration: usize,
+    workspace_root: &Path,
 ) -> Option<Vec<ModelToolCall>> {
     if pending_scopes.is_empty() {
         return None;
@@ -11780,6 +11787,7 @@ fn focus_verification_tool_calls(
                 .or_else(|| scope.strip_prefix("verify_after_write:"))
                 .or_else(|| scope.strip_prefix("verify_upstream_change:"))?;
             let (_, path) = normalize_workspace_scope(&format!("read:{path}"))?;
+            let path = focus_verification_read_path(&path, workspace_root)?;
             (path != ".").then(|| ModelToolCall {
                 id: format!("runtime-focus-verify-{iteration}-{index}"),
                 name: "read_file".to_string(),
@@ -11788,6 +11796,55 @@ fn focus_verification_tool_calls(
             })
         })
         .collect()
+}
+
+/// A `read:` Focus may authorize either a file or a directory. `read_file`
+/// cannot satisfy the latter when passed the directory itself, so choose one
+/// deterministic regular descendant for the Runtime-authored verification.
+/// The governed ToolHost still performs the actual read and creates the
+/// receipt; this lookup only selects a safe, already-authorized target.
+fn focus_verification_read_path(path: &str, workspace_root: &Path) -> Option<String> {
+    if path == "." {
+        return None;
+    }
+    let candidate = workspace_root.join(path);
+    let metadata = std::fs::symlink_metadata(&candidate).ok();
+    if metadata.as_ref().is_none_or(|metadata| !metadata.is_dir()) {
+        return Some(path.to_string());
+    }
+    let root = workspace_root.canonicalize().ok()?;
+    let file = first_regular_workspace_file(&candidate, &root)?;
+    file.strip_prefix(&root)
+        .ok()?
+        .to_str()
+        .map(|relative| relative.replace('\\', "/"))
+}
+
+fn first_regular_workspace_file(directory: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    let mut directories = vec![directory.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let mut entries = std::fs::read_dir(directory)
+            .ok()?
+            .flatten()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries.into_iter().rev() {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_file() {
+                let canonical = path.canonicalize().ok()?;
+                if canonical.starts_with(workspace_root) {
+                    return Some(canonical);
+                }
+            } else if file_type.is_dir() {
+                directories.push(path);
+            }
+        }
+    }
+    None
 }
 
 fn concrete_focus_verification_scopes(
@@ -16006,6 +16063,7 @@ mod tests {
 
     #[test]
     fn focus_verification_compiles_exact_required_reads_and_post_write_reads() {
+        let workspace = tempfile::tempdir().expect("workspace");
         let calls = focus_verification_tool_calls(
             &[
                 "read:fixtures/source.txt".into(),
@@ -16013,6 +16071,7 @@ mod tests {
                 "verify_upstream_change:fixtures/b.txt".into(),
             ],
             7,
+            workspace.path(),
         )
         .expect("exact verification calls");
         assert_eq!(calls.len(), 3);
@@ -16022,12 +16081,44 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&calls[0].input).expect("read input"),
             serde_json::json!({"path": "fixtures/source.txt"})
         );
-        assert!(
-            focus_verification_tool_calls(&["workspace_change:src/lib.rs".into()], 1).is_none()
-        );
-        assert!(
-            focus_verification_tool_calls(&["verify_after_write:../outside.txt".into()], 1)
-                .is_none()
+        assert!(focus_verification_tool_calls(
+            &["workspace_change:src/lib.rs".into()],
+            1,
+            workspace.path(),
+        )
+        .is_none());
+        assert!(focus_verification_tool_calls(
+            &["verify_after_write:../outside.txt".into()],
+            1,
+            workspace.path(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn focus_verification_reads_a_deterministic_descendant_for_directory_scope() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/gateway/src")).expect("gateway tree");
+        std::fs::write(
+            workspace.path().join("crates/gateway/Cargo.toml"),
+            "[package]",
+        )
+        .expect("gateway manifest");
+        std::fs::write(
+            workspace.path().join("crates/gateway/src/lib.rs"),
+            "pub fn gateway() {}",
+        )
+        .expect("gateway source");
+
+        let calls =
+            focus_verification_tool_calls(&["read:crates/gateway".into()], 8, workspace.path())
+                .expect("directory verification call");
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].input).expect("read input"),
+            serde_json::json!({"path": "crates/gateway/Cargo.toml"})
         );
     }
 
@@ -16047,6 +16138,7 @@ mod tests {
         let calls = focus_verification_tool_calls(
             &["verify_after_write:fixtures/target.txt".into()],
             followup_iteration,
+            workspace.path(),
         )
         .expect("verification calls");
         let nodes = tool_nodes_for_calls(
