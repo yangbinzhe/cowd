@@ -1587,6 +1587,9 @@ impl ExecutionCommitService {
             ExecutionGraphCommand::ApplyCollaborationTeamRetirement { patch, .. } => {
                 apply_collaboration_team_retirement(&mut next, patch)?;
             }
+            ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing { patch, .. } => {
+                apply_collaboration_objective_narrowing(&mut next, patch)?;
+            }
             ExecutionGraphCommand::Replan { .. } => {
                 return Err(ExecutionCommitError::InvalidCommand(
                     "replan requires the graph compiler and cannot be applied as a status mutation"
@@ -2475,6 +2478,9 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::ApplyCollaborationTeamRetirement {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::Replan {
             expected_revision, ..
         } => *expected_revision,
@@ -2506,6 +2512,9 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         }
         ExecutionGraphCommand::ApplyCollaborationTeamRetirement { .. } => {
             ("apply_collaboration_team_retirement", None)
+        }
+        ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing { .. } => {
+            ("apply_collaboration_objective_narrowing", None)
         }
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
     }
@@ -2821,6 +2830,132 @@ fn apply_collaboration_team_retirement(
             .expect("current Program exists")
             .clone_from(&candidate);
     }
+    validate_execution_graph(graph)
+        .map(|_| ())
+        .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
+}
+
+/// Narrow a semantic Team objective before any mapped physical instance has
+/// started. Team identity, template, scope, acceptance, effects and graph
+/// topology are intentionally untouched: only the serialized immutable Team
+/// request that admission will consume is replaced atomically with the
+/// Program revision.
+fn apply_collaboration_objective_narrowing(
+    graph: &mut ExecutionGraph,
+    patch: &harness_contract::execution_graph::CollaborationIntentPatch,
+) -> Result<(), ExecutionCommitError> {
+    use harness_contract::execution_graph::{
+        CollaborationIntentPatchOperation, CollaborationProgramLifecycle, ExecutionNodeKind,
+    };
+
+    patch
+        .validate()
+        .map_err(ExecutionCommitError::InvalidCommand)?;
+    let CollaborationIntentPatchOperation::NarrowObjective {
+        semantic_node_id,
+        objective,
+    } = &patch.operation
+    else {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "objective narrowing command requires a narrow_objective patch".to_string(),
+        ));
+    };
+    let current = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(
+                "graph has no collaboration program control plane".to_string(),
+            )
+        })?;
+    if patch.program_id != current.program_id || patch.base_revision != current.revision {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "objective narrowing patch program revision conflict".to_string(),
+        ));
+    }
+    if current.control.lifecycle.is_terminal() {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "objective narrowing patch targets a terminal Program".to_string(),
+        ));
+    }
+    let node_ids = current
+        .semantic_node_instances
+        .get(semantic_node_id)
+        .filter(|nodes| !nodes.is_empty())
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "objective narrowing patch references unknown Team semantic `{semantic_node_id}`"
+            ))
+        })?
+        .clone();
+    for node_id in &node_ids {
+        let status = graph.node_statuses.get(node_id).copied().ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "objective narrowing node `{node_id}` is absent"
+            ))
+        })?;
+        if status != ExecutionNodeStatus::Planned {
+            return Err(ExecutionCommitError::InvalidCommand(format!(
+                "objective narrowing requires planned Team nodes; `{node_id}` is {status:?}"
+            )));
+        }
+    }
+
+    let mut updated_payloads = BTreeMap::new();
+    for node_id in &node_ids {
+        let node = graph
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == *node_id)
+            .ok_or_else(|| {
+                ExecutionCommitError::InvalidCommand(format!(
+                    "objective narrowing node `{node_id}` is absent from node specs"
+                ))
+            })?;
+        if node.kind != ExecutionNodeKind::Subgraph {
+            return Err(ExecutionCommitError::InvalidCommand(format!(
+                "objective narrowing node `{node_id}` is not a Team subgraph"
+            )));
+        }
+        let mut request = serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+            &node.payload_ref,
+        )
+        .map_err(|error| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "objective narrowing node `{node_id}` has invalid Team payload: {error}"
+            ))
+        })?;
+        request.objective = objective.clone();
+        let payload_ref =
+            serde_json::to_string(&request).map_err(ExecutionCommitError::Serialization)?;
+        updated_payloads.insert(node_id.clone(), payload_ref);
+    }
+
+    let mut candidate = current.clone();
+    candidate.revision = candidate.revision.saturating_add(1);
+    if candidate.control.lifecycle != CollaborationProgramLifecycle::Planning {
+        candidate.control.resource_ledger.revision = candidate.revision;
+        for obligation in &mut candidate.control.obligations {
+            obligation.revision = candidate.revision;
+        }
+    }
+    candidate.validate().map_err(|error| {
+        ExecutionCommitError::InvalidCommand(format!(
+            "invalid objective narrowing candidate: {error}"
+        ))
+    })?;
+    for node in &mut graph.nodes {
+        if let Some(payload_ref) = updated_payloads.remove(&node.id) {
+            node.payload_ref = payload_ref;
+        }
+    }
+    graph
+        .orchestration
+        .as_mut()
+        .and_then(|metadata| metadata.collaboration_program.as_mut())
+        .expect("current Program exists")
+        .clone_from(&candidate);
     validate_execution_graph(graph)
         .map(|_| ())
         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
@@ -4165,6 +4300,96 @@ mod tests {
             started_rejection,
             Err(ExecutionCommitError::InvalidCommand(message)) if message.contains("requires a planned Team")
         ));
+    }
+
+    #[test]
+    fn objective_narrowing_rewrites_only_a_planned_team_request_atomically() {
+        use harness_contract::execution_graph::{
+            CollaborationProgram, CollaborationProgramLifecycle, CollaborationTeamInstance,
+            ExecutionGraphCommand, ExecutionOrchestrationMetadata,
+        };
+
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let service = ExecutionCommitService::new(store);
+        let mut graph = waiting_child_join_graph();
+        graph
+            .node_statuses
+            .insert("child-team".to_string(), ExecutionNodeStatus::Planned);
+        graph.node_results.clear();
+        graph.orchestration = Some(ExecutionOrchestrationMetadata {
+            mutation_id: "narrow-objective-test".to_string(),
+            applied_mutation_ids: Vec::new(),
+            semantic_revision: 1,
+            source_generation: 1,
+            completion: Default::default(),
+            collaboration_program: Some(CollaborationProgram {
+                program_id: "program-narrow-objective".to_string(),
+                revision: 1,
+                required_team_count: 1,
+                team_instances: vec![CollaborationTeamInstance {
+                    instance_id: "research:1".to_string(),
+                    semantic_node_id: "research".to_string(),
+                    required: true,
+                }],
+                edges: Vec::new(),
+                semantic_node_instances: BTreeMap::from([(
+                    "research".to_string(),
+                    vec!["child-team".to_string()],
+                )]),
+                control: harness_contract::execution_graph::CollaborationProgramControlState {
+                    lifecycle: CollaborationProgramLifecycle::Planning,
+                    ..Default::default()
+                },
+            }),
+        });
+        let registered = service.register_graph(graph).expect("register graph").graph;
+        let patch = harness_contract::execution_graph::CollaborationIntentPatch {
+            program_id: "program-narrow-objective".to_string(),
+            base_revision: 1,
+            source_attempt: "child-team:attempt:0".to_string(),
+            reason: "the user constrained this branch to a single source".to_string(),
+            evidence_refs: Vec::new(),
+            canonical_digest: "n".repeat(64),
+            user_confirmation_ref: None,
+            operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::NarrowObjective {
+                semantic_node_id: "research".to_string(),
+                objective: "inspect only the declared source and report its evidence".to_string(),
+            },
+        };
+        let narrowed = service
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing {
+                    expected_revision: registered.revision,
+                    patch: Box::new(patch),
+                },
+            )
+            .expect("planned Team objective narrows atomically")
+            .graph;
+        let request = serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+            &narrowed.nodes[0].payload_ref,
+        )
+        .expect("Team request stays decodable");
+        assert_eq!(
+            request.objective,
+            "inspect only the declared source and report its evidence"
+        );
+        assert_eq!(
+            narrowed
+                .orchestration
+                .as_ref()
+                .expect("metadata")
+                .collaboration_program
+                .as_ref()
+                .expect("program")
+                .revision,
+            2
+        );
+        assert_eq!(
+            narrowed.node_statuses["child-team"],
+            ExecutionNodeStatus::Planned
+        );
+        assert!(validate_execution_graph(&narrowed).is_ok());
     }
 
     #[test]

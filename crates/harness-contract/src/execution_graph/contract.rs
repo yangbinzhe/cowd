@@ -1344,6 +1344,13 @@ pub enum ExecutionGraphCommand {
         expected_revision: u64,
         patch: Box<CollaborationIntentPatch>,
     },
+    /// Coordinator-owned narrowing of an unstarted semantic Team objective.
+    /// Runtime rewrites only the matching durable Team request payloads and
+    /// advances the Program revision in the same graph transaction.
+    ApplyCollaborationObjectiveNarrowing {
+        expected_revision: u64,
+        patch: Box<CollaborationIntentPatch>,
+    },
     Replan {
         expected_revision: u64,
         reason: String,
