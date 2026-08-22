@@ -101,20 +101,6 @@ pub struct RuntimeActionContract {
 impl RuntimeCapabilityCatalog {
     #[must_use]
     pub fn current() -> Self {
-        let templates = builtin_team_template_summaries()
-            .into_iter()
-            .map(
-                |(template_id, protocol_id, requires_review, best_for)| RuntimeTemplateSummary {
-                    template_id,
-                    protocol_id: protocol_id.clone(),
-                    protocol_version: 1,
-                    availability: "available".to_string(),
-                    requires_review,
-                    best_for,
-                    role_ids: protocol_role_ids(&protocol_id),
-                },
-            )
-            .collect();
         let protocols = ProtocolRegistry::all()
             .into_iter()
             .map(|protocol| RuntimeProtocolSummary {
@@ -132,7 +118,10 @@ impl RuntimeCapabilityCatalog {
             .collect();
         Self {
             name: "cowd-runtime-capability-catalog".to_string(),
-            templates,
+            // Standalone capability metadata is deliberately not a Team
+            // selector. Runnable Team revisions enter only through the
+            // Definition Registry snapshot in `from_registry`.
+            templates: Vec::new(),
             protocols,
             operation_groups: vec![
                 operation_group(
@@ -317,9 +306,9 @@ impl RuntimeCapabilityCatalog {
     /// Rebuild the model-facing template catalog from the Registry snapshot.
     ///
     /// Builtin summaries keep their curated metadata; every custom published
-    /// Template revision enters without any code change. This is the single
-    /// catalog truth for model proposals: `current()` alone is only the
-    /// builtin fallback and must never be presented as the complete registry.
+    /// Every runnable Team revision enters without any code change. The
+    /// Definition Registry is the single model-visible catalog truth;
+    /// `current()` contributes no hidden builtin fallback.
     #[must_use]
     pub fn from_registry(entries: &[RuntimeTeamTemplateCatalogEntry]) -> Self {
         let mut catalog = Self::current();
@@ -610,6 +599,7 @@ pub fn runtime_capabilities_response_with_leased_decision(
         detail,
         leased_decision,
         &available_tools,
+        None,
     )
 }
 
@@ -621,6 +611,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     detail: Option<&str>,
     leased_decision: Option<&RuntimeExecutionDecision>,
     available_tool_names: &[String],
+    team_template_entries: Option<&[RuntimeTeamTemplateCatalogEntry]>,
 ) -> Value {
     // The provider transport validates this enum for native function calls,
     // but compatibility transports and persisted/replayed calls can still
@@ -640,7 +631,9 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         "action_selection",
     ];
     let mut manifest = RuntimeCapabilityManifest::current();
-    let catalog = RuntimeCapabilityCatalog::current();
+    let catalog = team_template_entries
+        .map(RuntimeCapabilityCatalog::from_registry)
+        .unwrap_or_else(RuntimeCapabilityCatalog::current);
     let context_profile = profile.and_then(parse_context_profile);
     let execution_decision = leased_decision
         .cloned()
@@ -660,15 +653,20 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     let detail_normalized_from = requested_detail
         .filter(|value| *value != detail_value)
         .map(str::to_string);
-    let backend_capabilities =
-        backend_capabilities(detail_value, &execution_decision, &action_selection);
+    let backend_capabilities = backend_capabilities(
+        detail_value,
+        &execution_decision,
+        &action_selection,
+        &catalog,
+    );
     let runtime_orchestrate_enabled = available_tool_names
         .iter()
         .any(|name| name == "runtime_orchestrate");
     let context_retrieve_enabled = available_tool_names
         .iter()
         .any(|name| name == "context_retrieve");
-    let preflight = leased_decision.map(orchestration_preflight);
+    let preflight =
+        leased_decision.map(|decision| orchestration_preflight_with_catalog(decision, &catalog));
     let preflight_can_execute = preflight
         .as_ref()
         .and_then(|value| value.get("can_execute_now"))
@@ -1111,8 +1109,8 @@ fn backend_capabilities(
     detail: &str,
     execution_decision: &RuntimeExecutionDecision,
     action_selection: &crate::execution_core::RuntimeActionSelectionReport,
+    catalog: &RuntimeCapabilityCatalog,
 ) -> Value {
-    let catalog = RuntimeCapabilityCatalog::current();
     let templates = catalog
         .templates
         .iter()
@@ -1327,90 +1325,6 @@ fn capability(
     }
 }
 
-fn builtin_team_template_summaries() -> Vec<(String, String, bool, Vec<String>)> {
-    [
-        (
-            "builtin/cowd/direct-executor",
-            "direct@1",
-            false,
-            &["direct bounded work"][..],
-        ),
-        (
-            "builtin/cowd/planner-executor-verifier",
-            "review_fix@1",
-            true,
-            &["planning, execution, and independent verification"][..],
-        ),
-        (
-            "builtin/cowd/parallel-research-synthesis",
-            "jps@1",
-            false,
-            &["independent evidence gathering", "synthesis"][..],
-        ),
-        (
-            "builtin/cowd/implementation-review-fix",
-            "review_fix@1",
-            true,
-            &["implementation, review, and repair"][..],
-        ),
-        (
-            "builtin/cowd/debate-critic-arbiter",
-            "debate@1",
-            true,
-            &["competing proposals", "arbitration"][..],
-        ),
-        (
-            "builtin/cowd/incident-response",
-            "incident@1",
-            true,
-            &["incident triage and remediation"][..],
-        ),
-        (
-            "builtin/cowd/matrix-scenario-ensemble",
-            "matrix_scenario@1",
-            false,
-            &["counterfactual scenarios", "matrix comparison"][..],
-        ),
-        (
-            "builtin/cowd/long-running-workstreams",
-            "workstreams@1",
-            true,
-            &[
-                "durable parallel workstreams",
-                "checkpoint and coordination",
-            ][..],
-        ),
-    ]
-    .into_iter()
-    .map(|(template_id, protocol_id, requires_review, best_for)| {
-        (
-            template_id.to_string(),
-            protocol_id.to_string(),
-            requires_review,
-            best_for.iter().map(|value| (*value).to_string()).collect(),
-        )
-    })
-    .collect()
-}
-
-fn protocol_role_ids(protocol_id: &str) -> Vec<String> {
-    let id = match protocol_id.split('@').next() {
-        Some("debate") => Some(crate::execution_core::protocols::ProtocolId::Debate),
-        Some("jps") => Some(crate::execution_core::protocols::ProtocolId::Jps),
-        Some("review_fix") => Some(crate::execution_core::protocols::ProtocolId::ReviewFix),
-        Some("incident") => Some(crate::execution_core::protocols::ProtocolId::Incident),
-        _ => None,
-    };
-    id.map(|id| {
-        crate::execution_core::protocols::ProtocolRegistry::spec(id)
-            .roles
-            .into_iter()
-            .map(|role| role.id)
-            .collect()
-    })
-    .unwrap_or_default()
-}
-
 /// P14-F6: one minimal legal proposal example per template so models stop
 /// guessing role ids. The example always uses exact catalog roles and the
 /// team recipe, which is what `runtime_orchestrate(propose)` compiles.
@@ -1451,6 +1365,13 @@ fn template_example_proposal(template: &RuntimeTemplateSummary) -> Value {
 /// It is a pure local computation: no network, no DB, no graph mutation.
 #[must_use]
 pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
+    orchestration_preflight_with_catalog(decision, &RuntimeCapabilityCatalog::current())
+}
+
+fn orchestration_preflight_with_catalog(
+    decision: &RuntimeExecutionDecision,
+    template_catalog: &RuntimeCapabilityCatalog,
+) -> Value {
     let lease_pattern = decision.lease.locked_pattern.as_str();
     let recommended_action = decision
         .recommended_actions
@@ -1527,7 +1448,6 @@ pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
     }
 
     let template_id = template_hint.map(str::to_string);
-    let template_catalog = RuntimeCapabilityCatalog::current();
     let role_ids = template_id
         .as_deref()
         .and_then(|template| {
@@ -1751,22 +1671,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn team_template_summaries_expose_protocol_role_ids() {
+    fn standalone_catalog_never_invents_runnable_team_templates() {
         let catalog = RuntimeCapabilityCatalog::current();
-        let jps = catalog
-            .templates
-            .iter()
-            .find(|template| template.protocol_id == "jps@1")
-            .expect("jps template");
-        assert!(jps.role_ids.contains(&"solution".to_string()));
-        assert!(jps.role_ids.contains(&"decision_synthesis".to_string()));
-        assert!(!jps.role_ids.contains(&"researcher".to_string()));
-        let direct = catalog
-            .templates
-            .iter()
-            .find(|template| template.protocol_id == "direct@1")
-            .expect("direct template");
-        assert!(direct.role_ids.is_empty());
+        assert!(catalog.templates.is_empty());
     }
 
     #[test]
@@ -1804,10 +1711,11 @@ mod tests {
                 .templates
                 .iter()
                 .all(|template| template.template_id != "workspace/cowd/custom-review"),
-            "current() is the builtin-only fallback and must not invent custom templates"
+            "current() must not invent any runnable templates"
         );
 
-        let merged = RuntimeCapabilityCatalog::from_registry(&[custom]);
+        let entries = vec![custom];
+        let merged = RuntimeCapabilityCatalog::from_registry(&entries);
         let custom_summary = merged
             .templates
             .iter()
@@ -1820,15 +1728,11 @@ mod tests {
             merged
                 .templates
                 .iter()
-                .filter(|template| template.template_id == "builtin/cowd/direct-executor")
+                .filter(|template| template.template_id == "workspace/cowd/custom-review")
                 .count(),
             1,
-            "registry merge must deduplicate builtin entries"
+            "registry entries remain exactly represented"
         );
-    }
-
-    #[test]
-    fn team_templates_detail_includes_roles_and_guidance() {
         let response = runtime_capabilities_response_with_leased_decision_and_tools(
             "propose",
             None,
@@ -1836,32 +1740,30 @@ mod tests {
             Some("team_templates"),
             None,
             &["runtime_orchestrate".to_string()],
+            Some(&entries),
+        );
+        assert_eq!(
+            response["collaboration_templates"][0]["template_id"],
+            "workspace/cowd/custom-review"
+        );
+    }
+
+    #[test]
+    fn team_templates_detail_without_registry_is_honest_and_empty() {
+        let response = runtime_capabilities_response_with_leased_decision_and_tools(
+            "propose",
+            None,
+            None,
+            Some("team_templates"),
+            None,
+            &["runtime_orchestrate".to_string()],
+            None,
         );
         let templates = response["collaboration_templates"]
             .as_array()
             .expect("templates");
-        let jps = templates
-            .iter()
-            .find(|template| template["protocol_id"] == "jps@1")
-            .expect("jps template");
-        assert!(jps["roles"]
-            .as_array()
-            .expect("roles")
-            .iter()
-            .any(|role| role == "decision_synthesis"));
-        let example_roles = jps["example_proposal"]["node"]["focuses"]
-            .as_array()
-            .expect("example focuses")
-            .iter()
-            .filter_map(|focus| focus["role_id"].as_str())
-            .collect::<Vec<_>>();
-        let catalog_roles = jps["roles"]
-            .as_array()
-            .expect("roles")
-            .iter()
-            .filter_map(|role| role.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(example_roles, catalog_roles);
+        assert!(templates.is_empty());
+        assert!(response["guidance"].as_str().is_some());
         assert!(response["guidance"]
             .as_str()
             .expect("guidance")
@@ -2042,7 +1944,7 @@ mod tests {
         );
         assert!(preflight["preflight_roles"]
             .as_array()
-            .is_some_and(|roles| !roles.is_empty()));
+            .is_some_and(Vec::is_empty));
     }
 
     #[test]
@@ -2181,6 +2083,7 @@ mod tests {
             None,
             None,
             &["runtime_capabilities".to_string(), "read_many".to_string()],
+            None,
         );
 
         assert_eq!(response["runtime_orchestrate"]["available"], false);
@@ -2220,7 +2123,7 @@ mod tests {
         );
         assert!(templates["backend_capabilities"]["collaboration_templates"]
             .as_array()
-            .is_some_and(|items| items.len() >= 7));
+            .is_some_and(Vec::is_empty));
 
         let budget = runtime_capabilities_response_with_detail(
             "慢模型复杂分析",
@@ -2272,7 +2175,7 @@ mod tests {
     #[test]
     fn runtime_capability_catalog_exposes_model_visible_actions() {
         let catalog = RuntimeCapabilityCatalog::current();
-        assert!(catalog.templates.len() >= 7);
+        assert!(catalog.templates.is_empty());
         assert!(catalog
             .operation_groups
             .iter()

@@ -575,6 +575,10 @@ impl GatewayToolExecutor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            let team_templates = self
+                .runtime_services
+                .get()
+                .and_then(|services| services.definition_registry().runnable_team_catalog().ok());
             return serde_json::to_string_pretty(
                 &runtime::runtime_capabilities_response_with_leased_decision_and_tools(
                     &input.intent,
@@ -583,6 +587,7 @@ impl GatewayToolExecutor {
                     input.detail.as_deref(),
                     leased_decision.as_ref(),
                     &self.available_tool_names(),
+                    team_templates.as_deref(),
                 ),
             )
             .map_err(|error| ToolError::new(error.to_string()));
