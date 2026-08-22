@@ -4396,10 +4396,66 @@ mod tests {
         });
         let mut started_graph = graph.clone();
         started_graph.id = "retire-team-started-root".to_string();
+        let mut active_graph = graph.clone();
+        active_graph.id = "retire-team-active-root".to_string();
+        let active_program = active_graph
+            .orchestration
+            .as_mut()
+            .and_then(|metadata| metadata.collaboration_program.as_mut())
+            .expect("Program");
+        active_program.control =
+            harness_contract::execution_graph::CollaborationProgramControlState {
+                lifecycle: CollaborationProgramLifecycle::Admitting,
+                obligations: vec![
+                    harness_contract::execution_graph::TeamAdmissionObligation {
+                        instance_id: "producer:1".to_string(),
+                        binding_ref: "team-binding:sha256:producer".to_string(),
+                        state: harness_contract::execution_graph::TeamAdmissionState::Admitting,
+                        child_graph_ref: None,
+                        reason_kind: None,
+                        reservation:
+                            harness_contract::execution_graph::TeamAdmissionResourceReservation {
+                                context_reservation_tokens: 30,
+                                output_reservation_tokens: 20,
+                                parallel_demand: 1,
+                            },
+                        revision: 1,
+                    },
+                    harness_contract::execution_graph::TeamAdmissionObligation {
+                        instance_id: "consumer:1".to_string(),
+                        binding_ref: "team-binding:sha256:consumer".to_string(),
+                        state: harness_contract::execution_graph::TeamAdmissionState::Admitting,
+                        child_graph_ref: None,
+                        reason_kind: None,
+                        reservation:
+                            harness_contract::execution_graph::TeamAdmissionResourceReservation {
+                                context_reservation_tokens: 10,
+                                output_reservation_tokens: 5,
+                                parallel_demand: 1,
+                            },
+                        revision: 1,
+                    },
+                ],
+                resource_ledger: harness_contract::execution_graph::ProgramResourceLedger {
+                    context_reservation_tokens: 40,
+                    output_reservation_tokens: 25,
+                    parallel_demand: 2,
+                    deadline_at_ms: 1,
+                    confidence_basis_points: 10_000,
+                    revision: 1,
+                },
+                waiting_relation: Some("team_admission".to_string()),
+                blocker_ref: None,
+                next_action: Some("admit_exact_team_bindings".to_string()),
+            };
         let registered = service.register_graph(graph).expect("register graph").graph;
         let started_registered = service
             .register_graph(started_graph)
             .expect("register started graph")
+            .graph;
+        let active_registered = service
+            .register_graph(active_graph)
+            .expect("register active graph")
             .graph;
         let patch = |confirmation: Option<&str>| {
             Box::new(harness_contract::execution_graph::CollaborationIntentPatch {
@@ -4467,6 +4523,29 @@ mod tests {
             vec!["producer-team"]
         );
         assert!(validate_execution_graph(&retired).is_ok());
+
+        let active_retired = service
+            .apply_command(
+                &active_registered,
+                &ExecutionGraphCommand::ApplyCollaborationTeamRetirement {
+                    expected_revision: active_registered.revision,
+                    patch: patch(Some("approval:retire-consumer")),
+                },
+            )
+            .expect("active Team retirement releases its exact reservation")
+            .graph;
+        let active_ledger = &active_retired
+            .orchestration
+            .as_ref()
+            .expect("metadata")
+            .collaboration_program
+            .as_ref()
+            .expect("Program")
+            .control
+            .resource_ledger;
+        assert_eq!(active_ledger.context_reservation_tokens, 30);
+        assert_eq!(active_ledger.output_reservation_tokens, 20);
+        assert_eq!(active_ledger.parallel_demand, 1);
 
         let started = service
             .transition_node(
