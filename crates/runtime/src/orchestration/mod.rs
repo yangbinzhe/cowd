@@ -1402,6 +1402,7 @@ async fn revise(
             completion,
             collaboration_program,
             proposal.collaboration_escalation.clone(),
+            proposal.retired_collaboration_instance_ids.clone(),
         );
         let outcome = if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
@@ -2412,6 +2413,7 @@ mod tests {
                 completion: Default::default(),
                 collaboration_program: None,
                 collaboration_escalation: None,
+                retired_collaboration_instance_ids: Vec::new(),
                 reason: "parallel evidence lanes".to_string(),
             }),
             control: None,

@@ -834,6 +834,7 @@ impl RuntimeExecutionSupervisor {
         collaboration_escalation: Option<
             harness_contract::execution_graph::CollaborationEscalationReceipt,
         >,
+        retired_instance_ids: Vec<String>,
     ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
         let graph = self
             .runner
@@ -847,6 +848,7 @@ impl RuntimeExecutionSupervisor {
                 completion,
                 collaboration_program,
                 collaboration_escalation,
+                retired_instance_ids,
             )
             .await?;
         let receipt = self.receipt(&graph, "semantic-mutation", now_ms());

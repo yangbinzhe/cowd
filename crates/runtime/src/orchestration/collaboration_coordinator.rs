@@ -238,6 +238,7 @@ pub(crate) fn compile_conversation_program_intent(
             },
             collaboration_program: None,
             collaboration_escalation: None,
+            retired_collaboration_instance_ids: Vec::new(),
             reason: format!(
                 "admitted strategy decision selected Team at conversation admission ({selection_mode:?})"
             ),
@@ -399,6 +400,7 @@ pub(crate) fn compile_collaboration_intent_patch(
             },
             collaboration_program: None,
             collaboration_escalation: patch.escalation.clone(),
+            retired_collaboration_instance_ids: Vec::new(),
             reason: patch.reason.clone(),
         }),
         control: None,

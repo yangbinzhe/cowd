@@ -1558,6 +1558,7 @@ fn orchestration_preflight_with_catalog(
         },
         collaboration_program: None,
         collaboration_escalation: None,
+        retired_collaboration_instance_ids: Vec::new(),
         reason: "runtime preflight of the recommended orchestration proposal".to_string(),
     };
     let request = RuntimeOrchestrationCommand {

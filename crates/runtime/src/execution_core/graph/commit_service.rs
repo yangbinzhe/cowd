@@ -1165,10 +1165,11 @@ impl ExecutionCommitService {
         collaboration_escalation: Option<
             harness_contract::execution_graph::CollaborationEscalationReceipt,
         >,
+        retired_instance_ids: Vec<String>,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
-            service.replan_semantic(
+            service.replan_semantic_with_retirements(
                 &graph,
                 nodes,
                 edges,
@@ -1177,6 +1178,7 @@ impl ExecutionCommitService {
                 completion,
                 collaboration_program,
                 collaboration_escalation,
+                retired_instance_ids,
             )
         })
         .await

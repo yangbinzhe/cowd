@@ -790,6 +790,7 @@ mod tests {
                 completion: Default::default(),
                 collaboration_program: None,
                 collaboration_escalation: None,
+                retired_collaboration_instance_ids: Vec::new(),
                 reason: "custom Team".to_string(),
             }),
             template_proposal: Some(serde_json::json!({"name": "custom"})),

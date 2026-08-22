@@ -107,6 +107,10 @@ pub struct GraphMutationProposal {
     /// persists it with the matching semantic replan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration_escalation: Option<CollaborationEscalationReceipt>,
+    /// Runtime-derived source Team instances replaced by this compiled
+    /// semantic mutation. Model input cannot populate this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_collaboration_instance_ids: Vec<String>,
     pub reason: String,
 }
 
@@ -120,6 +124,7 @@ impl From<ModelGraphMutationProposal> for GraphMutationProposal {
             completion: value.completion,
             collaboration_program: None,
             collaboration_escalation: None,
+            retired_collaboration_instance_ids: Vec::new(),
             reason: value.reason,
         }
     }

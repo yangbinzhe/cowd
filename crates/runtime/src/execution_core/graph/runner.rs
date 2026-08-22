@@ -1611,6 +1611,7 @@ impl ExecutionGraphRunner {
         collaboration_escalation: Option<
             harness_contract::execution_graph::CollaborationEscalationReceipt,
         >,
+        retired_instance_ids: Vec<String>,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
         self.ensure_mutation_allowed()?;
         let coordination = self.graph_coordination_without_command(graph_id).await;
@@ -1635,6 +1636,7 @@ impl ExecutionGraphRunner {
                 completion,
                 collaboration_program,
                 collaboration_escalation,
+                retired_instance_ids,
             )
             .await?
             .graph;
