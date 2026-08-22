@@ -18,6 +18,11 @@ that does not equal the lossless sum of its exact Team obligations. This
 prevents a replan/restart from recovering a Program with a silently drifted
 capacity claim.
 
+The shared supervisor/resource-manager lane also proves that two independent
+root workloads overlap at the configured Agent quota and that a parent/child
+handoff completes with only one Agent slot. These are resource-scheduler
+evidence, not a substitute for the still-open multi-Team business E2E.
+
 ## Checks
 
 ```text
@@ -26,6 +31,9 @@ cargo test -p runtime startup_recovery_rehydrates_and_advances_persistent_execut
 cargo test -p runtime resource_pressure_keeps_a_ready_graph_pump_alive_until_a_lease_releases --lib
 cargo test -p runtime continuation_retry_returns_the_existing_root_to_the_execution_runner --lib
 cargo test -p runtime collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams --lib
+cargo test -p runtime two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota --lib
+cargo test -p runtime two_roots_each_reach_their_parent_parallel_ceiling_without_serializing --lib
+cargo test -p runtime one_agent_slot_does_not_deadlock_a_parent_child_handoff --lib
 cargo test -p harness-contract active_program_control_requires_exact_obligations_and_technical_ledger --lib
 cargo check -p runtime --all-targets
 cargo fmt --all -- --check
