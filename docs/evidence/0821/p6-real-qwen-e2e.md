@@ -1,9 +1,9 @@
-# P6 real-Qwen end-to-end evidence
+# P6 real-Qwen supplemental end-to-end evidence
 
-## Final gate
+## Increment gate
 
-The final deep-real gate passed against `qwen3.7-plus` through a locally
-isolated Gateway:
+This controlled deep-real increment passed against `qwen3.7-plus` through a
+locally isolated Gateway:
 
 ```text
 COWD_EVAL_KEEP_GATEWAY_ARTIFACTS=1 COWD_EVAL_TIMEOUT_SECS=900 \
@@ -24,7 +24,7 @@ sha256 25f2bc0cbc747739b987343cab66d0f730947094bee3a73c85d24945ce5c8e6b
 
 ## Observed results
 
-- Overall report status and all 19 report gates: `passed`.
+- The increment report status and all 19 harness-report gates: `passed`.
 - The real-model gate recorded 34 provider rounds for `qwen3.7-plus`.
 - Isolated Gateway health check: `passed`.
 - All four live scenarios passed: direct terminal, tool evidence, single
@@ -34,6 +34,16 @@ sha256 25f2bc0cbc747739b987343cab66d0f730947094bee3a73c85d24945ce5c8e6b
   9/9.
 - Public projection traversal, rather than root-only metrics, is the
   authoritative evidence for child-Team Agent completion.
+
+## Scope boundary
+
+This is **not** the authority-plan A12 release gate. Section 22.3 requires a
+single controlled scenario with at least two Teams, independent parallel work
+and a merge, escalation, same-session continuation, cross-session deny/allow,
+approval, PostgreSQL query summary, Surface screenshot, candidate/config/event
+hashes and performance evidence. The scenario above proves only the listed
+Gateway/harness increment. `completion-audit-2026-08-23.md` tracks the
+remaining authority gates and must be satisfied before claiming P6 closure.
 
 ## Regression coverage added for the final closure
 
