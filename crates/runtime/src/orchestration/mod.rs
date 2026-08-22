@@ -23,7 +23,7 @@ use crate::{
     ApprovalSource, ApprovalSourceKind, ApprovalTimeoutPolicy, ExecutionGraphHost, RuntimeServices,
     SubmitGlobalApprovalRequest,
 };
-use harness_contract::core::TaskRisk;
+use harness_contract::core::{ExecutionPattern, TaskRisk};
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeStatus,
     ExecutionParentBinding, ExecutionUsage,
@@ -121,6 +121,13 @@ pub async fn submit_collaboration_intent_patch(
         .load_async(graph_id)
         .await
         .map_err(|error| format!("patch_target_load_failed:{error}"))?;
+    if matches!(
+        &patch.operation,
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::ChangeEdge { .. }
+            | harness_contract::execution_graph::CollaborationIntentPatchOperation::RetireTeam { .. }
+    ) {
+        return Err("collaboration_patch_operation_requires_attested_source_attempt".to_string());
+    }
     let request = collaboration_coordinator::compile_collaboration_intent_patch(&graph, patch)?;
     Ok(submit_runtime_orchestration_request_controlled(
         request,
@@ -130,6 +137,82 @@ pub async fn submit_collaboration_intent_patch(
         None,
     )
     .await)
+}
+
+/// Apply a non-additive live Program patch only after Runtime has derived the
+/// source attempt from the managed Agent binding.  The patch's own attempt
+/// string is evidence, never authentication: callers that only possess JSON
+/// must use the additive path or receive a typed rejection.
+pub async fn submit_attested_collaboration_intent_patch(
+    graph_id: &str,
+    expected_source_attempt: &str,
+    patch: &harness_contract::execution_graph::CollaborationIntentPatch,
+    services: &RuntimeServices,
+) -> Result<RuntimeOrchestrationResult, String> {
+    if patch.source_attempt != expected_source_attempt {
+        return Err("collaboration_patch_source_attempt_mismatch".to_string());
+    }
+    let graph = services
+        .graph_state_store()
+        .load_async(graph_id)
+        .await
+        .map_err(|error| format!("patch_target_load_failed:{error}"))?;
+    let command = match &patch.operation {
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::ChangeEdge {
+            ..
+        } => ExecutionGraphCommand::ApplyCrossTeamEdgePatch {
+            expected_revision: graph.revision,
+            patch: Box::new(patch.clone()),
+        },
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::RetireTeam {
+            ..
+        } => ExecutionGraphCommand::ApplyCollaborationTeamRetirement {
+            expected_revision: graph.revision,
+            patch: Box::new(patch.clone()),
+        },
+        _ => return submit_collaboration_intent_patch(graph_id, patch, services).await,
+    };
+    services
+        .execution_supervisor()
+        .command_graph(graph_id, command)
+        .await
+        .map_err(|error| format!("collaboration_patch_commit_failed:{error}"))?;
+    let projection = services
+        .execution_supervisor()
+        .projection(graph_id)
+        .await
+        .map_err(|error| format!("collaboration_patch_projection_failed:{error}"))?;
+    let outcome = completed_projection(
+        RuntimeOrchestrationOperation::Control,
+        projection,
+        None,
+        false,
+        services,
+    )?;
+    let mut decision = RuntimeOrchestrationDecision {
+        selected_pattern: ExecutionPattern::Collaborate,
+        selected_template: None,
+        reason: "applied a Runtime-attested collaboration Program patch".to_string(),
+        policy_gates: Vec::new(),
+        validation_findings: Vec::new(),
+        adjustments: Vec::new(),
+        required_approval: None,
+        recovery_hints: Vec::new(),
+        budget: json!({ "source_attempt": expected_source_attempt }),
+        permission: json!({ "authorization": "runtime_attested_source_attempt" }),
+        status: outcome.status.clone(),
+    };
+    if outcome.status == "blocked" {
+        decision.validation_findings.push(
+            "the Program patch committed, but the resulting graph is blocked by its durable completion state"
+                .to_string(),
+        );
+    }
+    Ok(result_from_outcome(
+        &format!("collaboration-patch:{}", patch.canonical_digest),
+        decision,
+        outcome,
+    ))
 }
 
 /// Compatibility facade for callers that already hold an `AddTeam` patch.
@@ -178,7 +261,8 @@ pub async fn submit_collaboration_escalation(
     if let Some(template_proposal) = escalation.template_proposal.clone() {
         attach_escalated_ephemeral_template(&graph, &mut patch, template_proposal, services)?;
     }
-    submit_collaboration_intent_patch(graph_id, &patch, services).await
+    submit_attested_collaboration_intent_patch(graph_id, expected_source_attempt, &patch, services)
+        .await
 }
 
 fn attach_escalated_ephemeral_template(
