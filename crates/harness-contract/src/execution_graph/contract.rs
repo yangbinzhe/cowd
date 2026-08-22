@@ -504,6 +504,12 @@ pub enum CollaborationIntentPatchOperation {
         review: CollaborationPatchTeam,
         reviewed_instance_ids: Vec<String>,
     },
+    /// Add an independent verifier for a concrete disagreement. The named
+    /// instance ids are durable evidence producers, never display labels.
+    ResolveDispute {
+        review: CollaborationPatchTeam,
+        disputed_instance_ids: Vec<String>,
+    },
     ChangeEdge {
         edge_id: String,
         from_instance_id: String,
@@ -558,6 +564,16 @@ impl CollaborationIntentPatch {
                     return Err("review patch has no reviewed Team instances".to_string());
                 }
                 validate_unique_patch_values("reviewed_instance_ids", reviewed_instance_ids)?;
+            }
+            CollaborationIntentPatchOperation::ResolveDispute {
+                review,
+                disputed_instance_ids,
+            } => {
+                validate_patch_team(review)?;
+                if disputed_instance_ids.is_empty() {
+                    return Err("dispute patch has no disputed Team instances".to_string());
+                }
+                validate_unique_patch_values("disputed_instance_ids", disputed_instance_ids)?;
             }
             CollaborationIntentPatchOperation::ChangeEdge {
                 edge_id,
@@ -1652,6 +1668,28 @@ mod dependency_policy_tests {
             },
         };
         assert!(patch.validate().is_ok());
+
+        let dispute = CollaborationIntentPatch {
+            operation: CollaborationIntentPatchOperation::ResolveDispute {
+                review: match &patch.operation {
+                    CollaborationIntentPatchOperation::AddTeam { team } => team.clone(),
+                    _ => unreachable!("fixture remains an AddTeam patch"),
+                },
+                disputed_instance_ids: vec!["research:1".to_string()],
+            },
+            ..patch.clone()
+        };
+        assert!(dispute.validate().is_ok());
+        let mut invalid_dispute = dispute;
+        let CollaborationIntentPatchOperation::ResolveDispute {
+            disputed_instance_ids,
+            ..
+        } = &mut invalid_dispute.operation
+        else {
+            unreachable!("fixture remains a dispute patch")
+        };
+        disputed_instance_ids.clear();
+        assert!(invalid_dispute.validate().is_err());
 
         let mut invalid = patch.clone();
         invalid.base_revision = 0;

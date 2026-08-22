@@ -268,11 +268,11 @@ pub(crate) fn compile_conversation_program_intent(
 }
 
 /// Convert a fenced additive Program patch to an internal semantic revision.
-/// `AddTeam` and `RequestReview` are the additive operations: the latter
-/// derives its semantic dependencies from named durable Team instances rather
-/// than trusting a free-form textual review target. Operations that mutate an
-/// existing node or edge deliberately need the separate atomic Program+Graph
-/// mutation path and are rejected here until that path exists.
+/// `AddTeam`, `RequestReview`, and `ResolveDispute` are additive operations.
+/// The two verifier operations derive dependencies from named durable Team
+/// instances rather than trusting a free-form textual review target.
+/// Operations that mutate an existing node or edge deliberately need the
+/// separate atomic Program+Graph mutation path.
 pub(crate) fn compile_collaboration_intent_patch(
     graph: &ExecutionGraph,
     patch: &harness_contract::execution_graph::CollaborationIntentPatch,
@@ -291,6 +291,10 @@ pub(crate) fn compile_collaboration_intent_patch(
             review,
             reviewed_instance_ids,
         } => Some((review, reviewed_instance_ids)),
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::ResolveDispute {
+            review,
+            disputed_instance_ids,
+        } => Some((review, disputed_instance_ids)),
         _ => None,
     };
     let review_team = requested_review
@@ -303,6 +307,9 @@ pub(crate) fn compile_collaboration_intent_patch(
             team
         }
         harness_contract::execution_graph::CollaborationIntentPatchOperation::RequestReview {
+            ..
+        }
+        | harness_contract::execution_graph::CollaborationIntentPatchOperation::ResolveDispute {
             ..
         } => review_team
             .as_ref()

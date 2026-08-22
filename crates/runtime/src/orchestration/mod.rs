@@ -3519,6 +3519,32 @@ mod tests {
             &services,
         )
         .expect("Runtime binds the escalation custom template to its parent Program");
+        let review = match &patch.operation {
+            harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam {
+                team,
+            } => team.clone(),
+            _ => unreachable!("escalation creates an AddTeam patch"),
+        };
+        let mut dispute_patch = patch.clone();
+        dispute_patch.operation =
+            harness_contract::execution_graph::CollaborationIntentPatchOperation::ResolveDispute {
+                review,
+                disputed_instance_ids: vec!["research:1".to_string()],
+            };
+        let dispute_request = collaboration_coordinator::compile_collaboration_intent_patch(
+            &registered,
+            &dispute_patch,
+        )
+        .expect("fenced dispute resolution derives durable Team dependencies");
+        assert_eq!(
+            dispute_request
+                .proposal
+                .as_ref()
+                .expect("dispute proposal")
+                .nodes[0]
+                .depends_on,
+            vec!["research".to_string()]
+        );
         let mut patch_request =
             collaboration_coordinator::compile_collaboration_intent_patch(&registered, &patch)
                 .expect("fenced AddTeam patch compiles");
