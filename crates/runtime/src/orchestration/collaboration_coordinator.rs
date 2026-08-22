@@ -1764,8 +1764,30 @@ mod tests {
             .register_graph(graph)
             .expect("register fan-in graph")
             .graph;
+        let consumer_ready = services
+            .commit_service()
+            .transition_node(
+                &registered,
+                "consumer",
+                harness_contract::execution_graph::ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("consumer ready")
+            .graph;
+        let consumer_running = services
+            .commit_service()
+            .transition_node(
+                &consumer_ready,
+                "consumer",
+                harness_contract::execution_graph::ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .expect("consumer starts its first attempt")
+            .graph;
         let error = claim_incoming_cross_team_deliveries(
-            &registered.id,
+            &consumer_running.id,
             "consumer",
             1,
             services.execution_supervisor().as_ref(),
@@ -1774,5 +1796,75 @@ mod tests {
         .await
         .expect_err("one claimed receipt cannot admit a two-edge consumer");
         assert_eq!(error, "cross_team_claims_not_all_delivered");
+
+        // Complete the missing independent producer through the same durable
+        // graph transition path that a real Team uses. The transition records
+        // its delivery receipt; the Coordinator may then claim precisely that
+        // receipt without replacing the already-claimed A lane.
+        let producer_b_ready = services
+            .commit_service()
+            .transition_node(
+                &consumer_running,
+                "producer-b",
+                harness_contract::execution_graph::ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("producer B ready")
+            .graph;
+        let producer_b_running = services
+            .commit_service()
+            .transition_node(
+                &producer_b_ready,
+                "producer-b",
+                harness_contract::execution_graph::ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .expect("producer B running")
+            .graph;
+        services
+            .commit_service()
+            .transition_node(
+                &producer_b_running,
+                "producer-b",
+                harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                Some(harness_contract::execution_graph::ExecutionNodeResult {
+                    status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
+                    result_ref: Some("artifact:b".to_string()),
+                    summary: Some("independent B evidence".to_string()),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: Default::default(),
+                    finished_at_ms: 2,
+                }),
+                Vec::new(),
+            )
+            .expect("producer B completes and delivers");
+        claim_incoming_cross_team_deliveries(
+            &registered.id,
+            "consumer",
+            1,
+            services.execution_supervisor().as_ref(),
+            services.graph_state_store(),
+        )
+        .await
+        .expect("both producer receipts are claimed before consumer admission");
+        let claimed = services
+            .graph_state_store()
+            .load_async(&registered.id)
+            .await
+            .expect("load claimed fan-in graph");
+        let program = claimed
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .expect("fan-in Program");
+        assert!(program.edges.iter().all(|edge| {
+            edge.state == CrossTeamEdgeState::Claimed
+                && edge.claim_receipt.as_ref().is_some_and(|claim| {
+                    claim.consumer_node_id == "consumer" && claim.consumer_attempt == 1
+                })
+        }));
     }
 }
