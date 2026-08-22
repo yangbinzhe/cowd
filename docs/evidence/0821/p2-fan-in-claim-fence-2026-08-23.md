@@ -21,21 +21,31 @@ The reconciler now evaluates the complete incoming edge set:
 ## Verification
 
 ```text
-cargo test -p runtime --lib orchestration::collaboration_coordinator::tests::consumer_cannot_admit_after_only_one_of_multiple_incoming_claims -- --nocapture
+cargo test -p runtime consumer_cannot_admit_after_only_one_of_multiple_incoming_claims --lib -q
 # 1 passed
 
-cargo test -p runtime --lib -q
-# 1798 passed, 0 failed, 2 ignored
+cargo test -p runtime cross_team_edge_delivery_and_claim_are_fenced_by_node_attempts --lib -q
+# 1 passed
+
+cargo test -p runtime terminal_producer_without_required_cross_team_facts_blocks_edge_durably --lib -q
+# 1 passed
+
+cargo check -p runtime --all-targets
 
 git diff --check
 ```
 
 The regression constructs a three-Team Program where A's receipt is claimed
-and B's handoff remains pending; the consumer must receive the typed rejection
-instead of admission.
+and B's handoff remains pending; the consumer receives the typed rejection
+instead of admission. It then starts consumer attempt 1, completes B through
+the durable graph transition path, verifies that B's terminal transition
+produces its delivery receipt, and has the Coordinator claim B without
+rewriting A. Completion requires both receipt claims to name the same
+consumer node and attempt.
 
 ## Still open
 
-- A full deterministic A/B parallel + C merge execution trace is still needed
-  for B3/A3, including receipt delivery and child-admission ordering.
+- A full deterministic A/B parallel + C merge run through actual Team child
+  admission remains needed for B3/A3; this increment proves the durable
+  root-graph delivery/claim recovery chain, not provider/child-Team execution.
 - P3--P6, all remaining B gates and the real-Qwen A12 gate remain open.
