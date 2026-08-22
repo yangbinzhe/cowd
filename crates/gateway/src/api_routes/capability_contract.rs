@@ -2729,6 +2729,12 @@ mod tests {
             ),
             "execution projection must expose the typed collaboration program"
         );
+        assert_eq!(
+            document["components"]["schemas"]["ExecutionOrchestrationMetadata"]["properties"]
+                ["collaboration_escalations"]["items"]["$ref"],
+            "#/components/schemas/CollaborationEscalationReceipt",
+            "execution projection must expose applied escalation receipts as typed facts"
+        );
         for field in ["control", "semantic_node_instances"] {
             assert!(
                 collaboration_program["properties"][field].is_object(),

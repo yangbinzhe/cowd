@@ -237,6 +237,7 @@ pub(crate) fn compile_conversation_program_intent(
                 allow_unresolved_conflicts: false,
             },
             collaboration_program: None,
+            collaboration_escalation: None,
             reason: format!(
                 "admitted strategy decision selected Team at conversation admission ({selection_mode:?})"
             ),
@@ -386,6 +387,7 @@ pub(crate) fn compile_collaboration_intent_patch(
                 allow_unresolved_conflicts: false,
             },
             collaboration_program: None,
+            collaboration_escalation: patch.escalation.clone(),
             reason: patch.reason.clone(),
         }),
         control: None,
@@ -574,6 +576,7 @@ pub(crate) fn prepare_program_revision_admission(
         harness_contract::execution_graph::ExecutionOrchestrationMetadata {
             mutation_id: "program-revision-admission".to_string(),
             applied_mutation_ids: Vec::new(),
+            collaboration_escalations: Vec::new(),
             semantic_revision: 0,
             source_generation: 0,
             completion: Default::default(),
@@ -1252,6 +1255,7 @@ mod tests {
             evidence_refs: Vec::new(),
             canonical_digest: "c".repeat(64),
             user_confirmation_ref: None,
+            escalation: None,
             operation:
                 harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam {
                     team: harness_contract::execution_graph::CollaborationPatchTeam {
@@ -1358,6 +1362,7 @@ mod tests {
         graph.orchestration = Some(ExecutionOrchestrationMetadata {
             mutation_id: "fan-in-claim-test".to_string(),
             applied_mutation_ids: Vec::new(),
+            collaboration_escalations: Vec::new(),
             semantic_revision: 1,
             source_generation: 1,
             completion: Default::default(),

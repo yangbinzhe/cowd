@@ -14935,6 +14935,7 @@ mod tests {
             harness_contract::execution_graph::ExecutionOrchestrationMetadata {
                 mutation_id: "program-mutation".to_string(),
                 applied_mutation_ids: vec!["program-mutation".to_string()],
+                collaboration_escalations: Vec::new(),
                 semantic_revision: 1,
                 source_generation: 1,
                 completion: Default::default(),

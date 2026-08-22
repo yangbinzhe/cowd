@@ -119,6 +119,7 @@ pub fn compile_orchestration(
     graph.orchestration = Some(ExecutionOrchestrationMetadata {
         mutation_id: proposal.mutation_id.clone(),
         applied_mutation_ids: vec![proposal.mutation_id.clone()],
+        collaboration_escalations: Vec::new(),
         semantic_revision: 1,
         source_generation: 1,
         completion: materialize_completion(
@@ -1429,6 +1430,7 @@ mod tests {
             ],
             completion: Default::default(),
             collaboration_program: None,
+            collaboration_escalation: None,
             reason: "independent workstreams".to_string(),
         };
         let program = collaboration_program_from_proposal(&independent, None)
@@ -1447,6 +1449,7 @@ mod tests {
             ],
             completion: Default::default(),
             collaboration_program: None,
+            collaboration_escalation: None,
             reason: "review consumes research evidence".to_string(),
         };
         let program = collaboration_program_from_proposal(&dependent, None)

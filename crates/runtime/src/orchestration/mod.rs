@@ -1390,6 +1390,7 @@ async fn revise(
             proposal.mutation_id.clone(),
             completion,
             collaboration_program,
+            proposal.collaboration_escalation.clone(),
         );
         let outcome = if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
@@ -2399,6 +2400,7 @@ mod tests {
                 nodes,
                 completion: Default::default(),
                 collaboration_program: None,
+                collaboration_escalation: None,
                 reason: "parallel evidence lanes".to_string(),
             }),
             control: None,
@@ -3570,6 +3572,7 @@ mod tests {
                 patch_proposal.mutation_id.clone(),
                 completion,
                 Some(delta),
+                patch_proposal.collaboration_escalation.clone(),
             )
             .expect("patch revision commits atomically")
             .graph;
@@ -3579,6 +3582,17 @@ mod tests {
             .and_then(|metadata| metadata.collaboration_program.as_ref())
             .expect("revised Program");
         assert_eq!(revised.revision, program.revision + 1);
+        let escalation_receipt = committed
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_escalations.first())
+            .expect("applied escalation has a durable receipt");
+        assert_eq!(escalation_receipt.escalation_id, escalation.digest);
+        assert_eq!(escalation_receipt.source_attempt, escalation.source_attempt);
+        assert_eq!(
+            escalation_receipt.applied_graph_revision,
+            committed.revision
+        );
         assert_eq!(revised.team_instances.len(), 2);
         assert_eq!(revised.control.obligations.len(), 2);
         assert_eq!(

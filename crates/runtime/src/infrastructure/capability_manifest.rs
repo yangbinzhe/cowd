@@ -1637,6 +1637,7 @@ pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
             allow_unresolved_conflicts: false,
         },
         collaboration_program: None,
+        collaboration_escalation: None,
         reason: "runtime preflight of the recommended orchestration proposal".to_string(),
     };
     let request = RuntimeOrchestrationCommand {

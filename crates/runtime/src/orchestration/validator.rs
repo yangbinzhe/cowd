@@ -789,6 +789,7 @@ mod tests {
                 nodes: Vec::new(),
                 completion: Default::default(),
                 collaboration_program: None,
+                collaboration_escalation: None,
                 reason: "custom Team".to_string(),
             }),
             template_proposal: Some(serde_json::json!({"name": "custom"})),

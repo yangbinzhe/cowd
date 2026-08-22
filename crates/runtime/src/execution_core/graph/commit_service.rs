@@ -1020,6 +1020,9 @@ impl ExecutionCommitService {
         mutation_id: String,
         completion: harness_contract::execution_graph::ExecutionCompletionContract,
         collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
+        collaboration_escalation: Option<
+            harness_contract::execution_graph::CollaborationEscalationReceipt,
+        >,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         if mutation_id.trim().is_empty() {
             return Err(ExecutionCommitError::InvalidReplan(
@@ -1040,6 +1043,7 @@ impl ExecutionCommitService {
             harness_contract::execution_graph::ExecutionOrchestrationMetadata {
                 mutation_id: String::new(),
                 applied_mutation_ids: Vec::new(),
+                collaboration_escalations: Vec::new(),
                 semantic_revision: 0,
                 source_generation: 0,
                 completion: Default::default(),
@@ -1059,6 +1063,28 @@ impl ExecutionCommitService {
         orchestration.applied_mutation_ids.push(mutation_id.clone());
         orchestration.applied_mutation_ids.sort();
         orchestration.applied_mutation_ids.dedup();
+        if let Some(mut escalation) = collaboration_escalation {
+            if escalation.applied_graph_revision != 0 {
+                return Err(ExecutionCommitError::InvalidReplan(
+                    "collaboration escalation receipt already has an applied graph revision"
+                        .to_string(),
+                ));
+            }
+            if orchestration
+                .collaboration_escalations
+                .iter()
+                .any(|existing| existing.escalation_id == escalation.escalation_id)
+            {
+                return Err(ExecutionCommitError::InvalidReplan(
+                    "collaboration escalation receipt is already applied".to_string(),
+                ));
+            }
+            escalation.applied_graph_revision = next.revision;
+            orchestration.collaboration_escalations.push(escalation);
+            orchestration
+                .collaboration_escalations
+                .sort_by(|left, right| left.escalation_id.cmp(&right.escalation_id));
+        }
         orchestration.semantic_revision = orchestration.semantic_revision.saturating_add(1);
         orchestration.source_generation = orchestration.source_generation.saturating_add(1);
         if !completion.required_node_ids.is_empty() {
@@ -1104,6 +1130,9 @@ impl ExecutionCommitService {
         mutation_id: String,
         completion: harness_contract::execution_graph::ExecutionCompletionContract,
         collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
+        collaboration_escalation: Option<
+            harness_contract::execution_graph::CollaborationEscalationReceipt,
+        >,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let service = self.clone();
         tokio::task::spawn_blocking(move || {
@@ -1115,6 +1144,7 @@ impl ExecutionCommitService {
                 mutation_id,
                 completion,
                 collaboration_program,
+                collaboration_escalation,
             )
         })
         .await
@@ -3703,6 +3733,7 @@ mod tests {
             harness_contract::execution_graph::ExecutionOrchestrationMetadata {
                 mutation_id: "initial-mutation".to_string(),
                 applied_mutation_ids: vec!["initial-mutation".to_string()],
+                collaboration_escalations: Vec::new(),
                 semantic_revision: 1,
                 source_generation: 1,
                 completion: Default::default(),
@@ -3722,6 +3753,7 @@ mod tests {
                 "add bounded reviewer".to_string(),
                 "revision-2".to_string(),
                 Default::default(),
+                None,
                 None,
             )
             .expect("semantic revision commits");
@@ -3745,6 +3777,7 @@ mod tests {
             "revision-2".to_string(),
             Default::default(),
             None,
+            None,
         ) {
             Ok(_) => panic!("same mutation id cannot commit twice"),
             Err(error) => error,
@@ -3762,6 +3795,7 @@ mod tests {
             "stale proposal".to_string(),
             "revision-stale".to_string(),
             Default::default(),
+            None,
             None,
         ) {
             Ok(_) => panic!("stale graph revision cannot partially commit"),
@@ -3935,6 +3969,7 @@ mod tests {
         graph.orchestration = Some(ExecutionOrchestrationMetadata {
             mutation_id: "cross-team-test".to_string(),
             applied_mutation_ids: Vec::new(),
+            collaboration_escalations: Vec::new(),
             semantic_revision: 1,
             source_generation: 1,
             completion: Default::default(),
@@ -3994,6 +4029,7 @@ mod tests {
                             evidence_refs: Vec::new(),
                             canonical_digest: "e".repeat(64),
                             user_confirmation_ref: None,
+                            escalation: None,
                             operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::ChangeEdge {
                                 edge_id: "producer:1->consumer:1".to_string(),
                                 from_instance_id: "producer:1".to_string(),
@@ -4164,6 +4200,7 @@ mod tests {
         graph.orchestration = Some(ExecutionOrchestrationMetadata {
             mutation_id: "retire-team-test".to_string(),
             applied_mutation_ids: Vec::new(),
+            collaboration_escalations: Vec::new(),
             semantic_revision: 1,
             source_generation: 1,
             completion: harness_contract::execution_graph::ExecutionCompletionContract {
@@ -4222,6 +4259,7 @@ mod tests {
                 evidence_refs: Vec::new(),
                 canonical_digest: "r".repeat(64),
                 user_confirmation_ref: confirmation.map(str::to_string),
+                escalation: None,
                 operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::RetireTeam {
                     instance_id: "consumer:1".to_string(),
                 },
@@ -4319,6 +4357,7 @@ mod tests {
         graph.orchestration = Some(ExecutionOrchestrationMetadata {
             mutation_id: "narrow-objective-test".to_string(),
             applied_mutation_ids: Vec::new(),
+            collaboration_escalations: Vec::new(),
             semantic_revision: 1,
             source_generation: 1,
             completion: Default::default(),
@@ -4351,6 +4390,7 @@ mod tests {
             evidence_refs: Vec::new(),
             canonical_digest: "n".repeat(64),
             user_confirmation_ref: None,
+            escalation: None,
             operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::NarrowObjective {
                 semantic_node_id: "research".to_string(),
                 objective: "inspect only the declared source and report its evidence".to_string(),
@@ -4418,6 +4458,7 @@ mod tests {
         graph.orchestration = Some(ExecutionOrchestrationMetadata {
             mutation_id: "cross-team-blocked-test".to_string(),
             applied_mutation_ids: Vec::new(),
+            collaboration_escalations: Vec::new(),
             semantic_revision: 1,
             source_generation: 1,
             completion: Default::default(),

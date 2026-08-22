@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use harness_contract::execution_graph::{
-    CollaborationProgram, ExecutionCompletionContract, ExecutionDependencyPolicy,
+    CollaborationEscalationReceipt, CollaborationProgram, ExecutionCompletionContract,
+    ExecutionDependencyPolicy,
 };
 use harness_contract::input_disposition::ModelInputDispositionBatch;
 use harness_contract::orchestration::{
@@ -102,6 +103,10 @@ pub struct GraphMutationProposal {
     /// Team semantic nodes when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration_program: Option<CollaborationProgram>,
+    /// Set only by the Runtime-attested escalation ingress. The commit service
+    /// persists it with the matching semantic replan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_escalation: Option<CollaborationEscalationReceipt>,
     pub reason: String,
 }
 
@@ -114,6 +119,7 @@ impl From<ModelGraphMutationProposal> for GraphMutationProposal {
             nodes: value.nodes.into_iter().map(Into::into).collect(),
             completion: value.completion,
             collaboration_program: None,
+            collaboration_escalation: None,
             reason: value.reason,
         }
     }

@@ -338,6 +338,21 @@ pub struct CollaborationEscalationRequest {
     pub template_proposal: Option<serde_json::Value>,
 }
 
+/// Durable receipt for an escalation that actually expanded its parent
+/// Program. Rejected requests are deliberately not represented here: this is
+/// execution truth, not an audit log of arbitrary caller input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationEscalationReceipt {
+    pub escalation_id: String,
+    pub source_attempt: String,
+    pub base_program_revision: u64,
+    pub request_kind: String,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+    pub applied_graph_revision: u64,
+}
+
 impl CollaborationEscalationRequest {
     pub fn validate(&self) -> Result<(), String> {
         for (field, value) in [
@@ -378,6 +393,17 @@ impl CollaborationEscalationRequest {
             evidence_refs: self.evidence_refs.clone(),
             canonical_digest: self.digest.clone(),
             user_confirmation_ref: None,
+            escalation: Some(CollaborationEscalationReceipt {
+                escalation_id: self.digest.clone(),
+                source_attempt: self.source_attempt.clone(),
+                base_program_revision: self.base_revision,
+                request_kind: self.request_kind.clone(),
+                reason: self.reason.clone(),
+                evidence_refs: self.evidence_refs.clone(),
+                // The commit service is the only owner of the succeeding
+                // graph revision, so it fills this field atomically.
+                applied_graph_revision: 0,
+            }),
             operation: CollaborationIntentPatchOperation::AddTeam {
                 team: CollaborationPatchTeam {
                     semantic_node_id: team.semantic_node_id.clone(),
@@ -425,6 +451,10 @@ pub struct CollaborationIntentPatch {
     pub canonical_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_confirmation_ref: Option<String>,
+    /// Present only when this patch originates from a Runtime-attested Agent
+    /// escalation. It cannot be supplied by a generic model patch route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation: Option<CollaborationEscalationReceipt>,
     pub operation: CollaborationIntentPatchOperation,
 }
 
@@ -910,6 +940,11 @@ pub struct ExecutionOrchestrationMetadata {
     pub mutation_id: String,
     #[serde(default)]
     pub applied_mutation_ids: Vec<String>,
+    /// Applied managed-Agent escalations. Entries are appended in the same
+    /// graph transaction as their semantic expansion, so projection/recovery
+    /// never infer an escalation from a mutation-id string.
+    #[serde(default)]
+    pub collaboration_escalations: Vec<CollaborationEscalationReceipt>,
     pub semantic_revision: u64,
     #[serde(default)]
     pub source_generation: u64,
@@ -1578,6 +1613,7 @@ mod dependency_policy_tests {
             evidence_refs: Vec::new(),
             canonical_digest: "a".repeat(64),
             user_confirmation_ref: None,
+            escalation: None,
             operation: CollaborationIntentPatchOperation::AddTeam {
                 team: CollaborationPatchTeam {
                     semantic_node_id: "independent-review".to_string(),
@@ -1632,6 +1668,13 @@ mod dependency_policy_tests {
         assert!(patch.validate().is_ok());
         assert_eq!(patch.source_attempt, escalation.source_attempt);
         assert_eq!(patch.canonical_digest, escalation.digest);
+        assert_eq!(
+            patch
+                .escalation
+                .as_ref()
+                .map(|receipt| receipt.escalation_id.as_str()),
+            Some(escalation.digest.as_str())
+        );
         let mut invalid = escalation;
         invalid.base_revision = 0;
         assert!(invalid.validate().is_err());
