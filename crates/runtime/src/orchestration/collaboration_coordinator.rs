@@ -766,31 +766,49 @@ pub(crate) async fn claim_incoming_cross_team_deliveries(
             return Ok(());
         };
         let consumer_instance = instance_id_for_node(program, consumer_node_id)?;
-        let delivered = program
+        let incoming = program
             .edges
             .iter()
+            .filter(|edge| edge.to == consumer_instance)
+            .collect::<Vec<_>>();
+        if incoming.iter().any(|edge| {
+            matches!(
+                edge.state,
+                harness_contract::execution_graph::CrossTeamEdgeState::Blocked
+                    | harness_contract::execution_graph::CrossTeamEdgeState::Cancelled
+            )
+        }) {
+            return Err("cross_team_claim_is_terminally_blocked".to_string());
+        }
+        let delivered = incoming
+            .iter()
             .find(|edge| {
-                edge.to == consumer_instance
-                    && edge.state
-                        == harness_contract::execution_graph::CrossTeamEdgeState::Delivered
+                edge.state == harness_contract::execution_graph::CrossTeamEdgeState::Delivered
             })
             .map(|edge| edge.edge_id.clone());
         let Some(edge_id) = delivered else {
-            let stale_claim = program.edges.iter().find(|edge| {
-                edge.to == consumer_instance
-                    && edge.state == harness_contract::execution_graph::CrossTeamEdgeState::Claimed
-            });
-            return match stale_claim {
-                Some(edge)
-                    if edge.claim_receipt.as_ref().is_some_and(|claim| {
+            if incoming.is_empty() {
+                return Ok(());
+            }
+            if incoming.iter().any(|edge| {
+                matches!(
+                    edge.state,
+                    harness_contract::execution_graph::CrossTeamEdgeState::Pending
+                        | harness_contract::execution_graph::CrossTeamEdgeState::AwaitingProducer
+                )
+            }) {
+                return Err("cross_team_claims_not_all_delivered".to_string());
+            }
+            return if incoming.iter().all(|edge| {
+                edge.state == harness_contract::execution_graph::CrossTeamEdgeState::Claimed
+                    && edge.claim_receipt.as_ref().is_some_and(|claim| {
                         claim.consumer_node_id == consumer_node_id
                             && claim.consumer_attempt == consumer_attempt
-                    }) =>
-                {
-                    Ok(())
-                }
-                Some(_) => Err("cross_team_claim_attempt_conflict".to_string()),
-                None => Ok(()),
+                    })
+            }) {
+                Ok(())
+            } else {
+                Err("cross_team_claim_attempt_conflict".to_string())
             };
         };
         match supervisor
@@ -1312,5 +1330,115 @@ mod tests {
         assert!(
             materialize_review_patch_team(&program, &review, &["missing:1".to_string()]).is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn consumer_cannot_admit_after_only_one_of_multiple_incoming_claims() {
+        use harness_contract::execution_graph::{
+            CollaborationEdgeKind, CollaborationProgramEdge, CollaborationProgramLifecycle,
+            CollaborationTeamInstance, CrossTeamEdgeClaimReceipt, CrossTeamEdgeDeliveryReceipt,
+            CrossTeamEdgeState, ExecutionNodeKind, ExecutionNodeSpec,
+            ExecutionOrchestrationMetadata,
+        };
+
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let mut graph = ExecutionGraph::new("fan-in receipt fence");
+        graph.id = "fan-in-claim-root".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        for node_id in ["producer-a", "producer-b", "consumer"] {
+            let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "{}");
+            node.id = node_id.to_string();
+            node.idempotency_key = format!("{node_id}-key");
+            graph.node_statuses.insert(
+                node.id.clone(),
+                harness_contract::execution_graph::ExecutionNodeStatus::Planned,
+            );
+            graph.nodes.push(node);
+        }
+        graph.orchestration = Some(ExecutionOrchestrationMetadata {
+            mutation_id: "fan-in-claim-test".to_string(),
+            applied_mutation_ids: Vec::new(),
+            semantic_revision: 1,
+            source_generation: 1,
+            completion: Default::default(),
+            collaboration_program: Some(CollaborationProgram {
+                program_id: "program-fan-in".to_string(),
+                revision: 1,
+                required_team_count: 3,
+                team_instances: vec![
+                    CollaborationTeamInstance {
+                        instance_id: "a:1".to_string(),
+                        semantic_node_id: "a".to_string(),
+                        required: true,
+                    },
+                    CollaborationTeamInstance {
+                        instance_id: "b:1".to_string(),
+                        semantic_node_id: "b".to_string(),
+                        required: true,
+                    },
+                    CollaborationTeamInstance {
+                        instance_id: "consumer:1".to_string(),
+                        semantic_node_id: "consumer".to_string(),
+                        required: true,
+                    },
+                ],
+                edges: vec![
+                    CollaborationProgramEdge {
+                        edge_id: "a:1->consumer:1".to_string(),
+                        from: "a:1".to_string(),
+                        to: "consumer:1".to_string(),
+                        kind: CollaborationEdgeKind::Handoff,
+                        input_contract: Default::default(),
+                        state: CrossTeamEdgeState::Claimed,
+                        delivery_receipt: Some(CrossTeamEdgeDeliveryReceipt {
+                            receipt_ref: "receipt-a".to_string(),
+                            producer_node_id: "producer-a".to_string(),
+                            producer_attempt: 1,
+                            producer_result_ref: "artifact:a".to_string(),
+                            evidence_refs: Vec::new(),
+                        }),
+                        claim_receipt: Some(CrossTeamEdgeClaimReceipt {
+                            claim_ref: "claim-a".to_string(),
+                            consumer_node_id: "consumer".to_string(),
+                            consumer_attempt: 1,
+                        }),
+                    },
+                    CollaborationProgramEdge {
+                        edge_id: "b:1->consumer:1".to_string(),
+                        from: "b:1".to_string(),
+                        to: "consumer:1".to_string(),
+                        kind: CollaborationEdgeKind::Handoff,
+                        input_contract: Default::default(),
+                        state: CrossTeamEdgeState::Pending,
+                        delivery_receipt: None,
+                        claim_receipt: None,
+                    },
+                ],
+                semantic_node_instances: std::collections::BTreeMap::from([
+                    ("a".to_string(), vec!["producer-a".to_string()]),
+                    ("b".to_string(), vec!["producer-b".to_string()]),
+                    ("consumer".to_string(), vec!["consumer".to_string()]),
+                ]),
+                control: harness_contract::execution_graph::CollaborationProgramControlState {
+                    lifecycle: CollaborationProgramLifecycle::Planning,
+                    ..Default::default()
+                },
+            }),
+        });
+        let registered = services
+            .commit_service()
+            .register_graph(graph)
+            .expect("register fan-in graph")
+            .graph;
+        let error = claim_incoming_cross_team_deliveries(
+            &registered.id,
+            "consumer",
+            1,
+            services.execution_supervisor().as_ref(),
+            services.graph_state_store(),
+        )
+        .await
+        .expect_err("one claimed receipt cannot admit a two-edge consumer");
+        assert_eq!(error, "cross_team_claims_not_all_delivered");
     }
 }
