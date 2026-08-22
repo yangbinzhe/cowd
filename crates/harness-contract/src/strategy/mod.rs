@@ -3641,6 +3641,14 @@ mod tests {
             .required_team_count,
             3
         );
+        assert_eq!(
+            understand(&StrategyInput::from_prompt(
+                "这是复杂架构审查：必须实际启动三个协作 Team，不可用一个 Team 或模型文本替代。Team A 独立审查 runtime，Team B 独立审查 memory 与 gateway；两者可并行。Team C 必须在收到 A 和 B 的经过授权的证据/摘要后，汇合并审查跨组件边界，再综合最终结论。不得在 A/B 的事实交接完成前启动 Team C 的实质审查。"
+            ))
+            .required_team_count,
+            3,
+            "a later singular Team constraint must not erase the preceding explicit three-Team requirement"
+        );
         assert!(explicit_team_fan_in_required(
             "必须实际启动三个协作 Team，Team A、B 完成后由 Team C 汇合"
         ));

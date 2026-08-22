@@ -50,9 +50,19 @@ if ss -ltn | rg -q ":${PORT}\\b"; then
   echo "isolated Gateway port $PORT is already in use" >&2
   exit 2
 fi
-if [[ ! -x "$BIN" ]]; then
+# The Gateway is the system under test.  Building only harness-eval after the
+# Gateway starts leaves an old `target/debug/cowd` serving the scenario and
+# silently evaluates a previous candidate.  The default binary is therefore
+# rebuilt before every real run.  An explicit COWD_BIN remains an operator
+# supplied immutable artifact and must already be executable.
+if [[ -z "${COWD_BIN:-}" ]]; then
   cargo build -p cli --bin cowd
+elif [[ ! -x "$BIN" ]]; then
+  echo "COWD_BIN is not executable: $BIN" >&2
+  exit 2
 fi
+GATEWAY_BINARY_SHA256="$(sha256sum "$BIN" | awk '{print $1}')"
+printf 'Gateway binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" >&2
 
 mkdir -p "$CONFIG_HOME" "$ISOLATED_HOME/.cowd"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
@@ -111,6 +121,7 @@ env \
   COWD_API_TOKEN="$TOKEN" \
   COWD_EVAL_GATEWAY_URL="$BASE_URL" \
   COWD_EVAL_REAL_MODEL=1 \
+  COWD_EVAL_BINARY_SHA256="$GATEWAY_BINARY_SHA256" \
   COWD_AI_HARNESS_REPORT_DIR="$EVIDENCE_ROOT" \
   timeout "${COWD_EVAL_TIMEOUT_SECS:-900}s" \
   cargo run -p harness-eval -- deep-real --provider "$MODEL" --budget full --allow-real-model

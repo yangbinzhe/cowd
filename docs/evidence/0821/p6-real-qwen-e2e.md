@@ -136,3 +136,22 @@ qualified form and carries an explicit fan-in constraint into the semantic
 proposal, where the final declared Team gets typed dependencies on its declared
 predecessors. The repair has unit and compiler coverage but requires a fresh
 real-Qwen run before it can close this gate.
+
+## 2026-08-23 candidate-freshness correction
+
+The first rerun after that repair also reported one Team, but it did **not**
+exercise candidate `05de14d0`: `harness-eval-real-qwen.sh` started the existing
+`target/debug/cowd` Gateway and only then compiled `harness-eval`. The Gateway
+therefore served a stale Runtime binary. Its retained report is diagnostic of
+the runner defect, not evidence that the parser repair failed:
+
+```text
+/tmp/cowd-real-qwen-evidence.UJPUdl/runs/v0.9.703-1787439975-mission-harness-deep/report.json
+```
+
+The scenario script now rebuilds the default `cowd` binary before starting the
+isolated Gateway and exports its SHA-256 into the evaluation environment. An
+explicit `COWD_BIN` is treated as an operator-supplied immutable artifact and
+must already be executable. The next provider run is consequently bound to the
+current source candidate; this correction is not itself a passing real-model
+result.
