@@ -549,6 +549,14 @@ pub enum CollaborationIntentPatchOperation {
         semantic_node_id: String,
         objective: String,
     },
+    /// Broaden an unstarted Team's objective without changing its frozen
+    /// identity, authority, resource scopes, acceptance, or effect contract.
+    /// A durable user confirmation reference is mandatory because the model
+    /// cannot treat a broader user goal as implied consent.
+    ExpandObjective {
+        semantic_node_id: String,
+        objective: String,
+    },
     SetParallelismHint {
         semantic_node_id: String,
         parallelism_hint: u16,
@@ -650,6 +658,17 @@ impl CollaborationIntentPatch {
             } => {
                 require_patch_value("semantic_node_id", semantic_node_id)?;
                 require_patch_value("objective", objective)?;
+            }
+            CollaborationIntentPatchOperation::ExpandObjective {
+                semantic_node_id,
+                objective,
+            } => {
+                require_patch_value("semantic_node_id", semantic_node_id)?;
+                require_patch_value("objective", objective)?;
+                require_patch_value(
+                    "user_confirmation_ref",
+                    self.user_confirmation_ref.as_deref().unwrap_or_default(),
+                )?;
             }
             CollaborationIntentPatchOperation::SetParallelismHint {
                 semantic_node_id,
@@ -1783,6 +1802,19 @@ mod dependency_policy_tests {
         };
         source_instance_ids.truncate(1);
         assert!(invalid_merge.validate().is_err());
+
+        let expand = CollaborationIntentPatch {
+            user_confirmation_ref: Some("approval:objective-expand".to_string()),
+            operation: CollaborationIntentPatchOperation::ExpandObjective {
+                semantic_node_id: "research".to_string(),
+                objective: "also compare the explicitly approved second source".to_string(),
+            },
+            ..patch.clone()
+        };
+        assert!(expand.validate().is_ok());
+        let mut unconfirmed_expand = expand;
+        unconfirmed_expand.user_confirmation_ref = None;
+        assert!(unconfirmed_expand.validate().is_err());
 
         let mut invalid_dispute = dispute;
         let CollaborationIntentPatchOperation::ResolveDispute {

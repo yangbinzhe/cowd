@@ -128,6 +128,7 @@ pub async fn submit_collaboration_intent_patch(
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::MergeWorkstream { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::RetireTeam { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::NarrowObjective { .. }
+            | harness_contract::execution_graph::CollaborationIntentPatchOperation::ExpandObjective { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::SetParallelismHint { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::Reprioritize { .. }
     ) {
@@ -192,6 +193,9 @@ pub async fn submit_attested_collaboration_intent_patch(
             patch: Box::new(patch.clone()),
         },
         harness_contract::execution_graph::CollaborationIntentPatchOperation::NarrowObjective {
+            ..
+        }
+        | harness_contract::execution_graph::CollaborationIntentPatchOperation::ExpandObjective {
             ..
         } => ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing {
             expected_revision: graph.revision,

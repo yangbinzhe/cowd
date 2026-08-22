@@ -3090,11 +3090,12 @@ fn apply_collaboration_team_retirement(
         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
 }
 
-/// Narrow a semantic Team objective before any mapped physical instance has
+/// Change a semantic Team objective before any mapped physical instance has
 /// started. Team identity, template, scope, acceptance, effects and graph
 /// topology are intentionally untouched: only the serialized immutable Team
 /// request that admission will consume is replaced atomically with the
-/// Program revision.
+/// Program revision. A broadening requires a durable user confirmation at
+/// contract validation; no objective-only patch can acquire new authority.
 fn apply_collaboration_objective_narrowing(
     graph: &mut ExecutionGraph,
     patch: &harness_contract::execution_graph::CollaborationIntentPatch,
@@ -3106,14 +3107,20 @@ fn apply_collaboration_objective_narrowing(
     patch
         .validate()
         .map_err(ExecutionCommitError::InvalidCommand)?;
-    let CollaborationIntentPatchOperation::NarrowObjective {
-        semantic_node_id,
-        objective,
-    } = &patch.operation
-    else {
-        return Err(ExecutionCommitError::InvalidCommand(
-            "objective narrowing command requires a narrow_objective patch".to_string(),
-        ));
+    let (semantic_node_id, objective) = match &patch.operation {
+        CollaborationIntentPatchOperation::NarrowObjective {
+            semantic_node_id,
+            objective,
+        }
+        | CollaborationIntentPatchOperation::ExpandObjective {
+            semantic_node_id,
+            objective,
+        } => (semantic_node_id, objective),
+        _ => {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "objective mutation command requires an objective patch".to_string(),
+            ));
+        }
     };
     let current = graph
         .orchestration
@@ -4998,7 +5005,50 @@ mod tests {
             narrowed.node_statuses["child-team"],
             ExecutionNodeStatus::Planned
         );
+        let expanded = service
+            .apply_command(
+                &narrowed,
+                &ExecutionGraphCommand::ApplyCollaborationObjectiveNarrowing {
+                    expected_revision: narrowed.revision,
+                    patch: Box::new(harness_contract::execution_graph::CollaborationIntentPatch {
+                        program_id: "program-narrow-objective".to_string(),
+                        base_revision: 4,
+                        source_attempt: "child-team:attempt:0".to_string(),
+                        reason: "the user approved comparison of one additional source".to_string(),
+                        evidence_refs: Vec::new(),
+                        canonical_digest: "x".repeat(64),
+                        user_confirmation_ref: Some("approval:objective-expand".to_string()),
+                        escalation: None,
+                        operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::ExpandObjective {
+                            semantic_node_id: "research".to_string(),
+                            objective: "compare the declared source with the approved second source".to_string(),
+                        },
+                    }),
+                },
+            )
+            .expect("confirmed objective expansion preserves the same Team contract")
+            .graph;
+        let expanded_request = serde_json::from_str::<
+            harness_contract::team::TeamInstantiationRequest,
+        >(&expanded.nodes[0].payload_ref)
+        .expect("expanded Team request stays decodable");
+        assert_eq!(
+            expanded_request.objective,
+            "compare the declared source with the approved second source"
+        );
+        assert_eq!(
+            expanded
+                .orchestration
+                .as_ref()
+                .expect("metadata")
+                .collaboration_program
+                .as_ref()
+                .expect("program")
+                .revision,
+            5
+        );
         assert!(validate_execution_graph(&narrowed).is_ok());
+        assert!(validate_execution_graph(&expanded).is_ok());
     }
 
     #[test]
