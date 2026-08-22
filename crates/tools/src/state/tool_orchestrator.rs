@@ -268,6 +268,21 @@ fn resolve_effect_properties(
                 }
             }
         }
+        // A managed Agent can only request an escalation. Runtime attests the
+        // immutable parent/attempt fences and independently decides whether
+        // to append a Program revision, so this tool has no direct workspace
+        // or external mutation authority of its own.
+        "runtime.collaboration_escalation" => EffectProperties {
+            effect_kind: ToolEffectKind::Read,
+            idempotency: ToolIdempotency::Idempotent,
+            scopes: vec![read_scope()],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::None,
+            uses_network: false,
+            spawns_process: false,
+            mutates_packages: false,
+            mutates_system: false,
+        },
         "builtin.network" => EffectProperties {
             effect_kind: ToolEffectKind::Network,
             idempotency: ToolIdempotency::Unknown,
@@ -932,6 +947,24 @@ mod tests {
             ToolPermissionMode::WorkspaceWrite
         );
         assert_eq!(propose.idempotency, ToolIdempotency::IdempotentWithKey);
+    }
+
+    #[test]
+    fn collaboration_escalation_is_a_readonly_program_request_effect() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "runtime.collaboration_escalation".to_string(),
+            resolver_version: 1,
+        };
+        let descriptor = resolve_registered_tool_effect(
+            &resolver,
+            "request_collaboration_escalation",
+            &json!({"base_revision": 7}),
+            ToolPermissionMode::ReadOnly,
+        );
+
+        assert_eq!(descriptor.effect_kind, ToolEffectKind::Read);
+        assert_eq!(descriptor.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(descriptor.approval_class, ToolApprovalClass::None);
     }
 
     #[test]

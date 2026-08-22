@@ -204,9 +204,10 @@ impl ProviderClient {
         protocol: ProviderProtocol,
         http: reqwest::Client,
     ) -> Result<Self, ApiError> {
+        let api_key = resolve_config_api_key(provider)?;
         match protocol {
             ProviderProtocol::Anthropic => {
-                let auth = AuthSource::ApiKey(provider.api_key.clone());
+                let auth = AuthSource::ApiKey(api_key);
                 Ok(Self::Anthropic(
                     AnthropicClient::from_auth_with_http(auth, http)
                         .with_base_url(&provider.base_url),
@@ -226,7 +227,7 @@ impl ProviderClient {
                 };
                 Ok(Self::OpenAi(
                     OpenAiCompatClient::new_custom_with_protocol_and_http(
-                        provider.api_key.clone(),
+                        api_key,
                         url,
                         &provider.name,
                         wire_protocol,
@@ -344,11 +345,53 @@ pub fn read_xai_base_url() -> String {
     openai_compat::read_base_url(OpenAiCompatConfig::xai())
 }
 
+/// Resolve a provider credential without copying a secret into an isolated
+/// configuration file. `api_key: env:NAME` is intentionally opt-in and is
+/// resolved only at the final transport boundary; literal values retain their
+/// existing behavior.
+fn resolve_config_api_key(provider: &ProviderConfig) -> Result<String, ApiError> {
+    let Some(variable) = provider.api_key.strip_prefix("env:") else {
+        return Ok(provider.api_key.clone());
+    };
+    if variable.is_empty()
+        || !variable
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(ApiError::InvalidProviderConfig {
+            provider: provider.name.clone(),
+            reason: "api_key env reference must use `env:UPPERCASE_NAME`".to_string(),
+        });
+    }
+    std::env::var(variable)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::InvalidProviderConfig {
+            provider: provider.name.clone(),
+            reason: format!("api_key environment variable `{variable}` is unavailable or empty"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ProviderClient;
+    use super::{resolve_config_api_key, ProviderClient};
     use crate::providers::{detect_provider_kind, ProviderKind};
     use crate::test_utils::{env_lock, EnvVarGuard};
+    use model_protocol::provider_config::{
+        EarlyToolStartMode, ParallelToolCallsMode, ProviderConfig,
+    };
+
+    fn configured_provider(api_key: &str) -> ProviderConfig {
+        ProviderConfig {
+            base_url: "https://provider.example/v1".to_string(),
+            api_key: api_key.to_string(),
+            models: vec!["test-model".to_string()],
+            name: "test-provider".to_string(),
+            protocol: Some("completions".to_string()),
+            parallel_tool_calls: ParallelToolCallsMode::Auto,
+            early_tool_start: EarlyToolStartMode::Auto,
+        }
+    }
 
     #[test]
     fn provider_detection_prefers_model_family() {
@@ -383,6 +426,28 @@ mod tests {
             }
             other => panic!("Expected ProviderClient::OpenAi for qwen-plus, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn configured_provider_api_key_can_reference_a_process_environment_secret() {
+        let _lock = env_lock();
+        let _secret = EnvVarGuard::set("COWD_PROVIDER_TEST_SECRET", Some("test-secret"));
+
+        let key = resolve_config_api_key(&configured_provider("env:COWD_PROVIDER_TEST_SECRET"))
+            .expect("environment credential should resolve at transport composition");
+
+        assert_eq!(key, "test-secret");
+    }
+
+    #[test]
+    fn configured_provider_api_key_environment_reference_fails_closed() {
+        let _lock = env_lock();
+        let _missing = EnvVarGuard::set("COWD_PROVIDER_TEST_SECRET", None);
+
+        let error = resolve_config_api_key(&configured_provider("env:COWD_PROVIDER_TEST_SECRET"))
+            .expect_err("missing environment credential must not construct a client");
+
+        assert!(error.to_string().contains("unavailable or empty"));
     }
 
     #[test]

@@ -620,6 +620,10 @@ mod tests {
     fn runtime_capability_tool_is_always_registered_as_readonly() {
         let tools = runtime_capability_tool_definitions();
 
+        GatewayToolRegistry::builtin()
+            .with_runtime_tools(tools.clone())
+            .expect("every production runtime tool must have a concrete effect resolver");
+
         let lark_read = tools
             .iter()
             .find(|tool| tool.name == "lark_cli_read")
