@@ -3197,7 +3197,26 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
                     || counted_role_phrase(&cardinal_normalized, english, role, true)
                     || counted_role_phrase(&cardinal_normalized, &arabic, role, true)
             });
-        if chinese_match || english_match {
+        // Natural-language Chinese often qualifies an English `Team` between
+        // its cardinality and the noun (for example, `三个协作 Team`). That is
+        // still an explicit cardinality, not three Agents inside one Team.
+        // Keep the qualifier set narrowly collaboration-specific so an
+        // unrelated phrase cannot accidentally become a Team obligation.
+        let qualified_english_team_match =
+            ["协作", "独立", "并行", "平行"].iter().any(|qualifier| {
+                ["team", "teams"].iter().any(|role| {
+                    [
+                        format!("{chinese}{qualifier} {role}"),
+                        format!("{chinese}个{qualifier} {role}"),
+                        format!("{arabic}{qualifier} {role}"),
+                        format!("{arabic}个{qualifier} {role}"),
+                        format!("{arabic} {qualifier} {role}"),
+                    ]
+                    .iter()
+                    .any(|pattern| cardinal_normalized.contains(pattern))
+                })
+            });
+        if chinese_match || english_match || qualified_english_team_match {
             requested = requested.max(*count);
             break;
         }
@@ -3242,6 +3261,27 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
         requested = ordinal_count;
     }
     requested
+}
+
+/// Whether an explicitly requested multi-Team collaboration includes a typed
+/// fan-in requirement. This is ingress interpretation only: the resulting
+/// dependency is carried as data in the durable semantic proposal, never
+/// inferred later from Team names or a fixed role workflow.
+#[must_use]
+pub fn explicit_team_fan_in_required(prompt: &str) -> bool {
+    let normalized = prompt.to_ascii_lowercase();
+    explicit_team_count(&normalized) >= 2
+        && [
+            "汇合",
+            "合并",
+            "汇总",
+            "整合",
+            "merge",
+            "aggregate",
+            "fan-in",
+        ]
+        .iter()
+        .any(|term| normalized.contains(term))
 }
 
 /// Whether the user requires a real Team execution even when no explicit
@@ -3590,6 +3630,21 @@ mod tests {
         assert_eq!(explicit_team_count("start three research teams"), 3);
         assert_eq!(explicit_team_count("请使用恰好3个Team完成真实任务"), 3);
         assert_eq!(explicit_team_count("启动三个 Team 并行核查"), 3);
+        assert_eq!(
+            explicit_team_count("必须实际启动三个协作 Team，Team A、B、C 分工汇合"),
+            3
+        );
+        assert_eq!(
+            understand(&StrategyInput::from_prompt(
+                "必须实际启动三个协作 Team，Team A、B、C 分工汇合"
+            ))
+            .required_team_count,
+            3
+        );
+        assert!(explicit_team_fan_in_required(
+            "必须实际启动三个协作 Team，Team A、B 完成后由 Team C 汇合"
+        ));
+        assert!(!explicit_team_fan_in_required("启动三个协作 Team 并行核查"));
         assert_eq!(
             explicit_team_count("一个团队负责研究，另一个团队负责复核"),
             2

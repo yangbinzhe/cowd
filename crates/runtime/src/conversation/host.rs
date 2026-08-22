@@ -2272,6 +2272,9 @@ where
                 decision_lease: strategy.decision_lease.clone(),
                 turn_ref: strategy.turn_ref.clone(),
                 requested_team_count: structured_team_count(understanding),
+                requires_fan_in: harness_contract::strategy::explicit_team_fan_in_required(
+                    objective,
+                ),
                 focus_count,
                 requests_multi_agent: understanding.requests_multi_agent,
                 requires_write: parent_requires_write,

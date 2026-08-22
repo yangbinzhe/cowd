@@ -102,3 +102,37 @@ was allowed to consume the fact. This makes the next real-Qwen run a meaningful
 A12 sub-gate instead of another one-Team increment. It has not yet been run
 against a provider at this candidate SHA, so this section records the stricter
 gate rather than a successful real-model result.
+
+## 2026-08-23 strict-gate real-Qwen result and root cause
+
+The strict gate was run once from candidate `b2162162` against the isolated
+Gateway and `qwen3.7-plus`:
+
+```text
+COWD_EVAL_KEEP_GATEWAY_ARTIFACTS=1 COWD_EVAL_TIMEOUT_SECS=1800 \
+  scripts/scenarios/harness-eval-real-qwen.sh
+```
+
+It correctly failed, rather than accepting a prose claim of collaboration.
+The direct, tool-evidence and single-architecture scenarios passed. The Team
+scenario made 22 provider rounds and 143 read-only tool calls, then completed
+one Team with four Agents; it produced zero claimed cross-Team edges. Its
+quality score was 6/9, and the suite status was `failed`.
+
+```text
+/tmp/cowd-real-qwen-evidence.CqEd00/runs/v0.9.703-1787438996-mission-harness-deep/report.json
+sha256 5f4c3a4d807bd764db704a7545016d24e486649f40a4c0b0d6f04330a9538b0d
+
+live-scenarios/004-live_team_projection.json
+sha256 4f39ac709613f5d78383488e11a28e6f5a1b40c6148f7b278ac03b91563f8ea9
+```
+
+The durable projection identified the actual cause: the Chinese/English mixed
+phrase `三个协作 Team` was parsed as `required_team_count=1`, so the
+deterministic selected-Team path created one obligation and no edges. This is a
+contract parsing/compilation failure, not provider inactivity or an early-stop
+condition. The follow-up candidate adds a narrow cardinality parser for that
+qualified form and carries an explicit fan-in constraint into the semantic
+proposal, where the final declared Team gets typed dependencies on its declared
+predecessors. The repair has unit and compiler coverage but requires a fresh
+real-Qwen run before it can close this gate.

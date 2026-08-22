@@ -40,6 +40,10 @@ pub(crate) struct ConversationProgramIntent {
     pub decision_lease: String,
     pub turn_ref: String,
     pub requested_team_count: usize,
+    /// An explicit user-declared merge requirement. The compiler translates it
+    /// into typed predecessor edges for the final semantic Team; it never
+    /// derives a workflow from a Team's display name.
+    pub requires_fan_in: bool,
     pub focus_count: usize,
     pub requests_multi_agent: bool,
     pub requires_write: bool,
@@ -152,7 +156,9 @@ pub(crate) fn compile_conversation_program_intent(
                 node_id: node_id.clone(),
                 recipe: CapabilityRecipeId::Team,
                 objective: intent.objective.clone(),
-                depends_on: if writer && index > 0 {
+                depends_on: if (writer || (intent.requires_fan_in && index + 1 == team_count))
+                    && index > 0
+                {
                     team_node_ids[..index].to_vec()
                 } else {
                     Vec::new()
@@ -1435,6 +1441,7 @@ mod tests {
                 decision_lease: "lease-intent".to_string(),
                 turn_ref: "turn-intent".to_string(),
                 requested_team_count: 3,
+                requires_fan_in: false,
                 focus_count: 3,
                 requests_multi_agent: true,
                 requires_write: false,
@@ -1450,6 +1457,7 @@ mod tests {
             .expect("Program intent has a graph proposal");
         assert_eq!(proposal.nodes.len(), 3);
         assert_eq!(proposal.completion.required_node_ids.len(), 3);
+        assert!(proposal.nodes.iter().all(|node| node.depends_on.is_empty()));
         assert!(proposal.nodes.iter().all(|node| {
             node.recipe == CapabilityRecipeId::Team
                 && node.template.as_deref() == Some("cowd/external-research-synthesis")
@@ -1459,6 +1467,58 @@ mod tests {
                     .all(|scope| scope == "network:*")
         }));
         assert_eq!(request.constraints.max_parallel_agents, Some(9));
+    }
+
+    #[test]
+    fn conversation_program_intent_compiles_explicit_fan_in_as_typed_team_dependencies() {
+        let request = compile_conversation_program_intent(
+            ConversationProgramIntent {
+                objective: "Three independent Teams must merge their authorised evidence"
+                    .to_string(),
+                model_lease: "test-model".to_string(),
+                session_id: "session-intent".to_string(),
+                lineage: None,
+                mission_id: None,
+                decision_id: "decision-fan-in".to_string(),
+                decision_revision: 3,
+                decision_lease: "lease-intent".to_string(),
+                turn_ref: "turn-intent".to_string(),
+                requested_team_count: 3,
+                requires_fan_in: true,
+                focus_count: 3,
+                requests_multi_agent: true,
+                requires_write: false,
+                requires_external_facts: true,
+                permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+                risk: "medium".to_string(),
+            },
+            std::path::Path::new("."),
+        )
+        .expect("fan-in intent has bounded network scopes");
+        let proposal = request
+            .proposal
+            .expect("Program intent has a graph proposal");
+
+        assert_eq!(proposal.nodes.len(), 3);
+        assert!(proposal.nodes[..2]
+            .iter()
+            .all(|node| node.depends_on.is_empty()));
+        assert_eq!(
+            proposal.nodes[2].depends_on,
+            proposal.nodes[..2]
+                .iter()
+                .map(|node| node.node_id.clone())
+                .collect::<Vec<_>>()
+        );
+        let program =
+            crate::orchestration::compiler::collaboration_program_from_proposal(&proposal, None)
+                .expect("valid collaboration Program")
+                .expect("Team proposal has a Program");
+        assert_eq!(program.edges.len(), 2);
+        assert!(program
+            .edges
+            .iter()
+            .all(|edge| edge.to.ends_with("team-3:1")));
     }
 
     #[test]
