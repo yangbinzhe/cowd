@@ -104,10 +104,12 @@ impl NodeExecutor for TeamSubgraphExecutor {
             });
         }
         let mut summaries = Vec::new();
-        for edge in context.graph.edges.iter().filter(|edge| {
-            edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::DependsOn
-                && edge.to == context.node.id
-        }) {
+        for edge in context
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind.is_dependency() && edge.to == context.node.id)
+        {
             let Some(result) = context.graph.node_results.get(&edge.from) else {
                 continue;
             };

@@ -2809,8 +2809,18 @@ mod tests {
                 .edges
                 .iter()
                 .filter(|edge| {
-                    edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::DependsOn
+                    edge.kind
+                        == harness_contract::execution_graph::ExecutionEdgeKind::CrossTeamHandoff
                 })
+                .count(),
+            3
+        );
+        assert_eq!(
+            compiled
+                .graph
+                .edges
+                .iter()
+                .filter(|edge| edge.kind.is_dependency())
                 .count(),
             3
         );

@@ -203,7 +203,7 @@ pub fn project_work_graph(graph: &ExecutionGraph) -> Option<ExecutionWorkGraphPr
         .edges
         .iter()
         .filter(|edge| {
-            edge.kind == ExecutionEdgeKind::DependsOn
+            edge.kind.is_dependency()
                 && work_ids.contains(edge.from.as_str())
                 && work_ids.contains(edge.to.as_str())
         })

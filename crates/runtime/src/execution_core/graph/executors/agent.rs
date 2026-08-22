@@ -161,9 +161,7 @@ impl NodeExecutor for AgentTaskExecutor {
                 .edges
                 .iter()
                 .filter(|edge| {
-                    edge.to == ticket.node_id
-                        && edge.kind
-                            == harness_contract::execution_graph::ExecutionEdgeKind::DependsOn
+                    edge.to == ticket.node_id && edge.kind.is_dependency()
                         && graph.nodes.iter().any(|node| {
                             node.id == edge.from
                                 && node.kind

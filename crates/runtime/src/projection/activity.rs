@@ -548,6 +548,7 @@ fn project_single_execution_activities_from_events(
     for edge in &graph.edges {
         let kind = match edge.kind {
             ExecutionEdgeKind::DependsOn => ActivityRelationKind::DependsOn,
+            ExecutionEdgeKind::CrossTeamHandoff => ActivityRelationKind::DependsOn,
             ExecutionEdgeKind::Verifies => ActivityRelationKind::ContributesTo,
             ExecutionEdgeKind::Produces => ActivityRelationKind::Produced,
         };
@@ -558,7 +559,7 @@ fn project_single_execution_activities_from_events(
             &node_activity_id(&graph.graph_id, &edge.to),
             None,
         );
-        if edge.kind == ExecutionEdgeKind::DependsOn {
+        if edge.kind.is_dependency() {
             insert_committed_predecessor_consumed_relations(
                 &mut relations,
                 &activities,

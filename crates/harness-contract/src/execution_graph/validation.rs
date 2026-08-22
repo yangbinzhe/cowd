@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
-use super::{ExecutionDependencyPolicy, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind};
+use super::{ExecutionDependencyPolicy, ExecutionGraph, ExecutionNodeKind};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ExecutionGraphValidationError {
@@ -74,11 +74,7 @@ pub fn validate_execution_graph(
         .map(|id| (id.clone(), 0usize))
         .collect::<BTreeMap<_, _>>();
     let mut outgoing = BTreeMap::<String, Vec<String>>::new();
-    for edge in graph
-        .edges
-        .iter()
-        .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn)
-    {
+    for edge in graph.edges.iter().filter(|edge| edge.kind.is_dependency()) {
         if !ids.contains(&edge.from) {
             return Err(ExecutionGraphValidationError::MissingNode(
                 edge.from.clone(),
@@ -103,7 +99,7 @@ pub fn validate_execution_graph(
         let predecessor_count = graph
             .edges
             .iter()
-            .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
+            .filter(|edge| edge.kind.is_dependency() && edge.to == node.id)
             .count();
         match work.dependency {
             ExecutionDependencyPolicy::All | ExecutionDependencyPolicy::Finally => {}

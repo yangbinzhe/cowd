@@ -89,6 +89,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                     && matches!(
                         edge.kind,
                         ExecutionEdgeKind::DependsOn
+                            | ExecutionEdgeKind::CrossTeamHandoff
                             | ExecutionEdgeKind::Produces
                             | ExecutionEdgeKind::Verifies
                     )
@@ -148,9 +149,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                     let upstream_evidence = graph
                         .edges
                         .iter()
-                        .filter(|edge| {
-                            edge.to == predecessor_id && edge.kind == ExecutionEdgeKind::DependsOn
-                        })
+                        .filter(|edge| edge.to == predecessor_id && edge.kind.is_dependency())
                         .filter_map(|edge| graph.node_results.get(&edge.from))
                         .flat_map(|result| result.evidence_refs.iter())
                         .filter(|reference| {

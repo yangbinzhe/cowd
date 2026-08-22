@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
 use harness_contract::execution_graph::{
-    validate_execution_graph, ExecutionEdgeKind, ExecutionGraph, ExecutionGraphCommand,
-    ExecutionGraphValidationError, ExecutionNodeResult, ExecutionNodeStatus,
+    validate_execution_graph, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
+    ExecutionNodeResult, ExecutionNodeStatus,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1724,7 +1724,7 @@ fn dependency_predecessors<'a>(
     graph
         .edges
         .iter()
-        .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == node.id)
+        .filter(|edge| edge.kind.is_dependency() && edge.to == node.id)
         .map(|edge| {
             let status = verified_predecessor_status(graph, &edge.from, required_evidence_refs);
             DependencyPredecessor {
@@ -2026,7 +2026,7 @@ fn quorum_tail_cancellations(graph: &ExecutionGraph) -> Vec<String> {
         for predecessor_id in graph
             .edges
             .iter()
-            .filter(|edge| edge.kind == ExecutionEdgeKind::DependsOn && edge.to == consumer.id)
+            .filter(|edge| edge.kind.is_dependency() && edge.to == consumer.id)
             .map(|edge| edge.from.as_str())
         {
             let Some(predecessor) = graph.nodes.iter().find(|node| node.id == predecessor_id)

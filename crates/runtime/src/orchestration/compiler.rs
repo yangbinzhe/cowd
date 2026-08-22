@@ -392,10 +392,15 @@ pub fn compile_graph_mutation(
                 })?;
             for provider in &providers {
                 for consumer in consumers {
+                    let producer_recipe = proposal
+                        .nodes
+                        .iter()
+                        .find(|node| node.node_id == *dependency)
+                        .map(|node| node.recipe);
                     edges.push(ExecutionEdge {
                         from: provider.clone(),
                         to: consumer.clone(),
-                        kind: ExecutionEdgeKind::DependsOn,
+                        kind: semantic_dependency_edge_kind(semantic.recipe, producer_recipe),
                     });
                     if proposal
                         .nodes
@@ -423,6 +428,19 @@ pub fn compile_graph_mutation(
         edges,
         semantic_node_instances,
     })
+}
+
+fn semantic_dependency_edge_kind(
+    consumer_recipe: CapabilityRecipeId,
+    producer_recipe: Option<CapabilityRecipeId>,
+) -> ExecutionEdgeKind {
+    if consumer_recipe == CapabilityRecipeId::Team
+        && matches!(producer_recipe, Some(CapabilityRecipeId::Team))
+    {
+        ExecutionEdgeKind::CrossTeamHandoff
+    } else {
+        ExecutionEdgeKind::DependsOn
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1447,6 +1465,28 @@ mod tests {
                 TerminalFactKind::ObservedEvidence,
                 TerminalFactKind::AcceptanceVerdict,
             ]
+        );
+    }
+
+    #[test]
+    fn team_to_team_dependency_keeps_a_distinct_physical_handoff_identity() {
+        assert_eq!(
+            semantic_dependency_edge_kind(CapabilityRecipeId::Team, Some(CapabilityRecipeId::Team)),
+            ExecutionEdgeKind::CrossTeamHandoff
+        );
+        assert_eq!(
+            semantic_dependency_edge_kind(
+                CapabilityRecipeId::Team,
+                Some(CapabilityRecipeId::Agent)
+            ),
+            ExecutionEdgeKind::DependsOn
+        );
+        assert_eq!(
+            semantic_dependency_edge_kind(
+                CapabilityRecipeId::Review,
+                Some(CapabilityRecipeId::Team)
+            ),
+            ExecutionEdgeKind::DependsOn
         );
     }
 }
