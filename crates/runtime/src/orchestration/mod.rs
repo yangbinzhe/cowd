@@ -125,6 +125,7 @@ pub async fn submit_collaboration_intent_patch(
         &patch.operation,
         harness_contract::execution_graph::CollaborationIntentPatchOperation::ChangeEdge { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::SplitWorkstream { .. }
+            | harness_contract::execution_graph::CollaborationIntentPatchOperation::MergeWorkstream { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::RetireTeam { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::NarrowObjective { .. }
             | harness_contract::execution_graph::CollaborationIntentPatchOperation::SetParallelismHint { .. }
@@ -163,6 +164,9 @@ pub async fn submit_attested_collaboration_intent_patch(
         .map_err(|error| format!("patch_target_load_failed:{error}"))?;
     let command = match &patch.operation {
         harness_contract::execution_graph::CollaborationIntentPatchOperation::SplitWorkstream {
+            ..
+        }
+        | harness_contract::execution_graph::CollaborationIntentPatchOperation::MergeWorkstream {
             ..
         } => {
             let request = collaboration_coordinator::compile_collaboration_intent_patch(&graph, patch)?;

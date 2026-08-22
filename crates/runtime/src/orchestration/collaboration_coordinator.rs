@@ -321,6 +321,18 @@ pub(crate) fn compile_collaboration_intent_patch(
             materialize_split_patch_teams(graph, program, source_instance_id, teams)?,
             vec![source_instance_id.clone()],
         ),
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::MergeWorkstream {
+            source_instance_ids,
+            team,
+        } => (
+            materialize_replacement_patch_teams(
+                graph,
+                program,
+                source_instance_ids,
+                std::slice::from_ref(team),
+            )?,
+            source_instance_ids.clone(),
+        ),
         _ => {
             return Err("patch_operation_requires_atomic_program_graph_mutation".to_string());
         }
@@ -479,28 +491,56 @@ fn materialize_split_patch_teams(
     source_instance_id: &str,
     teams: &[harness_contract::execution_graph::CollaborationPatchTeam],
 ) -> Result<Vec<harness_contract::execution_graph::CollaborationPatchTeam>, String> {
+    materialize_replacement_patch_teams(graph, program, &[source_instance_id.to_string()], teams)
+}
+
+fn materialize_replacement_patch_teams(
+    graph: &ExecutionGraph,
+    program: &CollaborationProgram,
+    source_instance_ids: &[String],
+    teams: &[harness_contract::execution_graph::CollaborationPatchTeam],
+) -> Result<Vec<harness_contract::execution_graph::CollaborationPatchTeam>, String> {
     if program.control.lifecycle.is_terminal() {
-        return Err("split_patch_program_is_terminal".to_string());
+        return Err("replacement_patch_program_is_terminal".to_string());
     }
-    let source = program
-        .team_instances
+    let source_instances = source_instance_ids
         .iter()
-        .find(|instance| instance.instance_id == source_instance_id)
-        .ok_or_else(|| "split_patch_source_instance_missing".to_string())?;
-    let source_node_id = node_id_for_instance(program, source_instance_id)?;
-    if graph.node_statuses.get(&source_node_id)
-        != Some(&harness_contract::execution_graph::ExecutionNodeStatus::Planned)
-    {
-        return Err("split_patch_source_is_not_unstarted".to_string());
-    }
-    if program
-        .control
-        .obligations
+        .map(|source_instance_id| {
+            let source = program
+                .team_instances
+                .iter()
+                .find(|instance| instance.instance_id == *source_instance_id)
+                .ok_or_else(|| "replacement_patch_source_instance_missing".to_string())?;
+            let source_node_id = node_id_for_instance(program, source_instance_id)?;
+            if graph.node_statuses.get(&source_node_id)
+                != Some(&harness_contract::execution_graph::ExecutionNodeStatus::Planned)
+            {
+                return Err("replacement_patch_source_is_not_unstarted".to_string());
+            }
+            if program
+                .control
+                .obligations
+                .iter()
+                .find(|obligation| obligation.instance_id == *source_instance_id)
+                .is_some_and(|obligation| obligation.child_graph_ref.is_some())
+            {
+                return Err("replacement_patch_source_has_child_graph".to_string());
+            }
+            Ok(source)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let source_semantic_ids = source_instances
         .iter()
-        .find(|obligation| obligation.instance_id == source_instance_id)
-        .is_some_and(|obligation| obligation.child_graph_ref.is_some())
+        .map(|source| source.semantic_node_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if source_instances.len() != source_instance_ids.len()
+        || source_instances.len()
+            != source_instance_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
     {
-        return Err("split_patch_source_has_child_graph".to_string());
+        return Err("replacement_patch_source_instances_are_not_unique".to_string());
     }
     let instance_semantics = program
         .team_instances
@@ -510,15 +550,16 @@ fn materialize_split_patch_teams(
     let inherited_dependencies = program
         .edges
         .iter()
-        .filter(|edge| edge.to == source_instance_id)
+        .filter(|edge| source_instance_ids.contains(&edge.to))
+        .filter(|edge| !source_instance_ids.contains(&edge.from))
         .filter_map(|edge| instance_semantics.get(&edge.from).map(|id| (*id).clone()))
         .collect::<std::collections::BTreeSet<_>>();
     teams
         .iter()
         .cloned()
         .map(|mut team| {
-            if team.semantic_node_id == source.semantic_node_id {
-                return Err("split_patch_reuses_source_semantic_id".to_string());
+            if source_semantic_ids.contains(team.semantic_node_id.as_str()) {
+                return Err("replacement_patch_reuses_source_semantic_id".to_string());
             }
             team.depends_on
                 .extend(inherited_dependencies.iter().cloned());
@@ -543,7 +584,7 @@ pub(crate) fn split_replacement_outgoing_graph_edges(
         .iter()
         .map(|instance_id| node_id_for_instance(program, instance_id))
         .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-    Ok(graph
+    let mut edges = graph
         .edges
         .iter()
         .filter(|edge| source_node_ids.contains(&edge.from))
@@ -556,7 +597,18 @@ pub(crate) fn split_replacement_outgoing_graph_edges(
                     kind: edge.kind.clone(),
                 })
         })
-        .collect())
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| {
+        (&left.from, &left.to, format!("{:?}", left.kind)).cmp(&(
+            &right.from,
+            &right.to,
+            format!("{:?}", right.kind),
+        ))
+    });
+    edges.dedup_by(|left, right| {
+        left.from == right.from && left.to == right.to && left.kind == right.kind
+    });
+    Ok(edges)
 }
 
 /// Program edge receipts belong to the retired source, never to a
@@ -567,7 +619,7 @@ pub(crate) fn split_replacement_outgoing_program_edges(
     source_instance_ids: &[String],
     replacement_instance_ids: &[String],
 ) -> Vec<CollaborationProgramEdge> {
-    program
+    let mut edges = program
         .edges
         .iter()
         .filter(|edge| source_instance_ids.contains(&edge.from))
@@ -585,7 +637,10 @@ pub(crate) fn split_replacement_outgoing_program_edges(
                     claim_receipt: None,
                 })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| left.edge_id.cmp(&right.edge_id));
+    edges.dedup_by(|left, right| left.edge_id == right.edge_id);
+    edges
 }
 
 fn materialize_review_patch_team(
@@ -1606,7 +1661,7 @@ mod tests {
         assert_eq!(
             materialize_split_patch_teams(&graph, &program, "source:1", &[])
                 .expect_err("a started Team is never split"),
-            "split_patch_source_is_not_unstarted"
+            "replacement_patch_source_is_not_unstarted"
         );
     }
 

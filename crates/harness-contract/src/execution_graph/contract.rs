@@ -518,6 +518,13 @@ pub enum CollaborationIntentPatchOperation {
         source_instance_id: String,
         teams: Vec<CollaborationPatchTeam>,
     },
+    /// Coalesce two or more unstarted Team workstreams into one replacement.
+    /// The Runtime retains their union of unfinished input/output relations;
+    /// any started source is rejected instead of replaying its effects.
+    MergeWorkstream {
+        source_instance_ids: Vec<String>,
+        team: CollaborationPatchTeam,
+    },
     RetireTeam {
         instance_id: String,
     },
@@ -587,6 +594,18 @@ impl CollaborationIntentPatch {
                         return Err("split patch reuses a replacement semantic Team id".to_string());
                     }
                 }
+            }
+            CollaborationIntentPatchOperation::MergeWorkstream {
+                source_instance_ids,
+                team,
+            } => {
+                if source_instance_ids.len() < 2 {
+                    return Err(
+                        "merge patch requires at least two source Team instances".to_string()
+                    );
+                }
+                validate_unique_patch_values("source_instance_ids", source_instance_ids)?;
+                validate_patch_team(team)?;
             }
             CollaborationIntentPatchOperation::RetireTeam { instance_id } => {
                 require_patch_value("instance_id", instance_id)?;
@@ -1742,6 +1761,28 @@ mod dependency_policy_tests {
         };
         teams.pop();
         assert!(invalid_split.validate().is_err());
+
+        let merge = CollaborationIntentPatch {
+            operation: CollaborationIntentPatchOperation::MergeWorkstream {
+                source_instance_ids: vec!["research:1".to_string(), "review:1".to_string()],
+                team: match &patch.operation {
+                    CollaborationIntentPatchOperation::AddTeam { team } => team.clone(),
+                    _ => unreachable!("fixture remains an AddTeam patch"),
+                },
+            },
+            ..patch.clone()
+        };
+        assert!(merge.validate().is_ok());
+        let mut invalid_merge = merge;
+        let CollaborationIntentPatchOperation::MergeWorkstream {
+            source_instance_ids,
+            ..
+        } = &mut invalid_merge.operation
+        else {
+            unreachable!("fixture remains a merge patch")
+        };
+        source_instance_ids.truncate(1);
+        assert!(invalid_merge.validate().is_err());
 
         let mut invalid_dispute = dispute;
         let CollaborationIntentPatchOperation::ResolveDispute {
