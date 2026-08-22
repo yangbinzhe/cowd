@@ -67,6 +67,30 @@ trap 'rm -f "$LAUNCHER_TMP"' EXIT
 install -m 0500 "$LAUNCHER_BIN" "$LAUNCHER_TMP"
 mv -f "$LAUNCHER_TMP" "$INSTALL_DIR/managed-worker-launcher"
 trap - EXIT
+LAUNCHER_DIGEST="sha256:$(sha256sum "$INSTALL_DIR/managed-worker-launcher" | awk '{print $1}')"
+
+# The launcher is deliberately pinned in an APP-enabled local configuration.
+# Updating the binary without updating that pin leaves the next Gateway restart
+# fail-closed.  Only touch a configuration that explicitly points at the
+# launcher we have just installed; unrelated/custom launcher paths stay under
+# the operator's control.
+CONFIG_FILE="$CONFIG_HOME/config.yaml"
+if [[ -f "$CONFIG_FILE" ]] \
+  && grep -Fqx "    path: $INSTALL_DIR/managed-worker-launcher" "$CONFIG_FILE"; then
+  CONFIG_TMP="$(mktemp "$CONFIG_HOME/.config.launcher-digest.XXXXXX")"
+  trap 'rm -f "$CONFIG_TMP"' EXIT
+  LAUNCHER_PATH="$INSTALL_DIR/managed-worker-launcher" \
+    LAUNCHER_DIGEST="$LAUNCHER_DIGEST" \
+    perl -0pe '
+      my $path = quotemeta($ENV{LAUNCHER_PATH});
+      my $digest = $ENV{LAUNCHER_DIGEST};
+      s{(?m)^(\s*launcher:\n\s*path:\s*$path\s*\n\s*sha256:\s*)\S+}{$1$digest}
+        or die "could not update the configured managed-worker-launcher digest\\n";
+    ' "$CONFIG_FILE" >"$CONFIG_TMP"
+  chmod --reference="$CONFIG_FILE" "$CONFIG_TMP"
+  mv -f "$CONFIG_TMP" "$CONFIG_FILE"
+  trap - EXIT
+fi
 rm -f \
   "$INSTALL_DIR/cowd-auth-broker" \
   "$INSTALL_DIR/cowd-sandbox-launcher" \
@@ -82,6 +106,7 @@ cat >"$INSTALL_DIR/install.json" <<EOF
   "source_root": "$ROOT",
   "binary": "$INSTALL_DIR/cowd",
   "managed_worker_launcher": "$INSTALL_DIR/managed-worker-launcher",
+  "managed_worker_launcher_sha256": "$LAUNCHER_DIGEST",
   "process_model": "single_binary_multi_process"
 }
 EOF
