@@ -155,3 +155,35 @@ explicit `COWD_BIN` is treated as an operator-supplied immutable artifact and
 must already be executable. The next provider run is consequently bound to the
 current source candidate; this correction is not itself a passing real-model
 result.
+
+## 2026-08-23 fresh-binary fan-in execution result
+
+After the candidate-freshness repair, the strict scenario exposed and then
+closed two runtime defects: directory-scoped Focus verification incorrectly
+called `read_file` on the directory itself, and the Supervisor's direct child
+join omitted the child Team's terminal acceptance/artifact facts. The latter
+left a merge Team permanently blocked even when both producers had completed.
+
+Candidate `c5258653` was rebuilt into Gateway binary
+`0f1ab221478bbcfb1df7641053a6100cc5c908d18b8c95188a7e85308cb4ad9c`
+and then executed against real `qwen3.7-plus`. The structural collaboration
+sub-gate now passes: the public projection records three completed Teams, nine
+completed Agents, zero failed Agents/Teams, two claimed typed handoff edges,
+and a completed Program lifecycle. This is real execution evidence, not an
+inferred topology result.
+
+```text
+/tmp/cowd-real-qwen-evidence.ExlMS6/runs/v0.9.703-1787442943-mission-harness-deep/report.json
+sha256 984ae2561f7f27cb1d587387eee362c1d24f5fbd5844832602b1b18af1b8fe56
+
+live-scenarios/004-live_team_projection.json
+sha256 8aaaacad848e9f65d7a7f21bc5d9efc57af111596392446bef1501146203db8d
+```
+
+The whole suite remains failed and therefore does **not** close P6. Its
+remaining defect is the root final presentation: it retained an earlier model
+claim that the Teams could not start, although the canonical Program completed
+afterward. The architecture-quality evaluator correctly rejects that stale,
+contradictory text (5/9). The next repair must make root presentation consume
+the completed Program's canonical terminal result instead of an earlier model
+answer; weakening the quality gate would conceal the defect.
