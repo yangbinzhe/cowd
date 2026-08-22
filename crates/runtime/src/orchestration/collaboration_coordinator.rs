@@ -823,8 +823,10 @@ pub(crate) async fn reconcile_program_wait_state_with(
     Err("program_wait_conflict_exhausted".to_string())
 }
 
-/// Bounded startup reconciliation for Program terminal truth. This scans
+/// Bounded startup reconciliation for Program control truth. This scans
 /// durable graph cursors once; it neither starts workers nor polls Teams.
+/// A restarted non-terminal Program still needs its durable approval/admission
+/// wait state projected before the regular graph recovery pump resumes it.
 pub(crate) async fn reconcile_terminal_programs_on_startup(
     supervisor: &RuntimeExecutionSupervisor,
     graphs: &ExecutionGraphStateStore,
@@ -843,6 +845,7 @@ pub(crate) async fn reconcile_terminal_programs_on_startup(
             if examined >= limit {
                 break;
             }
+            reconcile_program_wait_state_with(graph_id, supervisor, graphs).await?;
             reconcile_terminal_program_with(graph_id, supervisor, graphs).await?;
             examined = examined.saturating_add(1);
         }

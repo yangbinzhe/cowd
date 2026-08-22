@@ -3148,6 +3148,107 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn startup_reconciliation_restores_live_program_approval_wait_state() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
+        let mut team = node("research", CapabilityRecipeId::Team, Vec::new());
+        team.template = Some("cowd/parallel-research-synthesis".to_string());
+        let mut request = proposal(vec![team]);
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut request);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let mut graph = services
+            .compile_graph_agent_intents(
+                compiler::compile_orchestration(
+                    "startup-program-wait",
+                    &request,
+                    &plan,
+                    None,
+                    Some(services.team_runtime().as_ref()),
+                )
+                .expect("Team Program compiles")
+                .graph,
+            )
+            .expect("Agent intents compile");
+        collaboration_coordinator::prepare_program_admission(
+            &mut graph,
+            services.team_runtime().as_ref(),
+        )
+        .expect("Program admission control compiles");
+        let node_id = graph.nodes[0].id.clone();
+        let graph = services
+            .commit_service()
+            .register_graph(graph)
+            .expect("register Program")
+            .graph;
+        let graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                &node_id,
+                harness_contract::execution_graph::ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("make Team root ready")
+            .graph;
+        let graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                &node_id,
+                harness_contract::execution_graph::ExecutionNodeStatus::Running,
+                None,
+                Vec::new(),
+            )
+            .expect("make Team root running")
+            .graph;
+        let graph = services
+            .commit_service()
+            .transition_node(
+                &graph,
+                &node_id,
+                harness_contract::execution_graph::ExecutionNodeStatus::WaitingApproval,
+                None,
+                Vec::new(),
+            )
+            .expect("persist approval wait")
+            .graph;
+
+        let examined = collaboration_coordinator::reconcile_terminal_programs_on_startup(
+            services.execution_supervisor().as_ref(),
+            services.graph_state_store(),
+            16,
+        )
+        .await
+        .expect("startup reconciliation");
+        assert_eq!(examined, 1);
+        let stored = services
+            .graph_state_store()
+            .load_async(&graph.id)
+            .await
+            .expect("load reconciled Program");
+        let control = &stored
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .expect("Program")
+            .control;
+        assert_eq!(
+            control.lifecycle,
+            harness_contract::execution_graph::CollaborationProgramLifecycle::AwaitingApproval
+        );
+        assert_eq!(
+            control.blocker_ref.as_deref(),
+            Some(format!("execution-node:{node_id}").as_str())
+        );
+    }
+
     #[test]
     fn add_team_patch_compiles_to_an_exact_active_program_revision() {
         let services = RuntimeServices::in_memory().expect("runtime services");
