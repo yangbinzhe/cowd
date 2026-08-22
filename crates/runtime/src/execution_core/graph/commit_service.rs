@@ -43,6 +43,8 @@ pub enum ExecutionCommitError {
     },
     #[error("execution graph command is not valid in the current state: {0}")]
     InvalidCommand(String),
+    #[error("execution graph registration was already applied for continuation root `{graph_id}`")]
+    AlreadyAppliedSame { graph_id: String },
     #[error("domain event attempted to mutate canonical graph stream `{0}`")]
     GraphStreamCollision(String),
     #[error("domain event for stream `{0}` has no stable idempotency key")]
@@ -670,27 +672,13 @@ impl ExecutionCommitService {
             })
             .transpose()?;
         if let Some(event) = continuation_event.as_ref() {
-            let key = event.idempotency_key.as_deref().ok_or_else(|| {
-                ExecutionCommitError::MissingDomainIdempotency(event.event.stream_id.clone())
-            })?;
-            if self
-                .event_store
-                .event_by_idempotency_key(&event.event.stream_id, key)?
-                .is_some()
-            {
-                return Err(ExecutionCommitError::InvalidCommand(format!(
-                    "continuation binding `{}` has already claimed a root graph",
-                    graph
-                        .continuation_binding
-                        .as_ref()
-                        .map(|binding| binding.binding_digest.as_str())
-                        .unwrap_or_default()
-                )));
+            if let Some(graph_id) = self.existing_continuation_root(event)? {
+                return Err(ExecutionCommitError::AlreadyAppliedSame { graph_id });
             }
         }
         let domain_events = lineage_event
             .into_iter()
-            .chain(continuation_event)
+            .chain(continuation_event.clone())
             .collect::<Vec<_>>();
         let mut last_lineage_conflict = None;
         for _ in 0..8 {
@@ -709,7 +697,18 @@ impl ExecutionCommitService {
                 {
                     last_lineage_conflict = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    // A racing retry can lose after the preflight lookup.
+                    // Re-read the immutable continuation claim before
+                    // exposing a failure, so callers resume the durable
+                    // winner rather than creating or reporting a second root.
+                    if let Some(event) = continuation_event.as_ref() {
+                        if let Some(graph_id) = self.existing_continuation_root(event)? {
+                            return Err(ExecutionCommitError::AlreadyAppliedSame { graph_id });
+                        }
+                    }
+                    return Err(error);
+                }
             }
         }
         Err(last_lineage_conflict.unwrap_or_else(|| {
@@ -717,6 +716,35 @@ impl ExecutionCommitService {
                 "lineage registration retry exhausted without a conflict receipt".to_string(),
             )
         }))
+    }
+
+    /// Return the root selected by an immutable continuation CAS claim. The
+    /// idempotency key already includes ingress and binding digest, so this is
+    /// only an `AlreadyAppliedSame` result, never a fuzzy duplicate match.
+    fn existing_continuation_root(
+        &self,
+        event: &RuntimeTransactionEventInput,
+    ) -> Result<Option<String>, ExecutionCommitError> {
+        let key = event.idempotency_key.as_deref().ok_or_else(|| {
+            ExecutionCommitError::MissingDomainIdempotency(event.event.stream_id.clone())
+        })?;
+        let Some(existing) = self
+            .event_store
+            .event_by_idempotency_key(&event.event.stream_id, key)?
+        else {
+            return Ok(None);
+        };
+        let graph_id = existing
+            .payload
+            .pointer("/root_graph_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ExecutionCommitError::InvalidCommand(
+                    "existing continuation claim has no durable root graph id".to_string(),
+                )
+            })?;
+        Ok(Some(graph_id.to_string()))
     }
 
     pub async fn register_graph_async(
@@ -3756,6 +3784,7 @@ mod tests {
             team_set_ref: "team_graph:team-previous".to_string(),
             delivery_revision: 9,
             result_refs: vec!["team_graph:team-previous".to_string()],
+            handoff_id: None,
         };
         let binding = crate::compile_continuation_binding(
             &candidate,
@@ -3771,7 +3800,7 @@ mod tests {
         graph.continuation_binding = Some(binding.clone());
 
         let receipt = service.register_graph(graph).expect("atomic registration");
-        assert_eq!(receipt.graph.continuation_binding, Some(binding));
+        assert_eq!(receipt.graph.continuation_binding, Some(binding.clone()));
         let claim = store
             .list_stream("continuation-cas")
             .expect("claim stream")
@@ -3793,6 +3822,23 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("root-current")
         );
+
+        let mut retry = ExecutionGraph::new("continue verified Team work");
+        retry.id = "root-retry-must-not-exist".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut retry);
+        retry.continuation_binding = Some(binding);
+        let error = match service.register_graph(retry) {
+            Ok(_) => panic!("continuation retry must return the existing root"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ExecutionCommitError::AlreadyAppliedSame { ref graph_id } if graph_id == "root-current"
+        ));
+        assert!(store
+            .list_stream("root-retry-must-not-exist")
+            .expect("retry graph stream")
+            .is_empty());
     }
 
     fn register_waiting_child_join(service: &ExecutionCommitService) -> ExecutionGraph {

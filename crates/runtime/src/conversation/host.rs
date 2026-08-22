@@ -109,6 +109,10 @@ pub struct TurnIngressRef {
     pub claim_owner: String,
     pub claim_token: String,
     pub claim_revision: u64,
+    /// Runtime-owned route hint for a durable SessionHandoff. This arrives
+    /// only from the persisted Session outbox, never from request text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_id: Option<String>,
 }
 
 /// Inputs required to build a standard provider-backed runtime host.
@@ -809,6 +813,41 @@ fn resolve_turn_continuation_binding(
 ) -> Result<Option<CollaborationContinuationBinding>, RuntimeError> {
     use harness_contract::strategy::CollaborationReference;
 
+    let explicit_handoff_id = ingress.and_then(|ingress| ingress.handoff_id.as_deref());
+    if let Some(handoff_id) = explicit_handoff_id {
+        let Some(policy) = services.session_execution_policy(session_id) else {
+            return Err(RuntimeError::new(
+                "cross-session continuation requires an active target Session policy",
+            ));
+        };
+        let Some((candidate, candidate_revision)) =
+            crate::orchestration::collaboration_continuation::accepted_cross_session_candidate(
+                services.event_store(),
+                session_id,
+                handoff_id,
+            )
+            .map_err(RuntimeError::new)?
+        else {
+            return Err(RuntimeError::new(
+                "cross-session continuation handoff is absent or is not accepted for this Session",
+            ));
+        };
+        let current_ingress = ingress.map_or_else(
+            || format!("session:{session_id}:turn:{turn_ref}"),
+            |ingress| ingress.request_id.clone(),
+        );
+        let binding = crate::compile_continuation_binding(
+            &candidate,
+            &current_ingress,
+            candidate_revision,
+            ContinuationAuthorization::Authorized,
+            policy.revision,
+        )
+        .map_err(RuntimeError::new)?;
+        crate::ensure_reauthorized(&binding, session_id, true, policy.revision)
+            .map_err(RuntimeError::new)?;
+        return Ok(Some(binding));
+    }
     match reference {
         CollaborationReference::None => Ok(None),
         CollaborationReference::LatestEligible => {

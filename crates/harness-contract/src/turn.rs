@@ -242,6 +242,11 @@ pub struct CollaborationContinuationBinding {
     pub binding_digest: String,
     pub authorization: ContinuationAuthorization,
     pub authorization_revision: u64,
+    /// Present only when Runtime derived this binding from a durable,
+    /// accepted cross-session `SessionHandoff`. It is an authority reference,
+    /// never a user-supplied conversation identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_id: Option<String>,
 }
 
 /// Typed continuation authorization state.

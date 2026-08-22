@@ -5,7 +5,10 @@
 //! a typed handoff reference; same-session candidates are ordered by recency
 //! and a CAS claim guarantees one new root per continuation digest+ingress.
 
-use harness_contract::turn::{CollaborationContinuationBinding, ContinuationAuthorization};
+use harness_contract::turn::{
+    CollaborationContinuationBinding, ContinuationAuthorization, SessionHandoff,
+};
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -26,6 +29,9 @@ pub struct ContinuationCandidate {
     pub team_set_ref: String,
     pub delivery_revision: u64,
     pub result_refs: Vec<String>,
+    /// A durable accepted cross-session handoff authorizing this candidate.
+    /// Same-session candidates intentionally leave this empty.
+    pub handoff_id: Option<String>,
 }
 
 /// Candidate ordering: current active/recoverable root (0), latest same
@@ -110,6 +116,7 @@ pub fn compile_continuation_binding(
         binding_digest: String::new(),
         authorization,
         authorization_revision,
+        handoff_id: candidate.handoff_id.clone(),
     };
     binding.binding_digest = continuation_digest(&binding)?;
     Ok(binding)
@@ -209,6 +216,7 @@ pub fn latest_same_session_candidate(
                 // mutable graph revision is intentionally not consulted.
                 delivery_revision: event.sequence,
                 result_refs,
+                handoff_id: None,
             },
             event.sequence,
         )));
@@ -228,6 +236,7 @@ fn continuation_digest(binding: &CollaborationContinuationBinding) -> Result<Str
         "candidate_revision": binding.candidate_revision,
         "authorization": binding.authorization,
         "authorization_revision": binding.authorization_revision,
+        "handoff_id": binding.handoff_id,
     });
     Ok(format!(
         "{:x}",
@@ -326,13 +335,92 @@ pub fn ensure_reauthorized(
             binding.authorization_revision
         ));
     }
-    if binding.source_session_id != current_session_id && !cross_session_allowed {
-        return Err(format!(
-            "cross-session continuation requires an explicit typed handoff reference (source session `{}`)",
-            binding.source_session_id
-        ));
+    if binding.source_session_id != current_session_id {
+        if !cross_session_allowed || binding.handoff_id.as_deref().is_none_or(str::is_empty) {
+            return Err(format!(
+                "cross-session continuation requires an explicit typed handoff reference (source session `{}`)",
+                binding.source_session_id
+            ));
+        }
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AcceptedSessionHandoff {
+    handoff: SessionHandoff,
+    request_id: String,
+    source_graph_id: String,
+}
+
+/// Resolve a cross-session continuation only from the immutable acceptance
+/// event written by `SessionDispatchNodeExecutor`. A handoff id received at
+/// ingress is merely a lookup key; this function validates target Session and
+/// returns only the handoff's authorized evidence references.
+pub fn accepted_cross_session_candidate(
+    store: &RuntimeEventStore,
+    target_session_id: &str,
+    handoff_id: &str,
+) -> Result<Option<(ContinuationCandidate, u64)>, String> {
+    if target_session_id.trim().is_empty() || handoff_id.trim().is_empty() {
+        return Err(
+            "cross-session continuation requires target session and handoff id".to_string(),
+        );
+    }
+    for stream_id in store
+        .stream_ids_for_scope(RuntimeEventScope::SessionInput)
+        .map_err(|error| error.to_string())?
+    {
+        if !stream_id.starts_with("session-handoff-target:") {
+            continue;
+        }
+        for event in store
+            .list_stream(&stream_id)
+            .map_err(|error| error.to_string())?
+        {
+            if event.kind != "session.handoff.accepted.v1" {
+                continue;
+            }
+            let accepted: AcceptedSessionHandoff =
+                serde_json::from_value(event.payload).map_err(|error| error.to_string())?;
+            let handoff = accepted.handoff;
+            // Older dispatches stored correlation_id in TaskRouteHint while
+            // the externally visible handoff id remained canonical. Accept
+            // either durable identity, but persist the canonical handoff id.
+            if handoff.target_session_id != target_session_id
+                || (handoff.handoff_id != handoff_id && handoff.correlation_id != handoff_id)
+            {
+                continue;
+            }
+            let mut result_refs = handoff
+                .evidence_refs
+                .iter()
+                .filter(|reference| reference.is_durable())
+                .map(|reference| {
+                    format!(
+                        "evidence:{}:{}",
+                        reference.evidence_ref.ref_type, reference.evidence_ref.id
+                    )
+                })
+                .collect::<Vec<_>>();
+            result_refs.push(format!("session_handoff:{}", handoff.handoff_id));
+            result_refs.sort();
+            result_refs.dedup();
+            return Ok(Some((
+                ContinuationCandidate {
+                    source_session_id: handoff.source_session_id,
+                    source_turn_id: accepted.request_id,
+                    source_root_id: accepted.source_graph_id,
+                    team_set_ref: format!("session_handoff:{}", handoff.handoff_id),
+                    delivery_revision: event.sequence,
+                    result_refs,
+                    handoff_id: Some(handoff.handoff_id),
+                },
+                event.sequence,
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// CAS claim for one continuation root. Exactly one concurrent caller wins;
@@ -393,6 +481,7 @@ mod tests {
             team_set_ref: format!("team-set:{root}"),
             delivery_revision: 3,
             result_refs: vec![format!("result:{root}")],
+            handoff_id: None,
         }
     }
 
@@ -459,7 +548,9 @@ mod tests {
             ensure_reauthorized(&first, "session-2", false, 42).is_err(),
             "cross-session without explicit handoff fails closed"
         );
-        ensure_reauthorized(&first, "session-2", true, 42).expect("explicit handoff");
+        let mut cross_session = first.clone();
+        cross_session.handoff_id = Some("handoff-1".to_string());
+        ensure_reauthorized(&cross_session, "session-2", true, 42).expect("explicit handoff");
 
         let mut revoked = first.clone();
         revoked.authorization = ContinuationAuthorization::Revoked;
@@ -475,6 +566,66 @@ mod tests {
         assert!(
             claim_continuation_root(&store, "ingress-2", "digest-1").expect("different ingress")
         );
+    }
+
+    #[test]
+    fn accepted_cross_session_handoff_is_the_only_cross_session_candidate_source() {
+        let store = RuntimeEventStore::try_open_in_memory().expect("event store");
+        let handoff = SessionHandoff {
+            handoff_id: "handoff-authorized".to_string(),
+            source_session_id: "session-source".to_string(),
+            target_session_id: "session-target".to_string(),
+            objective: "continue only the durable handoff evidence".to_string(),
+            scope: vec!["read:evidence".to_string()],
+            acceptance: vec!["report evidence gaps".to_string()],
+            context_lens: Vec::new(),
+            evidence_refs: Vec::new(),
+            context_budget_lease: None,
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+            deadline_at_ms: None,
+            priority: 1,
+            correlation_id: "handoff-correlation".to_string(),
+            result_contract: "evidence-backed continuation".to_string(),
+            task_route_hint: None,
+        };
+        store
+            .append(RuntimeEventInput {
+                stream_id: "session-handoff-target:request-target".to_string(),
+                scope: RuntimeEventScope::SessionInput,
+                kind: "session.handoff.accepted.v1".to_string(),
+                status: Some("queued".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: json!({
+                    "handoff": handoff,
+                    "request_id": "request-target",
+                    "receipt": {},
+                    "source_graph_id": "source-root",
+                    "source_node_id": "source-dispatch",
+                }),
+            })
+            .expect("accepted handoff event");
+        let (candidate, revision) =
+            accepted_cross_session_candidate(&store, "session-target", "handoff-correlation")
+                .expect("lookup")
+                .expect("accepted target handoff");
+        assert_eq!(candidate.source_root_id, "source-root");
+        assert_eq!(candidate.handoff_id.as_deref(), Some("handoff-authorized"));
+        assert!(
+            accepted_cross_session_candidate(&store, "other-session", "handoff-authorized")
+                .expect("lookup")
+                .is_none()
+        );
+        let binding = compile_continuation_binding(
+            &candidate,
+            "ingress-target",
+            revision,
+            ContinuationAuthorization::Authorized,
+            4,
+        )
+        .expect("binding");
+        ensure_reauthorized(&binding, "session-target", true, 4)
+            .expect("accepted handoff authorizes cross-session continuation");
     }
 
     fn append_outcome(

@@ -2166,6 +2166,10 @@ impl RuntimeService {
                         record.request_id
                     )
                 })?,
+                handoff_id: record
+                    .task_route_hint
+                    .as_ref()
+                    .and_then(|hint| hint.handoff_id.clone()),
             };
         let ingress_options = match record
             .runtime_options_json

@@ -382,7 +382,15 @@ impl ExecutionGraphRunner {
         self.ensure_mutation_allowed()?;
         validate_execution_graph(&graph)?;
         self.registry.validate_graph(&graph)?;
-        Ok(self.commit_service.register_graph_async(graph).await?.graph)
+        match self.commit_service.register_graph_async(graph).await {
+            Ok(receipt) => Ok(receipt.graph),
+            Err(ExecutionCommitError::AlreadyAppliedSame { graph_id }) => self
+                .state_store
+                .load_async(graph_id)
+                .await
+                .map_err(ExecutionRunnerError::from),
+            Err(error) => Err(error.into()),
+        }
     }
 
     #[cfg(test)]

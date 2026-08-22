@@ -132,10 +132,12 @@ impl NodeExecutor for TeamSubgraphExecutor {
             }
         }
         if let Some(binding) = context.graph.continuation_binding.as_ref() {
-            if binding.source_session_id != request.lineage.session_id {
+            if binding.source_session_id != request.lineage.session_id
+                && binding.handoff_id.as_deref().is_none_or(str::is_empty)
+            {
                 return Err(NodeExecutorError::Invalid {
                     node_id: context.node.id.clone(),
-                    reason: "continuation source Session does not match the Team child lineage"
+                    reason: "cross-session continuation lacks a durable accepted handoff"
                         .to_string(),
                 });
             }
