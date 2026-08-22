@@ -890,6 +890,9 @@ impl TeamInstantiationService {
             TeamTemplateSelector::Default { template_id } => {
                 (template_id.clone(), RevisionSelector::DefaultPointer)
             }
+            TeamTemplateSelector::Ephemeral { snapshot } => {
+                return self.resolve_ephemeral_template(request, snapshot);
+            }
             TeamTemplateSelector::Automatic => {
                 let template = if request
                     .resource_scopes
@@ -941,6 +944,72 @@ impl TeamInstantiationService {
             .resolve_team(&template_id, selector)
             .map(|resolved| (resolved, None))
             .map_err(|error| error.to_string())
+    }
+
+    fn resolve_ephemeral_template(
+        &self,
+        request: &TeamInstantiationRequest,
+        snapshot: &harness_contract::execution_graph::EphemeralTeamTemplateSnapshot,
+    ) -> Result<
+        (
+            crate::team_definition::ResolvedTeamTemplate,
+            Option<EvolutionReleaseAssignment>,
+        ),
+        String,
+    > {
+        snapshot.validate()?;
+        if snapshot.session_id != request.lineage.session_id
+            || snapshot.turn_id != request.lineage.turn_id
+        {
+            return Err("ephemeral_template_scope_mismatch".to_string());
+        }
+        if snapshot.expires_at_ms <= crate::tool_invocation::now_ms() {
+            return Err("ephemeral_template_expired".to_string());
+        }
+        let expected_fence = format!(
+            "task:{}:turn:{}",
+            request.lineage.root_task_id, request.lineage.turn_id
+        );
+        if snapshot.terminal_fence != expected_fence {
+            return Err("ephemeral_template_terminal_fence_mismatch".to_string());
+        }
+        let (revision, normalized_markdown) = crate::team_definition::build_revision(
+            snapshot.revision.manifest.clone(),
+            &snapshot.team_markdown,
+        )
+        .map_err(|error| format!("ephemeral_template_invalid:{error}"))?;
+        if revision != snapshot.revision || revision.content_digest != snapshot.template_digest {
+            return Err("ephemeral_template_revision_digest_mismatch".to_string());
+        }
+        for role in &revision.manifest.roles {
+            let RevisionSelector::ExactApprovedRevision { revision } = role.agent_selector else {
+                return Err(format!(
+                    "ephemeral_template_role_agent_not_exact:{}",
+                    role.role_id
+                ));
+            };
+            self.registry
+                .resolve_agent(
+                    &role.agent_definition_id,
+                    RevisionSelector::ExactApprovedRevision { revision },
+                )
+                .map_err(|error| {
+                    format!(
+                        "ephemeral_template_role_agent_unavailable:{}:{error}",
+                        role.role_id
+                    )
+                })?;
+        }
+        Ok((
+            crate::team_definition::ResolvedTeamTemplate {
+                revision: snapshot.revision.clone(),
+                team_markdown: normalized_markdown,
+                selected_by: RevisionSelector::ExactApprovedRevision {
+                    revision: snapshot.revision.revision_ref.revision,
+                },
+            },
+            None,
+        ))
     }
 }
 

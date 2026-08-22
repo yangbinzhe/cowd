@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use harness_contract::execution_graph::{
     CollaborationProgram, ExecutionCompletionContract, ExecutionDependencyPolicy,
@@ -142,6 +143,16 @@ pub struct RuntimeOrchestrationCommand {
     pub inspect_execution_id: Option<String>,
     pub proposal: Option<GraphMutationProposal>,
     pub template_proposal: Option<serde_json::Value>,
+    /// Runtime-owned session-scoped templates keyed by semantic Team node.
+    /// Model JSON cannot populate this map; a Coordinator attaches a
+    /// validated immutable snapshot before semantic compilation.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        skip_deserializing
+    )]
+    pub ephemeral_team_templates:
+        BTreeMap<String, harness_contract::execution_graph::EphemeralTeamTemplateSnapshot>,
     pub control: Option<RuntimeControlRequest>,
     pub input_disposition: Option<ModelInputDispositionBatch>,
     pub selection_mode: Option<TeamSelectionMode>,
@@ -168,6 +179,7 @@ impl RuntimeOrchestrationCommand {
             inspect_execution_id: input.inspect_execution_id,
             proposal: input.proposal.map(Into::into),
             template_proposal: input.template_proposal,
+            ephemeral_team_templates: BTreeMap::new(),
             control: input.control,
             input_disposition: input.input_disposition,
             selection_mode: binding.selection_mode,

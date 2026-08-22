@@ -23,3 +23,4 @@ pub use store::{
 };
 
 pub(crate) use bootstrap::{bootstrap_builtin_teams, BuiltinTeamTrust};
+pub(crate) use validation::build_revision;

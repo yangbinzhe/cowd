@@ -35,6 +35,7 @@ use harness_contract::policy::{
 use serde_json::{json, Value};
 
 const MAX_REVISION_CAS_ATTEMPTS: usize = 3;
+const EPHEMERAL_TEMPLATE_TTL_MS: u64 = 60 * 60 * 1000;
 
 pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
@@ -106,6 +107,127 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
     .await
 }
 
+/// Apply a typed AddTeam patch through the same bounded Coordinator submit
+/// path as every other semantic revision. Callers cannot provide graph nodes,
+/// executors or mutable Team identities.
+pub async fn submit_collaboration_add_team_patch(
+    graph_id: &str,
+    patch: &harness_contract::execution_graph::CollaborationIntentPatch,
+    services: &RuntimeServices,
+) -> Result<RuntimeOrchestrationResult, String> {
+    let graph = services
+        .graph_state_store()
+        .load_async(graph_id)
+        .await
+        .map_err(|error| format!("patch_target_load_failed:{error}"))?;
+    let request = collaboration_coordinator::compile_add_team_patch(&graph, patch)?;
+    Ok(submit_runtime_orchestration_request_controlled(
+        request,
+        None,
+        services,
+        graph.parent_execution,
+        None,
+    )
+    .await)
+}
+
+/// Admit a managed-Agent escalation through its parent Program only.  The
+/// caller supplies the Runtime-attested attempt fence; an Agent-provided
+/// `source_attempt` is never trusted by itself.  This intentionally has no
+/// route for creating a child root graph.
+pub async fn submit_collaboration_escalation(
+    graph_id: &str,
+    expected_source_attempt: &str,
+    escalation: &harness_contract::execution_graph::CollaborationEscalationRequest,
+    services: &RuntimeServices,
+) -> Result<RuntimeOrchestrationResult, String> {
+    escalation.validate()?;
+    if escalation.source_attempt != expected_source_attempt {
+        return Err("collaboration_escalation_source_attempt_mismatch".to_string());
+    }
+    let graph = services
+        .graph_state_store()
+        .load_async(graph_id)
+        .await
+        .map_err(|error| format!("escalation_target_load_failed:{error}"))?;
+    let program_id = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+        .map(|program| program.program_id.clone())
+        .ok_or_else(|| "escalation_target_has_no_collaboration_program".to_string())?;
+    let mut patch = escalation.as_add_team_patch(program_id);
+    if let Some(template_proposal) = escalation.template_proposal.clone() {
+        attach_escalated_ephemeral_template(&graph, &mut patch, template_proposal, services)?;
+    }
+    submit_collaboration_add_team_patch(graph_id, &patch, services).await
+}
+
+fn attach_escalated_ephemeral_template(
+    graph: &ExecutionGraph,
+    patch: &mut harness_contract::execution_graph::CollaborationIntentPatch,
+    template_proposal: serde_json::Value,
+    services: &RuntimeServices,
+) -> Result<(), String> {
+    let harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam { team } =
+        &mut patch.operation
+    else {
+        return Err("escalation_template_requires_add_team_operation".to_string());
+    };
+    if team.ephemeral_template.is_some() {
+        return Err("escalation_template_snapshot_must_be_runtime_owned".to_string());
+    }
+    let seed = graph
+        .nodes
+        .iter()
+        .find_map(|node| {
+            serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+                &node.payload_ref,
+            )
+            .ok()
+        })
+        .ok_or_else(|| "escalation_template_parent_has_no_team_lineage_seed".to_string())?;
+    let policy_ref = services
+        .session_execution_policy(&seed.lineage.session_id)
+        .map(|policy| {
+            format!(
+                "session:{}:policy:{}",
+                seed.lineage.session_id, policy.revision
+            )
+        })
+        .unwrap_or_else(|| format!("session:{}:unversioned", seed.lineage.session_id));
+    team.ephemeral_template = Some(compile_ephemeral_team_template_snapshot(
+        template_proposal,
+        &seed.lineage,
+        seed.permission_ceiling,
+        policy_ref,
+        crate::tool_invocation::now_ms().saturating_add(EPHEMERAL_TEMPLATE_TTL_MS),
+        services,
+    )?);
+    Ok(())
+}
+
+/// Produce a session/turn-bound custom Team snapshot without publishing a
+/// reusable catalog revision. Callers must attach the returned snapshot to a
+/// Coordinator-owned semantic Team request; it is not itself executable.
+pub fn compile_ephemeral_team_template_snapshot(
+    proposal_value: serde_json::Value,
+    lineage: &harness_contract::execution_graph::ExecutionGraphLineage,
+    permission_ceiling: harness_contract::policy::PermissionMode,
+    policy_ref: String,
+    expires_at_ms: u64,
+    services: &RuntimeServices,
+) -> Result<harness_contract::execution_graph::EphemeralTeamTemplateSnapshot, String> {
+    collaboration_coordinator::compile_ephemeral_team_template_snapshot(
+        proposal_value,
+        lineage,
+        permission_ceiling,
+        policy_ref,
+        expires_at_ms,
+        services,
+    )
+}
+
 pub(crate) async fn admit_runtime_orchestration_request_background(
     request: RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
@@ -138,6 +260,9 @@ async fn submit_runtime_orchestration_request_with_mode(
     submission_mode: OrchestrationSubmissionMode,
 ) -> RuntimeOrchestrationResult {
     bind_strategy(&mut request, leased_decision, parent_execution.as_ref());
+    if let Err(error) = materialize_ephemeral_team_template(&mut request, services) {
+        return rejected_ephemeral_template_result(&request, error);
+    }
     let understanding = leased_decision
         .map(|decision| decision.strategy.understanding.clone())
         .unwrap_or_else(|| planner::understand_runtime_orchestration_request(&request));
@@ -324,6 +449,84 @@ async fn submit_runtime_orchestration_request_with_mode(
             result_without_runtime_with_id(&request_id, &request, decision)
         }
     }
+}
+
+/// Materialize the narrow model-facing custom-Team path.  Model JSON provides
+/// only semantic topology and template content; Runtime alone creates the
+/// immutable snapshot and binds it to the authenticated session/turn lineage.
+fn materialize_ephemeral_team_template(
+    request: &mut RuntimeOrchestrationCommand,
+    services: &RuntimeServices,
+) -> Result<(), String> {
+    let Some(template_proposal) = request.template_proposal.take() else {
+        return Ok(());
+    };
+    if request.operation != RuntimeOrchestrationOperation::Propose {
+        request.template_proposal = Some(template_proposal);
+        return Ok(());
+    }
+    if !request.ephemeral_team_templates.is_empty() {
+        return Err("ephemeral_template_already_materialized".to_string());
+    }
+    let lineage = request
+        .lineage
+        .as_ref()
+        .ok_or_else(|| "ephemeral_template_requires_bound_lineage".to_string())?;
+    let proposal = request
+        .proposal
+        .as_ref()
+        .ok_or_else(|| "ephemeral_template_requires_graph_proposal".to_string())?;
+    if proposal.target_execution_id.is_some() {
+        return Err("ephemeral_template_rejects_existing_graph_target".to_string());
+    }
+    let team_nodes = proposal
+        .nodes
+        .iter()
+        .filter(|node| node.recipe == CapabilityRecipeId::Team)
+        .collect::<Vec<_>>();
+    let [team_node] = team_nodes.as_slice() else {
+        return Err("ephemeral_template_requires_exactly_one_team_node".to_string());
+    };
+    if team_node.template.is_some() {
+        return Err("ephemeral_template_rejects_catalog_template_selector".to_string());
+    }
+    let policy_ref = request
+        .session_id
+        .as_deref()
+        .and_then(|session_id| {
+            services
+                .session_execution_policy(session_id)
+                .map(|policy| format!("session:{session_id}:policy:{}", policy.revision))
+        })
+        .unwrap_or_else(|| format!("session:{}:unversioned", lineage.session_id));
+    let snapshot = compile_ephemeral_team_template_snapshot(
+        template_proposal,
+        lineage,
+        request.constraints.permission_ceiling,
+        policy_ref,
+        crate::tool_invocation::now_ms().saturating_add(EPHEMERAL_TEMPLATE_TTL_MS),
+        services,
+    )?;
+    request
+        .ephemeral_team_templates
+        .insert(team_node.node_id.clone(), snapshot);
+    Ok(())
+}
+
+fn rejected_ephemeral_template_result(
+    request: &RuntimeOrchestrationCommand,
+    finding: String,
+) -> RuntimeOrchestrationResult {
+    let plan = planner::plan_runtime_orchestration(request);
+    let mut decision = validator::validate_request(
+        request,
+        &plan.execution_decision,
+        plan.model_proposal.as_ref(),
+        None,
+    );
+    decision.status = "rejected".to_string();
+    decision.validation_findings.push(finding);
+    result_without_runtime(request, decision)
 }
 
 async fn propose_template(
@@ -921,6 +1124,21 @@ async fn revise(
                 graph.revision
             ));
         }
+        // A CollaborationIntentPatch is fenced both by its Program revision
+        // (checked when compiled) and by this root-graph revision.  Generic
+        // semantic revisions may be safely recompiled after an unrelated
+        // graph transition, but a live-program patch must never silently
+        // rebase: its source Agent made the decision against an exact durable
+        // topology.  The prefix is private to `compile_add_team_patch`; model
+        // JSON cannot acquire a more permissive path by choosing it.
+        if proposal.mutation_id.starts_with("program-patch:")
+            && graph.revision != requested_base_revision
+        {
+            return Err(format!(
+                "patch_graph_revision_conflict:requested={requested_base_revision}:actual={}",
+                graph.revision
+            ));
+        }
         let existing_ids = graph
             .nodes
             .iter()
@@ -986,6 +1204,15 @@ async fn revise(
             Some(&mutation.semantic_node_instances),
         )
         .map_err(|error| format!("semantic_revision_program_failed:{error}"))?;
+        if let Some(delta) = collaboration_program.as_mut() {
+            collaboration_coordinator::prepare_program_revision_admission(
+                &graph,
+                delta,
+                mutation.nodes.clone(),
+                services.team_runtime().as_ref(),
+            )
+            .map_err(|error| format!("semantic_revision_admission_failed:{error}"))?;
+        }
         if let (Some(delta), Some(existing)) = (
             collaboration_program.as_mut(),
             graph
@@ -2049,6 +2276,7 @@ mod tests {
             }),
             control: None,
             template_proposal: None,
+            ephemeral_team_templates: Default::default(),
 
             input_disposition: None,
             selection_mode: None,
@@ -2120,6 +2348,79 @@ mod tests {
     }
 
     #[test]
+    fn propose_with_custom_template_materializes_a_turn_bound_team_snapshot() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
+        let mut team = node(
+            "independent-assessment",
+            CapabilityRecipeId::Team,
+            Vec::new(),
+        );
+        team.objective = "independently assess the bounded evidence".to_string();
+        team.output_artifacts = vec!["assessment".to_string()];
+        team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
+        let mut request = proposal(vec![team]);
+        request.template_proposal = Some(json!({
+            "template_id": "cowd/turn-scoped-independent-assessment",
+            "name": "Turn scoped independent assessment",
+            "team_display_name": "独立评估",
+            "roles": [{
+                "role_id": "evidence_assessor",
+                "display_name": "证据评估师",
+                "responsibility": "独立检查已授权证据并报告不确定性",
+                "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                "grant_ceiling": ["read"],
+                "fixed_count": 1,
+                "acceptance": ["summary", "evidence"],
+                "behavior": [{"kind": "reacquire_evidence", "required": true}]
+            }],
+            "result_fields": ["summary", "evidence"],
+            "evidence_required": true,
+            "instructions": "# 独立评估\n\n只使用已授权证据，清楚列出不确定性。"
+        }));
+
+        materialize_ephemeral_team_template(&mut request, &services)
+            .expect("normal propose ingress materializes the snapshot");
+        assert!(request.template_proposal.is_none());
+        let snapshot = request
+            .ephemeral_team_templates
+            .get("independent-assessment")
+            .expect("snapshot is owned by the Team node");
+        assert_eq!(snapshot.session_id, "session-v621");
+        assert_eq!(snapshot.turn_id, "turn-v621");
+        assert!(services
+            .definition_registry()
+            .resolve_team(
+                &snapshot.revision.revision_ref.template_id,
+                harness_contract::agent::RevisionSelector::LatestApprovedStable,
+            )
+            .is_err());
+
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut request);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "turn-scoped-custom-team",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("the normal propose compiler uses the snapshot");
+        let child_request: harness_contract::team::TeamInstantiationRequest =
+            serde_json::from_str(&compiled.graph.nodes[0].payload_ref)
+                .expect("typed Team child request");
+        assert!(matches!(
+            child_request.template_selector,
+            harness_contract::team::TeamTemplateSelector::Ephemeral { .. }
+        ));
+    }
+
+    #[test]
     fn semantic_contract_rejects_physical_executor_injection() {
         let parsed = serde_json::from_value::<RuntimeOrchestrationCommand>(json!({
             "intent": "inject executor",
@@ -2136,6 +2437,20 @@ mod tests {
             }
         }));
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn semantic_contract_cannot_deserialize_runtime_owned_ephemeral_snapshots() {
+        let mut encoded = serde_json::to_value(proposal(vec![node(
+            "team",
+            CapabilityRecipeId::Team,
+            Vec::new(),
+        )]))
+        .expect("serialize semantic request");
+        encoded["ephemeral_team_templates"] = json!({"team": {"forged": true}});
+        let parsed: RuntimeOrchestrationCommand =
+            serde_json::from_value(encoded).expect("Runtime-owned field is ignored at boundary");
+        assert!(parsed.ephemeral_team_templates.is_empty());
     }
 
     #[test]
@@ -2831,6 +3146,218 @@ mod tests {
             obligation.state == harness_contract::execution_graph::TeamAdmissionState::Admitted
                 && obligation.child_graph_ref.is_some()
         }));
+    }
+
+    #[test]
+    fn add_team_patch_compiles_to_an_exact_active_program_revision() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
+        let mut seed_team = node("research", CapabilityRecipeId::Team, Vec::new());
+        seed_team.objective = "collect the bounded research evidence".to_string();
+        seed_team.output_artifacts = vec!["research".to_string()];
+        seed_team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
+        let mut seed_request = proposal(vec![seed_team]);
+        seed_request.template_proposal = Some(serde_json::json!({
+            "template_id": "cowd/ephemeral-research-parent",
+            "name": "临时研究父团队",
+            "team_display_name": "研究",
+            "roles": [{
+                "role_id": "evidence_researcher",
+                "display_name": "证据研究员",
+                "responsibility": "收集并校验授权范围内的研究证据",
+                "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                "grant_ceiling": ["read"],
+                "fixed_count": 1,
+                "acceptance": ["summary", "evidence"],
+                "behavior": [{"kind": "reacquire_evidence", "required": true}]
+            }],
+            "result_fields": ["summary", "evidence"],
+            "evidence_required": true,
+            "instructions": "# 临时研究\n\n仅收集授权范围内的证据。"
+        }));
+        materialize_ephemeral_team_template(&mut seed_request, &services)
+            .expect("custom parent Team snapshot materializes");
+        seed_request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
+            decision_id: "patch-seed".to_string(),
+            decision_revision: 1,
+            decision_lease: "patch-seed-lease".to_string(),
+            turn_ref: "turn-v621".to_string(),
+        });
+        team_authority::bind_semantic_resource_authority(
+            &mut seed_request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut seed_request);
+        let seed_plan = planner::plan_runtime_orchestration(&seed_request);
+        let mut seed_graph = services
+            .compile_graph_agent_intents(
+                compiler::compile_orchestration(
+                    "patch-seed",
+                    &seed_request,
+                    &seed_plan,
+                    None,
+                    Some(services.team_runtime().as_ref()),
+                )
+                .expect("seed Team program compiles")
+                .graph,
+            )
+            .expect("seed Agent intents compile");
+        collaboration_coordinator::prepare_program_admission(
+            &mut seed_graph,
+            services.team_runtime().as_ref(),
+        )
+        .expect("seed Program admission compiles");
+        let registered = services
+            .commit_service()
+            .register_graph(seed_graph)
+            .expect("register active Program")
+            .graph;
+        let program = registered
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .expect("registered Program");
+        let escalation = harness_contract::execution_graph::CollaborationEscalationRequest {
+            base_revision: program.revision,
+            source_attempt: "team-agent:research:attempt:1".to_string(),
+            request_kind: "add_team".to_string(),
+            reason: "independent evidence review is required".to_string(),
+            evidence_refs: Vec::new(),
+            digest: "d".repeat(64),
+            requested_add_team: Some(
+                harness_contract::execution_graph::CollaborationEscalationAddTeam {
+                    semantic_node_id: "independent-review".to_string(),
+                    objective: "independently review the bounded research evidence".to_string(),
+                    depends_on: vec!["research".to_string()],
+                    resource_scopes: vec!["network:*".to_string()],
+                    output_artifacts: vec!["independent-review".to_string()],
+                    evidence_contract: vec!["summary".to_string(), "evidence".to_string()],
+                    required: true,
+                    parallelism_hint: 1,
+                },
+            ),
+            template_proposal: Some(serde_json::json!({
+                "template_id": "cowd/independent-review-snapshot",
+                "name": "独立审查团队",
+                "team_display_name": "独立审查",
+                "roles": [{
+                    "role_id": "evidence_reviewer",
+                    "display_name": "独立审查员",
+                    "responsibility": "独立复核授权证据并明确未解决风险",
+                    "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                    "grant_ceiling": ["read"],
+                    "fixed_count": 1,
+                    "acceptance": ["summary", "evidence"],
+                    "behavior": [{"kind": "verification", "mode": "independent"}]
+                }],
+                "result_fields": ["summary", "evidence"],
+                "evidence_required": true,
+                "instructions": "# 独立审查\n\n只依据授权证据复核结论，说明不确定性。"
+            })),
+        };
+        escalation.validate().expect("typed escalation validates");
+        let mut patch = escalation.as_add_team_patch(program.program_id.clone());
+        attach_escalated_ephemeral_template(
+            &registered,
+            &mut patch,
+            escalation
+                .template_proposal
+                .clone()
+                .expect("custom template proposal"),
+            &services,
+        )
+        .expect("Runtime binds the escalation custom template to its parent Program");
+        let mut patch_request =
+            collaboration_coordinator::compile_add_team_patch(&registered, &patch)
+                .expect("fenced AddTeam patch compiles");
+        team_authority::bind_semantic_resource_authority(
+            &mut patch_request,
+            None,
+            services.workspace_root(),
+        );
+        let patch_plan = planner::plan_runtime_orchestration(&patch_request);
+        let patch_proposal = patch_request.proposal.as_ref().expect("patch proposal");
+        let existing_instances = program.semantic_node_instances.clone();
+        let mut repairs = Vec::new();
+        let mut mutation = compiler::compile_graph_mutation(
+            "patch-revision",
+            &patch_request,
+            &patch_plan,
+            patch_proposal,
+            &registered.id,
+            registered.parent_execution.as_ref(),
+            services.team_runtime().as_ref(),
+            &existing_instances,
+            &mut repairs,
+        )
+        .expect("patch Team node compiles");
+        assert!(repairs.is_empty());
+        let compiled_team_request = serde_json::from_str::<
+            harness_contract::team::TeamInstantiationRequest,
+        >(&mutation.nodes[0].payload_ref)
+        .expect("compiled custom Team request");
+        assert!(matches!(
+            compiled_team_request.template_selector,
+            harness_contract::team::TeamTemplateSelector::Ephemeral { .. }
+        ));
+        services
+            .compile_agent_task_nodes(&mut mutation.nodes)
+            .expect("patch Agent intents compile");
+        let mut delta = compiler::collaboration_program_from_proposal(
+            patch_proposal,
+            Some(&mutation.semantic_node_instances),
+        )
+        .expect("patch Program delta compiles")
+        .expect("Team patch has a Program delta");
+        collaboration_coordinator::prepare_program_revision_admission(
+            &registered,
+            &mut delta,
+            mutation.nodes.clone(),
+            services.team_runtime().as_ref(),
+        )
+        .expect("patch admission is fully prepared before commit");
+        let completion = compiler::materialize_completion(
+            &patch_proposal.completion,
+            &mutation.semantic_node_instances,
+            &patch_proposal.nodes,
+        );
+        let committed = services
+            .commit_service()
+            .replan_semantic(
+                &registered,
+                mutation.nodes.clone(),
+                mutation.edges.clone(),
+                patch_proposal.reason.clone(),
+                patch_proposal.mutation_id.clone(),
+                completion,
+                Some(delta),
+            )
+            .expect("patch revision commits atomically")
+            .graph;
+        let revised = committed
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .expect("revised Program");
+        assert_eq!(revised.revision, program.revision + 1);
+        assert_eq!(revised.team_instances.len(), 2);
+        assert_eq!(revised.control.obligations.len(), 2);
+        assert_eq!(
+            revised.control.lifecycle,
+            harness_contract::execution_graph::CollaborationProgramLifecycle::Admitting
+        );
+        assert!(revised.control.obligations.iter().all(|obligation| {
+            obligation.revision == revised.revision
+                && obligation.binding_ref.starts_with("team-binding:sha256:")
+        }));
+        assert!(revised
+            .semantic_node_instances
+            .contains_key("independent-review"));
+        assert!(
+            collaboration_coordinator::compile_add_team_patch(&committed, &patch)
+                .is_err_and(|error| error == "patch_program_revision_conflict")
+        );
     }
 
     #[tokio::test]

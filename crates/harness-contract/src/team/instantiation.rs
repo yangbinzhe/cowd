@@ -115,6 +115,12 @@ pub enum TeamTemplateSelector {
     Default {
         template_id: TeamTemplateDefinitionId,
     },
+    /// Immutable session/turn-scoped template carried with this request.
+    /// It is deliberately not a catalog identifier and can never be selected
+    /// by a later unrelated Team request.
+    Ephemeral {
+        snapshot: Box<crate::execution_graph::EphemeralTeamTemplateSnapshot>,
+    },
     Automatic,
 }
 
@@ -364,6 +370,19 @@ impl TeamInstantiationRequest {
                 });
             }
             _ => {}
+        }
+        if let TeamTemplateSelector::Ephemeral { snapshot } = &self.template_selector {
+            snapshot
+                .validate()
+                .map_err(|message| ValidationError::InvalidContract { message })?;
+            if snapshot.session_id != self.lineage.session_id
+                || snapshot.turn_id != self.lineage.turn_id
+            {
+                return Err(ValidationError::InvalidContract {
+                    message: "ephemeral Team template scope must match canonical session and turn"
+                        .to_string(),
+                });
+            }
         }
         if self.selection_mode == TeamSelectionMode::Automatic {
             let binding =

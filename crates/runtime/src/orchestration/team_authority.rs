@@ -1777,6 +1777,7 @@ mod tests {
             }),
             control: None,
             template_proposal: None,
+            ephemeral_team_templates: Default::default(),
 
             input_disposition: None,
             selection_mode: None,
@@ -1844,6 +1845,7 @@ mod tests {
             }),
             control: None,
             template_proposal: None,
+            ephemeral_team_templates: Default::default(),
             input_disposition: None,
             selection_mode: None,
             strategy_binding: None,
@@ -2127,6 +2129,7 @@ mod tests {
             }),
             control: None,
             template_proposal: None,
+            ephemeral_team_templates: Default::default(),
 
             input_disposition: None,
             selection_mode: None,
@@ -2275,6 +2278,7 @@ mod tests {
             }),
             control: None,
             template_proposal: None,
+            ephemeral_team_templates: Default::default(),
 
             input_disposition: None,
             selection_mode: None,
@@ -2391,6 +2395,7 @@ mod tests {
             }),
             control: None,
             template_proposal: None,
+            ephemeral_team_templates: Default::default(),
 
             input_disposition: None,
             selection_mode: None,
@@ -2464,6 +2469,7 @@ mod tests {
             }),
             control: None,
             template_proposal: None,
+            ephemeral_team_templates: Default::default(),
 
             input_disposition: None,
             selection_mode: None,

@@ -243,6 +243,7 @@ pub(crate) fn compile_conversation_program_intent(
         }),
         control: None,
         template_proposal: None,
+        ephemeral_team_templates: Default::default(),
         input_disposition: None,
         selection_mode: Some(selection_mode),
         strategy_binding: Some(harness_contract::team::TeamStrategyBinding {
@@ -263,6 +264,216 @@ pub(crate) fn compile_conversation_program_intent(
         },
         surface: Some("conversation_runtime_host".to_string()),
     })
+}
+
+/// Convert a fenced AddTeam patch to the internal semantic-revision request.
+/// The caller must submit this request through the normal Coordinator path;
+/// this helper deliberately exposes no physical node or executor choice.
+pub(crate) fn compile_add_team_patch(
+    graph: &ExecutionGraph,
+    patch: &harness_contract::execution_graph::CollaborationIntentPatch,
+) -> Result<RuntimeOrchestrationCommand, String> {
+    patch.validate()?;
+    let program = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+        .ok_or_else(|| "patch_target_has_no_collaboration_program".to_string())?;
+    if patch.program_id != program.program_id || patch.base_revision != program.revision {
+        return Err("patch_program_revision_conflict".to_string());
+    }
+    let harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam { team } =
+        &patch.operation
+    else {
+        return Err("patch_operation_not_add_team".to_string());
+    };
+    if !team.behavior_facets.is_empty() && team.ephemeral_template.is_none() {
+        return Err("add_team_behavior_facets_require_ephemeral_template_snapshot".to_string());
+    }
+    if program
+        .semantic_node_instances
+        .contains_key(&team.semantic_node_id)
+    {
+        return Err("patch_team_semantic_id_already_exists".to_string());
+    }
+    let seed = graph
+        .nodes
+        .iter()
+        .find_map(|node| {
+            serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+                &node.payload_ref,
+            )
+            .ok()
+        })
+        .ok_or_else(|| "patch_target_has_no_durable_team_binding_seed".to_string())?;
+    // A custom AddTeam carries its complete immutable snapshot.  In that
+    // case the parent Program's Team may itself be ephemeral, so attempting
+    // to recover a reusable catalog selector from the seed would both fail
+    // and reintroduce a mutable lookup that the snapshot deliberately avoids.
+    let template = team
+        .ephemeral_template
+        .is_none()
+        .then(|| template_path_from_seed(&seed))
+        .transpose()?;
+    let mutation_id = format!("program-patch:{}", patch.canonical_digest);
+    Ok(RuntimeOrchestrationCommand {
+        intent: patch.reason.clone(),
+        model_lease: Some(seed.model_lease),
+        session_id: Some(seed.lineage.session_id.clone()),
+        lineage: Some(seed.lineage),
+        mission_id: Some(seed.mission_id),
+        operation: RuntimeOrchestrationOperation::Revise,
+        inspect_execution_id: None,
+        proposal: Some(GraphMutationProposal {
+            mutation_id,
+            target_execution_id: Some(graph.id.clone()),
+            expected_revision: Some(graph.revision),
+            nodes: vec![GraphSemanticNode {
+                node_id: team.semantic_node_id.clone(),
+                recipe: CapabilityRecipeId::Team,
+                objective: team.objective.clone(),
+                depends_on: team.depends_on.clone(),
+                multiplicity: team.parallelism_hint.max(1),
+                focuses: Vec::new(),
+                // Preserve the selected Team definition family from the
+                // already-admitted Program. A patch must not let the
+                // planner's current default silently replace the source
+                // Program's capability/acceptance contract.
+                template,
+                target_session_id: None,
+                output_artifacts: team.output_artifacts.clone(),
+                evidence_contract: team.evidence_contract.clone(),
+                required_evidence_refs: patch
+                    .evidence_refs
+                    .iter()
+                    .map(|reference| reference.evidence_ref.id.clone())
+                    .collect(),
+                resource_scopes: team.resource_scopes.clone(),
+                required: team.required,
+                dependency: Default::default(),
+                cancellation_group: None,
+            }],
+            completion: harness_contract::execution_graph::ExecutionCompletionContract {
+                required_node_ids: team
+                    .required
+                    .then(|| team.semantic_node_id.clone())
+                    .into_iter()
+                    .collect(),
+                required_artifact_kinds: team.output_artifacts.clone(),
+                allow_unresolved_conflicts: false,
+            },
+            collaboration_program: None,
+            reason: patch.reason.clone(),
+        }),
+        control: None,
+        template_proposal: None,
+        ephemeral_team_templates: team
+            .ephemeral_template
+            .as_ref()
+            .map(|snapshot| {
+                std::collections::BTreeMap::from([(
+                    team.semantic_node_id.clone(),
+                    snapshot.clone(),
+                )])
+            })
+            .unwrap_or_default(),
+        input_disposition: None,
+        selection_mode: Some(seed.selection_mode),
+        strategy_binding: seed.strategy_binding,
+        capabilities: team
+            .resource_scopes
+            .iter()
+            .map(|scope| format!("resource:{scope}"))
+            .collect(),
+        evidence_refs: patch
+            .evidence_refs
+            .iter()
+            .map(|reference| reference.evidence_ref.id.clone())
+            .collect(),
+        constraints: RuntimeOrchestrationConstraints {
+            max_parallel_agents: Some(usize::from(team.parallelism_hint.max(1))),
+            risk: None,
+            approval_id: None,
+            requires_write: Some(
+                team.resource_scopes
+                    .iter()
+                    .any(|scope| scope.starts_with("write:")),
+            ),
+            surface_latency_sensitive: Some(false),
+            permission_ceiling: seed.permission_ceiling,
+        },
+        surface: Some("collaboration_program_patch".to_string()),
+    })
+}
+
+/// Compile a custom Team for exactly one session/turn without publishing it
+/// to the shared Team catalog.  The snapshot contains the complete immutable
+/// revision and exact Agent references, so later graph recovery uses no
+/// mutable `LatestStable` lookup.
+pub(crate) fn compile_ephemeral_team_template_snapshot(
+    proposal_value: serde_json::Value,
+    lineage: &harness_contract::execution_graph::ExecutionGraphLineage,
+    permission_ceiling: harness_contract::policy::PermissionMode,
+    policy_ref: String,
+    expires_at_ms: u64,
+    services: &RuntimeServices,
+) -> Result<harness_contract::execution_graph::EphemeralTeamTemplateSnapshot, String> {
+    let mut normalized = proposal_value;
+    crate::team_template_candidate::normalize_template_proposal(&mut normalized)
+        .map_err(|error| format!("ephemeral_template_invalid_proposal:{error}"))?;
+    let proposal: crate::team_template_candidate::TeamTemplateProposal =
+        serde_json::from_value(normalized)
+            .map_err(|error| format!("ephemeral_template_invalid_proposal:{error}"))?;
+    let candidate = crate::team_template_candidate::TemplateCandidateCompiler::compile(
+        services.definition_registry(),
+        &proposal,
+        permission_ceiling,
+    )
+    .map_err(|error| format!("ephemeral_template_compile_failed:{error}"))?;
+    let (revision, team_markdown) = crate::team_definition::build_revision(
+        candidate.manifest,
+        &crate::team_template_candidate::normalized_team_instructions(&proposal.instructions),
+    )
+    .map_err(|error| format!("ephemeral_template_revision_failed:{error}"))?;
+    let snapshot = harness_contract::execution_graph::EphemeralTeamTemplateSnapshot {
+        session_id: lineage.session_id.clone(),
+        turn_id: lineage.turn_id.clone(),
+        template_digest: revision.content_digest.clone(),
+        role_ids: revision
+            .manifest
+            .roles
+            .iter()
+            .map(|role| role.role_id.clone())
+            .collect(),
+        revision,
+        team_markdown,
+        policy_ref,
+        expires_at_ms,
+        terminal_fence: format!("task:{}:turn:{}", lineage.root_task_id, lineage.turn_id),
+    };
+    snapshot
+        .validate()
+        .map_err(|error| format!("ephemeral_template_snapshot_invalid:{error}"))?;
+    Ok(snapshot)
+}
+
+fn template_path_from_seed(
+    seed: &harness_contract::team::TeamInstantiationRequest,
+) -> Result<String, String> {
+    let template_id = match &seed.template_selector {
+        harness_contract::team::TeamTemplateSelector::Exact { revision_ref } => {
+            &revision_ref.template_id
+        }
+        harness_contract::team::TeamTemplateSelector::LatestStable { template_id }
+        | harness_contract::team::TeamTemplateSelector::Default { template_id } => template_id,
+        harness_contract::team::TeamTemplateSelector::Automatic => {
+            return Err("patch_target_seed_has_automatic_template_selector".to_string());
+        }
+        harness_contract::team::TeamTemplateSelector::Ephemeral { .. } => {
+            return Err("patch_target_seed_has_ephemeral_template_selector".to_string());
+        }
+    };
+    Ok(template_id.as_str().to_string())
 }
 
 /// Compile the complete Program admission truth into the root graph before it
@@ -291,6 +502,34 @@ pub(crate) fn prepare_program_admission(
         .and_then(|metadata| metadata.collaboration_program.as_mut())
         .ok_or_else(|| "program_control_disappeared_while_preparing_admission".to_string())?
         .control = control;
+    Ok(())
+}
+
+/// Freeze only the newly compiled Team instances for an additive Program
+/// revision. CommitService merges this delta in the same graph CAS that adds
+/// the physical nodes, so an active Program never observes orphan Team nodes.
+pub(crate) fn prepare_program_revision_admission(
+    graph: &ExecutionGraph,
+    delta: &mut CollaborationProgram,
+    nodes: Vec<harness_contract::execution_graph::ExecutionNodeSpec>,
+    teams: &TeamRuntime,
+) -> Result<(), String> {
+    if delta.control.lifecycle != CollaborationProgramLifecycle::Planning {
+        return Err("program_revision_delta_is_not_planning".to_string());
+    }
+    let mut candidate = graph.clone();
+    candidate.nodes = nodes;
+    candidate.orchestration = Some(
+        harness_contract::execution_graph::ExecutionOrchestrationMetadata {
+            mutation_id: "program-revision-admission".to_string(),
+            applied_mutation_ids: Vec::new(),
+            semantic_revision: 0,
+            source_generation: 0,
+            completion: Default::default(),
+            collaboration_program: Some(delta.clone()),
+        },
+    );
+    delta.control = admission_control(&candidate, delta, teams)?;
     Ok(())
 }
 
@@ -762,5 +1001,36 @@ mod tests {
                     .all(|scope| scope == "network:*")
         }));
         assert_eq!(request.constraints.max_parallel_agents, Some(9));
+    }
+
+    #[test]
+    fn add_team_patch_cannot_target_a_graph_without_a_durable_program() {
+        let patch = harness_contract::execution_graph::CollaborationIntentPatch {
+            program_id: "missing-program".to_string(),
+            base_revision: 1,
+            source_attempt: "attempt-1".to_string(),
+            reason: "add an independent reviewer".to_string(),
+            evidence_refs: Vec::new(),
+            canonical_digest: "c".repeat(64),
+            user_confirmation_ref: None,
+            operation:
+                harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam {
+                    team: harness_contract::execution_graph::CollaborationPatchTeam {
+                        semantic_node_id: "review".to_string(),
+                        objective: "independently review evidence".to_string(),
+                        depends_on: Vec::new(),
+                        behavior_facets: Vec::new(),
+                        ephemeral_template: None,
+                        resource_scopes: vec!["network:*".to_string()],
+                        output_artifacts: vec!["review".to_string()],
+                        evidence_contract: vec!["evidence".to_string()],
+                        required: true,
+                        parallelism_hint: 1,
+                    },
+                },
+        };
+        let error = compile_add_team_patch(&ExecutionGraph::new("ordinary graph"), &patch)
+            .expect_err("Patch must target a durable Program");
+        assert_eq!(error, "patch_target_has_no_collaboration_program");
     }
 }

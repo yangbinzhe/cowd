@@ -562,6 +562,16 @@ fn compile_team_subgraph_node(
     };
     let template_id = TeamTemplateDefinitionId::new(scope, local)
         .map_err(|error| OrchestrationCompileError::TeamInstantiation(error.to_string()))?;
+    let template_selector = request
+        .ephemeral_team_templates
+        .get(&semantic.node_id)
+        .cloned()
+        .map(|snapshot| TeamTemplateSelector::Ephemeral {
+            snapshot: Box::new(snapshot),
+        })
+        .unwrap_or(TeamTemplateSelector::LatestStable {
+            template_id: template_id.clone(),
+        });
     let team_id = format!(
         "runtime-team:{}:{}:{}",
         request_id, semantic.node_id, instance_index
@@ -574,7 +584,10 @@ fn compile_team_subgraph_node(
     tracing::debug!(
         permission_ceiling = ?request.constraints.permission_ceiling,
         scopes = ?semantic.resource_scopes,
-        template = ?template_id.as_str(),
+        template = ?match &template_selector {
+            TeamTemplateSelector::Ephemeral { snapshot } => snapshot.revision.revision_ref.template_id.as_str(),
+            _ => template_id.as_str(),
+        },
         "team orchestration compile scopes"
     );
     let team_request = TeamInstantiationRequest {
@@ -598,7 +611,7 @@ fn compile_team_subgraph_node(
         }),
         selection_mode: TeamSelectionMode::ModelAssisted,
         strategy_binding: request.strategy_binding.clone(),
-        template_selector: TeamTemplateSelector::LatestStable { template_id },
+        template_selector,
         objective: bounded_team_node_objective(semantic),
         acceptance: semantic.evidence_contract.clone(),
         risk: None,

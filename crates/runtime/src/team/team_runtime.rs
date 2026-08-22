@@ -130,6 +130,7 @@ impl TeamRuntime {
         &self,
         request: TeamInstantiationRequest,
     ) -> Result<TeamProjection, String> {
+        self.ensure_ephemeral_template_parent_is_live(&request)?;
         self.claim_team_root(&request)?;
         self.ensure_root_task(&request)?;
         let mut instantiated = self.plan(request)?;
@@ -160,6 +161,42 @@ impl TeamRuntime {
             .await
             .map_err(|error| error.to_string())?;
         self.projection.project(&graph_id)
+    }
+
+    fn ensure_ephemeral_template_parent_is_live(
+        &self,
+        request: &TeamInstantiationRequest,
+    ) -> Result<(), String> {
+        let harness_contract::team::TeamTemplateSelector::Ephemeral { snapshot } =
+            &request.template_selector
+        else {
+            return Ok(());
+        };
+        snapshot.validate()?;
+        let parent = request
+            .parent_execution
+            .as_ref()
+            .ok_or_else(|| "ephemeral_template_requires_program_parent".to_string())?;
+        let graph = self
+            .graphs
+            .load(&parent.execution_id)
+            .map_err(|error| format!("ephemeral_template_parent_load_failed:{error}"))?;
+        let program = graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .ok_or_else(|| "ephemeral_template_parent_has_no_program".to_string())?;
+        if program.control.lifecycle.is_terminal() {
+            return Err("ephemeral_template_parent_program_is_terminal".to_string());
+        }
+        let expected_fence = format!(
+            "task:{}:turn:{}",
+            request.lineage.root_task_id, request.lineage.turn_id
+        );
+        if snapshot.terminal_fence != expected_fence {
+            return Err("ephemeral_template_parent_terminal_fence_mismatch".to_string());
+        }
+        Ok(())
     }
 
     /// Idempotent child-graph entry used by a root Mission graph. Recovery

@@ -6288,6 +6288,12 @@ impl RuntimeServices {
                                 .to_string(),
                         ));
                     }
+                    harness_contract::team::TeamTemplateSelector::Ephemeral { .. } => {
+                        return Err(RuntimeServicesError::Invariant(
+                            "managed Team target cannot reuse an ephemeral template snapshot"
+                                .to_string(),
+                        ));
+                    }
                 };
                 if selector_template_id != template_id {
                     return Err(RuntimeServicesError::Invariant(
@@ -10196,6 +10202,59 @@ mod tests {
         assert_eq!(projection.status, "unavailable");
         assert!(max_active.load(Ordering::SeqCst) >= 2);
         assert!(max_active.load(Ordering::SeqCst) <= 3);
+    }
+
+    #[test]
+    fn ephemeral_team_snapshot_compiles_without_catalog_publication() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut request = team_request(
+            "ephemeral-template",
+            "ephemeral-session",
+            "cowd/parallel-research-synthesis",
+            "independently assess the bounded evidence",
+            "test-model",
+            services.mission_runtime().default_mission_id(),
+        );
+        let snapshot = crate::orchestration::compile_ephemeral_team_template_snapshot(
+            serde_json::json!({
+                "template_id": "cowd/ephemeral-independent-assessment",
+                "name": "独立证据评估团队",
+                "team_display_name": "独立评估",
+                "roles": [{
+                    "role_id": "evidence_assessor",
+                    "display_name": "证据评估师",
+                    "responsibility": "独立检查已授权证据并报告不确定性",
+                    "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                    "grant_ceiling": ["read"],
+                    "fixed_count": 1,
+                    "acceptance": ["summary", "evidence"],
+                    "behavior": [{"kind": "reacquire_evidence", "required": true}]
+                }],
+                "result_fields": ["summary", "evidence"],
+                "evidence_required": true,
+                "instructions": "# 独立评估\n\n只使用已授权证据，清楚列出不确定性。"
+            }),
+            &request.lineage,
+            harness_contract::policy::PermissionMode::ReadOnly,
+            "session-policy:ephemeral-session:1".to_string(),
+            u64::MAX,
+            &services,
+        )
+        .expect("custom snapshot compiles without catalog publication");
+        snapshot.validate().expect("snapshot is self-consistent");
+        let ephemeral_id = snapshot.revision.revision_ref.template_id.clone();
+        request.template_selector = TeamTemplateSelector::Ephemeral {
+            snapshot: Box::new(snapshot),
+        };
+        let planned = services
+            .team_runtime()
+            .plan(request)
+            .expect("ephemeral Team compiles without a published catalog revision");
+        assert_eq!(planned.template_ref.template_id, ephemeral_id);
+        assert!(services
+            .definition_registry()
+            .resolve_team(&ephemeral_id, RevisionSelector::LatestApprovedStable)
+            .is_err());
     }
 
     fn team_request(

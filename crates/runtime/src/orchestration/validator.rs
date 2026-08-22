@@ -264,6 +264,22 @@ fn validate_operation_shape(
             {
                 reject(status, findings, "propose_rejects_existing_graph_target");
             }
+            if request.template_proposal.is_some()
+                && request.proposal.as_ref().is_some_and(|proposal| {
+                    proposal
+                        .nodes
+                        .iter()
+                        .filter(|node| node.recipe == CapabilityRecipeId::Team)
+                        .count()
+                        != 1
+                })
+            {
+                reject(
+                    status,
+                    findings,
+                    "ephemeral_template_requires_exactly_one_team_node",
+                );
+            }
         }
         RuntimeOrchestrationOperation::ProposeTemplate => {
             if request.template_proposal.is_none()
@@ -733,6 +749,7 @@ mod tests {
                 "name": "业务/技术双团队研讨",
                 "roles": []
             })),
+            ephemeral_team_templates: Default::default(),
             control: None,
             input_disposition: None,
             selection_mode: None,
@@ -753,5 +770,48 @@ mod tests {
         let mut findings = Vec::new();
         validate_operation_shape(&missing, &mut status, &mut findings);
         assert!(findings.contains(&"propose_template_requires_only_template_proposal".to_string()));
+    }
+
+    #[test]
+    fn custom_propose_template_requires_exactly_one_team_node() {
+        let mut command = RuntimeOrchestrationCommand {
+            intent: "run a turn-scoped custom Team".to_string(),
+            model_lease: None,
+            session_id: None,
+            lineage: None,
+            mission_id: None,
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(GraphMutationProposal {
+                mutation_id: "custom-team".to_string(),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: Vec::new(),
+                completion: Default::default(),
+                collaboration_program: None,
+                reason: "custom Team".to_string(),
+            }),
+            template_proposal: Some(serde_json::json!({"name": "custom"})),
+            ephemeral_team_templates: Default::default(),
+            control: None,
+            input_disposition: None,
+            selection_mode: None,
+            strategy_binding: None,
+            capabilities: Vec::new(),
+            evidence_refs: Vec::new(),
+            constraints: RuntimeOrchestrationConstraints::default(),
+            surface: None,
+        };
+        let mut status = "accepted".to_string();
+        let mut findings = Vec::new();
+        validate_operation_shape(&command, &mut status, &mut findings);
+        assert_eq!(status, "rejected");
+        assert!(findings.contains(&"ephemeral_template_requires_exactly_one_team_node".to_string()));
+
+        command.template_proposal = None;
+        let mut status = "accepted".to_string();
+        let mut findings = Vec::new();
+        validate_operation_shape(&command, &mut status, &mut findings);
+        assert!(findings.is_empty());
     }
 }

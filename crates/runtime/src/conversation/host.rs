@@ -5286,7 +5286,7 @@ where
                                     .collect::<Vec<_>>()
                                     .join("；");
                                 let reason = format!(
-                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请继续自行编排：先调用 runtime_capabilities(detail=team_templates) 复制 catalog 中的精确 template_id；若 catalog 中已有与用户要求匹配的用户模板，直接用该精确 ID 调用 runtime_orchestrate(operation=propose) 启动团队；若没有，先调用 runtime_orchestrate(operation=propose_template, template_proposal=...) 发布定制模板并确认返回 published，再按上述步骤启动团队。禁止只输出总结文本，继续执行（尝试 {}）。",
+                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请继续自行编排：先调用 runtime_capabilities(detail=team_templates)；若 catalog 中已有与用户要求匹配的可复用模板，复制精确 template_id 并调用 runtime_orchestrate(operation=propose) 启动团队；若用户要求定制角色，直接调用 runtime_orchestrate(operation=propose)，提交恰好一个省略 template 的 Team 节点和 template_proposal，由 Runtime 绑定当前 turn 的不可变快照后启动。只有用户明确要求发布或复用模板时，才调用 runtime_orchestrate(operation=propose_template)。禁止只输出总结文本，继续执行（尝试 {}）。",
                                     if catalog_hint.is_empty() {
                                         String::new()
                                     } else {

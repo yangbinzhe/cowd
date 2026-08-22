@@ -147,8 +147,22 @@ struct RuntimeToolExecutionBinding<'a> {
     memory_context: Option<&'a memory::MemoryTurnContext>,
     model_lease: Option<&'a str>,
     parent_execution: Option<&'a harness_contract::execution_graph::ExecutionParentBinding>,
+    parent_execution_attempt: Option<u32>,
     execution_decision: Option<&'a runtime::RuntimeExecutionDecision>,
     permission_ceiling: harness_contract::policy::PermissionMode,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationEscalationToolRequest {
+    base_revision: u64,
+    reason: String,
+    digest: String,
+    #[serde(default)]
+    evidence_refs: Vec<harness_contract::context::EvidenceAccessRef>,
+    requested_add_team: harness_contract::execution_graph::CollaborationEscalationAddTeam,
+    #[serde(default)]
+    template_proposal: Option<serde_json::Value>,
 }
 
 fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
@@ -158,6 +172,7 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
             | "runtime_resource_capabilities"
             | "runtime_capabilities"
             | "runtime_orchestrate"
+            | "request_collaboration_escalation"
             | "mcp_tool"
             | "list_mcp_resources_tool"
             | "read_mcp_resource_tool"
@@ -422,6 +437,7 @@ impl GatewayToolExecutor {
                 memory_context: self.runtime_memory_context.as_ref(),
                 model_lease: self.runtime_model_lease.as_deref(),
                 parent_execution: None,
+                parent_execution_attempt: None,
                 execution_decision: None,
                 permission_ceiling: self.runtime_permission_ceiling,
             },
@@ -570,6 +586,59 @@ impl GatewayToolExecutor {
                 ),
             )
             .map_err(|error| ToolError::new(error.to_string()));
+        }
+        if tool_name == "request_collaboration_escalation" {
+            let input: CollaborationEscalationToolRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            let parent = binding.parent_execution.ok_or_else(|| {
+                ToolError::new(
+                    "collaboration escalation requires an immutable managed Agent parent binding",
+                )
+            })?;
+            let attempt = binding.parent_execution_attempt.ok_or_else(|| {
+                ToolError::new("collaboration escalation requires a managed Agent attempt fence")
+            })?;
+            let services = self.runtime_services.get().cloned().ok_or_else(|| {
+                ToolError::new("collaboration escalation requires the workspace RuntimeServices")
+            })?;
+            // A managed Agent belongs to its Team child graph. Resolve the
+            // durable parent binding before touching collaboration state: the
+            // Program lives on that root graph, never on an Agent's child
+            // graph. This is a lookup, not a model-supplied parent id.
+            let team_graph = services
+                .graph_state_store()
+                .load_async(&parent.execution_id)
+                .await
+                .map_err(|error| {
+                    ToolError::new(format!("escalation_team_graph_load_failed:{error}"))
+                })?;
+            let program_parent = team_graph.parent_execution.ok_or_else(|| {
+                ToolError::new("collaboration escalation Agent graph has no durable Program parent")
+            })?;
+            let source_attempt = format!(
+                "{}:{}:attempt:{attempt}",
+                parent.execution_id, parent.node_id
+            );
+            let escalation = harness_contract::execution_graph::CollaborationEscalationRequest {
+                source_attempt: source_attempt.clone(),
+                base_revision: input.base_revision,
+                request_kind: "add_team".to_string(),
+                reason: input.reason,
+                evidence_refs: input.evidence_refs,
+                digest: input.digest,
+                requested_add_team: Some(input.requested_add_team),
+                template_proposal: input.template_proposal,
+            };
+            let result = runtime::orchestration::submit_collaboration_escalation(
+                &program_parent.execution_id,
+                &source_attempt,
+                &escalation,
+                services.as_ref(),
+            )
+            .await
+            .map_err(ToolError::new)?;
+            return serde_json::to_string_pretty(&result)
+                .map_err(|error| ToolError::new(error.to_string()));
         }
         if tool_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
             tracing::debug!(
@@ -1444,7 +1513,9 @@ impl GatewayToolExecutor {
         let mut allowed_tools = self
             .available_tool_names()
             .into_iter()
-            .filter(|name| !is_gateway_runtime_control_tool(name))
+            .filter(|name| {
+                !is_gateway_runtime_control_tool(name) || name == "request_collaboration_escalation"
+            })
             .filter(|name| self.tool_permission_mode(name) == Some(ToolPermissionMode::ReadOnly))
             .collect::<Vec<_>>();
         allowed_tools.sort();
@@ -1659,6 +1730,7 @@ impl GatewayToolExecutor {
                         memory_context: self.runtime_memory_context.as_ref(),
                         model_lease: self.runtime_model_lease.as_deref(),
                         parent_execution: None,
+                        parent_execution_attempt: None,
                         execution_decision: None,
                         permission_ceiling: authorization.authorization_lease.ceiling,
                     },
@@ -2253,6 +2325,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                     memory_context: request.memory_context.as_ref(),
                     model_lease: request.model_lease.as_deref(),
                     parent_execution: request.parent_execution.as_ref(),
+                    parent_execution_attempt: request.parent_execution_attempt,
                     execution_decision: request.execution_decision.as_ref(),
                     permission_ceiling: request
                         .authorization
@@ -4223,6 +4296,7 @@ mod tests {
             proposal: None,
             control: None,
             template_proposal: None,
+            ephemeral_team_templates: Default::default(),
 
             input_disposition: None,
             selection_mode: None,

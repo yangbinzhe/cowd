@@ -411,12 +411,12 @@ impl RuntimeCapabilityManifest {
                 ),
                 capability(
                     "runtime_orchestration",
-                    "Model-visible semantic control plane for inspect, propose, propose_template, revise, and control over Agent, Team, review, synthesis, and session-dispatch graph recipes.",
+                    "Model-visible semantic control plane for inspect, propose, reusable propose_template, revise, and control over Agent, Team, review, synthesis, and session-dispatch graph recipes.",
                     &["runtime_capabilities", "runtime_orchestrate"],
                     &[
                         "Inspect current Runtime state before changing an existing graph.",
                         "Propose semantic nodes and dependencies; revise by exact graph revision; never provide executors or leases.",
-                        "When the user names specific teams/roles (e.g. 业务团队/技术团队/CTO/供应链专家), draft a structured Team template with propose_template and let approval publish it; do not force a builtin template.",
+                        "When the user names specific teams/roles (e.g. 业务团队/技术团队/CTO/供应链专家), use propose with exactly one Team node plus template_proposal for a turn-scoped custom Team; use propose_template only when reusable catalog publication is explicitly wanted.",
                     ],
                 ),
                 capability(
@@ -520,10 +520,10 @@ pub fn runtime_capability_primer() -> String {
             .to_string(),
     );
     lines.push(
-        "TRIGGER RULE (custom teams): if the user names specific teams or roles (业务团队/技术团队, CTO, 供应链专家, 运维智能体, data scientist, AI expert, senior engineer...), call `runtime_orchestrate(propose_template)` with a structured template_proposal (template_id, name, team_display_name, roles[] with role_id/display_name/responsibility/behavior/agent_definition_ref/grant_ceiling/cardinality/acceptance, dependencies, result_fields, instructions). Each role MUST state typed behavior explicitly, for example evidence acquisition, upstream consumption, reducer, verification, or terminal-candidate; never encode behavior in the role name. The runtime validates definitions, clips permissions to your ceiling, and routes the candidate through approval before publishing it as a reusable User-scope template. Do NOT silently fall back to the builtin template when the user named custom roles."
+        "TRIGGER RULE (custom teams): if the user names specific teams or roles (业务团队/技术团队, CTO, 供应链专家, 运维智能体, data scientist, AI expert, senior engineer...), call `runtime_orchestrate(operation=propose)` with exactly one semantic Team node whose `template` is omitted, plus a structured `template_proposal` (template_id, name, team_display_name, roles[] with role_id/display_name/responsibility/behavior/agent_definition_ref/grant_ceiling/cardinality/acceptance, dependencies, result_fields, instructions). Each role MUST state typed behavior explicitly, for example evidence acquisition, upstream consumption, reducer, verification, or terminal-candidate; never encode behavior in the role name. Runtime validates definitions, clips permissions to your ceiling, and binds an immutable snapshot to the current session/turn without publishing it to the shared catalog. Use `propose_template` only when the user explicitly asks to publish/reuse a template. Do NOT silently fall back to the builtin template when the user named custom roles."
             .to_string(),
     );
-    lines.push("- Before proposing a Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values.".to_string());
+    lines.push("- Before proposing a reusable catalog Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values. A turn-scoped custom Team instead uses the structured `template_proposal` described above.".to_string());
     lines.push(
         "- Never invent, translate, or guess role ids; unknown roles are rejected at compile time."
             .to_string(),
@@ -1650,6 +1650,7 @@ pub fn orchestration_preflight(decision: &RuntimeExecutionDecision) -> Value {
         proposal: Some(proposal),
         control: None,
         template_proposal: None,
+        ephemeral_team_templates: Default::default(),
 
         input_disposition: None,
         selection_mode: None,

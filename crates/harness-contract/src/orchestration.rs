@@ -300,10 +300,14 @@ pub struct ModelRuntimeOrchestrationInput {
     pub inspect_execution_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proposal: Option<ModelGraphMutationProposal>,
-    /// Structured AI-authored Team template proposal (operation=propose_template).
-    /// The runtime embeds the typed `ModelTemplateProposal` schema into this
-    /// property for model guidance, but accepts tolerant variants (wrapped
-    /// JSON, map/array roles, string ceilings) at execution time.
+    /// Structured AI-authored Team template proposal. With
+    /// `operation=propose_template` it requests reusable catalog publication.
+    /// With `operation=propose`, it must accompany exactly one Team semantic
+    /// node and Runtime compiles an immutable session/turn-bound snapshot for
+    /// that graph without publishing it to the shared catalog. The runtime
+    /// embeds the typed `ModelTemplateProposal` schema into this property for
+    /// model guidance, but accepts tolerant variants (wrapped JSON, map/array
+    /// roles, string ceilings) at execution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_proposal: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -344,6 +344,44 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
             effect_resolver: runtime_effect_resolver("runtime.orchestration"),
         },
         RuntimeToolDefinition {
+            name: "request_collaboration_escalation".to_string(),
+            description: Some(
+                "At a managed-Agent safe checkpoint, request one additional bounded Team from the parent Collaboration Program. Runtime attests the caller identity and attempt, verifies the Program revision and digest, and may accept or reject the request. This tool never creates a child root graph or grants new permissions.".to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "base_revision": { "type": "integer", "minimum": 1 },
+                    "reason": { "type": "string", "minLength": 1 },
+                    "digest": { "type": "string", "minLength": 1 },
+                    "evidence_refs": { "type": "array", "items": { "type": "object" } },
+                    "requested_add_team": {
+                        "type": "object",
+                        "properties": {
+                            "semantic_node_id": { "type": "string", "minLength": 1 },
+                            "objective": { "type": "string", "minLength": 1 },
+                            "depends_on": { "type": "array", "items": { "type": "string" } },
+                            "resource_scopes": { "type": "array", "items": { "type": "string" } },
+                            "output_artifacts": { "type": "array", "items": { "type": "string" } },
+                            "evidence_contract": { "type": "array", "items": { "type": "string" } },
+                            "required": { "type": "boolean", "default": true },
+                            "parallelism_hint": { "type": "integer", "minimum": 1 }
+                        },
+                        "required": ["semantic_node_id", "objective"],
+                        "additionalProperties": false
+                    },
+                    "template_proposal": {
+                        "type": "object",
+                        "description": "Optional semantic custom-Team template. Runtime compiles it into a parent Program-bound ephemeral snapshot and never publishes it to the shared catalog."
+                    }
+                },
+                "required": ["base_revision", "reason", "digest", "requested_add_team"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.collaboration_escalation"),
+        },
+        RuntimeToolDefinition {
             name: "team_board".to_string(),
             description: Some(
                 "Publish or retrieve bounded semantic Team working-state checkpoints. Runtime binds the caller's Team, role, Agent instance and graph; raw private reasoning and arbitrary topology are rejected.".to_string(),
@@ -677,6 +715,29 @@ mod tests {
                 ["dependencies"]["type"],
             serde_json::json!(["array", "object", "string"]),
             "dependency guidance must stay relaxed so models never refuse the tool"
+        );
+
+        let escalation_tool = tools
+            .iter()
+            .find(|tool| tool.name == "request_collaboration_escalation")
+            .expect("managed-Agent escalation tool");
+        assert_eq!(
+            escalation_tool.required_permission,
+            ToolPermissionMode::ReadOnly
+        );
+        assert_eq!(
+            escalation_tool.effect_resolver.resolver_id,
+            "runtime.collaboration_escalation"
+        );
+        assert_eq!(
+            escalation_tool.input_schema["required"],
+            json!(["base_revision", "reason", "digest", "requested_add_team"])
+        );
+        assert!(
+            escalation_tool.input_schema["properties"]["requested_add_team"]
+                ["additionalProperties"]
+                .as_bool()
+                .is_some_and(|value| !value)
         );
 
         let evidence_tool = tools

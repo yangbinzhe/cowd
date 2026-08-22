@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -271,6 +271,28 @@ pub struct CrossTeamInputContract {
     pub require_satisfied_acceptance: bool,
 }
 
+/// The narrow AddTeam delta a managed Agent may request at an effect-safe
+/// checkpoint.  It deliberately carries no graph identity, executor, lease,
+/// permission ceiling or arbitrary template: the parent Program compiler owns
+/// all of those facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationEscalationAddTeam {
+    pub semantic_node_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub resource_scopes: Vec<String>,
+    #[serde(default)]
+    pub output_artifacts: Vec<String>,
+    #[serde(default)]
+    pub evidence_contract: Vec<String>,
+    #[serde(default = "default_required_team_instance")]
+    pub required: bool,
+    #[serde(default)]
+    pub parallelism_hint: u16,
+}
+
 /// A bounded escalation proposed by a managed Team at an effect-safe
 /// checkpoint.  The coordinator validates its base revision and digest before
 /// applying a separate program command.
@@ -283,21 +305,336 @@ pub struct CollaborationEscalationRequest {
     #[serde(default)]
     pub evidence_refs: Vec<EvidenceAccessRef>,
     pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_add_team: Option<CollaborationEscalationAddTeam>,
+    /// Optional semantic Team-template content for a new turn-bound Team.
+    /// Runtime, not the caller, compiles it with the parent Program's bound
+    /// lineage and permission ceiling into an immutable snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_proposal: Option<serde_json::Value>,
+}
+
+impl CollaborationEscalationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("source_attempt", &self.source_attempt),
+            ("request_kind", &self.request_kind),
+            ("reason", &self.reason),
+            ("digest", &self.digest),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("collaboration escalation {field} is empty"));
+            }
+        }
+        if self.base_revision == 0 {
+            return Err("collaboration escalation base_revision is zero".to_string());
+        }
+        if self.request_kind != "add_team" {
+            return Err("collaboration escalation request_kind is unsupported".to_string());
+        }
+        let team = self
+            .requested_add_team
+            .as_ref()
+            .ok_or_else(|| "collaboration escalation is missing requested_add_team".to_string())?;
+        validate_escalation_add_team(team)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn as_add_team_patch(&self, program_id: String) -> CollaborationIntentPatch {
+        let team = self
+            .requested_add_team
+            .as_ref()
+            .expect("validated escalation has requested_add_team");
+        CollaborationIntentPatch {
+            program_id,
+            base_revision: self.base_revision,
+            source_attempt: self.source_attempt.clone(),
+            reason: self.reason.clone(),
+            evidence_refs: self.evidence_refs.clone(),
+            canonical_digest: self.digest.clone(),
+            user_confirmation_ref: None,
+            operation: CollaborationIntentPatchOperation::AddTeam {
+                team: CollaborationPatchTeam {
+                    semantic_node_id: team.semantic_node_id.clone(),
+                    objective: team.objective.clone(),
+                    depends_on: team.depends_on.clone(),
+                    behavior_facets: Vec::new(),
+                    ephemeral_template: None,
+                    resource_scopes: team.resource_scopes.clone(),
+                    output_artifacts: team.output_artifacts.clone(),
+                    evidence_contract: team.evidence_contract.clone(),
+                    required: team.required,
+                    parallelism_hint: team.parallelism_hint,
+                },
+            },
+        }
+    }
+}
+
+fn validate_escalation_add_team(team: &CollaborationEscalationAddTeam) -> Result<(), String> {
+    validate_patch_team(&CollaborationPatchTeam {
+        semantic_node_id: team.semantic_node_id.clone(),
+        objective: team.objective.clone(),
+        depends_on: team.depends_on.clone(),
+        behavior_facets: Vec::new(),
+        ephemeral_template: None,
+        resource_scopes: team.resource_scopes.clone(),
+        output_artifacts: team.output_artifacts.clone(),
+        evidence_contract: team.evidence_contract.clone(),
+        required: team.required,
+        parallelism_hint: team.parallelism_hint,
+    })
+}
+
+/// The only model/managed-Agent proposal format allowed to change a live
+/// CollaborationProgram.  It identifies a durable Program revision and a
+/// source attempt; it is never an arbitrary replacement graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationIntentPatch {
+    pub program_id: String,
+    pub base_revision: u64,
+    pub source_attempt: String,
+    pub reason: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+    pub canonical_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_confirmation_ref: Option<String>,
+    pub operation: CollaborationIntentPatchOperation,
+}
+
+/// Data-only Team workstream shape. Display labels are intentionally absent:
+/// behavior, authority and acceptance are compiled from typed facets and
+/// contracts rather than a role or template display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationPatchTeam {
+    pub semantic_node_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub behavior_facets: Vec<crate::team::RoleBehaviorFacet>,
+    /// A complete session/turn-scoped template for a custom Team.  The
+    /// snapshot, not the display name or loose facets, is its executable
+    /// behavior/authority contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_template: Option<EphemeralTeamTemplateSnapshot>,
+    #[serde(default)]
+    pub resource_scopes: Vec<String>,
+    #[serde(default)]
+    pub output_artifacts: Vec<String>,
+    #[serde(default)]
+    pub evidence_contract: Vec<String>,
+    #[serde(default = "default_required_team_instance")]
+    pub required: bool,
+    #[serde(default)]
+    pub parallelism_hint: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CollaborationIntentPatchOperation {
+    AddTeam {
+        team: CollaborationPatchTeam,
+    },
+    RetireTeam {
+        instance_id: String,
+    },
+    RequestReview {
+        review: CollaborationPatchTeam,
+        reviewed_instance_ids: Vec<String>,
+    },
+    ChangeEdge {
+        edge_id: String,
+        from_instance_id: String,
+        to_instance_id: String,
+        edge_kind: CollaborationEdgeKind,
+        input_contract: CrossTeamInputContract,
+    },
+    NarrowObjective {
+        semantic_node_id: String,
+        objective: String,
+    },
+    SetParallelismHint {
+        semantic_node_id: String,
+        parallelism_hint: u16,
+    },
+}
+
+impl CollaborationIntentPatch {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("program_id", &self.program_id),
+            ("source_attempt", &self.source_attempt),
+            ("reason", &self.reason),
+            ("canonical_digest", &self.canonical_digest),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("collaboration patch {field} is empty"));
+            }
+        }
+        if self.base_revision == 0 {
+            return Err("collaboration patch base_revision is zero".to_string());
+        }
+        match &self.operation {
+            CollaborationIntentPatchOperation::AddTeam { team } => validate_patch_team(team)?,
+            CollaborationIntentPatchOperation::RetireTeam { instance_id } => {
+                require_patch_value("instance_id", instance_id)?;
+            }
+            CollaborationIntentPatchOperation::RequestReview {
+                review,
+                reviewed_instance_ids,
+                ..
+            } => {
+                validate_patch_team(review)?;
+                if reviewed_instance_ids.is_empty() {
+                    return Err("review patch has no reviewed Team instances".to_string());
+                }
+                validate_unique_patch_values("reviewed_instance_ids", reviewed_instance_ids)?;
+            }
+            CollaborationIntentPatchOperation::ChangeEdge {
+                edge_id,
+                from_instance_id,
+                to_instance_id,
+                ..
+            } => {
+                require_patch_value("edge_id", edge_id)?;
+                require_patch_value("from_instance_id", from_instance_id)?;
+                require_patch_value("to_instance_id", to_instance_id)?;
+                if from_instance_id == to_instance_id {
+                    return Err("cross-Team patch edge cannot be self-referential".to_string());
+                }
+            }
+            CollaborationIntentPatchOperation::NarrowObjective {
+                semantic_node_id,
+                objective,
+            } => {
+                require_patch_value("semantic_node_id", semantic_node_id)?;
+                require_patch_value("objective", objective)?;
+            }
+            CollaborationIntentPatchOperation::SetParallelismHint {
+                semantic_node_id,
+                parallelism_hint,
+            } => {
+                require_patch_value("semantic_node_id", semantic_node_id)?;
+                if *parallelism_hint == 0 {
+                    return Err("parallelism_hint is zero".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_patch_team(team: &CollaborationPatchTeam) -> Result<(), String> {
+    require_patch_value("team.semantic_node_id", &team.semantic_node_id)?;
+    require_patch_value("team.objective", &team.objective)?;
+    validate_unique_patch_values("team.depends_on", &team.depends_on)?;
+    if team
+        .depends_on
+        .iter()
+        .any(|id| id == &team.semantic_node_id)
+    {
+        return Err("Team patch cannot depend on itself".to_string());
+    }
+    if let Some(snapshot) = &team.ephemeral_template {
+        snapshot.validate()?;
+    } else if !team.behavior_facets.is_empty() {
+        return Err(
+            "Team patch behavior facets require an ephemeral template snapshot".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn require_patch_value(field: &str, value: &str) -> Result<(), String> {
+    (!value.trim().is_empty())
+        .then_some(())
+        .ok_or_else(|| format!("collaboration patch {field} is empty"))
+}
+
+fn validate_unique_patch_values(field: &str, values: &[String]) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        require_patch_value(field, value)?;
+        if !seen.insert(value.as_str()) {
+            return Err(format!(
+                "collaboration patch {field} has duplicate `{value}`"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Session/turn-bound custom Team template.  It is executable without global
 /// publication, but cannot outlive its terminal fence or become a catalog
 /// selection authority by accident.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EphemeralTeamTemplateSnapshot {
     pub session_id: String,
     pub turn_id: String,
     pub template_digest: String,
+    /// The complete immutable revision used for this execution.  It is held
+    /// in the Team request/graph payload instead of a mutable catalog slot;
+    /// restart therefore never reselects a newer custom template.
+    pub revision: crate::team::TeamTemplateRevision,
+    /// Normalized TEAM.md content covered by `revision.content_digest`.
+    pub team_markdown: String,
     #[serde(default)]
     pub role_ids: Vec<String>,
     pub policy_ref: String,
     pub expires_at_ms: u64,
     pub terminal_fence: String,
+}
+
+impl EphemeralTeamTemplateSnapshot {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("session_id", &self.session_id),
+            ("turn_id", &self.turn_id),
+            ("template_digest", &self.template_digest),
+            ("policy_ref", &self.policy_ref),
+            ("terminal_fence", &self.terminal_fence),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("ephemeral Team template {field} is empty"));
+            }
+        }
+        if self.expires_at_ms == 0 {
+            return Err("ephemeral Team template expires_at_ms is zero".to_string());
+        }
+        if self.team_markdown.trim().is_empty() || self.team_markdown.contains('\0') {
+            return Err("ephemeral Team template markdown is invalid".to_string());
+        }
+        self.revision
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if self.template_digest != self.revision.content_digest {
+            return Err("ephemeral Team template digest does not match revision".to_string());
+        }
+        let expected_role_ids = self
+            .revision
+            .manifest
+            .roles
+            .iter()
+            .map(|role| role.role_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let role_ids = self
+            .role_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        if expected_role_ids.is_empty()
+            || role_ids.len() != self.role_ids.len()
+            || role_ids != expected_role_ids
+        {
+            return Err(
+                "ephemeral Team template role identities do not match revision".to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Technical (not monetary) resource snapshot owned by the program revision.
@@ -1116,5 +1453,74 @@ mod dependency_policy_tests {
             "legacy metadata cannot impersonate an admitted program"
         );
         assert!(legacy.validate().is_ok());
+    }
+
+    #[test]
+    fn collaboration_intent_patch_requires_fenced_identity_and_non_self_team() {
+        let patch = CollaborationIntentPatch {
+            program_id: "program-p3".to_string(),
+            base_revision: 2,
+            source_attempt: "agent-attempt-7".to_string(),
+            reason: "independent review is required".to_string(),
+            evidence_refs: Vec::new(),
+            canonical_digest: "a".repeat(64),
+            user_confirmation_ref: None,
+            operation: CollaborationIntentPatchOperation::AddTeam {
+                team: CollaborationPatchTeam {
+                    semantic_node_id: "independent-review".to_string(),
+                    objective: "review the evidence independently".to_string(),
+                    depends_on: vec!["research".to_string()],
+                    behavior_facets: Vec::new(),
+                    ephemeral_template: None,
+                    resource_scopes: vec!["network:*".to_string()],
+                    output_artifacts: vec!["review".to_string()],
+                    evidence_contract: vec!["evidence".to_string()],
+                    required: true,
+                    parallelism_hint: 1,
+                },
+            },
+        };
+        assert!(patch.validate().is_ok());
+
+        let mut invalid = patch.clone();
+        invalid.base_revision = 0;
+        assert!(invalid.validate().is_err());
+        let CollaborationIntentPatchOperation::AddTeam { team } = &mut invalid.operation else {
+            unreachable!("test patch is an AddTeam")
+        };
+        invalid.base_revision = 2;
+        team.depends_on = vec![team.semantic_node_id.clone()];
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn collaboration_escalation_requires_fenced_attempt_identity() {
+        let escalation = CollaborationEscalationRequest {
+            source_attempt: "team-agent:attempt:3".to_string(),
+            base_revision: 4,
+            request_kind: "add_team".to_string(),
+            reason: "independent verification is required".to_string(),
+            evidence_refs: Vec::new(),
+            digest: "b".repeat(64),
+            requested_add_team: Some(CollaborationEscalationAddTeam {
+                semantic_node_id: "verification".to_string(),
+                objective: "verify the existing evidence independently".to_string(),
+                depends_on: vec!["research".to_string()],
+                resource_scopes: vec!["network:*".to_string()],
+                output_artifacts: vec!["verification".to_string()],
+                evidence_contract: vec!["evidence".to_string()],
+                required: true,
+                parallelism_hint: 1,
+            }),
+            template_proposal: None,
+        };
+        assert!(escalation.validate().is_ok());
+        let patch = escalation.as_add_team_patch("program-1".to_string());
+        assert!(patch.validate().is_ok());
+        assert_eq!(patch.source_attempt, escalation.source_attempt);
+        assert_eq!(patch.canonical_digest, escalation.digest);
+        let mut invalid = escalation;
+        invalid.base_revision = 0;
+        assert!(invalid.validate().is_err());
     }
 }

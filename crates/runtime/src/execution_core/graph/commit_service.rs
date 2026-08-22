@@ -138,8 +138,42 @@ fn merge_collaboration_program(
     // an additive review Team may legitimately consume a prior Team instance
     // from the same durable program.
     let mut candidate = program.clone();
+    let active = !candidate.control.lifecycle.is_terminal()
+        && candidate.control.lifecycle
+            != harness_contract::execution_graph::CollaborationProgramLifecycle::Planning;
+    if active && delta.control.obligations.len() != delta.team_instances.len() {
+        return Err(ExecutionCommitError::InvalidReplan(
+            "active Program revision is missing exact Team admission obligations".to_string(),
+        ));
+    }
     candidate.team_instances.extend(delta.team_instances);
     candidate.edges.extend(delta.edges);
+    if active {
+        candidate
+            .control
+            .obligations
+            .extend(delta.control.obligations);
+        candidate.control.resource_ledger.context_reservation_tokens = candidate
+            .control
+            .resource_ledger
+            .context_reservation_tokens
+            .saturating_add(delta.control.resource_ledger.context_reservation_tokens);
+        candidate.control.resource_ledger.output_reservation_tokens = candidate
+            .control
+            .resource_ledger
+            .output_reservation_tokens
+            .saturating_add(delta.control.resource_ledger.output_reservation_tokens);
+        candidate.control.resource_ledger.parallel_demand = candidate
+            .control
+            .resource_ledger
+            .parallel_demand
+            .saturating_add(delta.control.resource_ledger.parallel_demand);
+        candidate.control.resource_ledger.deadline_at_ms = candidate
+            .control
+            .resource_ledger
+            .deadline_at_ms
+            .max(delta.control.resource_ledger.deadline_at_ms);
+    }
     for (semantic_id, physical_nodes) in delta.semantic_node_instances {
         if candidate
             .semantic_node_instances
@@ -164,6 +198,21 @@ fn merge_collaboration_program(
         )
     })?;
     candidate.revision = candidate.revision.saturating_add(1);
+    if active {
+        // An obligation is fenced by the Program revision, not by the point
+        // at which its Team was first admitted.  Advancing only newly-added
+        // obligations would make the candidate internally inconsistent and
+        // let a recovery path observe mixed ownership revisions.
+        for obligation in &mut candidate.control.obligations {
+            obligation.revision = candidate.revision;
+        }
+        candidate.control.resource_ledger.revision = candidate.revision;
+        candidate.control.lifecycle =
+            harness_contract::execution_graph::CollaborationProgramLifecycle::Admitting;
+        candidate.control.waiting_relation = Some("team_admission".to_string());
+        candidate.control.blocker_ref = None;
+        candidate.control.next_action = Some("admit_exact_team_bindings".to_string());
+    }
     candidate
         .validate()
         .map_err(ExecutionCommitError::InvalidReplan)?;
@@ -2942,8 +2991,9 @@ mod tests {
     #[test]
     fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
         use harness_contract::execution_graph::{
-            CollaborationEdgeKind, CollaborationProgram, CollaborationProgramEdge,
-            CollaborationTeamInstance,
+            CollaborationEdgeKind, CollaborationProgram, CollaborationProgramControlState,
+            CollaborationProgramEdge, CollaborationProgramLifecycle, CollaborationTeamInstance,
+            ProgramResourceLedger, TeamAdmissionObligation, TeamAdmissionState,
         };
 
         let mut current = Some(CollaborationProgram {
@@ -2960,7 +3010,28 @@ mod tests {
                 "research".to_string(),
                 vec!["graph:research:1".to_string()],
             )]),
-            control: Default::default(),
+            control: CollaborationProgramControlState {
+                lifecycle: CollaborationProgramLifecycle::Running,
+                obligations: vec![TeamAdmissionObligation {
+                    instance_id: "research:1".to_string(),
+                    binding_ref: "team-binding:sha256:research".to_string(),
+                    state: TeamAdmissionState::Admitted,
+                    child_graph_ref: Some("team-graph:research".to_string()),
+                    reason_kind: None,
+                    revision: 1,
+                }],
+                resource_ledger: ProgramResourceLedger {
+                    context_reservation_tokens: 100,
+                    output_reservation_tokens: 50,
+                    parallel_demand: 1,
+                    deadline_at_ms: 1000,
+                    confidence_basis_points: 10_000,
+                    revision: 1,
+                },
+                waiting_relation: None,
+                blocker_ref: None,
+                next_action: Some("await_graph_transitions".to_string()),
+            },
         });
         let delta = CollaborationProgram {
             program_id: "ignored-delta-id".to_string(),
@@ -2983,7 +3054,28 @@ mod tests {
                 "review".to_string(),
                 vec!["graph:review:1".to_string()],
             )]),
-            control: Default::default(),
+            control: CollaborationProgramControlState {
+                lifecycle: CollaborationProgramLifecycle::Admitting,
+                obligations: vec![TeamAdmissionObligation {
+                    instance_id: "review:1".to_string(),
+                    binding_ref: "team-binding:sha256:review".to_string(),
+                    state: TeamAdmissionState::Admitting,
+                    child_graph_ref: None,
+                    reason_kind: None,
+                    revision: 1,
+                }],
+                resource_ledger: ProgramResourceLedger {
+                    context_reservation_tokens: 70,
+                    output_reservation_tokens: 30,
+                    parallel_demand: 1,
+                    deadline_at_ms: 2000,
+                    confidence_basis_points: 10_000,
+                    revision: 1,
+                },
+                waiting_relation: Some("team_admission".to_string()),
+                blocker_ref: None,
+                next_action: Some("admit_exact_team_bindings".to_string()),
+            },
         };
         merge_collaboration_program(&mut current, Some(delta)).expect("merge additive revision");
         let program = current.expect("program");
@@ -2992,6 +3084,35 @@ mod tests {
         assert_eq!(program.required_team_count, 2);
         assert_eq!(program.edges.len(), 1);
         assert_eq!(program.semantic_node_instances.len(), 2);
+        assert_eq!(
+            program.control.lifecycle,
+            CollaborationProgramLifecycle::Admitting
+        );
+        assert_eq!(program.control.obligations.len(), 2);
+        assert_eq!(
+            program.control.obligations[0].state,
+            TeamAdmissionState::Admitted
+        );
+        assert_eq!(
+            program.control.obligations[1].state,
+            TeamAdmissionState::Admitting
+        );
+        assert!(program
+            .control
+            .obligations
+            .iter()
+            .all(|obligation| obligation.revision == 2));
+        assert_eq!(program.control.resource_ledger.revision, 2);
+        assert_eq!(
+            program.control.resource_ledger.context_reservation_tokens,
+            170
+        );
+        assert_eq!(
+            program.control.resource_ledger.output_reservation_tokens,
+            80
+        );
+        assert_eq!(program.control.resource_ledger.parallel_demand, 2);
+        assert_eq!(program.control.resource_ledger.deadline_at_ms, 2000);
         assert_eq!(
             program
                 .team_instances
