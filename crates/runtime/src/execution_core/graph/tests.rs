@@ -958,6 +958,48 @@ async fn resource_pressure_keeps_a_ready_graph_pump_alive_until_a_lease_releases
 }
 
 #[tokio::test]
+async fn continuation_retry_returns_the_existing_root_to_the_execution_runner() {
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(Vec::new(), Duration::ZERO)))
+        .expect("test executor");
+    let runner = test_runner(registry, state.clone(), commits);
+    let binding = crate::compile_continuation_binding(
+        &crate::ContinuationCandidate {
+            source_session_id: "continuation-session".to_string(),
+            source_turn_id: "continuation-turn".to_string(),
+            source_root_id: "continuation-source-root".to_string(),
+            team_set_ref: "team_graph:continuation-source-team".to_string(),
+            delivery_revision: 7,
+            result_refs: vec!["team_graph:continuation-source-team".to_string()],
+            handoff_id: None,
+        },
+        "continuation-ingress",
+        7,
+        harness_contract::turn::ContinuationAuthorization::Authorized,
+        1,
+    )
+    .expect("binding");
+    let mut first = test_graph("first continuation root");
+    first.id = "continuation-existing-root".to_string();
+    first.nodes.push(node("continuation-first-node"));
+    first.continuation_binding = Some(binding.clone());
+    let registered = runner.register(first).await.expect("first registration");
+    assert_eq!(registered.id, "continuation-existing-root");
+
+    let mut replay = test_graph("replayed continuation root");
+    replay.id = "continuation-replay-must-not-exist".to_string();
+    replay.nodes.push(node("continuation-replay-node"));
+    replay.continuation_binding = Some(binding);
+    let replayed = runner
+        .register(replay)
+        .await
+        .expect("replayed registration");
+    assert_eq!(replayed.id, "continuation-existing-root");
+    assert!(state.load("continuation-replay-must-not-exist").is_err());
+}
+
+#[tokio::test]
 async fn two_root_teams_overlap_through_real_supervisor_and_agent_resource_quota() {
     let (registry, state, commits) = harness();
     let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(75)));
