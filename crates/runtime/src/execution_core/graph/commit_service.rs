@@ -1584,6 +1584,9 @@ impl ExecutionCommitService {
             ExecutionGraphCommand::ApplyCrossTeamEdgePatch { patch, .. } => {
                 apply_cross_team_edge_patch(&mut next, patch)?;
             }
+            ExecutionGraphCommand::ApplyCollaborationTeamRetirement { patch, .. } => {
+                apply_collaboration_team_retirement(&mut next, patch)?;
+            }
             ExecutionGraphCommand::Replan { .. } => {
                 return Err(ExecutionCommitError::InvalidCommand(
                     "replan requires the graph compiler and cannot be applied as a status mutation"
@@ -2469,6 +2472,9 @@ fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::ApplyCrossTeamEdgePatch {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::ApplyCollaborationTeamRetirement {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::Replan {
             expected_revision, ..
         } => *expected_revision,
@@ -2497,6 +2503,9 @@ fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str, Option<&s
         }
         ExecutionGraphCommand::ApplyCrossTeamEdgePatch { .. } => {
             ("apply_cross_team_edge_patch", None)
+        }
+        ExecutionGraphCommand::ApplyCollaborationTeamRetirement { .. } => {
+            ("apply_collaboration_team_retirement", None)
         }
         ExecutionGraphCommand::Replan { reason, .. } => ("replan", Some(reason)),
     }
@@ -2673,6 +2682,145 @@ fn apply_cross_team_edge_patch(
         .and_then(|metadata| metadata.collaboration_program.as_mut())
         .expect("current Program exists")
         .clone_from(&candidate);
+    validate_execution_graph(graph)
+        .map(|_| ())
+        .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
+}
+
+/// Retire exactly one Team before it has acquired any execution or admission
+/// effect.  This is intentionally narrower than a generic graph deletion:
+/// the Team node remains durably visible as cancelled, while the Program's
+/// semantic contract, resource obligations, physical handoffs and completion
+/// gate are revised in the same graph transaction.
+fn apply_collaboration_team_retirement(
+    graph: &mut ExecutionGraph,
+    patch: &harness_contract::execution_graph::CollaborationIntentPatch,
+) -> Result<(), ExecutionCommitError> {
+    use harness_contract::execution_graph::{
+        CollaborationIntentPatchOperation, CollaborationProgramLifecycle, ExecutionEdgeKind,
+    };
+
+    patch
+        .validate()
+        .map_err(ExecutionCommitError::InvalidCommand)?;
+    let CollaborationIntentPatchOperation::RetireTeam { instance_id } = &patch.operation else {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "Team retirement command requires a retire_team patch".to_string(),
+        ));
+    };
+    let current = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(
+                "graph has no collaboration program control plane".to_string(),
+            )
+        })?;
+    if patch.program_id != current.program_id || patch.base_revision != current.revision {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "Team retirement patch program revision conflict".to_string(),
+        ));
+    }
+    if current.control.lifecycle.is_terminal() {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "Team retirement patch targets a terminal Program".to_string(),
+        ));
+    }
+    let instance = current
+        .team_instances
+        .iter()
+        .find(|candidate| candidate.instance_id == *instance_id)
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "Team retirement patch references unknown Team instance `{instance_id}`"
+            ))
+        })?;
+    if instance.required
+        && patch
+            .user_confirmation_ref
+            .as_deref()
+            .is_none_or(|reference| reference.trim().is_empty())
+    {
+        return Err(ExecutionCommitError::InvalidCommand(
+            "retiring a required Team requires an explicit user confirmation reference".to_string(),
+        ));
+    }
+    let retired_node_id = physical_node_for_team_instance(current, instance_id)?;
+    let status = graph
+        .node_statuses
+        .get(&retired_node_id)
+        .copied()
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "Team retirement node `{retired_node_id}` is absent"
+            ))
+        })?;
+    if status != ExecutionNodeStatus::Planned {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "Team retirement requires a planned Team; `{retired_node_id}` is {status:?}"
+        )));
+    }
+
+    let mut candidate = current.clone();
+    candidate
+        .team_instances
+        .retain(|team| team.instance_id != *instance_id);
+    candidate
+        .edges
+        .retain(|edge| edge.from != *instance_id && edge.to != *instance_id);
+    candidate
+        .control
+        .obligations
+        .retain(|obligation| obligation.instance_id != *instance_id);
+    let semantic_id = instance.semantic_node_id.clone();
+    let remove_mapping = candidate
+        .semantic_node_instances
+        .get_mut(&semantic_id)
+        .is_some_and(|nodes| {
+            nodes.retain(|node_id| node_id != &retired_node_id);
+            nodes.is_empty()
+        });
+    if remove_mapping {
+        candidate.semantic_node_instances.remove(&semantic_id);
+    }
+    candidate.required_team_count = u16::try_from(
+        candidate
+            .team_instances
+            .iter()
+            .filter(|team| team.required)
+            .count(),
+    )
+    .unwrap_or(u16::MAX);
+    candidate.revision = candidate.revision.saturating_add(1);
+    if candidate.control.lifecycle != CollaborationProgramLifecycle::Planning {
+        candidate.control.resource_ledger.revision = candidate.revision;
+        for obligation in &mut candidate.control.obligations {
+            obligation.revision = candidate.revision;
+        }
+    }
+    candidate.validate().map_err(|error| {
+        ExecutionCommitError::InvalidCommand(format!("invalid Team retirement candidate: {error}"))
+    })?;
+
+    graph
+        .node_statuses
+        .insert(retired_node_id.clone(), ExecutionNodeStatus::Cancelled);
+    graph.edges.retain(|edge| {
+        !(edge.kind == ExecutionEdgeKind::CrossTeamHandoff
+            && (edge.from == retired_node_id || edge.to == retired_node_id))
+    });
+    if let Some(orchestration) = graph.orchestration.as_mut() {
+        orchestration
+            .completion
+            .required_node_ids
+            .retain(|node_id| node_id != &retired_node_id);
+        orchestration
+            .collaboration_program
+            .as_mut()
+            .expect("current Program exists")
+            .clone_from(&candidate);
+    }
     validate_execution_graph(graph)
         .map(|_| ())
         .map_err(|error| ExecutionCommitError::InvalidCommand(error.to_string()))
@@ -3849,6 +3997,174 @@ mod tests {
                 .map(|receipt| receipt.consumer_attempt),
             Some(1)
         );
+    }
+
+    #[test]
+    fn retirement_cancels_only_a_confirmed_unstarted_team_and_revises_program_atomically() {
+        use harness_contract::execution_graph::{
+            CollaborationEdgeKind, CollaborationProgram, CollaborationProgramEdge,
+            CollaborationProgramLifecycle, CollaborationTeamInstance, ExecutionGraphCommand,
+            ExecutionOrchestrationMetadata,
+        };
+
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+        let service = ExecutionCommitService::new(store);
+        let mut graph = agent_task_graph();
+        graph.id = "retire-team-root".to_string();
+        let mut consumer = graph.nodes[0].clone();
+        consumer.id = "consumer-team".to_string();
+        consumer.idempotency_key = "consumer-team-key".to_string();
+        graph.nodes[0].id = "producer-team".to_string();
+        graph.nodes[0].idempotency_key = "producer-team-key".to_string();
+        graph.nodes.push(consumer);
+        graph.node_statuses = BTreeMap::from([
+            ("producer-team".to_string(), ExecutionNodeStatus::Planned),
+            ("consumer-team".to_string(), ExecutionNodeStatus::Planned),
+        ]);
+        graph.edges = vec![ExecutionEdge {
+            from: "producer-team".to_string(),
+            to: "consumer-team".to_string(),
+            kind: harness_contract::execution_graph::ExecutionEdgeKind::CrossTeamHandoff,
+        }];
+        graph.orchestration = Some(ExecutionOrchestrationMetadata {
+            mutation_id: "retire-team-test".to_string(),
+            applied_mutation_ids: Vec::new(),
+            semantic_revision: 1,
+            source_generation: 1,
+            completion: harness_contract::execution_graph::ExecutionCompletionContract {
+                required_node_ids: vec!["producer-team".to_string(), "consumer-team".to_string()],
+                ..Default::default()
+            },
+            collaboration_program: Some(CollaborationProgram {
+                program_id: "program-retire-team".to_string(),
+                revision: 1,
+                required_team_count: 2,
+                team_instances: vec![
+                    CollaborationTeamInstance {
+                        instance_id: "producer:1".to_string(),
+                        semantic_node_id: "producer".to_string(),
+                        required: true,
+                    },
+                    CollaborationTeamInstance {
+                        instance_id: "consumer:1".to_string(),
+                        semantic_node_id: "consumer".to_string(),
+                        required: true,
+                    },
+                ],
+                edges: vec![CollaborationProgramEdge {
+                    edge_id: "producer:1->consumer:1".to_string(),
+                    from: "producer:1".to_string(),
+                    to: "consumer:1".to_string(),
+                    kind: CollaborationEdgeKind::Handoff,
+                    input_contract: Default::default(),
+                    state: Default::default(),
+                    delivery_receipt: None,
+                    claim_receipt: None,
+                }],
+                semantic_node_instances: BTreeMap::from([
+                    ("producer".to_string(), vec!["producer-team".to_string()]),
+                    ("consumer".to_string(), vec!["consumer-team".to_string()]),
+                ]),
+                control: harness_contract::execution_graph::CollaborationProgramControlState {
+                    lifecycle: CollaborationProgramLifecycle::Planning,
+                    ..Default::default()
+                },
+            }),
+        });
+        let mut started_graph = graph.clone();
+        started_graph.id = "retire-team-started-root".to_string();
+        let registered = service.register_graph(graph).expect("register graph").graph;
+        let started_registered = service
+            .register_graph(started_graph)
+            .expect("register started graph")
+            .graph;
+        let patch = |confirmation: Option<&str>| {
+            Box::new(harness_contract::execution_graph::CollaborationIntentPatch {
+                program_id: "program-retire-team".to_string(),
+                base_revision: 1,
+                source_attempt: "producer-team:attempt:0".to_string(),
+                reason: "the bounded consumer branch is no longer required".to_string(),
+                evidence_refs: Vec::new(),
+                canonical_digest: "r".repeat(64),
+                user_confirmation_ref: confirmation.map(str::to_string),
+                operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::RetireTeam {
+                    instance_id: "consumer:1".to_string(),
+                },
+            })
+        };
+        let missing_confirmation = service.apply_command(
+            &registered,
+            &ExecutionGraphCommand::ApplyCollaborationTeamRetirement {
+                expected_revision: registered.revision,
+                patch: patch(None),
+            },
+        );
+        assert!(matches!(
+            missing_confirmation,
+            Err(ExecutionCommitError::InvalidCommand(message))
+                if message.contains("explicit user confirmation")
+        ));
+
+        let retired = service
+            .apply_command(
+                &registered,
+                &ExecutionGraphCommand::ApplyCollaborationTeamRetirement {
+                    expected_revision: registered.revision,
+                    patch: patch(Some("approval:retire-consumer")),
+                },
+            )
+            .expect("confirmed pending Team retires atomically")
+            .graph;
+        let program = retired
+            .orchestration
+            .as_ref()
+            .expect("metadata")
+            .collaboration_program
+            .as_ref()
+            .expect("program");
+        assert_eq!(program.revision, 2);
+        assert_eq!(program.required_team_count, 1);
+        assert_eq!(program.team_instances.len(), 1);
+        assert_eq!(program.team_instances[0].instance_id, "producer:1");
+        assert!(program.edges.is_empty());
+        assert!(!program.semantic_node_instances.contains_key("consumer"));
+        assert_eq!(
+            retired.node_statuses["consumer-team"],
+            ExecutionNodeStatus::Cancelled
+        );
+        assert!(retired.edges.is_empty());
+        assert_eq!(
+            retired
+                .orchestration
+                .as_ref()
+                .expect("metadata")
+                .completion
+                .required_node_ids,
+            vec!["producer-team"]
+        );
+        assert!(validate_execution_graph(&retired).is_ok());
+
+        let started = service
+            .transition_node(
+                &started_registered,
+                "consumer-team",
+                ExecutionNodeStatus::Ready,
+                None,
+                Vec::new(),
+            )
+            .expect("consumer becomes ready")
+            .graph;
+        let started_rejection = service.apply_command(
+            &started,
+            &ExecutionGraphCommand::ApplyCollaborationTeamRetirement {
+                expected_revision: started.revision,
+                patch: patch(Some("approval:retire-consumer")),
+            },
+        );
+        assert!(matches!(
+            started_rejection,
+            Err(ExecutionCommitError::InvalidCommand(message)) if message.contains("requires a planned Team")
+        ));
     }
 
     #[test]

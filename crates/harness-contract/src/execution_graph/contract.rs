@@ -1337,6 +1337,13 @@ pub enum ExecutionGraphCommand {
         expected_revision: u64,
         patch: Box<CollaborationIntentPatch>,
     },
+    /// Coordinator-owned atomic retirement of one not-yet-started Team. The
+    /// commit service cancels its physical node and removes every matching
+    /// Program obligation, handoff and completion requirement together.
+    ApplyCollaborationTeamRetirement {
+        expected_revision: u64,
+        patch: Box<CollaborationIntentPatch>,
+    },
     Replan {
         expected_revision: u64,
         reason: String,
