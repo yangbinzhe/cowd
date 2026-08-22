@@ -2720,6 +2720,47 @@ mod tests {
             ),
             "canonical nullable strategy schema must reference StrategyDecisionProjection"
         );
+        let collaboration_program = &document["components"]["schemas"]["CollaborationProgram"];
+        assert!(
+            schema_contains_ref(
+                &document["components"]["schemas"]["ExecutionOrchestrationMetadata"]["properties"]
+                    ["collaboration_program"],
+                "#/components/schemas/CollaborationProgram",
+            ),
+            "execution projection must expose the typed collaboration program"
+        );
+        for field in ["control", "semantic_node_instances"] {
+            assert!(
+                collaboration_program["properties"][field].is_object(),
+                "collaboration program must retain {field} in the public projection schema"
+            );
+        }
+        let collaboration_edge = &document["components"]["schemas"]["CollaborationProgramEdge"];
+        for field in [
+            "input_contract",
+            "state",
+            "delivery_receipt",
+            "claim_receipt",
+        ] {
+            assert!(
+                collaboration_edge["properties"][field].is_object(),
+                "collaboration edge must retain {field} in the public projection schema"
+            );
+        }
+        let control = &document["components"]["schemas"]["CollaborationProgramControlState"];
+        for field in [
+            "lifecycle",
+            "obligations",
+            "resource_ledger",
+            "waiting_relation",
+            "blocker_ref",
+            "next_action",
+        ] {
+            assert!(
+                control["properties"][field].is_object(),
+                "collaboration control must retain {field} in the public projection schema"
+            );
+        }
         let strategy_required = document["components"]["schemas"]["StrategyDecisionProjection"]
             ["required"]
             .as_array()
