@@ -1448,6 +1448,15 @@ async fn run_completion_pump(
                     }
                     Ok((node_id, Err(error))) => {
                         in_flight.remove(&node_id);
+                        if matches!(error, ExecutionRunnerError::ResourceDeferred { .. }) {
+                            // Keep the graph driver alive across soft resource
+                            // pressure. `wait_for_change` is notification-led
+                            // with a bounded fallback, so a release cannot
+                            // strand a Ready node and a missed notification
+                            // cannot spin forever.
+                            runner.wait_for_resource_change().await;
+                            continue;
+                        }
                         // Node-local executor failures are already isolated
                         // inside `execute_pump_node`. Anything that still
                         // escapes is a graph/state/commit error, which must not

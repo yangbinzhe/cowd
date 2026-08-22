@@ -516,6 +516,13 @@ impl ExecutionGraphRunner {
         self.state_store.subscribe_commits()
     }
 
+    /// Resource pressure is a soft wait, not a terminal graph outcome.  The
+    /// completion pump owns the retry loop so a released lease wakes the same
+    /// durable Ready node instead of silently ending its graph driver.
+    pub(crate) async fn wait_for_resource_change(&self) {
+        self.resource_manager.wait_for_change().await;
+    }
+
     pub(crate) async fn terminal_report(
         &self,
         graph_id: &str,
@@ -636,7 +643,7 @@ impl ExecutionGraphRunner {
         let result = self.start_and_execute_node(graph_id, node).await;
         let (node_id, outcome) = match result {
             Err(ExecutionRunnerError::CommandSuperseded { .. }) => return Ok(()),
-            Err(ExecutionRunnerError::ResourceDeferred { .. }) => return Ok(()),
+            Err(error @ ExecutionRunnerError::ResourceDeferred { .. }) => return Err(error),
             Err(ExecutionRunnerError::DeadlineExceeded {
                 node_id,
                 deadline_at_ms,
@@ -1243,7 +1250,6 @@ impl ExecutionGraphRunner {
                             deadline_at_ms: deadline_at_ms.unwrap_or_default(),
                         });
                     }
-                    self.resource_manager.wait_for_change().await;
                     return Err(ExecutionRunnerError::ResourceDeferred {
                         node_id: node.id.clone(),
                         reason: format!("resource admission overloaded: {wait_reason:?}"),

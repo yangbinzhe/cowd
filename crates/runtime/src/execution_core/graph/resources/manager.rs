@@ -900,12 +900,13 @@ impl ExecutionResourceManager {
 
     /// Wait for one admission-state transition without exposing queue
     /// ownership. Durable graph pumps use this only after typed overload; the
-    /// bounded fallback closes the `notify_waiters` registration race.
+    /// bounded fallback closes the `notify_waiters` registration race without
+    /// turning sustained overload into a hot retry loop.
     pub(crate) async fn wait_for_change(&self) {
         let notified = self.shared.changed.notified();
         tokio::select! {
             () = notified => {}
-            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+            () = tokio::time::sleep(Duration::from_millis(25)) => {}
         }
     }
 

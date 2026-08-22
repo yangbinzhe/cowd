@@ -707,6 +707,15 @@ fn test_runner(
     state: ExecutionGraphStateStore,
     commits: ExecutionCommitService,
 ) -> ExecutionGraphRunner {
+    test_runner_with_agent_limit(registry, state, commits, 4)
+}
+
+fn test_runner_with_agent_limit(
+    registry: Arc<NodeExecutorRegistry>,
+    state: ExecutionGraphStateStore,
+    commits: ExecutionCommitService,
+    agent_limit: usize,
+) -> ExecutionGraphRunner {
     let workspace_id = format!("test-{}", uuid::Uuid::new_v4());
     let leases = WorktreeLeaseManager::open(
         std::env::temp_dir()
@@ -726,7 +735,7 @@ fn test_runner(
             ),
             (
                 ExecutionResourceKind::Agent,
-                ResourceQuota::new(1, 4, 8).expect("agent quota"),
+                ResourceQuota::new(1, agent_limit, agent_limit).expect("agent quota"),
             ),
             (
                 ExecutionResourceKind::Tool,
@@ -870,6 +879,82 @@ async fn supervisor_runs_one_hundred_graphs_with_bounded_cross_key_parallelism()
     let shutdown = supervisor.shutdown().await;
     assert_eq!(shutdown.remaining_keys, 0);
     assert_eq!(shutdown.forced_aborts, 0);
+}
+
+#[tokio::test]
+async fn resource_pressure_keeps_a_ready_graph_pump_alive_until_a_lease_releases() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(100)));
+    registry.register(executor.clone()).unwrap();
+    let supervisor = Arc::new(crate::RuntimeExecutionSupervisor::with_limits(
+        Arc::new(test_runner_with_agent_limit(
+            registry,
+            state.clone(),
+            commits,
+            1,
+        )),
+        8,
+        2,
+        Duration::from_secs(2),
+    ));
+    let deadline_at_ms = crate::tool_invocation::now_ms().saturating_add(5_000);
+    let mut first = test_graph("first graph holds the only Agent lease");
+    first.id = "resource-pressure-first".to_string();
+    let mut first_node = node("first-agent");
+    first_node.kind = ExecutionNodeKind::AgentTask;
+    first_node.payload_ref = agent_intent_payload(&first.id, &first_node.id, deadline_at_ms);
+    first.nodes.push(first_node);
+    supervisor
+        .submit_graph(
+            first,
+            ExecutionGraphCommand::Start {
+                expected_revision: 0,
+            },
+        )
+        .await
+        .expect("first graph admitted");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while executor.running.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first graph acquires the Agent lease");
+
+    let mut deferred = test_graph("second graph waits for the Agent lease");
+    deferred.id = "resource-pressure-deferred".to_string();
+    let deferred_id = deferred.id.clone();
+    let mut deferred_node = node("deferred-agent");
+    deferred_node.kind = ExecutionNodeKind::AgentTask;
+    deferred_node.payload_ref =
+        agent_intent_payload(&deferred.id, &deferred_node.id, deadline_at_ms);
+    deferred.nodes.push(deferred_node);
+    supervisor
+        .submit_graph(
+            deferred,
+            ExecutionGraphCommand::Start {
+                expected_revision: 0,
+            },
+        )
+        .await
+        .expect("deferred graph admitted");
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.wait_for_quiescence(&deferred_id),
+    )
+    .await
+    .expect("resource release wakes the deferred graph")
+    .expect("deferred graph reaches quiescence");
+    assert_eq!(report.completed, 1);
+    assert_eq!(
+        state
+            .load(&deferred_id)
+            .expect("deferred graph state")
+            .node_statuses["deferred-agent"],
+        ExecutionNodeStatus::Completed
+    );
+    supervisor.shutdown().await;
 }
 
 #[tokio::test]
