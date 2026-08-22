@@ -376,8 +376,9 @@ impl CutoverContext {
     }
 
     async fn copy_domains_parallel(&self) -> Result<BTreeMap<String, serde_json::Value>, String> {
+        let sqlite_source = sqlite_cutover_source_topology();
         let source = Arc::new(SelectedStorageTopology::compose_for_maintenance(
-            &runtime::StorageTopologyConfig::default(),
+            &sqlite_source,
             &self.config_home,
             &self.workspace_root,
         )?);
@@ -789,6 +790,17 @@ fn manifest_digest(manifest: &CutoverManifest) -> Result<String, String> {
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
+// The source side of a cutover is deliberately SQLite. Maintenance mode
+// otherwise treats an `auto` topology as PostgreSQL-only, which is correct
+// for the target schema upgrade but makes an empty/default source
+// configuration fail before any domain can be copied.
+fn sqlite_cutover_source_topology() -> runtime::StorageTopologyConfig {
+    runtime::StorageTopologyConfig {
+        backend: runtime::StorageBackendSelection::Sqlite,
+        ..runtime::StorageTopologyConfig::default()
+    }
+}
+
 fn workspace_key(workspace_root: &Path) -> String {
     storage::StorageScope::workspace_key_for_root(workspace_root)
 }
@@ -935,6 +947,16 @@ fn stringify(error: impl std::fmt::Display) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cutover_source_topology_is_explicitly_sqlite() {
+        let topology = sqlite_cutover_source_topology();
+        assert_eq!(
+            topology.backend,
+            runtime::StorageBackendSelection::Sqlite,
+            "the copy source must not inherit maintenance-mode PostgreSQL selection"
+        );
+    }
 
     #[test]
     fn cleanup_removes_only_expired_owned_artifacts() {
