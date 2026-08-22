@@ -266,10 +266,13 @@ pub(crate) fn compile_conversation_program_intent(
     })
 }
 
-/// Convert a fenced AddTeam patch to the internal semantic-revision request.
-/// The caller must submit this request through the normal Coordinator path;
-/// this helper deliberately exposes no physical node or executor choice.
-pub(crate) fn compile_add_team_patch(
+/// Convert a fenced additive Program patch to an internal semantic revision.
+/// `AddTeam` and `RequestReview` are the additive operations: the latter
+/// derives its semantic dependencies from named durable Team instances rather
+/// than trusting a free-form textual review target. Operations that mutate an
+/// existing node or edge deliberately need the separate atomic Program+Graph
+/// mutation path and are rejected here until that path exists.
+pub(crate) fn compile_collaboration_intent_patch(
     graph: &ExecutionGraph,
     patch: &harness_contract::execution_graph::CollaborationIntentPatch,
 ) -> Result<RuntimeOrchestrationCommand, String> {
@@ -282,10 +285,30 @@ pub(crate) fn compile_add_team_patch(
     if patch.program_id != program.program_id || patch.base_revision != program.revision {
         return Err("patch_program_revision_conflict".to_string());
     }
-    let harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam { team } =
-        &patch.operation
-    else {
-        return Err("patch_operation_not_add_team".to_string());
+    let requested_review = match &patch.operation {
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::RequestReview {
+            review,
+            reviewed_instance_ids,
+        } => Some((review, reviewed_instance_ids)),
+        _ => None,
+    };
+    let review_team = requested_review
+        .map(|(review, reviewed_instance_ids)| {
+            materialize_review_patch_team(program, review, reviewed_instance_ids)
+        })
+        .transpose()?;
+    let team = match &patch.operation {
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam { team } => {
+            team
+        }
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::RequestReview {
+            ..
+        } => review_team
+            .as_ref()
+            .expect("request-review operation materializes its review Team"),
+        _ => {
+            return Err("patch_operation_requires_atomic_program_graph_mutation".to_string());
+        }
     };
     if !team.behavior_facets.is_empty() && team.ephemeral_template.is_none() {
         return Err("add_team_behavior_facets_require_ephemeral_template_snapshot".to_string());
@@ -404,6 +427,34 @@ pub(crate) fn compile_add_team_patch(
         },
         surface: Some("collaboration_program_patch".to_string()),
     })
+}
+
+fn materialize_review_patch_team(
+    program: &CollaborationProgram,
+    review: &harness_contract::execution_graph::CollaborationPatchTeam,
+    reviewed_instance_ids: &[String],
+) -> Result<harness_contract::execution_graph::CollaborationPatchTeam, String> {
+    let mut semantic_dependencies = reviewed_instance_ids
+        .iter()
+        .map(|instance_id| {
+            program
+                .team_instances
+                .iter()
+                .find(|instance| instance.instance_id == *instance_id)
+                .map(|instance| instance.semantic_node_id.clone())
+                .ok_or_else(|| {
+                    format!("review_patch_references_unknown_team_instance:{instance_id}")
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    semantic_dependencies.sort();
+    semantic_dependencies.dedup();
+    let mut review = review.clone();
+    // The typed `reviewed_instance_ids` are authoritative. A model cannot
+    // smuggle an unrelated dependency through the shape that describes the
+    // new reviewer Team.
+    review.depends_on = semantic_dependencies;
+    Ok(review)
 }
 
 /// Compile a custom Team for exactly one session/turn without publishing it
@@ -1199,8 +1250,67 @@ mod tests {
                     },
                 },
         };
-        let error = compile_add_team_patch(&ExecutionGraph::new("ordinary graph"), &patch)
-            .expect_err("Patch must target a durable Program");
+        let error =
+            compile_collaboration_intent_patch(&ExecutionGraph::new("ordinary graph"), &patch)
+                .expect_err("Patch must target a durable Program");
         assert_eq!(error, "patch_target_has_no_collaboration_program");
+    }
+
+    #[test]
+    fn request_review_derives_only_named_durable_team_dependencies() {
+        let program = CollaborationProgram {
+            program_id: "program-review".to_string(),
+            revision: 2,
+            required_team_count: 3,
+            team_instances: vec![
+                harness_contract::execution_graph::CollaborationTeamInstance {
+                    instance_id: "research:1".to_string(),
+                    semantic_node_id: "research".to_string(),
+                    required: true,
+                },
+                harness_contract::execution_graph::CollaborationTeamInstance {
+                    instance_id: "research:2".to_string(),
+                    semantic_node_id: "research".to_string(),
+                    required: true,
+                },
+                harness_contract::execution_graph::CollaborationTeamInstance {
+                    instance_id: "implementation:1".to_string(),
+                    semantic_node_id: "implementation".to_string(),
+                    required: true,
+                },
+            ],
+            edges: Vec::new(),
+            semantic_node_instances: std::collections::BTreeMap::new(),
+            control: Default::default(),
+        };
+        let review = harness_contract::execution_graph::CollaborationPatchTeam {
+            semantic_node_id: "independent-review".to_string(),
+            objective: "review only the named Team outcomes".to_string(),
+            depends_on: vec!["untrusted-model-dependency".to_string()],
+            behavior_facets: Vec::new(),
+            ephemeral_template: None,
+            resource_scopes: vec!["read:src".to_string()],
+            output_artifacts: vec!["review".to_string()],
+            evidence_contract: vec!["evidence".to_string()],
+            required: true,
+            parallelism_hint: 1,
+        };
+        let materialized = materialize_review_patch_team(
+            &program,
+            &review,
+            &[
+                "implementation:1".to_string(),
+                "research:1".to_string(),
+                "research:2".to_string(),
+            ],
+        )
+        .expect("named instances resolve to their durable semantic dependencies");
+        assert_eq!(
+            materialized.depends_on,
+            vec!["implementation".to_string(), "research".to_string()]
+        );
+        assert!(
+            materialize_review_patch_team(&program, &review, &["missing:1".to_string()]).is_err()
+        );
     }
 }

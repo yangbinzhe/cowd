@@ -107,10 +107,11 @@ pub(crate) async fn submit_runtime_orchestration_request_controlled(
     .await
 }
 
-/// Apply a typed AddTeam patch through the same bounded Coordinator submit
-/// path as every other semantic revision. Callers cannot provide graph nodes,
-/// executors or mutable Team identities.
-pub async fn submit_collaboration_add_team_patch(
+/// Apply a typed live-Program patch through the bounded Coordinator submit
+/// path. Callers cannot provide physical graph nodes, executors or mutable
+/// Team identities; supported operations are compiled from the exact durable
+/// Program revision they name.
+pub async fn submit_collaboration_intent_patch(
     graph_id: &str,
     patch: &harness_contract::execution_graph::CollaborationIntentPatch,
     services: &RuntimeServices,
@@ -120,7 +121,7 @@ pub async fn submit_collaboration_add_team_patch(
         .load_async(graph_id)
         .await
         .map_err(|error| format!("patch_target_load_failed:{error}"))?;
-    let request = collaboration_coordinator::compile_add_team_patch(&graph, patch)?;
+    let request = collaboration_coordinator::compile_collaboration_intent_patch(&graph, patch)?;
     Ok(submit_runtime_orchestration_request_controlled(
         request,
         None,
@@ -129,6 +130,23 @@ pub async fn submit_collaboration_add_team_patch(
         None,
     )
     .await)
+}
+
+/// Compatibility facade for callers that already hold an `AddTeam` patch.
+/// The generic entry point is the production owner so `RequestReview` and
+/// future governed operations cannot grow a second mutation route.
+pub async fn submit_collaboration_add_team_patch(
+    graph_id: &str,
+    patch: &harness_contract::execution_graph::CollaborationIntentPatch,
+    services: &RuntimeServices,
+) -> Result<RuntimeOrchestrationResult, String> {
+    if !matches!(
+        &patch.operation,
+        harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam { .. }
+    ) {
+        return Err("add_team_facade_requires_add_team_operation".to_string());
+    }
+    submit_collaboration_intent_patch(graph_id, patch, services).await
 }
 
 /// Admit a managed-Agent escalation through its parent Program only.  The
@@ -160,7 +178,7 @@ pub async fn submit_collaboration_escalation(
     if let Some(template_proposal) = escalation.template_proposal.clone() {
         attach_escalated_ephemeral_template(&graph, &mut patch, template_proposal, services)?;
     }
-    submit_collaboration_add_team_patch(graph_id, &patch, services).await
+    submit_collaboration_intent_patch(graph_id, &patch, services).await
 }
 
 fn attach_escalated_ephemeral_template(
@@ -1129,7 +1147,7 @@ async fn revise(
         // semantic revisions may be safely recompiled after an unrelated
         // graph transition, but a live-program patch must never silently
         // rebase: its source Agent made the decision against an exact durable
-        // topology.  The prefix is private to `compile_add_team_patch`; model
+        // topology.  The prefix is private to `compile_collaboration_intent_patch`; model
         // JSON cannot acquire a more permissive path by choosing it.
         if proposal.mutation_id.starts_with("program-patch:")
             && graph.revision != requested_base_revision
@@ -3388,7 +3406,7 @@ mod tests {
         )
         .expect("Runtime binds the escalation custom template to its parent Program");
         let mut patch_request =
-            collaboration_coordinator::compile_add_team_patch(&registered, &patch)
+            collaboration_coordinator::compile_collaboration_intent_patch(&registered, &patch)
                 .expect("fenced AddTeam patch compiles");
         team_authority::bind_semantic_resource_authority(
             &mut patch_request,
@@ -3474,7 +3492,7 @@ mod tests {
             .semantic_node_instances
             .contains_key("independent-review"));
         assert!(
-            collaboration_coordinator::compile_add_team_patch(&committed, &patch)
+            collaboration_coordinator::compile_collaboration_intent_patch(&committed, &patch)
                 .is_err_and(|error| error == "patch_program_revision_conflict")
         );
     }
