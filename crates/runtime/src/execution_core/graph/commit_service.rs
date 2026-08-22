@@ -1024,6 +1024,37 @@ impl ExecutionCommitService {
             harness_contract::execution_graph::CollaborationEscalationReceipt,
         >,
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        self.replan_semantic_with_retirements(
+            graph,
+            nodes,
+            edges,
+            reason,
+            mutation_id,
+            completion,
+            collaboration_program,
+            collaboration_escalation,
+            Vec::new(),
+        )
+    }
+
+    /// Apply a compiled semantic delta while retiring exact unstarted Team
+    /// instances in the very same graph transaction. The caller may only
+    /// supply Runtime-derived instance identities; the commit service derives
+    /// physical nodes and resource releases from the durable Program.
+    pub fn replan_semantic_with_retirements(
+        &self,
+        graph: &ExecutionGraph,
+        nodes: Vec<ExecutionNodeSpec>,
+        edges: Vec<ExecutionEdge>,
+        reason: String,
+        mutation_id: String,
+        completion: harness_contract::execution_graph::ExecutionCompletionContract,
+        collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
+        collaboration_escalation: Option<
+            harness_contract::execution_graph::CollaborationEscalationReceipt,
+        >,
+        retired_instance_ids: Vec<String>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         if mutation_id.trim().is_empty() {
             return Err(ExecutionCommitError::InvalidReplan(
                 "semantic mutation id is empty".to_string(),
@@ -1032,6 +1063,7 @@ impl ExecutionCommitService {
         validate_replan(graph, &nodes)?;
         let added_node_ids = nodes.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
         let mut next = graph.clone();
+        retire_program_instances_for_semantic_replan(&mut next, &retired_instance_ids)?;
         for node in &nodes {
             next.node_statuses
                 .insert(node.id.clone(), ExecutionNodeStatus::Planned);
@@ -2315,6 +2347,155 @@ fn validate_replan(
         return Err(ExecutionCommitError::InvalidReplan(
             "replan must add at least one uniquely identified node".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn retire_program_instances_for_semantic_replan(
+    graph: &mut ExecutionGraph,
+    instance_ids: &[String],
+) -> Result<(), ExecutionCommitError> {
+    if instance_ids.is_empty() {
+        return Ok(());
+    }
+    let unique = instance_ids.iter().collect::<BTreeSet<_>>();
+    if unique.len() != instance_ids.len() || instance_ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(ExecutionCommitError::InvalidReplan(
+            "semantic topology replacement has invalid retired Team instances".to_string(),
+        ));
+    }
+    let program = graph
+        .orchestration
+        .as_mut()
+        .and_then(|metadata| metadata.collaboration_program.as_mut())
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidReplan(
+                "semantic topology replacement requires a collaboration Program".to_string(),
+            )
+        })?;
+    if program.control.lifecycle.is_terminal() {
+        return Err(ExecutionCommitError::InvalidReplan(
+            "semantic topology replacement targets a terminal Program".to_string(),
+        ));
+    }
+
+    let mut retired_nodes = Vec::with_capacity(instance_ids.len());
+    let mut released_context = 0u64;
+    let mut released_output = 0u64;
+    let mut released_parallel = 0u16;
+    for instance_id in instance_ids {
+        let instance = program
+            .team_instances
+            .iter()
+            .find(|instance| &instance.instance_id == instance_id)
+            .ok_or_else(|| {
+                ExecutionCommitError::InvalidReplan(format!(
+                    "semantic topology replacement references unknown Team instance `{instance_id}`"
+                ))
+            })?;
+        let node_id = physical_node_for_team_instance(program, instance_id)?;
+        if graph.node_statuses.get(&node_id).copied() != Some(ExecutionNodeStatus::Planned) {
+            return Err(ExecutionCommitError::InvalidReplan(format!(
+                "semantic topology replacement requires planned Team `{instance_id}`"
+            )));
+        }
+        if program.control.lifecycle
+            != harness_contract::execution_graph::CollaborationProgramLifecycle::Planning
+        {
+            let reservation = program
+                .control
+                .obligations
+                .iter()
+                .find(|obligation| obligation.instance_id == *instance_id)
+                .map(|obligation| obligation.reservation.clone())
+                .ok_or_else(|| {
+                    ExecutionCommitError::InvalidReplan(format!(
+                        "semantic topology replacement has no obligation for `{instance_id}`"
+                    ))
+                })?;
+            if reservation == Default::default()
+                && (program.control.resource_ledger.context_reservation_tokens > 0
+                    || program.control.resource_ledger.output_reservation_tokens > 0
+                    || program.control.resource_ledger.parallel_demand > 0)
+            {
+                return Err(ExecutionCommitError::InvalidReplan(
+                    "semantic topology replacement requires exact durable resource reservations"
+                        .to_string(),
+                ));
+            }
+            released_context =
+                released_context.saturating_add(reservation.context_reservation_tokens);
+            released_output = released_output.saturating_add(reservation.output_reservation_tokens);
+            released_parallel = released_parallel.saturating_add(reservation.parallel_demand);
+        }
+        retired_nodes.push((instance.semantic_node_id.clone(), node_id));
+    }
+
+    let retired_set = instance_ids.iter().collect::<BTreeSet<_>>();
+    program
+        .team_instances
+        .retain(|instance| !retired_set.contains(&instance.instance_id));
+    program
+        .edges
+        .retain(|edge| !retired_set.contains(&edge.from) && !retired_set.contains(&edge.to));
+    program
+        .control
+        .obligations
+        .retain(|obligation| !retired_set.contains(&obligation.instance_id));
+    program.control.resource_ledger.context_reservation_tokens = program
+        .control
+        .resource_ledger
+        .context_reservation_tokens
+        .saturating_sub(released_context);
+    program.control.resource_ledger.output_reservation_tokens = program
+        .control
+        .resource_ledger
+        .output_reservation_tokens
+        .saturating_sub(released_output);
+    program.control.resource_ledger.parallel_demand = program
+        .control
+        .resource_ledger
+        .parallel_demand
+        .saturating_sub(released_parallel);
+    for (semantic_id, node_id) in &retired_nodes {
+        let remove_mapping = program
+            .semantic_node_instances
+            .get_mut(semantic_id)
+            .is_some_and(|nodes| {
+                nodes.retain(|candidate| candidate != node_id);
+                nodes.is_empty()
+            });
+        if remove_mapping {
+            program.semantic_node_instances.remove(semantic_id);
+        }
+    }
+    program.required_team_count = u16::try_from(
+        program
+            .team_instances
+            .iter()
+            .filter(|instance| instance.required)
+            .count(),
+    )
+    .unwrap_or(u16::MAX);
+    for (_, node_id) in &retired_nodes {
+        graph
+            .node_statuses
+            .insert(node_id.clone(), ExecutionNodeStatus::Cancelled);
+    }
+    let retired_node_set = retired_nodes
+        .iter()
+        .map(|(_, node_id)| node_id.as_str())
+        .collect::<BTreeSet<_>>();
+    graph.edges.retain(|edge| {
+        !(edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::CrossTeamHandoff
+            && (retired_node_set.contains(edge.from.as_str())
+                || retired_node_set.contains(edge.to.as_str())))
+    });
+    if let Some(metadata) = graph.orchestration.as_mut() {
+        metadata
+            .completion
+            .required_node_ids
+            .retain(|node_id| !retired_node_set.contains(node_id.as_str()));
     }
     Ok(())
 }
@@ -4523,6 +4704,82 @@ mod tests {
             vec!["producer-team"]
         );
         assert!(validate_execution_graph(&retired).is_ok());
+
+        let mut topology_graph = registered.clone();
+        topology_graph.id = "retire-team-topology-root".to_string();
+        let topology_registered = service
+            .register_graph(topology_graph)
+            .expect("register topology graph")
+            .graph;
+        let mut replacement = topology_registered.nodes[0].clone();
+        replacement.id = "replacement-team".to_string();
+        replacement.idempotency_key = "replacement-team-key".to_string();
+        let replacement_program = CollaborationProgram {
+            program_id: "program-retire-team".to_string(),
+            revision: 1,
+            required_team_count: 1,
+            team_instances: vec![CollaborationTeamInstance {
+                instance_id: "replacement:1".to_string(),
+                semantic_node_id: "replacement".to_string(),
+                required: true,
+            }],
+            edges: Vec::new(),
+            semantic_node_instances: BTreeMap::from([(
+                "replacement".to_string(),
+                vec!["replacement-team".to_string()],
+            )]),
+            control: Default::default(),
+        };
+        let replaced = service
+            .replan_semantic_with_retirements(
+                &topology_registered,
+                vec![replacement],
+                Vec::new(),
+                "split consumer into a replacement workstream".to_string(),
+                "replace-consumer-with-replacement".to_string(),
+                harness_contract::execution_graph::ExecutionCompletionContract {
+                    required_node_ids: vec!["replacement-team".to_string()],
+                    ..Default::default()
+                },
+                Some(replacement_program),
+                None,
+                vec!["consumer:1".to_string()],
+            )
+            .expect("topology replacement commits atomically")
+            .graph;
+        let replaced_program = replaced
+            .orchestration
+            .as_ref()
+            .expect("metadata")
+            .collaboration_program
+            .as_ref()
+            .expect("Program");
+        assert!(replaced_program
+            .team_instances
+            .iter()
+            .all(|instance| instance.instance_id != "consumer:1"));
+        assert!(replaced_program
+            .semantic_node_instances
+            .contains_key("replacement"));
+        assert_eq!(
+            replaced.node_statuses["consumer-team"],
+            ExecutionNodeStatus::Cancelled
+        );
+        assert_eq!(
+            replaced.node_statuses["replacement-team"],
+            ExecutionNodeStatus::Planned
+        );
+        assert!(replaced.edges.is_empty());
+        assert_eq!(
+            replaced
+                .orchestration
+                .as_ref()
+                .expect("metadata")
+                .completion
+                .required_node_ids,
+            vec!["producer-team".to_string(), "replacement-team".to_string()]
+        );
+        assert!(validate_execution_graph(&replaced).is_ok());
 
         let active_retired = service
             .apply_command(
