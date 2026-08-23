@@ -31,7 +31,7 @@ diff hash are SHA-256 of the empty stream and the untracked-file count is zero.
 | B10 / P5 approval and Surface | current P5 evidence explicitly leaves operator Program timeline/audit aggregation open; generated Edge/API consumer closure not evidenced | incomplete | Gateway + Edge |
 | B11 / lifecycle projection | opaque node payload projection is implemented, but Program/Team/edge/wait/reason/resource/escalation typed projection is not proven end-to-end | incomplete | Gateway/Runtime projectors + Edge |
 | B12 / recovery fault matrix | only startup approval-wait recovery is recorded; required registration, task-link, edge claim, receipt, terminal, continuation and cancel races are not evidenced | incomplete | Runtime recovery owner |
-| P6 deletion/performance/cross-repo gates | `builtin_team_template_summaries` remains an active production selection source in `crates/runtime/src/infrastructure/capability_manifest.rs`; no 100x10, PostgreSQL, Edge/MFG or deletion audit evidence | incomplete | P3/P5/P6 owners |
+| P6 deletion/performance/cross-repo gates | The exact-symbol deletion gate proves the retired Host entry point, builtin Team selection summary, role/slot encodings and monetary pricing contracts are absent; 100x10 SQLite admission and Edge/MFG consumer evidence are recorded, but PostgreSQL and a shared release tuple remain open | partial | P6 release owner / PostgreSQL operator |
 | A12 real Qwen | `p6-real-qwen-e2e.md` proves a real model run and one Team with four Agents. It does not prove >=2 Teams, escalation, continuation, cross-session deny/allow, approval, PostgreSQL query summary or Surface screenshot. | incomplete | Integrated P6 owner |
 
 ## Code facts that block closure
@@ -101,6 +101,11 @@ candidate and generated Edge/MFG consumer output are independently audited,
 there is no single cross-repository release tuple. Finally, the real-Qwen
 fan-in pass does not include the required Agent escalation, same-session
 continuation, cross-session deny/allow, and approval in one controlled E2E.
+
+The repeatable local deletion command is
+`bash scripts/test/collaboration-deletion-gate.sh`. It is deliberately
+exact-symbol based: generic technical uses of words such as `cost` or `role`
+are not treated as monetary pricing or role-string dispatch.
 
 ## Follow-up audit — Edge and MFG consumer candidates
 
