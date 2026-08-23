@@ -3989,6 +3989,31 @@ where
                         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
                     );
                     runtime.require_next_model_reasoning_effort("none");
+                    // The provider wire constraint is necessary but not
+                    // sufficient: compatibility endpoints can return prose
+                    // when the surrounding normal-conversation context is
+                    // much larger than the control contract.  Supply one
+                    // latest, Runtime-owned micro-instruction that names only
+                    // the narrow semantic codec.  It contains the user-bound
+                    // cardinality but no roles, templates, graph ids, or
+                    // topology, so model autonomy remains semantic rather
+                    // than protocol-fragile.
+                    let mut item = ContextItem::new(
+                        format!(
+                            "runtime-root-collaboration-decision:{}:{}",
+                            session_id, turn_id
+                        ),
+                        ContextSourceKind::Task,
+                        ContextRole::Instruction,
+                        format!(
+                            "Root collaboration admission is pending. Call `{}` exactly once now; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} semantic workstream(s) with `decision_id`, `intent`, `reason`, and `workstreams`. Each workstream needs only `workstream_id`, `objective`, optional `depends_on`, evidence contract, and optional focuses. Runtime—not the model—binds templates, identities, permissions, resources, graph nodes, and execution. This is not `runtime_orchestrate`.",
+                            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+                        ),
+                    );
+                    item.authority = ContextAuthority::System;
+                    item.visibility = ContextVisibility::Private;
+                    item.evidence = vec![format!("turn:{turn_id}")];
+                    runtime.push_next_model_context_item(item);
                 }
                 RootControlPlanePhase::ProposalSubmitted => {}
             }
