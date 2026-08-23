@@ -201,9 +201,6 @@ impl NodeExecutor for VerifyNodeExecutor {
                                     } | harness_contract::team::TeamAcceptanceCheck::SourceVerification {
                                         ..
                                     } | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
-                                        | harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound {
-                                            ..
-                                        }
                                 )
                             })
                         });

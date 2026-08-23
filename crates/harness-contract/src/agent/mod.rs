@@ -87,6 +87,11 @@ pub struct AgentTaskIntent {
     /// newly planned work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_acceptance: Vec<crate::team::TeamAcceptanceRequirement>,
+    /// Runtime-selected requirement for this exact managed Team Agent to
+    /// submit one collaboration escalation after source evidence exists.
+    /// The Agent never receives Program identity or revision authority.
+    #[serde(default)]
+    pub requires_managed_collaboration_escalation: bool,
     pub acceptance: Vec<String>,
     pub constraints: Vec<String>,
     pub context_refs: Vec<String>,
@@ -258,6 +263,8 @@ pub struct AgentTaskPacket {
     /// migrated fail-closed at the Runtime boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_acceptance: Vec<crate::team::TeamAcceptanceRequirement>,
+    #[serde(default)]
+    pub requires_managed_collaboration_escalation: bool,
     /// The semantic role identity used while the Team compiler assembles the
     /// graph.  Once the Team binding is frozen, `team_role` binds this exact
     /// value to its immutable binding digest before persistence.

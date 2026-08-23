@@ -585,6 +585,7 @@ mod tests {
             role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "test-model".to_string(),
             execution_budget: harness_contract::context::ParentExecutionBudget::new(

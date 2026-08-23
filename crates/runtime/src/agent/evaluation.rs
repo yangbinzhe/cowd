@@ -192,8 +192,7 @@ pub(crate) fn required_acceptance_for_packet(
     for requirement in requirements {
         use harness_contract::team::TeamAcceptanceCheck;
         match requirement.check {
-            TeamAcceptanceCheck::ScopedEvidence { scopes: required }
-            | TeamAcceptanceCheck::LegacyEvidenceBound { scopes: required } => {
+            TeamAcceptanceCheck::ScopedEvidence { scopes: required } => {
                 scopes.extend(required.into_iter().map(|scope| {
                     if scope == "network:*" || scope.contains(':') {
                         scope

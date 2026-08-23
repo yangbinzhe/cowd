@@ -135,3 +135,44 @@ the incompatible backend provenance and unpublished Edge candidate as blockers.
   manifest. Edge remains unpublished locally and the backend identity above is
   different from the integration candidate; the cross-repository release tuple
   therefore remains unverified.
+
+## Terminal implementation candidate — deterministic closure
+
+This update closes the source-level control-plane residual that the preceding
+audit intentionally left open. A root strategy that requires collaboration now
+persists `runtime.control_plane.required` after the root model node commits,
+with the requested Team count and required `runtime_orchestrate` tool choice.
+It cannot create a Program from task-understanding text. Without a verified
+proposal receipt it produces zero Program/Team instances and, after one
+bounded repair, persists `runtime.control_plane.missing_proposal` as a typed
+blocked receipt. The former Host natural-language Program compiler and its
+test-only compiler path have been removed.
+
+The runtime authority layer also preserves an AI-declared builtin Team role
+topology while replacing its resource scopes with Runtime-owned leases. This
+fixes the former failure in which a declared multi-role Team was silently
+reduced to one focus by a narrow resource estimate; template validation still
+rejects undeclared, unknown or dependency-incomplete roles.
+
+The deterministic candidate evidence completed before real-provider execution:
+
+- `cargo test -p runtime --lib -- --test-threads=1`: 1,819 passed, 2 ignored.
+- `cargo test --workspace -- --test-threads=1`: passed after explicit Cowd and
+  managed-worker-launcher build; the installer atomic-replacement contract
+  passed.
+- `bash scripts/test/postgres-contract.sh`: passed against disposable local
+  PostgreSQL source/target databases, which were removed after the run.
+- `bash scripts/test/collaboration-deletion-gate.sh`, `cargo fmt --all --
+  --check`, `git diff --check`, and `cargo check -p runtime --all-targets`:
+  passed.
+- Cowd Edge: WebUI 53 files / 438 tests plus its contract gates, production
+  WebUI build and release sidecar build passed. Cowd App MFG: Rust workspace,
+  WebUI typecheck, 13 files / 91 tests, browser gate and production build
+  passed. The MFG Rust build reports nine pre-existing dead-code warnings in
+  its database adapter; they are outside this Cowd candidate and do not affect
+  its test result.
+
+The next and final evidence boundary is one clean-SHA Token Plan run of the
+strict real-model scenario. Its report must independently prove the multi-Team
+fan-in, escalation, continuation, cross-session policy and projection facts;
+no earlier real-model report is reused for a changed candidate.

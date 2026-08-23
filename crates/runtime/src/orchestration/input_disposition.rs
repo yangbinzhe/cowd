@@ -601,6 +601,8 @@ fn bind_graph_proposal(
                     depends_on: Vec::new(),
                     multiplicity: 1,
                     focuses: Vec::new(),
+                    managed_agent_escalation:
+                        harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
                     template: None,
                     target_session_id: None,
                     output_artifacts: vec!["task_result".to_string()],

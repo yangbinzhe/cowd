@@ -180,11 +180,9 @@ mod tests {
         assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("tool_search"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
-        assert!(
-            resolved
-                .allowed_tools
-                .contains("request_collaboration_escalation")
-        );
+        assert!(resolved
+            .allowed_tools
+            .contains("request_collaboration_escalation"));
         assert_eq!(resolved.evidence_duties, vec!["source_notes"]);
     }
 

@@ -151,7 +151,7 @@ fn discover_mcp_tool_definitions_once(
     Ok(runtime_tools)
 }
 
-fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
+pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
     vec![
         RuntimeToolDefinition {
             name: "lark_cli_read".to_string(),
@@ -337,7 +337,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution. max_parallel_agents limits simultaneously runnable instances, not total graph nodes. Shared network/resource infrastructure is valid when focus objectives and evidence responsibilities remain distinct. Use runtime_capabilities(detail=orchestration_options) first when effective limits or templates are uncertain.".to_string(),
+                "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution. For a Team that selects a multi-role catalog template, proposal.nodes[].focuses must explicitly list every role_id that this semantic Team activates; list all template roles to run the whole template. max_parallel_agents limits simultaneously runnable instances, not total graph nodes. Shared network/resource infrastructure is valid when focus objectives and evidence responsibilities remain distinct. Use runtime_capabilities(detail=orchestration_options) first when effective limits or templates are uncertain.".to_string(),
             ),
             input_schema: runtime_orchestration_input_schema(),
             required_permission: ToolPermissionMode::ReadOnly,
@@ -694,6 +694,31 @@ mod tests {
             .expect("runtime orchestration tool");
         let semantic_node =
             &orchestration_tool.input_schema["$defs"]["ModelGraphSemanticNode"]["properties"];
+        assert!(
+            orchestration_tool.input_schema["$defs"]["ModelGraphSemanticNode"]["required"]
+                .as_array()
+                .is_some_and(|required| {
+                    required
+                        .iter()
+                        .any(|field| field == "managed_agent_escalation")
+                }),
+            "the model must explicitly select the managed escalation policy"
+        );
+        assert!(
+            orchestration_tool.input_schema["$defs"]["ManagedAgentEscalationRequirement"]["oneOf"]
+                .as_array()
+                .is_some_and(|variants| {
+                    ["none", "required"].into_iter().all(|expected| {
+                        variants.iter().any(|variant| {
+                            variant["const"] == expected
+                                || variant["enum"].as_array().is_some_and(|values| {
+                                    values.iter().any(|value| value == expected)
+                                })
+                        })
+                    })
+                }),
+            "the escalation policy must be a compact typed enum, not optional prose"
+        );
         assert_eq!(semantic_node["required"]["type"], "boolean");
         assert!(semantic_node["required"]["description"]
             .as_str()

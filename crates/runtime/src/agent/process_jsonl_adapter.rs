@@ -402,6 +402,7 @@ mod tests {
             objective: "wait for cancellation".into(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
             team_role_identity: None,
             team_role: None,

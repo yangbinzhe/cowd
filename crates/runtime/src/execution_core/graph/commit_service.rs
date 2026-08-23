@@ -3647,6 +3647,7 @@ mod tests {
             objective: "verify canonical reverse lineage".to_string(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
             team_role_identity: None,
             team_role: None,
@@ -3724,6 +3725,7 @@ mod tests {
             role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "fixture-model".to_string(),
             execution_budget: harness_contract::context::ParentExecutionBudget::new(

@@ -13,7 +13,7 @@ use harness_contract::execution_graph::{
 };
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, TeamInstantiationRequest, TeamSelectionMode,
-    TeamTemplateDefinitionId, TeamTemplateSelector,
+    TeamTemplateDefinitionId, TeamTemplateRevisionRef, TeamTemplateSelector,
 };
 use thiserror::Error;
 
@@ -585,37 +585,19 @@ fn compile_team_subgraph_node(
     team_runtime: &TeamRuntime,
     repairs: &mut Vec<String>,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
-    let requested_template = semantic
+    let template_path = semantic
         .template
         .as_deref()
-        .unwrap_or_else(|| plan.collaboration_decision.template_id.template_path());
-    let mut template_path = requested_template.to_string();
-    if template_path.contains("direct-executor") {
-        // Framework rule: Team proposals must use a collaboration template.
-        // Auto-bind the strategy-recommended template and record the repair
-        // instead of letting a non-collaboration template be rejected later.
-        template_path = plan
-            .collaboration_decision
-            .template_id
-            .template_path()
-            .to_string();
-        repairs.push(format!(
-            "template_bind:{requested_template}:{template_path}"
-        ));
-    }
-    let trimmed = template_path.trim();
-    let (scope, local) = if let Some(local) = trimmed.strip_prefix("workspace/") {
-        (harness_contract::agent::DefinitionScope::Workspace, local)
-    } else if let Some(local) = trimmed.strip_prefix("user/") {
-        (harness_contract::agent::DefinitionScope::User, local)
-    } else {
-        (
-            harness_contract::agent::DefinitionScope::Builtin,
-            trimmed.strip_prefix("builtin/").unwrap_or(trimmed),
-        )
-    };
-    let template_id = TeamTemplateDefinitionId::new(scope, local)
-        .map_err(|error| OrchestrationCompileError::TeamInstantiation(error.to_string()))?;
+        .unwrap_or_else(|| plan.collaboration_decision.template_id.template_path())
+        .to_string();
+    // The catalog's `template_id` is an executable Team contract. Preserve
+    // the model-selected catalog entry exactly: replacing one valid template
+    // with a strategy default silently changes its legal role ids and makes a
+    // typed proposal fail for reasons the model cannot observe. Runtime still
+    // validates the selected immutable revision and every capability/policy
+    // boundary below; it simply must not rewrite the Team's semantics here.
+    let (template_id, catalog_selector) =
+        parse_model_team_template_reference(template_path.trim())?;
     let template_selector = request
         .ephemeral_team_templates
         .get(&semantic.node_id)
@@ -623,9 +605,7 @@ fn compile_team_subgraph_node(
         .map(|snapshot| TeamTemplateSelector::Ephemeral {
             snapshot: Box::new(snapshot),
         })
-        .unwrap_or(TeamTemplateSelector::LatestStable {
-            template_id: template_id.clone(),
-        });
+        .unwrap_or(catalog_selector);
     let team_id = format!(
         "runtime-team:{}:{}:{}",
         request_id, semantic.node_id, instance_index
@@ -672,6 +652,10 @@ fn compile_team_subgraph_node(
         role_binding_overrides: Vec::new(),
         cardinality_overrides: Vec::new(),
         focus_partition_plans: focus_partition_plans(semantic, repairs),
+        requires_managed_collaboration_escalation: matches!(
+            semantic.managed_agent_escalation,
+            harness_contract::orchestration::ManagedAgentEscalationRequirement::Required
+        ),
         permission_ceiling: request.constraints.permission_ceiling,
         model_lease: request
             .model_lease
@@ -752,6 +736,45 @@ fn compile_team_subgraph_node(
     node.acceptance.criteria = semantic.evidence_contract.clone();
     node.acceptance.required_evidence = semantic.output_artifacts.clone();
     Ok(node)
+}
+
+/// Converts the model-facing catalog spelling into the typed Team selector.
+/// Catalog responses legitimately include immutable references such as
+/// `workspace/review@2`; accepting that spelling here preserves the revision
+/// fence instead of treating `@2` as part of an invalid local identifier.
+/// Bare ids remain an explicit `LatestStable` request.
+fn parse_model_team_template_reference(
+    value: &str,
+) -> Result<(TeamTemplateDefinitionId, TeamTemplateSelector), OrchestrationCompileError> {
+    let (path, revision) = match value.rsplit_once('@') {
+        Some((path, raw_revision)) => match raw_revision.parse::<u64>() {
+            Ok(revision) => (path, Some(revision)),
+            Err(_) => (value, None),
+        },
+        None => (value, None),
+    };
+    let (scope, local) = if let Some(local) = path.strip_prefix("workspace/") {
+        (harness_contract::agent::DefinitionScope::Workspace, local)
+    } else if let Some(local) = path.strip_prefix("user/") {
+        (harness_contract::agent::DefinitionScope::User, local)
+    } else {
+        (
+            harness_contract::agent::DefinitionScope::Builtin,
+            path.strip_prefix("builtin/").unwrap_or(path),
+        )
+    };
+    let template_id = TeamTemplateDefinitionId::new(scope, local)
+        .map_err(|error| OrchestrationCompileError::TeamInstantiation(error.to_string()))?;
+    let selector = match revision {
+        Some(revision) => TeamTemplateSelector::Exact {
+            revision_ref: TeamTemplateRevisionRef::new(template_id.clone(), revision)
+                .map_err(|error| OrchestrationCompileError::TeamInstantiation(error.to_string()))?,
+        },
+        None => TeamTemplateSelector::LatestStable {
+            template_id: template_id.clone(),
+        },
+    };
+    Ok((template_id, selector))
 }
 
 /// Derive a liveness window from the *compiled* Team topology.
@@ -955,6 +978,7 @@ fn compile_agent_node(
             evidence_obligations: Vec::new(),
         },
         output_acceptance: Vec::new(),
+        requires_managed_collaboration_escalation: false,
         acceptance: semantic.evidence_contract.clone(),
         // The bounded objective, resource scopes and typed acceptance are
         // already persisted fields.  Do not smuggle semantic focus through
@@ -1235,6 +1259,33 @@ mod tests {
     use crate::orchestration::request::SemanticFocus;
 
     #[test]
+    fn model_catalog_revision_reference_becomes_exact_team_selector() {
+        let (template_id, selector) =
+            parse_model_team_template_reference("workspace/two-team-parallel-review@1")
+                .expect("catalog revision reference parses");
+        assert_eq!(template_id.as_str(), "workspace/two-team-parallel-review");
+        let TeamTemplateSelector::Exact { revision_ref } = selector else {
+            panic!("a catalog @revision must retain its immutable revision fence");
+        };
+        assert_eq!(revision_ref.template_id, template_id);
+        assert_eq!(revision_ref.revision, 1);
+    }
+
+    #[test]
+    fn model_catalog_bare_template_remains_latest_stable_selector() {
+        let (template_id, selector) =
+            parse_model_team_template_reference("builtin/cowd/long-running-workstreams")
+                .expect("bare catalog id parses");
+        let TeamTemplateSelector::LatestStable {
+            template_id: selected,
+        } = selector
+        else {
+            panic!("a bare catalog id must retain latest-stable semantics");
+        };
+        assert_eq!(selected, template_id);
+    }
+
+    #[test]
     fn team_deadline_scales_with_compiled_waves_not_template_name_or_magic_ladder() {
         let base = harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS;
         let before = crate::tool_invocation::now_ms();
@@ -1372,6 +1423,8 @@ mod tests {
                     output_acceptance: Vec::new(),
                 },
             ],
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: None,
             target_session_id: None,
             output_artifacts: vec!["research evidence".to_string()],
@@ -1410,6 +1463,8 @@ mod tests {
             depends_on,
             multiplicity: 1,
             focuses: Vec::new(),
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: None,
             target_session_id: None,
             output_artifacts: vec!["terminal_synthesis".to_string()],

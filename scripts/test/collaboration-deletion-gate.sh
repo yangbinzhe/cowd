@@ -53,6 +53,10 @@ expect_absent \
   'retired monetary model-pricing contract returned' \
   'ModelPricing|UsageCostEstimate|estimated_cost_usd|_cost_microusd|max_cost' \
   crates
+expect_absent \
+  'retired model-authored acceptance compatibility field returned' \
+  'LegacyEvidenceBound|legacy_acceptance' \
+  crates
 
 if [[ "$failures" -ne 0 ]]; then
   exit 1

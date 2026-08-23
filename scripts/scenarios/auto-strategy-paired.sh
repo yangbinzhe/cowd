@@ -8,21 +8,24 @@ TARGET_ROOT="${CARGO_TARGET_DIR:-${ROOT}/target}"
 COWD_BIN="${COWD_BIN:-${TARGET_ROOT}/debug/cowd}"
 EVAL_BIN="${COWD_HARNESS_EVAL_BIN:-${TARGET_ROOT}/debug/harness-eval}"
 # Real-model evaluation is isolated from user state, but its route must be a
-# snapshot of the installed Cowd route.  Do not default a model to another
-# provider account: that makes a successful interactive configuration and its
-# evaluation exercise different products.
+# snapshot of the installed Cowd route. Do not default a model to another
+# provider account or copy a literal credential into an artifact: that makes a
+# successful interactive configuration and its evaluation exercise different
+# products and can leak a secret into the isolated workspace.
 SOURCE_CONFIG_HOME="${COWD_AUTO_STRATEGY_SOURCE_CONFIG_HOME:-${COWD_CONFIG_HOME:-${HOME}/.cowd}}"
 SOURCE_CONFIG_FILE="${SOURCE_CONFIG_HOME}/config.yaml"
 SOURCE_MODELS_FILE="${SOURCE_CONFIG_HOME}/models.yaml"
 MODEL="${COWD_AUTO_STRATEGY_MODEL:-}"
 JUDGE_MODEL="${COWD_AUTO_STRATEGY_JUDGE_MODEL:-}"
-PROVIDER_ID="${COWD_AUTO_STRATEGY_PROVIDER_ID:-}"
-PROVIDER_PROTOCOL="${COWD_AUTO_STRATEGY_PROVIDER_PROTOCOL:-}"
-PROVIDER_BASE_URL="${COWD_AUTO_STRATEGY_PROVIDER_BASE_URL:-}"
-PROVIDER_API_KEY="${COWD_AUTO_STRATEGY_PROVIDER_API_KEY:-}"
-PROVIDER_ACCOUNT_REF="${COWD_EVAL_PROVIDER_ACCOUNT_REF:-}"
-MODEL_CONTEXT_WINDOW="${COWD_AUTO_STRATEGY_CONTEXT_WINDOW:-}"
-MODEL_MAX_OUTPUT_TOKENS="${COWD_AUTO_STRATEGY_MAX_OUTPUT_TOKENS:-}"
+PROVIDER_ID=""
+PROVIDER_PROTOCOL=""
+PROVIDER_BASE_URL=""
+PROVIDER_CREDENTIAL=""
+STAGED_CREDENTIAL_REF=""
+STAGED_CREDENTIAL_ENV=""
+PROVIDER_ACCOUNT_REF=""
+MODEL_CONTEXT_WINDOW=""
+MODEL_MAX_OUTPUT_TOKENS=""
 DIAGNOSTIC_TASK_ID="${COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID:-}"
 API_TOKEN="${COWD_API_TOKEN:-auto-strategy-$$_credential}"
 SCENARIO_ID="auto-strategy-paired-$$-$(date +%s)"
@@ -113,7 +116,7 @@ yaml_provider_field() {
 
 resolve_installed_provider_route() {
   [[ -f "${SOURCE_CONFIG_FILE}" && -f "${SOURCE_MODELS_FILE}" ]] || {
-    echo "real-model evaluation requires ${SOURCE_CONFIG_FILE} and ${SOURCE_MODELS_FILE}, or explicit COWD_AUTO_STRATEGY_* route overrides" >&2
+    echo "real-model evaluation requires ${SOURCE_CONFIG_FILE} and ${SOURCE_MODELS_FILE}" >&2
     exit 1
   }
 
@@ -125,28 +128,40 @@ resolve_installed_provider_route() {
     exit 1
   }
 
-  PROVIDER_ID="${PROVIDER_ID:-$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" provider)}"
-  MODEL_CONTEXT_WINDOW="${MODEL_CONTEXT_WINDOW:-$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" context_window)}"
-  MODEL_MAX_OUTPUT_TOKENS="${MODEL_MAX_OUTPUT_TOKENS:-$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" max_output_tokens)}"
+  PROVIDER_ID="$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" provider)"
+  MODEL_CONTEXT_WINDOW="$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" context_window)"
+  MODEL_MAX_OUTPUT_TOKENS="$(yaml_model_field "${SOURCE_MODELS_FILE}" "${MODEL}" max_output_tokens)"
   [[ -n "${PROVIDER_ID}" && -n "${MODEL_CONTEXT_WINDOW}" && -n "${MODEL_MAX_OUTPUT_TOKENS}" ]] || {
     echo "model ${MODEL} must have provider, context_window, and max_output_tokens in ${SOURCE_MODELS_FILE}" >&2
     exit 1
   }
 
-  PROVIDER_PROTOCOL="${PROVIDER_PROTOCOL:-$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" protocol)}"
-  PROVIDER_BASE_URL="${PROVIDER_BASE_URL:-$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" base_url)}"
-  PROVIDER_API_KEY="${PROVIDER_API_KEY:-$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" api_key)}"
-  [[ -n "${PROVIDER_PROTOCOL}" && -n "${PROVIDER_BASE_URL}" && -n "${PROVIDER_API_KEY}" ]] || {
-    echo "provider ${PROVIDER_ID} must have protocol, base_url, and api_key in ${SOURCE_CONFIG_FILE}; use explicit COWD_AUTO_STRATEGY_* overrides if its secret is externally referenced" >&2
+  PROVIDER_PROTOCOL="$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" protocol)"
+  PROVIDER_BASE_URL="$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" base_url)"
+  PROVIDER_CREDENTIAL="$(yaml_provider_field "${SOURCE_CONFIG_FILE}" "${PROVIDER_ID}" api_key)"
+  [[ -n "${PROVIDER_PROTOCOL}" && -n "${PROVIDER_BASE_URL}" && -n "${PROVIDER_CREDENTIAL}" ]] || {
+    echo "provider ${PROVIDER_ID} must have protocol, base_url, and api_key in ${SOURCE_CONFIG_FILE}" >&2
     exit 1
   }
-  if [[ "${PROVIDER_API_KEY}" == file:* || "${PROVIDER_API_KEY}" == env:* ]]; then
-    echo "provider ${PROVIDER_ID} uses an external secret reference; pass COWD_AUTO_STRATEGY_PROVIDER_API_KEY explicitly for the isolated evaluation" >&2
-    exit 1
-  fi
 
   JUDGE_MODEL="${JUDGE_MODEL:-${MODEL}}"
-  PROVIDER_ACCOUNT_REF="${PROVIDER_ACCOUNT_REF:-${PROVIDER_ID}-default}"
+  JUDGE_PROVIDER_ID="$(yaml_model_field "${SOURCE_MODELS_FILE}" "${JUDGE_MODEL}" provider)"
+  [[ "$JUDGE_PROVIDER_ID" == "$PROVIDER_ID" ]] || {
+    echo "judge model ${JUDGE_MODEL} must use the same configured provider as ${MODEL}; cross-provider paired evaluation is not an implicit fallback" >&2
+    exit 1
+  }
+  case "${PROVIDER_CREDENTIAL}" in
+    env:*) STAGED_CREDENTIAL_REF="${PROVIDER_CREDENTIAL}" ;;
+    file:*)
+      echo "provider ${PROVIDER_ID} uses an unsupported file credential reference; use Cowd's env: credential reference" >&2
+      exit 1
+      ;;
+    *)
+      STAGED_CREDENTIAL_ENV="COWD_ISOLATED_EVAL_PROVIDER_API_KEY"
+      STAGED_CREDENTIAL_REF="env:${STAGED_CREDENTIAL_ENV}"
+      ;;
+  esac
+  PROVIDER_ACCOUNT_REF="configured:${PROVIDER_ID}"
 }
 
 resolve_installed_provider_route
@@ -186,17 +201,7 @@ BIN_SHA256="$(sha256sum "${COWD_BIN}" | awk '{print $1}')"
 mkdir -p "${SCENARIO_ROOT}" "${ARTIFACT_DIR}"
 EVAL_HOME="${SCENARIO_ROOT}/evaluator-home"
 mkdir -p "${EVAL_HOME}/.cowd"
-{
-  echo 'version: "1"'
-  echo "updated_at: \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
-  echo 'models:'
-  echo "  \"${MODEL}\":"
-  echo "    provider: \"${PROVIDER_ID}\""
-  echo "    display_name: \"${MODEL}\""
-  echo "    context_window: ${MODEL_CONTEXT_WINDOW}"
-  echo "    max_output_tokens: ${MODEL_MAX_OUTPUT_TOKENS}"
-  echo '    capabilities: ["text", "tool_use", "reasoning"]'
-} >"${EVAL_HOME}/.cowd/models.yaml"
+cp "${SOURCE_MODELS_FILE}" "${EVAL_HOME}/.cowd/models.yaml"
 for index in 0 1 2; do
   condition="${CONDITIONS[$index]}"
   port="${PORTS[$index]}"
@@ -219,7 +224,7 @@ for index in 0 1 2; do
     echo "providers:"
     echo "  ${PROVIDER_ID}:"
     echo "    base_url: \"${PROVIDER_BASE_URL}\""
-    echo "    api_key: \"${PROVIDER_API_KEY}\""
+    echo "    api_key: \"${STAGED_CREDENTIAL_REF}\""
     echo "    protocol: \"${PROVIDER_PROTOCOL}\""
     echo "    models: [\"${MODEL}\", \"${JUDGE_MODEL}\"]"
     echo "permissions:"
@@ -244,19 +249,27 @@ for index in 0 1 2; do
   fi
   (
     cd "${workspace}"
-    exec env \
-      COWD_CONFIG_HOME="${config_home}" \
-      COWD_API_TOKEN="${API_TOKEN}" \
-      COWD_EVAL_HARNESS=1 \
-      COWD_EVAL_CORPUS_ID=auto-strategy-v1 \
-      COWD_EVAL_WORKSPACE_FIXTURE=workspace-auto-strategy-frozen \
-      COWD_EVAL_STRATEGY_OVERRIDE="${condition}" \
-      COWD_MODEL_TEMPERATURE=0 \
-      HOME="${home}" \
-      "${COWD_BIN}" gateway run
+    gateway_env=(
+      COWD_CONFIG_HOME="${config_home}"
+      COWD_API_TOKEN="${API_TOKEN}"
+      COWD_EVAL_HARNESS=1
+      COWD_EVAL_CORPUS_ID=auto-strategy-v1
+      COWD_EVAL_WORKSPACE_FIXTURE=workspace-auto-strategy-frozen
+      COWD_EVAL_STRATEGY_OVERRIDE="${condition}"
+      COWD_MODEL_TEMPERATURE=0
+      HOME="${home}"
+    )
+    if [[ -n "${STAGED_CREDENTIAL_ENV}" ]]; then
+      gateway_env+=("${STAGED_CREDENTIAL_ENV}=${PROVIDER_CREDENTIAL}")
+    fi
+    exec env "${gateway_env[@]}" "${COWD_BIN}" gateway run
   ) >"${ARTIFACT_DIR}/${condition}-gateway.log" 2>&1 &
   PIDS+=("$!")
 done
+
+# A literal credential from the installed configuration is never retained in
+# the script process after the isolated Gateway children have inherited it.
+unset PROVIDER_CREDENTIAL
 
 for port in "${PORTS[@]}"; do
   ready=0

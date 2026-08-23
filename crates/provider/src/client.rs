@@ -110,6 +110,11 @@ impl ProviderClient {
         http: reqwest::Client,
     ) -> Result<Self, ApiError> {
         let resolved_model = model.trim();
+        if providers::requires_configured_provider_route(resolved_model) {
+            return Err(ApiError::NoProviderConfigured {
+                model: resolved_model.to_string(),
+            });
+        }
         match providers::detect_provider_kind(resolved_model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
                 Some(auth) => AnthropicClient::from_auth_with_http(auth, http),
@@ -131,13 +136,7 @@ impl ProviderClient {
                 )))
             }
             ProviderKind::OpenAi => {
-                // DashScope models (qwen-*) also return ProviderKind::OpenAi because they
-                // speak the OpenAI wire format, but they need the DashScope config which
-                // reads DASHSCOPE_API_KEY and points at dashscope.aliyuncs.com.
                 let config = match providers::metadata_for_model(resolved_model) {
-                    Some(meta) if meta.auth_env == "DASHSCOPE_API_KEY" => {
-                        OpenAiCompatConfig::dashscope()
-                    }
                     Some(meta) if meta.auth_env == "DEEPSEEK_API_KEY" => {
                         OpenAiCompatConfig::deepseek()
                     }
@@ -375,6 +374,7 @@ fn resolve_config_api_key(provider: &ProviderConfig) -> Result<String, ApiError>
 #[cfg(test)]
 mod tests {
     use super::{resolve_config_api_key, ProviderClient};
+    use crate::error::ApiError;
     use crate::providers::{detect_provider_kind, ProviderKind};
     use crate::test_utils::{env_lock, EnvVarGuard};
     use model_protocol::provider_config::{
@@ -403,29 +403,27 @@ mod tests {
     }
 
     #[test]
-    fn dashscope_model_uses_dashscope_config_not_openai() {
+    fn qwen_model_requires_configured_provider_route() {
         let _lock = env_lock();
-        let _dashscope = EnvVarGuard::set("DASHSCOPE_API_KEY", Some("test-dashscope-key"));
-        let _openai = EnvVarGuard::set("OPENAI_API_KEY", None);
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", Some("ambient-test-key"));
 
-        let client = ProviderClient::from_model("qwen-plus");
+        let error = ProviderClient::from_model("qwen-plus")
+            .expect_err("Qwen must not infer a provider from a model name or ambient credential");
 
-        assert!(
-            client.is_ok(),
-            "qwen-plus with DASHSCOPE_API_KEY set should build successfully, got: {:?}",
-            client.err()
-        );
+        assert!(matches!(error, ApiError::NoProviderConfigured { .. }));
+    }
 
-        match client.unwrap() {
-            ProviderClient::OpenAi(openai_client) => {
-                assert!(
-                    openai_client.base_url().contains("dashscope.aliyuncs.com"),
-                    "qwen-plus should route to DashScope base URL (contains 'dashscope.aliyuncs.com'), got: {}",
-                    openai_client.base_url()
-                );
-            }
-            other => panic!("Expected ProviderClient::OpenAi for qwen-plus, got: {other:?}"),
-        }
+    #[test]
+    fn configured_qwen_provider_does_not_need_ambient_provider_routing() {
+        let configured = ProviderConfig {
+            models: vec!["qwen3.8-max".to_string()],
+            ..configured_provider("configured-test-secret")
+        };
+
+        let client = ProviderClient::from_config(&configured)
+            .expect("the configured provider registry is the only valid Qwen route");
+
+        assert_eq!(client.provider_kind(), ProviderKind::OpenAi);
     }
 
     #[test]
@@ -469,10 +467,8 @@ mod tests {
             "https://open.bigmodel.cn/api/paas/v4"
         );
         assert_eq!(
-            ProviderClient::normalize_openai_url(
-                "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            ),
-            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            ProviderClient::normalize_openai_url("https://provider.example/compatible-mode/v1"),
+            "https://provider.example/compatible-mode/v1"
         );
     }
 }

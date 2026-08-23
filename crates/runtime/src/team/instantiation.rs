@@ -66,8 +66,7 @@ fn compile_required_acceptance(
     let mut scopes = Vec::new();
     for requirement in contract {
         match &requirement.check {
-            TeamAcceptanceCheck::ScopedEvidence { scopes: required }
-            | TeamAcceptanceCheck::LegacyEvidenceBound { scopes: required } => {
+            TeamAcceptanceCheck::ScopedEvidence { scopes: required } => {
                 scopes.extend(required.iter().map(|scope| {
                     if scope == "network:*" || scope.contains(':') {
                         scope.clone()
@@ -245,10 +244,19 @@ impl TeamInstantiationService {
         evaluation_allowed_tools: Option<&[String]>,
     ) -> Result<TeamInstantiation, String> {
         let manifest = &template.revision.manifest;
-        let binding_overrides = role_binding_overrides(&request, &manifest.roles)?;
-        let cardinality_overrides = role_cardinality_overrides(&request, &manifest.roles)?;
+        // A model-assisted orchestration that supplies role-specific focus
+        // plans is selecting the active role set for this Team node.  Older
+        // behavior treated focuses as annotations while instantiating every
+        // template role, which silently turned one semantic Team into an
+        // unrelated full topology.  An empty focus plan continues to mean
+        // "run the template as published"; an explicit plan is a declarative
+        // role selection and is validated against the immutable template.
         let (focus_plans, mut focus_repairs) =
             focus_partition_plans(&request, &manifest.roles, &manifest.role_aliases)?;
+        let active_roles = active_template_roles(&request, &manifest.roles, &focus_plans)?;
+        validate_active_role_dependencies(&active_roles, &manifest.dependencies)?;
+        let binding_overrides = role_binding_overrides(&request, &active_roles)?;
+        let cardinality_overrides = role_cardinality_overrides(&request, &active_roles)?;
         for plan in focus_plans.values() {
             for slot in &plan.slots {
                 for reference in &slot.capability_cropped_refs {
@@ -282,7 +290,7 @@ impl TeamInstantiationService {
         // Team topology. Copying the parent ceiling into every role slot
         // multiplies spend by cardinality and makes the advertised parent
         // budget unenforceable.
-        let planned_agent_slots = manifest.roles.iter().try_fold(0usize, |total, role| {
+        let planned_agent_slots = active_roles.iter().try_fold(0usize, |total, role| {
             let (focuses, _) = resolve_focuses(
                 role,
                 cardinality_overrides.get(&role.role_id),
@@ -298,7 +306,8 @@ impl TeamInstantiationService {
             request.execution_budget.predicted_tokens(),
             planned_agent_slots,
         )?;
-        for role in &manifest.roles {
+        let mut escalation_assignee_selected = false;
+        for role in &active_roles {
             let override_ = binding_overrides.get(&role.role_id);
             let (definition_ref, grant_ceiling) = resolved_role_binding(role, override_)?;
             let capability = resolve_agent_capability(AgentCapabilityRequest {
@@ -389,7 +398,13 @@ impl TeamInstantiationService {
                         .permission_ceiling
                         .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
                 );
-                let objective_context = bounded_objective_context(&request.objective);
+                let requires_managed_collaboration_escalation = request
+                    .requires_managed_collaboration_escalation
+                    && !upstream_only_reducer
+                    && !escalation_assignee_selected;
+                escalation_assignee_selected |= requires_managed_collaboration_escalation;
+                let objective_context =
+                    bounded_objective_context(requires_managed_collaboration_escalation);
                 let intent = AgentTaskIntent {
                     selected_agent_id: Some(definition_ref.definition_id.as_str().to_string()),
                     definition_ref: Some(definition_ref.clone()),
@@ -437,6 +452,7 @@ impl TeamInstantiationService {
                     ),
                     required_acceptance,
                     output_acceptance: acceptance_contract,
+                    requires_managed_collaboration_escalation,
                     acceptance: slot_acceptance,
                     constraints: vec![
                         format!("team_template:{}@{}", template.revision.revision_ref.template_id.as_str(), template.revision.revision_ref.revision),
@@ -626,7 +642,22 @@ impl TeamInstantiationService {
             }
         }
 
+        if request.requires_managed_collaboration_escalation && !escalation_assignee_selected {
+            return Err(
+                "managed collaboration escalation requires at least one non-reducer Team Agent"
+                    .to_string(),
+            );
+        }
+
         for dependency in &manifest.dependencies {
+            if !slots_by_role.contains_key(&dependency.from_role_id)
+                && !slots_by_role.contains_key(&dependency.to_role_id)
+            {
+                // Both endpoints are outside an explicit model-selected role
+                // set. `validate_active_role_dependencies` has already ruled
+                // out the only unsafe case (one endpoint selected).
+                continue;
+            }
             let from = slots_by_role.get(&dependency.from_role_id).ok_or_else(|| {
                 format!(
                     "resolved Team graph lacks source role `{}`",
@@ -1017,7 +1048,7 @@ fn ensure_static_graph_ceiling(
 pub(crate) fn team_acceptance_contract(
     criteria: &[String],
     resource_scopes: &[String],
-    allow_legacy_custom_contract: bool,
+    allow_custom_evidence_contract: bool,
     upstream_synthesis_role: bool,
 ) -> Result<Vec<TeamAcceptanceRequirement>, String> {
     let bounded = |scope: &String| {
@@ -1176,10 +1207,14 @@ pub(crate) fn team_acceptance_contract(
                                 scopes: vec![scope.trim().to_string()],
                             },
                         }
-                    } else if allow_legacy_custom_contract {
+                    } else if allow_custom_evidence_contract {
                         TeamAcceptanceRequirement {
                             criterion: criterion.clone(),
-                            check: TeamAcceptanceCheck::LegacyEvidenceBound {
+                            // The criterion remains an inspectable semantic
+                            // label, but proof comes only from Runtime tool
+                            // receipts. It never requires a model-invented
+                            // JSON compatibility field.
+                            check: TeamAcceptanceCheck::ScopedEvidence {
                                 scopes: evidence_scopes.clone(),
                             },
                         }
@@ -1191,8 +1226,7 @@ pub(crate) fn team_acceptance_contract(
                 }
             };
             let missing_scope = match &check.check {
-                TeamAcceptanceCheck::ScopedEvidence { scopes }
-                | TeamAcceptanceCheck::LegacyEvidenceBound { scopes } => scopes.is_empty(),
+                TeamAcceptanceCheck::ScopedEvidence { scopes } => scopes.is_empty(),
                 TeamAcceptanceCheck::WorkspaceChange { scopes, .. }
                 | TeamAcceptanceCheck::SourceVerification { scopes } => scopes.is_empty(),
                 TeamAcceptanceCheck::StructuredField { .. }
@@ -1228,6 +1262,78 @@ fn role_binding_overrides<'a>(
         overrides.insert(override_.role_id.clone(), override_);
     }
     Ok(overrides)
+}
+
+/// Resolve the active topology for one immutable Team request.
+///
+/// A Model-assisted request for a one-role template has an unambiguous
+/// published topology.  A multi-role template is not unambiguous: an empty
+/// focus list could mean either "this semantic Team owns every role" or
+/// "I forgot to select the one role I described".  Require the model to
+/// state its role set in that case.  To activate a whole multi-role template
+/// it simply lists every role, which remains fully flexible while preventing
+/// an implicit topology expansion. The immutable dependency graph is checked
+/// separately before graph materialization.
+fn active_template_roles(
+    request: &TeamInstantiationRequest,
+    roles: &[TeamRoleDefinition],
+    focus_plans: &BTreeMap<String, FocusPartitionPlan>,
+) -> Result<Vec<TeamRoleDefinition>, String> {
+    if !matches!(
+        request.selection_mode,
+        harness_contract::team::TeamSelectionMode::ModelAssisted
+    ) {
+        return Ok(roles.to_vec());
+    }
+    if focus_plans.is_empty() {
+        if roles.len() == 1 {
+            return Ok(roles.to_vec());
+        }
+        let mut valid_roles = roles
+            .iter()
+            .map(|role| role.role_id.as_str())
+            .collect::<Vec<_>>();
+        valid_roles.sort_unstable();
+        return Err(format!(
+            "model-assisted Team selected multi-role template without focuses; explicitly declare every active focus.role_id (list all roles to run the full template). Valid roles: {}",
+            valid_roles.join(", ")
+        ));
+    }
+    let selected = focus_plans.keys().collect::<BTreeSet<_>>();
+    let active = roles
+        .iter()
+        .filter(|role| selected.contains(&role.role_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if active.is_empty() {
+        return Err("model-assisted Team role selection resolved no template roles".to_string());
+    }
+    Ok(active)
+}
+
+/// The active role set may omit independent template roles, but it cannot
+/// omit one endpoint of a declared template dependency.  This produces a
+/// repairable compile-time error instead of creating a graph whose downstream
+/// role is guaranteed to remain blocked at runtime.
+fn validate_active_role_dependencies(
+    roles: &[TeamRoleDefinition],
+    dependencies: &[harness_contract::team::TeamRoleDependency],
+) -> Result<(), String> {
+    let active = roles
+        .iter()
+        .map(|role| role.role_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for dependency in dependencies {
+        let from_active = active.contains(dependency.from_role_id.as_str());
+        let to_active = active.contains(dependency.to_role_id.as_str());
+        if from_active != to_active {
+            return Err(format!(
+                "selected Team roles omit one endpoint of template dependency {} -> {}; select both roles or choose a compatible template",
+                dependency.from_role_id, dependency.to_role_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn role_cardinality_overrides<'a>(
@@ -1539,11 +1645,11 @@ fn bounded_slot_resource_scopes(team_scopes: &[String], focus_refs: &[String]) -
     scopes
 }
 
-fn bounded_objective_context(parent_objective: &str) -> String {
+fn bounded_objective_context(requires_managed_collaboration_escalation: bool) -> String {
     let mut context = "Runtime intentionally withholds the parent cross-Team objective from delegated Team roles. Evaluate only this role's bounded Focus, resource scopes, acceptance contract, and canonical upstream results."
         .to_string();
-    if parent_objective.contains("request_collaboration_escalation") {
-        context.push_str(" The parent contract explicitly requires one Runtime-attested collaboration escalation. After acquiring your first source receipt and before terminal synthesis, use the native request_collaboration_escalation tool once to propose one bounded follow-up Team. Supply only its semantic reason and requested_add_team; Runtime derives all fences. Do not replace this native call with prose.");
+    if requires_managed_collaboration_escalation {
+        context.push_str(" Runtime has assigned this exact managed Agent one bounded collaboration-escalation obligation. After acquiring your first source receipt and before terminal synthesis, invoke the native request_collaboration_escalation tool exactly once to request an independent follow-up Team relevant to your verified focus. Supply only the semantic reason and requested_add_team; Runtime derives all fences. Prose never substitutes for the native call.");
     }
     context
 }
@@ -1677,11 +1783,7 @@ mod acceptance_contract_tests {
 
     #[test]
     fn upstream_reducer_cannot_observe_or_judge_peer_team_objectives() {
-        let parent = "Team A reads a.toml; Team B reads b.toml; combine both.";
-        let bounded = bounded_objective_context(parent);
-        assert!(!bounded.contains("a.toml"));
-        assert!(!bounded.contains("b.toml"));
-        assert!(!bounded.contains("Team A"));
+        let bounded = bounded_objective_context(false);
         assert!(bounded.contains("bounded Focus"));
     }
 
@@ -1741,10 +1843,8 @@ mod acceptance_contract_tests {
                 "request_collaboration_escalation".to_string(),
             ]
         );
-        assert!(bounded_objective_context(
-            "the managed Agent must call request_collaboration_escalation after evidence"
-        )
-        .contains("native request_collaboration_escalation tool"));
+        assert!(bounded_objective_context(true)
+            .contains("native request_collaboration_escalation tool"));
     }
 
     #[test]
@@ -1812,7 +1912,7 @@ mod acceptance_contract_tests {
     }
 
     #[test]
-    fn session_authority_is_not_misclassified_as_a_workspace_evidence_scope() {
+    fn custom_criterion_uses_durable_evidence_not_a_json_compatibility_field() {
         let contract = team_acceptance_contract(
             &["evidence-backed output".to_string()],
             &[
@@ -1822,10 +1922,10 @@ mod acceptance_contract_tests {
             true,
             false,
         )
-        .expect("legacy custom contract has an exact evidence-bound adapter");
+        .expect("custom contract has an exact evidence-bound adapter");
         assert_eq!(
             contract[0].check,
-            TeamAcceptanceCheck::LegacyEvidenceBound {
+            TeamAcceptanceCheck::ScopedEvidence {
                 scopes: vec!["read:crates/runtime".to_string()]
             }
         );

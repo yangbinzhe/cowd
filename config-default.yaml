@@ -154,13 +154,10 @@ providers: {}
 #     protocol: "responses"
 #     parallel_tool_calls: "auto"
 #     early_tool_start: "auto"
-#   bailian:
-#     base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-#     api_key: "sk-..."
-#     models: ["qwen3-max", "qwen3-coder-next"]
-#     protocol: "completions"
-#     parallel_tool_calls: "auto"
-#     early_tool_start: "auto"
+# Qwen generation routes are intentionally omitted from defaults: declare the
+# chosen provider, endpoint, credential reference and model mapping in the
+# user's configuration (for example, the Token Plan profile). Bailian is
+# configured only under memory.vector when it supplies embeddings.
 
 # Provider 故障转移链
 # 按顺序尝试已配置模型。生产可用性链应跨 Provider/账户配置；

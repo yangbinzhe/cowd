@@ -131,11 +131,10 @@ impl ProviderCapabilityProfile {
     }
 
     /// The single wire-boundary truth for "this exact model must not receive
-    /// an explicit `tool_choice` field". DeepSeek v4 endpoints enable
-    /// thinking by default and reject `tool_choice` with HTTP 400
-    /// (`Thinking mode does not support this tool_choice`) even when no
-    /// `reasoning_effort` is sent, so the field is omitted unconditionally
-    /// for the v4 family unless a configured capability tag explicitly
+    /// an explicit `tool_choice` field". DeepSeek v4 and Qwen 3.7 Plus
+    /// thinking endpoints reject `tool_choice` with HTTP 400 even when no
+    /// `reasoning_effort` is sent. Omit the field unconditionally for these
+    /// exact model families unless a configured capability tag explicitly
     /// overrides it. Both the Runtime capability gate and the provider
     /// payload builders call this helper so they cannot drift.
     #[must_use]
@@ -143,7 +142,7 @@ impl ProviderCapabilityProfile {
         model: &str,
         _reasoning_effort: Option<&str>,
     ) -> bool {
-        Self::is_deepseek_v4(model)
+        Self::is_deepseek_v4(model) || Self::is_qwen_37_plus(model)
     }
 
     /// Exact DeepSeek v4 family check. It matches the canonical model id only;
@@ -152,6 +151,14 @@ impl ProviderCapabilityProfile {
         let lowered = model.trim().to_ascii_lowercase();
         let canonical = lowered.rsplit('/').next().unwrap_or_default();
         matches!(canonical, "deepseek-v4-pro" | "deepseek-v4-flash")
+    }
+
+    /// Exact Qwen 3.7 Plus check. It matches the canonical model id only so
+    /// unrelated Qwen variants retain their configured/default capability.
+    fn is_qwen_37_plus(model: &str) -> bool {
+        let lowered = model.trim().to_ascii_lowercase();
+        let canonical = lowered.rsplit('/').next().unwrap_or_default();
+        matches!(canonical, "qwen3.7-plus" | "qwen-3.7-plus")
     }
 }
 
@@ -280,6 +287,31 @@ mod tests {
                 "DeepSeek v4 defaults to thinking mode and rejects tool_choice with 400"
             );
         }
+    }
+
+    #[test]
+    fn qwen_37_plus_omits_explicit_tool_choice_without_downgrading_other_qwen_models() {
+        let qwen = ProviderCapabilityProfile::resolve_for_reasoning_mode(
+            ProviderProtocol::Completions,
+            "qwen3.7-plus",
+            Some("high"),
+        );
+        assert_eq!(
+            qwen.supports_explicit_tool_choice.state,
+            CapabilityState::Unsupported
+        );
+        assert!(
+            ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
+                "provider/qwen-3.7-plus",
+                None
+            )
+        );
+        assert!(
+            !ProviderCapabilityProfile::explicit_tool_choice_known_unsupported(
+                "qwen3.7-turbo",
+                Some("high")
+            )
+        );
     }
 
     #[test]

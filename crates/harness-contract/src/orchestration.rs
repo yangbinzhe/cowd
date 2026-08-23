@@ -68,6 +68,24 @@ pub struct ModelSemanticFocus {
     pub evidence_responsibilities: Vec<String>,
 }
 
+/// Explicit model-selected policy for the optional managed-Agent escalation
+/// lane of a Team. This is required on every semantic node so the model cannot
+/// accidentally omit a requested escalation by relying on an optional JSON
+/// default. Runtime owns the selected Agent, tool receipt, graph fences and
+/// the actual follow-up Team.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedAgentEscalationRequirement {
+    #[default]
+    None,
+    #[schemars(
+        description = "Require exactly one Runtime-attested managed-Agent escalation after its first source receipt. Use only for a Team whose work may need an independently discovered follow-up Team."
+    )]
+    Required,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModelGraphSemanticNode {
@@ -83,6 +101,10 @@ pub struct ModelGraphSemanticNode {
     pub multiplicity: u16,
     #[serde(default)]
     pub focuses: Vec<ModelSemanticFocus>,
+    /// Explicit Runtime-attested follow-up Team request policy. The model
+    /// describes only the semantic need; it cannot select an Agent instance,
+    /// construct graph ids, or supply a Program revision.
+    pub managed_agent_escalation: ManagedAgentEscalationRequirement,
     #[serde(default)]
     pub template: Option<String>,
     /// Explicit destination for `session_dispatch`. Runtime rejects this field
@@ -338,6 +360,7 @@ impl ModelRuntimeOrchestrationInput {
                     depends_on: Vec::new(),
                     multiplicity: 1,
                     focuses: Vec::new(),
+                    managed_agent_escalation: ManagedAgentEscalationRequirement::None,
                     template: None,
                     target_session_id: None,
                     output_artifacts: vec!["review_report".to_string()],
@@ -549,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_node_controls_use_the_runtime_safe_defaults() {
+    fn node_controls_keep_safe_defaults_but_require_explicit_escalation_policy() {
         let request: ModelRuntimeOrchestrationInput = serde_json::from_value(serde_json::json!({
             "intent": "Review the implementation",
             "operation": "propose",
@@ -558,7 +581,8 @@ mod tests {
                 "nodes": [{
                     "node_id": "review",
                     "recipe": "review",
-                    "objective": "Review the implementation"
+                    "objective": "Review the implementation",
+                    "managed_agent_escalation": "none"
                 }],
                 "reason": "Independent verification is required"
             }
@@ -568,5 +592,28 @@ mod tests {
         assert_eq!(node.multiplicity, 1);
         assert!(node.required);
         assert_eq!(node.dependency, ExecutionDependencyPolicy::All);
+        assert_eq!(
+            node.managed_agent_escalation,
+            ManagedAgentEscalationRequirement::None
+        );
+
+        let missing_policy =
+            serde_json::from_value::<ModelRuntimeOrchestrationInput>(serde_json::json!({
+                "intent": "Review the implementation",
+                "operation": "propose",
+                "proposal": {
+                    "mutation_id": "review-missing-escalation-policy",
+                    "nodes": [{
+                        "node_id": "review",
+                        "recipe": "review",
+                        "objective": "Review the implementation"
+                    }],
+                    "reason": "Independent verification is required"
+                }
+            }));
+        assert!(
+            missing_policy.is_err(),
+            "model must select none or required"
+        );
     }
 }

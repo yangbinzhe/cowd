@@ -21,7 +21,6 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.cn/v1";
 pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
@@ -64,7 +63,6 @@ pub enum OpenAiWireProtocol {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
-const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
 const MOONSHOT_ENV_VARS: &[&str] = &["MOONSHOT_API_KEY"];
 const DEEPSEEK_ENV_VARS: &[&str] = &["DEEPSEEK_API_KEY"];
 
@@ -90,22 +88,6 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: true,
-        }
-    }
-
-    /// Alibaba `DashScope` compatible-mode endpoint (Qwen family models).
-    /// Uses the OpenAI-compatible REST shape at /compatible-mode/v1.
-    /// Requested via community support channel: native Alibaba API for
-    /// higher rate limits than going through `OpenRouter`.
-    #[must_use]
-    pub const fn dashscope() -> Self {
-        Self {
-            provider_name: "DashScope",
-            api_key_env: "DASHSCOPE_API_KEY",
-            base_url_env: "DASHSCOPE_BASE_URL",
-            default_base_url: DEFAULT_DASHSCOPE_BASE_URL,
-            wire_protocol: OpenAiWireProtocol::Completions,
-            request_stream_usage: false,
         }
     }
 
@@ -148,7 +130,6 @@ impl OpenAiCompatConfig {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
-            "DashScope" => DASHSCOPE_ENV_VARS,
             "Moonshot" => MOONSHOT_ENV_VARS,
             "DeepSeek" => DEEPSEEK_ENV_VARS,
             _ => &[],

@@ -2523,6 +2523,7 @@ mod tests {
             objective: "verify lifecycle".into(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: vec!["verified".into()],
             team_role_identity: None,
             team_role: None,

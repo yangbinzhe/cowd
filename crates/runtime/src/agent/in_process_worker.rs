@@ -648,6 +648,51 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 return Err(error);
             }
         };
+        let (has_successful_escalation, has_source_evidence) = {
+            let receipts = tool_executor
+                .receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                receipts
+                    .iter()
+                    .any(|receipt| receipt.tool_name == "request_collaboration_escalation"),
+                receipts
+                    .iter()
+                    .any(|receipt| !receipt.observed_evidence.is_empty()),
+            )
+        };
+        if needs_managed_escalation_recovery(
+            packet.requires_managed_collaboration_escalation,
+            has_successful_escalation,
+            has_source_evidence,
+        ) {
+            // This is a bounded Agent-bound Runtime recovery, not an answer
+            // rewrite. The provider turn has already produced real source
+            // evidence, while the terminal outcome is not committed yet. A
+            // second `submit_turn` would create a new child graph and detach
+            // the resulting receipt from this Agent attempt, so execute the
+            // same native tool through its original scoped executor instead.
+            // Gateway still derives the Program revision/fences from the
+            // immutable Agent parent binding; this code supplies only the
+            // semantic delta permitted to the Agent.
+            let _ = services.agent_runtime().record_progress(
+                packet.agent_id(),
+                "agent.escalation.recovery_requested",
+                "source evidence is durable but the required native collaboration escalation is missing; executing one bounded Agent-bound native recovery",
+            );
+            let recovery_input = managed_escalation_recovery_input(&packet);
+            if let Err(error) = tool_executor
+                .execute_managed_escalation_recovery(&recovery_input)
+                .await
+            {
+                let _ = services.agent_runtime().record_progress(
+                    packet.agent_id(),
+                    "agent.escalation.recovery_failed",
+                    &format!("bounded native escalation recovery failed: {error}"),
+                );
+            }
+        }
         normalize_verified_narrative_terminal(&packet, &tool_executor, &mut summary);
         let evidence_refs = agent_evidence_refs(
             &packet,
@@ -767,8 +812,38 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 "accepted={acceptance:?}; changes={changes:?}; receipts={receipt_summary:?}; contract={contract_criteria:?}; pending_evidence_scopes={pending_evidence_scopes:?}; observed_acceptance={observed_acceptance:?}"
             ),
         );
-        let (status, failure) =
+        // A bounded recovery turn can commit its native escalation through a
+        // graph-owned ToolBatch after this worker's initial in-memory receipt
+        // snapshot was assembled.  The durable receipt log is authoritative
+        // at the Agent terminal boundary; checking only the startup snapshot
+        // incorrectly fails an Agent whose Runtime-attested escalation has
+        // already appended the follow-up Team.
+        let escalation_satisfied = !packet.requires_managed_collaboration_escalation
+            || tool_executor
+                .receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|receipt| receipt.tool_name == "request_collaboration_escalation")
+            || crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(
+                services.event_store(),
+            ))
+            .load_delegated_agent_tool_receipts(packet.graph_id(), packet.node_id(), packet.attempt)
+            .map(|receipts| {
+                receipts
+                    .iter()
+                    .any(|receipt| receipt.outcome.tool_name == "request_collaboration_escalation")
+            })
+            .unwrap_or(false);
+        let (mut status, mut failure) =
             agent_terminal_outcome(summary.terminal_completion, &summary.final_answer);
+        if !escalation_satisfied {
+            status = AgentTerminalStatus::Failed;
+            failure = Some(
+                "required managed collaboration escalation has no successful Runtime tool receipt"
+                    .to_string(),
+            );
+        }
         let terminal_ref = format!("agent-terminal:{}", packet.run_id());
         match status {
             AgentTerminalStatus::Completed => services.complete_live_execution(
@@ -1032,9 +1107,6 @@ fn packet_required_output_fields(packet: &AgentTaskPacket) -> Vec<String> {
             ),
             harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
             | harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
-            harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { .. } => {
-                Some("legacy_acceptance".to_string())
-            }
         })
         .collect::<Vec<_>>();
     fields.sort();
@@ -1065,6 +1137,34 @@ fn agent_terminal_outcome(
             Some("child turn returned an open goal as a terminal result".to_string()),
         ),
     }
+}
+
+fn needs_managed_escalation_recovery(
+    requires_escalation: bool,
+    has_successful_escalation: bool,
+    has_source_evidence: bool,
+) -> bool {
+    requires_escalation && !has_successful_escalation && has_source_evidence
+}
+
+fn managed_escalation_recovery_input(packet: &AgentTaskPacket) -> String {
+    let focus = packet
+        .team_role_identity
+        .as_ref()
+        .map(|identity| identity.focus_id.as_str())
+        .filter(|focus| !focus.trim().is_empty())
+        .unwrap_or("the bounded source-evidence focus");
+    let node_digest = format!("{:x}", Sha256::digest(packet.node_id().as_bytes()));
+    serde_json::json!({
+        "reason": format!(
+            "Runtime requires an independent follow-up verification of {focus} after the managed Agent's durable source-evidence pass."
+        ),
+        "requested_add_team": {
+            "semantic_node_id": format!("managed-follow-up-{}", &node_digest[..16]),
+            "objective": format!("Independently verify the bounded evidence for {focus}."),
+        }
+    })
+    .to_string()
 }
 
 fn agent_input_text(input: &AgentInput) -> String {
@@ -1114,6 +1214,7 @@ struct ScopedRuntimeToolExecutor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopedToolExecutionReceipt {
     sequence: u64,
+    tool_name: String,
     effect_kind: harness_contract::tool::ToolEffectKind,
     resource_scopes: Vec<String>,
     paths: Vec<String>,
@@ -1146,6 +1247,7 @@ fn scoped_receipt_from_durable(
     paths.sort();
     ScopedToolExecutionReceipt {
         sequence: receipt.sequence,
+        tool_name: receipt.outcome.tool_name.clone(),
         effect_kind: receipt.effect_kind,
         resource_scopes: receipt.authorized_scopes,
         paths,
@@ -1493,6 +1595,28 @@ impl ScopedRuntimeToolExecutor {
         input: &str,
         authorization: harness_contract::tool::ToolExecutionAuthorization,
     ) -> Result<String, ToolError> {
+        if tool_name == "request_collaboration_escalation" {
+            let receipts = self
+                .receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if receipts
+                .iter()
+                .any(|receipt| receipt.tool_name == "request_collaboration_escalation")
+            {
+                return Err(ToolError::new(
+                    "a managed Agent may request collaboration escalation at most once per attempt",
+                ));
+            }
+            if !receipts
+                .iter()
+                .any(|receipt| !receipt.observed_evidence.is_empty())
+            {
+                return Err(ToolError::new(
+                    "collaboration escalation requires a prior source-evidence receipt at a safe checkpoint",
+                ));
+            }
+        }
         let input = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
             ToolError::new(format!("invalid Runtime delegated tool input: {error}"))
         })?;
@@ -1550,6 +1674,139 @@ impl ScopedRuntimeToolExecutor {
                 })))
             }
         }
+    }
+
+    /// Execute the one Runtime-owned remediation for a managed-Agent
+    /// escalation obligation that the provider omitted after producing source
+    /// evidence. This is intentionally not exposed through [`ToolExecutor`]:
+    /// model-originated calls must carry a normal invocation authorization.
+    ///
+    /// The recovery is already constrained by the immutable packet flag, the
+    /// prior source-evidence receipt and the Gateway's parent-Team/Program
+    /// attestation. `request_collaboration_escalation` is a read-only Runtime
+    /// control-plane request with no workspace path. Sending it through the
+    /// generic scoped executor incorrectly rejects it as an unbounded file
+    /// effect before Gateway can validate that binding.
+    async fn execute_managed_escalation_recovery(
+        &self,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        const TOOL: &str = "request_collaboration_escalation";
+        if !self.allowed_tools.contains(TOOL) {
+            return Err(ToolError::new(
+                "managed escalation recovery is outside the AgentTaskPacket allow-list",
+            ));
+        }
+        {
+            let receipts = self
+                .receipts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if receipts.iter().any(|receipt| receipt.tool_name == TOOL) {
+                return Err(ToolError::new(
+                    "a managed Agent may request collaboration escalation at most once per attempt",
+                ));
+            }
+            if !receipts
+                .iter()
+                .any(|receipt| !receipt.observed_evidence.is_empty())
+            {
+                return Err(ToolError::new(
+                    "collaboration escalation requires a prior source-evidence receipt at a safe checkpoint",
+                ));
+            }
+        }
+        let value = serde_json::from_str::<serde_json::Value>(input).map_err(|error| {
+            ToolError::new(format!(
+                "invalid managed escalation recovery input: {error}"
+            ))
+        })?;
+        let descriptor = self
+            .host
+            .delegated_tool_effect_descriptor(TOOL, &value)
+            .ok_or_else(|| ToolError::new("managed escalation has no Runtime effect descriptor"))?;
+        if descriptor.effect_kind != harness_contract::tool::ToolEffectKind::Read
+            || descriptor.required_permission != harness_contract::policy::PermissionMode::ReadOnly
+        {
+            return Err(ToolError::new(
+                "managed escalation recovery requires a read-only Runtime control descriptor",
+            ));
+        }
+        let sequence = self
+            .next_receipt_sequence
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        let request = RuntimeToolExecutionRequest {
+            governed_plan_id: self.execution_id.clone(),
+            governed_plan_revision: sequence,
+            observation_wave_sequence: sequence,
+            idempotency_key: deterministic_scoped_tool_idempotency_key(
+                &self.execution_id,
+                &self.node_id,
+                self.attempt,
+                sequence,
+                TOOL,
+                input,
+            ),
+            tool_use_id: format!(
+                "agent-runtime-recovery:{}:{}:{}:{TOOL}",
+                self.node_id, self.attempt, sequence
+            ),
+            tool_name: TOOL.to_string(),
+            input: input.to_string(),
+            category: crate::ToolSafetyCategory::ReadOnly,
+            // This call is not model-originated. Gateway accepts an absent
+            // authorization only for a read-only control tool, then attests
+            // the exact Agent/Team/Program binding before it can mutate the
+            // Program through its fenced escalation transaction.
+            authorization: None,
+            session_id: Some(self.session_id.clone()),
+            sandbox_posture: self.sandbox_posture,
+            policy_revision: self.policy_revision,
+            authorized_scopes: self.authorized_scopes_for_tool(),
+            memory_context: Some(self.memory_context.clone()),
+            model_lease: Some(self.model_lease.clone()),
+            parent_execution: Some(harness_contract::execution_graph::ExecutionParentBinding {
+                execution_id: self.execution_id.clone(),
+                node_id: self.node_id.clone(),
+            }),
+            parent_execution_attempt: Some(self.attempt),
+            execution_decision: None,
+            evaluation_isolated: false,
+            managed_invocation: self.managed_invocation.clone(),
+            tool_progress: crate::ToolProgressSink::default(),
+        };
+        let outcome = self.host.execute_runtime_tool(&request).await;
+        if outcome.status != RuntimeToolExecutionStatus::Executed {
+            return Err(ToolError::new(outcome.error.unwrap_or_else(|| {
+                "managed escalation recovery was not executed".to_string()
+            })));
+        }
+        if let Some(commit_service) = &self.commit_service {
+            commit_service
+                .commit_readonly_tool_receipts(&[(request, outcome.clone())])
+                .map_err(|error| {
+                    ToolError::new(format!(
+                        "managed escalation recovery completed but durable receipt commit failed: {error}"
+                    ))
+                })?;
+        }
+        self.receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(ScopedToolExecutionReceipt {
+                sequence,
+                tool_name: TOOL.to_string(),
+                effect_kind: descriptor.effect_kind,
+                resource_scopes: vec!["runtime:collaboration_escalation".to_string()],
+                paths: Vec::new(),
+                prior_states: BTreeMap::new(),
+                after_digests: BTreeMap::new(),
+                observed_evidence: outcome.observed_evidence.clone(),
+            });
+        Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
+            outcome.output.unwrap_or_default(),
+        ))
     }
 
     fn authorized_scopes_for_tool(&self) -> Vec<String> {
@@ -1854,6 +2111,7 @@ impl ScopedRuntimeToolExecutor {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(ScopedToolExecutionReceipt {
                         sequence,
+                        tool_name: tool_name.to_string(),
                         effect_kind: descriptor.effect_kind,
                         resource_scopes,
                         paths: requested.paths,
@@ -2382,9 +2640,6 @@ fn system_prompt(
                 }
                 harness_contract::team::TeamAcceptanceCheck::UpstreamReview => Some("review"),
                 harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
-                harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { .. } => {
-                    Some("legacy_acceptance")
-                }
                 harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. } => None,
             })
             .collect::<Vec<_>>();
@@ -2555,17 +2810,6 @@ fn derive_receipt_backed_satisfied_criteria(
                         .all(|change| has_matching_read_receipt(change, &receipts, false))
             }
             harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => upstream_evidence,
-            harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { scopes } => {
-                produced_evidence
-                    && !scopes.is_empty()
-                    && scopes.iter().all(|scope| scope_observed(scope))
-                    && output
-                        .as_ref()
-                        .and_then(|object| object.get("legacy_acceptance"))
-                        .and_then(serde_json::Value::as_object)
-                        .and_then(|legacy| legacy.get(&requirement.criterion))
-                        .is_some_and(materialized_json_value)
-            }
         })
         .map(|requirement| requirement.criterion)
         .collect::<Vec<_>>();
@@ -2814,7 +3058,12 @@ fn parse_first_contract_json(text: &str) -> Option<serde_json::Value> {
 pub(crate) fn structured_agent_output(
     text: &str,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
-    const CONTRACT_FIELDS: [&str; 14] = [
+    // Keep this list aligned with `TeamStructuredOutputField`. The parser
+    // remains allow-listed: an arbitrary prose label cannot become an
+    // acceptance field merely because it contains a colon. Runtime evidence,
+    // rather than a model-authored compatibility field, is the sole proof for
+    // custom acceptance criteria.
+    const CONTRACT_FIELDS: [&str; 15] = [
         "summary",
         "findings",
         "evidence",
@@ -2824,11 +3073,12 @@ pub(crate) fn structured_agent_output(
         "review",
         "risks",
         "unresolved",
+        "key_decisions",
+        "unresolved_or_risks",
         "proposal",
         "critique",
         "mitigation",
         "checkpoint",
-        "legacy_acceptance",
     ];
     let has_contract_field = |object: &serde_json::Map<String, serde_json::Value>| {
         CONTRACT_FIELDS
@@ -2945,7 +3195,16 @@ pub(crate) fn structured_agent_output(
             });
         if let Some(heading) = heading {
             flush(&mut object, active_field, &mut active_lines);
-            let normalized = heading.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+            // Providers commonly render a requested label as a bold heading
+            // (`**Field: summary**`) rather than a bare heading.  `Field:`
+            // is presentation syntax, not part of the allow-listed field.
+            let heading = heading.trim();
+            let heading = heading
+                .strip_prefix("Field:")
+                .or_else(|| heading.strip_prefix("field:"))
+                .unwrap_or(heading)
+                .trim();
+            let normalized = heading.to_ascii_lowercase().replace([' ', '-'], "_");
             active_field = CONTRACT_FIELDS
                 .iter()
                 .copied()
@@ -3056,8 +3315,7 @@ fn narrative_field_for_requirement(
             Some(harness_contract::team::TeamStructuredOutputField::Review)
         }
         harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
-        | harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
-        | harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { .. } => None,
+        | harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
     }
 }
 
@@ -3151,6 +3409,14 @@ mod structured_output_probe {
     use super::*;
 
     #[test]
+    fn mandatory_escalation_recovery_requires_evidence_and_an_unsatisfied_contract() {
+        assert!(needs_managed_escalation_recovery(true, false, true));
+        assert!(!needs_managed_escalation_recovery(false, false, true));
+        assert!(!needs_managed_escalation_recovery(true, true, true));
+        assert!(!needs_managed_escalation_recovery(true, false, false));
+    }
+
+    #[test]
     fn arbiter_terminal_text_extracts_key_decisions() {
         let text = "Write and read-back verification complete: `cross-team-decision-report.html` confirmed on disk (215 lines, sha256 d6340e87…), covering summary / evidence / key_decisions (K1-K8) / unresolved_or_risks (U1-U7, R1-R10) with all six roles' evidence citations and arbitration reasons. Terminal synthesis follows.\n\n{\"summary\":\"convergence_arbiter 终态收敛完成\",\"evidence\":[\"tool://tool-raw-call_00_GPhgxF1uJefA7wiTBDTR0830-2b7d0e1f4574cf50（write_file 成功）\"],\"key_decisions\":[{\"id\":\"K1\",\"decision\":\"保持自研确定性 Rust 内核\"}],\"unresolved_or_risks\":[{\"id\":\"U1\",\"item\":\"无真实数据集\"}]}";
         let parsed = structured_agent_output(text);
@@ -3223,6 +3489,19 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn managed_escalation_recovery_input_contains_only_semantic_delta() {
+        let input = managed_escalation_recovery_input(&test_agent_packet(Vec::new()));
+        let value: serde_json::Value = serde_json::from_str(&input).expect("recovery input");
+        assert!(value.get("base_revision").is_none());
+        assert!(value.get("digest").is_none());
+        assert!(value.get("reason").is_some());
+        assert!(value
+            .pointer("/requested_add_team/semantic_node_id")
+            .is_some());
+        assert!(value.pointer("/requested_add_team/objective").is_some());
+    }
     use harness_contract::agent::AgentCommand;
     use harness_contract::turn::TurnId;
     use sha2::{Digest, Sha256};
@@ -3283,6 +3562,7 @@ mod tests {
     ) -> ScopedToolExecutionReceipt {
         ScopedToolExecutionReceipt {
             sequence,
+            tool_name: "test_tool".to_string(),
             effect_kind,
             resource_scopes: vec![format!(
                 "{}:{path}",
@@ -3334,6 +3614,7 @@ mod tests {
             objective: "review".into(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
             team_role_identity: None,
             team_role: None,
@@ -3488,6 +3769,7 @@ mod tests {
         };
         let receipt = ScopedToolExecutionReceipt {
             sequence: 1,
+            tool_name: "read_file".to_string(),
             effect_kind: harness_contract::tool::ToolEffectKind::Read,
             resource_scopes: vec!["read:./fixtures/auto-strategy-write/target.txt".to_string()],
             paths: vec!["./fixtures/auto-strategy-write/target.txt".to_string()],
@@ -3820,6 +4102,122 @@ mod tests {
         assert_eq!(host.max_active.load(Ordering::SeqCst), 2);
     }
 
+    struct ManagedEscalationRecoveryHost {
+        received_bound_recovery: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::RuntimeExecutionHost for ManagedEscalationRecoveryHost {
+        async fn execute_runtime_tool(
+            &self,
+            request: &crate::RuntimeToolExecutionRequest,
+        ) -> crate::RuntimeToolExecutionOutcome {
+            let accepted = request.tool_name == "request_collaboration_escalation"
+                && request.authorization.is_none()
+                && request.parent_execution.as_ref().is_some_and(|parent| {
+                    parent.execution_id == "graph" && parent.node_id == "node"
+                })
+                && request.parent_execution_attempt == Some(1)
+                && request.managed_invocation.is_none();
+            self.received_bound_recovery
+                .store(accepted, Ordering::SeqCst);
+            crate::RuntimeToolExecutionOutcome {
+                tool_use_id: request.tool_use_id.clone(),
+                tool_name: request.tool_name.clone(),
+                status: if accepted {
+                    crate::RuntimeToolExecutionStatus::Executed
+                } else {
+                    crate::RuntimeToolExecutionStatus::BlockedPermission
+                },
+                category: request.category,
+                output: accepted.then(|| "escalation accepted".to_string()),
+                error: (!accepted).then(|| "invalid escalation recovery request".to_string()),
+                evidence_ref: format!("agent-tool:{}", request.tool_use_id),
+                observed_evidence: Vec::new(),
+            }
+        }
+
+        fn delegated_tool_effect_descriptor(
+            &self,
+            tool_name: &str,
+            input: &serde_json::Value,
+        ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
+            test_tool_descriptor_for_input(tool_name, input)
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_escalation_recovery_is_bound_and_durably_receipted() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("crates/runtime/src")).expect("source scope");
+        std::fs::write(
+            root.path().join("crates/runtime/src/lib.rs"),
+            "source evidence",
+        )
+        .expect("source file");
+        let resolver = Arc::new(
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+                .expect("path identities"),
+        );
+        let source_evidence = resolver
+            .observe_tool_scope(
+                "read_file",
+                "read:crates/runtime/src/lib.rs",
+                Some("sha256:source-evidence"),
+                1,
+            )
+            .expect("source evidence receipt");
+        let host = Arc::new(ManagedEscalationRecoveryHost {
+            received_bound_recovery: std::sync::atomic::AtomicBool::new(false),
+        });
+        let executor = ScopedRuntimeToolExecutor {
+            host: host.clone(),
+            allowed_tools: BTreeSet::from(["request_collaboration_escalation".to_string()]),
+            session_id: "session".to_string(),
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            attempt: 1,
+            workspace_root: root.path().to_path_buf(),
+            path_identity_resolver: resolver,
+            scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
+            resource_scopes: Some(vec!["read:crates/runtime".to_string()]),
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(1),
+            receipts: Mutex::new(vec![ScopedToolExecutionReceipt {
+                sequence: 1,
+                tool_name: "read_file".to_string(),
+                effect_kind: harness_contract::tool::ToolEffectKind::Read,
+                resource_scopes: vec!["read:crates/runtime/src/lib.rs".to_string()],
+                paths: vec!["crates/runtime/src/lib.rs".to_string()],
+                prior_states: BTreeMap::new(),
+                after_digests: BTreeMap::new(),
+                observed_evidence: vec![source_evidence],
+            }]),
+        };
+
+        executor
+            .execute_managed_escalation_recovery(
+                r#"{"reason":"need a second team","requested_add_team":{"semantic_node_id":"follow-up","objective":"verify"}}"#,
+            )
+            .await
+            .expect("Runtime-owned recovery succeeds");
+
+        assert!(host.received_bound_recovery.load(Ordering::SeqCst));
+        let receipts = executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(receipts.iter().any(|receipt| {
+            receipt.tool_name == "request_collaboration_escalation"
+                && receipt.resource_scopes == ["runtime:collaboration_escalation"]
+        }));
+    }
+
     struct InputSensitiveRuntimeExecutionHost;
 
     impl InputSensitiveRuntimeExecutionHost {
@@ -3885,16 +4283,24 @@ mod tests {
             ToolPermissionMode,
         };
 
-        let (effect_kind, operation, required_permission) = match tool_name {
+        let (effect_kind, operation, required_permission, resource) = match tool_name {
             "read_file" | "grep_search" | "glob_search" => (
                 ToolEffectKind::Read,
                 PermissionOperation::Read,
                 ToolPermissionMode::ReadOnly,
+                PermissionResource::File,
+            ),
+            "request_collaboration_escalation" => (
+                ToolEffectKind::Read,
+                PermissionOperation::Read,
+                ToolPermissionMode::ReadOnly,
+                PermissionResource::Tool,
             ),
             "checkpoint_create" | "write_file" => (
                 ToolEffectKind::Write,
                 PermissionOperation::Write,
                 ToolPermissionMode::WorkspaceWrite,
+                PermissionResource::File,
             ),
             _ => return None,
         };
@@ -3904,7 +4310,7 @@ mod tests {
             effect_kind,
             idempotency: ToolIdempotency::Idempotent,
             scopes: vec![PermissionScope {
-                resource: PermissionResource::File,
+                resource,
                 operation,
                 target: input
                     .get("path")
@@ -4021,21 +4427,11 @@ mod tests {
                     field: harness_contract::team::TeamStructuredOutputField::Risks,
                 },
             },
-            harness_contract::team::TeamAcceptanceRequirement {
-                criterion: "legacy".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound {
-                    scopes: vec!["read:fixtures/target.txt".to_string()],
-                },
-            },
         ];
 
         assert_eq!(
             packet_required_output_fields(&packet),
-            [
-                "legacy_acceptance".to_string(),
-                "review".to_string(),
-                "risks".to_string()
-            ]
+            ["review".to_string(), "risks".to_string()]
         );
     }
 
@@ -4679,6 +5075,18 @@ mod tests {
         assert_eq!(output["summary"], "verified result");
         assert_eq!(output["risks"], "none identified");
 
+        let legacy = "**Field: retired_acceptance_field**\nACCEPTED";
+        assert!(
+            structured_agent_output(legacy).is_none(),
+            "retired presentation labels cannot become acceptance evidence"
+        );
+
+        let current =
+            "## Key Decisions\nKeep the fenced Program binding.\n\n## Unresolved Or Risks\nNone.";
+        let output = structured_agent_output(current).expect("current Team fields");
+        assert_eq!(output["key_decisions"], "Keep the fenced Program binding.");
+        assert_eq!(output["unresolved_or_risks"], "None.");
+
         assert!(structured_agent_output(r#"{"output":{"unrelated":"claim"}}"#).is_none());
     }
 
@@ -4862,6 +5270,7 @@ mod tests {
             objective: "inspect".into(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
             team_role_identity: None,
             team_role: None,
@@ -5125,6 +5534,7 @@ mod tests {
             objective: "inspect source".into(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
             team_role_identity: None,
             team_role: None,

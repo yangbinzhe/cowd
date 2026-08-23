@@ -20,6 +20,10 @@ use std::sync::Arc;
 #[cfg(test)]
 use harness_contract::{
     mission::MissionOrganizationAction,
+    policy::{
+        AutonomyProfileId, ExecutionPolicyBinding, PermissionMode, SessionExecutionPolicy,
+        SessionExecutionPolicyOrigin,
+    },
     reality::EvidenceRef,
     task::{TaskCreateCommand, TaskOrigin, TaskPhaseSpec, TaskSpec},
 };
@@ -4756,6 +4760,21 @@ mod tests {
         (store, url)
     }
 
+    fn policy_bound_task_spec(session_id: &str, objective: &str) -> TaskSpec {
+        let policy = SessionExecutionPolicy::from_profile(
+            AutonomyProfileId::Supervised,
+            1,
+            SessionExecutionPolicyOrigin::SessionExplicit,
+        );
+        let mut spec = TaskSpec::new(objective);
+        spec.execution_policy = spec.execution_policy.bind(ExecutionPolicyBinding::bind(
+            session_id,
+            &policy,
+            PermissionMode::ReadOnly,
+        ));
+        spec
+    }
+
     #[test]
     #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
     fn projection_work_class_maps_background_without_downgrading_recovery() {
@@ -5258,6 +5277,16 @@ mod tests {
             .runtime_event_store(reopened)
             .build()
             .expect("RuntimeServices composes PostgreSQL event backend");
+        services.publish_session_execution_policy(
+            "session:postgres-composed",
+            runtime::permissions::SessionExecutionPolicyControl::from_policy(
+                harness_contract::policy::SessionExecutionPolicy::from_profile(
+                    harness_contract::policy::AutonomyProfileId::Supervised,
+                    1,
+                    harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+                ),
+            ),
+        );
         let mission_id = services.mission_runtime().default_mission_id().to_string();
         services
             .task_runtime_port()
@@ -5273,9 +5302,16 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: harness_contract::task::TaskSpec::new(
-                    "prove canonical Task outbox reaches PostgreSQL event store",
-                ),
+                spec: services
+                    .task_runtime_port()
+                    .bind_task_spec(
+                        "session:postgres-composed",
+                        None,
+                        harness_contract::task::TaskSpec::new(
+                            "prove canonical Task outbox reaches PostgreSQL event store",
+                        ),
+                    )
+                    .expect("bind canonical Task policy for PostgreSQL composition"),
                 evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "test_fixture",
                     "test://runtime-postgres/composed-task",
@@ -5311,7 +5347,10 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: TaskSpec::new("Migrate the task control plane"),
+                spec: policy_bound_task_spec(
+                    "session-pg-migration",
+                    "Migrate the task control plane",
+                ),
                 evidence_refs: vec![EvidenceRef::observed(
                     "test_fixture",
                     "test://runtime-postgres/task-migration",
@@ -5398,7 +5437,10 @@ mod tests {
                         predecessor_task_id: None,
                         mission_assignment: TaskMissionAssignment::Default,
                         mission_assigned_by: "test".to_string(),
-                        spec: TaskSpec::new("one governed concurrent task"),
+                        spec: policy_bound_task_spec(
+                            "session-pg-concurrent",
+                            "one governed concurrent task",
+                        ),
                         evidence_refs: Vec::new(),
                     })
                 })
@@ -5435,7 +5477,7 @@ mod tests {
                 predecessor_task_id: None,
                 mission_assignment: TaskMissionAssignment::Default,
                 mission_assigned_by: "test".to_string(),
-                spec: TaskSpec::new("a conflicting objective"),
+                spec: policy_bound_task_spec("session-pg-concurrent", "a conflicting objective",),
                 evidence_refs: Vec::new(),
             })
             .is_err());

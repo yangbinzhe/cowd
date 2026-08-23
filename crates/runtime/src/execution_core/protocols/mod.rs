@@ -265,6 +265,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 evidence_obligations: Vec::new(),
             },
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance,
             constraints,
             context_refs: self.request.context_refs.clone(),

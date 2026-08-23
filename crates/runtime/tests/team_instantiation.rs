@@ -38,6 +38,7 @@ fn request(template_id: &str, mission_id: &str) -> TeamInstantiationRequest {
         role_display_overrides: Vec::new(),
         cardinality_overrides: Vec::new(),
         focus_partition_plans: Vec::new(),
+        requires_managed_collaboration_escalation: false,
         permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
         model_lease: "deepseek-v4-flash".to_string(),
         execution_budget: harness_contract::context::ParentExecutionBudget::new(
@@ -182,6 +183,134 @@ fn explicit_template_creates_bound_non_overlapping_role_slots() {
                             .any(|tool| tool == "grep_search" || tool == "glob_search"))
             }
     }));
+}
+
+#[test]
+fn model_selected_focuses_activate_only_declared_template_roles() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let mut request = request(
+        "cowd/direct-executor",
+        services.mission_runtime().default_mission_id(),
+    );
+    request.selection_mode = TeamSelectionMode::ModelAssisted;
+    request.focus_partition_plans = vec![FocusPartitionPlan {
+        role_id: "executor".to_string(),
+        shared_baseline: vec!["bounded independent review".to_string()],
+        slots: vec![FocusPartitionSlot {
+            focus_id: "runtime-review".to_string(),
+            boundary: "review runtime only".to_string(),
+            evidence_responsibility: "runtime source evidence".to_string(),
+            capability_cropped_refs: Vec::new(),
+            scope_hash: harness_contract::team::focus_scope_hash(
+                "executor",
+                "review runtime only",
+                &[],
+            ),
+            overlap_budget_bp: 0,
+            novelty_target_bp: 2_500,
+            output_contract: vec!["summary".to_string()],
+            output_acceptance: vec!["summary".to_string()],
+        }],
+    }];
+
+    let plan = services
+        .team_runtime()
+        .plan(request)
+        .expect("focused direct Team plans");
+    assert_eq!(plan.role_slots.len(), 1);
+    assert_eq!(plan.role_slots[0].role_id, "executor");
+    assert_eq!(
+        plan.role_slots[0].focus_partition.focus_id,
+        "runtime-review"
+    );
+}
+
+#[test]
+fn model_assisted_multi_role_template_requires_explicit_role_selection() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let mut request = request(
+        "cowd/parallel-research-synthesis",
+        services.mission_runtime().default_mission_id(),
+    );
+    request.selection_mode = TeamSelectionMode::ModelAssisted;
+
+    let error = services
+        .team_runtime()
+        .plan(request)
+        .expect_err("ambiguous model role selection must fail before graph execution");
+    assert!(error.contains("selected multi-role template without focuses"));
+    assert!(error.contains("researcher"));
+    assert!(error.contains("synthesizer"));
+}
+
+#[test]
+fn model_role_selection_rejects_partial_template_dependency_before_execution() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let mut request = request(
+        "cowd/parallel-research-synthesis",
+        services.mission_runtime().default_mission_id(),
+    );
+    request.selection_mode = TeamSelectionMode::ModelAssisted;
+    request.focus_partition_plans = vec![FocusPartitionPlan {
+        role_id: "researcher".to_string(),
+        shared_baseline: Vec::new(),
+        slots: vec![FocusPartitionSlot {
+            focus_id: "runtime-review".to_string(),
+            boundary: "review runtime only".to_string(),
+            evidence_responsibility: "runtime source evidence".to_string(),
+            capability_cropped_refs: Vec::new(),
+            scope_hash: harness_contract::team::focus_scope_hash(
+                "researcher",
+                "review runtime only",
+                &[],
+            ),
+            overlap_budget_bp: 0,
+            novelty_target_bp: 2_500,
+            output_contract: vec!["summary".to_string()],
+            output_acceptance: vec!["summary".to_string()],
+        }],
+    }];
+
+    let error = services
+        .team_runtime()
+        .plan(request)
+        .expect_err("partial role dependency must fail before a blocked graph exists");
+    assert!(
+        error.contains("omit one endpoint of template dependency"),
+        "{error}"
+    );
+}
+
+#[test]
+fn typed_managed_escalation_is_bound_to_one_agent_packet_not_objective_text() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let mut request = request(
+        "cowd/parallel-research-synthesis",
+        services.mission_runtime().default_mission_id(),
+    );
+    request.requires_managed_collaboration_escalation = true;
+    request.objective = "Review the bounded runtime evidence.".to_string();
+
+    let plan = services
+        .team_runtime()
+        .plan(request)
+        .expect("typed escalation Team plan");
+    let escalated = plan
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
+        .map(|node| {
+            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).expect("decode Agent packet")
+        })
+        .filter(|packet| packet.requires_managed_collaboration_escalation)
+        .collect::<Vec<_>>();
+
+    assert_eq!(escalated.len(), 1);
+    assert!(escalated[0]
+        .allowed_tools
+        .iter()
+        .any(|tool| tool == "request_collaboration_escalation"));
 }
 
 #[test]

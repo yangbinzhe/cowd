@@ -1102,6 +1102,8 @@ where
             collaboration_started: false,
             verified_team_ids: BTreeSet::new(),
             collaboration_committed_write: false,
+            pending_root_control_plane_receipt: None,
+            pending_root_control_plane_requirement: None,
             root_write_replans: 0,
             root_language_replan_attempted: false,
             nested_orchestration_forbidden: execution_parent.is_some()
@@ -1449,16 +1451,8 @@ where
             .recover(&graph_id)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let collaboration_started = submit_selected_program_intent(
-                &runtime,
-                &state,
-                services.as_ref(),
-                content,
-                &strategy,
-                &graph_id,
-                &strategy_parent_node_id,
-            )
-            .await?;
+            let collaboration_started =
+                submit_selected_program_intent(&state, services.as_ref(), &strategy).await?;
             state.lock().await.collaboration_started |= collaboration_started;
             if collaboration_started {
                 *parent_merge_timer
@@ -1549,16 +1543,8 @@ where
                     },
                 });
             }
-            let collaboration_started = submit_selected_program_intent(
-                &runtime,
-                &state,
-                services.as_ref(),
-                content,
-                &strategy,
-                &registered.id,
-                &strategy_parent_node_id,
-            )
-            .await?;
+            let collaboration_started =
+                submit_selected_program_intent(&state, services.as_ref(), &strategy).await?;
             state.lock().await.collaboration_started |= collaboration_started;
             if collaboration_started {
                 *parent_merge_timer
@@ -2124,20 +2110,25 @@ fn structured_team_count(understanding: &harness_contract::strategy::TaskUnderst
 /// Submit the admitted Team strategy as a Coordinator-owned Program intent
 /// before the parent graph asks the provider for its first step. The Host
 /// consumes the resulting receipt but never constructs or drives its graph.
-async fn submit_selected_program_intent<C, T>(
-    runtime: &Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
+async fn submit_selected_program_intent(
     turn_state: &Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: &crate::RuntimeServices,
-    objective: &str,
     strategy: &crate::execution_core::TurnStrategyDecisionState,
-    parent_graph_id: &str,
-    parent_node_id: &str,
-) -> Result<bool, RuntimeError>
-where
-    C: ApiClient + Clone + Send + Sync + 'static,
-    T: ToolExecutor,
-{
+) -> Result<bool, RuntimeError> {
     if strategy.selected_candidate != harness_contract::strategy::ExecutionCandidateKind::Team {
+        return Ok(false);
+    }
+    // A strategy classifier may identify a user hard requirement, but it is
+    // not permitted to manufacture the Program that satisfies it.  The root
+    // model must first submit a typed `runtime_orchestrate` proposal; only
+    // its durable receipt may be consumed here during recovery.  This closes
+    // the historical TaskUnderstanding-to-Program bypass that could create
+    // Teams even when the model never entered the control plane.
+    if strategy.collaboration_receipt.is_none() {
+        tracing::debug!(
+            decision_id = %strategy.decision_id,
+            "selected Team strategy awaits a durable root control-plane receipt"
+        );
         return Ok(false);
     }
     if let Some(receipt) = strategy.collaboration_receipt.as_ref() {
@@ -2205,569 +2196,10 @@ where
         }
         return Ok(true);
     }
-    let (model_lease, parent_requires_write, permission_mode) = {
-        let runtime = runtime.lock().await;
-        (
-            runtime.active_model_lease(),
-            strategy.decision.strategy.understanding.requires_write,
-            runtime.permission_policy().active_mode(),
-        )
-    };
-    let focus_count = selected_strategy_focus_count(strategy);
-    let understanding = &strategy.decision.strategy.understanding;
-    let team_owns_write = parent_requires_write
-        && harness_contract::strategy::explicit_team_owns_persisted_artifact(objective);
-    let team_requires_write = team_owns_write;
-    if team_requires_write
-        && !matches!(
-            permission_mode,
-            crate::PermissionMode::WorkspaceWrite | crate::PermissionMode::DangerFullAccess
-        )
-    {
-        runtime.lock().await.downgrade_turn_strategy(
-            best_non_team_strategy(strategy),
-            "Team write strategy cannot inherit a workspace-write parent permission lease",
-        )?;
-        return Ok(false);
-    }
-    let parent_lineage = services
-        .graph_state_store()
-        .load(parent_graph_id)
-        .map_err(|error| RuntimeError::new(error.to_string()))?
-        .lineage;
-    let ingress_lineage = turn_state.lock().await.ingress.as_ref().map(|ingress| {
-        harness_contract::execution_graph::ExecutionGraphLineage {
-            session_id: ingress.session_id.clone(),
-            turn_id: ingress.turn_id.clone(),
-            root_task_id: ingress.root_task_id.clone(),
-            task_id: ingress.primary_task_id.clone(),
-            generation: ingress.session_generation,
-        }
-    });
-    if let (Some(parent), Some(ingress)) = (&parent_lineage, &ingress_lineage) {
-        if parent != ingress {
-            return Err(RuntimeError::new(
-                "parent execution graph lineage conflicts with its admitted Turn ingress",
-            ));
-        }
-    }
-    let orchestration_lineage = parent_lineage.or(ingress_lineage);
-    let orchestration_mission_id = orchestration_lineage.as_ref().and_then(|lineage| {
-        services
-            .task_aggregate_service()
-            .get(&lineage.root_task_id)
-            .ok()
-            .flatten()
-            .map(|task| task.mission_id)
-    });
-    let request =
-        crate::orchestration::collaboration_coordinator::compile_conversation_program_intent(
-            crate::orchestration::collaboration_coordinator::ConversationProgramIntent {
-                objective: objective.to_string(),
-                model_lease,
-                session_id: strategy.session_ref.clone(),
-                lineage: orchestration_lineage,
-                mission_id: orchestration_mission_id,
-                decision_id: strategy.decision_id.clone(),
-                decision_revision: strategy.revision,
-                decision_lease: strategy.decision_lease.clone(),
-                turn_ref: strategy.turn_ref.clone(),
-                requested_team_count: structured_team_count(understanding),
-                requires_fan_in: harness_contract::strategy::explicit_team_fan_in_required(
-                    objective,
-                ),
-                focus_count,
-                requests_multi_agent: understanding.requests_multi_agent,
-                requires_write: parent_requires_write,
-                requires_external_facts: understanding.requires_external_facts,
-                permission_ceiling: match permission_mode {
-                    crate::PermissionMode::WorkspaceWrite => {
-                        harness_contract::policy::PermissionMode::WorkspaceWrite
-                    }
-                    crate::PermissionMode::DangerFullAccess => {
-                        harness_contract::policy::PermissionMode::DangerFullAccess
-                    }
-                    _ => harness_contract::policy::PermissionMode::ReadOnly,
-                },
-                risk: format!("{:?}", understanding.risk).to_ascii_lowercase(),
-            },
-            services.workspace_root(),
-        );
-    let request = match request {
-        Ok(request) => request,
-        Err(error) => {
-            let downgrade_reason = format!("Team Program intent rejected by Coordinator: {error}");
-            runtime
-                .lock()
-                .await
-                .downgrade_turn_strategy(best_non_team_strategy(strategy), &downgrade_reason)?;
-            return Ok(false);
-        }
-    };
-    let parent = harness_contract::execution_graph::ExecutionParentBinding {
-        execution_id: parent_graph_id.to_string(),
-        node_id: parent_node_id.to_string(),
-    };
-    let team_started = std::time::Instant::now();
-    let cancellation = runtime.lock().await.cancellation_token();
-    if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
-        bus.emit(CowdEvent::ExecutionPhase {
-            status: harness_contract::projection::ExecutionLiveStatus::Thinking,
-            detail: Some("running selected team".to_string()),
-        });
-    }
-    let result = crate::orchestration::submit_runtime_orchestration_request_controlled(
-        request,
-        Some(&strategy.decision),
-        services,
-        Some(parent),
-        Some(cancellation),
-    )
-    .await;
-    let team_duration_ms = u64::try_from(team_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    if result.status != "completed"
-        || result
-            .evidence
-            .get("executed")
-            .and_then(serde_json::Value::as_bool)
-            != Some(true)
-    {
-        let committed_write = result
-            .evidence
-            .get("committed_write")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let child_executed = result
-            .evidence
-            .get("executed")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let degraded_receipt = child_executed.then(|| {
-            let mut receipt = result.model_receipt();
-            if let Some(receipt) = receipt.as_object_mut() {
-                receipt.insert(
-                    "decision_id".to_string(),
-                    serde_json::Value::String(strategy.decision_id.clone()),
-                );
-                receipt.insert(
-                    "collaboration_lease".to_string(),
-                    serde_json::Value::String(strategy.decision_lease.clone()),
-                );
-                receipt.insert("degraded".to_string(), serde_json::Value::Bool(true));
-                receipt.insert("parent_merge_count".to_string(), serde_json::json!(0));
-                receipt.insert(
-                    "parent_merge_status".to_string(),
-                    serde_json::Value::String("pending_parent_terminal".to_string()),
-                );
-                receipt.insert(
-                    "team_duration_ms".to_string(),
-                    serde_json::json!(team_duration_ms),
-                );
-            }
-            receipt
-        });
-        let fallback = best_non_team_strategy(strategy);
-        let runtime = runtime.lock().await;
-        let mut degraded_context_item = None;
-        if let Some(receipt) = degraded_receipt {
-            let mut item = ContextItem::new(
-                format!("runtime-team-degraded:{}", strategy.decision_id),
-                ContextSourceKind::Task,
-                ContextRole::Warning,
-                format!(
-                    "The selected Team did not reach a verified successful terminal, but its durable graph evidence must be preserved during downgrade.\n{}",
-                    serde_json::to_string(&receipt).unwrap_or_else(|_| "{}".to_string())
-                ),
-            );
-            item.authority = ContextAuthority::Tool;
-            item.visibility = ContextVisibility::Private;
-            item.evidence = result
-                .evidence
-                .get("graph_id")
-                .and_then(serde_json::Value::as_str)
-                .map(|graph_id| vec![format!("team_graph:{graph_id}")])
-                .unwrap_or_default();
-            runtime.record_turn_strategy_collaboration_receipt(receipt)?;
-            degraded_context_item = Some(item);
-        }
-        let team_failure = format!(
-            "selected Team start failed with status `{}`: {}",
-            result.status,
-            result.decision.validation_findings.join(", ")
-        );
-        if selected_team_failure_must_block_parent_replay(child_executed) {
-            // Once a Team graph has actually executed, its own retry and
-            // recovery contract is authoritative. Rebuilding the same
-            // semantic graph from the parent would repeat completed reads,
-            // duplicate provider work and, after a partial mutation, risk
-            // replaying side effects. Preserve the durable child evidence and
-            // terminate explicitly; a later user-directed repair turn can
-            // inspect that graph under a fresh authority boundary.
-            let terminal = format!(
-                "Team execution exhausted its bounded recovery; automatic parent-level Team replay was not started to avoid duplicating completed work or side effects. committed_write={committed_write}. {team_failure}. Retrieve the durable Team graph evidence before deciding whether a new repair turn is required."
-            );
-            drop(runtime);
-            let mut state = turn_state.lock().await;
-            state
-                .persistent_collaboration_context
-                .extend(degraded_context_item);
-            state.terminal_override = Some((GoalCompletion::Partial, terminal));
-            return Ok(true);
-        }
-        runtime
-            .downgrade_turn_strategy(fallback, &team_failure)
-            .map_err(|downgrade_error| {
-                RuntimeError::new(format!(
-                    "{team_failure}; safe fallback failed: {downgrade_error}"
-                ))
-            })?;
-        drop(runtime);
-        turn_state
-            .lock()
-            .await
-            .persistent_collaboration_context
-            .extend(degraded_context_item);
-        // A started-but-failed child is durable evidence, not a successful
-        // collaboration lease. The root turn may still use its one bounded
-        // explicit Team request to repair the goal without replaying any
-        // committed write (handled above).
-        return Ok(false);
-    }
-
-    let committed_write = result
-        .evidence
-        .get("committed_write")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let collaboration_graph_id = result
-        .evidence
-        .get("graph_id")
-        .and_then(serde_json::Value::as_str);
-    // A provider/tool receipt is useful evidence, but it is not the owner of
-    // the N-Team admission contract.  Re-read the durable collaboration graph
-    // and count the concrete Program instances that reached `Completed`.
-    // This prevents an incomplete or stale `team_ids` list from turning one
-    // finished Team into a false whole-program success.
-    let collaboration_program = collaboration_graph_id
-        .map(|graph_id| {
-            let graph = services
-                .graph_state_store()
-                .load(graph_id)
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            collaboration_program_progress_from_graph(&graph)
-        })
-        .transpose()?
-        .flatten();
-    let verified_team_ids = collaboration_program.as_ref().map_or_else(
-        || orchestration_receipt_team_ids(&result.model_receipt()),
-        |progress| {
-            progress
-                .completed_required_instance_ids
-                .iter()
-                .cloned()
-                .collect()
-        },
-    );
-    let required_program_team_count = collaboration_program.as_ref().map_or_else(
-        || {
-            if understanding.requests_multi_agent {
-                structured_team_count(understanding)
-            } else {
-                1
-            }
-        },
-        |progress| progress.required_team_count,
-    );
-    let mut receipt = result.model_receipt();
-    let child_usage = result.evidence.get("child_usage");
-    let child_metric = |name: &str| {
-        child_usage
-            .and_then(|usage| usage.get(name))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-    };
-    let child_input_tokens = child_metric("input_tokens");
-    let child_output_tokens = child_metric("output_tokens");
-    let child_cached_tokens = child_metric("cached_tokens");
-    let child_tool_calls = child_metric("tool_calls");
-    let child_duplicate_tool_calls = child_metric("duplicate_tool_calls");
-    let child_max_tool_concurrency_observed = child_metric("max_tool_concurrency_observed");
-    let child_parallel_tool_batches = child_metric("parallel_tool_batches");
-    let actual_speedup_ratio_bp = result
-        .execution
-        .pointer("/projection/work/actual_speedup_basis_points")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let mut child_write_attempt_paths = result
-        .evidence
-        .get("write_attempt_paths")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flat_map(|paths| paths.iter())
-        .filter_map(serde_json::Value::as_str)
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    child_write_attempt_paths.sort();
-    child_write_attempt_paths.dedup();
-    let child_write_scopes = child_write_attempt_paths
-        .iter()
-        .filter_map(|path| normalized_workspace_write_scope(path))
-        .collect::<BTreeSet<_>>();
-    let child_observed_evidence = team_receipt_observed_evidence(&result.evidence);
-    let required_write_scopes = turn_state
-        .lock()
-        .await
-        .required_workspace_write_scopes
-        .clone();
-    let parent_write_satisfied = write_obligation_satisfied(
-        parent_requires_write,
-        &required_write_scopes,
-        &child_observed_evidence,
-        committed_write,
-        services.path_identity_resolver(),
-    );
-    let parent_goal_satisfied = team_phase_satisfies_parent_goal(
-        required_program_team_count,
-        parent_requires_write,
-        parent_write_satisfied,
-        verified_team_ids.len(),
-    );
-    let child_execution_ids = result
-        .evidence
-        .get("graph_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|team_graph_id| services.graph_state_store().child_links(team_graph_id).ok())
-        .map(|links| {
-            links
-                .into_iter()
-                .map(|link| link.child_execution_id)
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    let child_strategy_events = services
-        .event_store()
-        .list_stream(&format!("session:{}", strategy.session_ref))
-        .unwrap_or_default();
-    let belongs_to_child = |event: &crate::DurableRuntimeEvent| {
-        event
-            .payload
-            .get("execution_graph_ref")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|graph_id| child_execution_ids.contains(graph_id))
-    };
-    let child_early_stopped = child_strategy_events
-        .iter()
-        .any(|event| event.kind == "runtime.strategy.early_stopped" && belongs_to_child(event));
-    let (
-        actual_evidence_overlap_bp,
-        allowed_evidence_overlap_bp,
-        evidence_overlap_observed,
-        evidence_overlap_exceeded,
-    ) = team_working_state_overlap_bp(&result.execution);
-    if let Some(receipt) = receipt.as_object_mut() {
-        receipt.insert(
-            "decision_id".to_string(),
-            serde_json::Value::String(strategy.decision_id.clone()),
-        );
-        receipt.insert(
-            "decision_revision".to_string(),
-            serde_json::json!(strategy.revision),
-        );
-        receipt.insert(
-            "collaboration_lease".to_string(),
-            serde_json::Value::String(strategy.decision_lease.clone()),
-        );
-        receipt.insert(
-            "parent_execution_ref".to_string(),
-            serde_json::Value::String(parent_graph_id.to_string()),
-        );
-        receipt.insert("parent_merge_count".to_string(), serde_json::json!(0));
-        receipt.insert(
-            "parent_merge_status".to_string(),
-            serde_json::Value::String("pending_parent_terminal".to_string()),
-        );
-        receipt.insert(
-            "team_duration_ms".to_string(),
-            serde_json::json!(team_duration_ms),
-        );
-        receipt.insert(
-            "child_input_tokens".to_string(),
-            serde_json::json!(child_input_tokens),
-        );
-        receipt.insert(
-            "child_output_tokens".to_string(),
-            serde_json::json!(child_output_tokens),
-        );
-        receipt.insert(
-            "child_cached_tokens".to_string(),
-            serde_json::json!(child_cached_tokens),
-        );
-        receipt.insert(
-            "child_tool_calls".to_string(),
-            serde_json::json!(child_tool_calls),
-        );
-        receipt.insert(
-            "evidence_overlap_bp".to_string(),
-            serde_json::json!(actual_evidence_overlap_bp),
-        );
-        receipt.insert(
-            "evidence_overlap_observed".to_string(),
-            serde_json::json!(evidence_overlap_observed),
-        );
-        receipt.insert(
-            "allowed_evidence_overlap_bp".to_string(),
-            serde_json::json!(allowed_evidence_overlap_bp),
-        );
-        receipt.insert(
-            "evidence_overlap_exceeded".to_string(),
-            serde_json::json!(evidence_overlap_exceeded),
-        );
-        receipt.insert(
-            "duplicate_tool_calls".to_string(),
-            serde_json::json!(child_duplicate_tool_calls),
-        );
-        receipt.insert(
-            "max_tool_concurrency_observed".to_string(),
-            serde_json::json!(child_max_tool_concurrency_observed),
-        );
-        receipt.insert(
-            "parallel_tool_batches".to_string(),
-            serde_json::json!(child_parallel_tool_batches),
-        );
-        receipt.insert(
-            "actual_speedup_ratio_bp".to_string(),
-            serde_json::json!(actual_speedup_ratio_bp),
-        );
-        receipt.insert(
-            "write_attempt_paths".to_string(),
-            serde_json::json!(child_write_attempt_paths),
-        );
-        // `RuntimeOrchestrationResult` has already verified materialized Team
-        // working state against the durable child graph. Preserve that fact in
-        // the parent receipt so the turn outcome and every Surface project the
-        // same completed-state truth instead of reverting to the default false.
-        receipt.insert(
-            "working_state_verified".to_string(),
-            serde_json::json!(result
-                .evidence
-                .get("working_state_verified")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)),
-        );
-        receipt.insert(
-            "replayed_team_request".to_string(),
-            serde_json::json!(result
-                .evidence
-                .get("reused")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)),
-        );
-        receipt.insert(
-            "parent_requires_write".to_string(),
-            serde_json::json!(parent_requires_write),
-        );
-        receipt.insert(
-            "committed_write".to_string(),
-            serde_json::json!(committed_write),
-        );
-        receipt.insert(
-            "parent_goal_satisfied".to_string(),
-            serde_json::json!(parent_goal_satisfied),
-        );
-        receipt.insert(
-            "verified_team_executions".to_string(),
-            serde_json::json!(verified_team_ids.len()),
-        );
-        if let Some(progress) = collaboration_program.as_ref() {
-            receipt.insert(
-                "collaboration_program".to_string(),
-                serde_json::to_value(progress).map_err(|error| {
-                    RuntimeError::new(format!(
-                        "encode durable collaboration program progress: {error}"
-                    ))
-                })?,
-            );
-        }
-    }
-    let receipt_text = serde_json::to_string(&receipt)
-        .map_err(|error| RuntimeError::new(format!("encode Team receipt: {error}")))?;
-    let mut item = ContextItem::new(
-        format!("runtime-team-receipt:{}", strategy.decision_id),
-        ContextSourceKind::Task,
-        ContextRole::Evidence,
-        if parent_goal_satisfied {
-            format!(
-                "Runtime already executed the selected Team and verified that its receipt satisfies the parent goal. Keep this checked collaboration result available throughout the current parent Turn; do not start another Team for the same decision lease.\n{receipt_text}"
-            )
-        } else {
-            format!(
-                "Runtime executed one bounded Team phase, but its receipt does not satisfy the complete parent goal. Preserve and use this checked evidence, then continue the remaining acceptance work. A distinct follow-up Team may be started when the user requested another Team; never replay this decision lease.\n{receipt_text}"
-            )
-        },
-    );
-    item.authority = ContextAuthority::Tool;
-    item.visibility = ContextVisibility::Private;
-    item.evidence = vec![
-        format!("strategy_decision:{}", strategy.decision_id),
-        format!("execution_graph:{parent_graph_id}"),
-        result
-            .evidence
-            .get("graph_id")
-            .and_then(serde_json::Value::as_str)
-            .map_or_else(
-                || "team_graph:unknown".to_string(),
-                |graph_id| format!("team_graph:{graph_id}"),
-            ),
-    ];
-    // A completed collaboration Program is durable execution truth even when
-    // its child Team has no reusable user-facing presentation (for example a
-    // mechanical/review Team with no terminal candidate).  In that case the
-    // parent gets one normal synthesis pass over the preserved receipts; it
-    // must not fail the whole Turn or pretend that a missing child prose
-    // answer is a failed Team.  A verified child presentation can still
-    // short-circuit the parent narrator below.
-    let terminal_summary = verified_team_terminal_summary(&receipt);
-    let runtime = runtime.lock().await;
-    if child_early_stopped {
-        runtime.record_turn_strategy_early_stop(
-            "one or more bounded Team children stopped after consecutive low-novelty evidence batches",
-        )?;
-    }
-    runtime.record_turn_strategy_collaboration_receipt(receipt)?;
-    // Never await the turn-state mutex while retaining the ConversationRuntime
-    // mutex; later graph executors acquire these owners in the opposite phase.
-    drop(runtime);
-    {
-        let mut state = turn_state.lock().await;
-        state.verified_team_ids.extend(verified_team_ids);
-        state.collaboration_committed_write |= committed_write;
-        state
-            .committed_workspace_write_scopes
-            .extend(child_write_scopes);
-        for evidence in child_observed_evidence {
-            if !state
-                .committed_workspace_observed_evidence
-                .contains(&evidence)
-            {
-                state.committed_workspace_observed_evidence.push(evidence);
-            }
-        }
-        if parent_goal_satisfied {
-            // The typed child envelopes and presentations already prove the
-            // requested Team work. Publish that deterministic carrier as the
-            // parent terminal instead of asking another model to reconstruct
-            // evidence from a JSON-encoded tool result. This removes both the
-            // brittle serialization dependency and the duplicate narrator
-            // path that could contradict completed child work.
-            if let Some(terminal_summary) = terminal_summary {
-                state.terminal_override = Some((GoalCompletion::Satisfied, terminal_summary));
-            }
-        }
-        state.persistent_collaboration_context.push(item);
-    }
-    Ok(true)
+    return Ok(false);
 }
 
+#[cfg(test)]
 fn selected_team_failure_must_block_parent_replay(child_executed: bool) -> bool {
     child_executed
 }
@@ -2984,6 +2416,7 @@ fn team_phase_satisfies_parent_goal(
 /// all lifecycle and result truth; this compact carrier is only used to make
 /// a root receipt and Surface answer the precise question “which required
 /// Teams completed?” without parsing labels, model JSON or child summaries.
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 struct CollaborationProgramProgress {
     program_id: String,
@@ -2994,6 +2427,7 @@ struct CollaborationProgramProgress {
     instances: Vec<CollaborationProgramInstanceProgress>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize)]
 struct CollaborationProgramInstanceProgress {
     instance_id: String,
@@ -3005,6 +2439,7 @@ struct CollaborationProgramInstanceProgress {
     failure_kind: Option<String>,
 }
 
+#[cfg(test)]
 fn collaboration_program_progress_from_graph(
     graph: &harness_contract::execution_graph::ExecutionGraph,
 ) -> Result<Option<CollaborationProgramProgress>, RuntimeError> {
@@ -3418,22 +2853,6 @@ fn parent_merge_actuals(
     )
 }
 
-fn team_working_state_overlap_bp(execution: &serde_json::Value) -> (u16, u16, bool, bool) {
-    execution
-        .get("focus_overlap_assessment")
-        .and_then(|value| {
-            serde_json::from_value::<crate::FocusOverlapAssessment>(value.clone()).ok()
-        })
-        .map_or((0, 0, false, false), |assessment| {
-            (
-                assessment.maximum_overlap_bp,
-                assessment.allowed_overlap_bp,
-                assessment.observed,
-                assessment.exceeded,
-            )
-        })
-}
-
 fn selected_strategy_focus_count(
     strategy: &crate::execution_core::TurnStrategyDecisionState,
 ) -> usize {
@@ -3724,6 +3143,14 @@ struct TurnGraphState {
     collaboration_started: bool,
     verified_team_ids: BTreeSet<String>,
     collaboration_committed_write: bool,
+    /// A root Turn that was explicitly required to collaborate but exhausted
+    /// its one control-plane repair records this durable receipt only after
+    /// the model node itself commits. It is intentionally distinct from a
+    /// collaboration Program receipt: no Program was admitted.
+    pending_root_control_plane_receipt: Option<String>,
+    /// A root collaboration requirement becomes durable with the next model
+    /// node commit, before any proposal receipt can be consumed.
+    pending_root_control_plane_requirement: Option<u8>,
     root_write_replans: u8,
     root_language_replan_attempted: bool,
     nested_orchestration_forbidden: bool,
@@ -4467,16 +3894,21 @@ where
             )
         };
         let mut runtime = self.runtime.lock().await;
-        let orchestration_gate_active = {
+        let required_control_plane_team_count = {
             let state = self.state.lock().await;
-            !state.execution_role.is_delegated_leaf()
-                && state
-                    .task_understanding
-                    .as_ref()
-                    .map_or(false, |value| value.required_team_count > 0)
-                && state.verified_team_ids.is_empty()
+            if state.execution_role.is_delegated_leaf() || !state.verified_team_ids.is_empty() {
+                None
+            } else {
+                state.task_understanding.as_ref().and_then(|value| {
+                    (value.required_team_count > 0).then_some(value.required_team_count)
+                })
+            }
         };
-        if orchestration_gate_active {
+        if let Some(required_team_count) = required_control_plane_team_count {
+            self.state
+                .lock()
+                .await
+                .pending_root_control_plane_requirement = Some(required_team_count);
             runtime.require_next_model_orchestration_only();
         }
         for item in pending_next_model_context {
@@ -5337,7 +4769,12 @@ where
                         if verified_team_executions < required_team_executions {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            if state.team_orchestration_requests < 2 {
+                            // A required control-plane proposal gets exactly
+                            // one Runtime-owned repair. Repeating the same
+                            // root prompt a second time only burns another
+                            // model round and cannot create a durable Program
+                            // without the native receipt.
+                            if state.team_orchestration_requests < 1 {
                                 state.team_orchestration_requests =
                                     state.team_orchestration_requests.saturating_add(1);
                                 let catalog_hint = self
@@ -5364,7 +4801,7 @@ where
                                             .collect::<Vec<_>>()
                                             .join("、");
                                         format!(
-                                            "{}@{}（名称：{}；角色：{}）",
+                                            "{}（revision {}；名称：{}；角色：{}）",
                                             entry.revision_ref.template_id.as_str(),
                                             entry.revision_ref.revision,
                                             entry.name,
@@ -5374,7 +4811,7 @@ where
                                     .collect::<Vec<_>>()
                                     .join("；");
                                 let reason = format!(
-                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请继续自行编排：先调用 runtime_capabilities(detail=team_templates)；若 catalog 中已有与用户要求匹配的可复用模板，复制精确 template_id 并调用 runtime_orchestrate(operation=propose) 启动团队；若用户要求定制角色，直接调用 runtime_orchestrate(operation=propose)，提交恰好一个省略 template 的 Team 节点和 template_proposal，由 Runtime 绑定当前 turn 的不可变快照后启动。只有用户明确要求发布或复用模板时，才调用 runtime_orchestrate(operation=propose_template)。禁止只输出总结文本，继续执行（尝试 {}）。",
+                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请继续自行编排：先调用 runtime_capabilities(detail=team_templates)；若 catalog 中已有与用户要求匹配的可复用模板，复制精确 template_id 并调用 runtime_orchestrate(operation=propose) 启动团队。对 model-assisted Team，focuses 是该 Team 的精确激活角色集合：每个 focus.role_id 必须来自该模板；多角色模板必须显式列出一个或多个焦点（需要运行整套模板时就列出全部角色）；已选角色必须包含模板依赖的两端。不要把“一个角色的 Team”误写成“含该角色的多角色模板并期待其他角色自动忽略”。若用户要求定制角色，直接调用 runtime_orchestrate(operation=propose)，提交恰好一个省略 template 的 Team 节点和 template_proposal，由 Runtime 绑定当前 turn 的不可变快照后启动。只有用户明确要求发布或复用模板时，才调用 runtime_orchestrate(operation=propose_template)。禁止只输出总结文本，继续执行（尝试 {}）。",
                                     if catalog_hint.is_empty() {
                                         String::new()
                                     } else {
@@ -5415,8 +4852,9 @@ where
                                 )];
                             }
                             let reason = format!(
-                                "explicit Team acceptance is incomplete: verified {verified_team_executions} of {required_team_executions} required Team execution(s)"
+                                "missing_control_plane_proposal: explicit Team acceptance is incomplete after one required control-plane repair; verified {verified_team_executions} of {required_team_executions} required Team execution(s)"
                             );
+                            state.pending_root_control_plane_receipt = Some(reason.clone());
                             state.terminal_override =
                                 Some((GoalCompletion::Partial, reason.clone()));
                             model_intervention =
@@ -6490,11 +5928,19 @@ where
                         );
                     }
                     let post_receipt_failure = state.tool_receipts_observed > 0;
-                    let protocol_attempt = (protocol_failure && !post_receipt_failure).then(|| {
-                        state.provider_protocol_recovery_attempts =
-                            state.provider_protocol_recovery_attempts.saturating_add(1);
-                        state.provider_protocol_recovery_attempts
-                    });
+                    // A known deferred schema is a Runtime-owned replan, not
+                    // a provider failure after a successful side effect.  A
+                    // managed Agent commonly has its first source receipt
+                    // before requesting its required escalation; synthesizing
+                    // at that point discards the one governed retry and makes
+                    // the terminal obligation impossible to satisfy.
+                    let protocol_attempt = (protocol_failure
+                        && (!post_receipt_failure || tool_exposure_miss))
+                        .then(|| {
+                            state.provider_protocol_recovery_attempts =
+                                state.provider_protocol_recovery_attempts.saturating_add(1);
+                            state.provider_protocol_recovery_attempts
+                        });
                     let identity = runtime_observation_identity(&self.services, &state, ticket);
                     (
                         state.goal_id.clone(),
@@ -6522,7 +5968,7 @@ where
                     observation.cost_delta.cached_tokens = u64::from(usage.cache_read_input_tokens);
                 }
                 observation.failure_class = Some(ObservationFailureClass::Provider);
-                let intervention = if post_receipt_failure {
+                let intervention = if post_receipt_failure && !tool_exposure_miss {
                     let already_synthesizing =
                         clean_terminal_synthesis || clean_terminal_synthesis_attempted;
                     // A tool-protocol violation inside the zero-tool synthesis
@@ -6755,13 +6201,25 @@ where
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
         tracing::debug!(node_id = %ticket.node_id, "publishing committed model transcript");
-        let messages = self
-            .state
-            .lock()
-            .await
-            .pending_transcript
-            .remove(&ticket.node_id)
-            .unwrap_or_default();
+        let (
+            messages,
+            required_control_plane_team_count,
+            missing_control_plane_proposal,
+            session_id,
+            turn_id,
+        ) = {
+            let mut state = self.state.lock().await;
+            (
+                state
+                    .pending_transcript
+                    .remove(&ticket.node_id)
+                    .unwrap_or_default(),
+                state.pending_root_control_plane_requirement.take(),
+                state.pending_root_control_plane_receipt.take(),
+                state.session_id.clone(),
+                state.turn_id.clone(),
+            )
+        };
         tracing::debug!(node_id = %ticket.node_id, message_count = messages.len(), "model transcript staged for publication");
         self.runtime
             .lock()
@@ -6769,6 +6227,74 @@ where
             .session_mut_async()
             .await
             .extend_messages(messages);
+        if let Some(required_team_count) = required_control_plane_team_count {
+            self.services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: format!("session:{session_id}"),
+                    scope: crate::RuntimeEventScope::Session,
+                    kind: "runtime.control_plane.required".to_string(),
+                    status: Some("waiting".to_string()),
+                    actor: Some("conversation_runtime.root_control_plane".to_string()),
+                    refs: vec![
+                        crate::RuntimeEventRef {
+                            kind: "execution_graph".to_string(),
+                            id: ticket.graph_id.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "execution_node".to_string(),
+                            id: ticket.node_id.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "turn".to_string(),
+                            id: turn_id.clone(),
+                        },
+                    ],
+                    payload: serde_json::json!({
+                        "required_team_count": required_team_count,
+                        "required_tool_choice": "runtime_orchestrate",
+                        "program_admitted": false,
+                    }),
+                })
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("persist root control-plane requirement: {error}"),
+                })?;
+        }
+        if let Some(reason) = missing_control_plane_proposal {
+            self.services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: format!("session:{session_id}"),
+                    scope: crate::RuntimeEventScope::Session,
+                    kind: "runtime.control_plane.missing_proposal".to_string(),
+                    status: Some("blocked".to_string()),
+                    actor: Some("conversation_runtime.root_control_plane".to_string()),
+                    refs: vec![
+                        crate::RuntimeEventRef {
+                            kind: "execution_graph".to_string(),
+                            id: ticket.graph_id.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "execution_node".to_string(),
+                            id: ticket.node_id.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "turn".to_string(),
+                            id: turn_id,
+                        },
+                    ],
+                    payload: serde_json::json!({
+                        "reason": reason,
+                        "repair_attempts": 1_u8,
+                        "program_admitted": false,
+                    }),
+                })
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("persist missing root control-plane proposal receipt: {error}"),
+                })?;
+        }
         tracing::debug!(node_id = %ticket.node_id, "committed model transcript published");
         Ok(())
     }
@@ -12165,6 +11691,39 @@ fn remove_tool_call_from_latest_assistant(
 /// dependencies are represented by this order and removed from the inner
 /// batch scheduler.
 fn tool_batches_for_turn(calls: &[ModelToolCall]) -> Result<Vec<Vec<ModelToolCall>>, String> {
+    // An escalation is guarded by a Runtime receipt, rather than a model
+    // assertion that it has already inspected source.  Providers commonly
+    // emit a first read/glob and the required escalation in the same frame;
+    // executing that frame as one parallel ToolBatch races the receipt guard
+    // and consumes the Agent's only requested escalation.  Persist the
+    // source batch first and make the escalation its own successor node.
+    //
+    // This is deliberately a scheduling constraint, not an inferred model
+    // dependency: the delegated tool itself retains the safe-checkpoint
+    // validation and still rejects an escalation when there is no actual
+    // prior evidence receipt.
+    let (managed_escalation, other): (Vec<_>, Vec<_>) = calls.iter().cloned().partition(|call| {
+        call.name
+            .eq_ignore_ascii_case("request_collaboration_escalation")
+    });
+    if !managed_escalation.is_empty() && !other.is_empty() {
+        let mut batches = tool_batches_for_turn(&other)?;
+        let escalation_ids = managed_escalation
+            .iter()
+            .map(|call| call.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut escalation = managed_escalation;
+        for call in &mut escalation {
+            // Dependencies on the completed evidence batch are represented by
+            // the durable graph edge between batches; retain only dependencies
+            // between same-batch escalation calls for the leaf scheduler.
+            call.depends_on
+                .retain(|dependency| escalation_ids.contains(dependency));
+        }
+        batches.push(escalation);
+        return Ok(batches);
+    }
+
     let (runtime_control, regular): (Vec<_>, Vec<_>) = calls.iter().cloned().partition(|call| {
         call.name
             .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
@@ -14876,11 +14435,12 @@ mod tests {
     }
 
     #[test]
-    fn host_admission_materializes_every_explicitly_required_team_before_parent_model() {
-        // This deliberately exercises two full nested Team graphs with their
-        // durable snapshots. The test harness's default worker stack is too
-        // small for the production-shaped async future; use a bounded
-        // dedicated stack rather than relying on an ambient RUST_MIN_STACK.
+    fn host_does_not_materialize_required_teams_before_root_control_plane_receipt() {
+        // The model fixture returns prose instead of the required native
+        // control-plane action.  This must never be translated into a
+        // heuristic Program merely because its user input mentioned two
+        // Teams. Use a bounded stack because the production-shaped root graph
+        // still runs its ordinary terminal/recovery machinery.
         std::thread::Builder::new()
             .name("two-team-host-admission-test".to_string())
             .stack_size(32 * 1024 * 1024)
@@ -14895,11 +14455,9 @@ mod tests {
         for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
             std::fs::create_dir_all(workspace.join(relative)).expect("bounded workspace scope");
         }
-        // The production admission path deliberately derives typed Team
-        // authority from materialized workspace resources; empty directories
-        // are not authority. Keep this fixture production-shaped so it proves
-        // that two explicitly required Teams are actually admitted rather
-        // than merely testing the model's intent parser.
+        // Keep a production-shaped workspace: this proves that the absence of
+        // a model proposal, rather than an absent resource, prevents Program
+        // admission.
         for relative in [
             "crates/runtime/src.rs",
             "crates/gateway/src.rs",
@@ -14973,98 +14531,61 @@ mod tests {
             .iter()
             .find(|event| event.kind == "runtime.strategy.outcome")
             .expect("outcome event");
-        if outcome
-            .payload
-            .get("status")
-            .and_then(serde_json::Value::as_str)
-            != Some("completed")
-        {
-            if let Some(graph_id) = outcome
-                .payload
-                .pointer("/collaboration_receipt/evidence/graph_id")
-                .and_then(serde_json::Value::as_str)
-            {
-                let graph = services
-                    .graph_state_store()
-                    .load(graph_id)
-                    .expect("load failed collaboration graph for diagnostic");
-                eprintln!(
-                    "collaboration graph diagnostic: {:?}",
-                    graph
-                        .nodes
-                        .iter()
-                        .map(|node| (
-                            &node.id,
-                            graph.node_statuses.get(&node.id),
-                            graph.node_results.get(&node.id),
-                        ))
-                        .collect::<Vec<_>>()
-                );
-            }
-        }
         assert_eq!(
             outcome
                 .payload
                 .get("status")
                 .and_then(serde_json::Value::as_str),
-            Some("completed"),
-            "an admitted Team must run before the parent model and produce a durable terminal outcome"
+            Some("partial"),
+            "a prose-only root response must be an honest incomplete result, never a heuristic Team admission"
         );
         assert_eq!(
             outcome
                 .payload
-                .pointer("/collaboration_receipt/verified_team_executions")
-                .and_then(serde_json::Value::as_u64),
-            Some(2),
-            "the terminal strategy receipt must prove that both required Team instances completed"
+                .get("collaboration_receipt")
+                .filter(|value| !value.is_null()),
+            None,
+            "without runtime_orchestrate there is no durable collaboration receipt"
         );
-        let collaboration_graph_id = outcome
-            .payload
-            .pointer("/collaboration_receipt/evidence/graph_id")
-            .and_then(serde_json::Value::as_str)
-            .expect("terminal receipt must retain its collaboration graph identity");
-        let collaboration_graph = services
-            .graph_state_store()
-            .load(collaboration_graph_id)
-            .expect("load durable collaboration graph");
-        let program = collaboration_graph
-            .orchestration
-            .and_then(|metadata| metadata.collaboration_program)
-            .expect("every Team proposal must persist a collaboration program");
-        assert_eq!(program.required_team_count, 2);
-        assert_eq!(program.team_instances.len(), 2);
-        assert!(program
-            .team_instances
+        let required_control_plane = events
             .iter()
-            .all(|team| team.semantic_node_id.starts_with("collaboration-")));
-        assert_eq!(program.semantic_node_instances.len(), 2);
-        assert!(program
-            .semantic_node_instances
-            .values()
-            .flatten()
-            .all(|node_id| collaboration_graph
-                .nodes
-                .iter()
-                .any(|node| node.id == *node_id)));
+            .find(|event| event.kind == "runtime.control_plane.required")
+            .expect("a required root control-plane state must be durable");
+        assert_eq!(required_control_plane.status.as_deref(), Some("waiting"));
         assert_eq!(
-            outcome
+            required_control_plane
                 .payload
-                .pointer("/collaboration_receipt/collaboration_program/completed_required_team_count")
+                .get("required_team_count")
                 .and_then(serde_json::Value::as_u64),
-            Some(2),
-            "the root receipt must derive completion from durable Program node status, not a provider string list"
+            Some(2)
         );
         assert_eq!(
-            outcome
+            required_control_plane
                 .payload
-                .pointer("/collaboration_receipt/collaboration_program/instances")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len),
-            Some(2),
+                .get("required_tool_choice")
+                .and_then(serde_json::Value::as_str),
+            Some("runtime_orchestrate")
+        );
+        let missing_proposal = events
+            .iter()
+            .find(|event| event.kind == "runtime.control_plane.missing_proposal")
+            .expect("one failed root proposal repair must leave a durable receipt");
+        assert_eq!(missing_proposal.status.as_deref(), Some("blocked"));
+        assert_eq!(
+            missing_proposal
+                .payload
+                .get("program_admitted")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "a missing proposal must never materialize a hidden Program"
         );
         assert!(
-            program.edges.is_empty(),
-            "independent required Team workstreams must not acquire a synthetic serial handoff"
+            missing_proposal
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|reason| reason.contains("missing_control_plane_proposal")),
+            "receipt must distinguish the root control-plane failure from a Team failure"
         );
         assert!(
             events
@@ -16817,6 +16338,33 @@ mod tests {
             vec!["read:Cargo.toml"]
         );
         assert!(resource_scopes_for_tool_calls(&batches[1]).is_empty());
+    }
+
+    #[test]
+    fn managed_agent_escalation_runs_after_its_source_evidence_batch() {
+        let calls = vec![
+            ModelToolCall {
+                id: "source".into(),
+                name: "read_file".into(),
+                input: r#"{\"path\":\"crates/runtime/src/lib.rs\"}"#.into(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "escalate".into(),
+                name: "request_collaboration_escalation".into(),
+                input: r#"{\"reason\":\"independent verification\",\"requested_add_team\":{}}"#
+                    .into(),
+                // Provider dependency declarations are optional and cannot be
+                // relied on for this Runtime-owned receipt fence.
+                depends_on: Vec::new(),
+            },
+        ];
+
+        let batches = tool_batches_for_turn(&calls).expect("batches");
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0][0].name, "read_file");
+        assert_eq!(batches[1][0].name, "request_collaboration_escalation");
+        assert!(batches[1][0].depends_on.is_empty());
     }
 
     #[test]

@@ -4928,6 +4928,7 @@ impl RuntimeServices {
                 evidence_obligations: Vec::new(),
             },
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: scenario.acceptance.clone(),
             constraints: vec![
                 "evolution_evaluation:isolation_required".to_string(),
@@ -6149,6 +6150,7 @@ impl RuntimeServices {
                         evidence_obligations: Vec::new(),
                     },
                     output_acceptance: acceptance_contract,
+                    requires_managed_collaboration_escalation: false,
                     acceptance: definition.acceptance.clone(),
                     constraints: vec![
                         format!(
@@ -6332,6 +6334,7 @@ impl RuntimeServices {
                     role_display_overrides: Vec::new(),
                     cardinality_overrides: Vec::new(),
                     focus_partition_plans: Vec::new(),
+                    requires_managed_collaboration_escalation: false,
                     permission_ceiling: definition.permission_ceiling.clone(),
                     model_lease: definition.model_lease.clone(),
                     execution_budget: crate::team_instantiation::bounded_parent_execution_budget(
@@ -7085,6 +7088,7 @@ fn evolution_team_request(
         role_display_overrides: Vec::new(),
         cardinality_overrides: Vec::new(),
         focus_partition_plans: Vec::new(),
+        requires_managed_collaboration_escalation: false,
         permission_ceiling: scenario.permission_ceiling.clone(),
         model_lease: scenario.model_lease.clone(),
         execution_budget: crate::team_instantiation::bounded_parent_execution_budget(
@@ -9213,6 +9217,7 @@ mod tests {
                 evidence_obligations: Vec::new(),
             },
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: vec!["completed".into()],
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -9386,6 +9391,7 @@ mod tests {
                         scopes: vec![format!("read:binding-domain-{index}")],
                     },
                 }],
+                requires_managed_collaboration_escalation: false,
                 acceptance: vec!["evidence".to_string()],
                 constraints: Vec::new(),
                 context_refs: Vec::new(),
@@ -10291,6 +10297,7 @@ mod tests {
             role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             permission_ceiling: if template_id == "cowd/execute-review" {
                 harness_contract::policy::PermissionMode::WorkspaceWrite
             } else {

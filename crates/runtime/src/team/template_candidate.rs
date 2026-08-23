@@ -235,7 +235,7 @@ pub(crate) fn normalize_template_proposal(
         value["role_display_names"] = serde_json::json!(normalized);
     }
     if let Some(fields) = value.get("result_fields").cloned() {
-        let normalized = match fields {
+        let mut normalized = match fields {
             serde_json::Value::String(raw) => serde_json::json!([raw]),
             serde_json::Value::Object(map) => {
                 serde_json::json!(map.keys().cloned().collect::<Vec<_>>())
@@ -248,6 +248,20 @@ pub(crate) fn normalize_template_proposal(
                 ))
             }
         };
+        // Candidate templates always compile to a synthesis-required Team.
+        // Keep any model-authored result fields, but make the corresponding
+        // immutable result contract valid before it reaches the compiler.
+        // (An omitted field list already receives this default below.)
+        let result_fields = normalized
+            .as_array_mut()
+            .expect("result_fields normalization always produces an array");
+        if !result_fields
+            .iter()
+            .any(|field| field.as_str() == Some("summary"))
+        {
+            result_fields.insert(0, serde_json::json!("summary"));
+            notes.push("added required synthesis result field `summary`".to_string());
+        }
         value["result_fields"] = normalized;
     }
     normalize_dependencies(value, &mut notes)?;
@@ -1728,6 +1742,30 @@ mod tests {
         let mut value = serde_json::json!(42);
         let error = normalize_template_proposal(&mut value).expect_err("number must error");
         assert!(error.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn normalize_template_proposal_adds_summary_to_explicit_result_fields() {
+        let mut value = serde_json::json!({
+            "template_id": "cowd/summary-contract",
+            "name": "Summary contract",
+            "roles": [{
+                "role_id": "researcher",
+                "responsibility": "Gather evidence",
+                "behavior": "terminal, evidence"
+            }],
+            "result_fields": ["evidence", "risks"]
+        });
+
+        let notes = normalize_template_proposal(&mut value).expect("normalizes");
+
+        assert_eq!(
+            value["result_fields"],
+            serde_json::json!(["summary", "evidence", "risks"])
+        );
+        assert!(notes
+            .iter()
+            .any(|note| note == "added required synthesis result field `summary`"));
     }
 
     #[test]

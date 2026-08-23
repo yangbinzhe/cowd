@@ -2,20 +2,28 @@
 set -euo pipefail
 
 # Run the deep-real Harness lane through an isolated, short-lived Gateway.
-# The Qwen credential stays in DASHSCOPE_API_KEY; the generated config holds
-# only the explicit env: reference understood by provider::ProviderClient.
+#
+# The evaluated route is resolved from the installed Cowd configuration. The
+# isolated Gateway receives a minimal copy of that route, but never a literal
+# credential. This prevents a scenario from silently testing a different
+# provider from the interactive Gateway.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CALLER_HOME="$HOME"
 CARGO_HOME_DIR="${CARGO_HOME:-$CALLER_HOME/.cargo}"
 RUSTUP_HOME_DIR="${RUSTUP_HOME:-$CALLER_HOME/.rustup}"
-MODEL="${COWD_EVAL_MODEL:-qwen3.7-plus}"
+SOURCE_CONFIG_HOME="${COWD_EVAL_SOURCE_CONFIG_HOME:-${COWD_CONFIG_HOME:-$CALLER_HOME/.cowd}}"
+SOURCE_CONFIG_FILE="$SOURCE_CONFIG_HOME/config.yaml"
+SOURCE_MODELS_FILE="$SOURCE_CONFIG_HOME/models.yaml"
+MODEL="${COWD_EVAL_MODEL:-}"
 BIN="${COWD_BIN:-$ROOT/target/debug/cowd}"
 PORT="${COWD_EVAL_GATEWAY_PORT:-18657}"
 BASE_URL="http://127.0.0.1:$PORT"
 TOKEN="harness-eval-real-qwen-${RANDOM}-${RANDOM}"
 RUN_ROOT="$(mktemp -d /tmp/cowd-real-qwen-gateway.XXXXXX)"
-EVIDENCE_ROOT="${COWD_AI_HARNESS_REPORT_DIR:-$(mktemp -d /tmp/cowd-real-qwen-evidence.XXXXXX)}"
+# Keep evidence under ignored build artifacts by default so a matching run can
+# be reused. A caller may choose another durable evidence root explicitly.
+EVIDENCE_ROOT="${COWD_AI_HARNESS_REPORT_DIR:-$ROOT/target/acceptance/real-qwen}"
 CONFIG_HOME="$RUN_ROOT/config"
 ISOLATED_HOME="$RUN_ROOT/home"
 # Evaluation must inspect the actual source tree. Isolation applies to the
@@ -24,6 +32,12 @@ ISOLATED_HOME="$RUN_ROOT/home"
 WORKSPACE="$ROOT"
 GATEWAY_LOG="$RUN_ROOT/gateway.log"
 GATEWAY_PID=""
+PROVIDER_ID=""
+PROVIDER_BASE_URL=""
+PROVIDER_PROTOCOL=""
+PROVIDER_CREDENTIAL=""
+STAGED_CREDENTIAL_REF=""
+STAGED_CREDENTIAL_ENV=""
 
 cleanup() {
   local status=$?
@@ -40,12 +54,124 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[[ -n "${DASHSCOPE_API_KEY:-}" ]] || {
-  echo 'DASHSCOPE_API_KEY must be set for the real Qwen evaluation.' >&2
-  exit 2
+yaml_model_field() {
+  local file="$1"
+  local model="$2"
+  local field="$3"
+  awk -v target="$model" -v key="$field" '
+    function scalar(line, pos, value) {
+      pos = index(line, ":")
+      value = substr(line, pos + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      sub(/^\047/, "", value); sub(/\047$/, "", value)
+      sub(/^\"/, "", value); sub(/\"$/, "", value)
+      return value
+    }
+    $0 ~ "^[[:space:]]*" target ":[[:space:]]*$" { matched = 1; next }
+    matched && $0 ~ "^[[:space:]]{2}[^[:space:]]" { exit }
+    matched && $0 ~ "^[[:space:]]{4}" key ":[[:space:]]*" { print scalar($0); exit }
+  ' "$file"
 }
+
+yaml_provider_field() {
+  local file="$1"
+  local provider="$2"
+  local field="$3"
+  awk -v target="$provider" -v key="$field" '
+    function scalar(line, pos, value) {
+      pos = index(line, ":")
+      value = substr(line, pos + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+#.*$/, "", value)
+      sub(/^\047/, "", value); sub(/\047$/, "", value)
+      sub(/^\"/, "", value); sub(/\"$/, "", value)
+      return value
+    }
+    /^providers:[[:space:]]*$/ { providers = 1; next }
+    providers && $0 ~ "^[[:space:]]{2}" target ":[[:space:]]*$" { matched = 1; next }
+    providers && matched && $0 ~ "^[^[:space:]]" { exit }
+    providers && matched && $0 ~ "^[[:space:]]{2}[^[:space:]]" { exit }
+    providers && matched && $0 ~ "^[[:space:]]{4}" key ":[[:space:]]*" { print scalar($0); exit }
+  ' "$file"
+}
+
+resolve_installed_route() {
+  [[ -f "$SOURCE_CONFIG_FILE" && -f "$SOURCE_MODELS_FILE" ]] || {
+    echo "real-model evaluation requires ${SOURCE_CONFIG_FILE} and ${SOURCE_MODELS_FILE}" >&2
+    exit 2
+  }
+  if [[ -z "$MODEL" ]]; then
+    MODEL="$(awk '/^model:[[:space:]]*/ { value = $0; sub(/^model:[[:space:]]*/, "", value); sub(/[[:space:]]+#.*$/, "", value); gsub(/^\"|\"$/, "", value); gsub(/^\047|\047$/, "", value); print value; exit }' "$SOURCE_CONFIG_FILE")"
+  fi
+  [[ -n "$MODEL" ]] || {
+    echo "real-model evaluation cannot resolve the configured default model" >&2
+    exit 2
+  }
+  PROVIDER_ID="$(yaml_model_field "$SOURCE_MODELS_FILE" "$MODEL" provider)"
+  [[ -n "$PROVIDER_ID" ]] || {
+    echo "model ${MODEL} has no provider mapping in ${SOURCE_MODELS_FILE}" >&2
+    exit 2
+  }
+  PROVIDER_BASE_URL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" base_url)"
+  PROVIDER_PROTOCOL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" protocol)"
+  PROVIDER_CREDENTIAL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" api_key)"
+  [[ -n "$PROVIDER_BASE_URL" && -n "$PROVIDER_CREDENTIAL" ]] || {
+    echo "provider ${PROVIDER_ID} must declare base_url and api_key in ${SOURCE_CONFIG_FILE}" >&2
+    exit 2
+  }
+  case "$PROVIDER_CREDENTIAL" in
+    env:*) STAGED_CREDENTIAL_REF="$PROVIDER_CREDENTIAL" ;;
+    file:*)
+      echo "provider ${PROVIDER_ID} uses an unsupported file credential reference; use Cowd's env: credential reference" >&2
+      exit 2
+      ;;
+    *)
+      # The user configuration is the credential authority. A literal value
+      # is passed only in the child process environment and is never written
+      # to the generated isolated configuration or evidence artifacts.
+      STAGED_CREDENTIAL_ENV="COWD_ISOLATED_EVAL_PROVIDER_API_KEY"
+      STAGED_CREDENTIAL_REF="env:${STAGED_CREDENTIAL_ENV}"
+      ;;
+  esac
+}
+
+resolve_installed_route
 command -v curl >/dev/null || { echo 'curl is required.' >&2; exit 2; }
 command -v ss >/dev/null || { echo 'ss is required.' >&2; exit 2; }
+command -v jq >/dev/null || { echo 'jq is required.' >&2; exit 2; }
+if [[ -n "$(git -C "$ROOT" status --porcelain=v1 --untracked-files=all)" ]]; then
+  echo 'real-model evaluation requires a clean candidate worktree; run deterministic checks on the current changes, then evaluate the immutable candidate once.' >&2
+  exit 2
+fi
+CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
+CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
+ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
+EVIDENCE_KEY="$(printf '%s\n' "deep-real-v2" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" | sha256sum | awk '{print $1}')"
+if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
+  prior_evidence="$({
+    find "$EVIDENCE_ROOT/runs" -type f -name report.json -exec jq -r --arg key "$EVIDENCE_KEY" '
+      if .evidence_manifest.execution_key == $key then
+        if .status == "passed" and .authorized_real_model == true then
+          "passed\t" + (.result_package_dir // input_filename)
+        else
+          "gap\t" + (.status // "unknown") + "\t" + (.result_package_dir // input_filename)
+        end
+      else empty end
+    ' {} + 2>/dev/null
+  } | head -n 1)"
+  case "$prior_evidence" in
+    passed$'\t'*)
+      printf 'reusing matching real-model evidence: %s\n' "${prior_evidence#*$'\t'}"
+      exit 0
+      ;;
+    gap$'\t'*)
+      printf 'matching evidence has an unresolved gap; inspect it before any rerun: %s\n' "${prior_evidence#*$'\t'}" >&2
+      printf 'set COWD_EVAL_FORCE_RERUN=1 only after the candidate, route, fixture, or external provider state has changed.\n' >&2
+      exit 3
+      ;;
+  esac
+fi
 if ss -ltn | rg -q ":${PORT}\\b"; then
   echo "isolated Gateway port $PORT is already in use" >&2
   exit 2
@@ -65,13 +191,20 @@ GATEWAY_BINARY_SHA256="$(sha256sum "$BIN" | awk '{print $1}')"
 printf 'Gateway binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" >&2
 
 mkdir -p "$CONFIG_HOME" "$ISOLATED_HOME/.cowd"
+cp "$SOURCE_MODELS_FILE" "$ISOLATED_HOME/.cowd/models.yaml"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "$MODEL"
 providers:
-  dashscope:
-    base_url: "${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}"
-    api_key: "env:DASHSCOPE_API_KEY"
-    protocol: completions
+  "$PROVIDER_ID":
+    base_url: "$PROVIDER_BASE_URL"
+    api_key: "$STAGED_CREDENTIAL_REF"
+EOF
+if [[ -n "$PROVIDER_PROTOCOL" ]]; then
+  cat >>"$CONFIG_HOME/config.yaml" <<EOF
+    protocol: "$PROVIDER_PROTOCOL"
+EOF
+fi
+cat >>"$CONFIG_HOME/config.yaml" <<EOF
     models:
       - "$MODEL"
 permissions:
@@ -93,12 +226,22 @@ gateway:
         token: "$TOKEN"
 EOF
 
+gateway_env=(
+  COWD_CONFIG_HOME="$CONFIG_HOME"
+  HOME="$ISOLATED_HOME"
+  COWD_LOG_STDERR=1
+)
+if [[ -n "$STAGED_CREDENTIAL_ENV" ]]; then
+  gateway_env+=("$STAGED_CREDENTIAL_ENV=$PROVIDER_CREDENTIAL")
+fi
 (
   cd "$WORKSPACE"
-  env COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$ISOLATED_HOME" COWD_LOG_STDERR=1 \
+  env "${gateway_env[@]}" \
     "$BIN" gateway run >"$GATEWAY_LOG" 2>&1 &
   echo $! >"$RUN_ROOT/gateway.pid"
 )
+# The literal credential, if present, is now only held by the isolated child.
+unset PROVIDER_CREDENTIAL
 GATEWAY_PID="$(<"$RUN_ROOT/gateway.pid")"
 for _ in {1..240}; do
   if curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/healthz" >/dev/null 2>&1; then
@@ -121,6 +264,7 @@ env \
   COWD_API_TOKEN="$TOKEN" \
   COWD_EVAL_GATEWAY_URL="$BASE_URL" \
   COWD_EVAL_REAL_MODEL=1 \
+  COWD_EVAL_EVIDENCE_KEY="$EVIDENCE_KEY" \
   COWD_EVAL_BINARY_SHA256="$GATEWAY_BINARY_SHA256" \
   COWD_AI_HARNESS_REPORT_DIR="$EVIDENCE_ROOT" \
   timeout "${COWD_EVAL_TIMEOUT_SECS:-900}s" \

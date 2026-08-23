@@ -1874,6 +1874,20 @@ fn bootstrap_tool_ids(
         "tool_search".to_string(),
         "context_retrieve".to_string(),
         "runtime_capabilities".to_string(),
+        // Managed Team roles must acquire their first bounded source receipt
+        // before a required escalation.  These core read-only evidence tools
+        // therefore cannot be deferred: an exposure miss terminates the
+        // provider step before the role reaches its Runtime-owned checkpoint.
+        "glob_search".to_string(),
+        "grep_search".to_string(),
+        "read_file".to_string(),
+        // A managed Agent may carry a Runtime-issued, terminal escalation
+        // obligation.  Deferred discovery is unsafe for that contract: the
+        // first native request otherwise ends the model step with an
+        // exposure-miss before the Agent can retry.  Gateway still verifies
+        // the Agent binding and parent Program before executing this tool, so
+        // schema visibility grants no standalone escalation authority.
+        "request_collaboration_escalation".to_string(),
     ];
     // Stateful orchestration is a runtime-native capability. When the current
     // policy already permits workspace writes, exposing it up front lets the
@@ -2096,10 +2110,18 @@ mod tool_exposure_contract_tests {
     use harness_contract::tool::ToolPermissionMode;
 
     #[test]
-    fn stateful_runtime_orchestration_is_bootstrapped_only_when_policy_allows_write() {
+    fn required_runtime_control_tools_are_bootstrapped_while_orchestration_stays_write_gated() {
         assert_eq!(
             bootstrap_tool_ids(ToolPermissionMode::ReadOnly),
-            vec!["tool_search", "context_retrieve", "runtime_capabilities"]
+            vec![
+                "tool_search",
+                "context_retrieve",
+                "runtime_capabilities",
+                "glob_search",
+                "grep_search",
+                "read_file",
+                "request_collaboration_escalation"
+            ]
         );
         assert_eq!(
             bootstrap_tool_ids(ToolPermissionMode::WorkspaceWrite),
@@ -2107,6 +2129,10 @@ mod tool_exposure_contract_tests {
                 "tool_search",
                 "context_retrieve",
                 "runtime_capabilities",
+                "glob_search",
+                "grep_search",
+                "read_file",
+                "request_collaboration_escalation",
                 "runtime_orchestrate"
             ]
         );
@@ -3322,11 +3348,6 @@ pub struct ConversationRuntime<C, T> {
     /// The narrowed tool set represents an already-admitted business
     /// obligation and one actual call is required on the next request.
     next_model_tool_required: AtomicBool,
-    /// Orchestration-phase gate: while a user explicitly requires Teams and
-    /// none are verified yet, only control-plane tools are exposed to the
-    /// root model so it cannot drift into manual file exploration before
-    /// publishing and starting the Teams.
-    next_model_orchestration_only: AtomicBool,
     /// A successful tool_search activation creates a one-request execution
     /// handoff. The following automatic provider request receives the newly
     /// activated schemas but temporarily hides tool_search so discovery cannot
@@ -3805,7 +3826,6 @@ where
             next_model_text_only: AtomicBool::new(false),
             next_model_tool_allowlist: std::sync::Mutex::new(None),
             next_model_tool_required: AtomicBool::new(false),
-            next_model_orchestration_only: AtomicBool::new(false),
             next_model_tool_activation_notice: std::sync::Mutex::new(None),
             next_model_reasoning_effort: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
@@ -4341,14 +4361,23 @@ where
         self.next_model_tool_required.store(true, Ordering::SeqCst);
     }
 
-    /// Restrict the next provider request to the runtime control plane only
-    /// (`runtime_capabilities` + `runtime_orchestrate`). Used while a user
-    /// explicitly required Teams but no verified Team execution exists yet,
-    /// so the model physically cannot drift into manual file exploration
-    /// before publishing and starting the Teams.
+    /// Require the root model to take one native control-plane action before
+    /// a user-required collaboration may admit any Team. The bounded pair
+    /// deliberately includes a read-only capability inspection as well as a
+    /// proposal: a model must be able to discover current template role ids
+    /// before it can make a valid typed proposal. Ordinary workspace and
+    /// discovery tools remain unavailable, so this is still an admission
+    /// barrier rather than a hardcoded Team topology.
     pub(crate) fn require_next_model_orchestration_only(&self) {
-        self.next_model_orchestration_only
-            .store(true, Ordering::SeqCst);
+        self.require_next_model_tool_action([
+            "runtime_capabilities".to_string(),
+            harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID.to_string(),
+        ]);
+        // Qwen hybrid endpoints reject `tool_choice=required` while their
+        // thinking mode is enabled.  The proposal step is intentionally tiny
+        // and fully typed, so disable thinking for this one wire request only;
+        // every admitted Team and Agent keeps its normal model policy.
+        self.require_next_model_reasoning_effort("none");
     }
 
     /// Override reasoning effort for exactly one provider request. Provider
@@ -6892,42 +6921,6 @@ where
                 *state = Some(exposure.clone());
             }
         }
-        // Orchestration-phase gate: a user-required Team has no verified
-        // execution yet, so the root model only sees the control plane. This
-        // is a mechanical tool-exposure bound, not a prose instruction: the
-        // model physically cannot read/search/write before publishing and
-        // starting the Teams it was asked for.
-        if self
-            .next_model_orchestration_only
-            .swap(false, Ordering::SeqCst)
-            && !text_only_response
-            && !explicitly_forbids_tool_use
-        {
-            let allowed: BTreeSet<String> = [
-                harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID.to_string(),
-                "runtime_capabilities".to_string(),
-            ]
-            .into_iter()
-            .collect();
-            exposure = ToolExposureState {
-                catalog_revision: exposure.catalog_revision,
-                bootstrap: Default::default(),
-                active: allowed.clone(),
-                deferred: available_tools
-                    .iter()
-                    .filter(|tool| !allowed.contains(*tool))
-                    .cloned()
-                    .collect(),
-                reason:
-                    "orchestration-phase gate: user-required Teams have no verified execution yet; only control-plane tools are exposed"
-                        .to_string(),
-                revision: exposure.revision.saturating_add(1),
-                fallback_full: false,
-            };
-            if let Ok(mut state) = self.tool_exposure_state.lock() {
-                *state = Some(exposure.clone());
-            }
-        }
         let exposure_projection = exposure.projection(0);
         let exposed_tool_ids = exposure_projection
             .bootstrap_ids
@@ -7345,43 +7338,41 @@ where
                 let activated =
                     self.activate_deferred_tool_calls(&activation_candidates, &discovery);
                 // Provider transports validate framing, while Runtime owns
-                // this request's exposure lease. A known healthy deferred tool
-                // receives one Runtime-owned activation/replan; invented,
-                // unhealthy, or over-permission names still fail closed before
-                // any assistant transcript is published.
+                // this request's exposure lease. When every requested tool is
+                // a known healthy deferred tool, Runtime has already parsed
+                // the current frame and can execute it under the just-bound
+                // lease. Dropping that frame for a model retry causes managed
+                // Agents to exhaust protocol recovery after their first
+                // source receipt, before they can meet a required escalation.
+                // Unknown, unhealthy, or overlay-denied names still fail
+                // closed before any assistant transcript is published.
                 self.reconcile_provider_context_usage(usage);
                 self.usage_tracker.record(usage);
                 if let Some(callback) = &self.tool_callback {
                     callback.on_usage(&usage);
                 }
-                if denied_by_overlay.is_empty() && !activated.is_empty() {
+                if denied_by_overlay.is_empty() && activated.len() == unexposed_tool_names.len() {
+                    // Fall through and execute the parsed calls. Activation
+                    // remains durable for subsequent provider requests.
+                } else {
                     return Err(
-                        RuntimeError::with_tool_exposure_miss(format!(
-                            "tool_exposure_miss: provider requested known deferred tool names [{}]; Runtime activated [{}] for the single governed retry",
-                            unexposed_tool_names.join(", "),
-                            activated.into_iter().collect::<Vec<_>>().join(", ")
-                        ))
+                        RuntimeError::with_provider_failure_metadata(
+                            format!(
+                                "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}",
+                                unexposed_tool_names.join(", "),
+                                (!denied_by_overlay.is_empty()).then(|| format!(
+                                    "; governed one-request allowlist rejected [{}]",
+                                    denied_by_overlay.join(", ")
+                                )).unwrap_or_default()
+                            ),
+                            None,
+                            true,
+                            crate::execution_core::graph::ResourceResultClass::Failed,
+                        )
                         .with_provider_usage(usage)
                         .with_effect_receipts(early_tool_receipts),
                     );
                 }
-                return Err(
-                    RuntimeError::with_provider_failure_metadata(
-                        format!(
-                            "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}",
-                            unexposed_tool_names.join(", "),
-                            (!denied_by_overlay.is_empty()).then(|| format!(
-                                "; governed one-request allowlist rejected [{}]",
-                                denied_by_overlay.join(", ")
-                            )).unwrap_or_default()
-                        ),
-                        None,
-                        true,
-                        crate::execution_core::graph::ResourceResultClass::Failed,
-                    )
-                    .with_provider_usage(usage)
-                    .with_effect_receipts(early_tool_receipts),
-                );
             }
             if let Some((call, error)) = calls.iter().find_map(|call| {
                 self.tool_executor
@@ -11877,23 +11868,6 @@ where
             reason,
             Some("runtime.strategy.early_stopped"),
         )?;
-        Ok(())
-    }
-
-    pub(crate) fn record_turn_strategy_collaboration_receipt(
-        &self,
-        receipt: serde_json::Value,
-    ) -> Result<(), RuntimeError> {
-        let mut guard = self
-            .active_turn_strategy
-            .lock()
-            .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| RuntimeError::new("collaboration receipt has no turn strategy"))?;
-        if state.collaboration_receipt.is_none() {
-            state.collaboration_receipt = Some(receipt);
-        }
         Ok(())
     }
 
@@ -16907,13 +16881,19 @@ mod tests {
     #[derive(Clone)]
     struct ExposureRecordingApi {
         projections: Arc<std::sync::Mutex<Vec<harness_contract::tool::ToolExposureProjection>>>,
+        required_tool_choices: Arc<std::sync::Mutex<Vec<bool>>>,
+        reasoning_efforts: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     }
 
     impl ApiClient for ExposureRecordingApi {
         fn stream(
             &mut self,
-            _request: ApiRequest,
+            request: ApiRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.reasoning_efforts
+                .lock()
+                .unwrap()
+                .push(request.reasoning_effort_override);
             Box::pin(futures::stream::iter(vec![
                 Ok(AssistantEvent::TextDelta("bounded conclusion".to_string())),
                 Ok(AssistantEvent::MessageStop),
@@ -16925,6 +16905,10 @@ mod tests {
             projection: harness_contract::tool::ToolExposureProjection,
         ) {
             self.projections.lock().unwrap().push(projection);
+        }
+
+        fn configure_tool_choice_required(&mut self, required: bool) {
+            self.required_tool_choices.lock().unwrap().push(required);
         }
     }
 
@@ -17108,6 +17092,8 @@ mod tests {
         let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
         let api = ExposureRecordingApi {
             projections: Arc::clone(&projections),
+            required_tool_choices: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reasoning_efforts: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -17172,6 +17158,8 @@ mod tests {
         let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
         let api = ExposureRecordingApi {
             projections: Arc::clone(&projections),
+            required_tool_choices: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reasoning_efforts: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -17407,7 +17395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn known_deferred_tool_call_activates_for_one_governed_retry() {
+    async fn known_deferred_tool_call_activates_and_executes_the_current_frame() {
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             DirectDeferredApi,
@@ -17420,11 +17408,10 @@ mod tests {
             .begin_turn_strategy("direct-deferred-turn", "inspect README")
             .expect("turn strategy");
 
-        let miss = runtime
+        let executed = runtime
             .execute_model_step("inspect README", true)
             .await
-            .expect_err("known deferred schema needs one governed retry");
-        assert!(miss.is_tool_exposure_miss(), "{miss}");
+            .expect("known deferred schema executes under Runtime's just-bound lease");
         assert!(runtime
             .tool_exposure_state
             .lock()
@@ -17432,12 +17419,8 @@ mod tests {
             .as_ref()
             .is_some_and(|state| state.active.contains("custom_reader")));
 
-        let resumed = runtime
-            .execute_model_step("inspect README", false)
-            .await
-            .expect("activated schema must be usable without tool_search");
-        let ModelStepIntent::ToolCalls { calls } = resumed.intent else {
-            panic!("retry must preserve the provider tool call");
+        let ModelStepIntent::ToolCalls { calls } = executed.intent else {
+            panic!("activated frame must preserve the provider tool call");
         };
         assert_eq!(calls[0].name, "custom_reader");
     }
@@ -17716,10 +17699,14 @@ mod tests {
     #[tokio::test]
     async fn orchestration_phase_gate_exposes_only_control_plane_tools() {
         let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let required_tool_choices = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reasoning_efforts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut runtime = ConversationRuntime::new(
             Session::new(),
             ExposureRecordingApi {
                 projections: Arc::clone(&projections),
+                required_tool_choices: Arc::clone(&required_tool_choices),
+                reasoning_efforts: Arc::clone(&reasoning_efforts),
             },
             ExposureToolExecutor,
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
@@ -17745,8 +17732,32 @@ mod tests {
             .chain(projection.bootstrap_ids.iter())
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(active.contains("runtime_capabilities"));
         assert!(active.contains("runtime_orchestrate"));
+        assert_eq!(
+            active.len(),
+            2,
+            "root admission may expose only the control-plane tools: {active:?}"
+        );
+        assert!(
+            active.contains("runtime_capabilities"),
+            "the model must be able to inspect exact template role ids before proposing: {active:?}"
+        );
+        assert_eq!(
+            required_tool_choices
+                .lock()
+                .expect("required choices")
+                .as_slice(),
+            &[true],
+            "root admission must propagate a required native tool choice to the provider adapter"
+        );
+        assert_eq!(
+            reasoning_efforts
+                .lock()
+                .expect("reasoning efforts")
+                .as_slice(),
+            &[Some("none".to_string())],
+            "the forced Qwen-compatible proposal request disables thinking only for this call"
+        );
         assert!(
             !active.contains("grep_search"),
             "orchestration-phase gate must hide general tools: {active:?}"

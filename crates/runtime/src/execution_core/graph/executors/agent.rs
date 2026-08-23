@@ -572,6 +572,7 @@ mod tests {
             objective: "inspect".into(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: vec!["reviewed".into()],
             team_role_identity: None,
             team_role: None,

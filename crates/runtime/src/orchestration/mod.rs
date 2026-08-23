@@ -1173,49 +1173,6 @@ fn repair_semantic_compilation(
         }
         return true;
     }
-    if error.contains("Team acceptance criterion")
-        && error.contains("has no bounded Runtime resource scope")
-    {
-        // The session does not grant bounded workspace write authority for
-        // this proposal. Narrow every Team node to read-only research instead
-        // of failing the whole orchestration; Runtime never widens authority,
-        // and the terminal report can state that the workspace write was not
-        // authorized. Write-acceptance criteria are removed with it, so a
-        // missing artifact can never be silently reported as created.
-        let mut repaired = false;
-        if let Some(proposal) = request.proposal.as_mut() {
-            for node in &mut proposal.nodes {
-                if node.recipe != CapabilityRecipeId::Team {
-                    continue;
-                }
-                node.template = Some("cowd/parallel-research-synthesis".to_string());
-                node.output_artifacts = vec!["terminal_synthesis".to_string()];
-                node.evidence_contract = vec![
-                    "summary".to_string(),
-                    "evidence".to_string(),
-                    "unresolved".to_string(),
-                ];
-                // Stale role plans (e.g. `implementer`) belong to the old
-                // write template; clearing focuses lets the compiler derive
-                // fresh researcher/synthesizer plans for the read-only
-                // template instead of failing role resolution.
-                node.focuses = Vec::new();
-                node.required = true;
-                repaired = true;
-            }
-            if repaired {
-                proposal
-                    .completion
-                    .required_artifact_kinds
-                    .retain(|artifact| artifact != "workspace_change");
-                request.constraints.requires_write = Some(false);
-                tracing::warn!(
-                    "orchestration repair: Team proposal downgraded to read-only research because no bounded workspace write scope exists"
-                );
-            }
-        }
-        return repaired;
-    }
     false
 }
 
@@ -2409,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn write_scope_repair_downgrades_team_nodes_to_read_only_research() {
+    fn write_scope_failure_preserves_the_model_proposal_for_a_typed_replan() {
         let mut request = proposal(vec![GraphSemanticNode {
             node_id: "team-1".to_string(),
             recipe: CapabilityRecipeId::Team,
@@ -2417,6 +2374,8 @@ mod tests {
             depends_on: Vec::new(),
             multiplicity: 1,
             focuses: Vec::new(),
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: Some("cowd/execute-review".to_string()),
             target_session_id: None,
             output_artifacts: vec![
@@ -2436,38 +2395,13 @@ mod tests {
             cancellation_group: None,
         }]);
         let error = "Team template resolution failed: Team acceptance criterion `implementation` has no bounded Runtime resource scope";
-        assert!(repair_semantic_compilation(
+        let before = request.clone();
+        assert!(!repair_semantic_compilation(
             &mut request,
             std::path::Path::new("/tmp"),
             error
         ));
-        let node = &request.proposal.as_ref().unwrap().nodes[0];
-        assert_eq!(
-            node.template.as_deref(),
-            Some("cowd/parallel-research-synthesis")
-        );
-        assert_eq!(
-            node.output_artifacts,
-            vec!["terminal_synthesis".to_string()]
-        );
-        assert_eq!(
-            node.evidence_contract,
-            vec![
-                "summary".to_string(),
-                "evidence".to_string(),
-                "unresolved".to_string(),
-            ]
-        );
-        assert!(node.focuses.is_empty());
-        assert!(!request
-            .proposal
-            .as_ref()
-            .unwrap()
-            .completion
-            .required_artifact_kinds
-            .iter()
-            .any(|artifact| artifact == "workspace_change"));
-        assert_eq!(request.constraints.requires_write, Some(false));
+        assert_eq!(request, before);
     }
 
     fn proposal(nodes: Vec<GraphSemanticNode>) -> RuntimeOrchestrationCommand {
@@ -2522,6 +2456,8 @@ mod tests {
             depends_on,
             multiplicity: 1,
             focuses: Vec::new(),
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: None,
             target_session_id: None,
             output_artifacts: Vec::new(),
@@ -2532,6 +2468,32 @@ mod tests {
             dependency: Default::default(),
             cancellation_group: None,
         }
+    }
+
+    fn parallel_research_team(id: &str, depends_on: Vec<String>) -> GraphSemanticNode {
+        let mut team = node(id, CapabilityRecipeId::Team, depends_on);
+        team.template = Some("cowd/parallel-research-synthesis".to_string());
+        team.focuses = vec![
+            SemanticFocus {
+                focus_id: format!("{id}-research"),
+                role_id: "researcher".to_string(),
+                objective: "collect bounded source evidence".to_string(),
+                resource_scopes: Vec::new(),
+                evidence_responsibilities: vec!["source evidence".to_string()],
+                output_contract: Vec::new(),
+                output_acceptance: Vec::new(),
+            },
+            SemanticFocus {
+                focus_id: format!("{id}-synthesis"),
+                role_id: "synthesizer".to_string(),
+                objective: "synthesize the selected evidence".to_string(),
+                resource_scopes: Vec::new(),
+                evidence_responsibilities: vec!["evidence synthesis".to_string()],
+                output_contract: Vec::new(),
+                output_acceptance: Vec::new(),
+            },
+        ];
+        team
     }
 
     fn ensure_test_team_resource(request: &mut RuntimeOrchestrationCommand) {
@@ -2937,17 +2899,15 @@ mod tests {
         let mut teams = ["domain-a", "domain-b", "domain-c"]
             .into_iter()
             .map(|id| {
-                let mut team = node(id, CapabilityRecipeId::Team, Vec::new());
-                team.template = Some("cowd/parallel-research-synthesis".to_string());
+                let mut team = parallel_research_team(id, Vec::new());
                 team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
                 team.output_artifacts = vec![format!("{id}-finding")];
                 team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
                 team
             })
             .collect::<Vec<_>>();
-        let mut review = node(
+        let mut review = parallel_research_team(
             "review-team",
-            CapabilityRecipeId::Team,
             vec![
                 "domain-a".to_string(),
                 "domain-b".to_string(),
@@ -3032,12 +2992,7 @@ mod tests {
         ensure_test_mission(&services);
         let nodes = (0..100)
             .map(|index| {
-                let mut team = node(
-                    &format!("team-{index:03}"),
-                    CapabilityRecipeId::Team,
-                    Vec::new(),
-                );
-                team.template = Some("cowd/parallel-research-synthesis".to_string());
+                let mut team = parallel_research_team(&format!("team-{index:03}"), Vec::new());
                 team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
                 team
             })
@@ -3131,8 +3086,7 @@ mod tests {
     async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         ensure_test_mission(&services);
-        let mut team = node("team", CapabilityRecipeId::Team, Vec::new());
-        team.template = Some("cowd/parallel-research-synthesis".to_string());
+        let team = parallel_research_team("team", Vec::new());
         let mut request = proposal(vec![team]);
         request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
             decision_id: "decision-v621".to_string(),
@@ -3258,10 +3212,8 @@ mod tests {
     async fn collaboration_coordinator_persists_every_compiled_team_obligation_before_admission() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         ensure_test_mission(&services);
-        let mut first = node("research", CapabilityRecipeId::Team, Vec::new());
-        first.template = Some("cowd/parallel-research-synthesis".to_string());
-        let mut second = node("review", CapabilityRecipeId::Team, Vec::new());
-        second.template = Some("cowd/parallel-research-synthesis".to_string());
+        let first = parallel_research_team("research", Vec::new());
+        let second = parallel_research_team("review", Vec::new());
         let mut request = proposal(vec![first, second]);
         request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
             decision_id: "coordinator-obligations".to_string(),
@@ -3399,6 +3351,35 @@ mod tests {
                         Vec::new(),
                     );
                     team.template = Some("cowd/parallel-research-synthesis".to_string());
+                    // This is a model-assisted Program fixture. A multi-role
+                    // template must state its active role set explicitly so
+                    // the scale gate measures the same contract used in
+                    // production, rather than relying on the retired
+                    // implicit full-template expansion.
+                    team.focuses = vec![
+                        SemanticFocus {
+                            focus_id: format!(
+                                "program-{program_index:03}-team-{team_index:02}-research"
+                            ),
+                            role_id: "researcher".to_string(),
+                            objective: "collect bounded source evidence".to_string(),
+                            resource_scopes: Vec::new(),
+                            evidence_responsibilities: vec!["source evidence".to_string()],
+                            output_contract: Vec::new(),
+                            output_acceptance: Vec::new(),
+                        },
+                        SemanticFocus {
+                            focus_id: format!(
+                                "program-{program_index:03}-team-{team_index:02}-synthesis"
+                            ),
+                            role_id: "synthesizer".to_string(),
+                            objective: "synthesize the selected evidence".to_string(),
+                            resource_scopes: Vec::new(),
+                            evidence_responsibilities: vec!["evidence synthesis".to_string()],
+                            output_contract: Vec::new(),
+                            output_acceptance: Vec::new(),
+                        },
+                    ];
                     team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
                     team
                 })
@@ -3413,11 +3394,11 @@ mod tests {
                 decision_lease: format!("hundred-programs-lease-{program_index}"),
                 turn_ref: "turn-v621".to_string(),
             });
-            team_authority::bind_semantic_resource_authority(
-                &mut request,
-                None,
-                services.workspace_root(),
-            );
+            // The stress fixture already supplies a complete semantic Team
+            // contract, including exact focus roles. Do not run the
+            // request-authority synthesizer here: it is responsible for
+            // model-originated incomplete proposals and would overwrite this
+            // deliberately frozen topology before the admission benchmark.
             ensure_test_team_resource(&mut request);
             let plan = planner::plan_runtime_orchestration(&request);
             let compiled = compiler::compile_orchestration(
@@ -3521,8 +3502,7 @@ mod tests {
     async fn startup_reconciliation_restores_live_program_approval_wait_state() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         ensure_test_mission(&services);
-        let mut team = node("research", CapabilityRecipeId::Team, Vec::new());
-        team.template = Some("cowd/parallel-research-synthesis".to_string());
+        let team = parallel_research_team("research", Vec::new());
         let mut request = proposal(vec![team]);
         team_authority::bind_semantic_resource_authority(
             &mut request,
@@ -3910,8 +3890,7 @@ mod tests {
     async fn collaboration_coordinator_records_rejected_team_admission_as_typed_program_truth() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         ensure_test_mission(&services);
-        let mut team = node("rejected-team", CapabilityRecipeId::Team, Vec::new());
-        team.template = Some("cowd/parallel-research-synthesis".to_string());
+        let team = parallel_research_team("rejected-team", Vec::new());
         let mut request = proposal(vec![team]);
         request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
             decision_id: "coordinator-rejection".to_string(),

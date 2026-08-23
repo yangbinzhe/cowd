@@ -51,6 +51,7 @@ impl From<ModelInputDispositionGraphNode> for ModelGraphSemanticNode {
             depends_on: value.depends_on,
             multiplicity: value.multiplicity,
             focuses: value.focuses,
+            managed_agent_escalation: crate::orchestration::ManagedAgentEscalationRequirement::None,
             template: value.template,
             target_session_id: None,
             output_artifacts: value.output_artifacts,

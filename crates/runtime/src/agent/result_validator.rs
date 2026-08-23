@@ -88,7 +88,6 @@ pub fn validate_agent_return(
                         | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { .. }
                         | harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. }
                         | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
-                        | harness_contract::team::TeamAcceptanceCheck::LegacyEvidenceBound { .. }
                 )
             });
             let consumes_upstream = requirements.iter().any(|requirement| {
@@ -184,6 +183,7 @@ mod tests {
                     scopes: vec!["read:src".to_string()],
                 },
             }],
+            requires_managed_collaboration_escalation: false,
             acceptance: vec!["evidence".to_string()],
             team_role_identity: None,
             team_role: None,

@@ -53,6 +53,11 @@ pub struct TaskUnderstanding {
     /// cardinality parsing is only the ingress fallback used to populate it.
     #[serde(default)]
     pub required_team_count: u8,
+    /// Explicit user contract requiring a managed Agent to invoke Runtime's
+    /// follow-up collaboration escalation tool.  This is ingress authority,
+    /// not an optional model-planning preference.
+    #[serde(default)]
+    pub requires_managed_collaboration_escalation: bool,
     #[serde(default)]
     pub forbids_team: bool,
     pub requests_deep_plan: bool,
@@ -2411,6 +2416,8 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     };
     let requests_multi_agent =
         (contains_any(&normalized, MULTI_AGENT_TERMS) || required_team_count > 0) && !forbids_team;
+    let requires_managed_collaboration_escalation =
+        explicit_managed_collaboration_escalation_required(&normalized) && !forbids_team;
     let collaboration_reference = if contains_any(
         &normalized,
         &[
@@ -2462,6 +2469,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         requests_parallelism,
         requests_multi_agent,
         required_team_count,
+        requires_managed_collaboration_escalation,
         forbids_team,
         requests_deep_plan,
         requests_deliberation,
@@ -3145,7 +3153,10 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
     // delimiters are presentation only. Normalize those delimiters before
     // matching so `两个** required Team` means the same as `两个 required Team`.
     let markdown_stripped = prompt.to_ascii_lowercase().replace(['*', '`'], " ");
-    let normalized = markdown_stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = markdown_stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     const COUNTS: &[(&str, &str, u8)] = &[
         ("一", "one", 1),
         ("二", "two", 2),
@@ -3207,21 +3218,23 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
         // Keep the qualifier set narrowly collaboration-specific so an
         // unrelated phrase cannot accidentally become a Team obligation.
         let qualified_english_team_match =
-            ["协作", "独立", "并行", "平行", "required"].iter().any(|qualifier| {
-                ["team", "teams"].iter().any(|role| {
-                    [
-                        format!("{chinese}{qualifier} {role}"),
-                        format!("{chinese}个{qualifier} {role}"),
-                        format!("{chinese}个 {qualifier} {role}"),
-                        format!("{arabic}{qualifier} {role}"),
-                        format!("{arabic}个{qualifier} {role}"),
-                        format!("{arabic}个 {qualifier} {role}"),
-                        format!("{arabic} {qualifier} {role}"),
-                    ]
-                    .iter()
-                    .any(|pattern| cardinal_normalized.contains(pattern))
-                })
-            });
+            ["协作", "独立", "并行", "平行", "required"]
+                .iter()
+                .any(|qualifier| {
+                    ["team", "teams"].iter().any(|role| {
+                        [
+                            format!("{chinese}{qualifier} {role}"),
+                            format!("{chinese}个{qualifier} {role}"),
+                            format!("{chinese}个 {qualifier} {role}"),
+                            format!("{arabic}{qualifier} {role}"),
+                            format!("{arabic}个{qualifier} {role}"),
+                            format!("{arabic}个 {qualifier} {role}"),
+                            format!("{arabic} {qualifier} {role}"),
+                        ]
+                        .iter()
+                        .any(|pattern| cardinal_normalized.contains(pattern))
+                    })
+                });
         if chinese_match || english_match || qualified_english_team_match {
             requested = requested.max(*count);
             break;
@@ -3331,6 +3344,32 @@ pub fn explicit_team_execution_required(prompt: &str) -> bool {
     .iter()
     .any(|marker| normalized.contains(marker));
     mentions_team && requires_execution && !explicitly_forbids_collaboration(&normalized)
+}
+
+/// Whether the user explicitly requires an Agent to use the native Runtime
+/// escalation tool to create a follow-up Team.  Keep this deliberately
+/// narrow: merely documenting the tool or mentioning collaboration must not
+/// grant Runtime authority to add an execution obligation.
+#[must_use]
+pub fn explicit_managed_collaboration_escalation_required(prompt: &str) -> bool {
+    let normalized = prompt.to_ascii_lowercase();
+    let names_native_tool = normalized.contains("request_collaboration_escalation");
+    let requires_execution = ["必须", "必须要", "must", "required", "actual", "实际调用"]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+    let names_escalation_outcome = [
+        "升级",
+        "escalation",
+        "follow-up team",
+        "follow up team",
+        "后续 team",
+        "后续团队",
+        "program revision",
+        "runtime-attested",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker));
+    names_native_tool && requires_execution && names_escalation_outcome
 }
 
 fn explicit_team_ordinal_count(normalized: &str) -> u8 {
@@ -3711,6 +3750,19 @@ mod tests {
         let restored = serde_json::from_value::<TaskUnderstanding>(legacy)
             .expect("legacy understanding remains readable");
         assert_eq!(restored.required_team_count, 0);
+    }
+
+    #[test]
+    fn native_managed_escalation_contract_is_not_a_model_optional_field() {
+        let required = understand(&StrategyInput::from_prompt(
+            "必须让 Team A 的 Agent 实际调用 request_collaboration_escalation；完成后创建后续 Team，并保留 Runtime-attested receipt。",
+        ));
+        assert!(required.requires_managed_collaboration_escalation);
+
+        let catalog_only = understand(&StrategyInput::from_prompt(
+            "只展示 request_collaboration_escalation 的 schema，不要启动 Team。",
+        ));
+        assert!(!catalog_only.requires_managed_collaboration_escalation);
     }
 
     #[test]

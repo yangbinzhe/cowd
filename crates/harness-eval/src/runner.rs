@@ -637,6 +637,9 @@ fn build_evidence_manifest(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
+    let execution_key = std::env::var("COWD_EVAL_EVIDENCE_KEY")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     json!({
         "kind": "harness_eval.evidence_manifest",
         "report_id": null,
@@ -651,6 +654,7 @@ fn build_evidence_manifest(
         "requested_at_ms": requested_at_ms,
         "real_model_authorized": options.allow_real_model,
         "provider": options.provider.as_deref(),
+        "execution_key": execution_key,
         "budget": options.budget.as_deref(),
         "token_usage": {
             "total_tokens": total_tokens,
@@ -775,6 +779,7 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "harness_eval".to_string(),
             execution_budget: harness_contract::context::ParentExecutionBudget::new(

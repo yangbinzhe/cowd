@@ -307,6 +307,7 @@ mod tests {
                     requests_parallelism: false,
                     requests_multi_agent: false,
                     required_team_count: 0,
+                    requires_managed_collaboration_escalation: false,
                     forbids_team: false,
                     requests_deep_plan: false,
                     requests_deliberation: false,

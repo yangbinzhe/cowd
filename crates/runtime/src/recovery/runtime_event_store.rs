@@ -25,6 +25,13 @@ const EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_TERMINAL_ARTIFACT_REF_PREFIX: &str = "terminal_artifact_v1:";
+/// Projection lanes share SQLite's single writer with foreground lifecycle
+/// commits.  They must yield quickly under a sustained write load, but an
+/// immediate (0ms) failure turns ordinary writer hand-off into noisy failed
+/// projection passes.  This short bounded wait preserves foreground priority
+/// while allowing WAL's normal writer hand-off to settle before the reactor's
+/// durable retry/backoff policy takes over.
+const BACKGROUND_PROJECTION_BUSY_TIMEOUT_MS: u64 = 250;
 
 thread_local! {
     static PROJECTION_WORK_CLASS: Cell<Option<RuntimeProjectionWorkClass>> =
@@ -1713,7 +1720,7 @@ impl SqliteRuntimeEventStore {
             RuntimeEventStore::current_projection_work_class(),
             Some(RuntimeProjectionWorkClass::Background)
         )
-        .then_some(0);
+        .then_some(BACKGROUND_PROJECTION_BUSY_TIMEOUT_MS);
         self.executor
             .checkout_with_busy_timeout(busy_timeout_ms)
             .map_err(RuntimeEventStoreError::from)
@@ -5387,6 +5394,26 @@ mod tests {
             );
         });
         assert_eq!(RuntimeEventStore::current_projection_work_class(), None);
+    }
+
+    #[test]
+    fn background_projection_connections_wait_briefly_for_sqlite_writer_handoff() {
+        let store = SqliteRuntimeEventStore::try_open_in_memory().unwrap();
+        let work_class = RuntimeEventStore::try_open_in_memory().unwrap();
+        let timeout_ms =
+            work_class.run_projection_work(RuntimeProjectionWorkClass::Background, || {
+                let connection = store.checkout_event_connection().unwrap();
+                connection
+                    .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))
+                    .unwrap()
+            });
+        assert_eq!(timeout_ms, BACKGROUND_PROJECTION_BUSY_TIMEOUT_MS);
+
+        let foreground = store.checkout_event_connection().unwrap();
+        let foreground_timeout = foreground
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0))
+            .unwrap();
+        assert_eq!(foreground_timeout, 5_000);
     }
 
     #[test]

@@ -421,7 +421,7 @@ fn additional_builtin_team_manifests(
         ))
     };
 
-    Ok(vec![
+    let mut templates = vec![
         template(
             "cowd/direct-executor",
             "Direct Executor",
@@ -604,7 +604,21 @@ fn additional_builtin_team_manifests(
             result(&["summary", "evidence", "unresolved"]),
             "# Long-Running Workstreams\n\nRun durable workstreams with bounded checkpoints and a coordinating synthesis.\n",
         )?,
-    ])
+    ];
+    // Role aliases belong to the immutable template revision rather than the
+    // orchestration prompt. They preserve the template's canonical topology
+    // while accepting common semantic labels a model may use for a durable
+    // workstream. The instantiated receipt records every alias repair.
+    if let Some((manifest, _)) = templates.iter_mut().find(|(manifest, _)| {
+        manifest.template_id.as_str() == "builtin/cowd/long-running-workstreams"
+    }) {
+        manifest.role_aliases = std::collections::BTreeMap::from([
+            ("researcher".to_string(), "workstream".to_string()),
+            ("worker".to_string(), "workstream".to_string()),
+            ("synthesizer".to_string(), "coordinator".to_string()),
+        ]);
+    }
+    Ok(templates)
 }
 
 fn revision_key(revision_ref: &TeamTemplateRevisionRef) -> String {
@@ -618,6 +632,28 @@ fn revision_key(revision_ref: &TeamTemplateRevisionRef) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_running_workstreams_declares_durable_semantic_role_aliases() {
+        let execute = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap();
+        let direct = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/direct").unwrap();
+        let templates = additional_builtin_team_manifests(&execute, &direct).unwrap();
+        let manifest = templates
+            .iter()
+            .map(|(manifest, _)| manifest)
+            .find(|manifest| {
+                manifest.template_id.as_str() == "builtin/cowd/long-running-workstreams"
+            })
+            .expect("long-running workstreams template");
+        assert_eq!(
+            manifest.role_aliases.get("researcher"),
+            Some(&"workstream".to_string())
+        );
+        assert_eq!(
+            manifest.role_aliases.get("synthesizer"),
+            Some(&"coordinator".to_string())
+        );
+    }
 
     #[test]
     fn external_research_template_binds_network_capability_to_explore_v2() {

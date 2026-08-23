@@ -54,12 +54,6 @@ pub enum TeamAcceptanceCheck {
     /// Pure reducer role: consume predecessor durable evidence without
     /// repeating source/tool acquisition.
     UpstreamEvidence,
-    /// Rolling-safe adapter for a pre-typed custom Team contract. The exact
-    /// legacy criterion must be returned under `legacy_acceptance` and is
-    /// accepted only with scoped durable evidence.
-    LegacyEvidenceBound {
-        scopes: Vec<String>,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +250,11 @@ pub struct TeamInstantiationRequest {
     pub cardinality_overrides: Vec<TeamRoleCardinalityOverride>,
     #[serde(default)]
     pub focus_partition_plans: Vec<FocusPartitionPlan>,
+    /// Runtime-compiled semantic obligation for exactly one eligible Team
+    /// Agent to request a bounded follow-up Team. It is never inferred from
+    /// free-form objective text and never grants direct graph mutation.
+    #[serde(default)]
+    pub requires_managed_collaboration_escalation: bool,
     pub permission_ceiling: PermissionMode,
     pub model_lease: String,
     /// Required immutable hard budget for this Team execution. Runtime
@@ -713,6 +712,7 @@ mod tests {
             role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
             focus_partition_plans: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             permission_ceiling: PermissionMode::ReadOnly,
             model_lease: "default".to_string(),
             execution_budget: ParentExecutionBudget::new(

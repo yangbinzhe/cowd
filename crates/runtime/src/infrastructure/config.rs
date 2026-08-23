@@ -2638,11 +2638,11 @@ fn extract_fallbacks_from_legacy(value: &JsonValue) -> Vec<String> {
 ///     apiKey: "..."
 ///     models:
 ///       - "step-3.5-flash"
-///   bailian:
-///     baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-///     apiKey: "sk-..."
+///   qwen-tokenplan:
+///     baseUrl: "https://configured-provider.example/v1"
+///     apiKey: "env:COWD_PROVIDER_API_KEY"
 ///     models:
-///       - "qwen3-coder-next"
+///       - "configured-qwen-model"
 /// ```
 ///
 /// If the `providers` key is absent the function returns an empty

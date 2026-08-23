@@ -294,6 +294,8 @@ mod tests {
             depends_on: Vec::new(),
             multiplicity: 1,
             focuses: Vec::new(),
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: None,
             target_session_id: None,
             output_artifacts: vec![format!("{node_id}_report")],

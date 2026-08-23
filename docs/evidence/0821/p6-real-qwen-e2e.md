@@ -11,7 +11,8 @@ COWD_EVAL_KEEP_GATEWAY_ARTIFACTS=1 COWD_EVAL_TIMEOUT_SECS=900 \
 ```
 
 The runner creates a temporary Gateway configuration, local bearer token and
-SQLite state. The provider configuration stores only `env:DASHSCOPE_API_KEY`;
+SQLite state. The provider configuration stores only the Token Plan reference
+`env:COWD_EVAL_TOKEN_PLAN_API_KEY`; real generation never uses DashScope/Bailian.
 the credential itself is never written to configuration, output or this
 record. The source workspace remains the read-only evaluation fixture.
 

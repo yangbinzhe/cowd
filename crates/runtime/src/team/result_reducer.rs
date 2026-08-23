@@ -859,6 +859,7 @@ mod tests {
             objective: "synthesize".to_string(),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
             team_role_identity: Some(
                 frozen_role(

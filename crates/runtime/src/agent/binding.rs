@@ -624,6 +624,7 @@ mod tests {
             team_role_identity: Some(team_identity("implementer", 1, "focus-default")),
             required_acceptance: Default::default(),
             output_acceptance: Vec::new(),
+            requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
             constraints: Vec::new(),
             context_refs: Vec::new(),

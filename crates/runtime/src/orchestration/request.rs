@@ -7,8 +7,8 @@ use harness_contract::execution_graph::{
 };
 use harness_contract::input_disposition::ModelInputDispositionBatch;
 use harness_contract::orchestration::{
-    ModelGraphMutationProposal, ModelGraphSemanticNode, ModelRuntimeOrchestrationConstraints,
-    ModelRuntimeOrchestrationInput, ModelSemanticFocus,
+    ManagedAgentEscalationRequirement, ModelGraphMutationProposal, ModelGraphSemanticNode,
+    ModelRuntimeOrchestrationConstraints, ModelRuntimeOrchestrationInput, ModelSemanticFocus,
 };
 use harness_contract::policy::PermissionMode;
 use harness_contract::team::{TeamSelectionMode, TeamStrategyBinding};
@@ -57,6 +57,7 @@ pub struct GraphSemanticNode {
     pub depends_on: Vec<String>,
     pub multiplicity: u16,
     pub focuses: Vec<SemanticFocus>,
+    pub managed_agent_escalation: ManagedAgentEscalationRequirement,
     pub template: Option<String>,
     pub target_session_id: Option<String>,
     pub output_artifacts: Vec<String>,
@@ -78,6 +79,7 @@ impl From<ModelGraphSemanticNode> for GraphSemanticNode {
             depends_on: value.depends_on,
             multiplicity: value.multiplicity,
             focuses: value.focuses.into_iter().map(Into::into).collect(),
+            managed_agent_escalation: value.managed_agent_escalation,
             template: value.template,
             target_session_id: value.target_session_id,
             output_artifacts: value.output_artifacts,

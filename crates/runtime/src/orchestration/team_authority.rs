@@ -5,6 +5,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
+use harness_contract::orchestration::ManagedAgentEscalationRequirement;
 use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
 
 #[cfg(test)]
@@ -94,6 +95,7 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
     // widen a read-only user intent into workspace mutation authority.
     let requires_write =
         understanding.requires_write && request.constraints.requires_write.unwrap_or(true);
+    bind_required_managed_agent_escalation(proposal, understanding, requires_write);
     // Preserve admitted user intent even when the current permission ceiling
     // is too low. The validator/approval path must reject or elevate it;
     // silently rewriting a write goal into read-only work creates a false
@@ -208,7 +210,7 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
             // semantic topology, but derive authority independently per Team
             // node. A final writer must never turn preceding research nodes
             // into write-capable or template-incompatible roles.
-            node.focuses = if direct_explicit_research {
+            let runtime_focuses = if direct_explicit_research {
                 direct_executor_focus_for_team(
                     &request.intent,
                     workspace_root,
@@ -224,6 +226,16 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
                     node_requires_write,
                 )
             };
+            // The model chooses the semantic role topology; Runtime owns the
+            // authority attached to it.  Replacing a declared role list here
+            // made a valid two-role Team silently become a one-role Team when
+            // prompt inference chose a narrow parallelism bound.  Preserve
+            // the declared focus ids, roles and objectives, but overwrite
+            // every resource scope with the matching Runtime-derived lease.
+            // Template validation remains the final authority over which role
+            // names may execute.
+            node.focuses =
+                bind_declared_focus_authority(std::mem::take(&mut node.focuses), runtime_focuses);
             *team_position = team_position.saturating_add(1);
             node.resource_scopes = node
                 .focuses
@@ -327,6 +339,103 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
         .extend(scopes.into_iter().map(|scope| format!("resource:{scope}")));
     request.capabilities.sort();
     request.capabilities.dedup();
+}
+
+fn bind_declared_focus_authority(
+    declared: Vec<SemanticFocus>,
+    runtime_focuses: Vec<SemanticFocus>,
+) -> Vec<SemanticFocus> {
+    if declared.is_empty() {
+        return runtime_focuses;
+    }
+
+    let mut by_role = BTreeMap::<String, Vec<SemanticFocus>>::new();
+    for focus in runtime_focuses {
+        by_role
+            .entry(focus.role_id.clone())
+            .or_default()
+            .push(focus);
+    }
+    let mut role_offsets = BTreeMap::<String, usize>::new();
+    declared
+        .into_iter()
+        .map(|mut focus| {
+            let offset = role_offsets.entry(focus.role_id.clone()).or_default();
+            let authority = by_role
+                .get(&focus.role_id)
+                .and_then(|candidates| candidates.get(*offset % candidates.len().max(1)))
+                .or_else(|| by_role.values().find_map(|candidates| candidates.first()));
+            *offset = offset.saturating_add(1);
+            if let Some(authority) = authority {
+                focus.resource_scopes = authority.resource_scopes.clone();
+            }
+            focus
+        })
+        .collect()
+}
+
+/// A frozen user strategy contract outranks the model's semantic preference.
+/// Model JSON may opt in to an escalation lane, but it may not omit or turn
+/// off an explicitly required native escalation.  The first Team node is the
+/// deterministic semantic representative of the user's Team A; exactly one
+/// Team owns this obligation, while Runtime still chooses the concrete Agent.
+fn bind_required_managed_agent_escalation(
+    proposal: &mut crate::orchestration::GraphMutationProposal,
+    understanding: &harness_contract::strategy::TaskUnderstanding,
+    requires_write: bool,
+) {
+    if !understanding.requires_managed_collaboration_escalation {
+        return;
+    }
+
+    let team_count = proposal
+        .nodes
+        .iter()
+        .filter(|node| node.recipe == CapabilityRecipeId::Team)
+        .count();
+    let mut assigned = false;
+    let mut team_index = 0;
+    for node in &mut proposal.nodes {
+        if node.recipe != CapabilityRecipeId::Team {
+            continue;
+        }
+        node.managed_agent_escalation = if assigned {
+            ManagedAgentEscalationRequirement::None
+        } else {
+            assigned = true;
+            ManagedAgentEscalationRequirement::Required
+        };
+        // A native escalation requirement is an ingress-level execution
+        // contract, not a model hint.  Bind its builtin Team nodes to the
+        // same Runtime-owned template contract that supplies their focus
+        // topology.  Freezing only the escalation enum previously allowed a
+        // strategy default's role partitions to be paired with a different
+        // model-suggested template, producing an unexecutable graph before
+        // the selected Agent could reach the escalation checkpoint.
+        let custom_template = node.template.as_deref().is_some_and(|template| {
+            template.starts_with("workspace/") || template.starts_with("user/")
+        });
+        if !custom_template {
+            let contract = explicit_team_node_contract(
+                team_index,
+                team_count.max(1),
+                requires_write,
+                understanding.requires_external_facts,
+            );
+            node.template = Some(contract.template.to_string());
+            node.output_artifacts = contract
+                .output_artifacts
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect();
+            node.evidence_contract = contract
+                .evidence_contract
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect();
+        }
+        team_index = team_index.saturating_add(1);
+    }
 }
 
 fn team_authority_profile(
@@ -1373,6 +1482,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn declared_team_roles_keep_semantics_while_runtime_rebinds_their_scopes() {
+        let declared = vec![
+            SemanticFocus {
+                focus_id: "model-research".to_string(),
+                role_id: "researcher".to_string(),
+                objective: "inspect primary evidence".to_string(),
+                resource_scopes: vec!["write:unsafe".to_string()],
+                evidence_responsibilities: vec!["source evidence".to_string()],
+                output_contract: Vec::new(),
+                output_acceptance: Vec::new(),
+            },
+            SemanticFocus {
+                focus_id: "model-synthesis".to_string(),
+                role_id: "synthesizer".to_string(),
+                objective: "compare the bounded findings".to_string(),
+                resource_scopes: vec!["network:*".to_string()],
+                evidence_responsibilities: vec!["synthesis evidence".to_string()],
+                output_contract: Vec::new(),
+                output_acceptance: Vec::new(),
+            },
+        ];
+        let runtime = vec![
+            SemanticFocus {
+                focus_id: "runtime-research".to_string(),
+                role_id: "researcher".to_string(),
+                objective: "runtime boundary".to_string(),
+                resource_scopes: vec!["read:Moon".to_string()],
+                evidence_responsibilities: Vec::new(),
+                output_contract: Vec::new(),
+                output_acceptance: Vec::new(),
+            },
+            SemanticFocus {
+                focus_id: "runtime-synthesis".to_string(),
+                role_id: "synthesizer".to_string(),
+                objective: "runtime boundary".to_string(),
+                resource_scopes: vec!["read:Moon".to_string()],
+                evidence_responsibilities: Vec::new(),
+                output_contract: Vec::new(),
+                output_acceptance: Vec::new(),
+            },
+        ];
+
+        let bound = bind_declared_focus_authority(declared, runtime);
+        assert_eq!(bound[0].focus_id, "model-research");
+        assert_eq!(bound[1].objective, "compare the bounded findings");
+        assert_eq!(bound[0].resource_scopes, vec!["read:Moon"]);
+        assert_eq!(bound[1].resource_scopes, vec!["read:Moon"]);
+    }
+
+    #[test]
     fn explicit_team_contracts_match_their_builtin_topologies() {
         let first = explicit_team_node_contract(0, 3, true, false);
         let second = explicit_team_node_contract(1, 3, true, false);
@@ -1393,6 +1552,66 @@ mod tests {
             writer.evidence_contract,
             &["implementation", "source_verification", "evidence", "risks"]
         );
+    }
+
+    #[test]
+    fn managed_escalation_binds_builtin_team_templates_to_its_runtime_contract() {
+        let understanding = harness_contract::strategy::understand(
+            &harness_contract::strategy::StrategyInput::from_prompt(
+                "必须让 Team A 的 Agent 实际调用 request_collaboration_escalation，并在之后创建独立复核 Team。",
+            ),
+        );
+        assert!(understanding.requires_managed_collaboration_escalation);
+        let team = |id: &str| GraphSemanticNode {
+            node_id: id.to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: "inspect bounded source evidence".to_string(),
+            depends_on: Vec::new(),
+            multiplicity: 1,
+            focuses: Vec::new(),
+            managed_agent_escalation: ManagedAgentEscalationRequirement::None,
+            template: Some("builtin/cowd/direct-executor".to_string()),
+            target_session_id: None,
+            output_artifacts: vec!["model-supplied".to_string()],
+            evidence_contract: vec!["model-supplied".to_string()],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
+        };
+        let mut proposal = crate::orchestration::GraphMutationProposal {
+            mutation_id: "managed-escalation-template-binding".to_string(),
+            target_execution_id: None,
+            expected_revision: None,
+            nodes: vec![team("team-a"), team("team-b")],
+            completion: Default::default(),
+            collaboration_program: None,
+            collaboration_escalation: None,
+            retired_collaboration_instance_ids: Vec::new(),
+            reason: "test".to_string(),
+        };
+
+        bind_required_managed_agent_escalation(&mut proposal, &understanding, false);
+
+        assert_eq!(
+            proposal.nodes[0].managed_agent_escalation,
+            ManagedAgentEscalationRequirement::Required
+        );
+        assert_eq!(
+            proposal.nodes[1].managed_agent_escalation,
+            ManagedAgentEscalationRequirement::None
+        );
+        for node in proposal.nodes {
+            assert_eq!(
+                node.template.as_deref(),
+                Some("cowd/parallel-research-synthesis")
+            );
+            assert_eq!(
+                node.evidence_contract,
+                ["summary", "evidence", "unresolved"]
+            );
+        }
     }
 
     #[test]
@@ -1764,6 +1983,8 @@ mod tests {
                     depends_on: Vec::new(),
                     multiplicity: 1,
                     focuses: Vec::new(),
+                    managed_agent_escalation:
+                        harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
                     template: None,
                     target_session_id: None,
                     output_artifacts: vec!["terminal_synthesis".to_string()],
@@ -1821,6 +2042,8 @@ mod tests {
             depends_on: Vec::new(),
             multiplicity: 1,
             focuses: Vec::new(),
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: Some("workspace/cross-team-collaborative-decision".to_string()),
             target_session_id: None,
             output_artifacts: vec!["unified-html-decision-report".to_string()],
@@ -2088,6 +2311,8 @@ mod tests {
             depends_on: Vec::new(),
             multiplicity: 1,
             focuses: Vec::new(),
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: Some(template.to_string()),
             target_session_id: None,
             output_artifacts,
@@ -2233,6 +2458,8 @@ mod tests {
             depends_on: Vec::new(),
             multiplicity: 1,
             focuses: Vec::new(),
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: Some(template.to_string()),
             target_session_id: None,
             output_artifacts: artifacts,
@@ -2390,6 +2617,8 @@ mod tests {
                             output_acceptance: Vec::new(),
                         },
                     ],
+                    managed_agent_escalation:
+                        harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
                     template: None,
                     target_session_id: None,
                     output_artifacts: vec!["terminal_synthesis".to_string()],
@@ -2466,6 +2695,8 @@ mod tests {
                     depends_on: Vec::new(),
                     multiplicity: 1,
                     focuses: Vec::new(),
+                    managed_agent_escalation:
+                        harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
                     template: Some("cowd/parallel-research-synthesis".to_string()),
                     target_session_id: None,
                     output_artifacts: vec!["terminal_synthesis".to_string()],

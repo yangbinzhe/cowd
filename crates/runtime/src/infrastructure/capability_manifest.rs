@@ -1541,6 +1541,8 @@ fn orchestration_preflight_with_catalog(
             depends_on: Vec::new(),
             multiplicity: u16::try_from(width).unwrap_or(100),
             focuses,
+            managed_agent_escalation:
+                harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template,
             target_session_id: decision.session_ref.clone(),
             output_artifacts: Vec::new(),

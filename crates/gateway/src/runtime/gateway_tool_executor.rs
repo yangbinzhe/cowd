@@ -55,6 +55,39 @@ fn parse_qualified_mcp_name(qualified: &str) -> Result<(String, String), ToolErr
     Ok((server.to_string(), tool.to_string()))
 }
 
+/// Providers occasionally encode a nested native-function object as a JSON
+/// string even though the outer tool-call frame is valid JSON.  Normalize the
+/// two model-authored orchestration payloads once, at the Gateway boundary,
+/// before the ordinary schema and typed-contract validators run.  This is not
+/// a permissive fallback: only a JSON object is accepted; malformed strings,
+/// arrays/scalars and every business-rule violation still fail through the
+/// existing typed path.
+fn normalize_runtime_orchestration_wire_input(
+    mut value: serde_json::Value,
+) -> Result<serde_json::Value, ToolError> {
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ToolError::new("runtime_orchestrate input must be a JSON object"))?;
+    for field in ["proposal", "template_proposal"] {
+        let Some(serde_json::Value::String(encoded)) = object.get(field) else {
+            continue;
+        };
+        let parsed =
+            serde_json::from_str::<serde_json::Value>(encoded.trim()).map_err(|error| {
+                ToolError::new(format!(
+                    "runtime_orchestrate `{field}` JSON string is malformed: {error}"
+                ))
+            })?;
+        if !parsed.is_object() {
+            return Err(ToolError::new(format!(
+                "runtime_orchestrate `{field}` JSON string must decode to an object"
+            )));
+        }
+        object.insert(field.to_string(), parsed);
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Deserialize)]
 struct RuntimeCapabilitiesRequest {
     intent: String,
@@ -449,6 +482,11 @@ impl GatewayToolExecutor {
         value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        let value = if tool_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
+            normalize_runtime_orchestration_wire_input(value)?
+        } else {
+            value
+        };
         if matches!(
             tool_name,
             "runtime_orchestrate" | "team_board" | "runtime_capabilities"
@@ -1998,6 +2036,13 @@ impl ToolExecutor for GatewayToolExecutor {
         }
         let value = serde_json::from_str::<serde_json::Value>(input)
             .map_err(|error| self.input_contract_error(&canonical_name, error))?;
+        let value =
+            if canonical_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
+                normalize_runtime_orchestration_wire_input(value)
+                    .map_err(|error| self.input_contract_error(&canonical_name, error))?
+            } else {
+                value
+            };
         self.tool_host
             .pin_snapshot()
             .validate_input(&canonical_name, &value)
@@ -2874,6 +2919,62 @@ fn network_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_orchestration_unwraps_nested_json_objects_before_typed_validation() {
+        let normalized = normalize_runtime_orchestration_wire_input(serde_json::json!({
+            "intent": "review the runtime",
+            "operation": "propose",
+            "proposal": r#"{"mutation_id":"review-v1","nodes":[],"reason":"typed proposal"}"#,
+            "template_proposal": r#"{"template_id":"local-review","name":"Local review"}"#
+        }))
+        .expect("nested JSON objects are a transport representation, not a semantic error");
+
+        assert!(normalized["proposal"].is_object());
+        assert!(normalized["template_proposal"].is_object());
+        assert_eq!(normalized["proposal"]["mutation_id"], "review-v1");
+    }
+
+    #[test]
+    fn runtime_orchestration_rejects_non_object_or_malformed_nested_json() {
+        let scalar = normalize_runtime_orchestration_wire_input(serde_json::json!({
+            "intent": "review",
+            "proposal": "[1,2,3]"
+        }))
+        .expect_err("proposal must remain an object after normalization");
+        assert!(scalar.to_string().contains("must decode to an object"));
+
+        let malformed = normalize_runtime_orchestration_wire_input(serde_json::json!({
+            "intent": "review",
+            "proposal": "{not json}"
+        }))
+        .expect_err("malformed nested JSON is not tolerated");
+        assert!(malformed.to_string().contains("JSON string is malformed"));
+    }
+
+    #[test]
+    fn runtime_orchestration_validates_a_provider_wrapped_typed_proposal() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+            .expect("production runtime tools register");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        let mut input = serde_json::to_value(
+            harness_contract::orchestration::ModelRuntimeOrchestrationInput::minimal_example(),
+        )
+        .expect("serialize canonical typed proposal");
+        let proposal = input["proposal"].take();
+        assert!(
+            proposal.is_object(),
+            "minimal input contains an object proposal"
+        );
+        input["proposal"] = serde_json::Value::String(proposal.to_string());
+
+        executor
+            .validate_tool_input("runtime_orchestrate", &input.to_string())
+            .expect(
+                "the Gateway must normalize the provider wire spelling before schema validation",
+            );
+    }
 
     #[test]
     fn collaboration_escalation_input_is_limited_to_semantic_delta() {
@@ -4299,7 +4400,7 @@ mod tests {
         let error = execute_signed_test_tool(
             &executor,
             "runtime_orchestrate",
-            r#"{"intent":"需要多 Agent 协同审查架构","operation":"propose","proposal":{"mutation_id":"missing-runtime-team","reason":"test","nodes":[{"node_id":"team","recipe":"team","objective":"审查架构"}]}}"#,
+            r#"{"intent":"需要多 Agent 协同审查架构","operation":"propose","proposal":{"mutation_id":"missing-runtime-team","reason":"test","nodes":[{"node_id":"team","recipe":"team","objective":"审查架构","managed_agent_escalation":"none"}]}}"#,
             4,
         )
         .await

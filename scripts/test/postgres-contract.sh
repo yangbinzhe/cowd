@@ -9,10 +9,21 @@ cd "$ROOT"
 logs="$(mktemp -d)"
 trap 'rm -rf "$logs"' EXIT
 
+# Every contract case owns a logically empty target.  Several migration tests
+# deliberately reject a non-empty target database; sharing one disposable
+# schema made their result depend on execution order instead of the contract.
+# The caller has already supplied an isolated database, so resetting only its
+# `public` schema is safe and keeps the same connection/pool configuration.
+reset_disposable_schema() {
+  psql "$COWD_TEST_POSTGRES_URL" -v ON_ERROR_STOP=1 \
+    -c 'DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;' >/dev/null
+}
+
 run_lib_test() {
   local package="$1"
   local test_name="$2"
   local log="$logs/${package}-${test_name}.log"
+  reset_disposable_schema
   echo "[postgres-contract] ${package} :: ${test_name}"
   cargo test -p "$package" --lib "$test_name" \
     -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
@@ -27,6 +38,7 @@ run_lib_test_with_features() {
   local features="$2"
   local test_name="$3"
   local log="$logs/${package}-${test_name}.log"
+  reset_disposable_schema
   echo "[postgres-contract] ${package} [${features}] :: ${test_name}"
   cargo test -p "$package" --features "$features" --lib "$test_name" \
     -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
@@ -41,6 +53,7 @@ run_integration_test() {
   local target="$2"
   local test_name="$3"
   local log="$logs/${package}-${target}-${test_name}.log"
+  reset_disposable_schema
   echo "[postgres-contract] ${package} :: ${target} :: ${test_name}"
   cargo test -p "$package" --test "$target" "$test_name" \
     -- --ignored --nocapture --test-threads=1 2>&1 | tee "$log"
@@ -77,7 +90,6 @@ run_lib_test_with_features storage storage-postgres real_pool_set_isolates_backg
 run_lib_test_with_features storage storage-postgres real_pool_set_resets_search_path_between_scoped_and_public_checkouts
 
 run_lib_test session-postgres existing_postgres_outbox_schema_migrates_claim_fence_epoch_in_place
-run_lib_test session-postgres postgres_input_application_receipt_contract
 run_lib_test session-postgres postgres_activation_index_and_manifest_repair_match_sqlite_semantics
 run_lib_test session-postgres postgres_adapter_real_copy_fences_and_injected_facade
 run_lib_test session-postgres postgres_fenced_terminal_commit_matches_sqlite_atomic_identity_contract
@@ -100,6 +112,7 @@ run_integration_test session-postgres shared_backend_contract_test postgres_life
 run_integration_test session-postgres shared_backend_contract_test postgres_branch_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_domain_event_idempotency_and_kind_query_contract
 run_integration_test session-postgres shared_backend_contract_test postgres_application_execution_32_way_semantic_idempotency_contract
+run_integration_test session-postgres shared_backend_contract_test postgres_input_application_receipt_contract
 
 if [[ -n "${COWD_TEST_POSTGRES_TARGET_URL:-}" ]]; then
   run_lib_test surface-postgres real_postgres_to_postgres_quiesced_copy_is_digest_exact_and_target_only

@@ -807,6 +807,8 @@ impl AgentBindingSnapshot {
             objective: intent.objective,
             required_acceptance,
             output_acceptance: intent.output_acceptance,
+            requires_managed_collaboration_escalation: intent
+                .requires_managed_collaboration_escalation,
             team_role_identity,
             team_role: None,
             acceptance: intent.acceptance,
