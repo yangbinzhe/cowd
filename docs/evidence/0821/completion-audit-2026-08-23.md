@@ -248,3 +248,35 @@ The local regression set passed before candidate commit:
 The next strict real-model run is reserved for the exact clean commit containing
 this repair. No report from either earlier SHA is used as final acceptance
 evidence.
+
+## Custom-template focus preservation repair — preflight for the next candidate
+
+The third clean Token Plan run preserved the strategy lease repair but did not
+pass the strict live Gateway gate. Its preserved report is
+`target/acceptance/real-qwen/runs/v0.9.704-1787484772-mission-harness-deep/`.
+The provider route remained `qwen-tokenplan` / `qwen3.8-max`; there was no
+provider protocol failure and no strategy-lease conflict. It passed every
+deterministic, context-governance, mission-closure, next-generation and
+complex-scenario gate, while live Gateway scenarios were 3/5.
+
+The raw durable tool receipts isolate the remaining failure precisely. The
+model supplied typed focus objects for each Team node of the workspace
+multi-role templates. `bind_semantic_resource_authority` then erased those
+focuses for `workspace/` and `user/` templates in an attempt to avoid
+injecting Runtime builtin roles. The downstream template compiler correctly
+received an empty focus set and rejected a multi-role template as ambiguous.
+The failure was therefore an internal loss of valid model semantic topology,
+not malformed model JSON.
+
+The repair preserves model-declared custom-template focus ids, role ids,
+objectives and evidence responsibilities. Runtime binds their authority only
+to the already-bounded node resource lease; it never invents a role, template,
+Team name or dependency. An empty focus set remains empty and a multi-role
+template still fails closed, so ambiguity does not become an implicit whole-
+template expansion.
+
+The changed regression proves that a custom write-capable template retains its
+declared two-role topology and that each role receives only a Runtime-derived
+subset of the node lease. Existing builtin escalation and root strategy-lease
+tests also pass. The next real run is reserved for the exact clean commit of
+this repair.

@@ -165,8 +165,12 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
             // User/workspace templates own their role topology. Runtime
             // derives the bounded resource lease but must not inject
             // builtin-role focus partitions (researcher/implementer/...)
-            // that the custom template does not declare. Template roles
-            // then receive the node lease through their default focus slots.
+            // that the custom template does not declare. A model-declared
+            // custom focus set is nevertheless semantic input, not an
+            // authority grant: retain it and bind it to the node's bounded
+            // Runtime lease. Dropping it makes every multi-role custom
+            // template indistinguishable from an empty-role proposal at the
+            // later template compiler.
             let custom_template =
                 template.starts_with("workspace/") || template.starts_with("user/");
             // Do not manufacture a minimum number of role slots.  Template
@@ -188,10 +192,13 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
                     node_requires_write,
                     "custom template bounded resource lease (no builtin focus partitions)"
                 );
-                node.focuses = Vec::new();
                 node.resource_scopes = custom_scopes;
                 node.resource_scopes.sort();
                 node.resource_scopes.dedup();
+                node.focuses = bind_declared_focuses_to_node_scopes(
+                    std::mem::take(&mut node.focuses),
+                    &node.resource_scopes,
+                );
                 scopes.extend(node.resource_scopes.iter().cloned());
                 *team_position = team_position.saturating_add(1);
                 continue;
@@ -369,6 +376,24 @@ fn bind_declared_focus_authority(
             if let Some(authority) = authority {
                 focus.resource_scopes = authority.resource_scopes.clone();
             }
+            focus
+        })
+        .collect()
+}
+
+/// A custom template's declared role set is semantic topology selected by the
+/// model. Unlike builtin focus partitions, Runtime cannot substitute an
+/// inferred role for it. Bind every selected role to the same already-bounded
+/// node lease; the template's own role policy remains the narrower authority
+/// boundary for individual Agent instances.
+fn bind_declared_focuses_to_node_scopes(
+    declared: Vec<SemanticFocus>,
+    node_scopes: &[String],
+) -> Vec<SemanticFocus> {
+    declared
+        .into_iter()
+        .map(|mut focus| {
+            focus.resource_scopes = node_scopes.to_vec();
             focus
         })
         .collect()
@@ -2041,7 +2066,26 @@ mod tests {
             objective: "生成统一 HTML 决策报告并写入工作区".to_string(),
             depends_on: Vec::new(),
             multiplicity: 1,
-            focuses: Vec::new(),
+            focuses: vec![
+                SemanticFocus {
+                    focus_id: "writer".to_string(),
+                    role_id: "writer".to_string(),
+                    objective: "write the bounded decision report".to_string(),
+                    resource_scopes: Vec::new(),
+                    evidence_responsibilities: vec!["written report".to_string()],
+                    output_contract: Vec::new(),
+                    output_acceptance: Vec::new(),
+                },
+                SemanticFocus {
+                    focus_id: "reviewer".to_string(),
+                    role_id: "reviewer".to_string(),
+                    objective: "verify the bounded decision report".to_string(),
+                    resource_scopes: Vec::new(),
+                    evidence_responsibilities: vec!["verification evidence".to_string()],
+                    output_contract: Vec::new(),
+                    output_acceptance: Vec::new(),
+                },
+            ],
             managed_agent_escalation:
                 harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: Some("workspace/cross-team-collaborative-decision".to_string()),
@@ -2114,10 +2158,30 @@ mod tests {
             "full-trust write teams must also receive a whole-workspace read lease: {:?}",
             team.resource_scopes
         );
-        assert!(
-            team.focuses.is_empty(),
-            "custom templates must keep their own role topology; Runtime must not inject builtin focus partitions"
+        assert_eq!(
+            team.focuses
+                .iter()
+                .map(|focus| focus.role_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["writer", "reviewer"],
+            "custom templates must preserve the model-selected role topology rather than replacing or dropping it"
         );
+        assert!(team.focuses.iter().all(|focus| {
+            !focus.resource_scopes.is_empty()
+                && focus
+                    .resource_scopes
+                    .iter()
+                    .all(|scope| team.resource_scopes.contains(scope))
+        }));
+    }
+
+    #[test]
+    fn custom_template_authority_does_not_invent_an_unselected_role() {
+        assert!(bind_declared_focuses_to_node_scopes(
+            Vec::new(),
+            &["read:crates/runtime".to_string()],
+        )
+        .is_empty());
     }
 
     #[test]
