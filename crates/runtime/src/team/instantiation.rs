@@ -1539,9 +1539,13 @@ fn bounded_slot_resource_scopes(team_scopes: &[String], focus_refs: &[String]) -
     scopes
 }
 
-fn bounded_objective_context(_parent_objective: &str) -> String {
-    "Runtime intentionally withholds the parent cross-Team objective from delegated Team roles. Evaluate only this role's bounded Focus, resource scopes, acceptance contract, and canonical upstream results."
-        .to_string()
+fn bounded_objective_context(parent_objective: &str) -> String {
+    let mut context = "Runtime intentionally withholds the parent cross-Team objective from delegated Team roles. Evaluate only this role's bounded Focus, resource scopes, acceptance contract, and canonical upstream results."
+        .to_string();
+    if parent_objective.contains("request_collaboration_escalation") {
+        context.push_str(" The parent contract explicitly requires one Runtime-attested collaboration escalation. After acquiring your first source receipt and before terminal synthesis, use the native request_collaboration_escalation tool once to propose one bounded follow-up Team. Supply only its semantic reason and requested_add_team; Runtime derives all fences. Do not replace this native call with prose.");
+    }
+    context
 }
 
 fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<String> {
@@ -1569,7 +1573,10 @@ fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<Stri
             "write_file" | "edit_file" | "bash" => workspace_write,
             // Context continuity, discovery over the already-cropped catalog,
             // and Team exchange do not widen a resource lease.
-            "context_retrieve" | "tool_search" | "evidence_retrieve" => true,
+            "context_retrieve"
+            | "tool_search"
+            | "evidence_retrieve"
+            | "request_collaboration_escalation" => true,
             // Capability expansion must add an explicit resource classification
             // here. Unknown tools fail closed instead of inheriting an
             // unrelated network/read lease.
@@ -1717,6 +1724,27 @@ mod acceptance_contract_tests {
             crop_tools_to_resource_lease(&tools, &["read:crates/runtime/Cargo.toml".to_string()]),
             vec!["read_file".to_string(), "evidence_retrieve".to_string()]
         );
+    }
+
+    #[test]
+    fn explicit_escalation_contract_survives_role_scope_cropping() {
+        assert_eq!(
+            crop_tools_to_resource_lease(
+                &[
+                    "read_file".to_string(),
+                    "request_collaboration_escalation".to_string(),
+                ],
+                &["read:crates/runtime".to_string()],
+            ),
+            vec![
+                "read_file".to_string(),
+                "request_collaboration_escalation".to_string(),
+            ]
+        );
+        assert!(bounded_objective_context(
+            "the managed Agent must call request_collaboration_escalation after evidence"
+        )
+        .contains("native request_collaboration_escalation tool"));
     }
 
     #[test]
