@@ -1441,6 +1441,18 @@ fn resolve_focuses(
                 let originals = expanded.clone();
                 for index in expanded.len()..target {
                     let source = &originals[index % originals.len()];
+                    // An expansion is Runtime-authorized duplication of this
+                    // exact focus.  The overlap checker uses the minimum of
+                    // both participants' budgets, so marking only the new
+                    // replica would still reject the pair against the
+                    // original slot's zero-overlap default.
+                    for existing in &mut expanded {
+                        if existing.focus_id == source.focus_id
+                            && existing.capability_cropped_refs == source.capability_cropped_refs
+                        {
+                            existing.overlap_budget_bp = 10_000;
+                        }
+                    }
                     let replica_index = index + 1;
                     let boundary = format!(
                         "{} (Template-required replica {replica_index}; no additional authority)",
@@ -1971,6 +1983,10 @@ mod acceptance_contract_tests {
             "Template expansion must not widen resource authority"
         );
         assert_eq!(focuses[1].overlap_budget_bp, 10_000);
+        assert_eq!(
+            focuses[0].overlap_budget_bp, 10_000,
+            "both sides of a template-required focus replica authorize its overlap"
+        );
         assert!(focuses[1].focus_id.contains("replica"));
     }
 
