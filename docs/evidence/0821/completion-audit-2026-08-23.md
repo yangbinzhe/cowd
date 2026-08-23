@@ -302,3 +302,45 @@ local host. It neither bypasses authorization nor relaxes the read-only policy;
 unsigned or forged leases remain rejected. The evaluator's full real-tool
 evidence regression now passes. A new real-model scenario is still required
 for the exact clean commit; this preflight is not release acceptance evidence.
+
+## Durable custom Team delivery repair — preflight for the next candidate
+
+The fifth clean Token Plan run reached the real root control-plane and started
+the requested Team work, but its Team verifier rejected completed source work
+with `team_delivery_unsatisfied`. The preserved report is
+`target/acceptance/real-qwen/runs/v0.9.704-1787490613-mission-harness-deep/`.
+The concrete missing labels were `evidence_paths` and `findings_summary`.
+
+These labels are custom Team acceptance criteria. The typed Team compiler
+already maps such criteria to bounded Runtime evidence checks; however, the
+Team-level verifier made a second and incompatible demand that a model summary
+contain JSON properties with exactly those names. That is a model-format
+dependency, not a missing-evidence condition.
+
+The candidate aligns the verifier with the frozen typed contract:
+
+- a custom, non-structured Team label is satisfied only after every role's
+  own typed acceptance is Runtime-satisfied and at least one materialized,
+  durable evidence receipt is retained;
+- known structured fields, source verification, review, upstream evidence and
+  explicit `evidence_scope:` criteria retain their existing strict checks;
+- no model text, JSON compatibility key or inferred Team topology is accepted
+  as evidence.
+
+The local Qwen Token Plan registry was also corrected from the stale
+`no_explicit_tool_choice` capability. The root control request already sends
+the provider-compatible `enable_thinking=false` override; the registry now
+allows the existing C1 required native tool-choice gate to reach the provider
+for the configured Qwen models. This is a configuration capability change,
+not a provider-name branch in production code.
+
+Preflight passed:
+
+- `cargo test -p runtime execution_core::graph::executors::verify::tests`
+- `cargo test -p runtime team_instantiation`
+- `cargo test -p runtime --lib orchestration_phase_gate_exposes_only_control_plane_tools`
+- `cargo check -p runtime --all-targets`
+- formatting and whitespace checks.
+
+The next strict real-model run is reserved for the exact clean commit of this
+candidate. It remains the sole authority for release/tag eligibility.

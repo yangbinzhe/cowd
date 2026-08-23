@@ -103,6 +103,11 @@ impl NodeExecutor for VerifyNodeExecutor {
         let mut terminal_unsatisfied = Vec::new();
         let mut invalid_team_slots = Vec::new();
         let mut satisfied_team_criteria = BTreeSet::new();
+        // A Team-level custom acceptance label is compiled by
+        // `team_acceptance_contract` as scoped Runtime evidence. It is not a
+        // request for a model to echo that label as a JSON key. Keep this
+        // verifier aligned with that frozen contract.
+        let mut has_durable_team_evidence = false;
         let team_verification = ticket.payload_ref.starts_with("team:");
         for predecessor_id in predecessor_ids {
             let predecessor_status = graph.node_statuses.get(predecessor_id).copied();
@@ -114,6 +119,8 @@ impl NodeExecutor for VerifyNodeExecutor {
                     available.insert(item.evidence_ref.id.clone());
                     available.insert(item.retrieval_selector.clone());
                     available.insert(item.sha256.clone());
+                    has_durable_team_evidence |=
+                        crate::agent_result_validator::is_materialized_durable_evidence(item);
                     evidence.push(item.clone());
                 }
             }
@@ -302,6 +309,17 @@ impl NodeExecutor for VerifyNodeExecutor {
             }
         }
 
+        // Unknown user-defined Team labels are evidence-backed by the typed
+        // contract compiler. Once each role's own acceptance is satisfied,
+        // use durable receipts rather than an optional free-form JSON field.
+        if team_verification && has_durable_team_evidence && invalid_team_slots.is_empty() {
+            for criterion in &node.acceptance.criteria {
+                if is_runtime_evidence_backed_team_criterion(criterion) {
+                    satisfied_team_criteria.insert(criterion.to_ascii_lowercase());
+                }
+            }
+        }
+
         let mut missing = node
             .acceptance
             .required_evidence
@@ -386,6 +404,34 @@ impl NodeExecutor for VerifyNodeExecutor {
             finished_at_ms: crate::tool_invocation::now_ms(),
         }))
     }
+}
+
+/// Return whether a Team delivery criterion is compiled as Runtime-backed
+/// scoped evidence rather than a structured presentation field.
+///
+/// This mirrors the explicit structured field set in
+/// `team::instantiation::team_acceptance_contract`. Unknown user-defined
+/// labels are intentionally evidence-backed there; requiring a matching JSON
+/// property here would create a second, model-fragile acceptance language.
+fn is_runtime_evidence_backed_team_criterion(criterion: &str) -> bool {
+    !matches!(
+        criterion.trim().to_ascii_lowercase().as_str(),
+        "summary"
+            | "findings"
+            | "plan"
+            | "risks"
+            | "unresolved"
+            | "key_decisions"
+            | "unresolved_or_risks"
+            | "proposal"
+            | "critique"
+            | "checkpoint"
+            | "implementation"
+            | "mitigation"
+            | "source_verification"
+            | "review"
+            | "evidence"
+    ) && !criterion.trim().starts_with("evidence_scope:")
 }
 
 fn produced_team_evidence(
@@ -689,6 +735,22 @@ mod tests {
             &result,
             std::slice::from_ref(&shared),
             &upstream,
+        ));
+    }
+
+    #[test]
+    fn custom_team_delivery_labels_are_evidence_backed_not_model_json_fields() {
+        assert!(is_runtime_evidence_backed_team_criterion("evidence_paths"));
+        assert!(is_runtime_evidence_backed_team_criterion(
+            "findings_summary"
+        ));
+        assert!(is_runtime_evidence_backed_team_criterion(
+            "user_defined_delivery"
+        ));
+        assert!(!is_runtime_evidence_backed_team_criterion("summary"));
+        assert!(!is_runtime_evidence_backed_team_criterion("evidence"));
+        assert!(!is_runtime_evidence_backed_team_criterion(
+            "evidence_scope:read:src"
         ));
     }
 }
