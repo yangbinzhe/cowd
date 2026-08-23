@@ -1456,15 +1456,14 @@ fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
-/// Hybrid Qwen families expose their Chat Completions reasoning switch as the
-/// non-standard top-level `enable_thinking` field. Keep this capability map at
-/// the wire boundary so Runtime remains provider-agnostic.
-fn supports_qwen_hybrid_thinking(model: &str) -> bool {
-    let lowered = model.to_ascii_lowercase();
-    let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    canonical.starts_with("qwen3.7-")
-        || canonical.starts_with("qwen3.6-")
-        || canonical.starts_with("qwen3.5-")
+/// Whether this exact configured model exposes the OpenAI-compatible
+/// `enable_thinking` switch. Runtime resolves the data from the model registry
+/// and carries it on the request; this adapter never guesses from model names.
+fn supports_openai_compat_thinking_control(request: &MessageRequest) -> bool {
+    request
+        .protocol_capabilities
+        .iter()
+        .any(|capability| capability == "openai_compat_enable_thinking")
 }
 
 /// Strip routing prefix (e.g., "openai/gpt-4" → "gpt-4") for the wire.
@@ -1576,7 +1575,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     // Qwen hybrid Chat Completions models use `enable_thinking`, not the
     // standard `reasoning_effort`, to disable their default thinking pass.
     if request.reasoning_effort.as_deref() == Some("none")
-        && supports_qwen_hybrid_thinking(&request.model)
+        && supports_openai_compat_thinking_control(request)
     {
         payload["enable_thinking"] = json!(false);
     }
@@ -4070,6 +4069,7 @@ mod tests {
     fn tuning_params_included_in_payload_when_set() {
         let request = MessageRequest {
             model: "gpt-4o".to_string(),
+            protocol_capabilities: Vec::new(),
             max_tokens: 1024,
             context_window_limit: None,
             messages: vec![],
@@ -4150,9 +4150,10 @@ mod tests {
     }
 
     #[test]
-    fn qwen_hybrid_none_effort_disables_thinking_at_wire_boundary() {
+    fn configured_hybrid_none_effort_disables_thinking_at_wire_boundary() {
         let request = MessageRequest {
-            model: "qwen3.7-plus".to_string(),
+            model: "configured-hybrid".to_string(),
+            protocol_capabilities: vec!["openai_compat_enable_thinking".to_string()],
             max_tokens: 1024,
             messages: vec![],
             stream: true,
@@ -4165,6 +4166,7 @@ mod tests {
 
         let unsupported = MessageRequest {
             model: "gpt-4o".to_string(),
+            protocol_capabilities: Vec::new(),
             ..request
         };
         let payload = build_chat_completion_request(&unsupported, OpenAiCompatConfig::openai());

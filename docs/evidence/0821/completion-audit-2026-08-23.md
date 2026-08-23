@@ -176,3 +176,34 @@ The next and final evidence boundary is one clean-SHA Token Plan run of the
 strict real-model scenario. Its report must independently prove the multi-Team
 fan-in, escalation, continuation, cross-session policy and projection facts;
 no earlier real-model report is reused for a changed candidate.
+
+## Provider protocol repair — preflight for the next candidate
+
+The first clean Token Plan run of the preceding candidate did **not** pass and
+is not acceptance evidence. Its preserved report is
+`target/acceptance/real-qwen/runs/v0.9.704-1787479938-mission-harness-deep/`;
+the isolated Gateway recorded a provider HTTP 400 before either failed scenario
+completed a model round: the configured model rejected an explicit
+`tool_choice` while its thinking mode was active. The active route and model in
+that report were `qwen-tokenplan` and `qwen3.8-max`, respectively.
+
+The repair is a data-driven protocol boundary, not a new model-name branch:
+
+- `~/.cowd/models.yaml` declares `no_explicit_tool_choice` and
+  `openai_compat_enable_thinking` for the configured hybrid models. The real
+  evaluator copies that registry into its isolated HOME, so it exercises the
+  same declared route and capabilities as the interactive Gateway.
+- Runtime captures those configured capabilities in its immutable provider
+  request profile and passes them to the provider request as transport-local
+  metadata. A one-request `reasoning_effort=none` override is honored only
+  when that capability is present; it then becomes the provider's documented
+  `enable_thinking=false` wire field.
+- The capability profile already maps `no_explicit_tool_choice` to omission of
+  the unsupported field. Runtime still constrains the tool exposure and checks
+  the durable control-plane receipt, so compatibility fallback cannot invent a
+  Team or weaken governed admission.
+
+The changed dependency cone has deterministic provider-wire and Runtime
+behavior tests. After it is committed as a clean candidate, the strict real
+scenario will be run exactly once for that SHA; only that result may reopen the
+release/tag decision.

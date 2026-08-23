@@ -32,14 +32,18 @@ pub use provider::ToolDefinition as ProviderToolDefinition;
 
 fn request_reasoning_effort(
     model: &str,
+    protocol_capabilities: &[String],
     request_override: Option<String>,
     configured: Option<String>,
 ) -> Option<String> {
     let lowered = model.to_ascii_lowercase();
     let canonical = lowered.rsplit('/').next().unwrap_or(lowered.as_str());
-    let qwen_hybrid = canonical.starts_with("qwen3.7-")
-        || canonical.starts_with("qwen3.6-")
-        || canonical.starts_with("qwen3.5-");
+    // This is a configured wire capability, not a model-family heuristic.
+    // Providers can introduce a new hybrid-thinking model without requiring a
+    // Runtime release: the registry snapshot travels in the request profile.
+    let supports_hybrid_thinking_control = protocol_capabilities
+        .iter()
+        .any(|capability| capability == "openai_compat_enable_thinking");
     let deepseek_v4 = matches!(canonical, "deepseek-v4-pro" | "deepseek-v4-flash");
     if deepseek_v4 {
         return request_override
@@ -52,7 +56,7 @@ fn request_reasoning_effort(
             });
     }
     request_override
-        .filter(|effort| effort == "none" && qwen_hybrid)
+        .filter(|effort| effort == "none" && supports_hybrid_thinking_control)
         .or(configured)
 }
 
@@ -227,6 +231,8 @@ pub struct ResolvedProviderProfile {
     pub parallel_tool_calls_mode: ParallelToolCallsMode,
     pub effective_parallel_tool_calls: Option<bool>,
     pub effective_early_tool_start: bool,
+    /// Model-specific wire facts captured from the user model registry.
+    pub model_capabilities: Vec<String>,
     pub capabilities: ProviderCapabilityProfile,
 }
 
@@ -493,9 +499,11 @@ impl ProviderRuntimeClient {
                 system: Some(system.into()),
                 reasoning_effort: request_reasoning_effort(
                     &entry.model,
+                    &entry.request_context.profile.model_capabilities,
                     None,
                     self.reasoning_effort.clone(),
                 ),
+                protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
                 ..MessageRequest::default()
             })
             .await
@@ -703,6 +711,10 @@ fn build_provider_template(
             parallel_tool_calls_mode,
             effective_parallel_tool_calls,
             effective_early_tool_start,
+            model_capabilities: model_protocol::model_registry::global_registry()
+                .capacity_model_info(resolved)
+                .map(|info| info.capabilities.clone())
+                .unwrap_or_default(),
             capabilities,
         },
         transport_fingerprint,
@@ -825,6 +837,7 @@ impl ProviderRuntimeClient {
         };
         let reasoning_effort = request_reasoning_effort(
             &entry.model,
+            &entry.request_context.profile.model_capabilities,
             request.reasoning_effort_override.clone(),
             self.reasoning_effort.clone(),
         );
@@ -956,6 +969,7 @@ async fn forward_provider_attempt(
     );
     let message_request = MessageRequest {
         model: entry.model.clone(),
+        protocol_capabilities: entry.request_context.profile.model_capabilities.clone(),
         max_tokens,
         context_window_limit: Some(context_window_limit),
         messages,
@@ -1390,6 +1404,9 @@ fn outcome_provider_identity(
         "reasoning_signature_roundtrip",
         profile.capabilities.requires_reasoning_signature_roundtrip,
     );
+    for capability in &profile.model_capabilities {
+        capabilities.insert(format!("model:{capability}"), "configured".to_string());
+    }
     capabilities.insert(
         "early_tool_start".to_string(),
         if profile.effective_early_tool_start {
@@ -1914,6 +1931,7 @@ mod tests {
         assert_eq!(
             request_reasoning_effort(
                 "deepseek-v4-pro",
+                &[],
                 Some("none".to_string()),
                 Some("medium".to_string()),
             ),
@@ -1922,10 +1940,33 @@ mod tests {
         assert_eq!(
             request_reasoning_effort(
                 "deepseek/deepseek-v4-flash",
+                &[],
                 Some("max".to_string()),
                 Some("high".to_string()),
             ),
             Some("max".to_string())
+        );
+    }
+
+    #[test]
+    fn configured_hybrid_model_honors_the_one_request_none_override() {
+        assert_eq!(
+            request_reasoning_effort(
+                "configured-hybrid",
+                &["openai_compat_enable_thinking".to_string()],
+                Some("none".to_string()),
+                Some("high".to_string()),
+            ),
+            Some("none".to_string())
+        );
+        assert_eq!(
+            request_reasoning_effort(
+                "ordinary-model",
+                &[],
+                Some("none".to_string()),
+                Some("high".to_string()),
+            ),
+            Some("high".to_string())
         );
     }
 

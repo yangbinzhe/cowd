@@ -13792,6 +13792,7 @@ mod tests {
                         model_protocol::provider_config::ParallelToolCallsMode::Auto,
                     effective_parallel_tool_calls: Some(true),
                     effective_early_tool_start: false,
+                    model_capabilities: Vec::new(),
                     capabilities:
                         model_protocol::provider_capability::ProviderCapabilityProfile::unknown(),
                 },

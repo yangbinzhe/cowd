@@ -45,6 +45,13 @@ impl TransportActivity {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MessageRequest {
     pub model: String,
+    /// Runtime-resolved protocol capabilities for this exact configured model.
+    ///
+    /// This is transport-local and never serialized upstream. Carrying the
+    /// facts on the request avoids a second ambient model lookup at the wire
+    /// boundary and makes the selected protocol behavior reproducible.
+    #[serde(skip)]
+    pub protocol_capabilities: Vec<String>,
     pub max_tokens: u32,
     /// Runtime-resolved context window for local preflight only. This is never
     /// serialized to an upstream provider request.
