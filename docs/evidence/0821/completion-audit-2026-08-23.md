@@ -80,6 +80,13 @@ on the integration candidate:
   contract (100 signed bundles, 256 singleflight callers, Gateway hot route
   3421 RPS versus direct 3789 RPS) and both release Runtime projection probes
   (2,000 foreground samples and a 512-item catch-up/10,000-sample probe).
+  The deterministic SQLite admission-scale regression
+  `one_hundred_programs_with_ten_teams_persist_all_admitted_obligations` also
+  passed: 100 persisted Program roots / 1,000 admitted Team obligations in
+  13.36 seconds, with 145 ms p95 per Program and an exact 100-item
+  nonterminal index. It is an admission/durability scale check, not a claim
+  that PostgreSQL query counts or the no-live-definition-N+1 projection gate
+  have been measured.
   One immediately preceding reference-transport attempt missed its throughput
   floor under local contention; the retry passed without a threshold change,
   so performance repeatability remains a release risk rather than a closed

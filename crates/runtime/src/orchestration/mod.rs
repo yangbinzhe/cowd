@@ -3381,6 +3381,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_hundred_programs_with_ten_teams_persist_all_admitted_obligations() {
+        use std::time::Instant;
+
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
+        let started = Instant::now();
+        let mut per_program_admission_us = Vec::with_capacity(100);
+
+        for program_index in 0..100 {
+            let program_started = Instant::now();
+            let nodes = (0..10)
+                .map(|team_index| {
+                    let mut team = node(
+                        &format!("program-{program_index:03}-team-{team_index:02}"),
+                        CapabilityRecipeId::Team,
+                        Vec::new(),
+                    );
+                    team.template = Some("cowd/parallel-research-synthesis".to_string());
+                    team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
+                    team
+                })
+                .collect::<Vec<_>>();
+            let mut request = proposal(nodes);
+            request.proposal.as_mut().expect("proposal").mutation_id =
+                format!("hundred-programs-mutation-{program_index}");
+            request.constraints.max_parallel_agents = Some(10);
+            request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
+                decision_id: format!("hundred-programs-{program_index}"),
+                decision_revision: 1,
+                decision_lease: format!("hundred-programs-lease-{program_index}"),
+                turn_ref: "turn-v621".to_string(),
+            });
+            team_authority::bind_semantic_resource_authority(
+                &mut request,
+                None,
+                services.workspace_root(),
+            );
+            ensure_test_team_resource(&mut request);
+            let plan = planner::plan_runtime_orchestration(&request);
+            let compiled = compiler::compile_orchestration(
+                &format!("hundred-programs-{program_index}"),
+                &request,
+                &plan,
+                None,
+                Some(services.team_runtime().as_ref()),
+            )
+            .expect("ten-Team Program compiles");
+            let mut graph = services
+                .compile_graph_agent_intents(compiled.graph)
+                .expect("agent intents compile");
+            collaboration_coordinator::prepare_program_admission(
+                &mut graph,
+                services.team_runtime().as_ref(),
+            )
+            .expect("Program admission control compiles");
+            let program = graph
+                .orchestration
+                .as_ref()
+                .and_then(|metadata| metadata.collaboration_program.as_ref())
+                .expect("Team graph has a Program");
+            let root_node_ids = program
+                .team_instances
+                .iter()
+                .map(|instance| {
+                    let (semantic, ordinal) = instance
+                        .instance_id
+                        .rsplit_once(':')
+                        .expect("stable semantic instance id");
+                    program.semantic_node_instances[semantic][ordinal
+                        .parse::<usize>()
+                        .expect("stable instance ordinal")
+                        .saturating_sub(1)]
+                    .clone()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(root_node_ids.len(), 10);
+            let registered = services
+                .execution_supervisor()
+                .register_graph(graph)
+                .await
+                .expect("register Program graph");
+            for node_id in &root_node_ids {
+                collaboration_coordinator::mark_team_admitted(
+                    &registered.id,
+                    node_id,
+                    &format!("team-graph:{node_id}"),
+                    services.execution_supervisor().as_ref(),
+                    services.graph_state_store(),
+                )
+                .await
+                .expect("mark Team admitted");
+            }
+            let stored = services
+                .graph_state_store()
+                .load_async(&registered.id)
+                .await
+                .expect("load registered Program");
+            let control = &stored
+                .orchestration
+                .as_ref()
+                .expect("metadata")
+                .collaboration_program
+                .as_ref()
+                .expect("Program")
+                .control;
+            assert_eq!(
+                control.lifecycle,
+                harness_contract::execution_graph::CollaborationProgramLifecycle::Running
+            );
+            assert_eq!(control.obligations.len(), 10);
+            assert!(control.obligations.iter().all(|obligation| {
+                obligation.state == harness_contract::execution_graph::TeamAdmissionState::Admitted
+                    && obligation.child_graph_ref.is_some()
+            }));
+            per_program_admission_us.push(program_started.elapsed().as_micros() as u64);
+        }
+
+        let indexed_programs = services
+            .graph_state_store()
+            .nonterminal_graph_ids_async()
+            .await
+            .expect("query nonterminal Program index");
+        assert_eq!(indexed_programs.len(), 100);
+        per_program_admission_us.sort_unstable();
+        let p95_index = (per_program_admission_us.len().saturating_sub(1) * 95) / 100;
+        eprintln!(
+            "100 Program x 10 Team durable admission: total_us={} p95_program_us={}",
+            started.elapsed().as_micros(),
+            per_program_admission_us[p95_index]
+        );
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "100 Program x 10 Team durable admission exceeded its bounded test window"
+        );
+    }
+
+    #[tokio::test]
     async fn startup_reconciliation_restores_live_program_approval_wait_state() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         ensure_test_mission(&services);
