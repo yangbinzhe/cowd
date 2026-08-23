@@ -16,7 +16,8 @@ use crate::execution_core::ExecutionStateStoreError;
 use crate::{ExecutionGraphStateStore, RuntimeExecutionSupervisor, RuntimeServices, TeamRuntime};
 
 use super::team_authority::{
-    derive_team_focus_partition_plans, explicit_team_node_contract, semantic_focuses_from_plans,
+    authorized_focuses_for_team, derive_team_focus_partition_plans, explicit_team_node_contract,
+    semantic_focuses_from_plans,
 };
 use super::{
     CapabilityRecipeId, GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationCommand,
@@ -144,7 +145,10 @@ pub(crate) fn compile_conversation_program_intent(
             let focuses = if writer {
                 write_focuses.clone()
             } else {
-                research_focuses.clone()
+                // Each independent Team receives only its own focus lease.
+                // A fan-in Team receives predecessor facts through typed
+                // handoffs, not through duplicated direct-read authority.
+                authorized_focuses_for_team(&research_focuses, index, research_team_count, false)
             };
             let mut resource_scopes = focuses
                 .iter()
@@ -1466,6 +1470,27 @@ mod tests {
                     .iter()
                     .all(|scope| scope == "network:*")
         }));
+        let focus_ids = proposal
+            .nodes
+            .iter()
+            .map(|node| {
+                node.focuses
+                    .iter()
+                    .map(|focus| focus.focus_id.as_str())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert!(focus_ids.iter().enumerate().all(|(index, left)| focus_ids
+            .iter()
+            .skip(index + 1)
+            .all(|right| left.is_disjoint(right))));
+        assert_eq!(
+            focus_ids
+                .iter()
+                .map(std::collections::BTreeSet::len)
+                .sum::<usize>(),
+            4
+        );
         assert_eq!(request.constraints.max_parallel_agents, Some(9));
     }
 

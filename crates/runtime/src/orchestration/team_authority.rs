@@ -394,7 +394,10 @@ pub(crate) fn semantic_focuses_from_plans(plans: &[FocusPartitionPlan]) -> Vec<S
         .collect()
 }
 
-fn authorized_focuses_for_team(
+/// Split Runtime-authored focus contracts across independent Team nodes.
+/// This is an authority boundary: duplicating every focus into every Team
+/// creates false same-scope overlap in an otherwise valid Program.
+pub(crate) fn authorized_focuses_for_team(
     focuses: &[SemanticFocus],
     team_index: usize,
     team_count: usize,
