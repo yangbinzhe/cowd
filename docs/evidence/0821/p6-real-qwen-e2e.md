@@ -220,3 +220,36 @@ The following candidate narrows that format classifier to explicit strict-JSON
 requirements and has a unit regression for JSON as one alternative among
 Markdown/field formats. It must receive a fresh real-Qwen run; this failed run
 does not close the structural sub-gate or P6.
+
+## 2026-08-23 strict-gate real-Qwen pass
+
+Candidate `5480a363` repaired the last root-presentation bridge without
+changing the Team terminal-result contract: the reducer retains a bounded,
+runtime-derived evidence bundle only after every non-reducer worker has
+completed with durable evidence and the Team delivery envelope is fully
+satisfied. The parent carries that summary separately from its mechanical
+`delivery-envelope:` result reference, and the root can therefore publish
+verified completed-Team evidence if the provider path would otherwise replace
+it with a contradictory answer.
+
+The isolated-Gateway real run passed all four production scenarios with the
+requested `qwen3.7-plus` model and no fallback. In the strict collaboration
+scenario it recorded three completed Teams, nine completed Agents, zero Team
+or Agent failures, two claimed typed cross-Team handoff edges, and a 9/9
+architecture-quality score. The root response included the deterministic
+delivery-risk status (`no unresolved delivery-contract findings`) alongside
+the checked source evidence; it did not claim that completed Teams were
+unexecuted.
+
+```text
+Gateway binary sha256 592ddb920c91a7ca8f3c051873d09827614d08c60b665521033d08202f406cd3
+/tmp/cowd-real-qwen-evidence.m8Gu9L/runs/v0.9.703-1787448771-mission-harness-deep/report.json
+sha256 6d0ebe3f89b0c61782bc6022117290010fa19302d44f6514cb4c63152f8f96b6
+
+live-scenarios/004-live_team_projection.json
+sha256 aeeb4ae2d5b8f049046a242cf0630bfe2faea6b64c2ce40a60944e2a16b38950
+```
+
+This closes the strict real-Qwen Team/fan-in presentation sub-gate only. P6
+release closure still requires the remaining cross-session, approval,
+PostgreSQL, and Surface evidence gates from the approved plan.
