@@ -30,7 +30,11 @@ const PROJECTOR_BATCH: usize = 128;
 // supervised pass small and leave a scheduling window between non-empty
 // passes; the durable cursor provides eventual catch-up without turning an
 // evidence burst into SQLite lock pressure on the active mission.
-const PROJECTOR_WORKER_BATCH: usize = 8;
+// Keep the maintenance worker's batch aligned with the independently bounded
+// source scan.  A smaller worker batch checkpointed empty/non-matching
+// commits repeatedly, creating avoidable SQLite writer contention under a
+// foreground burst.  This does not expand the event/byte scan ceiling.
+const PROJECTOR_WORKER_BATCH: usize = PROJECTOR_BATCH;
 const MAX_SOURCE_RETRIES: usize = 3;
 const REPAIR_BATCH: usize = 32;
 // One Runtime transaction is already hard-capped at these exact limits by the
@@ -1421,7 +1425,12 @@ mod tests {
                 .unwrap(),
         );
         reactor.start().unwrap();
-        let observation = append_foreground_probe(&events, prefix, samples);
+        // Start the paired foreground measurement only after the maintenance
+        // lane has entered its durable catch-up pass.  Otherwise the first
+        // scheduler/bootstrap race is charged to the foreground sample while
+        // later rounds are measured against an already-active lane.  The
+        // remaining backlog and the foreground events keep this a real
+        // contention measurement rather than a warmed-idle projection.
         if backlog > 0 {
             let catchup_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
             let catchup_health = loop {
@@ -1439,6 +1448,13 @@ mod tests {
             assert!(
                 catchup_health.lag_commits > 0,
                 "probe requires a real remaining backlog"
+            );
+        }
+        let observation = append_foreground_probe(&events, prefix, samples);
+        if backlog > 0 {
+            assert!(
+                projector.health().expect("projector health").lag_commits > 0,
+                "foreground measurement must overlap durable catch-up"
             );
         }
         let report = reactor.shutdown().await;

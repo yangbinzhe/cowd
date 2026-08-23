@@ -2718,7 +2718,9 @@ mod tests {
         let gateway_rps = HOT_SAMPLES as f64 / gateway_wall.as_secs_f64();
         assert!(
             gateway_rps >= direct_rps * 0.85,
-            "Gateway throughput fell below 85%"
+            "Gateway throughput fell below 85%: direct_rps={direct_rps:.2}, gateway_rps={gateway_rps:.2}, direct_wall_ms={}, gateway_wall_ms={}",
+            direct_wall.as_millis(),
+            gateway_wall.as_millis(),
         );
         let direct_cpu_per_request = direct_cpu_ticks as f64 / HOT_SAMPLES as f64;
         let gateway_cpu_per_request = gateway_cpu_ticks as f64 / HOT_SAMPLES as f64;

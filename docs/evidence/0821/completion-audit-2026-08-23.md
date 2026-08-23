@@ -423,3 +423,43 @@ Additional preflight:
 
 This remains a preflight correction, not a release result. The next candidate
 is again entitled to one clean full real scenario run only.
+
+## 2026-08-24 local closure rerun — real-provider boundary remains blocked
+
+The current dirty integration worktree was revalidated after the managed
+escalation receipt, root control-tool contract, provider-output tolerance and
+maintenance-projection fixes.  This is local evidence only; it does not create
+a release tuple or substitute for the authority-plan §22.3 real-provider run.
+
+- `cargo test -p runtime --lib -- --test-threads=1`: 1,827 passed, 0 failed,
+  2 ignored.
+- `cargo test -p gateway --lib -- --test-threads=1`: 795 passed, 0 failed,
+  12 explicitly external/serial ignored.
+- `cargo run -p harness-eval -- full --budget full`: passed, 18/18 report
+  gates; report
+  `/home/yi/.config/cowd/harness-eval/reports/runs/v0.9.704-1787526143-mission-harness-full/report.json`.
+- `bash scripts/test/reference-app-performance.sh`: passed.  Its latest
+  report records 100 signed bundles, 256 singleflight callers, direct hot
+  2790.41 RPS versus Gateway 3652.77 RPS, and bounded stream TTFB/cancel.
+- `bash scripts/test/runtime-projection-performance.sh`: passed.  The active
+  catch-up probe observed 566.033 ms baseline versus 570.682 ms projected
+  foreground mean, with p95/p99 unchanged at the test precision.
+- `one_hundred_programs_with_ten_teams_persist_all_admitted_obligations`:
+  passed in 10.19 seconds, p95 112.953 ms per Program, 100 indexed Programs
+  and 1,000 admitted Team obligations.
+- `bash scripts/test/postgres-contract.sh`: passed against two isolated,
+  disposable local PostgreSQL databases, including migration/restart/fence,
+  Session, Surface and cross-database copy contracts.  Both databases were
+  dropped after the run.
+- `bash scripts/scenarios/openapi-generation.sh check`, formatting,
+  `cargo check -p runtime -p gateway --all-targets`, and
+  `bash scripts/test/collaboration-deletion-gate.sh`: passed.
+
+The real Qwen command was intentionally attempted only through
+`scripts/scenarios/harness-eval-real-qwen.sh`'s configured Token Plan path.
+It failed before startup because `COWD_EVAL_TOKEN_PLAN_API_KEY` is absent from
+the current process.  No credential was searched for, logged or substituted,
+and no fallback provider was used.  Therefore §22.3/A12 remains blocked:
+there is still no clean current-candidate proof of the required multi-Team
+merge, managed escalation, same-session continuation, cross-session
+deny/allow, approval, PostgreSQL query summary and Surface screenshot.

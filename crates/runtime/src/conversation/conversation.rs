@@ -2148,7 +2148,8 @@ mod tool_exposure_contract_tests {
                 "grep_search",
                 "read_file",
                 "request_collaboration_escalation",
-                "runtime_orchestrate"
+                "runtime_orchestrate",
+                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
             ]
         );
     }
@@ -17868,7 +17869,9 @@ mod tests {
             .chain(projection.bootstrap_ids.iter())
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(active.contains("runtime_orchestrate"));
+        assert!(
+            active.contains(harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID)
+        );
         assert_eq!(
             active.len(),
             2,

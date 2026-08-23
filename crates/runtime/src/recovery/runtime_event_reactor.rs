@@ -28,6 +28,11 @@ pub enum RuntimeProjectionLatencyClass {
     Maintenance,
 }
 
+// Maintenance lanes are durable but never latency-critical.  Coalescing their
+// backlog passes for this short interval prevents a busy foreground stream
+// from turning each commit notification into a competing SQLite scan/write.
+const MAINTENANCE_BACKLOG_YIELD: Duration = Duration::from_millis(50);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProjectionDescriptor {
     pub projection_id: String,
@@ -369,7 +374,11 @@ impl RuntimeEventReactor {
                                         tokio::task::yield_now().await;
                                     }
                                     RuntimeProjectionLatencyClass::Maintenance => {
-                                        tokio::time::sleep(Duration::from_millis(1)).await;
+                                        // Maintenance projections share durable stores with
+                                        // foreground execution.  A short but real yield keeps
+                                        // catch-up progressing while giving foreground writers
+                                        // a scheduling window between bounded passes.
+                                        tokio::time::sleep(MAINTENANCE_BACKLOG_YIELD).await;
                                     }
                                 }
                                 continue;
