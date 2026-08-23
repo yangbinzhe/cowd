@@ -94,3 +94,26 @@ candidate and generated Edge/MFG consumer output are independently audited,
 there is no single cross-repository release tuple. Finally, the real-Qwen
 fan-in pass does not include the required Agent escalation, same-session
 continuation, cross-session deny/allow, and approval in one controlled E2E.
+
+## Follow-up audit — Edge and MFG consumer candidates
+
+The independent consumer checks below were executed after the preceding
+integration-candidate audit. They establish that the checked consumer trees are
+buildable and contract-clean; they do **not** turn their independently selected
+backend SHA into the Cowd integration candidate's release tuple.
+
+- Cowd Edge `04b63861e9e332576d08a2f81326942b22c92e9a` was clean and four
+  commits ahead of `origin/master`. Its full WebUI gate passed: 53 test files /
+  438 tests, i18n source and coverage gates, API matrix, presentation contract,
+  capability parity, raw-payload, secondary-section and acceptance gates. A
+  production `pnpm build` also passed. The gate's recorded backend provenance
+  is Cowd `master` `b3d381ddd3c0c3d591f72f4d1f8fa9ede0b3a9e8`, not this
+  integration candidate, so it is consumer health evidence only.
+- Cowd App MFG `3d47526a37154ad58f3ecf9e174f229f10090a7d` was clean.
+  Its WebUI `npm run typecheck`, `npm test` (13 files / 91 tests and the
+  production browser gate), and `npm run build` all passed.
+- The Edge and MFG checks add the previously missing independent consumer
+  evidence, but neither generates nor validates a shared three-repository
+  manifest. Edge remains unpublished locally and the backend identity above is
+  different from the integration candidate; the cross-repository release tuple
+  therefore remains unverified.
