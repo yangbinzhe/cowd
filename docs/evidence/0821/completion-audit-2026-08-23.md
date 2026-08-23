@@ -20,7 +20,7 @@ diff hash are SHA-256 of the empty stream and the untracked-file count is zero.
 
 | Authority gate / phase | Current proof | Status | Required owner/action |
 |---|---|---|---|
-| P0 cross-repo baseline, ownership and generated-manifest freeze | `0821-file-ownership.tsv` exists, but no `collaboration-baseline.json` or three-repo generated-output manifest is present | incomplete | P0 evidence/baseline owner |
+| P0 cross-repo baseline, ownership and generated-manifest freeze | `0821-file-ownership.tsv` and `collaboration-baseline.json` now freeze the three checked trees, plan/ownership digests and the five Edge generated outputs; the JSON explicitly records that the release tuple is not verified | baseline complete; release tuple intentionally open | P6 release owner |
 | B1 / P1 N-Team durable admission | Coordinator and durable obligations exist; P1 targeted tests record admission behavior | partial; B1 exact gate not evidenced | Runtime Coordinator |
 | B2 / P3 ephemeral Team | Snapshot/AddTeam behavior is implemented and tested | partial; only the documented increment is closed | Runtime Coordinator + Team compiler |
 | B3 / P2 cross-Team delivery | `CrossTeamEdgeState` and `CrossTeamInputContract` are contracts only. Runtime has no delivery/claim receipt owner or consumer activation path. | missing | Runtime Coordinator + graph transaction |
@@ -108,6 +108,12 @@ The independent consumer checks below were executed after the preceding
 integration-candidate audit. They establish that the checked consumer trees are
 buildable and contract-clean; they do **not** turn their independently selected
 backend SHA into the Cowd integration candidate's release tuple.
+
+`collaboration-baseline.json` is the machine-readable P0 snapshot for these
+same checked trees. It records the plan/ownership digests, clean index and
+worktree hashes, untracked counts, and all five generated Edge contract output
+hashes. Its `release_tuple_verified` value is deliberately `false` and lists
+the incompatible backend provenance and unpublished Edge candidate as blockers.
 
 - Cowd Edge `04b63861e9e332576d08a2f81326942b22c92e9a` was clean and four
   commits ahead of `origin/master`. Its full WebUI gate passed: 53 test files /

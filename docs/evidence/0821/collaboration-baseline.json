@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "authority": {
+    "path": "/media/yi/Datas/workspace/plan/0821-自主编排与跨Agent跨团队协同-版本审计与框架升级方案.md",
+    "sha256": "dab9b51479e88899afb04a549a5a23ec407564b2a309018e18c40d4471efc8fd"
+  },
+  "ownership_tsv": {
+    "path": "docs/evidence/0821/0821-file-ownership.tsv",
+    "sha256": "5da5f45274fd26e02c9028a48c9618df63aad0b284b2957a9b09759f8bbc04ee"
+  },
+  "repositories": [
+    {
+      "name": "cowd",
+      "path": "/media/yi/Datas/workspace/cowd-0821-terminal",
+      "branch": "integration/0821-terminal",
+      "commit": "cc10f0b56d71f52299e784cce1cb73e90cd142c7",
+      "index_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "worktree_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_count": 0
+    },
+    {
+      "name": "cowd-edge",
+      "path": "/media/yi/Datas/workspace/cowd-edge",
+      "branch": "master",
+      "commit": "04b63861e9e332576d08a2f81326942b22c92e9a",
+      "index_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "worktree_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_count": 0,
+      "published_against_origin_master": false,
+      "consumer_backend_provenance": "b3d381ddd3c0c3d591f72f4d1f8fa9ede0b3a9e8"
+    },
+    {
+      "name": "cowd-app-mfg",
+      "path": "/media/yi/Datas/workspace/cowd-app-mfg",
+      "branch": "master",
+      "commit": "3d47526a37154ad58f3ecf9e174f229f10090a7d",
+      "index_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "worktree_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "untracked_count": 0
+    }
+  ],
+  "generated_edge_contract_outputs": [
+    {
+      "path": "surfaces/webui/src/generated/gateway-api.ts",
+      "sha256": "b7804e63db5804036f61a730c461650354014b0fe0984e2f0ee85b2ce1b6e961"
+    },
+    {
+      "path": "surfaces/webui/src/generated/live-contract-meta.ts",
+      "sha256": "15a9783fd17d886407040ff1212237700cee25dd3a17c64cca33d62ae24d3401"
+    },
+    {
+      "path": "surfaces/webui/src/generated/projection-v2-golden.ts",
+      "sha256": "41629a1d0cc9296d33556e87e0a1f1f4b456dc2f5c71cca0135513e406885b45"
+    },
+    {
+      "path": "surfaces/webui/src/generated/projection-contract-meta.ts",
+      "sha256": "fecb3c9582a2413a0cb57635eab527fd68bab0cc846fbd7f38f2d900fd4b56cf"
+    },
+    {
+      "path": "surfaces/webui/src/generated/app-protocol-meta.ts",
+      "sha256": "cd6cda74418c1c36737eaebd05ff0ea3a3a4b84ed1decccb7a3930c5214838bc"
+    }
+  ],
+  "release_tuple_verified": false,
+  "release_tuple_blockers": [
+    "cowd-edge is four commits ahead of origin/master",
+    "edge consumer provenance is Cowd master rather than this integration candidate",
+    "no release owner has created a single version/tag/build identity"
+  ]
+}
