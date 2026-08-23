@@ -3141,7 +3141,11 @@ fn explicit_workstream_count(normalized: &str) -> u8 {
 /// research Teams are not satisfied by two Agents inside one Team graph.
 #[must_use]
 pub fn explicit_team_count(prompt: &str) -> u8 {
-    let normalized = prompt.to_ascii_lowercase();
+    // Cardinality is a semantic contract, while Markdown emphasis/code
+    // delimiters are presentation only. Normalize those delimiters before
+    // matching so `两个** required Team` means the same as `两个 required Team`.
+    let markdown_stripped = prompt.to_ascii_lowercase().replace(['*', '`'], " ");
+    let normalized = markdown_stripped.split_whitespace().collect::<Vec<_>>().join(" ");
     const COUNTS: &[(&str, &str, u8)] = &[
         ("一", "one", 1),
         ("二", "two", 2),
@@ -3203,13 +3207,15 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
         // Keep the qualifier set narrowly collaboration-specific so an
         // unrelated phrase cannot accidentally become a Team obligation.
         let qualified_english_team_match =
-            ["协作", "独立", "并行", "平行"].iter().any(|qualifier| {
+            ["协作", "独立", "并行", "平行", "required"].iter().any(|qualifier| {
                 ["team", "teams"].iter().any(|role| {
                     [
                         format!("{chinese}{qualifier} {role}"),
                         format!("{chinese}个{qualifier} {role}"),
+                        format!("{chinese}个 {qualifier} {role}"),
                         format!("{arabic}{qualifier} {role}"),
                         format!("{arabic}个{qualifier} {role}"),
+                        format!("{arabic}个 {qualifier} {role}"),
                         format!("{arabic} {qualifier} {role}"),
                     ]
                     .iter()
@@ -3629,6 +3635,18 @@ mod tests {
         assert_eq!(explicit_team_count("启动两个研究团队并行核查"), 2);
         assert_eq!(explicit_team_count("start three research teams"), 3);
         assert_eq!(explicit_team_count("请使用恰好3个Team完成真实任务"), 3);
+        assert_eq!(
+            explicit_team_count("初始 Program 合同**恰好只有两个** required Team obligation"),
+            2,
+            "an explicit required-Team contract must preserve its cardinality"
+        );
+        assert_eq!(
+            understand(&StrategyInput::from_prompt(
+                "初始 Program 合同**恰好只有两个** required Team obligation"
+            ))
+            .required_team_count,
+            2
+        );
         assert_eq!(explicit_team_count("启动三个 Team 并行核查"), 3);
         assert_eq!(
             explicit_team_count("必须实际启动三个协作 Team，Team A、B、C 分工汇合"),
