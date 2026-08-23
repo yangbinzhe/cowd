@@ -125,12 +125,7 @@ fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String>
         let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref) else {
             continue;
         };
-        if packet.team_role_assignment().is_some_and(|assignment| {
-            assignment
-                .behavior
-                .iter()
-                .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. }))
-        }) {
+        if is_reducer_agent(&packet) {
             continue;
         }
         let Some(result) = graph.node_results.get(&node.id) else {
@@ -193,6 +188,15 @@ fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String>
     })
 }
 
+fn is_reducer_agent(packet: &AgentTaskPacket) -> bool {
+    packet.team_role_assignment().is_some_and(|assignment| {
+        assignment
+            .behavior
+            .iter()
+            .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. }))
+    })
+}
+
 /// Return a deterministic Team evidence bundle only when all worker branches
 /// are completed, evidence-bearing, and the graph's own delivery envelope is
 /// fully satisfied. This is a transport carrier, not an `AnswerCandidate` and
@@ -211,7 +215,12 @@ fn verified_team_evidence_bundle(
     let worker_count = graph
         .nodes
         .iter()
-        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        .filter(|node| {
+            node.kind == ExecutionNodeKind::AgentTask
+                && serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                    .map(|packet| !is_reducer_agent(&packet))
+                    .unwrap_or(false)
+        })
         .count();
     let summary = aggregate_positive_evidence_summary(graph)?;
     let summarized_worker_count = summary.lines().filter(|line| line.starts_with('[')).count();
@@ -979,6 +988,22 @@ mod tests {
         graph.nodes.push(node);
     }
 
+    fn add_reducer_branch(graph: &mut ExecutionGraph, node_id: &str) {
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::AgentTask,
+            "agent_task",
+            serde_json::to_string(&synthesizer_packet()).expect("reducer packet"),
+        );
+        node.id = node_id.to_string();
+        graph
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Completed);
+        let mut reducer_result = result(ExecutionNodeStatus::Completed, ExecutionUsage::default());
+        reducer_result.summary = Some("mechanical reducer branch".to_string());
+        graph.node_results.insert(node.id.clone(), reducer_result);
+        graph.nodes.push(node);
+    }
+
     #[test]
     fn only_topology_terminal_agent_publishes_the_team_answer() {
         let mut graph = ExecutionGraph::new("research");
@@ -1008,6 +1033,9 @@ mod tests {
         // select the visible Team result.
         add_evidence_branch(&mut graph, "branch-b", "plain text finding B", false);
         add_evidence_branch(&mut graph, "branch-a", "structured finding A", true);
+        // A real Team graph also has a reducer AgentTask. It participates in
+        // delivery status but must not be counted as evidence prose.
+        add_reducer_branch(&mut graph, "synthesizer");
         add_verify(&mut graph, true);
 
         assert_eq!(
