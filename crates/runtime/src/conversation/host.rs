@@ -16460,7 +16460,7 @@ mod tests {
                     "team_id": "team-runtime",
                     "working_state_verified": true,
                     "terminal_summary_kind": "verified_team_evidence_bundle",
-                    "terminal_summary": "# Verified Team evidence bundle\n\nobserved_source_paths: crates/runtime/src/conversation/host.rs",
+                    "terminal_summary": "# Verified Team evidence bundle\n\n## Risk status\n\nRisk: no unresolved delivery-contract findings in this completed Team.\n\nobserved_source_paths: crates/runtime/src/conversation/host.rs",
                     "delivery_envelope": {
                         "envelope_id": "team-runtime-envelope",
                         "revision": 3,
@@ -16474,7 +16474,7 @@ mod tests {
                     "team_id": "team-memory",
                     "working_state_verified": true,
                     "terminal_summary_kind": "verified_team_evidence_bundle",
-                    "terminal_summary": "# Verified Team evidence bundle\n\nobserved_source_paths: crates/memory/src/store/mod.rs",
+                    "terminal_summary": "# Verified Team evidence bundle\n\n## Risk status\n\nRisk: no unresolved delivery-contract findings in this completed Team.\n\nobserved_source_paths: crates/memory/src/store/mod.rs",
                     "delivery_envelope": {
                         "envelope_id": "team-memory-envelope",
                         "revision": 4,

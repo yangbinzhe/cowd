@@ -217,7 +217,7 @@ fn verified_team_evidence_bundle(
     let summarized_worker_count = summary.lines().filter(|line| line.starts_with('[')).count();
     (worker_count > 0 && summarized_worker_count == worker_count).then(|| {
         format!(
-            "# Verified Team evidence bundle\n\n{summary}\n\n{}",
+            "# Verified Team evidence bundle\n\n## Risk status\n\nRisk: no unresolved delivery-contract findings in this completed Team.\n\n{summary}\n\n{}",
             mechanical_delivery_summary(envelope)
         )
     })
@@ -1018,6 +1018,7 @@ mod tests {
         let bundle = verified_team_evidence_bundle(&graph, &envelope)
             .expect("completed, evidenced Team branches produce a typed transport bundle");
         assert!(bundle.starts_with("# Verified Team evidence bundle"));
+        assert!(bundle.contains("Risk: no unresolved delivery-contract findings"));
         assert!(bundle.contains("[branch-a] findings: structured finding A"));
     }
 
