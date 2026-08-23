@@ -48,6 +48,34 @@ use sha2::{Digest, Sha256};
 
 const PROVIDER_PROTOCOL_RECOVERY_BUDGET: u8 = 1;
 
+/// The root collaboration contract has a deliberately small, durable control
+/// plane. Capability discovery is useful, but it must not satisfy the action
+/// obligation that admits a Program. Keeping this as Runtime state prevents a
+/// provider from looping on a harmless catalog lookup while the user-required
+/// Team proposal never happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum RootControlPlanePhase {
+    /// The first request may inspect the current catalog or submit a proposal.
+    #[default]
+    CapabilityOrProposal,
+    /// A successful catalog inspection committed; the next request must
+    /// submit the typed orchestration proposal.
+    ProposalOnly,
+    /// A successful Team proposal receipt committed. Team execution evidence,
+    /// rather than this phase marker, still decides terminal satisfaction.
+    ProposalSubmitted,
+}
+
+impl RootControlPlanePhase {
+    const fn required_tool_choice(self) -> &'static str {
+        match self {
+            Self::CapabilityOrProposal => "runtime_capabilities|runtime_orchestrate",
+            Self::ProposalOnly | Self::ProposalSubmitted => "runtime_orchestrate",
+        }
+    }
+}
+
 /// Runtime-owned host for the standard provider-backed conversation engine.
 ///
 /// Gateway supplies service adapters such as tool executors and stream callbacks, but
@@ -1104,6 +1132,8 @@ where
             collaboration_committed_write: false,
             pending_root_control_plane_receipt: None,
             pending_root_control_plane_requirement: None,
+            root_control_plane_phase: RootControlPlanePhase::default(),
+            pending_root_control_plane_phase: None,
             root_write_replans: 0,
             root_language_replan_attempted: false,
             nested_orchestration_forbidden: execution_parent.is_some()
@@ -3151,6 +3181,13 @@ struct TurnGraphState {
     /// A root collaboration requirement becomes durable with the next model
     /// node commit, before any proposal receipt can be consumed.
     pending_root_control_plane_requirement: Option<u8>,
+    /// The committed root control-plane phase. This is also mirrored to the
+    /// Session event stream after every ToolBatch transition so recovery can
+    /// restore the same provider restriction without replaying model prose.
+    root_control_plane_phase: RootControlPlanePhase,
+    /// A ToolBatch stages its phase advance here; `after_commit` publishes it
+    /// and only then makes it visible to the following model node.
+    pending_root_control_plane_phase: Option<RootControlPlanePhase>,
     root_write_replans: u8,
     root_language_replan_attempted: bool,
     nested_orchestration_forbidden: bool,
@@ -3894,21 +3931,35 @@ where
             )
         };
         let mut runtime = self.runtime.lock().await;
-        let required_control_plane_team_count = {
+        let required_control_plane = {
             let state = self.state.lock().await;
             if state.execution_role.is_delegated_leaf() || !state.verified_team_ids.is_empty() {
                 None
             } else {
                 state.task_understanding.as_ref().and_then(|value| {
-                    (value.required_team_count > 0).then_some(value.required_team_count)
+                    (value.required_team_count > 0)
+                        .then_some((value.required_team_count, state.root_control_plane_phase))
                 })
             }
         };
-        if let Some(required_team_count) = required_control_plane_team_count {
-            self.state
-                .lock()
-                .await
-                .pending_root_control_plane_requirement = Some(required_team_count);
+        if let Some((required_team_count, local_phase)) = required_control_plane {
+            let (session_id, turn_id) = {
+                let state = self.state.lock().await;
+                (state.session_id.clone(), state.turn_id.clone())
+            };
+            let phase = recovered_root_control_plane_phase(&self.services, &session_id, &turn_id)
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!(
+                        "recover root collaboration control-plane phase before provider exposure: {error}"
+                    ),
+                })?
+                .unwrap_or(local_phase);
+            {
+                let mut state = self.state.lock().await;
+                state.root_control_plane_phase = phase;
+                state.pending_root_control_plane_requirement = Some(required_team_count);
+            }
             runtime
                 .require_active_turn_collaboration_control_plane(required_team_count)
                 .map_err(|error| NodeExecutorError::Poll {
@@ -3917,7 +3968,18 @@ where
                         "pin required root collaboration strategy before control-plane exposure: {error}"
                     ),
                 })?;
-            runtime.require_next_model_orchestration_only();
+            match phase {
+                RootControlPlanePhase::CapabilityOrProposal => {
+                    runtime.require_next_model_orchestration_only();
+                }
+                RootControlPlanePhase::ProposalOnly => {
+                    runtime.require_next_model_tool_action([
+                        harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID.to_string(),
+                    ]);
+                    runtime.require_next_model_reasoning_effort("none");
+                }
+                RootControlPlanePhase::ProposalSubmitted => {}
+            }
         }
         for item in pending_next_model_context {
             runtime.push_next_model_context_item(item);
@@ -6309,28 +6371,78 @@ where
 }
 
 fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
-    calls.iter().any(|call| {
-        if !call
-            .name
-            .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
-        {
-            return false;
-        }
-        serde_json::from_str::<serde_json::Value>(&call.input)
-            .ok()
-            .is_some_and(|input| {
-                input.get("operation").and_then(serde_json::Value::as_str) == Some("propose")
-                    && input
-                        .pointer("/proposal/nodes")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|nodes| {
-                            nodes.iter().any(|node| {
-                                node.get("recipe").and_then(serde_json::Value::as_str)
-                                    == Some("team")
-                            })
+    calls.iter().any(is_team_orchestration_call)
+}
+
+fn is_team_orchestration_call(call: &ModelToolCall) -> bool {
+    if !call
+        .name
+        .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
+    {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&call.input)
+        .ok()
+        .is_some_and(|input| {
+            input.get("operation").and_then(serde_json::Value::as_str) == Some("propose")
+                && input
+                    .pointer("/proposal/nodes")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            node.get("recipe").and_then(serde_json::Value::as_str) == Some("team")
                         })
-            })
-    })
+                    })
+        })
+}
+
+fn root_control_plane_phase_after_tool_batch(
+    current: RootControlPlanePhase,
+    calls: &[ModelToolCall],
+    successful_call_ids: &BTreeSet<String>,
+) -> RootControlPlanePhase {
+    if calls
+        .iter()
+        .any(|call| successful_call_ids.contains(&call.id) && is_team_orchestration_call(call))
+    {
+        return RootControlPlanePhase::ProposalSubmitted;
+    }
+    let inspected_capabilities = calls.iter().any(|call| {
+        successful_call_ids.contains(&call.id)
+            && call.name.eq_ignore_ascii_case("runtime_capabilities")
+    });
+    if inspected_capabilities && current == RootControlPlanePhase::CapabilityOrProposal {
+        RootControlPlanePhase::ProposalOnly
+    } else {
+        current
+    }
+}
+
+fn recovered_root_control_plane_phase(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+) -> Result<Option<RootControlPlanePhase>, String> {
+    services
+        .event_store()
+        .list_stream(&format!("session:{session_id}"))?
+        .into_iter()
+        .rev()
+        .find(|event| {
+            event.kind == "runtime.control_plane.phase"
+                && event
+                    .refs
+                    .iter()
+                    .any(|reference| reference.kind == "turn" && reference.id == turn_id)
+        })
+        .and_then(|event| {
+            event
+                .payload
+                .get("phase")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+        })
+        .map_or(Ok(None), |phase| Ok(Some(phase)))
 }
 
 fn requests_runtime_orchestration(calls: &[ModelToolCall]) -> bool {
@@ -6869,6 +6981,25 @@ where
             bounded_evidence_role && failed == 0 && !scope_keys.is_empty() && newly_scoped == 0;
         let mut automatic_focus_verification = None;
         let mut state = self.state.lock().await;
+        let root_control_plane_required = !state.execution_role.is_delegated_leaf()
+            && state.verified_team_ids.is_empty()
+            && state
+                .task_understanding
+                .as_ref()
+                .is_some_and(|understanding| understanding.required_team_count > 0);
+        if root_control_plane_required {
+            let next_phase = root_control_plane_phase_after_tool_batch(
+                state.root_control_plane_phase,
+                &calls,
+                &successful_call_ids,
+            );
+            if next_phase != state.root_control_plane_phase {
+                // Do not expose this transition to another model node until
+                // the ToolBatch itself is durable. `after_commit` publishes
+                // the matching Session event and then advances live state.
+                state.pending_root_control_plane_phase = Some(next_phase);
+            }
+        }
         state.max_tool_concurrency_observed = state
             .max_tool_concurrency_observed
             .max(result.max_concurrency_observed);
@@ -7512,19 +7643,67 @@ where
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
-        let messages = self
-            .state
-            .lock()
-            .await
-            .pending_transcript
-            .remove(&ticket.node_id)
-            .unwrap_or_default();
+        let (messages, root_control_plane_phase, session_id, turn_id) = {
+            let mut state = self.state.lock().await;
+            let phase = state.pending_root_control_plane_phase.take();
+            if let Some(phase) = phase {
+                state.root_control_plane_phase = phase;
+            }
+            (
+                state
+                    .pending_transcript
+                    .remove(&ticket.node_id)
+                    .unwrap_or_default(),
+                phase,
+                state.session_id.clone(),
+                state.turn_id.clone(),
+            )
+        };
         self.runtime
             .lock()
             .await
             .session_mut_async()
             .await
             .extend_messages(messages);
+        if let Some(phase) = root_control_plane_phase {
+            self.services
+                .event_store()
+                .append(crate::RuntimeEventInput {
+                    stream_id: format!("session:{session_id}"),
+                    scope: crate::RuntimeEventScope::Session,
+                    kind: "runtime.control_plane.phase".to_string(),
+                    status: Some(
+                        (phase == RootControlPlanePhase::ProposalSubmitted)
+                            .then_some("satisfied")
+                            .unwrap_or("waiting")
+                            .to_string(),
+                    ),
+                    actor: Some("conversation_runtime.root_control_plane".to_string()),
+                    refs: vec![
+                        crate::RuntimeEventRef {
+                            kind: "execution_graph".to_string(),
+                            id: ticket.graph_id.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "execution_node".to_string(),
+                            id: ticket.node_id.clone(),
+                        },
+                        crate::RuntimeEventRef {
+                            kind: "turn".to_string(),
+                            id: turn_id,
+                        },
+                    ],
+                    payload: serde_json::json!({
+                        "phase": phase,
+                        "required_tool_choice": phase.required_tool_choice(),
+                        "program_admitted": phase == RootControlPlanePhase::ProposalSubmitted,
+                    }),
+                })
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!("persist root control-plane phase: {error}"),
+                })?;
+        }
         Ok(())
     }
 }
@@ -16418,6 +16597,50 @@ mod tests {
         assert!(!requests_runtime_orchestration(std::slice::from_ref(
             &team_named_ordinary_tool
         )));
+    }
+
+    #[test]
+    fn capability_receipt_advances_root_control_plane_to_proposal_only() {
+        let capability = ModelToolCall {
+            id: "catalog".to_string(),
+            name: "runtime_capabilities".to_string(),
+            input: r#"{"detail":"team_templates"}"#.to_string(),
+            depends_on: Vec::new(),
+        };
+        let phase = root_control_plane_phase_after_tool_batch(
+            RootControlPlanePhase::CapabilityOrProposal,
+            std::slice::from_ref(&capability),
+            &BTreeSet::from([capability.id.clone()]),
+        );
+        assert_eq!(phase, RootControlPlanePhase::ProposalOnly);
+        assert_eq!(phase.required_tool_choice(), "runtime_orchestrate");
+    }
+
+    #[test]
+    fn only_a_successful_team_proposal_satisfies_root_control_plane_action() {
+        let proposal = ModelToolCall {
+            id: "team".to_string(),
+            name: "runtime_orchestrate".to_string(),
+            input: r#"{"intent":"review","operation":"propose","proposal":{"mutation_id":"review","nodes":[{"node_id":"review-team","recipe":"team","objective":"review"}],"reason":"independent review"}}"#.to_string(),
+            depends_on: Vec::new(),
+        };
+        assert_eq!(
+            root_control_plane_phase_after_tool_batch(
+                RootControlPlanePhase::ProposalOnly,
+                std::slice::from_ref(&proposal),
+                &BTreeSet::new(),
+            ),
+            RootControlPlanePhase::ProposalOnly,
+            "failed or absent tool results must not unlock ordinary tools"
+        );
+        assert_eq!(
+            root_control_plane_phase_after_tool_batch(
+                RootControlPlanePhase::ProposalOnly,
+                std::slice::from_ref(&proposal),
+                &BTreeSet::from([proposal.id.clone()]),
+            ),
+            RootControlPlanePhase::ProposalSubmitted
+        );
     }
 
     #[test]

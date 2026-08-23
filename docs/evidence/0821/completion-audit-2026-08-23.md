@@ -344,3 +344,48 @@ Preflight passed:
 
 The next strict real-model run is reserved for the exact clean commit of this
 candidate. It remains the sole authority for release/tag eligibility.
+
+## Root control-plane capability-to-proposal transition — preflight for the next candidate
+
+The next isolated Token Plan candidate was intentionally stopped after the
+first failing collaboration scenario, before the unrelated escalation scenario
+could spend another provider run. Gateway logged the configured route as
+`qwen-tokenplan` / `qwen3.8-max`; the raw retained Gateway log is under the
+isolated temporary run directory created by the harness. Direct evidence,
+tool evidence and the single-architecture scenario passed.
+
+The collaboration failure was neither a malformed Team request nor a provider
+transport problem. C1 correctly exposed only `runtime_capabilities` and
+`runtime_orchestrate` and correctly used required native tool choice. The
+model made the permitted capability query, then returned prose rather than a
+proposal. The existing one repair re-exposed the same two-tool pair, allowing
+the same harmless query to consume the required action again. Runtime then
+correctly recorded `missing_control_plane_proposal` with zero admitted Teams,
+but it had not prevented the avoidable loop.
+
+This candidate adds a three-state Runtime-owned control-plane transition:
+
+- `capability_or_proposal`: the initial request exposes exactly the C1 pair;
+- after a successful, committed capability receipt, `proposal_only`: the next
+  request exposes and requires only `runtime_orchestrate`;
+- only a successful typed Team proposal advances to `proposal_submitted`.
+
+The phase is staged until the ToolBatch graph commit succeeds, persisted as a
+Session event with the turn reference, and rehydrated from that durable event
+before any later provider exposure. It does not select a template, team name,
+role, focus, dependency or program on the model's behalf. A failed capability
+call or failed proposal leaves the prior restriction intact; verified Team
+execution remains the independent terminal acceptance condition.
+
+Preflight passed:
+
+- `cargo test -p runtime --lib capability_receipt_advances_root_control_plane_to_proposal_only`
+- `cargo test -p runtime --lib only_a_successful_team_proposal_satisfies_root_control_plane_action`
+- `cargo test -p runtime --lib orchestration_phase_gate_exposes_only_control_plane_tools`
+- `cargo test -p runtime --lib host_does_not_materialize_required_teams_before_root_control_plane_receipt`
+- `cargo check -p runtime --all-targets`
+- formatting and whitespace checks.
+
+The next real candidate must demonstrate the full multi-Team path, including
+the subsequent escalation and continuation scenarios, before any release
+claim, version change, tag or push is permitted.
