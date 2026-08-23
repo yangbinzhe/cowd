@@ -255,7 +255,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_agent_escalation",
-                prompt: "这是一次受控协作升级验收。必须先实际启动且仅启动两个独立协作 Team：Team A 审查 runtime 的 durable Program/edge 事实，Team B 审查 gateway 的受管 Agent 工具边界；两者可并行。Team A 在读取到第一批源码证据后的安全检查点，必须由其受管 Agent 实际调用 `request_collaboration_escalation` 恰好请求一个独立的第三个 Team，用于复核 A/B 的授权证据并综合边界结论。不可在初始方案中直接创建第三个 Team，也不可用模型文本替代该工具调用；不要猜测或提供 Program revision/digest，Runtime 会从已绑定父 Program 派生它们。最终结论必须字面列出至少三个完整的 `crates/.../*.rs` 源码路径，只陈述实际读取到的证据。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 和 request_collaboration_escalation；不要调用 bash 或任何写工具。",
+                prompt: "这是一次受控协作升级验收。初始 Program 合同**恰好只有两个** required Team obligation：Team A 审查 runtime 的 durable Program/edge 事实，Team B 审查 gateway 的受管 Agent 工具边界；两者可并行。初始 `runtime_orchestrate` proposal 绝不可包含额外 Team、reviewer、aggregator 或预先规划的 follow-up。Team A 在读取到第一批源码证据后的安全检查点，必须由其受管 Agent 实际调用 `request_collaboration_escalation` 申请一个独立复核工作流；只有该 Runtime-attested 工具调用可以使 Program 增加后续 Team。不可用模型文本替代该调用；不要猜测或提供 Program revision/digest，Runtime 会从已绑定父 Program 派生它们。最终结论必须字面列出至少三个完整的 `crates/.../*.rs` 源码路径，只陈述实际读取到的证据。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 和 request_collaboration_escalation；不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::EscalatedTeam {
                     minimum_teams: 3,
                     minimum_escalations: 1,
