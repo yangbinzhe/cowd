@@ -344,6 +344,17 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
             effect_resolver: runtime_effect_resolver("runtime.orchestration"),
         },
         RuntimeToolDefinition {
+            name: harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+                .to_string(),
+            description: Some(
+                "Submit the initial semantic collaboration decision for this user turn. Use this only to declare independent workstreams, their dependencies, evidence contracts, and optional role focuses. Runtime owns Team templates, physical graph nodes, permissions, resources, approvals, and recovery. Do not use this for inspect, revision, template publication, or control."
+                    .to_string(),
+            ),
+            input_schema: collaboration_decision_input_schema(),
+            required_permission: ToolPermissionMode::ReadOnly,
+            effect_resolver: runtime_effect_resolver("runtime.orchestration"),
+        },
+        RuntimeToolDefinition {
             name: "request_collaboration_escalation".to_string(),
             description: Some(
                 "At a managed-Agent safe checkpoint, request one additional bounded Team from the parent Collaboration Program. Runtime attests the caller identity and attempt, derives the current Program revision and idempotency digest, and may accept or reject the request. This tool never creates a child root graph or grants new permissions.".to_string(),
@@ -489,6 +500,13 @@ fn runtime_orchestration_input_schema() -> serde_json::Value {
         "additionalProperties": true
     });
     schema
+}
+
+fn collaboration_decision_input_schema() -> serde_json::Value {
+    serde_json::to_value(schemars::schema_for!(
+        harness_contract::orchestration::ModelCollaborationControlDecision
+    ))
+    .expect("narrow collaboration decision schema must serialize")
 }
 
 pub(crate) fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -692,6 +710,21 @@ mod tests {
             .iter()
             .find(|tool| tool.name == "runtime_orchestrate")
             .expect("runtime orchestration tool");
+        let collaboration_decision_tool = tools
+            .iter()
+            .find(|tool| {
+                tool.name == harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+            })
+            .expect("narrow collaboration decision tool");
+        assert!(collaboration_decision_tool.input_schema["properties"]
+            .get("workstreams")
+            .is_some());
+        assert!(collaboration_decision_tool.input_schema["properties"]
+            .get("proposal")
+            .is_none());
+        assert!(collaboration_decision_tool.input_schema["properties"]
+            .get("input_disposition")
+            .is_none());
         let semantic_node =
             &orchestration_tool.input_schema["$defs"]["ModelGraphSemanticNode"]["properties"];
         assert!(

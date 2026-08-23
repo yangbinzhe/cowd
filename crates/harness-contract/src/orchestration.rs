@@ -4,6 +4,12 @@ use crate::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPol
 use crate::input_disposition::ModelInputDispositionBatch;
 
 pub const RUNTIME_ORCHESTRATE_TOOL_ID: &str = "runtime_orchestrate";
+/// Narrow root-admission port for a collaboration Program.  Unlike
+/// `runtime_orchestrate`, this contract never carries inspection, graph
+/// revision, template publication, control, or input-disposition concerns.
+/// It is deliberately a semantic decision only; Runtime compiles and owns
+/// all physical graph identities, leases, permissions, and receipts.
+pub const SUBMIT_COLLABORATION_DECISION_TOOL_ID: &str = "submit_collaboration_decision";
 
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
@@ -147,6 +153,90 @@ pub struct ModelGraphMutationProposal {
     #[serde(default)]
     pub completion: ExecutionCompletionContract,
     pub reason: String,
+}
+
+/// One model-authored workstream for the narrow collaboration-admission
+/// contract.  It has no executor, provider, budget, permission, template
+/// publication, or physical-graph fields.  The Coordinator derives those
+/// facts from the active turn and immutable policy snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCollaborationWorkstream {
+    /// Portable semantic identity, unique within this decision.
+    pub workstream_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub focuses: Vec<ModelSemanticFocus>,
+    #[serde(default)]
+    pub output_artifacts: Vec<String>,
+    #[serde(default)]
+    pub evidence_contract: Vec<String>,
+    #[serde(default)]
+    pub managed_agent_escalation: ManagedAgentEscalationRequirement,
+}
+
+/// Provider-neutral, typed collaboration decision.  This is the semantic IR
+/// shared by native function, native structured-output, and future
+/// constrained-language codecs.  A transport receipt is accepted only after
+/// conversion to this type and normal Runtime validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelCollaborationControlDecision {
+    /// Stable per-ingress decision identity chosen by the model. Runtime
+    /// combines it with the authenticated turn fence for idempotency.
+    pub decision_id: String,
+    pub intent: String,
+    pub workstreams: Vec<ModelCollaborationWorkstream>,
+    pub reason: String,
+}
+
+impl ModelCollaborationControlDecision {
+    /// Convert only semantic workstream data into the existing, internal
+    /// orchestration command shape.  This keeps one graph compiler while
+    /// decoupling the root control transport from the huge legacy tool schema.
+    #[must_use]
+    pub fn into_runtime_orchestration_input(self) -> ModelRuntimeOrchestrationInput {
+        ModelRuntimeOrchestrationInput {
+            intent: self.intent,
+            operation: RuntimeOrchestrationOperation::Propose,
+            inspect_execution_id: None,
+            proposal: Some(ModelGraphMutationProposal {
+                mutation_id: format!("control-decision:{}", self.decision_id),
+                target_execution_id: None,
+                expected_revision: None,
+                nodes: self
+                    .workstreams
+                    .into_iter()
+                    .map(|workstream| ModelGraphSemanticNode {
+                        node_id: workstream.workstream_id,
+                        recipe: CapabilityRecipeId::Team,
+                        objective: workstream.objective,
+                        depends_on: workstream.depends_on,
+                        multiplicity: 1,
+                        focuses: workstream.focuses,
+                        managed_agent_escalation: workstream.managed_agent_escalation,
+                        template: None,
+                        target_session_id: None,
+                        output_artifacts: workstream.output_artifacts,
+                        evidence_contract: workstream.evidence_contract,
+                        required_evidence_refs: Vec::new(),
+                        required: true,
+                        dependency: ExecutionDependencyPolicy::All,
+                        cancellation_group: None,
+                    })
+                    .collect(),
+                completion: ExecutionCompletionContract::default(),
+                reason: self.reason,
+            }),
+            template_proposal: None,
+            control: None,
+            input_disposition: None,
+            evidence_refs: Vec::new(),
+            constraints: ModelRuntimeOrchestrationConstraints::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -440,6 +530,35 @@ mod tests {
                 "template_proposal schema must expose `{needle}` to the model"
             );
         }
+    }
+
+    #[test]
+    fn narrow_collaboration_decision_converts_without_runtime_owned_fields() {
+        let input = ModelCollaborationControlDecision {
+            decision_id: "review-v1".to_string(),
+            intent: "independent architecture review".to_string(),
+            workstreams: vec![ModelCollaborationWorkstream {
+                workstream_id: "runtime-review".to_string(),
+                objective: "review Runtime durable state".to_string(),
+                depends_on: Vec::new(),
+                focuses: Vec::new(),
+                output_artifacts: vec!["review".to_string()],
+                evidence_contract: vec!["evidence".to_string()],
+                managed_agent_escalation: ManagedAgentEscalationRequirement::None,
+            }],
+            reason: "independent evidence is required".to_string(),
+        };
+
+        let orchestration = input.into_runtime_orchestration_input();
+        assert_eq!(
+            orchestration.operation,
+            RuntimeOrchestrationOperation::Propose
+        );
+        let proposal = orchestration.proposal.expect("derived proposal");
+        assert_eq!(proposal.mutation_id, "control-decision:review-v1");
+        assert_eq!(proposal.nodes[0].recipe, CapabilityRecipeId::Team);
+        assert!(proposal.nodes[0].template.is_none());
+        assert!(orchestration.template_proposal.is_none());
     }
 
     #[test]

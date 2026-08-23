@@ -203,6 +203,7 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
             | "runtime_resource_capabilities"
             | "runtime_capabilities"
             | "runtime_orchestrate"
+            | "submit_collaboration_decision"
             | "request_collaboration_escalation"
             | "mcp_tool"
             | "list_mcp_resources_tool"
@@ -484,6 +485,15 @@ impl GatewayToolExecutor {
     ) -> Result<String, ToolError> {
         let value = if tool_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
             normalize_runtime_orchestration_wire_input(value)?
+        } else if tool_name
+            == harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+        {
+            let decision = serde_json::from_value::<
+                harness_contract::orchestration::ModelCollaborationControlDecision,
+            >(value)
+            .map_err(|error| self.input_contract_error(tool_name, error))?;
+            serde_json::to_value(decision.into_runtime_orchestration_input())
+                .map_err(|error| ToolError::new(error.to_string()))?
         } else {
             value
         };
@@ -719,12 +729,16 @@ impl GatewayToolExecutor {
             return serde_json::to_string_pretty(&result)
                 .map_err(|error| ToolError::new(error.to_string()));
         }
-        if tool_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
+        if matches!(
+            tool_name,
+            harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID
+                | harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+        ) {
             tracing::debug!(
                 tool = %tool_name,
                 session = ?binding.session_id,
                 binding_ceiling = ?binding.permission_ceiling,
-                "runtime_orchestrate entering gateway execution"
+                "runtime collaboration command entering gateway execution"
             );
             let input = serde_json::from_value::<
                 harness_contract::orchestration::ModelRuntimeOrchestrationInput,
@@ -2127,6 +2141,7 @@ impl ToolExecutor for GatewayToolExecutor {
 
     fn collaboration_runtime_available(&self) -> bool {
         self.has_tool("runtime_orchestrate")
+            || self.has_tool(harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID)
     }
 
     fn mission_runtime_available(&self) -> bool {
@@ -2191,7 +2206,12 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 observed_evidence: Vec::new(),
             };
         }
-        if request.managed_invocation.is_some() && request.tool_name == "runtime_orchestrate" {
+        if request.managed_invocation.is_some()
+            && matches!(
+                request.tool_name.as_str(),
+                "runtime_orchestrate" | "submit_collaboration_decision"
+            )
+        {
             // `runtime_orchestrate` would create a child graph whose task
             // packets do not belong to this invocation's effect outbox. A
             // Managed Agent must select a Managed Team target instead, so all
@@ -2203,7 +2223,7 @@ impl runtime::RuntimeExecutionHost for GatewayToolExecutor {
                 category: request.category,
                 output: None,
                 error: Some(
-                    "managed Agent cannot invoke runtime_orchestrate; use a Managed Team definition so every child role inherits the invocation fence"
+                    "managed Agent cannot invoke a root collaboration admission tool; use a Managed Team definition so every child role inherits the invocation fence"
                         .to_string(),
                 ),
                 evidence_ref,

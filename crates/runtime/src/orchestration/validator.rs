@@ -195,6 +195,12 @@ fn recovery_hints_for_findings(findings: &[String]) -> Vec<RecoveryHint> {
             true,
         ),
         (
+            "explicit_team_requirement_count_mismatch",
+            "repair_required_team_cardinality",
+            "Submit exactly the user-required number of Team workstreams; do not collapse or add hidden Teams",
+            true,
+        ),
+        (
             "model_proposal_conflicts_with_strategy_lease",
             "repropose_with_lease_pattern",
             "Re-propose with the pattern named by lease_pattern_available, or Revise the current graph instead of retrying an unchanged proposal",

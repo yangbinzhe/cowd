@@ -402,6 +402,9 @@ async fn submit_runtime_orchestration_request_with_mode(
     submission_mode: OrchestrationSubmissionMode,
 ) -> RuntimeOrchestrationResult {
     bind_strategy(&mut request, leased_decision, parent_execution.as_ref());
+    if let Err(error) = validate_explicit_team_cardinality(&request, leased_decision) {
+        return rejected_explicit_team_cardinality_result(&request, error);
+    }
     if let Err(error) = materialize_ephemeral_team_template(&mut request, services) {
         return rejected_ephemeral_template_result(&request, error);
     }
@@ -591,6 +594,52 @@ async fn submit_runtime_orchestration_request_with_mode(
             result_without_runtime_with_id(&request_id, &request, decision)
         }
     }
+}
+
+/// A user-declared Team cardinality is an admission obligation, not a soft
+/// planner hint.  The root transport may choose the semantic workstreams, but
+/// it may neither collapse required Teams nor add hidden pre-planned Teams.
+/// This is intentionally evaluated against the already-bound turn strategy,
+/// never against a model-supplied count.
+fn validate_explicit_team_cardinality(
+    request: &RuntimeOrchestrationCommand,
+    leased_decision: Option<&RuntimeExecutionDecision>,
+) -> Result<(), String> {
+    let required = u16::from(
+        leased_decision
+            .map(|decision| decision.strategy.understanding.required_team_count)
+            .unwrap_or_default(),
+    );
+    if required == 0 || request.operation != RuntimeOrchestrationOperation::Propose {
+        return Ok(());
+    }
+    let actual = request.proposal.as_ref().map_or(0, |proposal| {
+        proposal
+            .nodes
+            .iter()
+            .filter(|node| node.recipe == CapabilityRecipeId::Team)
+            .map(|node| node.multiplicity)
+            .sum::<u16>()
+    });
+    (actual == required).then_some(()).ok_or_else(|| {
+        format!("explicit_team_requirement_count_mismatch:required={required}:proposed={actual}")
+    })
+}
+
+fn rejected_explicit_team_cardinality_result(
+    request: &RuntimeOrchestrationCommand,
+    finding: String,
+) -> RuntimeOrchestrationResult {
+    let plan = planner::plan_runtime_orchestration(request);
+    let mut decision = validator::validate_request(
+        request,
+        &plan.execution_decision,
+        plan.model_proposal.as_ref(),
+        None,
+    );
+    decision.status = "rejected".to_string();
+    decision.validation_findings.push(finding);
+    result_without_runtime(request, decision)
 }
 
 /// Materialize the narrow model-facing custom-Team path.  Model JSON provides
@@ -2363,6 +2412,29 @@ mod tests {
 
         assert_eq!(paths, BTreeSet::from(["reports/final.html".to_string()]));
         assert_eq!(invalid_receipts, vec!["not-json".to_string()]);
+    }
+
+    #[test]
+    fn explicit_team_requirement_rejects_collapsed_or_extra_workstreams() {
+        let mut decision = crate::execution_core::build_runtime_execution_decision(
+            "two independent reviews",
+            None,
+        );
+        decision.strategy.understanding.required_team_count = 2;
+        let one_team = proposal(vec![node(
+            "runtime-review",
+            CapabilityRecipeId::Team,
+            Vec::new(),
+        )]);
+        let error = validate_explicit_team_cardinality(&one_team, Some(&decision))
+            .expect_err("one Team cannot satisfy an explicit two-Team obligation");
+        assert!(error.contains("required=2:proposed=1"));
+
+        let two_teams = proposal(vec![
+            node("runtime-review", CapabilityRecipeId::Team, Vec::new()),
+            node("gateway-review", CapabilityRecipeId::Team, Vec::new()),
+        ]);
+        assert!(validate_explicit_team_cardinality(&two_teams, Some(&decision)).is_ok());
     }
 
     #[test]

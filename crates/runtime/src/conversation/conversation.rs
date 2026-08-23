@@ -538,8 +538,8 @@ fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelS
         // tool's typed input contract. Names such as `team_board` or
         // `permission_status` are ordinary tools; they must never create an
         // Agent, Team, approval, or replan merely because of a substring.
-        // Stateful orchestration remains the responsibility of the one
-        // canonical `runtime_orchestrate` tool and its validated schema.
+        // Stateful orchestration remains the responsibility of Runtime's
+        // validated native control contracts.
         ModelStepIntent::ToolCalls { calls }
     }
 }
@@ -630,6 +630,15 @@ fn apply_explicit_team_requirement(
 }
 
 fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
+    if call.name.eq_ignore_ascii_case(
+        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+    ) {
+        return serde_json::from_str::<
+            harness_contract::orchestration::ModelCollaborationControlDecision,
+        >(&call.input)
+        .ok()
+        .is_some_and(|decision| !decision.workstreams.is_empty());
+    }
     if !is_runtime_team_orchestration_call_name(&call.name) {
         return false;
     }
@@ -679,6 +688,9 @@ fn runtime_team_orchestration_count(call: &ModelToolCall) -> usize {
 
 fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("runtime_orchestrate")
+        || name.eq_ignore_ascii_case(
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+        )
 }
 
 #[cfg(test)]
@@ -1899,6 +1911,9 @@ fn bootstrap_tool_ids(
         harness_contract::tool::ToolPermissionMode::ReadOnly
     ) {
         bootstrap.push("runtime_orchestrate".to_string());
+        bootstrap.push(
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID.to_string(),
+        );
     }
     bootstrap
 }
@@ -4395,7 +4410,7 @@ where
     pub(crate) fn require_next_model_orchestration_only(&self) {
         self.require_next_model_tool_action([
             "runtime_capabilities".to_string(),
-            harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID.to_string(),
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID.to_string(),
         ]);
         // Qwen hybrid endpoints reject `tool_choice=required` while their
         // thinking mode is enabled.  The proposal step is intentionally tiny
@@ -6869,7 +6884,10 @@ where
             );
         }
         if decision.strategy.understanding.required_team_count > 0 {
-            for tool in ["runtime_capabilities", "runtime_orchestrate"] {
+            for tool in [
+                "runtime_capabilities",
+                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+            ] {
                 exposure.active.insert(tool.to_string());
                 exposure.deferred.remove(tool);
             }
@@ -10938,13 +10956,16 @@ where
             raw_ref.clone(),
             granted.max(24),
         );
-        // `runtime_orchestrate` already returns a deliberately bounded model
+        // Runtime collaboration commands already return a deliberately bounded model
         // receipt. Preserve a completed terminal summary as valid JSON so the
         // parent graph can consume it directly even on embedded/legacy hosts;
         // generic head-tail evidence compaction can otherwise split the JSON
         // and force an unnecessary parent model round.
         if !is_error
-            && tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+            && (tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+                || tool_name.eq_ignore_ascii_case(
+                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+                ))
             && output.len() <= 24_000
             && serde_json::from_str::<serde_json::Value>(output)
                 .ok()

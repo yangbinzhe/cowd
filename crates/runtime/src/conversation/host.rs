@@ -70,8 +70,8 @@ enum RootControlPlanePhase {
 impl RootControlPlanePhase {
     const fn required_tool_choice(self) -> &'static str {
         match self {
-            Self::CapabilityOrProposal => "runtime_capabilities|runtime_orchestrate",
-            Self::ProposalOnly | Self::ProposalSubmitted => "runtime_orchestrate",
+            Self::CapabilityOrProposal => "runtime_capabilities|submit_collaboration_decision",
+            Self::ProposalOnly | Self::ProposalSubmitted => "submit_collaboration_decision",
         }
     }
 }
@@ -2391,7 +2391,12 @@ fn completed_orchestration_terminal_summary(
 ) -> Option<String> {
     let orchestration_ids = calls
         .iter()
-        .filter(|call| call.name.eq_ignore_ascii_case("runtime_orchestrate"))
+        .filter(|call| {
+            call.name.eq_ignore_ascii_case("runtime_orchestrate")
+                || call.name.eq_ignore_ascii_case(
+                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+                )
+        })
         .map(|call| call.id.as_str())
         .collect::<BTreeSet<_>>();
     messages
@@ -2403,7 +2408,10 @@ fn completed_orchestration_terminal_summary(
                 tool_name,
                 output,
                 is_error: false,
-            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+            } if (tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+                || tool_name.eq_ignore_ascii_case(
+                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+                ))
                 && orchestration_ids.contains(tool_use_id.as_str()) =>
             {
                 Some(output.as_str())
@@ -2841,7 +2849,11 @@ fn verified_orchestration_team_ids(messages: &[ConversationMessage]) -> BTreeSet
                 tool_name,
                 output,
                 is_error: false,
-            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate") => {
+            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+                || tool_name.eq_ignore_ascii_case(
+                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+                ) =>
+            {
                 orchestration_receipt_json(output).map(|receipt| (tool_use_id, receipt))
             }
             _ => None,
@@ -3974,7 +3986,7 @@ where
                 }
                 RootControlPlanePhase::ProposalOnly => {
                     runtime.require_next_model_named_tool_action(
-                        harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID,
+                        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
                     );
                     runtime.require_next_model_reasoning_effort("none");
                 }
@@ -4881,7 +4893,7 @@ where
                                     .collect::<Vec<_>>()
                                     .join("；");
                                 let reason = format!(
-                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请继续自行编排：先调用 runtime_capabilities(detail=team_templates)；若 catalog 中已有与用户要求匹配的可复用模板，复制精确 template_id 并调用 runtime_orchestrate(operation=propose) 启动团队。对 model-assisted Team，focuses 是该 Team 的精确激活角色集合：每个 focus.role_id 必须来自该模板；多角色模板必须显式列出一个或多个焦点（需要运行整套模板时就列出全部角色）；已选角色必须包含模板依赖的两端。不要把“一个角色的 Team”误写成“含该角色的多角色模板并期待其他角色自动忽略”。若用户要求定制角色，直接调用 runtime_orchestrate(operation=propose)，提交恰好一个省略 template 的 Team 节点和 template_proposal，由 Runtime 绑定当前 turn 的不可变快照后启动。只有用户明确要求发布或复用模板时，才调用 runtime_orchestrate(operation=propose_template)。禁止只输出总结文本，继续执行（尝试 {}）。",
+                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请提交一次 submit_collaboration_decision：只填写本任务的独立 workstreams、它们的 depends_on、objective、evidence_contract 与必要 focuses；Runtime 会绑定模板、身份、权限与物理图。不要输出总结文本，也不要发送 runtime_orchestrate 的完整图提案（尝试 {}）。",
                                     if catalog_hint.is_empty() {
                                         String::new()
                                     } else {
@@ -6322,7 +6334,7 @@ where
                     ],
                     payload: serde_json::json!({
                         "required_team_count": required_team_count,
-                        "required_tool_choice": "runtime_orchestrate",
+                        "required_tool_choice": harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
                         "program_admitted": false,
                     }),
                 })
@@ -6375,25 +6387,31 @@ fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
 }
 
 fn is_team_orchestration_call(call: &ModelToolCall) -> bool {
-    if !call
-        .name
-        .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
-    {
-        return false;
-    }
-    serde_json::from_str::<serde_json::Value>(&call.input)
+    if call.name.eq_ignore_ascii_case(
+        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+    ) {
+        return serde_json::from_str::<
+            harness_contract::orchestration::ModelCollaborationControlDecision,
+        >(&call.input)
         .ok()
-        .is_some_and(|input| {
-            input.get("operation").and_then(serde_json::Value::as_str) == Some("propose")
-                && input
-                    .pointer("/proposal/nodes")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|nodes| {
-                        nodes.iter().any(|node| {
-                            node.get("recipe").and_then(serde_json::Value::as_str) == Some("team")
+        .is_some_and(|decision| !decision.workstreams.is_empty());
+    }
+    call.name
+        .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
+        && serde_json::from_str::<serde_json::Value>(&call.input)
+            .ok()
+            .is_some_and(|input| {
+                input.get("operation").and_then(serde_json::Value::as_str) == Some("propose")
+                    && input
+                        .pointer("/proposal/nodes")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|nodes| {
+                            nodes.iter().any(|node| {
+                                node.get("recipe").and_then(serde_json::Value::as_str)
+                                    == Some("team")
+                            })
                         })
-                    })
-        })
+            })
 }
 
 fn root_control_plane_phase_after_tool_batch(
@@ -6449,6 +6467,9 @@ fn requests_runtime_orchestration(calls: &[ModelToolCall]) -> bool {
     calls.iter().any(|call| {
         call.name
             .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
+            || call.name.eq_ignore_ascii_case(
+                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+            )
     })
 }
 
@@ -10400,7 +10421,11 @@ fn retained_orchestration_terminal_candidate(
                 output,
                 is_error: false,
                 ..
-            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate") => {
+            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+                || tool_name.eq_ignore_ascii_case(
+                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+                ) =>
+            {
                 orchestration_receipt_json(output)
             }
             _ => None,
@@ -14751,7 +14776,7 @@ mod tests {
                 .payload
                 .get("required_tool_choice")
                 .and_then(serde_json::Value::as_str),
-            Some("runtime_orchestrate")
+            Some(harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID)
         );
         let missing_proposal = events
             .iter()
@@ -16613,15 +16638,19 @@ mod tests {
             &BTreeSet::from([capability.id.clone()]),
         );
         assert_eq!(phase, RootControlPlanePhase::ProposalOnly);
-        assert_eq!(phase.required_tool_choice(), "runtime_orchestrate");
+        assert_eq!(
+            phase.required_tool_choice(),
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+        );
     }
 
     #[test]
     fn only_a_successful_team_proposal_satisfies_root_control_plane_action() {
         let proposal = ModelToolCall {
             id: "team".to_string(),
-            name: "runtime_orchestrate".to_string(),
-            input: r#"{"intent":"review","operation":"propose","proposal":{"mutation_id":"review","nodes":[{"node_id":"review-team","recipe":"team","objective":"review"}],"reason":"independent review"}}"#.to_string(),
+            name: harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+                .to_string(),
+            input: r#"{"decision_id":"review","intent":"review","workstreams":[{"workstream_id":"review-team","objective":"review"}],"reason":"independent review"}"#.to_string(),
             depends_on: Vec::new(),
         };
         assert_eq!(
