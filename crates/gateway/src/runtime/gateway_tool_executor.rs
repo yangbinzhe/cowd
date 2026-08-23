@@ -155,9 +155,7 @@ struct RuntimeToolExecutionBinding<'a> {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CollaborationEscalationToolRequest {
-    base_revision: u64,
     reason: String,
-    digest: String,
     #[serde(default)]
     evidence_refs: Vec<harness_contract::context::EvidenceAccessRef>,
     requested_add_team: harness_contract::execution_graph::CollaborationEscalationAddTeam,
@@ -624,15 +622,53 @@ impl GatewayToolExecutor {
                 "{}:{}:attempt:{attempt}",
                 parent.execution_id, parent.node_id
             );
+            let program_graph = services
+                .graph_state_store()
+                .load_async(&program_parent.execution_id)
+                .await
+                .map_err(|error| {
+                    ToolError::new(format!("escalation_program_graph_load_failed:{error}"))
+                })?;
+            let program = program_graph
+                .orchestration
+                .as_ref()
+                .and_then(|metadata| metadata.collaboration_program.as_ref())
+                .ok_or_else(|| {
+                    ToolError::new("collaboration escalation parent has no durable Program")
+                })?;
+            // The Agent may propose only the bounded semantic delta. Revision
+            // fencing and idempotency material are Runtime facts: exposing
+            // them to the model made an otherwise valid escalation impossible
+            // to construct without guessing hidden graph state.
+            let base_revision = program.revision;
+            let reason = input.reason;
+            let evidence_refs = input.evidence_refs;
+            let requested_add_team = input.requested_add_team;
+            let template_proposal = input.template_proposal;
+            let digest_material = serde_json::json!({
+                "program_id": program.program_id,
+                "base_revision": base_revision,
+                "source_attempt": source_attempt,
+                "reason": reason,
+                "evidence_refs": evidence_refs,
+                "requested_add_team": requested_add_team,
+                "template_proposal": template_proposal,
+            });
+            let digest = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&digest_material).map_err(|error| {
+                    ToolError::new(format!("escalation_digest_encode_failed:{error}"))
+                })?)
+            );
             let escalation = harness_contract::execution_graph::CollaborationEscalationRequest {
                 source_attempt: source_attempt.clone(),
-                base_revision: input.base_revision,
+                base_revision,
                 request_kind: "add_team".to_string(),
-                reason: input.reason,
-                evidence_refs: input.evidence_refs,
-                digest: input.digest,
-                requested_add_team: Some(input.requested_add_team),
-                template_proposal: input.template_proposal,
+                reason,
+                evidence_refs,
+                digest,
+                requested_add_team: Some(requested_add_team),
+                template_proposal,
             };
             let result = runtime::orchestration::submit_collaboration_escalation(
                 &program_parent.execution_id,
@@ -2838,6 +2874,42 @@ fn network_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collaboration_escalation_input_is_limited_to_semantic_delta() {
+        let request: CollaborationEscalationToolRequest =
+            serde_json::from_value(serde_json::json!({
+                "reason": "independent review is required after the first evidence pass",
+                "requested_add_team": {
+                    "semantic_node_id": "independent-review",
+                    "objective": "independently verify the authorized evidence"
+                }
+            }))
+            .expect("semantic escalation input");
+
+        assert!(request.reason.contains("independent review"));
+        assert_eq!(
+            request.requested_add_team.semantic_node_id,
+            "independent-review"
+        );
+    }
+
+    #[test]
+    fn collaboration_escalation_input_rejects_model_supplied_runtime_fences() {
+        let error =
+            serde_json::from_value::<CollaborationEscalationToolRequest>(serde_json::json!({
+                "base_revision": 7,
+                "digest": "model-guessed",
+                "reason": "independent review is required",
+                "requested_add_team": {
+                    "semantic_node_id": "independent-review",
+                    "objective": "independently verify the authorized evidence"
+                }
+            }))
+            .expect_err("model must not submit Runtime-owned revision or digest");
+
+        assert!(error.to_string().contains("unknown field"));
+    }
 
     #[test]
     fn successful_gateway_file_fact_has_typed_identity_and_digest() {

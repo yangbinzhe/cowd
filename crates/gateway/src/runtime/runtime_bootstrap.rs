@@ -346,14 +346,12 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
         RuntimeToolDefinition {
             name: "request_collaboration_escalation".to_string(),
             description: Some(
-                "At a managed-Agent safe checkpoint, request one additional bounded Team from the parent Collaboration Program. Runtime attests the caller identity and attempt, verifies the Program revision and digest, and may accept or reject the request. This tool never creates a child root graph or grants new permissions.".to_string(),
+                "At a managed-Agent safe checkpoint, request one additional bounded Team from the parent Collaboration Program. Runtime attests the caller identity and attempt, derives the current Program revision and idempotency digest, and may accept or reject the request. This tool never creates a child root graph or grants new permissions.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "base_revision": { "type": "integer", "minimum": 1 },
                     "reason": { "type": "string", "minLength": 1 },
-                    "digest": { "type": "string", "minLength": 1 },
                     "evidence_refs": { "type": "array", "items": { "type": "object" } },
                     "requested_add_team": {
                         "type": "object",
@@ -375,7 +373,7 @@ fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
                         "description": "Optional semantic custom-Team template. Runtime compiles it into a parent Program-bound ephemeral snapshot and never publishes it to the shared catalog."
                     }
                 },
-                "required": ["base_revision", "reason", "digest", "requested_add_team"],
+                "required": ["reason", "requested_add_team"],
                 "additionalProperties": false
             }),
             required_permission: ToolPermissionMode::ReadOnly,
@@ -735,7 +733,7 @@ mod tests {
         );
         assert_eq!(
             escalation_tool.input_schema["required"],
-            json!(["base_revision", "reason", "digest", "requested_add_team"])
+            json!(["reason", "requested_add_team"])
         );
         assert!(
             escalation_tool.input_schema["properties"]["requested_add_team"]

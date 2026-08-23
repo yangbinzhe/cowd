@@ -253,6 +253,15 @@ impl LiveScenarioRunner {
                 },
                 timeout: LiveScenarioTimeout::team(),
             },
+            LiveScenarioSpec {
+                id: "live_agent_escalation",
+                prompt: "这是一次受控协作升级验收。必须先实际启动且仅启动两个独立协作 Team：Team A 审查 runtime 的 durable Program/edge 事实，Team B 审查 gateway 的受管 Agent 工具边界；两者可并行。Team A 在读取到第一批源码证据后的安全检查点，必须由其受管 Agent 实际调用 `request_collaboration_escalation` 恰好请求一个独立的第三个 Team，用于复核 A/B 的授权证据并综合边界结论。不可在初始方案中直接创建第三个 Team，也不可用模型文本替代该工具调用；不要猜测或提供 Program revision/digest，Runtime 会从已绑定父 Program 派生它们。最终结论必须字面列出至少三个完整的 `crates/.../*.rs` 源码路径，只陈述实际读取到的证据。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 和 request_collaboration_escalation；不要调用 bash 或任何写工具。",
+                acceptance: LiveAcceptance::EscalatedTeam {
+                    minimum_teams: 3,
+                    minimum_escalations: 1,
+                },
+                timeout: LiveScenarioTimeout::team(),
+            },
         ]
         .into_iter()
         .map(|spec| self.run_scenario(spec))
@@ -1100,6 +1109,10 @@ enum LiveAcceptance {
         minimum_teams: usize,
         minimum_claimed_cross_team_edges: usize,
     },
+    EscalatedTeam {
+        minimum_teams: usize,
+        minimum_escalations: usize,
+    },
 }
 
 impl LiveAcceptance {
@@ -1156,6 +1169,24 @@ impl LiveAcceptance {
                         json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
                         json!({"name": "completed_evidence_team", "required": minimum_teams, "passed": team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
                         json!({"name": "claimed_cross_team_edges", "required": minimum_claimed_cross_team_edges, "observed": claimed_cross_team_edges, "passed": edges_satisfied}),
+                    ],
+                }
+            }
+            Self::EscalatedTeam {
+                minimum_teams,
+                minimum_escalations,
+            } => {
+                let team_health = projected_team_health(projections);
+                let escalation_count = applied_escalation_count(projections);
+                let teams_satisfied = team_health.satisfies(minimum_teams);
+                let escalations_satisfied = escalation_count >= minimum_escalations;
+                LiveAcceptanceResult {
+                    passed: !response.trim().is_empty() && teams_satisfied && escalations_satisfied,
+                    quality: None,
+                    checks: vec![
+                        json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
+                        json!({"name": "completed_escalated_teams", "required": minimum_teams, "passed": teams_satisfied, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
+                        json!({"name": "runtime_attested_agent_escalation", "required": minimum_escalations, "observed": escalation_count, "passed": escalations_satisfied}),
                     ],
                 }
             }
@@ -1408,6 +1439,38 @@ fn claimed_cross_team_edge_count(projections: &[Value]) -> usize {
         }
     }
     claimed.len()
+}
+
+/// Count only applied, Runtime-attested escalation receipts. A model's tool
+/// request or a generic patch is not sufficient: the receipt must be recorded
+/// on the durable root Program projection after the fenced graph revision wins.
+fn applied_escalation_count(projections: &[Value]) -> usize {
+    let mut escalations = BTreeSet::new();
+    for projection in projections {
+        let graph_id = projection
+            .pointer("/graph/graph_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unidentified-graph");
+        for escalation in projection
+            .pointer("/graph/orchestration/collaboration_escalations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(escalation_id) = escalation.get("escalation_id").and_then(Value::as_str)
+            else {
+                continue;
+            };
+            if escalation
+                .get("applied_graph_revision")
+                .and_then(Value::as_u64)
+                .is_some_and(|revision| revision > 0)
+            {
+                escalations.insert(format!("{graph_id}:{escalation_id}"));
+            }
+        }
+    }
+    escalations.len()
 }
 
 fn projected_status(value: &Value) -> Option<&str> {
@@ -2081,6 +2144,75 @@ mod tests {
         .evaluate(answer, &receipts, &[projection]);
 
         assert!(result.passed);
+    }
+
+    #[test]
+    fn escalation_acceptance_requires_a_durable_applied_agent_receipt() {
+        let projection = json!({
+            "agents": [
+                {"id": "a-1", "status": "completed"}, {"id": "a-2", "status": "completed"},
+                {"id": "b-1", "status": "completed"}, {"id": "b-2", "status": "completed"},
+                {"id": "c-1", "status": "completed"}, {"id": "c-2", "status": "completed"}
+            ],
+            "teams": [
+                {"id": "team-a", "status": "completed"},
+                {"id": "team-b", "status": "completed"},
+                {"id": "team-c", "status": "completed"}
+            ],
+            "graph": {
+                "graph_id": "root",
+                "orchestration": {"collaboration_escalations": [
+                    {"escalation_id": "attested-add-team", "applied_graph_revision": 4}
+                ]}
+            }
+        });
+
+        assert_eq!(applied_escalation_count(&[projection.clone()]), 1);
+        let result = LiveAcceptance::EscalatedTeam {
+            minimum_teams: 3,
+            minimum_escalations: 1,
+        }
+        .evaluate(
+            "completed with durable evidence",
+            &Value::Null,
+            &[projection],
+        );
+
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn escalation_acceptance_rejects_unapplied_or_missing_receipts() {
+        let projection = json!({
+            "agents": [
+                {"id": "a-1", "status": "completed"}, {"id": "a-2", "status": "completed"},
+                {"id": "b-1", "status": "completed"}, {"id": "b-2", "status": "completed"},
+                {"id": "c-1", "status": "completed"}, {"id": "c-2", "status": "completed"}
+            ],
+            "teams": [
+                {"id": "team-a", "status": "completed"},
+                {"id": "team-b", "status": "completed"},
+                {"id": "team-c", "status": "completed"}
+            ],
+            "graph": {
+                "graph_id": "root",
+                "orchestration": {"collaboration_escalations": [
+                    {"escalation_id": "uncommitted-add-team", "applied_graph_revision": 0}
+                ]}
+            }
+        });
+
+        let result = LiveAcceptance::EscalatedTeam {
+            minimum_teams: 3,
+            minimum_escalations: 1,
+        }
+        .evaluate(
+            "completed with durable evidence",
+            &Value::Null,
+            &[projection],
+        );
+
+        assert!(!result.passed);
     }
 
     #[test]
