@@ -4361,7 +4361,18 @@ mod tests {
 
     #[test]
     fn delegated_capabilities_are_catalog_bound_read_only_and_non_recursive() {
-        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(vec![RuntimeToolDefinition {
+                name: "request_collaboration_escalation".to_string(),
+                description: Some("managed Agent escalation".to_string()),
+                input_schema: json!({"type":"object","additionalProperties":false}),
+                required_permission: ToolPermissionMode::ReadOnly,
+                effect_resolver: crate::runtime_bootstrap::runtime_effect_resolver(
+                    "runtime.collaboration_escalation",
+                ),
+            }])
+            .expect("runtime escalation tool registry");
+        let executor = GatewayToolExecutor::new(None, false, registry);
         let mut request = runtime::RuntimeOrchestrationCommand {
             intent: "review the workspace with a delegated team".to_string(),
             model_lease: None,
@@ -4400,6 +4411,7 @@ mod tests {
         assert!(!delegated.contains(&"runtime_orchestrate"));
         assert!(!delegated.contains(&"runtime_capabilities"));
         assert!(!delegated.contains(&"unknown_tool"));
+        assert!(delegated.contains(&"request_collaboration_escalation"));
         assert!(delegated.iter().all(|tool| {
             executor.tool_permission_mode(tool) == Some(ToolPermissionMode::ReadOnly)
         }));

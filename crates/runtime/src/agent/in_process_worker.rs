@@ -1317,7 +1317,10 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         // Gateway RuntimeExecutionHost. They are not pure ToolHost adapters;
         // letting them fall through would fail every required Team node with
         // "has no ToolHost implementation adapter".
-        if matches!(tool_name, "team_board" | "evidence_retrieve") {
+        if matches!(
+            tool_name,
+            "team_board" | "evidence_retrieve" | "request_collaboration_escalation"
+        ) {
             if !self.allowed_tools.contains(tool_name) {
                 return Err(ToolError::new(
                     "agent tool authorization does not match the allowed tool request",

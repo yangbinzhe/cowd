@@ -43,6 +43,12 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
     // The board is an internal, binding-scoped semantic exchange. Runtime
     // rejects callers that are not Team Agent nodes.
     allowed_tools.insert("team_board".to_string());
+    // A managed Team Agent may request (but never create) one bounded
+    // escalation through its already-bound parent Collaboration Program.
+    // The tool attests the caller and derives all runtime fences, so exposing
+    // this read-only control plane entry point does not grant recursive graph
+    // creation, broader permissions, or a lifecycle control to leaf Agents.
+    allowed_tools.insert("request_collaboration_escalation".to_string());
     // Durable raw tool outputs are read-only evidence references resolved by
     // the Runtime ArtifactStore; the tool itself enforces ref authorization.
     allowed_tools.insert("evidence_retrieve".to_string());
@@ -174,6 +180,11 @@ mod tests {
         assert!(resolved.allowed_tools.contains("grep_search"));
         assert!(resolved.allowed_tools.contains("tool_search"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
+        assert!(
+            resolved
+                .allowed_tools
+                .contains("request_collaboration_escalation")
+        );
         assert_eq!(resolved.evidence_duties, vec!["source_notes"]);
     }
 
