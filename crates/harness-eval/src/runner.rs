@@ -1106,7 +1106,14 @@ fn run_eval_tool_call(
 ) -> ToolCallDetail {
     let started = Instant::now();
     let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let host = tools::ToolHost::builtin("harness-eval", workspace_root);
+    // The evaluator exercises the same governed read-only tool path as the
+    // Gateway.  AuthorizationNegotiator signs the lease below, so the local
+    // host must verify that signature before it will execute an effect.  Do
+    // not make evaluation a bypass: an absent verifier must stay fail-closed.
+    let host = tools::ToolHost::builtin("harness-eval", workspace_root)
+        .with_authorization_lease_verifier(std::sync::Arc::new(
+            runtime::AuthorizationNegotiator::verify_lease_signature,
+        ));
     let lease = host.pin_snapshot();
     let effect = lease.describe_effect(name, &input);
     let authorization_request_id = format!("harness-eval:{scenario_id}:{call_index}");

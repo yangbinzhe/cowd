@@ -280,3 +280,25 @@ declared two-role topology and that each role receives only a Runtime-derived
 subset of the node lease. Existing builtin escalation and root strategy-lease
 tests also pass. The next real run is reserved for the exact clean commit of
 this repair.
+
+## Evaluator authorization-verifier repair — preflight for the next candidate
+
+The fourth clean Token Plan run reached the repaired custom-template path but
+did not pass the strict release gate. Its preserved report is
+`target/acceptance/real-qwen/runs/v0.9.704-1787486325-mission-harness-deep/`.
+The prior focus-loss and strategy-lease failure signatures are absent. Instead,
+the evaluator's own deterministic governed read tools failed before the live
+Teams could retain source-evidence receipts.
+
+The failure was narrow and fail-closed: `run_eval_tool_call` obtained a lease
+signed by `AuthorizationNegotiator`, but constructed its local `ToolHost`
+without the corresponding signature verifier. `ToolHost` therefore correctly
+rejected the lease as unverifiable. Production Gateway hosts already install
+the same verifier.
+
+The repair installs
+`AuthorizationNegotiator::verify_lease_signature` on only the evaluator's
+local host. It neither bypasses authorization nor relaxes the read-only policy;
+unsigned or forged leases remain rejected. The evaluator's full real-tool
+evidence regression now passes. A new real-model scenario is still required
+for the exact clean commit; this preflight is not release acceptance evidence.
