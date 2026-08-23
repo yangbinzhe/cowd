@@ -25,8 +25,8 @@ use crate::{
 };
 use harness_contract::core::{ExecutionPattern, TaskRisk};
 use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeStatus,
-    ExecutionParentBinding, ExecutionUsage,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphProjection, ExecutionNodeKind,
+    ExecutionNodeStatus, ExecutionParentBinding, ExecutionUsage,
 };
 use harness_contract::policy::{
     ApprovalContext, ApprovalDecisionActor, ApprovalDecisionActorKind, ApprovalDecisionCommand,
@@ -1878,11 +1878,20 @@ fn assess_team_subgraphs(
                     .take(per_team_summary_chars)
                     .collect::<String>()
             });
+            let terminal_summary_kind = child_graph
+                .nodes
+                .iter()
+                .find(|node| node.kind == ExecutionNodeKind::Synthesize)
+                .and_then(|node| child_graph.node_results.get(&node.id))
+                .and_then(|result| result.summary.as_deref())
+                .filter(|summary| summary.starts_with("# Verified Team evidence bundle"))
+                .map(|_| "verified_team_evidence_bundle");
             assessment.team_terminals.push(json!({
                 "team_id": team_id,
                 "graph_id": child_graph_id,
                 "working_state_verified": materialization.is_ok(),
                 "terminal_summary": terminal_summary,
+                "terminal_summary_kind": terminal_summary_kind,
                 "delivery_envelope": delivery_envelope,
                 "terminal_presentation": child_graph.terminal_presentation,
             }));

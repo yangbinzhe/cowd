@@ -2852,7 +2852,48 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
                 })
                 .collect::<Option<Vec<_>>>()
         });
+    let verified_evidence_bundle_summaries = receipt
+        .get("team_terminals")
+        .and_then(serde_json::Value::as_array)
+        .filter(|entries| !entries.is_empty())
+        .and_then(|entries| {
+            entries
+                .iter()
+                .map(|entry| {
+                    let envelope = serde_json::from_value::<
+                        harness_contract::outcome::DeliveryEnvelope,
+                    >(entry.get("delivery_envelope")?.clone())
+                    .ok()?;
+                    let summary = entry
+                        .get("terminal_summary")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|summary| !summary.is_empty())?;
+                    let team_id = entry
+                        .get("team_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("team");
+                    (entry
+                        .get("working_state_verified")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && entry
+                            .get("terminal_summary_kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("verified_team_evidence_bundle")
+                        && envelope.pipeline_status
+                            == harness_contract::outcome::PipelineStatus::Completed
+                        && envelope.delivery_status
+                            == harness_contract::outcome::DeliveryStatus::Satisfied
+                        && envelope.unresolved.is_empty()
+                        && envelope.coverage.required_obligation_ids
+                            == envelope.coverage.satisfied_obligation_ids)
+                        .then(|| format!("{team_id}: {summary}"))
+                })
+                .collect::<Option<Vec<_>>>()
+        });
     let typed_team_carrier_verified = typed_team_summaries.is_some();
+    let evidence_bundle_verified = verified_evidence_bundle_summaries.is_some();
     let terminal_summary = if typed_candidate_verified {
         receipt
             .get("terminal_summary")
@@ -2861,10 +2902,13 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
             .filter(|summary| !summary.is_empty())
             .map(str::to_string)
     } else {
-        typed_team_summaries.map(|summaries| summaries.join("\n\n"))
+        typed_team_summaries
+            .or(verified_evidence_bundle_summaries)
+            .map(|summaries| summaries.join("\n\n"))
     };
-    let verified_terminal_carrier =
-        typed_candidate_verified && working_state_verified || typed_team_carrier_verified;
+    let verified_terminal_carrier = typed_candidate_verified && working_state_verified
+        || typed_team_carrier_verified
+        || evidence_bundle_verified && working_state_verified;
     (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed")
         && verified_terminal_carrier
         && terminal_summary.is_some()
@@ -16403,6 +16447,54 @@ mod tests {
         let mut missing_result = verified;
         missing_result["execution"]["terminal_result_available"] = serde_json::json!(false);
         assert!(verified_team_terminal_summary(&missing_result).is_none());
+    }
+
+    #[test]
+    fn verified_team_evidence_bundles_bypass_a_failed_parent_provider() {
+        let receipt = serde_json::json!({
+            "status": "completed",
+            "working_state_verified": true,
+            "execution": {"terminal_result_available": true},
+            "team_terminals": [
+                {
+                    "team_id": "team-runtime",
+                    "working_state_verified": true,
+                    "terminal_summary_kind": "verified_team_evidence_bundle",
+                    "terminal_summary": "# Verified Team evidence bundle\n\nobserved_source_paths: crates/runtime/src/conversation/host.rs",
+                    "delivery_envelope": {
+                        "envelope_id": "team-runtime-envelope",
+                        "revision": 3,
+                        "objective_id": "runtime-review",
+                        "pipeline_status": "completed",
+                        "delivery_status": "satisfied",
+                        "created_at_ms": 10
+                    }
+                },
+                {
+                    "team_id": "team-memory",
+                    "working_state_verified": true,
+                    "terminal_summary_kind": "verified_team_evidence_bundle",
+                    "terminal_summary": "# Verified Team evidence bundle\n\nobserved_source_paths: crates/memory/src/store/mod.rs",
+                    "delivery_envelope": {
+                        "envelope_id": "team-memory-envelope",
+                        "revision": 4,
+                        "objective_id": "memory-review",
+                        "pipeline_status": "completed",
+                        "delivery_status": "satisfied",
+                        "created_at_ms": 12
+                    }
+                }
+            ]
+        });
+        let summary = verified_team_terminal_summary(&receipt)
+            .expect("every completed Team has a runtime-derived evidence bundle");
+        assert!(summary.contains("team-runtime: # Verified Team evidence bundle"));
+        assert!(summary.contains("crates/memory/src/store/mod.rs"));
+
+        let mut unverified = receipt;
+        unverified["team_terminals"][1]["terminal_summary_kind"] =
+            serde_json::json!("untyped_summary");
+        assert!(verified_team_terminal_summary(&unverified).is_none());
     }
 
     #[test]

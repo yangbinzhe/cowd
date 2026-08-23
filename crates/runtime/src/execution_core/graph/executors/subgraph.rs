@@ -321,7 +321,7 @@ impl NodeExecutor for TeamSubgraphExecutor {
             .as_ref()
             .map(|result| result.result_ref.clone())
             .or_else(|| Some(format!("execution-graph:{child_graph_id}")));
-        let usage = if completed {
+        let child_projection = if completed {
             let supervisor =
                 self.supervisor
                     .upgrade()
@@ -329,24 +329,38 @@ impl NodeExecutor for TeamSubgraphExecutor {
                         executor_kind: Self::KIND.to_string(),
                         node_id: ticket.node_id.clone(),
                     })?;
-            supervisor
-                .projection(&child_graph_id)
-                .await
-                .map_err(|reason| NodeExecutorError::Poll {
-                    node_id: ticket.node_id.clone(),
-                    reason: format!("load completed Team child usage: {reason}"),
-                })?
-                .nodes
-                .into_iter()
-                .find(|node| node.kind == ExecutionNodeKind::Synthesize)
-                .map(|node| node.usage)
-                .unwrap_or_default()
+            Some(
+                supervisor
+                    .projection(&child_graph_id)
+                    .await
+                    .map_err(|reason| NodeExecutorError::Poll {
+                        node_id: ticket.node_id.clone(),
+                        reason: format!("load completed Team child usage: {reason}"),
+                    })?,
+            )
         } else {
-            ExecutionUsage::default()
+            None
         };
-        let summary = result_ref
-            .as_deref()
-            .and_then(decode_team_terminal_summary)
+        let usage = child_projection
+            .as_ref()
+            .and_then(|child| {
+                child
+                    .nodes
+                    .iter()
+                    .find(|node| node.kind == ExecutionNodeKind::Synthesize)
+                    .map(|node| node.usage.clone())
+            })
+            .unwrap_or_default();
+        let summary = child_projection
+            .as_ref()
+            .and_then(|child| {
+                child
+                    .nodes
+                    .iter()
+                    .find(|node| node.kind == ExecutionNodeKind::Synthesize)
+                    .and_then(|node| node.summary.clone())
+            })
+            .or_else(|| result_ref.as_deref().and_then(decode_team_terminal_summary))
             .map(|terminal| format!("Team `{}` result:\n{terminal}", projection.team_id))
             .unwrap_or_else(|| {
                 format!(

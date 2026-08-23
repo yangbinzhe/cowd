@@ -1,12 +1,11 @@
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness_contract::agent::AgentTaskPacket;
 #[cfg(test)]
 use harness_contract::agent::AgentTerminalStatus;
+use harness_contract::context::EvidenceTargetIdentity;
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeStatus, ExecutionUsage,
 };
@@ -21,8 +20,9 @@ use harness_contract::outcome::{
     DeliveryStatus, DeliveryUnresolved, PipelineStatus, UserAnswerContract, VerifiedDeliveryEffect,
     VerifiedDeliveryReference, VerifiedEffectStatus,
 };
+use harness_contract::team::RoleBehaviorFacet;
 #[cfg(test)]
-use harness_contract::team::{RoleBehaviorFacet, TeamBindingSnapshot};
+use harness_contract::team::TeamBindingSnapshot;
 
 use crate::execution_core::graph::executors::{SynthesizeBackend, SynthesizeBackendResolver};
 use crate::execution_core::graph::{
@@ -83,15 +83,18 @@ impl TeamResultReducer {
         usage.runtime_observed_resource_scopes.dedup();
 
         let envelope = build_delivery_envelope(&graph);
-        // A graph reducer owns durable delivery facts, not user-facing model
-        // prose.  In particular, a completed reducer-role Agent summary is
-        // not an `AnswerCandidate`: the terminal Agent packet can be absent
-        // after restart and a summary has neither consumed the current
-        // envelope nor passed the root presentation gate.  Keep this result
-        // mechanical until that separately governed presentation owner emits
-        // an exact candidate.
+        // A graph reducer owns durable delivery facts, not a model-owned
+        // answer candidate. It may, however, retain a bounded evidence bundle
+        // derived solely from committed child summaries and observed workspace
+        // paths. The parent uses that typed bundle only when every Team branch
+        // has already satisfied the delivery contract; this prevents a
+        // provider failure at the root from erasing completed Team evidence.
+        let evidence_bundle = verified_team_evidence_bundle(&graph, &envelope);
+        // The result reference is deliberately still the mechanical delivery
+        // envelope. A summary is not an answer candidate and must not change
+        // the child graph's terminal-result contract.
         let result_ref = Some(format!("delivery-envelope: {}", envelope.envelope_id));
-        let summary = Some(mechanical_delivery_summary(&envelope));
+        let summary = evidence_bundle.or_else(|| Some(mechanical_delivery_summary(&envelope)));
         let mut outcome = NodeExecutionOutcome::new(ExecutionNodeResult {
             // The reducer itself completed even when business delivery is
             // partial or unavailable. DeliveryEnvelope owns that distinction.
@@ -113,7 +116,6 @@ impl TeamResultReducer {
 /// to appear first in the graph, and a useful plain-text result must not be
 /// discarded merely because the delegated model omitted an optional JSON
 /// wrapper.
-#[cfg(test)]
 fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String> {
     let mut branch_summaries = BTreeMap::new();
     for node in &graph.nodes {
@@ -148,14 +150,36 @@ fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String>
         if raw_summary.is_empty() {
             continue;
         }
-        let summary = crate::agent_in_process_worker::structured_agent_output(raw_summary)
-            .and_then(|object| {
-                object
-                    .get("findings")
-                    .or_else(|| object.get("summary"))
-                    .and_then(positive_field_text)
+        let mut sections = crate::agent_in_process_worker::structured_agent_output(raw_summary)
+            .map(|object| {
+                ["findings", "summary", "evidence", "risks", "unresolved"]
+                    .into_iter()
+                    .filter_map(|field| {
+                        positive_field_text(object.get(field)?)
+                            .map(|text| format!("{field}: {text}"))
+                    })
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or_else(|| raw_summary.to_string());
+            .unwrap_or_else(|| vec![raw_summary.to_string()]);
+        let observed_paths = result
+            .usage
+            .observed_acceptance
+            .observed_evidence
+            .iter()
+            .filter_map(|evidence| match &evidence.target {
+                EvidenceTargetIdentity::Workspace { scope } => {
+                    Some(scope.path.workspace_relative_path.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        if !observed_paths.is_empty() {
+            sections.push(format!(
+                "observed_source_paths: {}",
+                observed_paths.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        let summary = sections.join("\n");
         if !summary.trim().is_empty() {
             branch_summaries.insert(node.id.clone(), summary);
         }
@@ -166,6 +190,36 @@ fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String>
             .map(|(branch_id, summary)| format!("[{branch_id}] {summary}"))
             .collect::<Vec<_>>()
             .join("\n")
+    })
+}
+
+/// Return a deterministic Team evidence bundle only when all worker branches
+/// are completed, evidence-bearing, and the graph's own delivery envelope is
+/// fully satisfied. This is a transport carrier, not an `AnswerCandidate` and
+/// must never be attributed to a model or a TeamSynthesizer presentation.
+fn verified_team_evidence_bundle(
+    graph: &ExecutionGraph,
+    envelope: &DeliveryEnvelope,
+) -> Option<String> {
+    if envelope.pipeline_status != PipelineStatus::Completed
+        || envelope.delivery_status != DeliveryStatus::Satisfied
+        || !envelope.unresolved.is_empty()
+        || envelope.coverage.required_obligation_ids != envelope.coverage.satisfied_obligation_ids
+    {
+        return None;
+    }
+    let worker_count = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        .count();
+    let summary = aggregate_positive_evidence_summary(graph)?;
+    let summarized_worker_count = summary.lines().filter(|line| line.starts_with('[')).count();
+    (worker_count > 0 && summarized_worker_count == worker_count).then(|| {
+        format!(
+            "# Verified Team evidence bundle\n\n{summary}\n\n{}",
+            mechanical_delivery_summary(envelope)
+        )
     })
 }
 
@@ -561,7 +615,6 @@ fn is_synthesizer_role(packet: &AgentTaskPacket, _binding: Option<&TeamBindingSn
     })
 }
 
-#[cfg(test)]
 fn positive_field_text(value: &serde_json::Value) -> Option<String> {
     match value {
         serde_json::Value::String(text) => {
@@ -688,6 +741,7 @@ mod tests {
     use super::{
         aggregate_positive_evidence_summary, build_delivery_envelope, eligible_team_synthesizer,
         is_synthesizer_role, mechanical_delivery_summary, terminal_agent_node_ids,
+        verified_team_evidence_bundle,
     };
 
     fn frozen_role(
@@ -954,11 +1008,17 @@ mod tests {
         // select the visible Team result.
         add_evidence_branch(&mut graph, "branch-b", "plain text finding B", false);
         add_evidence_branch(&mut graph, "branch-a", "structured finding A", true);
+        add_verify(&mut graph, true);
 
         assert_eq!(
             aggregate_positive_evidence_summary(&graph).as_deref(),
-            Some("[branch-a] structured finding A\n[branch-b] plain text finding B")
+            Some("[branch-a] findings: structured finding A\n[branch-b] plain text finding B")
         );
+        let envelope = build_delivery_envelope(&graph);
+        let bundle = verified_team_evidence_bundle(&graph, &envelope)
+            .expect("completed, evidenced Team branches produce a typed transport bundle");
+        assert!(bundle.starts_with("# Verified Team evidence bundle"));
+        assert!(bundle.contains("[branch-a] findings: structured finding A"));
     }
 
     #[test]
