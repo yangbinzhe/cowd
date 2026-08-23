@@ -8960,9 +8960,6 @@ fn terminal_delivery_envelope(
 
 fn objective_requires_strict_json(objective: &str) -> bool {
     let normalized = objective.to_ascii_lowercase();
-    let requests_json = normalized.contains("json")
-        || normalized.contains("machine-readable")
-        || normalized.contains("机器可读");
     let rejects_json = [
         "不要求json",
         "不要求 json",
@@ -8978,7 +8975,40 @@ fn objective_requires_strict_json(objective: &str) -> bool {
     ]
     .iter()
     .any(|marker| normalized.contains(marker));
-    requests_json && !rejects_json
+    if rejects_json {
+        return false;
+    }
+
+    // Mentioning JSON as one acceptable presentation format is not a strict
+    // JSON contract. The latter must be an explicit user requirement; in
+    // particular, a prompt such as "JSON, Markdown headings, or Field:
+    // value" must retain its Markdown terminal candidate instead of sending
+    // an already-accepted answer through the narrator fallback.
+    [
+        "strict json",
+        "json only",
+        "only json",
+        "return json",
+        "return a json",
+        "respond with json",
+        "output json",
+        "machine-readable json",
+        "机器可读 json",
+        "只输出json",
+        "只输出 json",
+        "仅输出json",
+        "仅输出 json",
+        "只用json",
+        "只用 json",
+        "必须使用json",
+        "必须使用 json",
+        "输出json",
+        "输出 json",
+        "返回json",
+        "返回 json",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn qualified_root_answer(
@@ -17594,5 +17624,15 @@ mod tests {
         ));
         assert!(objective_requires_strict_json("Return strict JSON only."));
         assert!(objective_requires_strict_json("输出机器可读 JSON。"));
+    }
+
+    #[test]
+    fn alternative_json_format_does_not_reject_a_markdown_terminal_candidate() {
+        assert!(!objective_requires_strict_json(
+            "Give every required Team output field using native structured output, JSON, Markdown headings, or `Field: value` labels."
+        ));
+        assert!(!objective_requires_strict_json(
+            "最终结论可用 JSON、Markdown 标题或 Field: value 标签。"
+        ));
     }
 }

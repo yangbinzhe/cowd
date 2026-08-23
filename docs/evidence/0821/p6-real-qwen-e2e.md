@@ -187,3 +187,36 @@ afterward. The architecture-quality evaluator correctly rejects that stale,
 contradictory text (5/9). The next repair must make root presentation consume
 the completed Program's canonical terminal result instead of an earlier model
 answer; weakening the quality gate would conceal the defect.
+
+## 2026-08-23 strict-gate rerun: structural pass, terminal-format failure
+
+Candidate `0e6b19f8` was rebuilt into Gateway binary
+`84b64905bcc99d94557417fd1cbe17c490d3969f669f7ee45cb3027e284ab318` and
+executed against real `qwen3.7-plus` with the same isolated-Gateway command
+and an 1800-second process ceiling. This run is deliberately recorded as a
+failure, not as P6 evidence of completion:
+
+```text
+/tmp/cowd-real-qwen-evidence.OoJZbh/runs/v0.9.703-1787444861-mission-harness-deep/report.json
+sha256 f59036a035591f80be69c3640e5911041a2eba32160daa7c118d1f6e97a04b17
+
+live-scenarios/004-live_team_projection.json
+sha256 19e2660769333b8a41f63a338d5ba97da8b6f11e15bf5fbe9ceee83bcc9ecac7
+```
+
+The durable/public facts passed: three completed Teams, nine completed Agents,
+two claimed cross-Team edges, no failed Team or Agent, and real provider/model
+`qwen3.7-plus` without fallback. The suite nevertheless failed because its
+terminal architecture-quality score was 7/9. The accepted Markdown conclusion
+correctly said that all three Teams completed, but `objective_requires_strict_json`
+classified the prompt's phrase "JSON, Markdown headings, or `Field: value`"
+as a strict-JSON contract merely because it mentioned JSON. `Synthesize` then
+rejected the valid Markdown `assistant_json` candidate and asked the narrator
+to explain the default placeholder "Execution ended without a qualified root
+answer candidate." The narrator consequently contradicted the durable Team
+facts.
+
+The following candidate narrows that format classifier to explicit strict-JSON
+requirements and has a unit regression for JSON as one alternative among
+Markdown/field formats. It must receive a fresh real-Qwen run; this failed run
+does not close the structural sub-gate or P6.
