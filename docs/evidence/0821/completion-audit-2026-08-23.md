@@ -207,3 +207,44 @@ The changed dependency cone has deterministic provider-wire and Runtime
 behavior tests. After it is committed as a clean candidate, the strict real
 scenario will be run exactly once for that SHA; only that result may reopen the
 release/tag decision.
+
+## Strategy-lease coherence repair — preflight for the final candidate
+
+The second clean Token Plan run reached real Team/Agent control-plane behavior
+without a provider protocol error, but it did not pass the strict release gate.
+Its preserved report is
+`target/acceptance/real-qwen/runs/v0.9.704-1787482602-mission-harness-deep/`.
+Three of five production scenarios passed; the two remaining live scenarios
+were rejected with `model_proposal_conflicts_with_strategy_lease`. The model
+first read a `Collaborate` lease from `runtime_capabilities`, then its typed
+`runtime_orchestrate` proposal was checked against `Execute`. This is a
+Runtime coherence fault, not a malformed model proposal and not a provider
+failure.
+
+The final candidate makes the lease boundary atomic:
+
+- Every admitted turn immediately publishes its sole Runtime-owned decision to
+  the Gateway executor transport cache. Capability discovery and a later
+  proposal therefore begin from the same lease identity.
+- When the root has an explicit Team contract, Runtime pins that admitted
+  decision to `Team`/`Collaborate` before it exposes the control-plane tool
+  set. The pin is durable as a strategy-selected event and preserves the lease
+  identity across the revision.
+- This does not synthesize a Program, a Team name, a role topology or a
+  proposal. The model must still submit the typed control-plane proposal and
+  only its verified durable receipt can admit execution.
+
+The local regression set passed before candidate commit:
+
+- `explicit_root_collaboration_contract_pins_the_admitted_lease_before_control_plane`
+  proves that the required contract retains the one admitted lease while
+  selecting `Collaborate` and a Team candidate.
+- `model_team_proposal_retargets_within_the_same_strategy_lease`,
+  `host_does_not_materialize_required_teams_before_root_control_plane_receipt`,
+  and Gateway lease-reuse coverage all pass.
+- `cargo fmt --all -- --check` and `cargo check -p runtime --all-targets`
+  pass.
+
+The next strict real-model run is reserved for the exact clean commit containing
+this repair. No report from either earlier SHA is used as final acceptance
+evidence.

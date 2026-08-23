@@ -3909,6 +3909,14 @@ where
                 .lock()
                 .await
                 .pending_root_control_plane_requirement = Some(required_team_count);
+            runtime
+                .require_active_turn_collaboration_control_plane(required_team_count)
+                .map_err(|error| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason: format!(
+                        "pin required root collaboration strategy before control-plane exposure: {error}"
+                    ),
+                })?;
             runtime.require_next_model_orchestration_only();
         }
         for item in pending_next_model_context {

@@ -11454,6 +11454,13 @@ where
             self.session_id().to_string(),
             turn_ref,
         );
+        // Capability discovery and the later `runtime_orchestrate` proposal
+        // may be separate provider/tool batches. Bind the just-admitted
+        // decision before either one can run so both observe the same
+        // turn-owned lease. The executor is a transport cache only: the
+        // ConversationRuntime remains the sole decision owner.
+        self.tool_executor
+            .bind_execution_decision(state.decision.clone());
         *guard = Some(state.clone());
         Ok(state)
     }
@@ -11466,6 +11473,31 @@ where
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
+    }
+
+    /// Pin an explicit root collaboration contract to the admitted turn
+    /// before exposing the model control plane. This intentionally fixes a
+    /// runtime invariant rather than deriving any Team topology: the model
+    /// still owns the typed proposal and the durable receipt remains required
+    /// before a Program can materialize.
+    pub(crate) fn require_active_turn_collaboration_control_plane(
+        &self,
+        required_team_count: u8,
+    ) -> Result<crate::execution_core::RuntimeExecutionDecision, RuntimeError> {
+        if required_team_count == 0 {
+            return Err(RuntimeError::new(
+                "root collaboration control plane requires at least one Team",
+            ));
+        }
+        let decision = self.revise_active_turn_strategy(
+            harness_contract::strategy::ExecutionCandidateKind::Team,
+            harness_contract::core::ExecutionPattern::Collaborate,
+            crate::execution_core::TurnStrategyDecisionStatus::Running,
+            "explicit root collaboration contract pinned the turn strategy lease before model control-plane exposure",
+            Some("runtime.strategy.selected"),
+        )?;
+        self.tool_executor.bind_execution_decision(decision.clone());
+        Ok(decision)
     }
 
     pub(crate) fn bind_turn_strategy_execution(
@@ -15748,6 +15780,59 @@ mod tests {
                 .expect("canonical strategy")
                 .selected_candidate,
             harness_contract::strategy::ExecutionCandidateKind::Team
+        );
+    }
+
+    #[test]
+    fn explicit_root_collaboration_contract_pins_the_admitted_lease_before_control_plane() {
+        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::clone(&store));
+        let admitted = runtime
+            .begin_turn_strategy("root-collaboration-contract", "分析并解决这个问题")
+            .expect("admit strategy");
+        runtime
+            .bind_turn_strategy_execution("root-collaboration-contract", "root-graph")
+            .expect("bind strategy graph");
+
+        let pinned = runtime
+            .require_active_turn_collaboration_control_plane(2)
+            .expect("pin root collaboration contract");
+
+        assert_eq!(pinned.lease.lease_id, admitted.decision_lease);
+        assert_eq!(
+            pinned.pattern(),
+            harness_contract::core::ExecutionPattern::Collaborate
+        );
+        assert_eq!(
+            runtime
+                .active_turn_strategy()
+                .expect("active strategy")
+                .selected_candidate,
+            harness_contract::strategy::ExecutionCandidateKind::Team
+        );
+        let selected_events = store
+            .list_stream(&format!("session:{}", runtime.session_id()))
+            .expect("strategy events")
+            .into_iter()
+            .filter(|event| event.kind == "runtime.strategy.selected")
+            .collect::<Vec<_>>();
+        assert!(
+            selected_events.iter().any(|event| {
+                event
+                    .payload
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|reason| reason.contains("explicit root collaboration contract"))
+            }),
+            "the forced runtime invariant must be durable"
         );
     }
 
