@@ -389,3 +389,37 @@ Preflight passed:
 The next real candidate must demonstrate the full multi-Team path, including
 the subsequent escalation and continuation scenarios, before any release
 claim, version change, tag or push is permitted.
+
+### Candidate result and named-action follow-up
+
+The first execution of the phase-transition candidate was stopped immediately
+after the strict multi-Team scenario failed, before the harness could spend
+provider requests on unrelated later scenarios. Its isolated artifacts are
+under `/tmp/cowd-real-qwen-gateway.K8gS99`; the compiled Gateway SHA was
+`5fb7ce45e76a54af259efcae28acb3ec9fce37b71ad49a95b9eab2eeab9234a4` and
+startup confirmed the configured route `qwen-tokenplan` / `qwen3.8-max`.
+
+The new phase event did occur: a successful `runtime_capabilities` receipt was
+followed by the `proposal_only` restriction rather than another capability
+lookup. The provider nevertheless returned prose on the one-tool continuation
+and the bounded root repair ended honestly with
+`missing_control_plane_proposal`, zero verified Teams. This rules out a
+topology/compiler failure for that scenario and isolates a wire-level
+compliance weakness: generic `tool_choice=required` asks for any tool even
+when the exposed set happens to contain one function.
+
+The follow-up changes only that wire constraint. Runtime now carries an
+optional one-shot required function name. For `proposal_only`, it sends the
+OpenAI-compatible named function selection for `runtime_orchestrate`; the
+provider must enter the native orchestration schema, while the model still
+supplies the whole typed proposal and Runtime still verifies admission and
+Team evidence. The adapter fails closed if the named schema is not exposed.
+
+Additional preflight:
+
+- `cargo test -p runtime --lib named_governed_action_uses_provider_function_selection`
+- the prior root control-plane and provider capability tests
+- `cargo check -p runtime --all-targets`, formatting and whitespace checks.
+
+This remains a preflight correction, not a release result. The next candidate
+is again entitled to one clean full real scenario run only.

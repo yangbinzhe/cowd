@@ -2291,6 +2291,14 @@ pub trait ApiClient {
     /// exactly once; non-provider test clients may ignore it.
     fn configure_tool_choice_required(&mut self, _required: bool) {}
 
+    /// Optionally bind a required request to one already-exposed native tool.
+    /// This is a wire-level selection constraint, not permission or semantic
+    /// authority: Runtime still validates the tool input and every resulting
+    /// receipt. The default keeps lightweight test clients source-compatible.
+    fn configure_tool_choice(&mut self, required: bool, _required_tool_name: Option<String>) {
+        self.configure_tool_choice_required(required);
+    }
+
     fn configure_provider_wire_evidence(
         &mut self,
         _writer: Option<Arc<dyn crate::ProviderWireEvidenceWriter>>,
@@ -3348,6 +3356,10 @@ pub struct ConversationRuntime<C, T> {
     /// The narrowed tool set represents an already-admitted business
     /// obligation and one actual call is required on the next request.
     next_model_tool_required: AtomicBool,
+    /// A stricter one-shot provider selection for a governed native action.
+    /// It is only used after Runtime has reduced the eligible schema set to a
+    /// single control-plane action; it never encodes a Team topology.
+    next_model_required_tool_name: std::sync::Mutex<Option<String>>,
     /// A successful tool_search activation creates a one-request execution
     /// handoff. The following automatic provider request receives the newly
     /// activated schemas but temporarily hides tool_search so discovery cannot
@@ -3826,6 +3838,7 @@ where
             next_model_text_only: AtomicBool::new(false),
             next_model_tool_allowlist: std::sync::Mutex::new(None),
             next_model_tool_required: AtomicBool::new(false),
+            next_model_required_tool_name: std::sync::Mutex::new(None),
             next_model_tool_activation_notice: std::sync::Mutex::new(None),
             next_model_reasoning_effort: std::sync::Mutex::new(None),
             tool_trace_context_items: std::sync::Mutex::new(Vec::new()),
@@ -4359,6 +4372,17 @@ where
     ) {
         self.require_next_model_tools(tool_ids);
         self.next_model_tool_required.store(true, Ordering::SeqCst);
+    }
+
+    /// Require one exact already-governed native tool on the next provider
+    /// request. This is used only for a control-plane continuation after the
+    /// model has already inspected the capability catalog.
+    pub(crate) fn require_next_model_named_tool_action(&self, tool_id: impl Into<String>) {
+        let tool_id = tool_id.into();
+        self.require_next_model_tool_action([tool_id.clone()]);
+        if let Ok(mut required_tool_name) = self.next_model_required_tool_name.lock() {
+            *required_tool_name = Some(tool_id);
+        }
     }
 
     /// Require the root model to take one native control-plane action before
@@ -6765,6 +6789,11 @@ where
             .ok()
             .and_then(|mut allowlist| allowlist.take());
         let one_shot_tool_required = self.next_model_tool_required.swap(false, Ordering::SeqCst);
+        let one_shot_required_tool_name = self
+            .next_model_required_tool_name
+            .lock()
+            .ok()
+            .and_then(|mut tool_name| tool_name.take());
         let tool_activation_ceiling = one_shot_tool_allowlist.clone();
         let one_shot_reasoning_effort = self
             .next_model_reasoning_effort
@@ -6930,7 +6959,7 @@ where
             .collect::<BTreeSet<_>>();
         self.api_client.configure_tool_exposure(exposure_projection);
         self.api_client
-            .configure_tool_choice_required(one_shot_tool_required);
+            .configure_tool_choice(one_shot_tool_required, one_shot_required_tool_name);
 
         // Tool schemas are part of the request budget. Read their inventory
         // only after Runtime has made the exposure decision.

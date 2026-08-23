@@ -3973,9 +3973,9 @@ where
                     runtime.require_next_model_orchestration_only();
                 }
                 RootControlPlanePhase::ProposalOnly => {
-                    runtime.require_next_model_tool_action([
-                        harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID.to_string(),
-                    ]);
+                    runtime.require_next_model_named_tool_action(
+                        harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID,
+                    );
                     runtime.require_next_model_reasoning_effort("none");
                 }
                 RootControlPlanePhase::ProposalSubmitted => {}

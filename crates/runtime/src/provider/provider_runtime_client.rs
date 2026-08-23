@@ -279,6 +279,7 @@ pub struct ProviderRuntimeClient {
     tool_definitions: Vec<ToolDefinition>,
     tool_exposure: Option<ToolExposureProjection>,
     tool_choice_required: bool,
+    tool_choice_required_tool_name: Option<String>,
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
@@ -297,10 +298,20 @@ struct CompiledToolSchema {
     inventory: ProviderContextInventory,
 }
 
+#[cfg(test)]
 fn provider_tool_choice(
     has_active_tools: bool,
     required: bool,
     explicit_tool_choice: CapabilityState,
+) -> Result<Option<ToolChoice>, RuntimeError> {
+    provider_tool_choice_for_required_tool(has_active_tools, required, explicit_tool_choice, None)
+}
+
+fn provider_tool_choice_for_required_tool(
+    has_active_tools: bool,
+    required: bool,
+    explicit_tool_choice: CapabilityState,
+    required_tool_name: Option<&str>,
 ) -> Result<Option<ToolChoice>, RuntimeError> {
     match (has_active_tools, required, explicit_tool_choice) {
         (false, false, _) => Ok(None),
@@ -319,7 +330,11 @@ fn provider_tool_choice(
             Ok(None)
         }
         (true, false, CapabilityState::Unsupported) => Ok(None),
-        (true, true, CapabilityState::Supported) => Ok(Some(ToolChoice::Any)),
+        (true, true, CapabilityState::Supported) => Ok(Some(
+            required_tool_name.map_or(ToolChoice::Any, |name| ToolChoice::Tool {
+                name: name.to_string(),
+            }),
+        )),
         (true, false, CapabilityState::Supported) => Ok(Some(ToolChoice::Auto)),
     }
 }
@@ -428,6 +443,7 @@ impl ProviderRuntimeClient {
             tool_definitions,
             tool_exposure: None,
             tool_choice_required: false,
+            tool_choice_required_tool_name: None,
             reasoning_effort: None,
             emit_output: false,
             stream_callback: None,
@@ -558,6 +574,14 @@ impl ProviderRuntimeClient {
 
     pub fn configure_tool_choice_required(&mut self, required: bool) {
         self.tool_choice_required = required;
+        if !required {
+            self.tool_choice_required_tool_name = None;
+        }
+    }
+
+    pub fn configure_tool_choice(&mut self, required: bool, required_tool_name: Option<String>) {
+        self.tool_choice_required = required;
+        self.tool_choice_required_tool_name = required.then_some(required_tool_name).flatten();
     }
 
     fn active_tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -749,6 +773,10 @@ impl ApiClient for ProviderRuntimeClient {
         ProviderRuntimeClient::configure_tool_choice_required(self, required);
     }
 
+    fn configure_tool_choice(&mut self, required: bool, required_tool_name: Option<String>) {
+        ProviderRuntimeClient::configure_tool_choice(self, required, required_tool_name);
+    }
+
     fn context_inventory(&self) -> ProviderContextInventory {
         self.compiled_tool_schema().inventory
     }
@@ -807,6 +835,20 @@ impl ProviderRuntimeClient {
         );
         let active_tools = self.compiled_tool_schema().tools.to_vec();
         let tool_choice_required = std::mem::take(&mut self.tool_choice_required);
+        let required_tool_name = std::mem::take(&mut self.tool_choice_required_tool_name);
+        if let Some(name) = required_tool_name.as_deref() {
+            if !active_tools.iter().any(|tool| tool.name == name) {
+                let name = name.to_string();
+                return ApiClientStream {
+                    events: Box::pin(futures::stream::once(async move {
+                        Err(RuntimeError::new(format!(
+                            "provider request requires named governed tool `{name}`, but it is not exposed"
+                        )))
+                    })),
+                    transport_activity: None,
+                };
+            }
+        }
 
         // Runtime selects one candidate and owns the route/retry lifecycle.
         // This adapter owns exactly one pinned wire-protocol attempt.
@@ -859,7 +901,7 @@ impl ProviderRuntimeClient {
                     reasoning_effort.as_deref(),
                 );
         }
-        let tool_choice = match provider_tool_choice(
+        let tool_choice = match provider_tool_choice_for_required_tool(
             !active_tools.is_empty(),
             tool_choice_required,
             entry
@@ -868,6 +910,7 @@ impl ProviderRuntimeClient {
                 .capabilities
                 .supports_explicit_tool_choice
                 .state,
+            required_tool_name.as_deref(),
         ) {
             Ok(choice) => choice,
             Err(error) => {
@@ -1664,7 +1707,8 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
 mod tests {
     use super::{
         build_provider_entry, forward_text_delta, provider_attempt, provider_tool_choice,
-        request_reasoning_effort, tool_definitions_for_exposure,
+        provider_tool_choice_for_required_tool, request_reasoning_effort,
+        tool_definitions_for_exposure,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{AssistantEvent, ProviderRegistry, ProviderRuntimeClient, ProviderTransportPool};
@@ -1763,6 +1807,22 @@ mod tests {
             None
         );
         assert!(provider_tool_choice(false, true, CapabilityState::Supported).is_err());
+    }
+
+    #[test]
+    fn named_governed_action_uses_provider_function_selection() {
+        assert_eq!(
+            provider_tool_choice_for_required_tool(
+                true,
+                true,
+                CapabilityState::Supported,
+                Some("runtime_orchestrate"),
+            )
+            .expect("named native action must compile"),
+            Some(ToolChoice::Tool {
+                name: "runtime_orchestrate".to_string(),
+            })
+        );
     }
 
     #[test]
