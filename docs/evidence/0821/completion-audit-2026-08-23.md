@@ -57,3 +57,40 @@ substitute for this boundary.
 
 No version/tag/deployment or claim of completed autonomous cross-Team
 orchestration is justified at this audit point.
+
+## Follow-up audit — candidate `eadc526a` / `5480a363`
+
+The table above is the pre-fan-in snapshot and must not be used to describe
+the current Team delivery path. The following additional evidence was verified
+on the integration candidate:
+
+- B1 durable Team obligations: `collaboration_coordinator_persists_every_compiled_team_obligation_before_admission` passed.
+- B3 delivery/claim: `cross_team_edge_delivery_and_claim_are_fenced_by_node_attempts` and
+  `terminal_producer_without_required_cross_team_facts_blocks_edge_durably`
+  passed. The real Qwen strict fan-in scenario independently recorded three
+  completed Teams, nine completed Agents, and two claimed edges.
+- B4 implemented patch paths: atomically fenced retirement and objective
+  narrowing tests passed. This does not by itself prove every patch variant's
+  crash matrix.
+- B5 deterministic continuation primitives passed same-session selection,
+  duplicate CAS, cross-session deny/allow handoff authorization, and target
+  session policy reauthorization tests. A single integrated real-provider
+  scenario that exercises every continuation branch is still absent.
+- P5 bounded performance evidence passed on this candidate: reference Surface
+  contract (100 signed bundles, 256 singleflight callers, Gateway hot route
+  3421 RPS versus direct 3789 RPS) and both release Runtime projection probes
+  (2,000 foreground samples and a 512-item catch-up/10,000-sample probe).
+  One immediately preceding reference-transport attempt missed its throughput
+  floor under local contention; the retry passed without a threshold change,
+  so performance repeatability remains a release risk rather than a closed
+  100x10 database gate.
+
+The P6 release remains **incomplete**. `COWD_TEST_POSTGRES_URL` and
+`COWD_TEST_POSTGRES_TARGET_URL` are not configured in this environment, so
+the required real PostgreSQL contract/query evidence cannot be fabricated.
+The required 100 Program × 10 Team database measurement is also not present.
+`cowd-edge` is locally four commits ahead of `origin/master`; until that
+candidate and generated Edge/MFG consumer output are independently audited,
+there is no single cross-repository release tuple. Finally, the real-Qwen
+fan-in pass does not include the required Agent escalation, same-session
+continuation, cross-session deny/allow, and approval in one controlled E2E.
