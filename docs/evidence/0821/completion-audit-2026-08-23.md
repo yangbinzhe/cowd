@@ -592,3 +592,27 @@ This makes the policy observable without weakening a genuine execution hold.
 Focused Gateway projection and TUI rendering/parser tests pass; full
 real-provider validation remains deferred until exposed provider credentials
 are rotated and the isolated route can be safely re-run.
+
+### 2026-08-24 real-provider capacity closure
+
+The local Qwen Token Plan route was reconfigured and passed Cowd's redacted
+configuration validation. A new deep-real run reached the configured route,
+but the provider returned its typed `insufficient_quota` response. This is an
+external account-capacity condition, not an authentication, approval, Team, or
+execution-graph failure.
+
+The run exposed a convergence defect: generic HTTP 429 was classified as
+transient overload even when the provider explicitly declared account/plan
+quota exhaustion. Provider error handling now recognizes quota-exhaustion
+markers, suppresses same-model retries, and does not report that condition as
+downstream overload. The isolated deep run was repeated against the immutable
+candidate: all five live scenarios reached durable terminal reports in roughly
+1.1 seconds each, with no pending approval or recovery wait. The report is an
+honest failed gate because no provider capacity was available; it is evidence
+of failure convergence, not release success.
+
+Offline closure remains green: Provider's full unit suite, Runtime's serial
+library suite, TUI's full library suite, Gateway projection coverage, and the
+full Harness report all passed. The live report can become a success gate only
+after the provider account has usable quota again; no local implementation can
+manufacture that external capacity.
