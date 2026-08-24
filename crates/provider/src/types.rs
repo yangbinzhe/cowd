@@ -215,6 +215,10 @@ pub struct MessageResponse {
     #[serde(rename = "type")]
     pub kind: String,
     pub role: String,
+    // Anthropic-compatible streaming `message_start` frames may omit the
+    // empty content array. Treat it as an empty response until subsequent
+    // content-block frames arrive instead of rejecting the whole stream.
+    #[serde(default)]
     pub content: Vec<OutputContentBlock>,
     pub model: String,
     #[serde(default)]
@@ -354,7 +358,9 @@ pub enum StreamEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputContentBlock, InputMessage, MessageRequest, MessageResponse, Usage};
+    use super::{
+        InputContentBlock, InputMessage, MessageRequest, MessageResponse, StreamEvent, Usage,
+    };
 
     #[test]
     fn usage_total_tokens_includes_cache_tokens() {
@@ -367,6 +373,26 @@ mod tests {
 
         assert_eq!(usage.total_tokens(), 19);
         assert_eq!(usage.token_usage().total_tokens(), 19);
+    }
+
+    #[test]
+    fn streaming_message_start_accepts_an_omitted_empty_content_array() {
+        let event: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "resp-test",
+                "type": "message",
+                "role": "assistant",
+                "model": "gpt-5.6-terra",
+                "usage": {"input_tokens": 0, "output_tokens": 0}
+            }
+        }))
+        .expect("an Anthropic-compatible message_start frame should deserialize");
+
+        assert!(matches!(
+            event,
+            StreamEvent::MessageStart(start) if start.message.content.is_empty()
+        ));
     }
 
     #[test]

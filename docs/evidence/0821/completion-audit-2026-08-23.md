@@ -616,3 +616,27 @@ library suite, TUI's full library suite, Gateway projection coverage, and the
 full Harness report all passed. The live report can become a success gate only
 after the provider account has usable quota again; no local implementation can
 manufacture that external capacity.
+
+### 2026-08-24 CC Switch Anthropic streaming bridge compatibility
+
+Cowd can route a configured `anthropic` provider through a loopback CC Switch
+bridge, where the bridge converts the request to OpenAI Responses and keeps
+its OAuth credential outside Cowd's configuration. The bridge returned valid
+Anthropic SSE frames, but its `message_start` frame omitted the optional empty
+`content` array. Cowd previously made that field mandatory and rejected the
+entire stream before any text or tool frame could be processed.
+
+`MessageResponse.content` now defaults to an empty list during deserialization.
+The later `content_block_*` frames remain the authority for streamed content.
+The regression test exercises precisely that omitted-field frame. This is a
+wire-compatibility relaxation only; non-streaming response validation and all
+subsequent streamed content parsing remain unchanged.
+
+Focused proof passed:
+
+- `cargo test -p provider streaming_message_start_accepts_an_omitted_empty_content_array --lib`
+- `cargo check -p provider --all-targets`
+- `cargo fmt --all -- --check`
+
+A fresh clean deep-real run through the configured loopback bridge is required
+to establish the full business-chain gate.
