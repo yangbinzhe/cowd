@@ -643,7 +643,9 @@ fn compile_team_subgraph_node(
             execution_id: graph_id.to_string(),
             node_id: node_id.to_string(),
         }),
-        selection_mode: TeamSelectionMode::ModelAssisted,
+        selection_mode: request
+            .selection_mode
+            .unwrap_or(TeamSelectionMode::ModelAssisted),
         strategy_binding: request.strategy_binding.clone(),
         template_selector,
         objective: bounded_team_node_objective(semantic),

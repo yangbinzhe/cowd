@@ -2022,7 +2022,13 @@ fn bind_strategy(
     if !team_requested {
         return;
     }
-    request.selection_mode = Some(harness_contract::team::TeamSelectionMode::ModelAssisted);
+    // A root collaboration decision is already a Runtime-bound semantic
+    // Program, so its concrete Team roles are Runtime-owned. Preserve the
+    // explicit mode assigned at the narrow control boundary instead of
+    // overwriting it with the legacy model-assisted role-selection mode.
+    request
+        .selection_mode
+        .get_or_insert(harness_contract::team::TeamSelectionMode::ModelAssisted);
     if request.strategy_binding.is_none() {
         if let Some(decision) = leased_decision {
             request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
@@ -2360,6 +2366,23 @@ mod tests {
         );
         assert!(session_is_trust_all(&services, Some("session-1")));
         assert!(!session_is_trust_all(&services, None));
+    }
+
+    #[test]
+    fn root_collaboration_role_selection_survives_strategy_binding() {
+        let mut request = proposal(vec![node(
+            "runtime-owned-team",
+            CapabilityRecipeId::Team,
+            Vec::new(),
+        )]);
+        request.selection_mode = Some(harness_contract::team::TeamSelectionMode::Explicit);
+
+        bind_strategy(&mut request, None, None);
+
+        assert_eq!(
+            request.selection_mode,
+            Some(harness_contract::team::TeamSelectionMode::Explicit)
+        );
     }
 
     #[test]

@@ -516,3 +516,33 @@ narrow_collaboration_decision_converts_without_runtime_owned_fields --
 --test-threads=1`, the root control-plane regression, formatting, and
 `cargo check -p runtime -p harness-contract --all-targets` passed. A fresh
 clean real-provider run remains required.
+
+### Follow-up: preserve Runtime-owned role selection through compilation
+
+The next clean real-provider run still reported a partial-template dependency
+error even though the root converter had discarded the provider `focuses`.
+Tracing the typed request found a second authority bypass: Gateway supplied no
+selection mode, `bind_strategy` unconditionally rewrote that to
+`ModelAssisted`, and the Team compiler then unconditionally emitted that mode.
+The instantiator correctly treats a model-assisted empty multi-role request as
+ambiguous, but it must not see that legacy mode for a root collaboration
+decision whose concrete roles are Runtime-owned.
+
+The narrow Gateway control-tool boundary now marks only
+`submit_collaboration_decision` as `Explicit`; ordinary
+`runtime_orchestrate` remains model-assisted. Strategy binding preserves an
+already supplied selection mode, and the compiler carries it into the
+`TeamInstantiationRequest`. Explicit mode activates the immutable full
+template, which is then dependency-validated by Runtime. No provider field
+can name or omit a template role.
+
+Focused proof passed:
+
+- `cargo test -p gateway --lib root_collaboration_decision_uses_runtime_owned_team_role_selection -- --test-threads=1`
+- `cargo test -p runtime --lib root_collaboration_role_selection_survives_strategy_binding -- --test-threads=1`
+- `cargo test -p harness-contract --lib narrow_collaboration_decision_converts_without_runtime_owned_fields -- --test-threads=1`
+- `cargo check -p runtime -p gateway --all-targets`, formatting, and
+  whitespace checks.
+
+This repair is deliberately confined to the root collaboration tool. A fresh
+clean full real-provider run is still the release authority.

@@ -88,6 +88,13 @@ fn normalize_runtime_orchestration_wire_input(
     Ok(value)
 }
 
+fn team_selection_mode_for_runtime_tool(
+    tool_name: &str,
+) -> Option<harness_contract::team::TeamSelectionMode> {
+    (tool_name == harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID)
+        .then_some(harness_contract::team::TeamSelectionMode::Explicit)
+}
+
 #[derive(Debug, Deserialize)]
 struct RuntimeCapabilitiesRequest {
     intent: String,
@@ -483,6 +490,12 @@ impl GatewayToolExecutor {
         value: serde_json::Value,
         binding: RuntimeToolExecutionBinding<'_>,
     ) -> Result<String, ToolError> {
+        // Root collaboration decisions carry only user-requested workstream
+        // semantics. Runtime selects the concrete catalog template and must
+        // activate its complete dependency-valid role set; treating this as a
+        // ModelAssisted role selection would reintroduce model-authored
+        // template authority through a later compiler path.
+        let root_collaboration_selection = team_selection_mode_for_runtime_tool(tool_name);
         let value = if tool_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
             normalize_runtime_orchestration_wire_input(value)?
         } else if tool_name
@@ -781,7 +794,7 @@ impl GatewayToolExecutor {
                     session_id: binding.session_id.map(str::to_string),
                     lineage,
                     mission_id,
-                    selection_mode: None,
+                    selection_mode: root_collaboration_selection,
                     strategy_binding: None,
                     capabilities: Vec::new(),
                     surface: None,
@@ -2939,6 +2952,22 @@ fn network_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_collaboration_decision_uses_runtime_owned_team_role_selection() {
+        assert_eq!(
+            team_selection_mode_for_runtime_tool(
+                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+            ),
+            Some(harness_contract::team::TeamSelectionMode::Explicit)
+        );
+        assert_eq!(
+            team_selection_mode_for_runtime_tool(
+                harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID
+            ),
+            None
+        );
+    }
 
     #[test]
     fn runtime_orchestration_unwraps_nested_json_objects_before_typed_validation() {
