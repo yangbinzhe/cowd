@@ -1420,7 +1420,7 @@ impl Component for GatewayPanel {
                         Style::default().fg(Color::Yellow),
                     ),
                     Span::styled(
-                        "  Approvals/Relations: ",
+                        "  Pending approvals/relations: ",
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(
@@ -1460,6 +1460,29 @@ impl Component for GatewayPanel {
                             mission.control_requires_approval_count
                         ),
                         Style::default().fg(if mission.control_blocked_count > 0 {
+                            Color::Yellow
+                        } else {
+                            Color::Green
+                        }),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("Live work: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format!("{} agents running", mission.running_agent_count),
+                        Style::default().fg(if mission.running_agent_count > 0 {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                    Span::styled(
+                        "  Recovery attention: ",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        mission.recovery_required_count.to_string(),
+                        Style::default().fg(if mission.recovery_required_count > 0 {
                             Color::Yellow
                         } else {
                             Color::Green
@@ -2931,7 +2954,9 @@ mod tests {
             task_count: 3,
             team_count: 1,
             agent_count: 2,
+            running_agent_count: 2,
             pending_approvals: 3,
+            recovery_required_count: 0,
             relation_count: 4,
             execution_graph_count: 2,
             conflict_count: 1,
@@ -2990,6 +3015,11 @@ mod tests {
         assert!(
             joined.contains("4 ready, 1 blocked, 1 approval-gated"),
             "Should show mission control readiness, got: {joined}"
+        );
+        assert!(
+            joined.contains("Live work: 2 agents running")
+                && joined.contains("Recovery attention: 0"),
+            "Should show live Agent and recovery state, got: {joined}"
         );
         assert!(
             joined.contains("team.create")
