@@ -640,3 +640,26 @@ Focused proof passed:
 
 A fresh clean deep-real run through the configured loopback bridge is required
 to establish the full business-chain gate.
+
+### 2026-08-24 CC Switch Anthropic streaming tool-input compatibility
+
+The rerun passed the direct terminal scenario and then reached streamed tool
+calls in the runtime scenarios. CC Switch emitted a standard incremental
+Anthropic tool sequence: `content_block_start` named the `tool_use` but omitted
+its `input`, and later `input_json_delta` frames supplied the JSON arguments.
+Cowd required `input` at the start frame, so it rejected the stream before its
+existing delta accumulator could apply the deferred arguments.
+
+`OutputContentBlock::ToolUse.input` now defaults to JSON null when the start
+frame omits it. This preserves strictness for all other fields and leaves the
+existing incremental argument parsing as the source of the completed tool
+input. A regression test deserializes the exact deferred-input start frame.
+
+Focused proof passed:
+
+- `cargo test -p provider streaming_ --lib`
+- `cargo check -p provider --all-targets`
+- `cargo fmt --all -- --check`
+
+The next clean deep-real run is the authority for actual tool execution,
+orchestration, and Team-flow behavior through the bridge.

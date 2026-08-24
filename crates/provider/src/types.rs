@@ -250,6 +250,9 @@ pub enum OutputContentBlock {
     ToolUse {
         id: String,
         name: String,
+        // Streaming Anthropic-compatible adapters may defer tool arguments to
+        // subsequent `input_json_delta` frames and omit `input` here.
+        #[serde(default)]
         input: Value,
     },
     Thinking {
@@ -359,7 +362,8 @@ pub enum StreamEvent {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputContentBlock, InputMessage, MessageRequest, MessageResponse, StreamEvent, Usage,
+        InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+        StreamEvent, Usage,
     };
 
     #[test]
@@ -392,6 +396,26 @@ mod tests {
         assert!(matches!(
             event,
             StreamEvent::MessageStart(start) if start.message.content.is_empty()
+        ));
+    }
+
+    #[test]
+    fn streaming_tool_start_accepts_deferred_input_json() {
+        let event: StreamEvent = serde_json::from_value(serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "call-test",
+                "name": "read_file"
+            }
+        }))
+        .expect("a streaming tool start may defer its input to input_json_delta");
+
+        assert!(matches!(
+            event,
+            StreamEvent::ContentBlockStart(start)
+                if matches!(&start.content_block, OutputContentBlock::ToolUse { input, .. } if input.is_null())
         ));
     }
 
