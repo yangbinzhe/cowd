@@ -463,3 +463,32 @@ and no fallback provider was used.  Therefore §22.3/A12 remains blocked:
 there is still no clean current-candidate proof of the required multi-Team
 merge, managed escalation, same-session continuation, cross-session
 deny/allow, approval, PostgreSQL query summary and Surface screenshot.
+
+## 2026-08-24 real-provider repair candidate — root workstream cardinality
+
+The subsequent clean-candidate Qwen Token Plan run did execute against
+`qwen3.8-max` (21 live provider rounds). It failed honestly: the three-Team
+scenario submitted one semantic workstream containing three `focuses`, so the
+Runtime correctly rejected it with
+`explicit_team_requirement_count_mismatch:required=3:proposed=1`. The managed
+escalation scenario separately used an unpublished focus role (`solution`),
+which the Runtime correctly rejected during Team-template resolution.
+
+The failure is not an implicit-Team or topology repair. The root control-plane
+instruction now makes the wire contract explicit: each workstream represents
+exactly one Team, dependencies carry the parallel/merge ordering, and root
+submissions must omit `focuses` because it is not a Team list and role binding
+belongs to Runtime. The public schema description carries the same boundary.
+
+Preflight for this repair candidate passed:
+
+- `cargo test -p runtime --lib root_collaboration_instruction_makes_team_cardinality_and_focus_boundary_explicit -- --test-threads=1`
+- `cargo test -p runtime --lib capability_receipt_advances_root_control_plane_to_proposal_only -- --test-threads=1`
+- `cargo test -p runtime --lib only_a_successful_team_proposal_satisfies_root_control_plane_action -- --test-threads=1`
+- `cargo test -p harness-contract --lib narrow_collaboration_decision_converts_without_runtime_owned_fields -- --test-threads=1`
+- `cargo check -p runtime -p harness-contract --all-targets`, formatting,
+  whitespace, and `scripts/test/collaboration-deletion-gate.sh`.
+
+This is a repair candidate only. The next clean real-provider run must still
+pass every live scenario before §22.3/A12 can be closed; no tag or push is
+authorized by this record.

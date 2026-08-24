@@ -76,6 +76,19 @@ impl RootControlPlanePhase {
     }
 }
 
+/// Render the one-shot, Runtime-owned root-admission instruction.
+///
+/// A workstream is the unit that compiles to a Team.  Keeping that distinction
+/// explicit prevents a provider from putting several apparent Team roles into
+/// one `focuses` array, which would still be exactly one proposed Team and
+/// must correctly fail the cardinality gate.
+fn root_collaboration_decision_instruction(required_team_count: u8) -> String {
+    format!(
+        "Root collaboration admission is pending. Call `{}` exactly once now; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team, so do not put several Teams into one workstream. Give every workstream a distinct `workstream_id` and `objective`; express A/B parallelism and later synthesis only with `depends_on` between those workstream ids. Omit `focuses` entirely at root: `focuses` is not a Team list, and invented role ids are rejected. Include only `decision_id`, `intent`, `reason`, and `workstreams` (each with `workstream_id`, `objective`, optional `depends_on`, and optional `evidence_contract`). Runtime—not the model—binds templates, roles, identities, permissions, resources, graph nodes, and execution. This is not `runtime_orchestrate`.",
+        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+    )
+}
+
 /// Runtime-owned host for the standard provider-backed conversation engine.
 ///
 /// Gateway supplies service adapters such as tool executors and stream callbacks, but
@@ -3994,9 +4007,9 @@ where
                     // when the surrounding normal-conversation context is
                     // much larger than the control contract.  Supply one
                     // latest, Runtime-owned micro-instruction that names only
-                    // the narrow semantic codec.  It contains the user-bound
-                    // cardinality but no roles, templates, graph ids, or
-                    // topology, so model autonomy remains semantic rather
+                    // the narrow semantic codec. It contains the user-bound
+                    // cardinality but no Runtime-owned roles, templates, or
+                    // graph ids, so model autonomy remains semantic rather
                     // than protocol-fragile.
                     let mut item = ContextItem::new(
                         format!(
@@ -4005,10 +4018,7 @@ where
                         ),
                         ContextSourceKind::Task,
                         ContextRole::Instruction,
-                        format!(
-                            "Root collaboration admission is pending. Call `{}` exactly once now; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} semantic workstream(s) with `decision_id`, `intent`, `reason`, and `workstreams`. Each workstream needs only `workstream_id`, `objective`, optional `depends_on`, evidence contract, and optional focuses. Runtime—not the model—binds templates, identities, permissions, resources, graph nodes, and execution. This is not `runtime_orchestrate`.",
-                            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-                        ),
+                        root_collaboration_decision_instruction(required_team_count),
                     );
                     item.authority = ContextAuthority::System;
                     item.visibility = ContextVisibility::Private;
@@ -16667,6 +16677,15 @@ mod tests {
             phase.required_tool_choice(),
             harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
         );
+    }
+
+    #[test]
+    fn root_collaboration_instruction_makes_team_cardinality_and_focus_boundary_explicit() {
+        let instruction = root_collaboration_decision_instruction(3);
+        assert!(instruction.contains("exactly 3 `workstreams`"));
+        assert!(instruction.contains("one workstream is one proposed Team"));
+        assert!(instruction.contains("Omit `focuses` entirely at root"));
+        assert!(instruction.contains("submit_collaboration_decision"));
     }
 
     #[test]

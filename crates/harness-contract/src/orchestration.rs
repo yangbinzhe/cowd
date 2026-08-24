@@ -167,6 +167,9 @@ pub struct ModelCollaborationWorkstream {
     pub objective: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// An optional partition within this one Team, not a list of Teams. Root
+    /// collaboration admission should omit this field: Runtime selects and
+    /// validates concrete role ids after the semantic workstreams are bound.
     #[serde(default)]
     pub focuses: Vec<ModelSemanticFocus>,
     #[serde(default)]
