@@ -1652,8 +1652,9 @@ pub fn push_provider_output_block(
                 kind: crate::AssistantItemKind::ToolCall,
             });
             let initial_input = if streaming_tool_input
-                && input.is_object()
-                && input.as_object().is_some_and(serde_json::Map::is_empty)
+                && (input.is_null()
+                    || (input.is_object()
+                        && input.as_object().is_some_and(serde_json::Map::is_empty)))
             {
                 String::new()
             } else {
@@ -1707,16 +1708,16 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
 mod tests {
     use super::{
         build_provider_entry, forward_text_delta, provider_attempt, provider_tool_choice,
-        provider_tool_choice_for_required_tool, request_reasoning_effort,
-        tool_definitions_for_exposure,
+        provider_tool_choice_for_required_tool, push_provider_output_block,
+        request_reasoning_effort, tool_definitions_for_exposure,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{AssistantEvent, ProviderRegistry, ProviderRuntimeClient, ProviderTransportPool};
     use harness_contract::tool::ToolExposureProjection;
     use model_protocol::provider_capability::{CapabilityState, ProviderCapabilityProfile};
-    use provider::{ToolChoice, ToolDefinition};
+    use provider::{OutputContentBlock, ToolChoice, ToolDefinition};
     use serde_json::json;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     #[test]
@@ -1730,6 +1731,37 @@ mod tests {
         assert!(error
             .to_string()
             .contains("provider stream ended before terminal message_stop"));
+    }
+
+    #[test]
+    fn streaming_tool_start_with_null_input_waits_for_json_deltas() {
+        let mut events = Vec::new();
+        let mut pending_tools = BTreeMap::new();
+
+        push_provider_output_block(
+            OutputContentBlock::ToolUse {
+                id: "call-test".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::Value::Null,
+            },
+            1,
+            &mut events,
+            &mut pending_tools,
+            true,
+        );
+
+        assert!(matches!(
+            events.as_slice(),
+            [AssistantEvent::ItemStarted { index: 1, .. }]
+        ));
+        assert_eq!(
+            pending_tools.remove(&1),
+            Some((
+                "call-test".to_string(),
+                "read_file".to_string(),
+                String::new()
+            ))
+        );
     }
 
     fn tool(name: &str) -> ToolDefinition {

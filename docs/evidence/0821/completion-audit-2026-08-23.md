@@ -663,3 +663,23 @@ Focused proof passed:
 
 The next clean deep-real run is the authority for actual tool execution,
 orchestration, and Team-flow behavior through the bridge.
+
+### 2026-08-24 deferred-input accumulator correction
+
+The first deferred-input compatibility rerun exposed the remaining half of the
+same wire-path. The deserializer correctly represented a missing tool input as
+JSON null, but Runtime serialized that null into the streaming argument buffer
+before appending `input_json_delta`. The resulting `null{...}` text failed the
+tool contract parser with a trailing-character error. This was a local
+accumulator defect, not a model refusal, approval hold, or an idle Team.
+
+Runtime now treats both an empty object and JSON null on a streaming tool start
+as an empty argument buffer. Non-streaming null remains represented normally;
+only the incremental tool path changes. A focused runtime test verifies that a
+null start frame produces an empty buffer ready for subsequent JSON deltas.
+
+Focused proof passed:
+
+- `cargo test -p runtime streaming_tool_start_with_null_input_waits_for_json_deltas --lib`
+- `cargo check -p runtime --all-targets`
+- `cargo fmt --all -- --check`
