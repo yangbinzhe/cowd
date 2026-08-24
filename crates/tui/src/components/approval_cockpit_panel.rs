@@ -109,6 +109,16 @@ impl ApprovalCockpitPanel {
 
     fn render_lines(&self) -> Text<'_> {
         let pending = self.pending_approvals.unwrap_or_default();
+        let blocking = self
+            .approval_items
+            .iter()
+            .filter(|item| item.blocks_execution)
+            .count();
+        let confirmations = self
+            .approval_items
+            .iter()
+            .filter(|item| item.is_confirmation())
+            .count();
         let grants = self.cross_plane_grants_active.unwrap_or_default();
         let actions = self.cross_plane_actions_24h.unwrap_or_default();
         let mut lines = Vec::new();
@@ -162,7 +172,9 @@ impl ApprovalCockpitPanel {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )),
-            Line::from(format!("Pending daemon approvals: {pending}")),
+            Line::from(format!(
+                "Pending daemon items: {pending} (blocks: {blocking}, confirmations: {confirmations})"
+            )),
             Line::from(format!(
                 "Local permission prompts: {}",
                 self.permission_count
@@ -189,6 +201,25 @@ impl ApprovalCockpitPanel {
                 if !item.input_preview.is_empty() {
                     lines.push(Line::from(Span::styled(
                         format!("  {}", truncate(&item.input_preview, 64)),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    if item.is_confirmation() {
+                        "  Confirmation — execution continues; deny only to veto"
+                    } else {
+                        "  Approval required — execution waits for a decision"
+                    },
+                    Style::default().fg(if item.is_confirmation() {
+                        Color::LightCyan
+                    } else {
+                        Color::LightYellow
+                    }),
+                )));
+                if let Some(policy) = item.timeout_policy.as_deref() {
+                    let behavior = item.timeout_behavior.as_deref().unwrap_or(policy);
+                    lines.push(Line::from(Span::styled(
+                        format!("  On timeout: {}", humanize_identifier(behavior)),
                         Style::default().fg(Color::DarkGray),
                     )));
                 }
@@ -321,6 +352,10 @@ fn short_id(id: &str) -> &str {
     id.get(..id.len().min(10)).unwrap_or(id)
 }
 
+fn humanize_identifier(value: &str) -> String {
+    value.replace(['_', '-'], " ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +385,9 @@ mod tests {
             risk: Some("high".to_string()),
             requester: Some("session".to_string()),
             input_preview: "rm -rf /tmp/example".to_string(),
+            blocks_execution: true,
+            timeout_policy: Some("pending".to_string()),
+            timeout_behavior: Some("execution_waits_for_timeout_resolution".to_string()),
             ..ApprovalSummary::default()
         }];
         app.gateway_cross_plane_grants_active = Some(3);
@@ -362,13 +400,50 @@ mod tests {
         let rendered = render_panel(&mut panel, 82, 16);
         assert!(rendered.contains("Approvals (4)"), "{rendered}");
         assert!(
-            rendered.contains("Pending daemon approvals: 1"),
+            rendered.contains("Pending daemon items: 1 (blocks: 1, confirmations: 0)"),
             "{rendered}"
         );
         assert!(rendered.contains("Active grants: 3"), "{rendered}");
         assert!(rendered.contains("bash"), "{rendered}");
         assert!(rendered.contains("approval-1"), "{rendered}");
         assert!(rendered.contains("high"), "{rendered}");
+        assert!(
+            rendered.contains("Approval required — execution waits for a decision"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn renders_nonblocking_confirmation_as_a_veto_window() {
+        let mut app = App::new("model", "session");
+        app.server_running = true;
+        app.gateway_pending_approvals = Some(1);
+        app.gateway_approval_items = vec![ApprovalSummary {
+            id: "confirmation-123456789".to_string(),
+            tool_name: "definition.template.publish".to_string(),
+            risk: Some("medium".to_string()),
+            input_preview: "publish shared template".to_string(),
+            blocks_execution: false,
+            timeout_policy: Some("continue_alternative".to_string()),
+            timeout_behavior: Some("continue_alternative_after_deadline".to_string()),
+            ..ApprovalSummary::default()
+        }];
+        let mut panel = ApprovalCockpitPanel::new();
+        panel.sync_from_app(&app);
+
+        let rendered = render_panel(&mut panel, 88, 18);
+        assert!(
+            rendered.contains("Pending daemon items: 1 (blocks: 0, confirmations: 1)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Confirmation — execution continues; deny only to veto"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("On timeout: continue alternative after deadline"),
+            "{rendered}"
+        );
     }
 
     #[test]

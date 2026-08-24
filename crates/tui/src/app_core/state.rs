@@ -7371,6 +7371,9 @@ mod tests {
             expires_at_ms: Some(10_000),
             requested_sandbox_posture: Some("workspace-write-sandbox".to_string()),
             effective_sandbox_posture: Some("workspace-write-sandbox".to_string()),
+            blocks_execution: true,
+            timeout_policy: Some("pending".to_string()),
+            timeout_behavior: Some("execution_waits_for_timeout_resolution".to_string()),
             skippable: false,
             allowed_scopes: vec!["once".to_string()],
         }];

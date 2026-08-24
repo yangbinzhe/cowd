@@ -564,6 +564,31 @@ polls the authenticated public Mission Control summary during the run and
 emits compact progress records containing cursor/revision, Team and Agent
 states, pending approvals, recovery count, and readiness actions. It never
 prints a credential, prompt, tool input, or model output. This makes nested
-Team execution and a stuck/blocked state visible while it is happening; a
-fresh clean real run remains required after the remaining end-to-end timeout
-and cross-Team continuation work is repaired.
+Team execution and a stuck/blocked state visible while it is happening.
+
+The launcher no longer applies an implicit whole-suite wall-clock timeout. The
+five deep scenarios are serial and each has its own progress-aware maximum and
+cleanup path, so a generic outer deadline could terminate a later Team graph
+that was still healthy. An operator may still set `COWD_EVAL_TIMEOUT_SECS` when
+needed; otherwise the suite runs to a terminal per-scenario report. A fresh
+clean real run remains required once provider credentials are rotated.
+
+### 2026-08-24 approval surface — confirmation is not a blocker
+
+The durable approval queue already applies the required continuation contract:
+a request with `blocks_execution=false` receives a risk-scaled deadline and a
+`ContinueAlternative` timeout policy. It therefore cannot pin Team or session
+execution; a user decision is a veto/promotion decision, not a generic stop
+sign. Autonomous and trust-all profiles are separately auto-approved by the
+approval router with an auditable receipt.
+
+The authenticated Gateway projection now adds `interaction_mode` and
+`timeout_behavior`, and the TUI Approval Cockpit renders blocking approvals and
+non-blocking confirmations separately. A confirmation is labelled as continuing
+execution and exposes its timeout continuation behavior; an unknown legacy wire
+shape is deliberately treated as blocking rather than silently downgraded.
+
+This makes the policy observable without weakening a genuine execution hold.
+Focused Gateway projection and TUI rendering/parser tests pass; full
+real-provider validation remains deferred until exposed provider credentials
+are rotated and the isolated route can be safely re-run.

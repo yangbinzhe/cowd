@@ -35,6 +35,9 @@ pub struct ApprovalSummary {
     pub expires_at_ms: Option<u64>,
     pub requested_sandbox_posture: Option<String>,
     pub effective_sandbox_posture: Option<String>,
+    pub blocks_execution: bool,
+    pub timeout_policy: Option<String>,
+    pub timeout_behavior: Option<String>,
     pub skippable: bool,
     pub allowed_scopes: Vec<String>,
 }
@@ -63,6 +66,11 @@ impl ApprovalSummary {
                 .review_ref
                 .as_deref()
                 .is_some_and(|review| !review.trim().is_empty())
+    }
+
+    #[must_use]
+    pub const fn is_confirmation(&self) -> bool {
+        !self.blocks_execution
     }
 }
 
@@ -1666,6 +1674,21 @@ fn approval_summary_from_json(value: &serde_json::Value) -> Option<ApprovalSumma
             .pointer("/context/effective_sandbox_posture")
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned),
+        // Older Gateway versions omitted this field. Treat those records as
+        // blocking so an unknown wire shape is never displayed as a harmless
+        // confirmation.
+        blocks_execution: value
+            .get("blocks_execution")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        timeout_policy: value
+            .get("timeout_policy")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        timeout_behavior: value
+            .get("timeout_behavior")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
         skippable: value
             .get("skippable")
             .and_then(serde_json::Value::as_bool)
@@ -2704,6 +2727,9 @@ mod tests {
             "risk": "critical",
             "summary": "write workspace file",
             "skippable": false,
+            "blocks_execution": false,
+            "timeout_policy": "continue_alternative",
+            "timeout_behavior": "continue_alternative_after_deadline",
             "allowed_scopes": ["once"],
             "expires_at_ms": 9000,
             "context": {
@@ -2721,5 +2747,11 @@ mod tests {
         assert_eq!(item.expires_at_ms, Some(9000));
         assert_eq!(item.allowed_scopes, vec!["once"]);
         assert!(!item.skippable);
+        assert!(item.is_confirmation());
+        assert_eq!(item.timeout_policy.as_deref(), Some("continue_alternative"));
+        assert_eq!(
+            item.timeout_behavior.as_deref(),
+            Some("continue_alternative_after_deadline")
+        );
     }
 }

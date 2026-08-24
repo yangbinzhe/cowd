@@ -777,6 +777,26 @@ fn project_approval_request(
             serde_json::to_value(request.context.approval_profile)
                 .unwrap_or(serde_json::Value::Null),
         );
+        // A pending record is not necessarily a stop sign. Surface the
+        // execution contract explicitly so clients can present a veto-style
+        // confirmation separately from an approval that actually holds a
+        // graph node.
+        object.insert(
+            "interaction_mode".to_string(),
+            serde_json::json!(if request.blocks_execution {
+                "approval_required"
+            } else {
+                "confirmation"
+            }),
+        );
+        object.insert(
+            "timeout_behavior".to_string(),
+            serde_json::json!(if request.blocks_execution {
+                "execution_waits_for_timeout_resolution"
+            } else {
+                "continue_alternative_after_deadline"
+            }),
+        );
         object.insert(
             "requested_sandbox_posture".to_string(),
             serde_json::to_value(request.context.requested_sandbox_posture)
@@ -1098,6 +1118,19 @@ mod tests {
         );
         assert_eq!(projected["expires_at_ms"], 20);
         assert_eq!(projected["effect"]["effect_kind"], "read");
+        assert_eq!(projected["interaction_mode"], "approval_required");
+        assert_eq!(
+            projected["timeout_behavior"],
+            "execution_waits_for_timeout_resolution"
+        );
+        let mut confirmation = read.clone();
+        confirmation.blocks_execution = false;
+        let confirmation = project_approval_request(&confirmation, &admin);
+        assert_eq!(confirmation["interaction_mode"], "confirmation");
+        assert_eq!(
+            confirmation["timeout_behavior"],
+            "continue_alternative_after_deadline"
+        );
         let read_group = projected["equivalence_key"]["digest"]
             .as_str()
             .expect("server-derived equivalence digest")
