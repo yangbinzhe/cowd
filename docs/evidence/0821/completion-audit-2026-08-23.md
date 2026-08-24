@@ -683,3 +683,21 @@ Focused proof passed:
 - `cargo test -p runtime streaming_tool_start_with_null_input_waits_for_json_deltas --lib`
 - `cargo check -p runtime --all-targets`
 - `cargo fmt --all -- --check`
+
+### 2026-08-24 CC Switch deep-real business-chain closure
+
+The clean candidate with both streaming compatibility repairs passed the full
+deep-real harness through the local CC Switch bridge. The report has five of
+five production Gateway scenarios passed and all nineteen report gates passed.
+Every live scenario recorded `gpt-5.6-terra` as its effective model without
+fallback. The suite recorded 87 provider rounds, real governed tool calls,
+durable tool evidence, three completed Teams in the Team projection scenario,
+and a runtime-attested managed-Agent escalation with three completed Teams.
+
+Mission Control was sampled throughout the run. It observed live Team and
+Agent transitions with zero pending approvals and zero recovery waits, proving
+that autonomous Team execution continued instead of waiting for a user
+approval decision. The final report and full per-scenario durable traces are
+retained under:
+
+`target/acceptance/real-qwen/runs/v0.9.704-1787562664-mission-harness-deep/`
