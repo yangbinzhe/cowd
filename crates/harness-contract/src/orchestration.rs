@@ -167,9 +167,11 @@ pub struct ModelCollaborationWorkstream {
     pub objective: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// An optional partition within this one Team, not a list of Teams. Root
-    /// collaboration admission should omit this field: Runtime selects and
-    /// validates concrete role ids after the semantic workstreams are bound.
+    /// Compatibility-only input. Root collaboration admission intentionally
+    /// discards it: Runtime selects and validates concrete Team roles after
+    /// semantic workstreams are bound. Keeping this field deserializable lets
+    /// a provider recover from an over-specified request without accepting
+    /// model-authored template-role authority.
     #[serde(default)]
     pub focuses: Vec<ModelSemanticFocus>,
     #[serde(default)]
@@ -218,7 +220,11 @@ impl ModelCollaborationControlDecision {
                         objective: workstream.objective,
                         depends_on: workstream.depends_on,
                         multiplicity: 1,
-                        focuses: workstream.focuses,
+                        // Root workstreams determine the Program's semantic
+                        // responsibilities, not a concrete template's role
+                        // partition. Template roles are Runtime-owned and
+                        // must therefore never cross this control boundary.
+                        focuses: Vec::new(),
                         managed_agent_escalation: workstream.managed_agent_escalation,
                         template: None,
                         target_session_id: None,
@@ -544,7 +550,12 @@ mod tests {
                 workstream_id: "runtime-review".to_string(),
                 objective: "review Runtime durable state".to_string(),
                 depends_on: Vec::new(),
-                focuses: Vec::new(),
+                focuses: vec![ModelSemanticFocus {
+                    focus_id: "provider-supplied-role".to_string(),
+                    role_id: "not-a-runtime-role".to_string(),
+                    objective: "must not become a template partition".to_string(),
+                    evidence_responsibilities: Vec::new(),
+                }],
                 output_artifacts: vec!["review".to_string()],
                 evidence_contract: vec!["evidence".to_string()],
                 managed_agent_escalation: ManagedAgentEscalationRequirement::None,
@@ -560,6 +571,7 @@ mod tests {
         let proposal = orchestration.proposal.expect("derived proposal");
         assert_eq!(proposal.mutation_id, "control-decision:review-v1");
         assert_eq!(proposal.nodes[0].recipe, CapabilityRecipeId::Team);
+        assert!(proposal.nodes[0].focuses.is_empty());
         assert!(proposal.nodes[0].template.is_none());
         assert!(orchestration.template_proposal.is_none());
     }

@@ -492,3 +492,27 @@ Preflight for this repair candidate passed:
 This is a repair candidate only. The next clean real-provider run must still
 pass every live scenario before §22.3/A12 can be closed; no tag or push is
 authorized by this record.
+
+### Follow-up: root focus partitions are not template authority
+
+The next real run confirmed the workstream-cardinality repair: the provider
+submitted distinct workstreams. It still over-specified root `focuses` with a
+partial template-role set, causing the compiler to reject missing template
+dependency endpoints (`workstream -> coordinator` and
+`researcher -> synthesizer`). That rejection is correct, but a root semantic
+decision must not be able to select template roles at all.
+
+`ModelCollaborationControlDecision::into_runtime_orchestration_input` now
+accepts the legacy `focuses` input only for transport compatibility and
+intentionally discards it before producing Team graph nodes. The decision
+retains workstream identity, objective, dependencies, evidence contract,
+output artifacts and the explicit managed-Agent escalation requirement;
+Runtime alone selects template roles and validates their dependencies.
+
+The conversion regression uses a deliberately invalid provider role and
+asserts that the compiled Team node has no model-authored focus partition.
+`cargo test -p harness-contract --lib
+narrow_collaboration_decision_converts_without_runtime_owned_fields --
+--test-threads=1`, the root control-plane regression, formatting, and
+`cargo check -p runtime -p harness-contract --all-targets` passed. A fresh
+clean real-provider run remains required.
