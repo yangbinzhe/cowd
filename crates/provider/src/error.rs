@@ -17,6 +17,19 @@ const CONTEXT_WINDOW_ERROR_MARKERS: &[&str] = &[
     "request is too large",
 ];
 
+// A 429 can mean a short-lived request rate limit, but providers also use it
+// for account or plan exhaustion. The latter cannot be repaired by retrying
+// the same model in the same run and must reach Runtime as a terminal capacity
+// fact rather than an overload signal.
+const QUOTA_EXHAUSTED_MARKERS: &[&str] = &[
+    "insufficient_quota",
+    "quota has been exhausted",
+    "quota exhausted",
+    "quota is exhausted",
+    "credit balance is insufficient",
+    "billing quota exceeded",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompatibilityToolProtocolFailure {
     MalformedFrame,
@@ -185,7 +198,7 @@ impl ApiError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
-            Self::Api { retryable, .. } => *retryable,
+            Self::Api { retryable, .. } => *retryable && !self.is_quota_exhausted(),
             Self::RetriesExhausted { last_error, .. } => last_error.is_retryable(),
             Self::MissingCredentials { .. }
             | Self::ContextWindowExceeded { .. }
@@ -227,9 +240,48 @@ impl ApiError {
     #[must_use]
     pub fn is_downstream_overload(&self) -> bool {
         match self {
-            Self::Api { status, .. } => matches!(status.as_u16(), 429 | 502 | 503 | 504),
+            Self::Api { status, .. } => {
+                !self.is_quota_exhausted() && matches!(status.as_u16(), 429 | 502 | 503 | 504)
+            }
             Self::RetriesExhausted { last_error, .. } => last_error.is_downstream_overload(),
             _ => false,
+        }
+    }
+
+    /// A provider declared that the account/plan has no usable capacity. This
+    /// is deliberately distinct from a momentary rate limit so callers can
+    /// stop promptly and surface the required operator action.
+    #[must_use]
+    pub fn is_quota_exhausted(&self) -> bool {
+        match self {
+            Self::Api {
+                error_type,
+                message,
+                body,
+                ..
+            } => [
+                error_type.as_deref(),
+                message.as_deref(),
+                Some(body.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(looks_like_quota_exhausted),
+            Self::RetriesExhausted { last_error, .. } => last_error.is_quota_exhausted(),
+            Self::MissingCredentials { .. }
+            | Self::ContextWindowExceeded { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_)
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::RequestBodyTooLarge { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::CompatibilityToolProtocol(_)
+            | Self::BackoffOverflow { .. }
+            | Self::NoProviderConfigured { .. }
+            | Self::InvalidProviderConfig { .. } => false,
         }
     }
 
@@ -373,6 +425,13 @@ impl ApiError {
             | Self::InvalidProviderConfig { .. } => false,
         }
     }
+}
+
+fn looks_like_quota_exhausted(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    QUOTA_EXHAUSTED_MARKERS
+        .iter()
+        .any(|marker| value.contains(marker))
 }
 
 impl Display for ApiError {
@@ -761,6 +820,24 @@ mod tests {
         ));
         assert!(timed_out.is_timeout());
         assert!(!timed_out.is_downstream_overload());
+    }
+
+    #[test]
+    fn exhausted_quota_is_not_retried_or_treated_as_transient_overload() {
+        let exhausted = ApiError::Api {
+            status: reqwest::StatusCode::TOO_MANY_REQUESTS,
+            error_type: Some("insufficient_quota".to_string()),
+            message: Some("the configured plan quota has been exhausted".to_string()),
+            request_id: Some("quota-test".to_string()),
+            body: String::new(),
+            retryable: true,
+            retry_after: None,
+            suggested_action: None,
+        };
+
+        assert!(exhausted.is_quota_exhausted());
+        assert!(!exhausted.is_retryable());
+        assert!(!exhausted.is_downstream_overload());
     }
 
     #[test]
