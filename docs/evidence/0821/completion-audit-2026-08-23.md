@@ -546,3 +546,24 @@ Focused proof passed:
 
 This repair is deliberately confined to the root collaboration tool. A fresh
 clean full real-provider run is still the release authority.
+
+### 2026-08-24 live run observation — execution progress, not an opaque wait
+
+The clean `cbf9b6ee` candidate reached the real Qwen route and admitted root
+collaboration Programs, Team bindings and provider-backed child Agents. The
+role-selection repair therefore passed the previously failing compiler
+boundary. The full deep harness did not finish within its configured
+15-minute outer deadline: its timeout shut down the isolated Gateway while
+later cross-Team/managed follow-up work remained active. Runtime durably
+recorded the resulting cancellations; no report was written, so this run is
+not release evidence.
+
+The failure exposed an operator-observability gap, not a reason to relax a
+Team, approval, or acceptance check. The real-provider scenario launcher now
+polls the authenticated public Mission Control summary during the run and
+emits compact progress records containing cursor/revision, Team and Agent
+states, pending approvals, recovery count, and readiness actions. It never
+prints a credential, prompt, tool input, or model output. This makes nested
+Team execution and a stuck/blocked state visible while it is happening; a
+fresh clean real run remains required after the remaining end-to-end timeout
+and cross-Team continuation work is repaired.

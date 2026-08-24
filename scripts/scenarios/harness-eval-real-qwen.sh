@@ -32,6 +32,7 @@ ISOLATED_HOME="$RUN_ROOT/home"
 WORKSPACE="$ROOT"
 GATEWAY_LOG="$RUN_ROOT/gateway.log"
 GATEWAY_PID=""
+PROGRESS_PID=""
 PROVIDER_ID=""
 PROVIDER_BASE_URL=""
 PROVIDER_PROTOCOL=""
@@ -41,6 +42,10 @@ STAGED_CREDENTIAL_ENV=""
 
 cleanup() {
   local status=$?
+  if [[ -n "$PROGRESS_PID" ]]; then
+    kill "$PROGRESS_PID" >/dev/null 2>&1 || true
+    wait "$PROGRESS_PID" >/dev/null 2>&1 || true
+  fi
   if [[ -n "$GATEWAY_PID" ]]; then
     kill "$GATEWAY_PID" >/dev/null 2>&1 || true
     wait "$GATEWAY_PID" >/dev/null 2>&1 || true
@@ -53,6 +58,40 @@ cleanup() {
   printf 'Harness evidence: %s\n' "$EVIDENCE_ROOT" >&2
 }
 trap cleanup EXIT
+
+# A real-provider evaluation can legitimately run several nested Team graphs.
+# Keep the operator informed through the same public Mission Control projection
+# used by Surfaces, rather than leaving only an opaque provider wait. The
+# compact line deliberately contains state/counters only: it never reads
+# generated config, headers, credentials, prompts, or model/tool payloads.
+monitor_progress() {
+  local interval="${COWD_EVAL_PROGRESS_INTERVAL_SECS:-15}"
+  while kill -0 "$GATEWAY_PID" >/dev/null 2>&1; do
+    curl -fsS \
+      -H "Authorization: Bearer $TOKEN" \
+      "$BASE_URL/api/mission/control/summary" 2>/dev/null \
+      | jq -c '{
+          event: "harness_eval_progress",
+          cursor: .summary.cursor,
+          revision: .summary.revision,
+          teams: [.summary.projection.teams[]? | {
+            team_id,
+            status,
+            agent_count
+          }],
+          agents: [.summary.projection.agents[]? | {
+            agent_id,
+            team_id,
+            status
+          }],
+          pending_approvals: (.summary.projection.summary.pending_approval_count // 0),
+          recovery_required: (.summary.projection.summary.recovery_required_count // 0),
+          readiness: (.summary.projection.control_readiness.actions // [])
+        }' \
+      || true
+    sleep "$interval"
+  done
+}
 
 yaml_model_field() {
   local file="$1"
@@ -254,6 +293,8 @@ for _ in {1..240}; do
   sleep 0.25
 done
 curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/healthz" >/dev/null
+monitor_progress &
+PROGRESS_PID="$!"
 
 cd "$ROOT"
 env \
