@@ -297,6 +297,10 @@ monitor_progress &
 PROGRESS_PID="$!"
 
 cd "$ROOT"
+# A deep real-provider run can include nested Team graphs, managed
+# escalation and cross-session continuation. Fifteen minutes regularly
+# terminates a progressing run mid-graph; retain a bounded but realistic
+# default and let the Mission Control monitor expose live progress.
 env \
   COWD_CONFIG_HOME="$CONFIG_HOME" \
   HOME="$ISOLATED_HOME" \
@@ -308,5 +312,5 @@ env \
   COWD_EVAL_EVIDENCE_KEY="$EVIDENCE_KEY" \
   COWD_EVAL_BINARY_SHA256="$GATEWAY_BINARY_SHA256" \
   COWD_AI_HARNESS_REPORT_DIR="$EVIDENCE_ROOT" \
-  timeout "${COWD_EVAL_TIMEOUT_SECS:-900}s" \
+  timeout "${COWD_EVAL_TIMEOUT_SECS:-1800}s" \
   cargo run -p harness-eval -- deep-real --provider "$MODEL" --budget full --allow-real-model
