@@ -114,8 +114,14 @@ pub fn compile_orchestration(
     }
     graph.nodes = compiled.nodes;
     graph.edges = compiled.edges;
-    let collaboration_program =
+    let mut collaboration_program =
         collaboration_program_from_proposal(proposal, Some(&compiled.semantic_node_instances))?;
+    if let (Some(program), Some(semantic_intent)) = (
+        collaboration_program.as_mut(),
+        request.collaboration_semantic_intent.as_ref(),
+    ) {
+        program.semantic_intent = Some(semantic_intent.clone());
+    }
     graph.orchestration = Some(ExecutionOrchestrationMetadata {
         mutation_id: proposal.mutation_id.clone(),
         applied_mutation_ids: vec![proposal.mutation_id.clone()],
@@ -236,6 +242,7 @@ pub(crate) fn collaboration_program_from_proposal(
                 })
                 .collect()
         }),
+        semantic_intent: None,
         control: Default::default(),
     };
     derived

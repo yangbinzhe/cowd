@@ -346,7 +346,7 @@ impl TeamInstantiationService {
                     )
                 }))
                 && !requires_reacquisition;
-            let role_allowed_tools = if upstream_only_consumer {
+            let mut role_allowed_tools = if upstream_only_consumer {
                 Vec::new()
             } else {
                 match evaluation_allowed_tools {
@@ -358,6 +358,27 @@ impl TeamInstantiationService {
                     None => capability.allowed_tools.iter().cloned().collect(),
                 }
             };
+            if !role.task_contract.allowed_tool_contract_refs.is_empty() {
+                let required_tools = role
+                    .task_contract
+                    .allowed_tool_contract_refs
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let available_tools = role_allowed_tools.iter().cloned().collect::<BTreeSet<_>>();
+                let missing_tools = required_tools
+                    .difference(&available_tools)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !missing_tools.is_empty() {
+                    return Err(format!(
+                        "role `{}` semantic Tool requirements are unavailable after capability and evaluation ceilings: {}",
+                        role.role_id,
+                        missing_tools.join(", ")
+                    ));
+                }
+                role_allowed_tools.retain(|tool| required_tools.contains(tool));
+            }
             let (focuses, cardinality_resolution) = resolve_focuses(
                 role,
                 cardinality_overrides.get(&role.role_id),
@@ -379,12 +400,32 @@ impl TeamInstantiationService {
                         role.role_id
                     )
                 })?;
-            let role_allowed_skills = role_definition
+            let declared_skills = role_definition
                 .revision
                 .manifest
                 .capability_contract
                 .skill_refs
                 .clone();
+            let role_allowed_skills = if role.task_contract.allowed_skill_refs.is_empty() {
+                declared_skills
+            } else {
+                let declared = declared_skills.into_iter().collect::<BTreeSet<_>>();
+                let required = role
+                    .task_contract
+                    .allowed_skill_refs
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let missing = required.difference(&declared).cloned().collect::<Vec<_>>();
+                if !missing.is_empty() {
+                    return Err(format!(
+                        "role `{}` semantic Skill requirements are absent from exact Agent Definition: {}",
+                        role.role_id,
+                        missing.join(", ")
+                    ));
+                }
+                required.into_iter().collect()
+            };
             ensure_static_graph_ceiling(role_slots.len(), focuses.len())?;
             cardinality_resolutions.push(cardinality_resolution);
             for (slot, focus_partition) in focuses.into_iter().enumerate() {
@@ -2145,6 +2186,8 @@ mod acceptance_contract_tests {
             task_contract: harness_contract::team::TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/researcher@1".to_string(),
                 acceptance: vec!["findings".to_string(), "evidence".to_string()],
+                allowed_tool_contract_refs: Vec::new(),
+                allowed_skill_refs: Vec::new(),
                 dataflow: Default::default(),
             },
         };
@@ -2194,6 +2237,8 @@ mod acceptance_contract_tests {
             task_contract: harness_contract::team::TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/researcher@1".to_string(),
                 acceptance: vec!["evidence".to_string()],
+                allowed_tool_contract_refs: Vec::new(),
+                allowed_skill_refs: Vec::new(),
                 dataflow: Default::default(),
             },
         };
@@ -2336,6 +2381,8 @@ mod acceptance_contract_tests {
             task_contract: harness_contract::team::TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/reviewer@1".to_string(),
                 acceptance: vec!["review".to_string(), "evidence".to_string()],
+                allowed_tool_contract_refs: Vec::new(),
+                allowed_skill_refs: Vec::new(),
                 dataflow: Default::default(),
             },
         };

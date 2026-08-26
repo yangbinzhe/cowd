@@ -254,6 +254,17 @@ impl Default for TeamRoleDataflowContract {
 pub struct TeamRoleTaskContract {
     pub contract_ref: String,
     pub acceptance: Vec<String>,
+    /// Exact Tool contracts required by this role for this immutable Team
+    /// revision. An empty list is the legacy-compatible capability-derived
+    /// policy; v2 semantic compilation always supplies an explicit list when
+    /// the role declared Tool requirements.
+    #[serde(default)]
+    pub allowed_tool_contract_refs: Vec<String>,
+    /// Exact approved Skill references required by this role for this
+    /// immutable Team revision. An empty list retains legacy Definition
+    /// defaults; v2 semantic compilation narrows it when requirements exist.
+    #[serde(default)]
+    pub allowed_skill_refs: Vec<String>,
     /// Empty only for a legacy catalog revision. New turn-scoped templates
     /// must declare the producer/consumer keys used by their dependencies.
     #[serde(default)]
@@ -269,6 +280,14 @@ impl TeamRoleTaskContract {
             });
         }
         validate_unique_non_empty("role.task_contract.acceptance", &self.acceptance)?;
+        validate_unique_non_empty(
+            "role.task_contract.allowed_tool_contract_refs",
+            &self.allowed_tool_contract_refs,
+        )?;
+        validate_unique_non_empty(
+            "role.task_contract.allowed_skill_refs",
+            &self.allowed_skill_refs,
+        )?;
         self.dataflow.validate()
     }
 }
@@ -695,6 +714,8 @@ mod tests {
             task_contract: TeamRoleTaskContract {
                 contract_ref: format!("task/{role_id}"),
                 acceptance: vec!["evidence-backed output".to_string()],
+                allowed_tool_contract_refs: Vec::new(),
+                allowed_skill_refs: Vec::new(),
                 dataflow: Default::default(),
             },
         }

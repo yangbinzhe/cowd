@@ -2,13 +2,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use harness_contract::execution_graph::{
-    CollaborationEscalationReceipt, CollaborationProgram, ExecutionCompletionContract,
-    ExecutionDependencyPolicy,
+    CollaborationEscalationReceipt, CollaborationProgram, CollaborationSemanticIntentSnapshot,
+    ExecutionCompletionContract, ExecutionDependencyPolicy,
 };
 use harness_contract::input_disposition::ModelInputDispositionBatch;
 use harness_contract::orchestration::{
-    ManagedAgentEscalationRequirement, ModelGraphMutationProposal, ModelGraphSemanticNode,
-    ModelRuntimeOrchestrationConstraints, ModelRuntimeOrchestrationInput, ModelSemanticFocus,
+    ManagedAgentEscalationRequirement, ModelCollaborationControlDecisionV2,
+    ModelGraphMutationProposal, ModelGraphSemanticNode, ModelRuntimeOrchestrationConstraints,
+    ModelRuntimeOrchestrationInput, ModelSemanticFocus,
 };
 use harness_contract::policy::PermissionMode;
 use harness_contract::team::{TeamSelectionMode, TeamStrategyBinding};
@@ -156,6 +157,15 @@ pub struct RuntimeOrchestrationCommand {
     pub inspect_execution_id: Option<String>,
     pub proposal: Option<GraphMutationProposal>,
     pub template_proposal: Option<serde_json::Value>,
+    /// The narrow v2 collaboration intent. It is attached only by the
+    /// authenticated Gateway ingress and compiled by Runtime before generic
+    /// graph validation; model JSON cannot populate this Runtime field.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
+    pub collaboration_intent: Option<ModelCollaborationControlDecisionV2>,
+    /// Runtime-compiled, surface-safe provenance. This is persisted on the
+    /// Program when graph compilation succeeds and is never model writable.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
+    pub collaboration_semantic_intent: Option<CollaborationSemanticIntentSnapshot>,
     /// Runtime-owned session-scoped templates keyed by semantic Team node.
     /// Model JSON cannot populate this map; a Coordinator attaches a
     /// validated immutable snapshot before semantic compilation.
@@ -192,6 +202,8 @@ impl RuntimeOrchestrationCommand {
             inspect_execution_id: input.inspect_execution_id,
             proposal: input.proposal.map(Into::into),
             template_proposal: input.template_proposal,
+            collaboration_intent: None,
+            collaboration_semantic_intent: None,
             ephemeral_team_templates: BTreeMap::new(),
             control: input.control,
             input_disposition: input.input_disposition,

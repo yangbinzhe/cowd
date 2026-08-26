@@ -764,6 +764,8 @@ mod tests {
                 "roles": []
             })),
             ephemeral_team_templates: Default::default(),
+            collaboration_intent: None,
+            collaboration_semantic_intent: None,
             control: None,
             input_disposition: None,
             selection_mode: None,
@@ -809,6 +811,8 @@ mod tests {
             }),
             template_proposal: Some(serde_json::json!({"name": "custom"})),
             ephemeral_team_templates: Default::default(),
+            collaboration_intent: None,
+            collaboration_semantic_intent: None,
             control: None,
             input_disposition: None,
             selection_mode: None,

@@ -156,6 +156,8 @@ where
                         "implementation".to_string(),
                         "source_verification".to_string(),
                     ],
+                    allowed_tool_contract_refs: Vec::new(),
+                    allowed_skill_refs: Vec::new(),
                     dataflow: Default::default(),
                 },
             },
@@ -184,6 +186,8 @@ where
                         "evidence".to_string(),
                         "risks".to_string(),
                     ],
+                    allowed_tool_contract_refs: Vec::new(),
+                    allowed_skill_refs: Vec::new(),
                     dataflow: Default::default(),
                 },
             },
@@ -351,6 +355,8 @@ fn additional_builtin_team_manifests(
                     .iter()
                     .map(|value| (*value).to_string())
                     .collect(),
+                allowed_tool_contract_refs: Vec::new(),
+                allowed_skill_refs: Vec::new(),
                 dataflow: Default::default(),
             },
         };
@@ -672,6 +678,8 @@ mod tests {
             task_contract: TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/implementer@1".to_string(),
                 acceptance: vec!["implementation".to_string(), "evidence".to_string()],
+                allowed_tool_contract_refs: Vec::new(),
+                allowed_skill_refs: Vec::new(),
                 dataflow: Default::default(),
             },
         };

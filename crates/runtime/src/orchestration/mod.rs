@@ -7,6 +7,7 @@ pub mod collaboration_continuation;
 pub(crate) mod collaboration_coordinator;
 pub mod compiler;
 pub(crate) mod input_disposition;
+pub mod intent_compiler;
 pub mod planner;
 pub mod request;
 pub mod result;
@@ -405,6 +406,20 @@ async fn submit_runtime_orchestration_request_with_mode(
     cancellation: Option<crate::CancellationToken>,
     submission_mode: OrchestrationSubmissionMode,
 ) -> RuntimeOrchestrationResult {
+    if let Some(intent) = request.collaboration_intent.take() {
+        match intent_compiler::compile_turn_scoped_intent(&request, &intent, services) {
+            Ok(compiled) => {
+                request.proposal = Some(compiled.proposal);
+                request.template_proposal = Some(compiled.template_proposal);
+                request.collaboration_semantic_intent = Some(compiled.semantic_intent);
+                // v2 semantic intent always describes the complete active
+                // role set; the compiler, not a later model-assisted focus
+                // selector, owns the exact turn-scoped Team snapshot.
+                request.selection_mode = Some(harness_contract::team::TeamSelectionMode::Explicit);
+            }
+            Err(error) => return rejected_intent_compiler_result(&request, error),
+        }
+    }
     bind_strategy(&mut request, leased_decision, parent_execution.as_ref());
     if let Err(error) = validate_explicit_team_cardinality(&request, leased_decision) {
         return rejected_explicit_team_cardinality_result(&request, error);
@@ -596,6 +611,24 @@ async fn submit_runtime_orchestration_request_with_mode(
             result_without_runtime_with_id(&request_id, &request, decision)
         }
     }
+}
+
+fn rejected_intent_compiler_result(
+    request: &RuntimeOrchestrationCommand,
+    error: intent_compiler::IntentCompilerError,
+) -> RuntimeOrchestrationResult {
+    let plan = planner::plan_runtime_orchestration(request);
+    let mut decision = validator::validate_request(
+        request,
+        &plan.execution_decision,
+        plan.model_proposal.as_ref(),
+        None,
+    );
+    decision.status = "rejected".to_string();
+    decision
+        .validation_findings
+        .push(format!("collaboration_compile_diagnostic:{error}"));
+    result_without_runtime(request, decision)
 }
 
 /// A user-declared Team cardinality is an admission obligation, not a soft
@@ -2790,6 +2823,8 @@ mod tests {
             control: None,
             template_proposal: None,
             ephemeral_team_templates: Default::default(),
+            collaboration_intent: None,
+            collaboration_semantic_intent: None,
 
             input_disposition: None,
             selection_mode: None,
@@ -2861,7 +2896,12 @@ mod tests {
             .nodes
             .iter()
             .filter(|node| node.recipe == CapabilityRecipeId::Team)
-            .all(|node| node.resource_scopes.is_empty())
+            .all(|node| {
+                !node
+                    .resource_scopes
+                    .iter()
+                    .any(|scope| scope.starts_with("read:") || scope.as_str() == "network:*")
+            })
         {
             request.capabilities.push("resource:network:*".to_string());
             for node in proposal
@@ -2909,7 +2949,7 @@ mod tests {
                 "role_id": "evidence_assessor",
                 "display_name": "证据评估师",
                 "responsibility": "独立检查已授权证据并报告不确定性",
-                "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                "agent_definition_ref": "builtin/cowd/explore@1",
                 "grant_ceiling": ["read"],
                 "fixed_count": 1,
                 "acceptance": ["summary", "evidence"],
@@ -2961,180 +3001,113 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn root_control_decision_materializes_one_multirole_custom_team_snapshot() {
+    #[tokio::test]
+    async fn v2_semantic_decision_admits_an_exact_turn_scoped_team_snapshot() {
         use harness_contract::orchestration::{
-            ModelCollaborationControlDecision, ModelCollaborationWorkstream, ModelGrantCapability,
-            ModelProposedRole, ModelTemplateProposal,
+            ModelCollaborationControlDecisionV2, ModelCollaborationDependencyKind,
+            ModelCollaborationWorkstreamV2, ModelRoleDependency, ModelRoleIntent,
+            ModelSemanticAcceptanceCriterion, ModelTeamResultIntent, ModelTurnScopedTeamIntent,
         };
 
         let services = RuntimeServices::in_memory().expect("runtime services");
         ensure_test_mission(&services);
-        let decision = ModelCollaborationControlDecision {
-            decision_id: "runtime-audit".to_string(),
-            intent: "审计运行时的用户消息到工具结果回写链路".to_string(),
-            workstreams: vec![ModelCollaborationWorkstream {
-                workstream_id: "runtime-audit-team".to_string(),
-                objective: "一个三角色团队完成链路审计与证据仲裁".to_string(),
+        let mut request = proposal(Vec::new());
+        request.collaboration_intent = Some(ModelCollaborationControlDecisionV2 {
+            schema_version: 2,
+            decision_id: "runtime-v2-semantic-admission".to_string(),
+            intent: "perform an independent runtime evidence audit".to_string(),
+            reason: "the user requested a named two-role Team".to_string(),
+            workstreams: vec![ModelCollaborationWorkstreamV2 {
+                workstream_id: "runtime-audit".to_string(),
+                objective: "produce and synthesize bounded runtime evidence".to_string(),
                 depends_on: Vec::new(),
-                focuses: Vec::new(),
-                template: Some(ModelTemplateProposal {
-                    template_id: "cowd/turn-runtime-audit".to_string(),
-                    name: "运行时协同审计".to_string(),
-                    team_display_name: Some("运行时协同审计".to_string()),
-                    role_display_names: Vec::new(),
+                output_artifacts: vec!["summary".to_string()],
+                evidence_contract: vec![ModelSemanticAcceptanceCriterion::Artifact {
+                    artifact: "summary".to_string(),
+                }],
+                managed_agent_escalation: Default::default(),
+                team: ModelTurnScopedTeamIntent {
+                    team_key: "arbitrary-user-team".to_string(),
+                    display_name: Some("用户指定的任意团队名称".to_string()),
+                    instructions: "collect evidence independently and synthesize it".to_string(),
+                    result: ModelTeamResultIntent {
+                        required_artifacts: vec!["summary".to_string()],
+                        evidence_required: true,
+                        synthesis_required: true,
+                    },
                     roles: vec![
-                        ModelProposedRole {
-                            role_id: "fault_topology_scout".to_string(),
-                            display_name: Some("故障拓扑侦察员".to_string()),
-                            team: None,
-                            responsibility: "定位调用链中的边界和故障传播".to_string(),
-                            agent_definition_ref: None,
-                            grant_ceiling: vec![ModelGrantCapability::Read],
-                            fixed_count: Some(1),
-                            min_count: None,
-                            max_count: None,
-                            acceptance: vec!["summary".to_string(), "evidence".to_string()],
-                            input_artifacts: Vec::new(),
-                            output_artifacts: vec!["topology_evidence".to_string()],
-                            behavior: vec![
-                                harness_contract::team::RoleBehaviorFacet::ReacquireEvidence {
-                                    required: true,
+                        ModelRoleIntent {
+                            role_id: "任意取证职责".to_string(),
+                            display_name: Some("用户取证专家".to_string()),
+                            responsibility: "collect runtime evidence".to_string(),
+                            required_capabilities: vec!["read".to_string()],
+                            required_skills: Vec::new(),
+                            required_tools: vec!["read_file".to_string()],
+                            cardinality: Default::default(),
+                            acceptance: vec![
+                                ModelSemanticAcceptanceCriterion::Artifact {
+                                    artifact: "evidence".to_string(),
+                                },
+                                ModelSemanticAcceptanceCriterion::EvidenceScope {
+                                    operation: "read".to_string(),
+                                    resource: "crates/runtime/src/orchestration/mod.rs".to_string(),
                                 },
                             ],
-                        },
-                        ModelProposedRole {
-                            role_id: "concurrency_semantics_auditor".to_string(),
-                            display_name: Some("并发语义审计员".to_string()),
-                            team: None,
-                            responsibility: "验证队列、等待和回写语义".to_string(),
-                            agent_definition_ref: None,
-                            grant_ceiling: vec![ModelGrantCapability::Read],
-                            fixed_count: Some(1),
-                            min_count: None,
-                            max_count: None,
-                            acceptance: vec!["summary".to_string(), "evidence".to_string()],
                             input_artifacts: Vec::new(),
-                            output_artifacts: vec!["concurrency_evidence".to_string()],
-                            behavior: vec![
-                                harness_contract::team::RoleBehaviorFacet::Verification {
-                                    mode: "independent".to_string(),
-                                },
-                            ],
+                            output_artifacts: vec!["evidence".to_string()],
                         },
-                        ModelProposedRole {
-                            role_id: "evidence_summary_arbiter".to_string(),
-                            display_name: Some("证据汇总仲裁员".to_string()),
-                            team: None,
-                            responsibility: "交叉核对两个角色的证据并综合结论".to_string(),
-                            agent_definition_ref: None,
-                            grant_ceiling: vec![ModelGrantCapability::Read],
-                            fixed_count: Some(1),
-                            min_count: None,
-                            max_count: None,
-                            acceptance: vec!["summary".to_string(), "evidence".to_string()],
-                            input_artifacts: vec![
-                                "topology_evidence".to_string(),
-                                "concurrency_evidence".to_string(),
-                            ],
+                        ModelRoleIntent {
+                            role_id: "任意综合职责".to_string(),
+                            display_name: Some("用户结论专家".to_string()),
+                            responsibility: "synthesize supplied evidence".to_string(),
+                            required_capabilities: vec!["read".to_string()],
+                            required_skills: Vec::new(),
+                            required_tools: Vec::new(),
+                            cardinality: Default::default(),
+                            acceptance: vec![ModelSemanticAcceptanceCriterion::Artifact {
+                                artifact: "summary".to_string(),
+                            }],
+                            input_artifacts: vec!["evidence".to_string()],
                             output_artifacts: vec!["summary".to_string(), "evidence".to_string()],
-                            behavior: vec![
-                                harness_contract::team::RoleBehaviorFacet::Reducer {
-                                    mode: "finally".to_string(),
-                                },
-                                harness_contract::team::RoleBehaviorFacet::UpstreamConsumption {
-                                    required: true,
-                                },
-                                harness_contract::team::RoleBehaviorFacet::TerminalCandidate {
-                                    required: true,
-                                },
-                            ],
                         },
                     ],
-                    dependencies: Some(
-                        harness_contract::orchestration::ModelTemplateDependencies::Pairs(vec![
-                            harness_contract::orchestration::ModelProposedDependency {
-                                from: "fault_topology_scout".to_string(),
-                                to: "evidence_summary_arbiter".to_string(),
-                            },
-                            harness_contract::orchestration::ModelProposedDependency {
-                                from: "concurrency_semantics_auditor".to_string(),
-                                to: "evidence_summary_arbiter".to_string(),
-                            },
-                        ]),
-                    ),
-                    result_fields: vec!["summary".to_string(), "evidence".to_string()],
-                    evidence_required: true,
-                    instructions: "先独立审计，再交叉核对，再由仲裁员汇总。".to_string(),
-                }),
-                output_artifacts: vec!["audit".to_string()],
-                evidence_contract: vec!["summary".to_string(), "evidence".to_string()],
-                managed_agent_escalation: Default::default(),
+                    dependencies: vec![ModelRoleDependency {
+                        from: "任意取证职责".to_string(),
+                        to: "任意综合职责".to_string(),
+                        kind: ModelCollaborationDependencyKind::Handoff,
+                        artifacts: vec!["evidence".to_string()],
+                    }],
+                },
             }],
-            reason: "用户明确要求单个自定义三角色团队".to_string(),
-        };
-        let mut request = RuntimeOrchestrationCommand::from_model(
-            decision.into_runtime_orchestration_input(),
-            RuntimeOrchestrationBinding {
-                model_lease: Some("test-model".to_string()),
-                session_id: Some("session-v621".to_string()),
-                lineage: Some(harness_contract::execution_graph::ExecutionGraphLineage {
-                    session_id: "session-v621".to_string(),
-                    turn_id: "turn-v621".to_string(),
-                    root_task_id: "task-root-v621".to_string(),
-                    task_id: "task-root-v621".to_string(),
-                    generation: 1,
-                }),
-                mission_id: Some("mission-v621".to_string()),
-                selection_mode: Some(harness_contract::team::TeamSelectionMode::Explicit),
-                strategy_binding: None,
-                capabilities: Vec::new(),
-                surface: Some("test".to_string()),
-                permission_ceiling: PermissionMode::ReadOnly,
-            },
-        );
+        });
 
-        materialize_ephemeral_team_template(&mut request, &services)
-            .expect("root decision materializes the custom Team snapshot");
-        let snapshot = request
-            .ephemeral_team_templates
-            .get("runtime-audit-team")
-            .expect("one workstream owns one snapshot");
-        assert_eq!(request.ephemeral_team_templates.len(), 1);
-        assert_eq!(snapshot.role_ids.len(), 3);
+        let result =
+            admit_runtime_orchestration_request_background(request, None, &services, None).await;
         assert_eq!(
-            snapshot
-                .revision
-                .manifest
-                .display
-                .as_ref()
-                .and_then(|display| display.team_display_name.as_deref()),
-            Some("运行时协同审计")
+            result.status, "admitted",
+            "{:#?}",
+            result.decision.validation_findings
         );
-        assert_eq!(
-            snapshot.revision.manifest.roles[0].display_name.as_deref(),
-            Some("故障拓扑侦察员")
-        );
-        assert_eq!(
-            snapshot.revision.manifest.roles[2].display_name.as_deref(),
-            Some("证据汇总仲裁员")
-        );
-        team_authority::bind_semantic_resource_authority(
-            &mut request,
-            None,
-            services.workspace_root(),
-        );
-        let team = &request.proposal.as_ref().expect("proposal").nodes[0];
-        assert!(
-            team.focuses.is_empty(),
-            "an ephemeral custom Team must not receive builtin researcher/synthesizer focuses"
-        );
-        assert!(
-            team.resource_scopes
-                .iter()
-                .any(|scope| scope == "session:session-v621"),
-            "custom Team still receives its Runtime-owned Session evidence lease"
-        );
+        let graph_id = result.execution["graph_id"]
+            .as_str()
+            .expect("admitted graph id");
+        let graph = services
+            .graph_state_store()
+            .load_async(graph_id)
+            .await
+            .expect("admitted graph");
+        let program = graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .expect("collaboration program");
+        let intent = program
+            .semantic_intent
+            .as_ref()
+            .expect("semantic provenance");
+        assert_eq!(intent.decision_id, "runtime-v2-semantic-admission");
+        assert!(intent.ai_composed);
+        assert_eq!(intent.teams[0].roles.len(), 2);
     }
 
     #[test]
@@ -3158,7 +3131,7 @@ mod tests {
                             "role_id": "signal_cartographer",
                             "display_name": "信号制图师",
                             "responsibility": "identify business constraints from authorized evidence",
-                            "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                            "agent_definition_ref": "builtin/cowd/explore@1",
                             "grant_ceiling": ["read"],
                             "fixed_count": 1,
                             "acceptance": ["summary", "evidence"],
@@ -3179,7 +3152,7 @@ mod tests {
                             "role_id": "constraint_weaver",
                             "display_name": "约束编织者",
                             "responsibility": "assess technical feasibility from authorized evidence",
-                            "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                            "agent_definition_ref": "builtin/cowd/explore@1",
                             "grant_ceiling": ["read"],
                             "fixed_count": 1,
                             "acceptance": ["summary", "evidence"],
@@ -3803,6 +3776,7 @@ mod tests {
                     }],
                     ..Default::default()
                 },
+                semantic_intent: None,
             }),
         });
 
@@ -3841,15 +3815,7 @@ mod tests {
             None,
             services.workspace_root(),
         );
-        if request.proposal.as_ref().unwrap().nodes[0]
-            .resource_scopes
-            .is_empty()
-        {
-            request.capabilities.push("resource:network:*".to_string());
-            request.proposal.as_mut().unwrap().nodes[0]
-                .resource_scopes
-                .push("network:*".to_string());
-        }
+        ensure_test_team_resource(&mut request);
         let plan = planner::plan_runtime_orchestration(&request);
         let compiled = compiler::compile_orchestration(
             "team-board-v621",
@@ -4357,7 +4323,7 @@ mod tests {
                 "role_id": "evidence_researcher",
                 "display_name": "证据研究员",
                 "responsibility": "收集并校验授权范围内的研究证据",
-                "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                "agent_definition_ref": "builtin/cowd/explore@1",
                 "grant_ceiling": ["read"],
                 "fixed_count": 1,
                 "acceptance": ["summary", "evidence"],
@@ -4437,7 +4403,7 @@ mod tests {
                     "role_id": "evidence_reviewer",
                     "display_name": "独立审查员",
                     "responsibility": "独立复核授权证据并明确未解决风险",
-                    "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                    "agent_definition_ref": "builtin/cowd/explore@1",
                     "grant_ceiling": ["read"],
                     "fixed_count": 1,
                     "acceptance": ["summary", "evidence"],
@@ -4532,6 +4498,7 @@ mod tests {
             None,
             services.workspace_root(),
         );
+        ensure_test_team_resource(&mut patch_request);
         let patch_plan = planner::plan_runtime_orchestration(&patch_request);
         let patch_proposal = patch_request.proposal.as_ref().expect("patch proposal");
         let existing_instances = program.semantic_node_instances.clone();

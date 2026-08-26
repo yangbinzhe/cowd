@@ -4242,6 +4242,7 @@ mod tests {
                 blocker_ref: None,
                 next_action: Some("await_graph_transitions".to_string()),
             },
+            semantic_intent: None,
         });
         let delta = CollaborationProgram {
             program_id: "ignored-delta-id".to_string(),
@@ -4294,6 +4295,7 @@ mod tests {
                 blocker_ref: None,
                 next_action: Some("admit_exact_team_bindings".to_string()),
             },
+            semantic_intent: None,
         };
         merge_collaboration_program(&mut current, Some(delta)).expect("merge additive revision");
         let program = current.expect("program");
@@ -4407,6 +4409,7 @@ mod tests {
                     lifecycle: CollaborationProgramLifecycle::Planning,
                     ..Default::default()
                 },
+                semantic_intent: None,
             }),
         });
         graph.edges = vec![ExecutionEdge {
@@ -4641,6 +4644,7 @@ mod tests {
                     lifecycle: CollaborationProgramLifecycle::Planning,
                     ..Default::default()
                 },
+                semantic_intent: None,
             }),
         });
         let mut started_graph = graph.clone();
@@ -4799,6 +4803,7 @@ mod tests {
                 vec!["replacement-team".to_string()],
             )]),
             control: Default::default(),
+            semantic_intent: None,
         };
         let replaced = service
             .replan_semantic_with_retirements(
@@ -4936,6 +4941,7 @@ mod tests {
                     lifecycle: CollaborationProgramLifecycle::Planning,
                     ..Default::default()
                 },
+                semantic_intent: None,
             }),
         });
         let registered = service.register_graph(graph).expect("register graph").graph;
@@ -5181,6 +5187,7 @@ mod tests {
                     lifecycle: CollaborationProgramLifecycle::Planning,
                     ..Default::default()
                 },
+                semantic_intent: None,
             }),
         });
         let registered = service.register_graph(graph).expect("register graph").graph;

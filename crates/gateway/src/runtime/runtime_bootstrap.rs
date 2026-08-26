@@ -517,7 +517,7 @@ fn runtime_orchestration_input_schema() -> serde_json::Value {
 
 fn collaboration_decision_input_schema() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(
-        harness_contract::orchestration::ModelCollaborationControlDecision
+        harness_contract::orchestration::ModelCollaborationControlDecisionV2
     ))
     .expect("narrow collaboration decision schema must serialize")
 }
@@ -738,6 +738,14 @@ mod tests {
         assert!(collaboration_decision_tool.input_schema["properties"]
             .get("input_disposition")
             .is_none());
+        assert!(collaboration_decision_tool.input_schema["properties"]
+            .get("schema_version")
+            .is_some());
+        let collaboration_schema = collaboration_decision_tool.input_schema.to_string();
+        assert!(!collaboration_schema.contains("agent_definition_ref"));
+        assert!(!collaboration_schema.contains("grant_ceiling"));
+        assert!(!collaboration_schema.contains("RoleBehaviorFacet"));
+        assert!(!collaboration_schema.contains("\"behavior\""));
         let semantic_node =
             &orchestration_tool.input_schema["$defs"]["ModelGraphSemanticNode"]["properties"];
         assert!(

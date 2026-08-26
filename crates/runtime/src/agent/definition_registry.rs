@@ -629,6 +629,7 @@ fn agent_catalog_entry(
             .iter()
             .map(|capability| capability.as_str().to_string())
             .collect(),
+        skill_refs: manifest.capability_contract.skill_refs.clone(),
         scope: manifest.definition_id.scope(),
         evaluation: manifest.evaluation.clone(),
     }
@@ -778,6 +779,8 @@ mod tests {
                         task_contract: TeamRoleTaskContract {
                             contract_ref: "task/review@1".to_string(),
                             acceptance: vec!["evidence".to_string()],
+                            allowed_tool_contract_refs: Vec::new(),
+                            allowed_skill_refs: Vec::new(),
                             dataflow: Default::default(),
                         },
                     }],

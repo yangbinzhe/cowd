@@ -17,6 +17,11 @@ pub struct AgentCatalogEntry {
     pub name: String,
     pub description: String,
     pub capabilities: Vec<String>,
+    /// Approved immutable Skill references declared by the exact Definition
+    /// revision.  This is registry data used for semantic eligibility, never
+    /// a model-supplied effective grant.
+    #[serde(default)]
+    pub skill_refs: Vec<String>,
     pub scope: DefinitionScope,
     pub evaluation: AgentEvaluationContract,
 }
@@ -77,6 +82,15 @@ impl AgentCatalog {
 
     #[must_use]
     pub fn discover(&self, capabilities: &[String]) -> Vec<AgentCatalogEntry> {
+        self.discover_requirements(capabilities, &[])
+    }
+
+    #[must_use]
+    pub fn discover_requirements(
+        &self,
+        capabilities: &[String],
+        skill_refs: &[String],
+    ) -> Vec<AgentCatalogEntry> {
         let mut entries = self
             .entries
             .read()
@@ -86,6 +100,9 @@ impl AgentCatalog {
                 capabilities
                     .iter()
                     .all(|required| entry.capabilities.contains(required))
+                    && skill_refs
+                        .iter()
+                        .all(|required| entry.skill_refs.contains(required))
             })
             .cloned()
             .collect::<Vec<_>>();

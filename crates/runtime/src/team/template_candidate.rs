@@ -1,8 +1,8 @@
 //! AI-authored Team template candidates.
 //!
 //! The model drafts a structured team template; this module compiles it into
-//! a validated `TeamTemplateManifest`, clips every role's grant ceiling to the
-//! caller's permission ceiling, produces an audit preview, and publishes it as
+//! a validated `TeamTemplateManifest`, rejects every grant above the caller's
+//! permission ceiling, produces an audit preview, and publishes it as
 //! an immutable User-scope revision. Display names never participate in
 //! behavior; permission and acceptance contracts are the only execution facts.
 
@@ -63,6 +63,10 @@ pub struct ProposedRole {
     pub input_artifacts: Vec<String>,
     #[serde(default)]
     pub output_artifacts: Vec<String>,
+    #[serde(default)]
+    pub allowed_tool_contract_refs: Vec<String>,
+    #[serde(default)]
+    pub allowed_skill_refs: Vec<String>,
     /// Typed behavior is authored explicitly by the model/template author.
     /// The candidate compiler will never infer it from a role name, a graph
     /// edge, or an output field.
@@ -484,6 +488,18 @@ fn capability_names_from_string(raw: &str) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
+fn canonical_strings(values: &[String]) -> Vec<String> {
+    let mut canonical = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    canonical.sort();
+    canonical.dedup();
+    canonical
+}
+
 fn normalize_ref_string(raw: &str) -> Result<String, String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -509,38 +525,22 @@ fn normalize_ref_string(raw: &str) -> Result<String, String> {
 
 fn normalize_agent_definition_ref(
     fields: &mut serde_json::Map<String, serde_json::Value>,
-    ceiling_names: &[String],
-    notes: &mut Vec<String>,
+    _ceiling_names: &[String],
+    _notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let role_id = fields
         .get("role_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("<role>");
     let Some(value) = fields.get("agent_definition_ref").cloned() else {
-        let default_ref = if ceiling_names
-            .iter()
-            .any(|name| matches!(name.as_str(), "write" | "test"))
-        {
-            "builtin/cowd/execute@1"
-        } else if ceiling_names.iter().any(|name| name == "network") {
-            "builtin/cowd/explore@2"
-        } else {
-            "builtin/cowd/explore@1"
-        };
-        notes.push(format!(
-            "role `{role_id}`: defaulted agent_definition_ref to `{default_ref}`"
+        return Err(format!(
+            "role `{role_id}` is missing exact agent_definition_ref; custom Team admission must use the v2 semantic compiler"
         ));
-        fields.insert(
-            "agent_definition_ref".to_string(),
-            serde_json::json!(default_ref),
-        );
-        return Ok(());
     };
     if value.is_null() {
-        // An explicit `null` is the model saying "no preference", exactly
-        // like an absent field: use the safe builtin default.
-        fields.remove("agent_definition_ref");
-        return normalize_agent_definition_ref(fields, ceiling_names, notes);
+        return Err(format!(
+            "role `{role_id}` agent_definition_ref must not be null; custom Team admission must use the v2 semantic compiler"
+        ));
     }
     let normalized = match value {
         serde_json::Value::String(raw) => normalize_ref_string(&raw)?,
@@ -625,17 +625,7 @@ fn normalize_proposed_role(
         ));
     }
     if fields.get("responsibility").is_none() {
-        let display_name = fields
-            .get("display_name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(&role_id);
-        fields.insert(
-            "responsibility".to_string(),
-            serde_json::json!(format!("执行 {display_name} 的职责并产出可验证证据")),
-        );
-        notes.push(format!(
-            "role `{role_id}`: defaulted missing responsibility"
-        ));
+        return Err(format!("role `{role_id}` is missing responsibility"));
     }
     let mut ceiling_names: Vec<String> = Vec::new();
     match fields.get("grant_ceiling").cloned() {
@@ -1276,8 +1266,6 @@ impl TemplateCandidateCompiler {
             .map_err(|error| format!("invalid template_id: {error}"))?;
         let mut role_ids = std::collections::BTreeSet::new();
         let mut roles = Vec::with_capacity(proposal.roles.len());
-        let mut clipped_capabilities = Vec::new();
-        let mut defaulted_agent_refs = Vec::new();
         for role in &proposal.roles {
             if role.role_id.trim().is_empty() {
                 return Err("every proposed role needs a non-empty role_id".to_string());
@@ -1285,7 +1273,7 @@ impl TemplateCandidateCompiler {
             if !role_ids.insert(role.role_id.as_str()) {
                 return Err(format!("duplicate role_id `{}`", role.role_id));
             }
-            let (mut definition_id, mut revision) = parse_agent_ref(&role.agent_definition_ref)?;
+            let (definition_id, revision) = parse_agent_ref(&role.agent_definition_ref)?;
             // The Definition must exist in the registry; AI cannot invent one.
             if registry
                 .resolve_agent(
@@ -1294,42 +1282,10 @@ impl TemplateCandidateCompiler {
                 )
                 .is_err()
             {
-                // Bounded auto-repair for a nonexistent/invented Agent
-                // Definition: bind the safe builtin matching the requested
-                // capability profile (same rule as a missing ref) and record
-                // the exact substitution in the audit preview. Grant ceilings
-                // are still clipped to the caller's permission ceiling below.
-                let default_ref = if role
-                    .grant_ceiling
-                    .iter()
-                    .any(|name| matches!(name.as_str(), "write" | "test"))
-                {
-                    "builtin/cowd/execute@1"
-                } else if role.grant_ceiling.iter().any(|name| name == "network") {
-                    "builtin/cowd/explore@2"
-                } else {
-                    "builtin/cowd/explore@1"
-                };
-                let (default_id, default_revision) = parse_agent_ref(default_ref)?;
-                registry
-                    .resolve_agent(
-                        &default_id,
-                        RevisionSelector::ExactApprovedRevision {
-                            revision: default_revision,
-                        },
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "role `{}` references unknown Agent Definition `{}` and the safe builtin fallback `{default_ref}` is unavailable: {error}",
-                            role.role_id, role.agent_definition_ref
-                        )
-                    })?;
-                defaulted_agent_refs.push(format!(
-                    "{}: {} -> {default_ref}",
+                return Err(format!(
+                    "role `{}` references unknown Agent Definition `{}`; Runtime will not substitute a builtin",
                     role.role_id, role.agent_definition_ref
                 ));
-                definition_id = default_id;
-                revision = default_revision;
             }
             let mut grant_ceiling = Vec::new();
             for name in &role.grant_ceiling {
@@ -1340,16 +1296,18 @@ impl TemplateCandidateCompiler {
                     )
                 })?;
                 if !ceiling_allows(ceiling, capability) {
-                    // Bounded auto-repair: clip the over-ceiling capability and
-                    // record it in the preview so the audit trail shows the
-                    // exact compensation applied.
-                    clipped_capabilities.push(format!("{}:{}", role.role_id, name));
-                    continue;
+                    return Err(format!(
+                        "role `{}` capability `{name}` exceeds the authenticated permission ceiling",
+                        role.role_id
+                    ));
                 }
                 grant_ceiling.push(capability);
             }
             if grant_ceiling.is_empty() {
-                grant_ceiling.push(AgentCapability::Read);
+                return Err(format!(
+                    "role `{}` has no authorized capability after validation",
+                    role.role_id
+                ));
             }
             grant_ceiling.sort_by_key(|capability| format!("{capability:?}"));
             grant_ceiling.dedup();
@@ -1378,6 +1336,8 @@ impl TemplateCandidateCompiler {
                     } else {
                         role.acceptance.clone()
                     },
+                    allowed_tool_contract_refs: canonical_strings(&role.allowed_tool_contract_refs),
+                    allowed_skill_refs: canonical_strings(&role.allowed_skill_refs),
                     dataflow: TeamRoleDataflowContract {
                         inputs: role.input_artifacts.clone(),
                         outputs: role.output_artifacts.clone(),
@@ -1471,8 +1431,6 @@ impl TemplateCandidateCompiler {
                 "to": dependency.to_role_id,
             })).collect::<Vec<_>>(),
             "result_fields": manifest.result_contract.required_fields,
-            "clipped_capabilities": clipped_capabilities,
-            "defaulted_agent_refs": defaulted_agent_refs,
             "risk_notes": {
                 "requires_write": manifest.roles.iter().any(|role| role.grant_ceiling.contains(&AgentCapability::Write)),
                 "requires_network": manifest.roles.iter().any(|role| role.grant_ceiling.contains(&AgentCapability::Network)),
@@ -1651,6 +1609,8 @@ mod tests {
                     acceptance: vec!["findings".to_string(), "evidence".to_string()],
                     input_artifacts: Vec::new(),
                     output_artifacts: vec!["business_evidence".to_string()],
+                    allowed_tool_contract_refs: Vec::new(),
+                    allowed_skill_refs: Vec::new(),
                     behavior: vec![RoleBehaviorFacet::ReacquireEvidence { required: true }],
                 },
                 ProposedRole {
@@ -1665,6 +1625,8 @@ mod tests {
                     acceptance: vec!["summary".to_string(), "evidence".to_string()],
                     input_artifacts: vec!["business_evidence".to_string()],
                     output_artifacts: vec!["summary".to_string(), "evidence".to_string()],
+                    allowed_tool_contract_refs: Vec::new(),
+                    allowed_skill_refs: Vec::new(),
                     behavior: vec![
                         RoleBehaviorFacet::Reducer {
                             mode: "finally".to_string(),
@@ -1685,7 +1647,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_and_clips_a_business_tech_template() {
+    fn compiles_a_permission_bounded_business_tech_template() {
         let (_temp, registry) = registry();
         publish_agent(&registry, "cowd/explore");
         publish_agent(&registry, "cowd/direct");
@@ -1738,40 +1700,23 @@ mod tests {
     }
 
     #[test]
-    fn clips_over_ceiling_grants_and_defaults_unknown_definitions() {
+    fn rejects_unknown_definitions_and_over_ceiling_grants() {
         let (_temp, registry) = registry();
         publish_agent(&registry, "cowd/explore");
         publish_agent(&registry, "cowd/direct");
         let mut proposal = business_tech_proposal();
         proposal.roles[0].agent_definition_ref =
             "workspace/cowd/not-a-real-definition@1".to_string();
-        let candidate =
+        let error =
             TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
-                .expect("unknown definition falls back to a safe builtin");
-        assert_eq!(
-            candidate.manifest.roles[0].agent_definition_id.as_str(),
-            "builtin/cowd/explore"
-        );
-        assert!(candidate
-            .preview
-            .get("defaulted_agent_refs")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|defaulted| defaulted.len() == 1));
+                .expect_err("unknown definition must not fall back");
+        assert!(error.contains("unknown Agent Definition"));
         proposal = business_tech_proposal();
         proposal.roles[0].grant_ceiling = vec!["write".to_string()];
-        let candidate =
+        let error =
             TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
-                .expect("over-ceiling grant is clipped, not rejected");
-        assert!(candidate
-            .manifest
-            .roles
-            .iter()
-            .all(|role| !role.grant_ceiling.contains(&AgentCapability::Write)));
-        assert!(candidate
-            .preview
-            .get("clipped_capabilities")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|clipped| clipped.len() == 1));
+                .expect_err("over-ceiling grant must not be clipped");
+        assert!(error.contains("exceeds the authenticated permission ceiling"));
     }
 
     #[test]
@@ -2074,6 +2019,7 @@ mod tests {
                     "team": "business",
                     "cardinality": 1,
                     "grant_ceiling": "workspace-read",
+                    "agent_definition_ref": "builtin/cowd/explore@1",
                     "responsibility": "从制造现实出发评估约束",
                     "acceptance": "交付制造约束清单",
                     "behavior": "evidence"
@@ -2084,6 +2030,7 @@ mod tests {
                     "team": "technical",
                     "cardinality": 1,
                     "grant_ceiling": "workspace-read-write",
+                    "agent_definition_ref": "builtin/cowd/execute@1",
                     "responsibility": "总体架构决策",
                     "behavior": "evidence"
                 },
@@ -2093,6 +2040,7 @@ mod tests {
                     "team": "convergence",
                     "cardinality": 1,
                     "grant_ceiling": "workspace-read-write",
+                    "agent_definition_ref": "builtin/cowd/execute@1",
                     "responsibility": "主持收敛",
                     "behavior": "reducer, upstream, terminal"
                 }
@@ -2200,6 +2148,7 @@ mod tests {
             "roles": [{
                 "role_id": "researcher",
                 "responsibility": "Gather evidence",
+                "agent_definition_ref": "builtin/cowd/explore@1",
                 "behavior": "terminal, evidence"
             }],
             "result_fields": ["evidence", "risks"]
@@ -2240,7 +2189,8 @@ mod tests {
             "roles": [{
                 "role_id": "reviewer",
                 "responsibility": "review output",
-                "grant_ceiling": ["read"]
+                "grant_ceiling": ["read"],
+                "agent_definition_ref": "builtin/cowd/explore@1"
             }]
         });
         let error = normalize_template_proposal(&mut value)
@@ -2254,8 +2204,8 @@ mod tests {
             "template_id": "cowd/test",
             "name": "测试",
             "roles": [
-                {"role_id": "implementer", "responsibility": "x", "behavior": "evidence"},
-                {"role_id": "reviewer", "responsibility": "y", "behavior": "reducer, upstream, terminal"}
+                {"role_id": "implementer", "responsibility": "x", "agent_definition_ref": "builtin/cowd/explore@1", "behavior": "evidence"},
+                {"role_id": "reviewer", "responsibility": "y", "agent_definition_ref": "builtin/cowd/explore@1", "behavior": "reducer, upstream, terminal"}
             ],
             "dependencies": {"implementer": ["reviewer"]}
         });
@@ -2269,8 +2219,7 @@ mod tests {
     }
 
     #[test]
-    fn compiles_normalized_model_payload_with_defaulted_agent_refs() {
-        let (_temp, registry) = registry();
+    fn normalization_rejects_missing_exact_agent_refs() {
         let mut value = serde_json::json!({
             "template_id": "cowd/biz-tech-dual-team-deliberation",
             "name": "业务/技术双团队民主集中研讨",
@@ -2312,27 +2261,9 @@ mod tests {
             "result_fields": ["summary", "evidence"],
             "instructions": "# 研讨\n"
         });
-        normalize_template_proposal(&mut value).expect("normalize");
-        let proposal: TeamTemplateProposal = serde_json::from_value(value).expect("parse");
-        let candidate = TemplateCandidateCompiler::compile(
-            &registry,
-            &proposal,
-            PermissionMode::DangerFullAccess,
-        )
-        .expect("compile with builtin defaults");
-        assert_eq!(candidate.manifest.roles.len(), 3);
-        assert!(candidate.manifest.dependencies.iter().any(|dependency| {
-            dependency.from_role_id == "biz_expert"
-                && dependency.to_role_id == "convergence_arbiter"
-        }));
-        assert!(candidate.manifest.dependencies.iter().any(|dependency| {
-            dependency.from_role_id == "cto" && dependency.to_role_id == "convergence_arbiter"
-        }));
-        assert!(candidate
-            .manifest
-            .roles
-            .iter()
-            .any(|role| role.grant_ceiling.contains(&AgentCapability::Write)));
+        let error = normalize_template_proposal(&mut value)
+            .expect_err("generic templates must provide exact Agent refs");
+        assert!(error.contains("missing exact agent_definition_ref"));
     }
 
     #[test]
@@ -2360,12 +2291,13 @@ mod tests {
             "template_id": "cowd/test",
             "name": "测试",
             "roles": [
-                {"role_id": "business_expert", "responsibility": "x", "behavior": "evidence"},
-                {"role_id": "cto", "responsibility": "y", "behavior": "evidence"},
+                {"role_id": "business_expert", "responsibility": "x", "agent_definition_ref": "builtin/cowd/explore@1", "behavior": "evidence"},
+                {"role_id": "cto", "responsibility": "y", "agent_definition_ref": "builtin/cowd/explore@1", "behavior": "evidence"},
                 {
                     "role_id": "convergence_arbiter",
                     "team": "convergence",
                     "responsibility": "z",
+                    "agent_definition_ref": "builtin/cowd/explore@1",
                     "behavior": "reducer, upstream, terminal"
                 }
             ],
@@ -2389,26 +2321,15 @@ mod tests {
     }
 
     #[test]
-    fn unknown_agent_definition_refs_fall_back_to_safe_builtins_with_audit() {
+    fn unknown_agent_definition_refs_fail_closed() {
         let (_temp, registry) = registry();
         let mut proposal = business_tech_proposal();
         proposal.roles[0].agent_definition_ref = "builtin/cowd/researcher@1".to_string();
         proposal.roles[1].agent_definition_ref = "builtin/cowd/cto@1".to_string();
-        let candidate =
+        let error =
             TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
-                .expect("unknown agent refs fall back to safe builtins");
-        let defaulted = candidate.preview["defaulted_agent_refs"]
-            .as_array()
-            .expect("defaulted agent refs audit");
-        assert_eq!(defaulted.len(), 2);
-        assert_eq!(
-            candidate.manifest.roles[0].agent_definition_id.as_str(),
-            "builtin/cowd/explore"
-        );
-        assert_eq!(
-            candidate.manifest.roles[1].agent_definition_id.as_str(),
-            "builtin/cowd/explore"
-        );
+                .expect_err("unknown refs must not be substituted");
+        assert!(error.contains("unknown Agent Definition"));
     }
 
     #[test]
@@ -2424,20 +2345,8 @@ mod tests {
                 "behavior": "terminal, evidence"
             }]
         });
-        normalize_template_proposal(&mut value).expect("normalize");
-        assert_eq!(
-            value["roles"][0]["agent_definition_ref"],
-            "builtin/cowd/explore@1"
-        );
-        let (_temp, registry) = registry();
-        let proposal: TeamTemplateProposal =
-            serde_json::from_value(value).expect("parses after normalization");
-        let candidate =
-            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
-                .expect("compile with workspace-prefixed id and null agent ref");
-        assert_eq!(
-            candidate.manifest.template_id.as_str(),
-            "workspace/biz-tech-dual-team-deliberation"
-        );
+        let error =
+            normalize_template_proposal(&mut value).expect_err("null refs must not be defaulted");
+        assert!(error.contains("must not be null"));
     }
 }

@@ -9198,9 +9198,19 @@ mod tests {
             generation: 1,
         });
         let intent = AgentTaskIntent {
-            selected_agent_id: None,
-            definition_ref: None,
-            granted_capabilities: Vec::new(),
+            selected_agent_id: Some("builtin/cowd/direct".to_string()),
+            definition_ref: Some(
+                harness_contract::agent::AgentDefinitionRevisionRef::new(
+                    harness_contract::agent::AgentDefinitionId::new(
+                        harness_contract::agent::DefinitionScope::Builtin,
+                        "cowd/direct",
+                    )
+                    .expect("builtin definition id"),
+                    1,
+                )
+                .expect("builtin definition revision"),
+            ),
+            granted_capabilities: vec![harness_contract::agent::AgentCapability::Read],
             principal_id: "test".to_string(),
             source_turn_id: "agent-runtime-turn".to_string(),
             run_id: "agent-runtime-run".into(),
@@ -10234,7 +10244,7 @@ mod tests {
                     "role_id": "evidence_assessor",
                     "display_name": "证据评估师",
                     "responsibility": "独立检查已授权证据并报告不确定性",
-                    "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                    "agent_definition_ref": "builtin/cowd/explore@1",
                     "grant_ceiling": ["read"],
                     "fixed_count": 1,
                     "acceptance": ["summary", "evidence"],

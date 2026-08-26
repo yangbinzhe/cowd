@@ -917,6 +917,73 @@ pub struct CollaborationProgramEdge {
     pub claim_receipt: Option<CrossTeamEdgeClaimReceipt>,
 }
 
+/// Trusted Runtime provenance for a semantic collaboration admission.  It is
+/// presentation/audit data only: execution remains pinned to the immutable
+/// Team snapshots and exact Agent bindings below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationIntentOrigin {
+    UserDirectedTurnScoped,
+    ExplicitCatalog,
+    RuntimeReplan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationIntentLifecycle {
+    TurnScoped,
+    PublishCandidate,
+    CatalogRevision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationSemanticRoleSnapshot {
+    pub role_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub responsibility: String,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub required_skills: Vec<String>,
+    #[serde(default)]
+    pub required_tools: Vec<String>,
+    #[serde(default)]
+    pub input_artifacts: Vec<String>,
+    #[serde(default)]
+    pub output_artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationSemanticTeamSnapshot {
+    pub workstream_id: String,
+    pub team_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    pub roles: Vec<CollaborationSemanticRoleSnapshot>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationSemanticIntentSnapshot {
+    pub schema_version: u16,
+    pub decision_id: String,
+    pub intent_digest: String,
+    pub origin: CollaborationIntentOrigin,
+    pub lifecycle: CollaborationIntentLifecycle,
+    pub source_session_ref: String,
+    pub source_turn_ref: String,
+    pub compiler_revision: String,
+    pub binding_digest: String,
+    #[serde(default)]
+    pub teams: Vec<CollaborationSemanticTeamSnapshot>,
+    #[serde(default)]
+    pub ai_composed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_template_ref: Option<String>,
+}
+
 /// Immutable, graph-owned description of the Team obligations for one root
 /// execution.  It is not a second scheduler: the canonical `ExecutionGraph`
 /// remains responsible for admission, recovery, effects and terminal state.
@@ -934,6 +1001,10 @@ pub struct CollaborationProgram {
     /// a generated node id or consulting a mutable in-memory scheduler.
     #[serde(default)]
     pub semantic_node_instances: BTreeMap<String, Vec<String>>,
+    /// Additive, surface-safe semantic provenance for a turn-scoped custom
+    /// Team. Historical Programs decode without it and remain executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_intent: Option<CollaborationSemanticIntentSnapshot>,
     #[serde(default)]
     pub control: CollaborationProgramControlState,
 }
@@ -1056,6 +1127,19 @@ impl CollaborationProgram {
                             .to_string(),
                     );
                 }
+            }
+        }
+        if let Some(intent) = self.semantic_intent.as_ref() {
+            if intent.schema_version == 0
+                || intent.decision_id.trim().is_empty()
+                || intent.intent_digest.trim().is_empty()
+                || intent.source_session_ref.trim().is_empty()
+                || intent.source_turn_ref.trim().is_empty()
+                || intent.compiler_revision.trim().is_empty()
+                || intent.binding_digest.trim().is_empty()
+                || intent.teams.is_empty()
+            {
+                return Err("collaboration semantic intent provenance is incomplete".to_string());
             }
         }
         if !matches!(
@@ -1721,6 +1805,7 @@ mod dependency_policy_tests {
                 claim_receipt: None,
             }],
             semantic_node_instances: BTreeMap::new(),
+            semantic_intent: None,
             control: Default::default(),
         };
         assert!(valid.validate().is_ok());
@@ -1761,6 +1846,7 @@ mod dependency_policy_tests {
                     "graph:research:2".to_string(),
                 ],
             )]),
+            semantic_intent: None,
             control: Default::default(),
         };
         assert!(mapped.validate().is_ok());
@@ -1788,6 +1874,7 @@ mod dependency_policy_tests {
             }],
             edges: Vec::new(),
             semantic_node_instances: BTreeMap::new(),
+            semantic_intent: None,
             control: CollaborationProgramControlState {
                 lifecycle: CollaborationProgramLifecycle::Running,
                 obligations: vec![TeamAdmissionObligation {

@@ -509,7 +509,7 @@ pub fn runtime_capability_primer() -> String {
             .to_string(),
     );
     lines.push(
-        "TRIGGER RULE (custom teams): preserve every user-supplied Team and role identifier exactly and call `submit_collaboration_decision`, never a parallel `runtime_orchestrate(propose)` copy. Submit one workstream per Team with its complete turn-scoped template. Each template has team_display_name, roles[] with role_id/display_name/responsibility/typed behavior/agent definition/grant ceiling/cardinality/acceptance and directed dependencies, result fields and instructions. Runtime validates it, clips permissions, binds immutable snapshots to the current turn, and never publishes it or waits for template approval. Use a catalog template only when the user expressly selected it; use `propose_template` only when publication/reuse is expressly requested. Never silently replace a custom Team with a builtin template."
+        "TRIGGER RULE (custom teams): preserve every user-supplied Team and role identifier exactly and call `submit_collaboration_decision`, never a parallel `runtime_orchestrate(propose)` copy. Submit schema_version=2 with one semantic workstream per Team: role responsibility, required capabilities/Skills/Tools, cardinality, typed acceptance, producer-to-consumer dependencies and result intent. Do not supply behavior facets, Agent ids, grant ceilings, leases or templates. Runtime validates semantics, resolves exact approved Definitions, derives immutable behavior/bindings and never publishes the turn-scoped Team. Use a catalog template only when the user expressly selected it; use `propose_template` only when publication/reuse is expressly requested. Never silently replace a custom Team with a builtin template."
             .to_string(),
     );
     lines.push("- Before proposing a reusable catalog Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values. A user-named turn-scoped Team instead goes through `submit_collaboration_decision`; it never publishes a catalog revision.".to_string());
@@ -1574,6 +1574,8 @@ fn orchestration_preflight_with_catalog(
         proposal: Some(proposal),
         control: None,
         template_proposal: None,
+        collaboration_intent: None,
+        collaboration_semantic_intent: None,
         ephemeral_team_templates: Default::default(),
 
         input_disposition: None,

@@ -53,6 +53,7 @@ mod tests {
             name: "Reviewer".into(),
             description: "Reviews evidence".into(),
             capabilities: vec!["review".into()],
+            skill_refs: Vec::new(),
             scope: DefinitionScope::Workspace,
             evaluation: AgentEvaluationContract::single_release_gate("review", "evidence"),
         });

@@ -204,6 +204,8 @@ pub(crate) fn compile_collaboration_intent_patch(
             retired_collaboration_instance_ids: retired_instance_ids,
             reason: patch.reason.clone(),
         }),
+        collaboration_intent: None,
+        collaboration_semantic_intent: None,
         control: None,
         template_proposal: None,
         ephemeral_team_templates,
@@ -1327,6 +1329,7 @@ mod tests {
             edges: Vec::new(),
             semantic_node_instances: std::collections::BTreeMap::new(),
             control: Default::default(),
+            semantic_intent: None,
         };
         let review = harness_contract::execution_graph::CollaborationPatchTeam {
             semantic_node_id: "independent-review".to_string(),
@@ -1409,6 +1412,7 @@ mod tests {
                 ("consumer".to_string(), vec!["consumer-node".to_string()]),
             ]),
             control: Default::default(),
+            semantic_intent: None,
         };
         let team = harness_contract::execution_graph::CollaborationPatchTeam {
             semantic_node_id: "split-a".to_string(),
@@ -1564,6 +1568,7 @@ mod tests {
                     lifecycle: CollaborationProgramLifecycle::Planning,
                     ..Default::default()
                 },
+                semantic_intent: None,
             }),
         });
         let registered = services

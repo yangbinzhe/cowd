@@ -332,6 +332,8 @@ mod tests {
             control: None,
             template_proposal: None,
             ephemeral_team_templates: Default::default(),
+            collaboration_intent: None,
+            collaboration_semantic_intent: None,
 
             input_disposition: None,
             selection_mode: None,
@@ -383,6 +385,8 @@ mod tests {
             control: None,
             template_proposal: None,
             ephemeral_team_templates: Default::default(),
+            collaboration_intent: None,
+            collaboration_semantic_intent: None,
 
             input_disposition: None,
             selection_mode: None,

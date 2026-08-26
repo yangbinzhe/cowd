@@ -111,7 +111,7 @@ fn team_selection_mode_for_runtime_tool(
 /// display names. The model remains free to choose arbitrary Teams and role
 /// topology; Runtime retains the user-selected evidence boundary.
 fn validate_root_evidence_scope_coverage(
-    input: &harness_contract::orchestration::ModelRuntimeOrchestrationInput,
+    decision_input: &harness_contract::orchestration::ModelCollaborationControlDecisionV2,
     decision: &runtime::RuntimeExecutionDecision,
 ) -> Result<(), ToolError> {
     let mut required = decision
@@ -124,15 +124,25 @@ fn validate_root_evidence_scope_coverage(
     if required.is_empty() {
         return Ok(());
     }
-    let mut proposed = input
-        .proposal
-        .as_ref()
-        .into_iter()
-        .flat_map(|proposal| proposal.nodes.iter())
-        .flat_map(|node| node.evidence_contract.iter())
-        .filter_map(|criterion| criterion.trim().strip_prefix("evidence_scope:"))
-        .map(str::trim)
-        .map(str::to_string)
+    let mut proposed = decision_input
+        .workstreams
+        .iter()
+        .flat_map(|workstream| {
+            workstream.evidence_contract.iter().chain(
+                workstream
+                    .team
+                    .roles
+                    .iter()
+                    .flat_map(|role| role.acceptance.iter()),
+            )
+        })
+        .filter_map(|criterion| match criterion {
+            harness_contract::orchestration::ModelSemanticAcceptanceCriterion::EvidenceScope {
+                operation,
+                resource,
+            } => Some(format!("{}:{}", operation.trim(), resource.trim())),
+            _ => None,
+        })
         .collect::<Vec<_>>();
     proposed.sort();
     proposed.dedup();
@@ -551,17 +561,33 @@ impl GatewayToolExecutor {
         // ModelAssisted role selection would reintroduce model-authored
         // template authority through a later compiler path.
         let root_collaboration_selection = team_selection_mode_for_runtime_tool(tool_name);
+        let mut submitted_collaboration_intent = None;
         let value = if tool_name == harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID {
             normalize_runtime_orchestration_wire_input(value)?
         } else if tool_name
             == harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
         {
             let decision = serde_json::from_value::<
-                harness_contract::orchestration::ModelCollaborationControlDecision,
+                harness_contract::orchestration::ModelCollaborationControlDecisionV2,
             >(value)
             .map_err(|error| self.input_contract_error(tool_name, error))?;
-            serde_json::to_value(decision.into_runtime_orchestration_input())
-                .map_err(|error| ToolError::new(error.to_string()))?
+            let intent = decision.intent.clone();
+            submitted_collaboration_intent = Some(decision);
+            serde_json::to_value(
+                harness_contract::orchestration::ModelRuntimeOrchestrationInput {
+                    intent,
+                    operation:
+                        harness_contract::orchestration::RuntimeOrchestrationOperation::Propose,
+                    inspect_execution_id: None,
+                    proposal: None,
+                    template_proposal: None,
+                    control: None,
+                    input_disposition: None,
+                    evidence_refs: Vec::new(),
+                    constraints: Default::default(),
+                },
+            )
+            .map_err(|error| ToolError::new(error.to_string()))?
         } else {
             value
         };
@@ -829,8 +855,11 @@ impl GatewayToolExecutor {
                 // request binding. Legacy/direct Gateway calls may not carry
                 // it, and retain their existing Runtime admission path; they
                 // must not be rejected merely for using an older transport.
-                if let Some(decision) = leased_decision.as_ref() {
-                    validate_root_evidence_scope_coverage(&input, decision)?;
+                if let (Some(decision_input), Some(decision)) = (
+                    submitted_collaboration_intent.as_ref(),
+                    leased_decision.as_ref(),
+                ) {
+                    validate_root_evidence_scope_coverage(decision_input, decision)?;
                 }
             }
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
@@ -865,6 +894,7 @@ impl GatewayToolExecutor {
                     permission_ceiling: binding.permission_ceiling,
                 },
             );
+            request.collaboration_intent = submitted_collaboration_intent;
             self.bind_delegated_capabilities(&mut request);
             let decision =
                 effective_runtime_execution_decision(binding.execution_decision, leased_decision);
@@ -4599,6 +4629,8 @@ mod tests {
             control: None,
             template_proposal: None,
             ephemeral_team_templates: Default::default(),
+            collaboration_intent: None,
+            collaboration_semantic_intent: None,
 
             input_disposition: None,
             selection_mode: None,

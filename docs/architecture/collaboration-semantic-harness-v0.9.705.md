@@ -272,15 +272,34 @@ typed failure instead of looping.
   release scripts selected by the version gate;
 - `crates/harness-contract/src/orchestration.rs`;
 - `crates/harness-contract/src/execution_graph/contract.rs`;
+- `crates/harness-contract/src/team/definition.rs`, limited to additive,
+  immutable per-role Tool and Skill constraint fields. The compiler gate found
+  that semantic Tool/Skill requirements otherwise could be validated but not
+  frozen into a Team binding; the additive fields close that state boundary.
 - `crates/harness-contract/src/execution_graph/mod.rs` and
   `crates/harness-contract/src/lib.rs` only if needed to export new contracts;
 - `crates/runtime/src/orchestration/{mod,request,validator,compiler,intent_compiler,team_authority,collaboration_coordinator}.rs`;
 - `crates/runtime/src/team/{template_candidate,instantiation,team_binding}.rs`;
+- `crates/runtime/src/team/definition/{bootstrap,store}.rs`, limited to
+  default-empty persistence/migration for the additive per-role Tool and Skill
+  constraint fields; this is required so a compiled constraint survives a
+  durable Team definition round trip;
 - `crates/runtime/src/agent/{catalog,definition_registry,binding}.rs`;
 - `crates/runtime/src/infrastructure/capability_manifest.rs`;
 - `crates/runtime/src/execution_core/model_affordance.rs`;
+- `crates/runtime/src/execution_core/graph/commit_service.rs`, limited to
+  preserving the additive `CollaborationProgram.semantic_intent` provenance
+  field whenever program state is copied or revised. This caller amendment was
+  discovered during the contract compilation gate; it neither owns lifecycle
+  decisions nor changes graph-commit behavior.
 - `crates/runtime/src/conversation/host.rs` only for tool activation/guidance
   and bounded compensation wiring, not lifecycle ownership;
+- `crates/runtime/src/conversation/conversation.rs`,
+  `crates/runtime/src/execution_core/services.rs`,
+  `crates/runtime/src/team/agent_selector.rs`, and
+  `crates/runtime/src/orchestration/{planner,team_authority}.rs` only for
+  compile-checked request/fixture migration caused by the replacement v2
+  contract; they do not receive new authority or selection policy;
 - `crates/gateway/src/runtime/{runtime_bootstrap,gateway_tool_executor}.rs`;
 - directly affected OpenAPI/capability-contract tests;
 - `docs/evidence/collaboration-semantic-compiler-v0.9.705.md`.

@@ -634,7 +634,7 @@ fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
     ) {
         return serde_json::from_str::<
-            harness_contract::orchestration::ModelCollaborationControlDecision,
+            harness_contract::orchestration::ModelCollaborationControlDecisionV2,
         >(&call.input)
         .ok()
         .is_some_and(|decision| !decision.workstreams.is_empty());

@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use harness_contract::agent::{
     AgentBindingSnapshot, AgentCapability, AgentDataLease, AgentDefinitionId,
     AgentEvaluationBinding, AgentInstanceRef, AgentReleaseBinding, AgentTaskIntent,
-    AgentTaskPacket, DefinitionScope, RevisionSelector,
+    AgentTaskPacket, RevisionSelector,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -87,38 +87,37 @@ pub(crate) fn request_for_intent(
     intent: &AgentTaskIntent,
     catalog_entry: Option<AgentCatalogEntry>,
 ) -> Result<AgentBindingRequest, AgentBindingError> {
-    let (definition_id, selector, granted_capabilities) =
-        if let Some(definition_ref) = intent.definition_ref.as_ref() {
-            (
-                definition_ref.definition_id.clone(),
-                RevisionSelector::ExactApprovedRevision {
-                    revision: definition_ref.revision,
-                },
-                intent.granted_capabilities.clone(),
-            )
-        } else if let Some(entry) = catalog_entry {
-            (
-                entry.definition_ref.definition_id,
-                // The catalog is an eligibility index, not a release pin.
-                // Leaving the selector at latest Stable lets Runtime's
-                // release router apply an approved Canary deterministically
-                // and persist the exact resulting provenance in the Binding.
-                // Explicit definition refs above remain exact pins.
-                RevisionSelector::LatestApprovedStable,
-                entry
-                    .capabilities
-                    .into_iter()
-                    .filter_map(capability_from_name)
-                    .collect::<Vec<_>>(),
-            )
-        } else if intent.selected_agent_id.is_some() {
-            return Err(AgentBindingError::InvalidRequest(
-            "selected Agent is absent from the Runtime catalog; no fallback Binding is permitted"
-                .to_string(),
-        ));
-        } else {
-            fallback_binding_identity(intent)?
-        };
+    let (definition_id, selector, granted_capabilities) = if let Some(definition_ref) =
+        intent.definition_ref.as_ref()
+    {
+        (
+            definition_ref.definition_id.clone(),
+            RevisionSelector::ExactApprovedRevision {
+                revision: definition_ref.revision,
+            },
+            intent.granted_capabilities.clone(),
+        )
+    } else if let Some(entry) = catalog_entry {
+        (
+            entry.definition_ref.definition_id,
+            // The catalog is an eligibility index, not a release pin.
+            // Leaving the selector at latest Stable lets Runtime's
+            // release router apply an approved Canary deterministically
+            // and persist the exact resulting provenance in the Binding.
+            // Explicit definition refs above remain exact pins.
+            RevisionSelector::LatestApprovedStable,
+            entry
+                .capabilities
+                .into_iter()
+                .filter_map(capability_from_name)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        return Err(AgentBindingError::InvalidRequest(
+                "Agent intent has no exact Definition reference or Runtime catalog selection; no fallback Binding is permitted"
+                    .to_string(),
+            ));
+    };
     let mut request = AgentBindingRequest::new(
         definition_id,
         selector,
@@ -534,53 +533,13 @@ fn capability_from_name(value: String) -> Option<AgentCapability> {
     }
 }
 
-fn fallback_binding_identity(
-    intent: &AgentTaskIntent,
-) -> Result<(AgentDefinitionId, RevisionSelector, Vec<AgentCapability>), AgentBindingError> {
-    let requires_execute = intent.allowed_tools.iter().any(|tool| {
-        let lower = tool.to_ascii_lowercase();
-        ["write", "edit", "patch", "bash", "shell", "test"]
-            .iter()
-            .any(|keyword| lower.contains(keyword))
-    });
-    let requires_explore = !requires_execute
-        && (!intent.allowed_tools.is_empty()
-            || intent
-                .constraints
-                .iter()
-                .any(|constraint| constraint.contains("evidence")));
-    let (local_id, capabilities) = if requires_execute {
-        (
-            "cowd/execute",
-            vec![
-                AgentCapability::Read,
-                AgentCapability::Search,
-                AgentCapability::Write,
-                AgentCapability::Test,
-            ],
-        )
-    } else if requires_explore {
-        (
-            "cowd/explore",
-            vec![AgentCapability::Read, AgentCapability::Search],
-        )
-    } else {
-        ("cowd/direct", vec![AgentCapability::Read])
-    };
-    Ok((
-        AgentDefinitionId::new(DefinitionScope::Builtin, local_id)
-            .map_err(|error| AgentBindingError::InvalidRequest(error.to_string()))?,
-        RevisionSelector::LatestApprovedStable,
-        capabilities,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use harness_contract::agent::{
-        AgentCapability, AgentDefinitionId, AgentTaskIntent, DefinitionScope, RevisionSelector,
+        AgentCapability, AgentDefinitionId, AgentDefinitionRevisionRef, AgentTaskIntent,
+        DefinitionScope, RevisionSelector,
     };
     use harness_contract::context::ChildExecutionBudgetReservation;
     use harness_contract::policy::PermissionMode;
@@ -605,8 +564,15 @@ mod tests {
     fn team_intent() -> AgentTaskIntent {
         AgentTaskIntent {
             selected_agent_id: None,
-            definition_ref: None,
-            granted_capabilities: Vec::new(),
+            definition_ref: Some(
+                AgentDefinitionRevisionRef::new(
+                    AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute")
+                        .expect("builtin id"),
+                    1,
+                )
+                .expect("exact revision"),
+            ),
+            granted_capabilities: vec![AgentCapability::Read],
             principal_id: "test".to_string(),
             source_turn_id: "turn-1".to_string(),
             run_id: "run-1".to_string(),

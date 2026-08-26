@@ -6617,7 +6617,7 @@ fn is_team_orchestration_call(call: &ModelToolCall) -> bool {
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
     ) {
         return serde_json::from_str::<
-            harness_contract::orchestration::ModelCollaborationControlDecision,
+            harness_contract::orchestration::ModelCollaborationControlDecisionV2,
         >(&call.input)
         .ok()
         .is_some_and(|decision| !decision.workstreams.is_empty());
@@ -15249,6 +15249,7 @@ mod tests {
                             vec!["team-physical-1".to_string(), "team-physical-2".to_string()],
                         )]),
                         control: Default::default(),
+                        semantic_intent: None,
                     },
                 ),
             },
@@ -17131,7 +17132,7 @@ mod tests {
             id: "team".to_string(),
             name: harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
                 .to_string(),
-            input: r#"{"decision_id":"review","intent":"review","workstreams":[{"workstream_id":"review-team","objective":"review"}],"reason":"independent review"}"#.to_string(),
+            input: r#"{"schema_version":2,"decision_id":"review","intent":"review","workstreams":[{"workstream_id":"review-team","objective":"review","team":{"team_key":"review-team","roles":[{"role_id":"reviewer","responsibility":"review","required_capabilities":["read"],"output_artifacts":["summary","evidence"]}],"result":{"required_artifacts":["summary","evidence"],"evidence_required":true,"synthesis_required":true}}}],"reason":"independent review"}"#.to_string(),
             depends_on: Vec::new(),
         };
         assert_eq!(
