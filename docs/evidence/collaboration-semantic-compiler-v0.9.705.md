@@ -54,3 +54,12 @@ scenario evidence are recorded with their commands and results.
 | `cowd-edge`: authenticated `npm run generate:api` | Passed; reviewed generated OpenAPI projection adds the existing `TeamExecutionTerminal` carrier |
 | `cowd-edge`: `npm run test:api-matrix` | Passed; generic APP API matrix and production-residual gate both reported no failures |
 | `cowd-edge`: `npm run build` | Passed; Vite production build completed |
+
+## Version-close record
+
+| Repository | Phase commit | Tree | Annotated tag |
+| --- | --- | --- | --- |
+| `cowd-0821-terminal` | `4816b5c802219ba48ae45b4ae105310ac92a880d` | `e4af1497b6de2fb6cfba168b4b9a0098de0cd3dc` | `v0.9.705` (retargeted to this evidence-record commit) |
+| `cowd-edge` | `0a2a0183f1e60898c388807b6559435f2f175250` | `994ee69c455636b3495aa3ec108ecceb0d655ad2` | `v0.9.705` |
+
+Both worktrees were clean at phase close. No remote was pushed.
