@@ -8,7 +8,7 @@ inside the conversation host. The terminal architecture extends the existing
 graph-owned `CollaborationProgram`; it does not introduce a second Team
 scheduler or a second collaboration lifecycle registry.
 
-Baseline captured 2026-08-25:
+Historical incident baseline captured 2026-08-25:
 
 - Repository HEAD: `d04963d99fde71185826ceb419c5e24210a00d4f`.
 - Worktree is intentionally dirty in the collaboration dependency cone. The
@@ -19,13 +19,54 @@ Baseline captured 2026-08-25:
   role dependency direction, and an opaque required-node failure. A fourth
   run completed the Team but then the parent model reopened orchestration.
 
+Frozen release baseline captured 2026-08-26:
+
+- `cowd-0821-terminal`: annotated tag `v0.9.704`, commit
+  `31f578078727c59035a2a2c47a219e50ae429676`, tree
+  `913ebfd10622781c22a458f9e0d0abdc24830efd`.
+- `cowd-edge`: annotated tag `v0.9.704`, commit
+  `04b63861e9e332576d08a2f81326942b22c92e9a`, tree
+  `e78d575c4821a210e6f762edbd8afa785d463f7a`.
+- Core formatting and affected-crate checks passed; WebUI passed 438 unit tests
+  across 53 files and its production build. The exact commands and tag objects
+  are recorded in
+  `docs/evidence/collaboration-semantic-harness-baseline-v0.9.704.md`.
+- No remote push is authorized by this plan. Each implementation version must
+  close independently in both repositories before the next version starts.
+
 Review amendment captured 2026-08-26:
 
 - The semantic-contract, concurrency and experience-reuse design below is
   review-ready. It is deliberately recorded in this sole authority rather
   than in a competing plan. P7-P11 must not begin until the decisions in
-  **Review decisions** are accepted; the earlier correctness repairs remain
+  **Proposed locked decisions awaiting user confirmation** are accepted; the
+  earlier correctness repairs remain
   prerequisites and are not reopened by this amendment.
+
+Implementation confirmation gate captured 2026-08-26:
+
+- Planning and plan auditing are authorized before implementation.
+- No business-source implementation for P7-P11 may start until the user
+  explicitly confirms the audited three-version plan.
+- The release packaging below is the executable interpretation of P7-P11. Its
+  subordinate version contracts add source allowlists and acceptance evidence;
+  they do not create competing architecture authorities.
+
+## Three-version release packaging
+
+| Version | Architecture phases | Closed boundary | Subordinate contract |
+| --- | --- | --- | --- |
+| `v0.9.705` | P7 + P8 | One semantic model contract, deterministic intent compiler, exact capability/Skill/Tool resolution, immutable Program provenance, no builtin or name-based fallback. | `docs/architecture/collaboration-semantic-harness-v0.9.705.md` |
+| `v0.9.706` | P9 + approval and live-Surface portion of P11 | One execution-capacity profile, one approval/veto wait path, projection v3, truthful live WebUI/TUI collaboration card. | `docs/architecture/collaboration-semantic-harness-v0.9.706.md` |
+| `v0.9.707` | P10 + terminal integrated portion of P11 | Typed experience episodes, advisory semantic patterns, governed owner-specific promotion, real-provider/browser/concurrency/restart/fault acceptance. | `docs/architecture/collaboration-semantic-harness-v0.9.707.md` |
+
+The pre-implementation contradiction, ownership, concurrency, recovery,
+performance and source-overlap audit is
+`docs/architecture/collaboration-semantic-harness-plan-audit.md`. A version may
+not borrow a later version's completion claim: v0.9.705 proves semantic
+correctness without the new Surface; v0.9.706 proves live execution truth
+without reusable promotion; v0.9.707 proves governed reuse and the terminal
+business chain.
 
 ## User-visible terminal outcome
 
@@ -610,21 +651,35 @@ P9 capacity/concurrency closure   P10 experience/evolution closure
 P11 Surface + real-provider integrated closure
 ```
 
+Release grouping is dependency-preserving:
+
+```text
+v0.9.704 frozen baseline
+  -> v0.9.705 [P7 + P8]
+  -> v0.9.706 [P9 + approval/live projection P11]
+  -> v0.9.707 [P10 + terminal integrated P11]
+```
+
+P11 is deliberately split by ownership, not partially claimed: v0.9.706 owns
+the live projection protocol and Surface wiring needed to observe later tests;
+v0.9.707 owns the complete real-provider, browser, failure, recovery and reuse
+acceptance matrix.
+
 | Phase | Closed goal and source allowlist | Required deletion/rewire | Acceptance evidence |
 | --- | --- | --- | --- |
 | P7 | One small semantic intent: `crates/harness-contract/src/orchestration.rs`, `crates/harness-contract/src/team/{definition,binding}.rs`, `crates/runtime/src/orchestration/{request,validator}.rs`, `crates/runtime/src/team/template_candidate.rs`, `crates/gateway/src/runtime/{runtime_bootstrap,gateway_tool_executor}.rs`. | Remove model obligation to author behavior facets, physical Agent refs and mechanical recipes. Collapse dependency variants after boundary decoding; version persisted legacy reads without retaining two active internal contracts. | Native tool, structured-output and tolerant legacy fixtures normalize to one intent digest; property tests with arbitrary names; no semantic auto-repair. |
 | P8 | `IntentCompiler` and capability resolver: `crates/runtime/src/orchestration/{request,validator,compiler,team_authority}.rs`, `crates/runtime/src/team/{template_candidate,instantiation,team_binding}.rs`, `crates/runtime/src/agent/{catalog,binding}.rs`. | Delete default builtin role/template substitution and behavior-from-name/position heuristics. Derive facets/dataflow mechanics; resolve exact Definitions/Skills/Tools and emit typed gaps. | Goal-to-binding reverse audit; arbitrary-role generative tests; missing-capability negative tests; restart with exact binding digests. |
 | P9 | One capacity profile: `crates/harness-contract/src/{orchestration,execution_graph/contract}.rs`, `crates/runtime/src/orchestration/{mod,request,compiler}.rs`, `crates/runtime/src/team/instantiation.rs`, `crates/runtime/src/execution_core/graph/{runner,resources/manager}.rs`, `crates/runtime/src/projection/{mod,snapshot,activity}.rs`. | Remove scattered 100/32/default ceilings and duplicate orchestration capacity decisions; move veto/timeout values to policy snapshots. | Compiler/scale/saturation/fairness/lock/recovery gates above; configuration and projection tests; source scan for retired magic values. |
 | P10 | Governed experience/pattern/Skill promotion: `crates/runtime/src/evolution/{candidate_kind,governance}.rs`, `crates/runtime/src/team/{template_candidate,l4_promotion}.rs`, `crates/runtime/src/skill/{mod,governance}.rs`, `crates/runtime/src/agent/definition_registry.rs`, `crates/harness-contract/src/{agent/definition,team/definition,skill/mod}.rs`. | Do not auto-publish successful turn templates; do not use Memory L4 as executable authority; close or remove advertised subject kinds lacking a promotion adapter. | Repeated-evidence threshold, paired baseline, Canary, rollback, contamination and precedence tests. |
-| P11 | Gateway/Surface/eval: `crates/gateway/src/runtime/{runtime_bootstrap,gateway_tool_executor}.rs`, `crates/runtime/src/projection/*`, `crates/harness-contract/src/projection/*`, `crates/surface/src/*`, `tests/reference-app/webui/index.html`, `crates/harness-eval/src/{runner,live_scenario_runner}.rs`. | Remove obsolete huge low-level model schema and unlabelled template fallback from UI; no model prose as status. | Fresh-session custom names with no template, multi-Team dependencies, trust-all and veto timeout, capability gap/replan, restart, overload and reusable-pattern runs; observe every stage and prove Program/evidence/UI agreement. |
+| P11 | Gateway/Surface/eval: `crates/gateway/src/runtime/{runtime_bootstrap,gateway_tool_executor}.rs`, `crates/gateway/src/api_routes/{runtime_routes,live_routes,evolution_routes,audit_routes}.rs`, `crates/runtime/src/projection/*`, `crates/harness-contract/src/projection/*`, `crates/tui/src/{app_core/protocol.rs,components/agent_team_panel.rs}`, `crates/harness-eval/src/{runner,live_scenario_runner}.rs`, and sibling `cowd-edge/surfaces/webui`. | Remove obsolete huge low-level model schema and unlabelled template fallback from the production WebUI; no model prose as status. Reference-app surfaces remain test fixtures, not the acceptance UI. | Fresh production-WebUI Session with custom names and no template, multi-Team dependencies, trust-all and veto timeout, capability gap/replan, restart, overload and reusable-pattern runs; observe every stage and prove Program/evidence/UI agreement. |
 
 | Phase | Allowed residuals outside its closed boundary | Evidence file |
 | --- | --- | --- |
-| P7 | Versioned legacy decoding only at durable-read/transport ingress; it cannot write internal execution state. | `docs/evidence/collaboration-semantic-contract-p7.md` |
-| P8 | Historical compiled snapshots remain readable; no new snapshot is authored by the retired path. | `docs/evidence/collaboration-intent-compiler-p8.md` |
-| P9 | One named representability safety maximum may remain in the kernel; every operational limit is policy data. | `docs/evidence/collaboration-capacity-p9.md` |
-| P10 | Historical episodes and ineligible candidates remain auditable but are never executable defaults. | `docs/evidence/collaboration-experience-p10.md` |
-| P11 | No residual is allowed in the user-visible semantic/execution/evidence chain. | `docs/evidence/collaboration-terminal-p11.md` |
+| P7 | Versioned legacy decoding only at durable-read/transport ingress; it cannot write internal execution state. | `docs/evidence/collaboration-semantic-compiler-v0.9.705.md` |
+| P8 | Historical compiled snapshots remain readable; no new snapshot is authored by the retired path. | `docs/evidence/collaboration-semantic-compiler-v0.9.705.md` |
+| P9 | One named representability safety maximum may remain in the kernel; every operational limit is policy data. | `docs/evidence/collaboration-capacity-surface-v0.9.706.md` |
+| P10 | Historical episodes and ineligible candidates remain auditable but are never executable defaults. | `docs/evidence/collaboration-semantic-harness-v0.9.707.md` |
+| P11 | No residual is allowed in the user-visible semantic/execution/evidence chain. | v0.9.706 live-Surface evidence plus `docs/evidence/collaboration-semantic-harness-v0.9.707.md` terminal evidence |
 
 Every phase must publish the state-truth, producer-consumer,
 concurrency/wait, failure/recovery and resource/backpressure tables from its
@@ -632,9 +687,11 @@ actual implementation evidence. P11 is incomplete until the user-visible
 capability reaches level 5: production wired, durable/recoverable,
 failure/concurrency proven and operationally observable.
 
-## Review decisions
+## Proposed locked decisions awaiting user confirmation
 
-The recommended decisions for discussion are:
+The audited plan uses these decisions as fixed implementation constraints. The
+user confirmation gate accepts or rejects them as one coherent design; any
+requested change reopens the plan audit before source implementation.
 
 1. **AI-generated role semantics: accept.** AI generates missing duties,
    capability and Skill requirements; explicit user fields stay immutable.
@@ -648,7 +705,11 @@ The recommended decisions for discussion are:
 5. **No-template UX: accept.** Show an AI-composed, turn-scoped Team and its
    resolved capabilities/provenance; never silently match a local template.
 
-## Implementation phases and acceptance gates
+## Historical correctness phases and acceptance gates
+
+The P0-P6 work below records the correctness path that produced the frozen
+v0.9.704 baseline. It is retained for traceability and does not compete with
+the three-version P7-P11 release packaging above.
 
 | Phase | Closed boundary and write allowlist | Required deletion/rewire | Acceptance evidence |
 | --- | --- | --- | --- |
