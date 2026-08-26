@@ -116,7 +116,10 @@ impl TeamResultReducer {
 /// to appear first in the graph, and a useful plain-text result must not be
 /// discarded merely because the delegated model omitted an optional JSON
 /// wrapper.
-fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String> {
+fn aggregate_positive_evidence_summary(
+    graph: &ExecutionGraph,
+    include_reducer_roles: bool,
+) -> Option<String> {
     let mut branch_summaries = BTreeMap::new();
     for node in &graph.nodes {
         if node.kind != ExecutionNodeKind::AgentTask {
@@ -125,7 +128,7 @@ fn aggregate_positive_evidence_summary(graph: &ExecutionGraph) -> Option<String>
         let Ok(packet) = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref) else {
             continue;
         };
-        if is_reducer_agent(&packet) {
+        if !include_reducer_roles && is_reducer_agent(&packet) {
             continue;
         }
         let Some(result) = graph.node_results.get(&node.id) else {
@@ -212,7 +215,7 @@ fn verified_team_evidence_bundle(
     {
         return None;
     }
-    let worker_count = graph
+    let independent_worker_count = graph
         .nodes
         .iter()
         .filter(|node| {
@@ -222,7 +225,23 @@ fn verified_team_evidence_bundle(
                     .unwrap_or(false)
         })
         .count();
-    let summary = aggregate_positive_evidence_summary(graph)?;
+    // A final Team may deliberately contain only one upstream-consuming
+    // reducer/arbiter. It has no independent evidence producer by design,
+    // but its bounded terminal narrative is still the required user-facing
+    // report. Include that reducer only in this all-reducer topology; mixed
+    // Teams continue to derive their evidence bundle from independent workers
+    // and never let a reducer overwrite their source findings.
+    let include_reducer_roles = independent_worker_count == 0;
+    let worker_count = if include_reducer_roles {
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+            .count()
+    } else {
+        independent_worker_count
+    };
+    let summary = aggregate_positive_evidence_summary(graph, include_reducer_roles)?;
     let summarized_worker_count = summary.lines().filter(|line| line.starts_with('[')).count();
     (worker_count > 0 && summarized_worker_count == worker_count).then(|| {
         format!(
@@ -1001,6 +1020,16 @@ mod tests {
             .insert(node.id.clone(), ExecutionNodeStatus::Completed);
         let mut reducer_result = result(ExecutionNodeStatus::Completed, ExecutionUsage::default());
         reducer_result.summary = Some("mechanical reducer branch".to_string());
+        reducer_result
+            .evidence_refs
+            .push(EvidenceAccessRef::durable(
+                EvidenceRef::durable(format!("evidence:{node_id}")),
+                "0".repeat(64),
+                1,
+                "text/plain",
+                format!("artifact:{node_id}"),
+                "team:fixture",
+            ));
         graph.node_results.insert(node.id.clone(), reducer_result);
         graph.nodes.push(node);
     }
@@ -1040,7 +1069,7 @@ mod tests {
         add_verify(&mut graph, true);
 
         assert_eq!(
-            aggregate_positive_evidence_summary(&graph).as_deref(),
+            aggregate_positive_evidence_summary(&graph, false).as_deref(),
             Some("[branch-a] findings: structured finding A\n[branch-b] plain text finding B")
         );
         let envelope = build_delivery_envelope(&graph);
@@ -1049,6 +1078,18 @@ mod tests {
         assert!(bundle.starts_with("# Verified Team evidence bundle"));
         assert!(bundle.contains("Risk: no unresolved delivery-contract findings"));
         assert!(bundle.contains("[branch-a] findings: structured finding A"));
+    }
+
+    #[test]
+    fn all_reducer_terminal_team_keeps_its_attested_report() {
+        let mut graph = ExecutionGraph::new("upstream-only final arbiter");
+        add_reducer_branch(&mut graph, "arbiter");
+        add_verify(&mut graph, true);
+
+        let envelope = build_delivery_envelope(&graph);
+        let bundle = verified_team_evidence_bundle(&graph, &envelope)
+            .expect("an upstream-only terminal reducer must retain its nonempty report");
+        assert!(bundle.contains("[arbiter] mechanical reducer branch"));
     }
 
     #[test]

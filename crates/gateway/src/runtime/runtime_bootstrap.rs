@@ -337,7 +337,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         RuntimeToolDefinition {
             name: "runtime_orchestrate".to_string(),
             description: Some(
-                "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution. For a Team that selects a multi-role catalog template, proposal.nodes[].focuses must explicitly list every role_id that this semantic Team activates; list all template roles to run the whole template. max_parallel_agents limits simultaneously runnable instances, not total graph nodes. Shared network/resource infrastructure is valid when focus objectives and evidence responsibilities remain distinct. Use runtime_capabilities(detail=orchestration_options) first when effective limits or templates are uncertain.".to_string(),
+                "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution. Use this Team path only for an explicitly selected catalog template; proposal.nodes[].focuses must list the catalog role_ids that the semantic Team activates. For a user-named Team or user-named roles, use submit_collaboration_decision instead: it is the sole turn-scoped custom-Team admission path and does not publish a template. max_parallel_agents limits simultaneously runnable instances, not total graph nodes. Shared network/resource infrastructure is valid when focus objectives and evidence responsibilities remain distinct. Use runtime_capabilities(detail=orchestration_options) first when effective limits or templates are uncertain.".to_string(),
             ),
             input_schema: runtime_orchestration_input_schema(),
             required_permission: ToolPermissionMode::ReadOnly,
@@ -347,7 +347,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
             name: harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
                 .to_string(),
             description: Some(
-                "Submit the initial semantic collaboration decision for this user turn. Use this only to declare independent workstreams, their dependencies, evidence contracts, and optional role focuses. Runtime owns Team templates, physical graph nodes, permissions, resources, approvals, and recovery. Do not use this for inspect, revision, template publication, or control."
+                "Submit the initial semantic collaboration decision for this user turn. Use it for all user-named, turn-scoped Teams: one workstream is one Team and its optional template contains the complete arbitrary role topology, display names, typed behavior and directed role dependencies. Runtime validates and freezes the snapshot without catalog publication. Runtime owns physical graph nodes, permissions, resources, approvals, recovery and terminal state. Do not use this for inspect, revision, catalog template publication, or control."
                     .to_string(),
             ),
             input_schema: collaboration_decision_input_schema(),
@@ -452,8 +452,21 @@ fn runtime_orchestration_input_schema() -> serde_json::Value {
     // call the tool at all.
     schema["properties"]["template_proposal"] = serde_json::json!({
         "type": "object",
-        "description": "Structured Team template proposal. Every field below is guidance; the Runtime accepts tolerant variants and validates after admission.",
+        "description": "Structured turn-scoped custom Team template proposal. For one Team put the template fields directly here. For multiple named Teams use {teams:[{node_id,template}, ...]}; every Team node must be bound exactly once. Every field below is guidance; Runtime accepts tolerant variants and validates after admission.",
         "properties": {
+            "teams": {
+                "type": "array",
+                "description": "Multiple custom Team bindings. Each item has the semantic Team node_id and its complete template object; this is not catalog publication.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "node_id": { "type": "string" },
+                        "template": { "type": "object", "additionalProperties": true }
+                    },
+                    "required": ["node_id", "template"],
+                    "additionalProperties": true
+                }
+            },
             "template_id": {
                 "type": "string",
                 "description": "Publish-local template id, e.g. cross-team-collaborative-decision. Scope prefixes (cowd/, workspace/, user/) are accepted and normalized."

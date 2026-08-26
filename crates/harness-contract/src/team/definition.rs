@@ -223,9 +223,41 @@ impl RolePartitionPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleDataflowContract {
+    /// Named artifacts this role may consume from declared upstream roles.
+    /// These are semantic contract keys, not paths or display labels.
+    #[serde(default)]
+    pub inputs: Vec<String>,
+    /// Named artifacts this role publishes for downstream roles or the Team
+    /// terminal.  Runtime validates every dependency against these keys.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+}
+
+impl TeamRoleDataflowContract {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_unique_non_empty("role.task_contract.dataflow.inputs", &self.inputs)?;
+        validate_unique_non_empty("role.task_contract.dataflow.outputs", &self.outputs)
+    }
+}
+
+impl Default for TeamRoleDataflowContract {
+    fn default() -> Self {
+        Self {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamRoleTaskContract {
     pub contract_ref: String,
     pub acceptance: Vec<String>,
+    /// Empty only for a legacy catalog revision. New turn-scoped templates
+    /// must declare the producer/consumer keys used by their dependencies.
+    #[serde(default)]
+    pub dataflow: TeamRoleDataflowContract,
 }
 
 impl TeamRoleTaskContract {
@@ -236,7 +268,8 @@ impl TeamRoleTaskContract {
                 field: "role.task_contract.acceptance".to_string(),
             });
         }
-        validate_unique_non_empty("role.task_contract.acceptance", &self.acceptance)
+        validate_unique_non_empty("role.task_contract.acceptance", &self.acceptance)?;
+        self.dataflow.validate()
     }
 }
 
@@ -446,10 +479,54 @@ impl TeamTemplateManifest {
             }
         }
         validate_dependencies(&role_ids, &self.dependencies)?;
+        validate_dependency_dataflow(&self.roles, &self.dependencies)?;
         self.result_contract.validate()?;
         self.evaluation.validate()?;
         validate_digest("instructions_digest", &self.instructions_digest)
     }
+}
+
+fn validate_dependency_dataflow(
+    roles: &[TeamRoleDefinition],
+    dependencies: &[TeamRoleDependency],
+) -> Result<(), ValidationError> {
+    let by_id = roles
+        .iter()
+        .map(|role| (role.role_id.as_str(), role))
+        .collect::<BTreeMap<_, _>>();
+    for dependency in dependencies {
+        let producer = by_id
+            .get(dependency.from_role_id.as_str())
+            .expect("dependency endpoints were validated before dataflow");
+        let consumer = by_id
+            .get(dependency.to_role_id.as_str())
+            .expect("dependency endpoints were validated before dataflow");
+        let outputs = &producer.task_contract.dataflow.outputs;
+        let inputs = &consumer.task_contract.dataflow.inputs;
+        // Published catalog revisions from before the dataflow contract have
+        // neither side populated. They remain readable/immutable; every new
+        // turn-scoped candidate is required to populate both sides below.
+        if outputs.is_empty() && inputs.is_empty() {
+            continue;
+        }
+        if outputs.is_empty() || inputs.is_empty() {
+            return Err(ValidationError::InvalidContract {
+                message: format!(
+                    "role dependency `{}` -> `{}` must declare both producer outputs and consumer inputs",
+                    dependency.from_role_id, dependency.to_role_id
+                ),
+            });
+        }
+        if !outputs.iter().any(|output| inputs.contains(output)) {
+            return Err(ValidationError::InvalidContract {
+                message: format!(
+                    "role dependency `{}` -> `{}` has no producer-output to consumer-input contract match",
+                    dependency.from_role_id, dependency.to_role_id
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -618,6 +695,7 @@ mod tests {
             task_contract: TeamRoleTaskContract {
                 contract_ref: format!("task/{role_id}"),
                 acceptance: vec!["evidence-backed output".to_string()],
+                dataflow: Default::default(),
             },
         }
     }

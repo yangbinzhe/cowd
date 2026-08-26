@@ -405,7 +405,7 @@ impl RuntimeCapabilityManifest {
                     &[
                         "Inspect current Runtime state before changing an existing graph.",
                         "Propose semantic nodes and dependencies; revise by exact graph revision; never provide executors or leases.",
-                        "When the user names specific teams/roles (e.g. 业务团队/技术团队/CTO/供应链专家), use propose with exactly one Team node plus template_proposal for a turn-scoped custom Team; use propose_template only when reusable catalog publication is explicitly wanted.",
+                        "When the user names specific Teams or roles, use submit_collaboration_decision with one turn-scoped template per Team; use propose_template only when reusable catalog publication is explicitly wanted.",
                     ],
                 ),
                 capability(
@@ -505,16 +505,16 @@ pub fn runtime_capability_primer() -> String {
         "Orchestration capability contract (single source of truth, do not guess):".to_string(),
     );
     lines.push(
-        "TRIGGER RULE: if the user explicitly asks for teams, parallel agents, or multi-role collaboration, you MUST call `runtime_capabilities(detail=team_templates)` and then `runtime_orchestrate(propose)`. Do NOT answer such a request with web_fetch, bash, or ordinary tools; a team request is fulfilled only by a real Mission graph with the exact template_id and roles copied from the catalog."
+        "TRIGGER RULE: if the user explicitly asks for a named Team, named roles, responsibilities, or an organizational relationship, use `submit_collaboration_decision` when that native schema is active. It creates the real Program graph directly from one turn-scoped template per named Team; do not inspect or select a catalog template first. Use `runtime_capabilities(detail=team_templates)` followed by `runtime_orchestrate(propose)` only when the user expressly selected an already-published catalog template."
             .to_string(),
     );
     lines.push(
-        "TRIGGER RULE (custom teams): if the user names specific teams or roles (业务团队/技术团队, CTO, 供应链专家, 运维智能体, data scientist, AI expert, senior engineer...), call `runtime_orchestrate(operation=propose)` with exactly one semantic Team node whose `template` is omitted, plus a structured `template_proposal` (template_id, name, team_display_name, roles[] with role_id/display_name/responsibility/behavior/agent_definition_ref/grant_ceiling/cardinality/acceptance, dependencies, result_fields, instructions). Each role MUST state typed behavior explicitly, for example evidence acquisition, upstream consumption, reducer, verification, or terminal-candidate; never encode behavior in the role name. Runtime validates definitions, clips permissions to your ceiling, and binds an immutable snapshot to the current session/turn without publishing it to the shared catalog. Use `propose_template` only when the user explicitly asks to publish/reuse a template. Do NOT silently fall back to the builtin template when the user named custom roles."
+        "TRIGGER RULE (custom teams): preserve every user-supplied Team and role identifier exactly and call `submit_collaboration_decision`, never a parallel `runtime_orchestrate(propose)` copy. Submit one workstream per Team with its complete turn-scoped template. Each template has team_display_name, roles[] with role_id/display_name/responsibility/typed behavior/agent definition/grant ceiling/cardinality/acceptance and directed dependencies, result fields and instructions. Runtime validates it, clips permissions, binds immutable snapshots to the current turn, and never publishes it or waits for template approval. Use a catalog template only when the user expressly selected it; use `propose_template` only when publication/reuse is expressly requested. Never silently replace a custom Team with a builtin template."
             .to_string(),
     );
-    lines.push("- Before proposing a reusable catalog Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values. A turn-scoped custom Team instead uses the structured `template_proposal` described above.".to_string());
+    lines.push("- Before proposing a reusable catalog Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values. A user-named turn-scoped Team instead goes through `submit_collaboration_decision`; it never publishes a catalog revision.".to_string());
     lines.push(
-        "- Never invent, translate, or guess role ids; unknown roles are rejected at compile time."
+        "- Preserve the user's requested role name exactly in display_name. role_id is only a machine key; prefer a distinct lowercase ASCII slug when possible. If a provider emits a localized/non-machine role_id, Runtime deterministically normalizes that key while retaining the original display name, dependencies, and dataflow; never replace the requested role with a catalog role."
             .to_string(),
     );
     for template in &catalog.templates {

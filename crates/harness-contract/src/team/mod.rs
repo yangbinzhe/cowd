@@ -19,9 +19,9 @@ pub use binding::{
     TeamRoleIdentity,
 };
 pub use definition::{
-    RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDefinition,
-    TeamRoleDependency, TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest,
-    TeamTemplateRevision, TeamTemplateRevisionRef, TeamTopologyContract,
+    RoleCardinalityPolicy, RolePartitionPolicy, TeamResultContract, TeamRoleDataflowContract,
+    TeamRoleDefinition, TeamRoleDependency, TeamRoleTaskContract, TeamTemplateDefinitionId,
+    TeamTemplateManifest, TeamTemplateRevision, TeamTemplateRevisionRef, TeamTopologyContract,
 };
 pub use instantiation::{
     focus_scope_hash, FocusPartitionPlan, FocusPartitionSlot, TeamAcceptanceCheck,

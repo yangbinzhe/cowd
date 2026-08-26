@@ -55,6 +55,7 @@ fn manifest(revision: u64, name: &str) -> TeamTemplateManifest {
             task_contract: TeamRoleTaskContract {
                 contract_ref: "task/review@1".to_string(),
                 acceptance: vec!["evidence".to_string()],
+                dataflow: Default::default(),
             },
         }],
         dependencies: Vec::new(),

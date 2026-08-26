@@ -59,9 +59,10 @@ fn parse_qualified_mcp_name(qualified: &str) -> Result<(String, String), ToolErr
 /// string even though the outer tool-call frame is valid JSON.  Normalize the
 /// two model-authored orchestration payloads once, at the Gateway boundary,
 /// before the ordinary schema and typed-contract validators run.  This is not
-/// a permissive fallback: only a JSON object is accepted; malformed strings,
-/// arrays/scalars and every business-rule violation still fail through the
-/// existing typed path.
+/// a permissive fallback: proposal remains an object; template proposals may
+/// be an object or an array because the Runtime supports multiple turn-scoped
+/// Team bindings. Malformed strings/scalars and every business-rule violation
+/// still fail through the existing typed path.
 fn normalize_runtime_orchestration_wire_input(
     mut value: serde_json::Value,
 ) -> Result<serde_json::Value, ToolError> {
@@ -78,9 +79,14 @@ fn normalize_runtime_orchestration_wire_input(
                     "runtime_orchestrate `{field}` JSON string is malformed: {error}"
                 ))
             })?;
-        if !parsed.is_object() {
+        if field == "proposal" && !parsed.is_object() {
             return Err(ToolError::new(format!(
                 "runtime_orchestrate `{field}` JSON string must decode to an object"
+            )));
+        }
+        if field == "template_proposal" && !(parsed.is_object() || parsed.is_array()) {
+            return Err(ToolError::new(format!(
+                "runtime_orchestrate `{field}` JSON string must decode to an object or array"
             )));
         }
         object.insert(field.to_string(), parsed);
@@ -93,6 +99,55 @@ fn team_selection_mode_for_runtime_tool(
 ) -> Option<harness_contract::team::TeamSelectionMode> {
     (tool_name == harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID)
         .then_some(harness_contract::team::TeamSelectionMode::Explicit)
+}
+
+/// The user may explicitly name bounded source files for a collaboration
+/// request. Those scopes are extracted into the Runtime-owned strategy lease
+/// before the model is called. A root decision must cover them all: otherwise
+/// a structurally valid Team graph can spend its leases on an unrelated
+/// workspace log and still reach a misleading mechanical terminal.
+///
+/// This deliberately validates only source coverage, never role ids or
+/// display names. The model remains free to choose arbitrary Teams and role
+/// topology; Runtime retains the user-selected evidence boundary.
+fn validate_root_evidence_scope_coverage(
+    input: &harness_contract::orchestration::ModelRuntimeOrchestrationInput,
+    decision: &runtime::RuntimeExecutionDecision,
+) -> Result<(), ToolError> {
+    let mut required = decision
+        .strategy
+        .understanding
+        .required_workspace_evidence_scopes
+        .clone();
+    required.sort();
+    required.dedup();
+    if required.is_empty() {
+        return Ok(());
+    }
+    let mut proposed = input
+        .proposal
+        .as_ref()
+        .into_iter()
+        .flat_map(|proposal| proposal.nodes.iter())
+        .flat_map(|node| node.evidence_contract.iter())
+        .filter_map(|criterion| criterion.trim().strip_prefix("evidence_scope:"))
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    proposed.sort();
+    proposed.dedup();
+    let missing = required
+        .into_iter()
+        .filter(|scope| !proposed.contains(scope))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ToolError::new(format!(
+            "root collaboration decision omitted user-required bounded evidence scope(s): {}; every requested source must appear as an exact evidence_scope:read:<path> in a Team workstream or role acceptance",
+            missing.join(", ")
+        )))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -769,6 +824,15 @@ impl GatewayToolExecutor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
+            if tool_name == harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID {
+                // Governed root turns provide this lease through the Runtime
+                // request binding. Legacy/direct Gateway calls may not carry
+                // it, and retain their existing Runtime admission path; they
+                // must not be rejected merely for using an older transport.
+                if let Some(decision) = leased_decision.as_ref() {
+                    validate_root_evidence_scope_coverage(&input, decision)?;
+                }
+            }
             let services = self.runtime_services.get().cloned().ok_or_else(|| {
                 ToolError::new("runtime_orchestrate requires the workspace RuntimeServices Runner")
             })?;

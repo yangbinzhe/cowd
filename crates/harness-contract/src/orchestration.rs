@@ -167,13 +167,18 @@ pub struct ModelCollaborationWorkstream {
     pub objective: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Compatibility-only input. Root collaboration admission intentionally
-    /// discards it: Runtime selects and validates concrete Team roles after
-    /// semantic workstreams are bound. Keeping this field deserializable lets
-    /// a provider recover from an over-specified request without accepting
-    /// model-authored template-role authority.
+    /// Compatibility-only semantic focus input. New root decisions should use
+    /// `template` when a user requests named roles: a focus is not a Team
+    /// role binding and never creates an Agent identity by itself.
     #[serde(default)]
     pub focuses: Vec<ModelSemanticFocus>,
+    /// Optional turn-scoped Team template for this one workstream. It is never
+    /// published to the catalog: Runtime validates it, clips its grants to the
+    /// authenticated session ceiling, and creates the immutable snapshot. This
+    /// lets one Team carry any user-requested set of roles without treating
+    /// every role as a separate Team workstream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<ModelTemplateProposal>,
     #[serde(default)]
     pub output_artifacts: Vec<String>,
     #[serde(default)]
@@ -203,6 +208,64 @@ impl ModelCollaborationControlDecision {
     /// decoupling the root control transport from the huge legacy tool schema.
     #[must_use]
     pub fn into_runtime_orchestration_input(self) -> ModelRuntimeOrchestrationInput {
+        let mut templates = Vec::new();
+        let nodes = self
+            .workstreams
+            .into_iter()
+            .map(|workstream| {
+                // A custom template keeps evidence acceptance at the role
+                // boundary, where each named role can own a distinct source.
+                // The Team node still needs their union in order to issue a
+                // physical lease.  Requiring the model to duplicate those
+                // entries in the optional workstream-level contract created a
+                // split-brain contract: accepted role criteria could be
+                // rejected at tool execution because the Team lease fell back
+                // to an intent-derived directory.  Derive only typed scope
+                // criteria here; ordinary role acceptance stays local to the
+                // role and is not promoted to a Team-wide obligation.
+                let template_evidence_scopes = workstream
+                    .template
+                    .as_ref()
+                    .map(template_declared_evidence_scopes)
+                    .unwrap_or_default();
+                if let Some(template) = workstream.template {
+                    templates.push(serde_json::json!({
+                        "node_id": workstream.workstream_id.clone(),
+                        "template": template,
+                    }));
+                }
+                ModelGraphSemanticNode {
+                    node_id: workstream.workstream_id,
+                    recipe: CapabilityRecipeId::Team,
+                    objective: workstream.objective,
+                    depends_on: workstream.depends_on,
+                    multiplicity: 1,
+                    // Semantic focus is not an executable role binding. The
+                    // optional template above is compiled by Runtime into the
+                    // complete immutable Team role partition.
+                    focuses: Vec::new(),
+                    managed_agent_escalation: workstream.managed_agent_escalation,
+                    template: None,
+                    target_session_id: None,
+                    output_artifacts: workstream.output_artifacts,
+                    evidence_contract: merge_workstream_evidence_contract(
+                        workstream.evidence_contract,
+                        template_evidence_scopes,
+                    ),
+                    required_evidence_refs: Vec::new(),
+                    required: true,
+                    dependency: ExecutionDependencyPolicy::All,
+                    cancellation_group: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let template_proposal = match templates.len() {
+            0 => None,
+            1 if nodes.len() == 1 => templates
+                .pop()
+                .and_then(|entry| entry.get("template").cloned()),
+            _ => Some(serde_json::json!({ "teams": templates })),
+        };
         ModelRuntimeOrchestrationInput {
             intent: self.intent,
             operation: RuntimeOrchestrationOperation::Propose,
@@ -211,41 +274,65 @@ impl ModelCollaborationControlDecision {
                 mutation_id: format!("control-decision:{}", self.decision_id),
                 target_execution_id: None,
                 expected_revision: None,
-                nodes: self
-                    .workstreams
-                    .into_iter()
-                    .map(|workstream| ModelGraphSemanticNode {
-                        node_id: workstream.workstream_id,
-                        recipe: CapabilityRecipeId::Team,
-                        objective: workstream.objective,
-                        depends_on: workstream.depends_on,
-                        multiplicity: 1,
-                        // Root workstreams determine the Program's semantic
-                        // responsibilities, not a concrete template's role
-                        // partition. Template roles are Runtime-owned and
-                        // must therefore never cross this control boundary.
-                        focuses: Vec::new(),
-                        managed_agent_escalation: workstream.managed_agent_escalation,
-                        template: None,
-                        target_session_id: None,
-                        output_artifacts: workstream.output_artifacts,
-                        evidence_contract: workstream.evidence_contract,
-                        required_evidence_refs: Vec::new(),
-                        required: true,
-                        dependency: ExecutionDependencyPolicy::All,
-                        cancellation_group: None,
-                    })
-                    .collect(),
+                nodes,
                 completion: ExecutionCompletionContract::default(),
                 reason: self.reason,
             }),
-            template_proposal: None,
+            template_proposal,
             control: None,
             input_disposition: None,
             evidence_refs: Vec::new(),
             constraints: ModelRuntimeOrchestrationConstraints::default(),
         }
     }
+}
+
+fn template_declared_evidence_scopes(template: &ModelTemplateProposal) -> Vec<String> {
+    template
+        .roles
+        .iter()
+        .flat_map(|role| role.acceptance.iter())
+        .filter(|criterion| criterion.trim().starts_with("evidence_scope:"))
+        .cloned()
+        .collect()
+}
+
+fn merge_workstream_evidence_contract(
+    workstream_contract: Vec<String>,
+    template_evidence_scopes: Vec<String>,
+) -> Vec<String> {
+    let mut merged = normalize_workstream_evidence_contract(workstream_contract);
+    merged.extend(normalize_workstream_evidence_contract(
+        template_evidence_scopes,
+    ));
+    merged.sort();
+    merged.dedup();
+    merged
+}
+
+/// Normalize the narrow set of scope spellings that model providers commonly
+/// emit for a collaboration workstream.  `scope:path:project/file.rs` means
+/// the same bounded read evidence as `evidence_scope:read:project/file.rs`;
+/// accepting that alias here keeps the model-facing semantic port tolerant
+/// without widening authorization.  Absolute paths and traversal remain
+/// untouched and therefore fail the canonical Runtime validation.
+fn normalize_workstream_evidence_contract(values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| {
+            let trimmed = value.trim();
+            let Some(path) = trimmed.strip_prefix("scope:path:") else {
+                return value;
+            };
+            let path = path.trim().replace('\\', "/");
+            let bounded_relative = !path.is_empty()
+                && !path.starts_with('/')
+                && !path.split('/').any(|part| part == "..");
+            bounded_relative
+                .then(|| format!("evidence_scope:read:{path}"))
+                .unwrap_or(value)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -350,11 +437,31 @@ pub struct ModelProposedRole {
         description = "Acceptance criteria the role must satisfy before its evidence is trusted."
     )]
     pub acceptance: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Named artifacts this role consumes from declared upstream roles. Required for every dependency consumer in a new turn-scoped Team; each value must match an upstream role output_artifacts value."
+    )]
+    pub input_artifacts: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Named artifacts this role publishes for downstream roles or Team synthesis. Required for every dependency producer in a new turn-scoped Team."
+    )]
+    pub output_artifacts: Vec<String>,
+    #[schemars(
+        description = "Explicit typed execution behavior. Runtime never infers this from a role name: use reacquire_evidence or verification for independent evidence roles; use reducer plus upstream_consumption and terminal_candidate for a role that synthesizes upstream work."
+    )]
+    pub behavior: Vec<crate::team::RoleBehaviorFacet>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ModelProposedDependency {
+    #[schemars(
+        description = "Upstream producer role_id. This role must finish successfully before `to` may start; for evidence synthesis use each evidence-producing role here."
+    )]
     pub from: String,
+    #[schemars(
+        description = "Downstream consumer role_id. This role starts only after `from` finishes; a final reviewer or arbiter that consumes evidence belongs here, never in `from`."
+    )]
     pub to: String,
 }
 
@@ -393,6 +500,9 @@ pub struct ModelTemplateProposal {
     pub role_display_names: Vec<ModelRoleDisplayName>,
     pub roles: Vec<ModelProposedRole>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        description = "Directional role execution edges. Every pair is {from: upstream producer, to: downstream consumer}; `from` completes before `to` starts. For a final arbiter, put all evidence/review roles in from and the arbiter in to."
+    )]
     pub dependencies: Option<ModelTemplateDependencies>,
     #[serde(default)]
     #[schemars(
@@ -525,6 +635,7 @@ mod tests {
             "\"role_display_names\"",
             "\"grant_ceiling\"",
             "\"agent_definition_ref\"",
+            "\"behavior\"",
             "\"result_fields\"",
             "\"instructions\"",
             "\"dependencies\"",
@@ -556,6 +667,7 @@ mod tests {
                     objective: "must not become a template partition".to_string(),
                     evidence_responsibilities: Vec::new(),
                 }],
+                template: None,
                 output_artifacts: vec!["review".to_string()],
                 evidence_contract: vec!["evidence".to_string()],
                 managed_agent_escalation: ManagedAgentEscalationRequirement::None,
@@ -577,6 +689,135 @@ mod tests {
     }
 
     #[test]
+    fn narrow_collaboration_decision_normalizes_bounded_scope_path_evidence() {
+        let input = ModelCollaborationControlDecision {
+            decision_id: "scope-alias".to_string(),
+            intent: "read one source file".to_string(),
+            workstreams: vec![ModelCollaborationWorkstream {
+                workstream_id: "source-review".to_string(),
+                objective: "inspect source".to_string(),
+                depends_on: Vec::new(),
+                focuses: Vec::new(),
+                template: None,
+                output_artifacts: Vec::new(),
+                evidence_contract: vec!["scope:path:crates/runtime/src/lib.rs".to_string()],
+                managed_agent_escalation: ManagedAgentEscalationRequirement::None,
+            }],
+            reason: "bounded evidence".to_string(),
+        };
+
+        let contract = input
+            .into_runtime_orchestration_input()
+            .proposal
+            .expect("proposal")
+            .nodes[0]
+            .evidence_contract
+            .clone();
+        assert_eq!(
+            contract,
+            vec!["evidence_scope:read:crates/runtime/src/lib.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn narrow_collaboration_decision_preserves_one_custom_multirole_team() {
+        let template = ModelTemplateProposal {
+            template_id: "cowd/turn-runtime-audit".to_string(),
+            name: "运行时审计团队".to_string(),
+            team_display_name: Some("运行时审计团队".to_string()),
+            role_display_names: Vec::new(),
+            roles: vec![
+                ModelProposedRole {
+                    role_id: "fault_topology_scout".to_string(),
+                    display_name: Some("故障拓扑侦察员".to_string()),
+                    team: None,
+                    responsibility: "梳理调用链".to_string(),
+                    agent_definition_ref: None,
+                    grant_ceiling: vec![ModelGrantCapability::Read],
+                    fixed_count: Some(1),
+                    min_count: None,
+                    max_count: None,
+                    acceptance: vec![
+                        "summary".to_string(),
+                        "evidence".to_string(),
+                        "evidence_scope:read:crates/runtime/src/orchestration/mod.rs".to_string(),
+                    ],
+                    input_artifacts: Vec::new(),
+                    output_artifacts: vec!["topology_evidence".to_string()],
+                    behavior: vec![crate::team::RoleBehaviorFacet::ReacquireEvidence {
+                        required: true,
+                    }],
+                },
+                ModelProposedRole {
+                    role_id: "concurrency_semantics_auditor".to_string(),
+                    display_name: Some("并发语义审计员".to_string()),
+                    team: None,
+                    responsibility: "审计并发语义".to_string(),
+                    agent_definition_ref: None,
+                    grant_ceiling: vec![ModelGrantCapability::Read],
+                    fixed_count: Some(1),
+                    min_count: None,
+                    max_count: None,
+                    acceptance: vec![
+                        "summary".to_string(),
+                        "evidence".to_string(),
+                        "evidence_scope:read:crates/runtime/src/team/template_candidate.rs"
+                            .to_string(),
+                    ],
+                    input_artifacts: Vec::new(),
+                    output_artifacts: vec!["summary".to_string(), "evidence".to_string()],
+                    behavior: vec![crate::team::RoleBehaviorFacet::TerminalCandidate {
+                        required: true,
+                    }],
+                },
+            ],
+            dependencies: None,
+            result_fields: vec!["summary".to_string(), "evidence".to_string()],
+            evidence_required: true,
+            instructions: "只读审计并交叉核对证据。".to_string(),
+        };
+        let input = ModelCollaborationControlDecision {
+            decision_id: "runtime-audit".to_string(),
+            intent: "审计运行时".to_string(),
+            workstreams: vec![ModelCollaborationWorkstream {
+                workstream_id: "runtime-audit-team".to_string(),
+                objective: "由两个角色共同审计运行时".to_string(),
+                depends_on: Vec::new(),
+                focuses: Vec::new(),
+                template: Some(template),
+                output_artifacts: vec!["audit".to_string()],
+                evidence_contract: vec!["summary".to_string(), "evidence".to_string()],
+                managed_agent_escalation: ManagedAgentEscalationRequirement::None,
+            }],
+            reason: "用户明确要求自定义角色".to_string(),
+        };
+
+        let orchestration = input.into_runtime_orchestration_input();
+        let proposal = orchestration.proposal.expect("derived proposal");
+        assert_eq!(
+            proposal.nodes.len(),
+            1,
+            "one custom Team remains one workstream"
+        );
+        let template = orchestration
+            .template_proposal
+            .expect("custom template retained");
+        assert_eq!(template["roles"].as_array().map(Vec::len), Some(2));
+        assert_eq!(template["roles"][0]["display_name"], "故障拓扑侦察员");
+        assert_eq!(template["roles"][1]["display_name"], "并发语义审计员");
+        assert_eq!(
+            proposal.nodes[0].evidence_contract,
+            vec![
+                "evidence".to_string(),
+                "evidence_scope:read:crates/runtime/src/orchestration/mod.rs".to_string(),
+                "evidence_scope:read:crates/runtime/src/team/template_candidate.rs".to_string(),
+                "summary".to_string(),
+            ],
+            "role-owned typed evidence scopes must become the parent Team lease without promoting arbitrary role acceptance"
+        );
+    }
+
+    #[test]
     fn model_template_proposal_accepts_pairs_groups_and_group_arrays() {
         let base = |dependencies: serde_json::Value| {
             serde_json::json!({
@@ -589,7 +830,8 @@ mod tests {
                     "responsibility": "分析供应链约束",
                     "agent_definition_ref": "builtin/cowd/explore@1",
                     "grant_ceiling": ["read", "search"],
-                    "acceptance": ["findings", "evidence"]
+                    "acceptance": ["findings", "evidence"],
+                    "behavior": [{"kind": "reacquire_evidence", "required": true}]
                 }],
                 "dependencies": dependencies,
                 "result_fields": ["summary", "evidence"],

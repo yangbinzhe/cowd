@@ -3,7 +3,10 @@
 //! Callers may request collaboration and suggest a published template, but
 //! only Runtime derives filesystem, network, and session evidence leases.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use harness_contract::orchestration::ManagedAgentEscalationRequirement;
 use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
@@ -142,6 +145,17 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
             profile
         })
         .collect::<Vec<_>>();
+    // Ephemeral snapshots deliberately have no catalog selector on their
+    // semantic node. Their immutable role topology is nevertheless already
+    // known here, so they must follow the same no-builtin-focus branch as a
+    // workspace/user custom template. Otherwise this authority pass injects
+    // legacy `researcher`/`synthesizer` plans before the compiler sees the
+    // snapshot's user-defined role ids.
+    let ephemeral_team_nodes = request
+        .ephemeral_team_templates
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let mut profile_positions = BTreeMap::<TeamAuthorityProfile, usize>::new();
     let mut scopes = Vec::new();
     for (index, node) in proposal.nodes.iter_mut().enumerate() {
@@ -171,20 +185,34 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
             // Runtime lease. Dropping it makes every multi-role custom
             // template indistinguishable from an empty-role proposal at the
             // later template compiler.
-            let custom_template =
-                template.starts_with("workspace/") || template.starts_with("user/");
+            let custom_template = ephemeral_team_nodes.contains(&node.node_id)
+                || template.starts_with("workspace/")
+                || template.starts_with("user/");
             // Do not manufacture a minimum number of role slots.  Template
             // cardinality and the AI-authored semantic plan decide topology;
             // this authority layer only partitions the already granted scope.
             let focus_count = requested_count.max(profile_count);
             if custom_template {
-                let custom_scopes = bounded_workspace_focus_scopes(
-                    workspace_root,
-                    &request.intent,
-                    focus_count,
-                    node_requires_write,
-                    explicit_team,
-                );
+                // The narrow collaboration transport deliberately has no
+                // physical `resource_scopes` field.  Its semantic
+                // `evidence_contract` is the model-facing place to name
+                // bounded sources.  Honor only typed evidence_scope entries;
+                // if they are absent, retain the existing intent-derived
+                // fallback.  This keeps arbitrary Teams flexible while
+                // preventing a broad authorization lease from becoming an
+                // unverifiable `read:.` acceptance obligation.
+                let declared_scopes = declared_evidence_scopes(&node.evidence_contract);
+                let custom_scopes = if declared_scopes.is_empty() {
+                    bounded_workspace_focus_scopes(
+                        workspace_root,
+                        &request.intent,
+                        focus_count,
+                        node_requires_write,
+                        explicit_team,
+                    )
+                } else {
+                    declared_scopes
+                };
                 tracing::debug!(
                     node = %node.node_id,
                     template,
@@ -346,6 +374,22 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
         .extend(scopes.into_iter().map(|scope| format!("resource:{scope}")));
     request.capabilities.sort();
     request.capabilities.dedup();
+}
+
+fn declared_evidence_scopes(evidence_contract: &[String]) -> Vec<String> {
+    let mut scopes = evidence_contract
+        .iter()
+        .filter_map(|criterion| criterion.trim().strip_prefix("evidence_scope:"))
+        .map(str::trim)
+        .filter(|scope| {
+            (scope.starts_with("read:") && !matches!(*scope, "read:." | "read:./"))
+                || *scope == "network:*"
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 fn bind_declared_focus_authority(
@@ -1576,6 +1620,22 @@ mod tests {
         assert_eq!(
             writer.evidence_contract,
             &["implementation", "source_verification", "evidence", "risks"]
+        );
+    }
+
+    #[test]
+    fn custom_team_preserves_declared_bounded_evidence_scopes() {
+        assert_eq!(
+            declared_evidence_scopes(&[
+                "evidence".to_string(),
+                "evidence_scope:read:crates/runtime/src/orchestration/mod.rs".to_string(),
+                "evidence_scope:read:.".to_string(),
+                "evidence_scope:network:*".to_string(),
+            ]),
+            vec![
+                "network:*".to_string(),
+                "read:crates/runtime/src/orchestration/mod.rs".to_string(),
+            ]
         );
     }
 

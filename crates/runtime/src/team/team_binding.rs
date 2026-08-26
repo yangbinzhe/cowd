@@ -517,6 +517,7 @@ mod tests {
                 task_contract: harness_contract::team::TeamRoleTaskContract {
                     contract_ref: "task/implementer@1".to_string(),
                     acceptance: vec!["evidence".to_string()],
+                    dataflow: Default::default(),
                 },
             }],
             dependencies: Vec::new(),

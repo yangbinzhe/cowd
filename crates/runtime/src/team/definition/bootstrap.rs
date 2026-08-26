@@ -156,6 +156,7 @@ where
                         "implementation".to_string(),
                         "source_verification".to_string(),
                     ],
+                    dataflow: Default::default(),
                 },
             },
             TeamRoleDefinition {
@@ -183,6 +184,7 @@ where
                         "evidence".to_string(),
                         "risks".to_string(),
                     ],
+                    dataflow: Default::default(),
                 },
             },
         ],
@@ -349,6 +351,7 @@ fn additional_builtin_team_manifests(
                     .iter()
                     .map(|value| (*value).to_string())
                     .collect(),
+                dataflow: Default::default(),
             },
         };
     let role = |role_id: &str,
@@ -385,7 +388,11 @@ fn additional_builtin_team_manifests(
             TeamTemplateManifest {
                 api_version: "cowd.team/v1".to_string(),
                 template_id,
-                revision: 2,
+                // V704 release changed executable role behavior. Revisions are
+                // immutable, and installations can already contain v2, so
+                // this must be a new release revision rather than a mutable
+                // overwrite during Gateway startup.
+                revision: 3,
                 name: name.to_string(),
                 display: Some(TeamTemplateDisplay {
                     team_display_name: Some(builtin_team_display_name(name).to_string()),
@@ -421,7 +428,7 @@ fn additional_builtin_team_manifests(
         ))
     };
 
-    let mut templates = vec![
+    let templates = vec![
         template(
             "cowd/direct-executor",
             "Direct Executor",
@@ -605,19 +612,6 @@ fn additional_builtin_team_manifests(
             "# Long-Running Workstreams\n\nRun durable workstreams with bounded checkpoints and a coordinating synthesis.\n",
         )?,
     ];
-    // Role aliases belong to the immutable template revision rather than the
-    // orchestration prompt. They preserve the template's canonical topology
-    // while accepting common semantic labels a model may use for a durable
-    // workstream. The instantiated receipt records every alias repair.
-    if let Some((manifest, _)) = templates.iter_mut().find(|(manifest, _)| {
-        manifest.template_id.as_str() == "builtin/cowd/long-running-workstreams"
-    }) {
-        manifest.role_aliases = std::collections::BTreeMap::from([
-            ("researcher".to_string(), "workstream".to_string()),
-            ("worker".to_string(), "workstream".to_string()),
-            ("synthesizer".to_string(), "coordinator".to_string()),
-        ]);
-    }
     Ok(templates)
 }
 
@@ -632,28 +626,6 @@ fn revision_key(revision_ref: &TeamTemplateRevisionRef) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn long_running_workstreams_declares_durable_semantic_role_aliases() {
-        let execute = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/execute").unwrap();
-        let direct = AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/direct").unwrap();
-        let templates = additional_builtin_team_manifests(&execute, &direct).unwrap();
-        let manifest = templates
-            .iter()
-            .map(|(manifest, _)| manifest)
-            .find(|manifest| {
-                manifest.template_id.as_str() == "builtin/cowd/long-running-workstreams"
-            })
-            .expect("long-running workstreams template");
-        assert_eq!(
-            manifest.role_aliases.get("researcher"),
-            Some(&"workstream".to_string())
-        );
-        assert_eq!(
-            manifest.role_aliases.get("synthesizer"),
-            Some(&"coordinator".to_string())
-        );
-    }
 
     #[test]
     fn external_research_template_binds_network_capability_to_explore_v2() {
@@ -700,6 +672,7 @@ mod tests {
             task_contract: TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/implementer@1".to_string(),
                 acceptance: vec!["implementation".to_string(), "evidence".to_string()],
+                dataflow: Default::default(),
             },
         };
         let english = role("Implement the bounded change and provide verification evidence.");

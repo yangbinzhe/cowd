@@ -2014,7 +2014,7 @@ impl ScopedRuntimeToolExecutor {
                 ))
             })?
             .unwrap_or(crate::execution_core::graph::ToolEffectState::Fresh);
-        let (outcome, fresh_execution) = match effect_state {
+        let (mut outcome, fresh_execution) = match effect_state {
             crate::execution_core::graph::ToolEffectState::Completed(mut outcome) => {
                 outcome.tool_use_id.clone_from(&request.tool_use_id);
                 outcome.tool_name.clone_from(&request.tool_name);
@@ -2035,6 +2035,31 @@ impl ScopedRuntimeToolExecutor {
                 (self.host.execute_runtime_tool(&request).await, true)
             }
         };
+        // Delegated ToolHost adapters must return typed observations together
+        // with a successful receipt. Some compatibility adapters currently
+        // return only the bounded raw output, which leaves a completed exact
+        // read impossible to satisfy at the Agent terminal. The executor
+        // already owns the immutable requested path, actual successful
+        // output, and canonical path resolver, so it can construct the same
+        // Runtime-attested observation before the durable receipt is written.
+        // This bridge is intentionally limited to successful read effects
+        // with no adapter-supplied observations; writes and failed tools are
+        // never inferred from text.
+        if outcome.status == RuntimeToolExecutionStatus::Executed
+            && outcome.observed_evidence.is_empty()
+            && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read
+        {
+            for path in &requested.paths {
+                if let Ok(observed) = self.path_identity_resolver.observe_tool_scope(
+                    tool_name,
+                    &format!("read:{path}"),
+                    outcome.output.as_deref(),
+                    sequence,
+                ) {
+                    outcome.observed_evidence.push(observed);
+                }
+            }
+        }
         if fresh_execution {
             if let Some(commit_service) = &self.commit_service {
                 let committed =
@@ -2048,6 +2073,43 @@ impl ScopedRuntimeToolExecutor {
                     return Err(ToolError::new(format!(
                         "tool `{tool_name}` completed but durable receipt commit failed: {error}"
                     )));
+                }
+            }
+        }
+        // The delegated read receipt is now committed (or was recovered from
+        // that committed receipt). Bind any typed observation to that durable
+        // Runtime event before the Agent terminal consumes it. Gateway may
+        // initially expose the observation with an unavailable raw-artifact
+        // selector because transcript compaction happens later; the effect
+        // receipt itself is already durable and is the correct provenance
+        // carrier for acceptance.
+        if outcome.status == RuntimeToolExecutionStatus::Executed
+            && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read
+            && self.commit_service.is_some()
+            && !outcome.observed_evidence.is_empty()
+        {
+            let output = outcome.output.as_deref().unwrap_or_default();
+            let access = harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::context::EvidenceRef::observed(
+                    "delegated_agent_read_receipt",
+                    format!("{}:read-receipt", request.idempotency_key),
+                ),
+                format!("sha256:{:x}", Sha256::digest(output.as_bytes())),
+                u64::try_from(output.len().max(1)).unwrap_or(u64::MAX),
+                "application/vnd.cowd.tool-receipt+json",
+                format!(
+                    "event://execution-effect/{}/{}:read-receipt",
+                    request.idempotency_key, request.idempotency_key
+                ),
+                format!("session:{}", self.session_id),
+            );
+            for observed in &mut outcome.observed_evidence {
+                if observed
+                    .evidence_ref
+                    .as_ref()
+                    .is_none_or(|current| !current.is_durable())
+                {
+                    observed.evidence_ref = Some(access.clone());
                 }
             }
         }
@@ -4766,6 +4828,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].paths, ["crates/runtime/src/lib.rs"]);
+        assert!(
+            !receipts[0].observed_evidence.is_empty(),
+            "a successful delegated read with only raw adapter output must gain a typed Runtime observation"
+        );
     }
 
     #[tokio::test]

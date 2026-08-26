@@ -117,6 +117,8 @@ impl RuntimeOrchestrationResult {
             .pointer("/projection/terminal_presentation")
             .cloned();
         let team_terminals = execution.get("team_terminals").cloned();
+        let collaboration_program = execution.get("collaboration_program").cloned();
+        let collaboration_diagnostics = execution.get("collaboration_diagnostics").cloned();
         json!({
             "schema_version": 1,
             "receipt_id": format!("runtime-orchestration-receipt:{}", self.request_id),
@@ -173,6 +175,8 @@ impl RuntimeOrchestrationResult {
             "delivery_envelope": delivery_envelope,
             "terminal_presentation": terminal_presentation,
             "team_terminals": team_terminals,
+            "collaboration_program": collaboration_program,
+            "collaboration_diagnostics": collaboration_diagnostics,
             "next_model_guidance": self.next_model_guidance,
         })
     }
@@ -280,5 +284,42 @@ mod tests {
 
         assert_eq!(receipt["team_terminals"][0]["team_id"], "team-a");
         assert!(receipt["execution"].get("team_terminals").is_none());
+    }
+
+    #[test]
+    fn model_receipt_preserves_program_owned_failure_diagnostic() {
+        let outcome = result(json!({
+            "type": "execution_graph_run",
+            "status": "failed",
+            "collaboration_program": {
+                "program_id": "program-a",
+                "lifecycle": "failed",
+                "completed_required_instance_ids": []
+            },
+            "collaboration_diagnostics": [{
+                "code": "team_execution_not_completed",
+                "program_id": "program-a",
+                "team_instance_id": "audit:1",
+                "semantic_node_id": "audit",
+                "execution_node_id": "graph-audit",
+                "node_status": "failed",
+                "failure_kind": "provider_timeout",
+                "failure_message": "provider deadline elapsed",
+                "retryable": true,
+                "evidence_refs": [],
+                "next_action": "inspect_collaboration_terminal_diagnostic"
+            }]
+        }));
+
+        let receipt = outcome.model_receipt();
+
+        assert_eq!(receipt["collaboration_program"]["lifecycle"], "failed");
+        assert_eq!(
+            receipt["collaboration_diagnostics"][0]["failure_kind"],
+            "provider_timeout"
+        );
+        assert!(receipt["execution"]
+            .get("collaboration_diagnostics")
+            .is_none());
     }
 }

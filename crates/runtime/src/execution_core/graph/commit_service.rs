@@ -4222,6 +4222,7 @@ mod tests {
                     state: TeamAdmissionState::Admitted,
                     child_graph_ref: Some("team-graph:research".to_string()),
                     reason_kind: None,
+                    terminal: None,
                     reservation: TeamAdmissionResourceReservation {
                         context_reservation_tokens: 100,
                         output_reservation_tokens: 50,
@@ -4273,6 +4274,7 @@ mod tests {
                     state: TeamAdmissionState::Admitting,
                     child_graph_ref: None,
                     reason_kind: None,
+                    terminal: None,
                     reservation: TeamAdmissionResourceReservation {
                         context_reservation_tokens: 70,
                         output_reservation_tokens: 30,
@@ -4660,6 +4662,7 @@ mod tests {
                         state: harness_contract::execution_graph::TeamAdmissionState::Admitting,
                         child_graph_ref: None,
                         reason_kind: None,
+                        terminal: None,
                         reservation:
                             harness_contract::execution_graph::TeamAdmissionResourceReservation {
                                 context_reservation_tokens: 30,
@@ -4674,6 +4677,7 @@ mod tests {
                         state: harness_contract::execution_graph::TeamAdmissionState::Admitting,
                         child_graph_ref: None,
                         reason_kind: None,
+                        terminal: None,
                         reservation:
                             harness_contract::execution_graph::TeamAdmissionResourceReservation {
                                 context_reservation_tokens: 10,

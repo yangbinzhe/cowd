@@ -242,6 +242,12 @@ pub struct TeamAdmissionObligation {
     pub child_graph_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_kind: Option<String>,
+    /// Durable terminal truth for this exact Team instance. Admission state
+    /// answers whether Runtime could create the child graph; this field
+    /// answers how that admitted graph actually ended. Keeping both prevents
+    /// a failed child from collapsing into an opaque missing parent node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TeamExecutionTerminal>,
     /// Exact technical capacity attributed to this immutable Team binding.
     /// Keeping the contribution per obligation lets a topology replacement
     /// release only the retired workstream instead of guessing from a shared
@@ -249,6 +255,51 @@ pub struct TeamAdmissionObligation {
     #[serde(default)]
     pub reservation: TeamAdmissionResourceReservation,
     pub revision: u64,
+}
+
+/// Compact, durable terminal diagnostic for one Team obligation. Detailed
+/// role receipts remain in the child graph/evidence store addressed by
+/// `child_graph_ref`; this carrier gives parent recovery and Surface a stable
+/// failure class without reparsing model tool text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TeamExecutionTerminal {
+    pub node_status: ExecutionNodeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+    pub finished_at_ms: u64,
+}
+
+/// Surface-safe explanation of a Program obligation that did not reach a
+/// satisfied terminal.  This is derived solely from the durable Program and
+/// root graph: it intentionally carries no model text, mutable UI state, or
+/// child prompt payload.  Consumers can render this object directly instead
+/// of reducing a failed Team to an opaque physical-node identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CollaborationDiagnostic {
+    pub code: String,
+    pub program_id: String,
+    pub team_instance_id: String,
+    pub semantic_node_id: String,
+    pub execution_node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_graph_ref: Option<String>,
+    pub node_status: ExecutionNodeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_message: Option<String>,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub evidence_refs: Vec<EvidenceAccessRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1745,6 +1796,7 @@ mod dependency_policy_tests {
                     state: TeamAdmissionState::Admitted,
                     child_graph_ref: Some("execution-graph:child".to_string()),
                     reason_kind: None,
+                    terminal: None,
                     reservation: TeamAdmissionResourceReservation {
                         context_reservation_tokens: 4_000,
                         output_reservation_tokens: 1_000,

@@ -46,6 +46,11 @@ pub struct TaskUnderstanding {
     pub requires_external_facts: bool,
     #[serde(default)]
     pub requires_tool_evidence: bool,
+    /// Explicit bounded workspace evidence targets extracted from the user
+    /// request. They are an immutable admission constraint for a root
+    /// collaboration decision, not model-authored planning advice.
+    #[serde(default)]
+    pub required_workspace_evidence_scopes: Vec<String>,
     pub requests_parallelism: bool,
     pub requests_multi_agent: bool,
     /// Explicit number of independently executed Team entities requested by
@@ -2403,6 +2408,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     let requires_external_facts = requires_external_facts(&normalized) && !tool_use_forbidden;
     let requires_tool_evidence =
         contains_any(&normalized, TOOL_EVIDENCE_TERMS) && !tool_use_forbidden;
+    let required_workspace_evidence_scopes = explicit_workspace_evidence_scopes(&input.prompt);
     let requests_parallelism = contains_any(&normalized, PARALLEL_TERMS);
     // A request may mention teams solely to prohibit them. Treating every
     // occurrence of "team" as an affirmative collaboration request turns a
@@ -2466,6 +2472,7 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
         requires_write,
         requires_external_facts,
         requires_tool_evidence,
+        required_workspace_evidence_scopes,
         requests_parallelism,
         requests_multi_agent,
         required_team_count,
@@ -2484,6 +2491,32 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
             requests_multi_agent,
         ),
     }
+}
+
+/// Extract portable, bounded file targets that the user named explicitly.
+/// The extractor intentionally carries only relative workspace paths and
+/// performs no repository choice or authorization. Runtime still resolves
+/// each scope through `WorkspacePathIdentityResolver` at admission.
+fn explicit_workspace_evidence_scopes(prompt: &str) -> Vec<String> {
+    let mut scopes = prompt
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '/' | '_' | '-' | '.'))
+        })
+        .map(str::trim)
+        .filter(|candidate| {
+            candidate.contains('/')
+                && !candidate.starts_with('/')
+                && !candidate.starts_with("../")
+                && !candidate.contains("/../")
+                && candidate
+                    .rsplit_once('/')
+                    .is_some_and(|(_, name)| name.contains('.'))
+        })
+        .map(|candidate| format!("read:{candidate}"))
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 fn explicitly_forbids_collaboration(normalized: &str) -> bool {
@@ -3234,7 +3267,9 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
                         .iter()
                         .any(|pattern| cardinal_normalized.contains(pattern))
                     })
-                });
+                })
+                || qualified_chinese_team_phrase(&cardinal_normalized, chinese)
+                || qualified_chinese_team_phrase(&cardinal_normalized, &arabic);
         if chinese_match || english_match || qualified_english_team_match {
             requested = requested.max(*count);
             break;
@@ -3425,6 +3460,33 @@ fn counted_role_phrase(normalized: &str, count: &str, role: &str, english: bool)
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
         compact.is_empty() || compact.starts_with('个') || compact.starts_with('名')
+    })
+}
+
+/// Recognize an explicit Chinese Team count when the user places a short,
+/// meaningful qualifier between the counter and an English `Team`, such as
+/// `三个回合级自定义 Team workstream` or `3 个 turn-scoped custom Team`.
+/// The previous fixed qualifier list
+/// silently downgraded that request to a planner preference, so a two-Team
+/// strategy lease could incorrectly reject the user's three-Team topology.
+fn qualified_chinese_team_phrase(normalized: &str, count: &str) -> bool {
+    normalized.match_indices(count).any(|(offset, _)| {
+        let tail = &normalized[offset + count.len()..];
+        ["team", "teams"].iter().any(|role| {
+            let Some(role_offset) = tail.find(role) else {
+                return false;
+            };
+            let qualifier = &tail[..role_offset];
+            let compact = qualifier
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            compact.starts_with('个')
+                && compact.chars().count() <= 48
+                && !qualifier.chars().any(|character| {
+                    matches!(character, '，' | '。' | '；' | '：' | '、' | '！' | '？')
+                })
+        })
     })
 }
 
@@ -3675,6 +3737,14 @@ mod tests {
         assert_eq!(explicit_team_count("start three research teams"), 3);
         assert_eq!(explicit_team_count("请使用恰好3个Team完成真实任务"), 3);
         assert_eq!(
+            understand(&StrategyInput::from_prompt(
+                "恰好 3 个 turn-scoped custom Team workstream，全部真实执行"
+            ))
+            .required_team_count,
+            3,
+            "Arabic Team counts must survive common turn-scoped/custom qualifiers"
+        );
+        assert_eq!(
             explicit_team_count("初始 Program 合同**恰好只有两个** required Team obligation"),
             2,
             "an explicit required-Team contract must preserve its cardinality"
@@ -3687,6 +3757,11 @@ mod tests {
             2
         );
         assert_eq!(explicit_team_count("启动三个 Team 并行核查"), 3);
+        assert_eq!(
+            explicit_team_count("建立恰好三个回合级自定义 Team workstream，名称、角色和顺序不得改变"),
+            3,
+            "a user may qualify a requested Team with turn-scoped/custom wording without losing cardinality"
+        );
         assert_eq!(
             explicit_team_count("必须实际启动三个协作 Team，Team A、B、C 分工汇合"),
             3
@@ -5098,5 +5173,19 @@ mod tests {
         assert!(is_sha256(
             &store.negative_benefit_observations[0].report_sha256
         ));
+    }
+
+    #[test]
+    fn explicit_workspace_sources_become_root_evidence_constraints() {
+        let understanding = understand(&StrategyInput::from_prompt(
+            "只读检查 crates/runtime/src/orchestration/mod.rs 和 crates/runtime/src/team/template_candidate.rs，不修改文件",
+        ));
+        assert_eq!(
+            understanding.required_workspace_evidence_scopes,
+            vec![
+                "read:crates/runtime/src/orchestration/mod.rs".to_string(),
+                "read:crates/runtime/src/team/template_candidate.rs".to_string(),
+            ]
+        );
     }
 }

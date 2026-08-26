@@ -10,6 +10,7 @@ pub enum AgentResultValidationError {
     MissingEvidence,
     MissingToolExecution,
     UnsatisfiedAcceptance,
+    UpstreamOnlyOutcomeRequestsTool,
 }
 
 impl std::fmt::Display for AgentResultValidationError {
@@ -29,6 +30,9 @@ impl std::fmt::Display for AgentResultValidationError {
             }
             Self::UnsatisfiedAcceptance => {
                 "completed agent return has a non-satisfied Runtime acceptance verdict"
+            }
+            Self::UpstreamOnlyOutcomeRequestsTool => {
+                "upstream-only Team result simulated or requested a forbidden tool invocation"
             }
         };
         formatter.write_str(message)
@@ -57,6 +61,20 @@ pub fn validate_agent_return(
     }
     if returned.status == AgentTerminalStatus::Completed && returned.outcome.trim().is_empty() {
         return Err(AgentResultValidationError::MissingOutcome);
+    }
+    // An upstream-only role has no reacquisition lease by construction. Its
+    // conclusion must be based on Runtime-attached evidence, not on a
+    // model-written pseudo tool call that cannot be authorized, executed, or
+    // audited. This is deliberately keyed by the typed task constraint, not
+    // a role name, template id, or display label.
+    if returned.status == AgentTerminalStatus::Completed
+        && task
+            .constraints
+            .iter()
+            .any(|constraint| constraint == "upstream_evidence_only:no_tool_reacquisition")
+        && upstream_only_outcome_requests_tool(&returned.outcome)
+    {
+        return Err(AgentResultValidationError::UpstreamOnlyOutcomeRequestsTool);
     }
     if returned.status == AgentTerminalStatus::Completed {
         let evaluation = returned
@@ -139,6 +157,28 @@ pub fn validate_agent_return(
         }
     }
     Ok(())
+}
+
+fn upstream_only_outcome_requests_tool(outcome: &str) -> bool {
+    let compact = outcome
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let simulated_runtime_tools = [
+        "runtime_capabilities",
+        "tool_search",
+        "context_retrieve",
+        "evidence_retrieve",
+        "runtime_orchestrate",
+        "submit_collaboration_decision",
+        "request_collaboration_escalation",
+    ];
+    simulated_runtime_tools.iter().any(|tool| {
+        compact.contains(&format!(r#""name":"{tool}""#))
+            || compact.contains(&format!("<tool_call>{tool}"))
+            || compact.contains(&format!("<function_call>{tool}"))
+    })
 }
 
 #[must_use]
@@ -375,6 +415,37 @@ mod tests {
         assert_eq!(
             validate_agent_return(&task, &returned),
             Err(AgentResultValidationError::MissingEvidence)
+        );
+    }
+
+    #[test]
+    fn upstream_only_synthesis_rejects_simulated_runtime_tool_payloads() {
+        let mut task = team_task();
+        task.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+            criterion: "evidence".to_string(),
+            check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
+        }];
+        task.constraints = vec!["upstream_evidence_only:no_tool_reacquisition".to_string()];
+        let upstream = EvidenceAccessRef::durable(
+            EvidenceRef::observed("tool", "upstream"),
+            "d".repeat(64),
+            1,
+            "text/plain",
+            "artifact://art_result_validator_3",
+            "session:session",
+        );
+        task.evidence_refs = vec![upstream.clone()];
+        let mut returned = team_return(&task);
+        returned.tool_calls = 0;
+        returned.evidence_refs = vec![upstream];
+        returned.outcome = r#"```json
+        { "name": "runtime_capabilities", "arguments": {} }
+        ```"#
+            .to_string();
+
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::UpstreamOnlyOutcomeRequestsTool)
         );
     }
 

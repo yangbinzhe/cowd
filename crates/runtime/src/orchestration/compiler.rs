@@ -198,7 +198,7 @@ pub(crate) fn collaboration_program_from_proposal(
                         to,
                         kind: CollaborationEdgeKind::Handoff,
                         input_contract: CrossTeamInputContract {
-                            required_artifact_kinds: producer.output_artifacts.clone(),
+                            required_artifact_kinds: team_handoff_artifact_kinds(producer),
                             required_fact_kinds: vec![
                                 TerminalFactKind::ObservedEvidence,
                                 TerminalFactKind::AcceptanceVerdict,
@@ -265,6 +265,19 @@ pub(crate) fn collaboration_program_from_proposal(
         return Ok(Some(program.clone()));
     }
     Ok(Some(derived))
+}
+
+/// A Team's model-facing `output_artifacts` are semantic deliverable labels,
+/// not evidence-ref types authored by a model.  The canonical materialized
+/// Team output is its Runtime-owned terminal synthesis.  Translate any
+/// declared Team deliverable into that durable handoff fact rather than
+/// requiring an impossible evidence ref whose type happens to equal the
+/// model's arbitrary label.
+fn team_handoff_artifact_kinds(producer: &GraphSemanticNode) -> Vec<String> {
+    (!producer.output_artifacts.is_empty())
+        .then(|| "terminal_synthesis".to_string())
+        .into_iter()
+        .collect()
 }
 
 pub(crate) fn estimate_work_graph(
@@ -576,7 +589,7 @@ fn default_cross_team_dependency(
 fn compile_team_subgraph_node(
     request_id: &str,
     request: &RuntimeOrchestrationCommand,
-    plan: &RuntimeOrchestrationPlan,
+    _plan: &RuntimeOrchestrationPlan,
     semantic: &GraphSemanticNode,
     instance_index: usize,
     graph_id: &str,
@@ -585,27 +598,35 @@ fn compile_team_subgraph_node(
     team_runtime: &TeamRuntime,
     repairs: &mut Vec<String>,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
-    let template_path = semantic
-        .template
-        .as_deref()
-        .unwrap_or_else(|| plan.collaboration_decision.template_id.template_path())
-        .to_string();
-    // The catalog's `template_id` is an executable Team contract. Preserve
-    // the model-selected catalog entry exactly: replacing one valid template
-    // with a strategy default silently changes its legal role ids and makes a
-    // typed proposal fail for reasons the model cannot observe. Runtime still
-    // validates the selected immutable revision and every capability/policy
-    // boundary below; it simply must not rewrite the Team's semantics here.
-    let (template_id, catalog_selector) =
-        parse_model_team_template_reference(template_path.trim())?;
-    let template_selector = request
+    // A custom snapshot is the executable contract. Do not even parse the
+    // strategy recommendation in this branch: doing so makes an unrelated
+    // builtin template a hidden prerequisite and reintroduces silent fallback.
+    let (template_id, template_selector) = if let Some(snapshot) = request
         .ephemeral_team_templates
         .get(&semantic.node_id)
         .cloned()
-        .map(|snapshot| TeamTemplateSelector::Ephemeral {
-            snapshot: Box::new(snapshot),
-        })
-        .unwrap_or(catalog_selector);
+    {
+        let template_id = snapshot.revision.revision_ref.template_id.clone();
+        (
+            template_id,
+            TeamTemplateSelector::Ephemeral {
+                snapshot: Box::new(snapshot),
+            },
+        )
+    } else {
+        let template_path = semantic.template.as_deref().ok_or_else(|| {
+            OrchestrationCompileError::InvalidProposal(format!(
+                "team_template_required:{}:supply a turn-scoped template_proposal for a user-defined Team or an explicitly selected catalog template",
+                semantic.node_id
+            ))
+        })?;
+        // The catalog's `template_id` is an executable Team contract. Preserve
+        // the model-selected catalog entry exactly: replacing one valid template
+        // with a strategy default silently changes its legal role ids and makes a
+        // typed proposal fail for reasons the model cannot observe.
+        let (template_id, selector) = parse_model_team_template_reference(template_path.trim())?;
+        (template_id, selector)
+    };
     let team_id = format!(
         "runtime-team:{}:{}:{}",
         request_id, semantic.node_id, instance_index
@@ -736,7 +757,7 @@ fn compile_team_subgraph_node(
     node.idempotency_key = format!("{}:{}", request_id, node_id);
     node.resource_scopes = semantic.resource_scopes.clone();
     node.acceptance.criteria = semantic.evidence_contract.clone();
-    node.acceptance.required_evidence = semantic.output_artifacts.clone();
+    node.acceptance.required_evidence = team_handoff_artifact_kinds(semantic);
     Ok(node)
 }
 
@@ -1469,7 +1490,7 @@ mod tests {
                 harness_contract::orchestration::ManagedAgentEscalationRequirement::None,
             template: None,
             target_session_id: None,
-            output_artifacts: vec!["terminal_synthesis".to_string()],
+            output_artifacts: vec![format!("{id}_handoff")],
             evidence_contract: Vec::new(),
             required_evidence_refs: Vec::new(),
             resource_scopes: vec!["read:src".to_string()],

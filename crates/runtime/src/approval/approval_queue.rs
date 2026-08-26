@@ -853,7 +853,6 @@ impl ApprovalQueue {
             return Ok(receipt);
         }
         if request.timeout_policy == ApprovalTimeoutPolicy::AutoApproveOnce
-            && request.risk == harness_contract::core::TaskRisk::Low
             && !request.context.explicit_ask
         {
             let approval_id = request.approval_id.clone();
@@ -862,12 +861,12 @@ impl ApprovalQueue {
                 approval_id,
                 approved: true,
                 skip: false,
-                reason: "known low-risk approval wait timed out; approved once by policy"
+                reason: "approval veto window elapsed; approved once by the scoped timeout policy"
                     .to_string(),
                 scope: ApprovalGrantScope::Once,
                 actor: ApprovalDecisionActor {
                     kind: ApprovalDecisionActorKind::TimeoutPolicy,
-                    actor_id: "low-risk-timeout-policy".to_string(),
+                    actor_id: "scoped-timeout-policy".to_string(),
                 },
                 evidence_refs: vec!["approval.timeout.auto_approve_once".to_string()],
             });

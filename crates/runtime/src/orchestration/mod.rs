@@ -36,6 +36,10 @@ use serde_json::{json, Value};
 
 const MAX_REVISION_CAS_ATTEMPTS: usize = 3;
 const EPHEMERAL_TEMPLATE_TTL_MS: u64 = 60 * 60 * 1000;
+/// A user-directed custom Team may be vetoed, but confirmation must not turn
+/// into an indefinite scheduler barrier. The queue records the window and
+/// automatically grants this one invocation only when it expires.
+const ORCHESTRATION_VETO_WINDOW_MS: u64 = 5_000;
 
 pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
@@ -469,11 +473,9 @@ async fn submit_runtime_orchestration_request_with_mode(
             );
         }
     }
-    let trust_all_session = session_is_trust_all(services, request.session_id.as_deref());
-    let requires_orchestration_approval =
-        request.constraints.risk.as_deref() == Some("critical") || trust_all_session;
+    let requires_orchestration_approval = request.constraints.risk.as_deref() == Some("critical");
     if requires_orchestration_approval && request.constraints.approval_id.is_none() {
-        if let Err(error) = submit_approval(&mut request, services) {
+        if let Err(error) = submit_approval(&mut request, services).await {
             return unavailable_result(&request, format!("approval_submission_failed:{error}"));
         }
     }
@@ -642,9 +644,12 @@ fn rejected_explicit_team_cardinality_result(
     result_without_runtime(request, decision)
 }
 
-/// Materialize the narrow model-facing custom-Team path.  Model JSON provides
-/// only semantic topology and template content; Runtime alone creates the
-/// immutable snapshot and binds it to the authenticated session/turn lineage.
+/// Materialize model-authored custom Teams. Model JSON provides only semantic
+/// topology and template content; Runtime alone creates immutable snapshots
+/// and binds them to the authenticated session/turn lineage. A single Team
+/// continues to use the direct `template_proposal` object. Multiple Teams use
+/// `{ "teams": [{ "node_id": "…", "template": { … } }] }`; the node id is
+/// an admission-time binding, never a catalog selector.
 fn materialize_ephemeral_team_template(
     request: &mut RuntimeOrchestrationCommand,
     services: &RuntimeServices,
@@ -675,12 +680,7 @@ fn materialize_ephemeral_team_template(
         .iter()
         .filter(|node| node.recipe == CapabilityRecipeId::Team)
         .collect::<Vec<_>>();
-    let [team_node] = team_nodes.as_slice() else {
-        return Err("ephemeral_template_requires_exactly_one_team_node".to_string());
-    };
-    if team_node.template.is_some() {
-        return Err("ephemeral_template_rejects_catalog_template_selector".to_string());
-    }
+    let proposals = bind_ephemeral_template_proposals(template_proposal, &team_nodes)?;
     let policy_ref = request
         .session_id
         .as_deref()
@@ -690,18 +690,84 @@ fn materialize_ephemeral_team_template(
                 .map(|policy| format!("session:{session_id}:policy:{}", policy.revision))
         })
         .unwrap_or_else(|| format!("session:{}:unversioned", lineage.session_id));
-    let snapshot = compile_ephemeral_team_template_snapshot(
-        template_proposal,
-        lineage,
-        request.constraints.permission_ceiling,
-        policy_ref,
-        crate::tool_invocation::now_ms().saturating_add(EPHEMERAL_TEMPLATE_TTL_MS),
-        services,
-    )?;
-    request
-        .ephemeral_team_templates
-        .insert(team_node.node_id.clone(), snapshot);
+    for (team_node, template_proposal) in proposals {
+        if team_node.template.is_some() {
+            return Err(format!(
+                "ephemeral_template_rejects_catalog_template_selector:{}",
+                team_node.node_id
+            ));
+        }
+        let snapshot = compile_ephemeral_team_template_snapshot(
+            template_proposal,
+            lineage,
+            request.constraints.permission_ceiling,
+            policy_ref.clone(),
+            crate::tool_invocation::now_ms().saturating_add(EPHEMERAL_TEMPLATE_TTL_MS),
+            services,
+        )?;
+        request
+            .ephemeral_team_templates
+            .insert(team_node.node_id.clone(), snapshot);
+    }
     Ok(())
+}
+
+fn bind_ephemeral_template_proposals<'a>(
+    proposal: Value,
+    team_nodes: &[&'a GraphSemanticNode],
+) -> Result<Vec<(&'a GraphSemanticNode, Value)>, String> {
+    if team_nodes.is_empty() {
+        return Err("ephemeral_template_requires_at_least_one_team_node".to_string());
+    }
+    let Some(entries) = proposal.get("teams").and_then(Value::as_array) else {
+        let [team_node] = team_nodes else {
+            return Err("ephemeral_template_requires_named_team_bindings".to_string());
+        };
+        return Ok(vec![(team_node, proposal)]);
+    };
+    if entries.is_empty() {
+        return Err("ephemeral_template_teams_is_empty".to_string());
+    }
+    if entries.len() != team_nodes.len() {
+        return Err(format!(
+            "ephemeral_template_team_count_mismatch:teams={}:templates={}",
+            team_nodes.len(),
+            entries.len()
+        ));
+    }
+    let known = team_nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), *node))
+        .collect::<BTreeMap<_, _>>();
+    let mut bound = Vec::with_capacity(entries.len());
+    let mut seen = BTreeSet::new();
+    for entry in entries {
+        let node_id = entry
+            .get("node_id")
+            .and_then(Value::as_str)
+            .filter(|node_id| !node_id.trim().is_empty())
+            .ok_or_else(|| "ephemeral_template_team_binding_missing_node_id".to_string())?;
+        if !seen.insert(node_id) {
+            return Err(format!(
+                "ephemeral_template_duplicate_team_binding:{node_id}"
+            ));
+        }
+        let team_node = known
+            .get(node_id)
+            .copied()
+            .ok_or_else(|| format!("ephemeral_template_unknown_team_node:{node_id}"))?;
+        let template = entry
+            .get("template")
+            .cloned()
+            .ok_or_else(|| format!("ephemeral_template_binding_missing_template:{node_id}"))?;
+        if !template.is_object() {
+            return Err(format!(
+                "ephemeral_template_binding_template_not_object:{node_id}"
+            ));
+        }
+        bound.push((team_node, template));
+    }
+    Ok(bound)
 }
 
 fn rejected_ephemeral_template_result(
@@ -1639,6 +1705,16 @@ fn completed_projection(
     let mut completion_findings = completion_findings(&projection);
     let team_assessment = assess_team_subgraphs(&projection, services);
     completion_findings.extend(team_assessment.findings.iter().cloned());
+    let (collaboration_program, collaboration_diagnostics) =
+        collaboration_program_projection(&projection);
+    completion_findings.extend(collaboration_diagnostics.iter().map(|diagnostic| {
+        format!(
+            "collaboration_terminal_diagnostic:{}:{}",
+            diagnostic.team_instance_id, diagnostic.code
+        )
+    }));
+    completion_findings.sort();
+    completion_findings.dedup();
     let status = if graph_status(&projection) == "completed" && !completion_findings.is_empty() {
         "blocked"
     } else {
@@ -1660,6 +1736,8 @@ fn completed_projection(
             "terminal_result_ref": terminal_result_ref,
             "team_subgraphs": team_assessment.teams,
             "team_terminals": team_assessment.team_terminals,
+            "collaboration_program": collaboration_program,
+            "collaboration_diagnostics": collaboration_diagnostics,
             "completion_findings": completion_findings,
         }),
         evidence: json!({
@@ -1694,6 +1772,141 @@ fn completed_projection(
                 .to_string()
         },
     })
+}
+
+/// Render the sole durable collaboration terminal into the bounded operation
+/// projection.  The conversation host and Surface consume this carrier; they
+/// must not reconstruct success from a tool transcript or infer a failure
+/// from a physical node id.  Child graph details remain behind their governed
+/// evidence references.
+fn collaboration_program_projection(
+    projection: &ExecutionGraphProjection,
+) -> (
+    Option<Value>,
+    Vec<harness_contract::execution_graph::CollaborationDiagnostic>,
+) {
+    use harness_contract::execution_graph::{
+        CollaborationDiagnostic, TeamAdmissionState, TeamExecutionTerminal,
+    };
+
+    let Some(program) = projection
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+    else {
+        return (None, Vec::new());
+    };
+
+    let mut completed_required_instance_ids = Vec::new();
+    let mut diagnostics = Vec::new();
+    for (instance_index, instance) in program.team_instances.iter().enumerate() {
+        let same_semantic_index = program.team_instances[..instance_index]
+            .iter()
+            .filter(|candidate| candidate.semantic_node_id == instance.semantic_node_id)
+            .count();
+        let execution_node_id = program
+            .semantic_node_instances
+            .get(&instance.semantic_node_id)
+            .and_then(|nodes| nodes.get(same_semantic_index))
+            .cloned()
+            .unwrap_or_else(|| format!("unmapped:{}", instance.instance_id));
+        let node = projection
+            .nodes
+            .iter()
+            .find(|node| node.node_id == execution_node_id);
+        let obligation = program
+            .control
+            .obligations
+            .iter()
+            .find(|obligation| obligation.instance_id == instance.instance_id);
+        let terminal: Option<&TeamExecutionTerminal> =
+            obligation.and_then(|item| item.terminal.as_ref());
+        let node_status = terminal
+            .map(|terminal| terminal.node_status)
+            .or_else(|| node.map(|node| node.status))
+            .unwrap_or(ExecutionNodeStatus::Planned);
+        let admitted = obligation.is_some_and(|item| item.state == TeamAdmissionState::Admitted);
+        if instance.required && admitted && node_status == ExecutionNodeStatus::Completed {
+            completed_required_instance_ids.push(instance.instance_id.clone());
+            continue;
+        }
+        // A running Program is not a failure card.  Emit a diagnostic only
+        // after the Program/node/admission obligation itself is terminal;
+        // otherwise the Surface would turn ordinary progress into a false
+        // error and tempt the parent model to re-plan prematurely.
+        if !program.control.lifecycle.is_terminal()
+            && !node_status.is_terminal()
+            && !obligation.is_some_and(|item| item.state.is_terminal())
+        {
+            continue;
+        }
+
+        let failure = terminal
+            .and_then(|terminal| {
+                terminal
+                    .failure_kind
+                    .clone()
+                    .zip(terminal.failure_message.clone())
+            })
+            .or_else(|| {
+                node.and_then(|node| {
+                    node.failure
+                        .as_ref()
+                        .map(|failure| (failure.kind.clone(), failure.message.clone()))
+                })
+            });
+        let (failure_kind, failure_message) = failure
+            .map(|(kind, message)| (Some(kind), Some(message)))
+            .unwrap_or_else(|| {
+                let reason = obligation
+                    .and_then(|item| item.reason_kind.clone())
+                    .unwrap_or_else(|| format!("team_node_{node_status:?}").to_ascii_lowercase());
+                (
+                    Some(reason),
+                    Some(format!(
+                        "Team instance `{}` did not reach a completed terminal (status: {node_status:?})",
+                        instance.instance_id
+                    )),
+                )
+            });
+        diagnostics.push(CollaborationDiagnostic {
+            code: if admitted {
+                "team_execution_not_completed".to_string()
+            } else {
+                "team_admission_not_completed".to_string()
+            },
+            program_id: program.program_id.clone(),
+            team_instance_id: instance.instance_id.clone(),
+            semantic_node_id: instance.semantic_node_id.clone(),
+            execution_node_id,
+            child_graph_ref: obligation.and_then(|item| item.child_graph_ref.clone()),
+            node_status,
+            failure_kind,
+            failure_message,
+            retryable: terminal.is_some_and(|terminal| terminal.retryable)
+                || node
+                    .and_then(|node| node.failure.as_ref())
+                    .is_some_and(|failure| failure.retryable),
+            evidence_refs: terminal
+                .map(|terminal| terminal.evidence_refs.clone())
+                .or_else(|| node.map(|node| node.evidence_refs.clone()))
+                .unwrap_or_default(),
+            next_action: program.control.next_action.clone(),
+        });
+    }
+    completed_required_instance_ids.sort();
+    let result = json!({
+        "program_id": program.program_id,
+        "revision": program.revision,
+        "lifecycle": program.control.lifecycle,
+        "blocker_ref": program.control.blocker_ref,
+        "next_action": program.control.next_action,
+        "required_team_count": program.required_team_count,
+        "completed_required_instance_ids": completed_required_instance_ids,
+        "terminal_diagnostics": diagnostics,
+        "obligations": program.control.obligations,
+    });
+    (Some(result), diagnostics)
 }
 
 #[derive(Debug, Default)]
@@ -1938,6 +2151,7 @@ fn completion_findings(projection: &ExecutionGraphProjection) -> Vec<String> {
     let Some(metadata) = projection.orchestration.as_ref() else {
         return Vec::new();
     };
+    let (_, collaboration_diagnostics) = collaboration_program_projection(projection);
     let mut findings = Vec::new();
     for required in &metadata.completion.required_node_ids {
         if projection
@@ -1946,7 +2160,17 @@ fn completion_findings(projection: &ExecutionGraphProjection) -> Vec<String> {
             .find(|node| node.node_id == *required)
             .is_none_or(|node| node.status != ExecutionNodeStatus::Completed)
         {
-            findings.push(format!("required_node_not_completed:{required}"));
+            if let Some(diagnostic) = collaboration_diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.execution_node_id == *required)
+            {
+                findings.push(format!(
+                    "collaboration_terminal_diagnostic:{}:{}",
+                    diagnostic.team_instance_id, diagnostic.code
+                ));
+            } else {
+                findings.push(format!("required_node_not_completed:{required}"));
+            }
         }
     }
     for artifact in &metadata.completion.required_artifact_kinds {
@@ -2045,7 +2269,7 @@ fn bind_strategy(
     }
 }
 
-fn submit_approval(
+async fn submit_approval(
     request: &mut RuntimeOrchestrationCommand,
     services: &RuntimeServices,
 ) -> Result<(), String> {
@@ -2070,7 +2294,19 @@ fn submit_approval(
         application: None,
     };
     let action = format!("runtime_orchestrate:{}", request.operation.as_str());
-    services.approval_queue().submit_scoped(
+    let user_directed_custom_team = request.template_proposal.is_some()
+        && request.proposal.as_ref().is_some_and(|proposal| {
+            proposal
+                .nodes
+                .iter()
+                .any(|node| node.recipe == CapabilityRecipeId::Team)
+        });
+    let timeout_policy = user_directed_custom_team
+        .then_some(ApprovalTimeoutPolicy::AutoApproveOnce)
+        .unwrap_or(ApprovalTimeoutPolicy::Pending);
+    let expires_at_ms = user_directed_custom_team
+        .then(|| crate::tool_invocation::now_ms().saturating_add(ORCHESTRATION_VETO_WINDOW_MS));
+    services.approval_queue().submit_scoped_with_deadline(
         approval_id.clone(),
         SubmitGlobalApprovalRequest {
             context: services.bind_session_policy_to_approval_context(
@@ -2092,8 +2328,9 @@ fn submit_approval(
             domain: harness_contract::policy::ApprovalDomain::Execution,
             blocks_execution: true,
             evidence_refs: request.evidence_refs.iter().take(64).cloned().collect(),
-            timeout_policy: ApprovalTimeoutPolicy::Pending,
+            timeout_policy,
         },
+        expires_at_ms,
     )?;
     // The global approval router is the single authority. Autonomous and YOLO
     // auto-approve with an audit trail; lower levels queue for humans.
@@ -2157,6 +2394,30 @@ fn submit_approval(
                     format!("approval.router:{decision:?}"),
                 ],
             })?;
+    } else if user_directed_custom_team
+        && decision == crate::approval_router::ApprovalDecision::Human
+    {
+        // A confirmation profile reserves a real veto interval: an external
+        // UI decision may approve/deny while this bounded wait polls the one
+        // durable queue record. On expiry the queue produces a scoped
+        // timeout-policy grant, so an explicit Team request cannot stall
+        // merely because the user did not answer.
+        let deadline =
+            crate::tool_invocation::now_ms().saturating_add(ORCHESTRATION_VETO_WINDOW_MS);
+        loop {
+            let status = services
+                .approval_queue()
+                .get(&approval_id)
+                .map(|approval| approval.status);
+            if !matches!(status, Some(crate::GlobalApprovalStatus::Pending)) {
+                break;
+            }
+            if crate::tool_invocation::now_ms() >= deadline {
+                services.approval_queue().timeout(&approval_id)?;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
     request.constraints.approval_id = Some(approval_id);
     Ok(())
@@ -2201,6 +2462,7 @@ fn request_id(request: &RuntimeOrchestrationCommand) -> String {
     )
 }
 
+#[cfg(test)]
 fn session_is_trust_all(services: &RuntimeServices, session_id: Option<&str>) -> bool {
     let trust_all = session_id.is_some_and(|session_id| {
         services
@@ -2700,6 +2962,286 @@ mod tests {
     }
 
     #[test]
+    fn root_control_decision_materializes_one_multirole_custom_team_snapshot() {
+        use harness_contract::orchestration::{
+            ModelCollaborationControlDecision, ModelCollaborationWorkstream, ModelGrantCapability,
+            ModelProposedRole, ModelTemplateProposal,
+        };
+
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
+        let decision = ModelCollaborationControlDecision {
+            decision_id: "runtime-audit".to_string(),
+            intent: "审计运行时的用户消息到工具结果回写链路".to_string(),
+            workstreams: vec![ModelCollaborationWorkstream {
+                workstream_id: "runtime-audit-team".to_string(),
+                objective: "一个三角色团队完成链路审计与证据仲裁".to_string(),
+                depends_on: Vec::new(),
+                focuses: Vec::new(),
+                template: Some(ModelTemplateProposal {
+                    template_id: "cowd/turn-runtime-audit".to_string(),
+                    name: "运行时协同审计".to_string(),
+                    team_display_name: Some("运行时协同审计".to_string()),
+                    role_display_names: Vec::new(),
+                    roles: vec![
+                        ModelProposedRole {
+                            role_id: "fault_topology_scout".to_string(),
+                            display_name: Some("故障拓扑侦察员".to_string()),
+                            team: None,
+                            responsibility: "定位调用链中的边界和故障传播".to_string(),
+                            agent_definition_ref: None,
+                            grant_ceiling: vec![ModelGrantCapability::Read],
+                            fixed_count: Some(1),
+                            min_count: None,
+                            max_count: None,
+                            acceptance: vec!["summary".to_string(), "evidence".to_string()],
+                            input_artifacts: Vec::new(),
+                            output_artifacts: vec!["topology_evidence".to_string()],
+                            behavior: vec![
+                                harness_contract::team::RoleBehaviorFacet::ReacquireEvidence {
+                                    required: true,
+                                },
+                            ],
+                        },
+                        ModelProposedRole {
+                            role_id: "concurrency_semantics_auditor".to_string(),
+                            display_name: Some("并发语义审计员".to_string()),
+                            team: None,
+                            responsibility: "验证队列、等待和回写语义".to_string(),
+                            agent_definition_ref: None,
+                            grant_ceiling: vec![ModelGrantCapability::Read],
+                            fixed_count: Some(1),
+                            min_count: None,
+                            max_count: None,
+                            acceptance: vec!["summary".to_string(), "evidence".to_string()],
+                            input_artifacts: Vec::new(),
+                            output_artifacts: vec!["concurrency_evidence".to_string()],
+                            behavior: vec![
+                                harness_contract::team::RoleBehaviorFacet::Verification {
+                                    mode: "independent".to_string(),
+                                },
+                            ],
+                        },
+                        ModelProposedRole {
+                            role_id: "evidence_summary_arbiter".to_string(),
+                            display_name: Some("证据汇总仲裁员".to_string()),
+                            team: None,
+                            responsibility: "交叉核对两个角色的证据并综合结论".to_string(),
+                            agent_definition_ref: None,
+                            grant_ceiling: vec![ModelGrantCapability::Read],
+                            fixed_count: Some(1),
+                            min_count: None,
+                            max_count: None,
+                            acceptance: vec!["summary".to_string(), "evidence".to_string()],
+                            input_artifacts: vec![
+                                "topology_evidence".to_string(),
+                                "concurrency_evidence".to_string(),
+                            ],
+                            output_artifacts: vec!["summary".to_string(), "evidence".to_string()],
+                            behavior: vec![
+                                harness_contract::team::RoleBehaviorFacet::Reducer {
+                                    mode: "finally".to_string(),
+                                },
+                                harness_contract::team::RoleBehaviorFacet::UpstreamConsumption {
+                                    required: true,
+                                },
+                                harness_contract::team::RoleBehaviorFacet::TerminalCandidate {
+                                    required: true,
+                                },
+                            ],
+                        },
+                    ],
+                    dependencies: Some(
+                        harness_contract::orchestration::ModelTemplateDependencies::Pairs(vec![
+                            harness_contract::orchestration::ModelProposedDependency {
+                                from: "fault_topology_scout".to_string(),
+                                to: "evidence_summary_arbiter".to_string(),
+                            },
+                            harness_contract::orchestration::ModelProposedDependency {
+                                from: "concurrency_semantics_auditor".to_string(),
+                                to: "evidence_summary_arbiter".to_string(),
+                            },
+                        ]),
+                    ),
+                    result_fields: vec!["summary".to_string(), "evidence".to_string()],
+                    evidence_required: true,
+                    instructions: "先独立审计，再交叉核对，再由仲裁员汇总。".to_string(),
+                }),
+                output_artifacts: vec!["audit".to_string()],
+                evidence_contract: vec!["summary".to_string(), "evidence".to_string()],
+                managed_agent_escalation: Default::default(),
+            }],
+            reason: "用户明确要求单个自定义三角色团队".to_string(),
+        };
+        let mut request = RuntimeOrchestrationCommand::from_model(
+            decision.into_runtime_orchestration_input(),
+            RuntimeOrchestrationBinding {
+                model_lease: Some("test-model".to_string()),
+                session_id: Some("session-v621".to_string()),
+                lineage: Some(harness_contract::execution_graph::ExecutionGraphLineage {
+                    session_id: "session-v621".to_string(),
+                    turn_id: "turn-v621".to_string(),
+                    root_task_id: "task-root-v621".to_string(),
+                    task_id: "task-root-v621".to_string(),
+                    generation: 1,
+                }),
+                mission_id: Some("mission-v621".to_string()),
+                selection_mode: Some(harness_contract::team::TeamSelectionMode::Explicit),
+                strategy_binding: None,
+                capabilities: Vec::new(),
+                surface: Some("test".to_string()),
+                permission_ceiling: PermissionMode::ReadOnly,
+            },
+        );
+
+        materialize_ephemeral_team_template(&mut request, &services)
+            .expect("root decision materializes the custom Team snapshot");
+        let snapshot = request
+            .ephemeral_team_templates
+            .get("runtime-audit-team")
+            .expect("one workstream owns one snapshot");
+        assert_eq!(request.ephemeral_team_templates.len(), 1);
+        assert_eq!(snapshot.role_ids.len(), 3);
+        assert_eq!(
+            snapshot
+                .revision
+                .manifest
+                .display
+                .as_ref()
+                .and_then(|display| display.team_display_name.as_deref()),
+            Some("运行时协同审计")
+        );
+        assert_eq!(
+            snapshot.revision.manifest.roles[0].display_name.as_deref(),
+            Some("故障拓扑侦察员")
+        );
+        assert_eq!(
+            snapshot.revision.manifest.roles[2].display_name.as_deref(),
+            Some("证据汇总仲裁员")
+        );
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        let team = &request.proposal.as_ref().expect("proposal").nodes[0];
+        assert!(
+            team.focuses.is_empty(),
+            "an ephemeral custom Team must not receive builtin researcher/synthesizer focuses"
+        );
+        assert!(
+            team.resource_scopes
+                .iter()
+                .any(|scope| scope == "session:session-v621"),
+            "custom Team still receives its Runtime-owned Session evidence lease"
+        );
+    }
+
+    #[test]
+    fn multiple_custom_teams_preserve_named_bindings_without_catalog_fallback() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        ensure_test_mission(&services);
+        let mut business = node("business-team", CapabilityRecipeId::Team, Vec::new());
+        business.objective = "assess the business constraints".to_string();
+        let mut technical = node("technical-team", CapabilityRecipeId::Team, Vec::new());
+        technical.objective = "assess the technical constraints".to_string();
+        let mut request = proposal(vec![business, technical]);
+        request.template_proposal = Some(json!({
+            "teams": [
+                {
+                    "node_id": "business-team",
+                    "template": {
+                        "template_id": "cowd/turn-business-team",
+                        "name": "Business team",
+                        "team_display_name": "业务团队",
+                        "roles": [{
+                            "role_id": "signal_cartographer",
+                            "display_name": "信号制图师",
+                            "responsibility": "identify business constraints from authorized evidence",
+                            "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                            "grant_ceiling": ["read"],
+                            "fixed_count": 1,
+                            "acceptance": ["summary", "evidence"],
+                            "behavior": [{"kind": "reacquire_evidence", "required": true}]
+                        }],
+                        "result_fields": ["summary", "evidence"],
+                        "evidence_required": true,
+                        "instructions": "# 业务团队\n\n仅依据已授权证据。"
+                    }
+                },
+                {
+                    "node_id": "technical-team",
+                    "template": {
+                        "template_id": "cowd/turn-technical-team",
+                        "name": "Technical team",
+                        "team_display_name": "技术团队",
+                        "roles": [{
+                            "role_id": "constraint_weaver",
+                            "display_name": "约束编织者",
+                            "responsibility": "assess technical feasibility from authorized evidence",
+                            "agent_definition_ref": "workspace/cowd/nonexistent@1",
+                            "grant_ceiling": ["read"],
+                            "fixed_count": 1,
+                            "acceptance": ["summary", "evidence"],
+                            "behavior": [{"kind": "verification", "mode": "independent"}]
+                        }],
+                        "result_fields": ["summary", "evidence"],
+                        "evidence_required": true,
+                        "instructions": "# 技术团队\n\n仅依据已授权证据。"
+                    }
+                }
+            ]
+        }));
+
+        materialize_ephemeral_team_template(&mut request, &services)
+            .expect("multiple custom teams materialize");
+        assert!(request.template_proposal.is_none());
+        assert_eq!(request.ephemeral_team_templates.len(), 2);
+        assert_eq!(
+            request.ephemeral_team_templates["business-team"]
+                .revision
+                .manifest
+                .display
+                .as_ref()
+                .and_then(|display| display.team_display_name.as_deref()),
+            Some("业务团队")
+        );
+        assert_eq!(
+            request.ephemeral_team_templates["technical-team"]
+                .revision
+                .manifest
+                .roles[0]
+                .display_name
+                .as_deref(),
+            Some("约束编织者")
+        );
+
+        team_authority::bind_semantic_resource_authority(
+            &mut request,
+            None,
+            services.workspace_root(),
+        );
+        ensure_test_team_resource(&mut request);
+        let plan = planner::plan_runtime_orchestration(&request);
+        let compiled = compiler::compile_orchestration(
+            "multiple-turn-scoped-custom-teams",
+            &request,
+            &plan,
+            None,
+            Some(services.team_runtime().as_ref()),
+        )
+        .expect("custom snapshots compile without a builtin template selector");
+        for node in &compiled.graph.nodes {
+            let child_request: harness_contract::team::TeamInstantiationRequest =
+                serde_json::from_str(&node.payload_ref).expect("typed Team child request");
+            assert!(matches!(
+                child_request.template_selector,
+                harness_contract::team::TeamTemplateSelector::Ephemeral { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn semantic_contract_rejects_physical_executor_injection() {
         let parsed = serde_json::from_value::<RuntimeOrchestrationCommand>(json!({
             "intent": "inject executor",
@@ -3177,6 +3719,111 @@ mod tests {
         assert_eq!(findings, vec!["unresolved_conflict_rejected"]);
     }
 
+    #[test]
+    fn failed_team_requirement_projects_a_typed_program_diagnostic() {
+        use harness_contract::execution_graph::{
+            CollaborationProgram, CollaborationProgramControlState, CollaborationProgramLifecycle,
+            CollaborationTeamInstance, ExecutionFailure, ExecutionNodeResult, ExecutionNodeSpec,
+            ExecutionOrchestrationMetadata, TeamAdmissionObligation, TeamAdmissionState,
+            TeamExecutionTerminal,
+        };
+
+        let mut graph = ExecutionGraph::new("typed-team-terminal");
+        let mut node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::Subgraph,
+            compiler::TEAM_SUBGRAPH_EXECUTOR,
+            "{}",
+        );
+        node.id = "team-node".to_string();
+        node.idempotency_key = "team-node".to_string();
+        graph.nodes.push(node);
+        graph
+            .node_statuses
+            .insert("team-node".to_string(), ExecutionNodeStatus::Failed);
+        graph.node_results.insert(
+            "team-node".to_string(),
+            ExecutionNodeResult {
+                status: ExecutionNodeStatus::Failed,
+                result_ref: None,
+                summary: None,
+                evidence_refs: Vec::new(),
+                failure: Some(ExecutionFailure {
+                    kind: "provider_timeout".to_string(),
+                    message: "provider deadline elapsed".to_string(),
+                    retryable: true,
+                    evidence_refs: Vec::new(),
+                }),
+                usage: Default::default(),
+                finished_at_ms: 7,
+            },
+        );
+        graph.orchestration = Some(ExecutionOrchestrationMetadata {
+            mutation_id: "typed-team-terminal".to_string(),
+            applied_mutation_ids: Vec::new(),
+            collaboration_escalations: Vec::new(),
+            semantic_revision: 1,
+            source_generation: 1,
+            completion: ExecutionCompletionContract {
+                required_node_ids: vec!["team-node".to_string()],
+                required_artifact_kinds: Vec::new(),
+                allow_unresolved_conflicts: false,
+            },
+            collaboration_program: Some(CollaborationProgram {
+                program_id: "program-terminal".to_string(),
+                revision: 1,
+                required_team_count: 1,
+                team_instances: vec![CollaborationTeamInstance {
+                    instance_id: "audit:1".to_string(),
+                    semantic_node_id: "audit".to_string(),
+                    required: true,
+                }],
+                edges: Vec::new(),
+                semantic_node_instances: BTreeMap::from([(
+                    "audit".to_string(),
+                    vec!["team-node".to_string()],
+                )]),
+                control: CollaborationProgramControlState {
+                    lifecycle: CollaborationProgramLifecycle::Failed,
+                    obligations: vec![TeamAdmissionObligation {
+                        instance_id: "audit:1".to_string(),
+                        binding_ref: "team-binding:sha256:test".to_string(),
+                        state: TeamAdmissionState::Admitted,
+                        child_graph_ref: Some("team-graph:audit".to_string()),
+                        reason_kind: None,
+                        terminal: Some(TeamExecutionTerminal {
+                            node_status: ExecutionNodeStatus::Failed,
+                            failure_kind: Some("provider_timeout".to_string()),
+                            failure_message: Some("provider deadline elapsed".to_string()),
+                            retryable: true,
+                            evidence_refs: Vec::new(),
+                            finished_at_ms: 7,
+                        }),
+                        reservation: Default::default(),
+                        revision: 1,
+                    }],
+                    ..Default::default()
+                },
+            }),
+        });
+
+        let projection = harness_contract::execution_graph::project_execution_graph(&graph);
+        let findings = completion_findings(&projection);
+        assert_eq!(
+            findings,
+            vec!["collaboration_terminal_diagnostic:audit:1:team_execution_not_completed"]
+        );
+        assert!(!findings
+            .iter()
+            .any(|finding| finding.starts_with("required_node_not_completed:")));
+        let (_, diagnostics) = collaboration_program_projection(&projection);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].failure_kind.as_deref(),
+            Some("provider_timeout")
+        );
+        assert!(diagnostics[0].retryable);
+    }
+
     #[tokio::test]
     async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         let services = RuntimeServices::in_memory().expect("runtime services");
@@ -3606,7 +4253,7 @@ mod tests {
         );
         ensure_test_team_resource(&mut request);
         let plan = planner::plan_runtime_orchestration(&request);
-        let mut graph = services
+        let graph = services
             .compile_graph_agent_intents(
                 compiler::compile_orchestration(
                     "startup-program-wait",
@@ -3619,11 +4266,10 @@ mod tests {
                 .graph,
             )
             .expect("Agent intents compile");
-        collaboration_coordinator::prepare_program_admission(
-            &mut graph,
-            services.team_runtime().as_ref(),
-        )
-        .expect("Program admission control compiles");
+        // Persist the legacy Planning-shaped Program intentionally: startup
+        // recovery must backfill its exact control state from frozen Team
+        // requests rather than making Gateway boot depend on a prior
+        // in-memory admission pass.
         let node_id = graph.nodes[0].id.clone();
         let graph = services
             .commit_service()
@@ -3667,6 +4313,7 @@ mod tests {
         let examined = collaboration_coordinator::reconcile_terminal_programs_on_startup(
             services.execution_supervisor().as_ref(),
             services.graph_state_store(),
+            services.team_runtime().as_ref(),
             16,
         )
         .await

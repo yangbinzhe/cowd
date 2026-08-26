@@ -10,7 +10,7 @@ use super::definition::{RoleCardinalityPolicy, RolePartitionPolicy};
 
 /// Typed role behavior facet. Behavior dispatch is driven by these tagged
 /// facets, never by a raw role-name string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RoleBehaviorFacet {
     Reducer { mode: String },

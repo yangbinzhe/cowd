@@ -1877,22 +1877,17 @@ fn sanitize_tool_message_pairing(messages: Vec<Value>) -> Vec<Value> {
             .iter()
             .rev()
             .find(|m| m.get("role").and_then(|v| v.as_str()) != Some("tool"));
-        // A tool message is considered paired when:
-        // (a) the nearest preceding non-tool message is an assistant message
-        //     whose `tool_calls` array contains an entry with the matching id, OR
-        // (b) there's no clear preceding context (e.g. the message comes right
-        //     after a user turn — this can happen with translated mixed-content
-        //     user messages). In case (b) we allow the message through rather
-        //     than silently dropping potentially valid history.
+        // A tool message is considered paired only when the nearest preceding
+        // non-tool message is an assistant message whose `tool_calls` array
+        // contains the matching id.  OpenAI-compatible backends reject a
+        // `role:"tool"` entry after a user/system turn just as strictly as one
+        // after a plain assistant turn, so preserving it is never safe.
         let preceding_role = preceding
             .and_then(|m| m.get("role"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        // Only apply sanitization when the preceding message is an assistant
-        // turn (the invariant is: assistant-with-tool_calls must precede tool).
-        // If the preceding is something else (user, system) don't drop — it
-        // may be a valid translation artifact or a path we don't understand.
         if preceding_role != "assistant" {
+            drop_indices.insert(i);
             continue;
         }
         let paired = preceding
@@ -4367,6 +4362,21 @@ mod tests {
         let out = sanitize_tool_message_pairing(orphaned);
         assert_eq!(out.len(), 1, "orphaned tool message must be dropped");
         assert_eq!(out[0]["role"], json!("assistant"));
+
+        // A tool result following a user turn is just as invalid. This is
+        // the shape Runtime-authored tool recovery used to leak before it
+        // began recording its synthetic assistant tool-use predecessor.
+        let orphaned_after_user = vec![
+            json!({"role": "user", "content": "continue"}),
+            json!({"role": "tool", "tool_call_id": "call_2", "content": "orphaned"}),
+        ];
+        let out = sanitize_tool_message_pairing(orphaned_after_user);
+        assert_eq!(
+            out.len(),
+            1,
+            "tool messages after user turns must be dropped"
+        );
+        assert_eq!(out[0]["role"], json!("user"));
 
         // Mismatched tool_call_id
         let mismatched = vec![

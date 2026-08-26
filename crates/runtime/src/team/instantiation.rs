@@ -322,14 +322,31 @@ impl TeamInstantiationService {
                 .behavior
                 .iter()
                 .any(|facet| matches!(facet, RoleBehaviorFacet::Reducer { .. }));
+            let terminal_candidate_role = role.behavior.iter().any(|facet| {
+                matches!(
+                    facet,
+                    RoleBehaviorFacet::TerminalCandidate { required: true }
+                )
+            });
             let requires_reacquisition = role.behavior.iter().any(|facet| {
                 matches!(
                     facet,
                     RoleBehaviorFacet::ReacquireEvidence { required: true }
                 )
             });
-            let upstream_only_reducer = reducer_only_role && !requires_reacquisition;
-            let role_allowed_tools = if upstream_only_reducer {
+            // `upstream_consumption` is a first-class behavior declaration.
+            // A custom role must not also spell a particular reducer mode to
+            // receive the Runtime-owned handoff and a zero-tool lease. An
+            // explicit reacquisition behavior keeps the normal evidence path.
+            let upstream_only_consumer = (reducer_only_role
+                || role.behavior.iter().any(|facet| {
+                    matches!(
+                        facet,
+                        RoleBehaviorFacet::UpstreamConsumption { required: true }
+                    )
+                }))
+                && !requires_reacquisition;
+            let role_allowed_tools = if upstream_only_consumer {
                 Vec::new()
             } else {
                 match evaluation_allowed_tools {
@@ -373,22 +390,54 @@ impl TeamInstantiationService {
             for (slot, focus_partition) in focuses.into_iter().enumerate() {
                 let mut slot_acceptance = role.task_contract.acceptance.clone();
                 slot_acceptance.extend(focus_partition.output_acceptance.iter().cloned());
+                // `result_fields` is the Team's declared terminal contract.
+                // A terminal-candidate role is the sole model-backed carrier
+                // for that contract in a one-role final Team, so it must be
+                // required to materialize those fields itself.  Without this
+                // lift, an upstream-only arbiter could satisfy its evidence
+                // check with attached receipts while returning empty text;
+                // the Team would look mechanically completed but leave no
+                // final report for the parent or user.
+                slot_acceptance = terminal_candidate_acceptance(
+                    slot_acceptance,
+                    &manifest.result_contract.required_fields,
+                    terminal_candidate_role,
+                );
                 slot_acceptance.sort();
                 slot_acceptance.dedup();
                 let node_id = format!("{}:{}:{}", graph.id, role.role_id, slot + 1);
                 let run_id = format!("{}:run:{}:{}", request.team_id, role.role_id, slot + 1);
                 let task_id = format!("{}:task:{}:{}", request.team_id, role.role_id, slot + 1);
-                let resource_scopes = bounded_slot_resource_scopes(
+                let node_resource_scopes = bounded_slot_resource_scopes(
                     &request.resource_scopes,
                     &focus_partition.capability_cropped_refs,
                 );
-                let instance_allowed_tools =
+                let resource_scopes =
+                    role_bounded_evidence_scopes(&slot_acceptance, &node_resource_scopes);
+                // Collaboration escalation is a Runtime-assigned exception,
+                // not a generic leaf capability.  Exposing its schema to
+                // every Team role contradicts `nested_orchestration:forbidden`:
+                // an otherwise read-only reducer can innocently ask for help
+                // and have the whole Team blocked.  Select exactly one
+                // non-reducer assignee only when the parent Program carries
+                // the typed escalation obligation; every other role receives
+                // no such native function at all.
+                let requires_managed_collaboration_escalation = request
+                    .requires_managed_collaboration_escalation
+                    && !upstream_only_consumer
+                    && !escalation_assignee_selected;
+                escalation_assignee_selected |= requires_managed_collaboration_escalation;
+                let mut instance_allowed_tools =
                     crop_tools_to_resource_lease(&role_allowed_tools, &resource_scopes);
+                if !requires_managed_collaboration_escalation {
+                    instance_allowed_tools
+                        .retain(|tool| tool != "request_collaboration_escalation");
+                }
                 let acceptance_contract = team_acceptance_contract(
                     &slot_acceptance,
                     &resource_scopes,
                     !role.task_contract.contract_ref.starts_with("builtin/"),
-                    reducer_only_role,
+                    upstream_only_consumer,
                 )?;
                 let required_acceptance = compile_required_acceptance(
                     &slot_acceptance,
@@ -398,11 +447,6 @@ impl TeamInstantiationService {
                         .permission_ceiling
                         .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
                 );
-                let requires_managed_collaboration_escalation = request
-                    .requires_managed_collaboration_escalation
-                    && !upstream_only_reducer
-                    && !escalation_assignee_selected;
-                escalation_assignee_selected |= requires_managed_collaboration_escalation;
                 let objective_context =
                     bounded_objective_context(requires_managed_collaboration_escalation);
                 let intent = AgentTaskIntent {
@@ -444,8 +488,8 @@ impl TeamInstantiationService {
                         focus_partition.evidence_responsibility,
                         focus_partition.shared_baseline.join("; "),
                         focus_partition.output_contract.join(", "),
-                        if upstream_only_reducer {
-                            "Use only the canonical upstream results attached by Runtime. No workspace or network tools are authorized; do not reacquire predecessor evidence. Your success criterion is this Team's bounded Focus only. Peer Teams are outside your visibility and authority: never claim that another Team is missing, failed, incomplete, or needs to be rerun, and never judge whether the parent objective is complete. Return only this Team's positive verified conclusion plus genuine gaps inside this Team's own upstream results.\n"
+                        if upstream_only_consumer {
+                            "Use only the canonical upstream results attached by Runtime. Those attached results are already authenticated and sufficient for this bounded synthesis: produce the requested conclusion now. No workspace, network, capability-discovery, tool-search, context-retrieval, or evidence-retrieval tool is authorized; do not request, simulate, or describe a future tool call, and do not say that you need to inspect access/capabilities/evidence before answering. Your success criterion is this Team's bounded Focus only. Peer Teams are outside your visibility and authority: never claim that another Team is missing, failed, incomplete, or needs to be rerun, and never judge whether the parent objective is complete. Return only this Team's positive verified conclusion plus genuine gaps inside this Team's own attached upstream results.\n"
                         } else {
                             ""
                         },
@@ -462,7 +506,7 @@ impl TeamInstantiationService {
                     ]
                     .into_iter()
                     .chain(
-                        upstream_only_reducer
+                        upstream_only_consumer
                             .then_some("upstream_evidence_only:no_tool_reacquisition".to_string()),
                     )
                     .chain(request.strategy_binding.iter().flat_map(|binding| {
@@ -1045,6 +1089,43 @@ fn ensure_static_graph_ceiling(
     Ok(())
 }
 
+fn terminal_candidate_acceptance(
+    mut acceptance: Vec<String>,
+    team_result_fields: &[String],
+    terminal_candidate: bool,
+) -> Vec<String> {
+    if terminal_candidate {
+        acceptance.extend(team_result_fields.iter().cloned());
+    }
+    acceptance.sort();
+    acceptance.dedup();
+    acceptance
+}
+
+/// A custom Team may declare different evidence sources for arbitrary roles.
+/// Keep the Team node's union lease for graph authority, but crop each role
+/// to its own typed `evidence_scope:` criteria when present.  This is a data
+/// contract, not a role-name heuristic: any role can declare any bounded
+/// source, and a reducer with no source declaration retains the normal
+/// upstream-only path.
+fn role_bounded_evidence_scopes(criteria: &[String], node_scopes: &[String]) -> Vec<String> {
+    let mut declared = criteria
+        .iter()
+        .filter_map(|criterion| criterion.trim().strip_prefix("evidence_scope:"))
+        .map(str::trim)
+        .filter(|scope| !matches!(*scope, "read:." | "read:./"))
+        .filter(|scope| node_scopes.iter().any(|owned| owned == *scope))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    declared.sort();
+    declared.dedup();
+    if declared.is_empty() {
+        node_scopes.to_vec()
+    } else {
+        declared
+    }
+}
+
 pub(crate) fn team_acceptance_contract(
     criteria: &[String],
     resource_scopes: &[String],
@@ -1077,34 +1158,13 @@ pub(crate) fn team_acceptance_contract(
         })
         .cloned()
         .collect::<Vec<_>>();
-    // A `session:` lease is authorization context, not verifiable evidence:
-    // no tool receipt can close a `session:` obligation, so a role that
-    // returns a terminal answer would be blocked after Focus acceptance
-    // recovery ("returned a second final answer"). Prefer the whole-workspace
-    // read alias already present in the lease: it compiles (under a
-    // full-trust ceiling) to a workspace-root ScopedContent obligation that
-    // any descendant exact read satisfies, so research roles close it with
-    // their first read_file receipt. `session:` remains only as a last-resort
-    // compile-time bound for legacy session-only fixtures.
-    let evidence_scopes = if evidence_scopes.is_empty() {
-        let workspace_read = resource_scopes
-            .iter()
-            .filter(|scope| matches!(scope.trim(), "read:." | "read:./"))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !workspace_read.is_empty() {
-            workspace_read
-        } else {
-            resource_scopes
-                .iter()
-                .filter(|scope| bounded(scope))
-                .filter(|scope| scope.starts_with("session:"))
-                .cloned()
-                .collect::<Vec<_>>()
-        }
-    } else {
-        evidence_scopes
-    };
+    // `session:` and whole-workspace leases authorize an Agent, but neither
+    // names a fact that a tool receipt can prove.  Treating either as evidence
+    // made a custom Team appear admissible and then inevitably fail Focus
+    // recovery: there is no safe deterministic read for `read:.`, and a
+    // session id is never a resource observation.  Require an explicit,
+    // bounded read/network scope at admission instead, so the model receives
+    // a repairable contract error before a Program is created.
     // A full-trust `write:.` lease is dynamic rather than an unbounded
     // acceptance claim: the canonical ToolHost receipts determine the exact
     // paths that were actually changed.  Keep it as a root write obligation
@@ -1146,6 +1206,12 @@ pub(crate) fn team_acceptance_contract(
     };
     criteria
         .iter()
+        // Read-only / no-write statements are policy constraints already
+        // enforced by the Runtime permission ceiling.  They are not facts a
+        // tool receipt can prove, so accepting them as evidence criteria made
+        // otherwise valid custom Teams fail admission merely because a model
+        // repeated the user's safety instruction in `acceptance`.
+        .filter(|criterion| !is_policy_only_acceptance_clause(criterion))
         .map(|criterion| {
             let check = match criterion.as_str() {
                 "summary" => structured(criterion, TeamStructuredOutputField::Summary),
@@ -1214,8 +1280,12 @@ pub(crate) fn team_acceptance_contract(
                             // label, but proof comes only from Runtime tool
                             // receipts. It never requires a model-invented
                             // JSON compatibility field.
-                            check: TeamAcceptanceCheck::ScopedEvidence {
-                                scopes: evidence_scopes.clone(),
+                            check: if upstream_synthesis_role {
+                                TeamAcceptanceCheck::UpstreamEvidence
+                            } else {
+                                TeamAcceptanceCheck::ScopedEvidence {
+                                    scopes: evidence_scopes.clone(),
+                                }
                             },
                         }
                     } else {
@@ -1241,6 +1311,19 @@ pub(crate) fn team_acceptance_contract(
             Ok(check)
         })
         .collect()
+}
+
+fn is_policy_only_acceptance_clause(criterion: &str) -> bool {
+    matches!(
+        criterion.trim().to_ascii_lowercase().as_str(),
+        "不得修改任何文件"
+            | "不得修改文件"
+            | "不修改任何文件"
+            | "不修改文件"
+            | "只读"
+            | "read-only"
+            | "no write"
+    )
 }
 
 fn role_binding_overrides<'a>(
@@ -1859,6 +1942,49 @@ mod acceptance_contract_tests {
     }
 
     #[test]
+    fn policy_only_read_only_clause_is_not_misclassified_as_evidence() {
+        let requirements = team_acceptance_contract(
+            &["不得修改任何文件".to_string(), "evidence".to_string()],
+            &["read:crates/runtime/src/lib.rs".to_string()],
+            true,
+            false,
+        )
+        .expect("read-only policy is enforced by the lease, evidence by the receipt");
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].criterion, "evidence");
+    }
+
+    #[test]
+    fn custom_upstream_reducer_clause_uses_upstream_evidence_without_read_scope() {
+        let requirements =
+            team_acceptance_contract(&["结论必须来自上游产物".to_string()], &[], true, true)
+                .expect("upstream reducer has no independent source-read obligation");
+        assert!(matches!(
+            requirements[0].check,
+            TeamAcceptanceCheck::UpstreamEvidence
+        ));
+    }
+
+    #[test]
+    fn custom_role_evidence_scope_crops_the_team_union_lease() {
+        let scopes = role_bounded_evidence_scopes(
+            &[
+                "evidence".to_string(),
+                "evidence_scope:read:crates/runtime/src/orchestration/mod.rs".to_string(),
+            ],
+            &[
+                "read:crates/runtime/src/orchestration/mod.rs".to_string(),
+                "read:crates/gateway/src/api_routes/session_routes.rs".to_string(),
+                "session:session-1".to_string(),
+            ],
+        );
+        assert_eq!(
+            scopes,
+            vec!["read:crates/runtime/src/orchestration/mod.rs".to_string()]
+        );
+    }
+
+    #[test]
     fn typed_acceptance_uses_exact_scopes_and_checks() {
         let contract = team_acceptance_contract(
             &[
@@ -1951,24 +2077,14 @@ mod acceptance_contract_tests {
     }
 
     #[test]
-    fn session_lease_is_authorization_context_not_verifiable_evidence() {
-        // A session-only lease keeps the legacy compile-time bound, but a
-        // whole-workspace read alias is preferred whenever it exists because
-        // it is satisfiable by real read receipts.
+    fn unbounded_leases_are_not_accepted_as_evidence_contracts() {
         let session_only = team_acceptance_contract(
             &["evidence".to_string()],
             &["session:session-1".to_string()],
             false,
             false,
-        )
-        .expect("session lease remains the legacy last-resort bound");
-        assert!(session_only.iter().any(|requirement| {
-            requirement.criterion == "evidence"
-                && requirement.check
-                    == TeamAcceptanceCheck::ScopedEvidence {
-                        scopes: vec!["session:session-1".to_string()],
-                    }
-        }));
+        );
+        assert!(session_only.is_err());
 
         let network = team_acceptance_contract(
             &["evidence".to_string()],
@@ -1989,15 +2105,8 @@ mod acceptance_contract_tests {
             &["read:.".to_string(), "session:session-1".to_string()],
             false,
             false,
-        )
-        .expect("whole-workspace read alias keeps the evidence bound satisfiable");
-        assert!(workspace_root.iter().any(|requirement| {
-            requirement.criterion == "evidence"
-                && requirement.check
-                    == TeamAcceptanceCheck::ScopedEvidence {
-                        scopes: vec!["read:.".to_string()],
-                    }
-        }));
+        );
+        assert!(workspace_root.is_err());
         assert!(team_acceptance_contract(&["evidence".to_string()], &[], false, false).is_err());
     }
 
@@ -2036,6 +2145,7 @@ mod acceptance_contract_tests {
             task_contract: harness_contract::team::TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/researcher@1".to_string(),
                 acceptance: vec!["findings".to_string(), "evidence".to_string()],
+                dataflow: Default::default(),
             },
         };
         let topology_hash = || {
@@ -2084,6 +2194,7 @@ mod acceptance_contract_tests {
             task_contract: harness_contract::team::TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/researcher@1".to_string(),
                 acceptance: vec!["evidence".to_string()],
+                dataflow: Default::default(),
             },
         };
         let plan = FocusPartitionPlan {
@@ -2158,6 +2269,26 @@ mod acceptance_contract_tests {
     }
 
     #[test]
+    fn terminal_candidate_must_materialize_declared_team_result_fields() {
+        assert_eq!(
+            terminal_candidate_acceptance(
+                vec!["evidence".to_string()],
+                &["summary".to_string(), "evidence".to_string()],
+                true,
+            ),
+            vec!["evidence".to_string(), "summary".to_string()]
+        );
+        assert_eq!(
+            terminal_candidate_acceptance(
+                vec!["evidence".to_string()],
+                &["summary".to_string()],
+                false,
+            ),
+            vec!["evidence".to_string()]
+        );
+    }
+
+    #[test]
     fn reviewer_evidence_is_scoped_to_upstream_write_paths() {
         let contract = team_acceptance_contract(
             &[
@@ -2205,6 +2336,7 @@ mod acceptance_contract_tests {
             task_contract: harness_contract::team::TeamRoleTaskContract {
                 contract_ref: "builtin/team-role/reviewer@1".to_string(),
                 acceptance: vec!["review".to_string(), "evidence".to_string()],
+                dataflow: Default::default(),
             },
         };
         let plan = FocusPartitionPlan {

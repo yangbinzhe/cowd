@@ -13,8 +13,8 @@ use harness_contract::policy::PermissionMode;
 use harness_contract::team::definition::{RoleDisplayName, TeamTemplateDisplay};
 use harness_contract::team::{
     RoleBehaviorFacet, RoleCardinalityPolicy, RolePartitionPolicy, TeamEvaluationContract,
-    TeamResultContract, TeamRoleDefinition, TeamRoleDependency, TeamRoleTaskContract,
-    TeamTemplateDefinitionId, TeamTemplateManifest, TeamTopologyContract,
+    TeamResultContract, TeamRoleDataflowContract, TeamRoleDefinition, TeamRoleDependency,
+    TeamRoleTaskContract, TeamTemplateDefinitionId, TeamTemplateManifest, TeamTopologyContract,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -59,6 +59,10 @@ pub struct ProposedRole {
     pub max_count: Option<u32>,
     #[serde(default)]
     pub acceptance: Vec<String>,
+    #[serde(default)]
+    pub input_artifacts: Vec<String>,
+    #[serde(default)]
+    pub output_artifacts: Vec<String>,
     /// Typed behavior is authored explicitly by the model/template author.
     /// The candidate compiler will never infer it from a role name, a graph
     /// edge, or an output field.
@@ -234,6 +238,16 @@ pub(crate) fn normalize_template_proposal(
         };
         value["role_display_names"] = serde_json::json!(normalized);
     }
+    // `role_id` is an execution identifier, while a user's requested role
+    // name is presentation data.  Models commonly and reasonably put a
+    // localized name in both fields.  Keep that name in `display_name`, but
+    // turn an invalid machine identifier into a deterministic opaque one so
+    // an arbitrary language does not prevent a turn-scoped Team from ever
+    // reaching the orchestrator.  This does not infer a role's behavior or
+    // change its dataflow; it only makes the contract addressable.
+    let role_id_map = normalize_role_identifiers(value, &mut notes)?;
+    rewrite_role_display_name_references(value, &role_id_map)?;
+    rewrite_dependency_role_references(value, &role_id_map);
     if let Some(fields) = value.get("result_fields").cloned() {
         let mut normalized = match fields {
             serde_json::Value::String(raw) => serde_json::json!([raw]),
@@ -266,6 +280,157 @@ pub(crate) fn normalize_template_proposal(
     }
     normalize_dependencies(value, &mut notes)?;
     Ok(notes)
+}
+
+fn valid_role_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+        })
+}
+
+fn generated_role_id(raw: &str) -> String {
+    let digest = Sha256::digest(raw.as_bytes());
+    // The prefix gives the identifier an unambiguous namespace, while the
+    // digest avoids transliteration tables, locale-specific behavior, and
+    // any dependency on a finite list of role names.
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("role-{suffix}")
+}
+
+fn normalize_role_identifiers(
+    value: &mut serde_json::Value,
+    notes: &mut Vec<String>,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let roles = value
+        .get_mut("roles")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| "normalized template_proposal is missing roles".to_string())?;
+    let mut mappings = std::collections::BTreeMap::new();
+    let mut assigned = std::collections::BTreeSet::new();
+    for role in roles {
+        let fields = role
+            .as_object_mut()
+            .ok_or_else(|| "normalized role must be an object".to_string())?;
+        let raw = fields
+            .get("role_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "every proposed role needs a non-empty role_id".to_string())?
+            .to_string();
+        let canonical = if valid_role_id(&raw) {
+            raw.clone()
+        } else {
+            let generated = generated_role_id(&raw);
+            if fields
+                .get("display_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|display| !display.is_empty())
+                .is_none()
+            {
+                fields.insert("display_name".to_string(), serde_json::json!(raw));
+            }
+            notes.push(format!(
+                "normalized non-machine role_id `{raw}` to deterministic internal id `{generated}`; preserved requested name as display_name"
+            ));
+            generated
+        };
+        if !assigned.insert(canonical.clone()) {
+            return Err(format!(
+                "duplicate role_id `{raw}` after identifier normalization"
+            ));
+        }
+        mappings.insert(raw, canonical.clone());
+        fields.insert("role_id".to_string(), serde_json::json!(canonical));
+    }
+    Ok(mappings)
+}
+
+fn rewrite_role_display_name_references(
+    value: &mut serde_json::Value,
+    mappings: &std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    let Some(displays) = value.get_mut("role_display_names") else {
+        return Ok(());
+    };
+    let Some(items) = displays.as_array_mut() else {
+        return Err("normalized role_display_names must be an array".to_string());
+    };
+    for item in items {
+        let fields = item
+            .as_object_mut()
+            .ok_or_else(|| "normalized role_display_names item must be an object".to_string())?;
+        let Some(role_id) = fields.get("role_id").and_then(serde_json::Value::as_str) else {
+            return Err("role_display_names item is missing role_id".to_string());
+        };
+        if let Some(canonical) = mappings.get(role_id) {
+            fields.insert("role_id".to_string(), serde_json::json!(canonical));
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_dependency_role_references(
+    value: &mut serde_json::Value,
+    mappings: &std::collections::BTreeMap<String, String>,
+) {
+    let Some(dependencies) = value.get_mut("dependencies") else {
+        return;
+    };
+    rewrite_role_reference_value(dependencies, mappings);
+}
+
+fn rewrite_role_reference_value(
+    value: &mut serde_json::Value,
+    mappings: &std::collections::BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::String(raw) => {
+            if let Some(canonical) = mappings.get(raw) {
+                *raw = canonical.clone();
+            } else if let Some((from, to)) = raw.split_once("->") {
+                let from = mappings
+                    .get(from.trim())
+                    .cloned()
+                    .unwrap_or_else(|| from.trim().to_string());
+                let to = mappings
+                    .get(to.trim())
+                    .cloned()
+                    .unwrap_or_else(|| to.trim().to_string());
+                *raw = format!("{from}->{to}");
+            } else if let Some((from, to)) = raw.split_once(':') {
+                let from = mappings
+                    .get(from.trim())
+                    .cloned()
+                    .unwrap_or_else(|| from.trim().to_string());
+                let to = mappings
+                    .get(to.trim())
+                    .cloned()
+                    .unwrap_or_else(|| to.trim().to_string());
+                *raw = format!("{from}:{to}");
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rewrite_role_reference_value(item, mappings);
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            let mut rewritten = serde_json::Map::new();
+            for (key, mut nested) in std::mem::take(fields) {
+                rewrite_role_reference_value(&mut nested, mappings);
+                let key = mappings.get(&key).cloned().unwrap_or(key);
+                rewritten.insert(key, nested);
+            }
+            *fields = rewritten;
+        }
+        _ => {}
+    }
 }
 
 fn json_type_name(value: &serde_json::Value) -> &'static str {
@@ -561,8 +726,120 @@ fn normalize_proposed_role(
                 ))
             }
         };
-        fields.insert("acceptance".to_string(), normalized);
+        let acceptance = normalized
+            .as_array()
+            .expect("acceptance normalization always produces an array")
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        format!("role `{role_id}` acceptance items must be non-empty strings")
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (typed, prose): (Vec<_>, Vec<_>) = acceptance
+            .into_iter()
+            .partition(|criterion| !is_freeform_acceptance_requirement(criterion));
+        if !prose.is_empty() {
+            let responsibility = fields
+                .get("responsibility")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            fields.insert(
+                "responsibility".to_string(),
+                serde_json::json!(format!(
+                    "{responsibility}\n\nModel-authored delivery intent (not a Runtime acceptance field): {}",
+                    prose.join("; ")
+                )),
+            );
+            notes.push(format!(
+                "role `{role_id}`: moved free-form acceptance prose into responsibility; only typed Runtime acceptance remains"
+            ));
+        }
+        fields.insert("acceptance".to_string(), serde_json::json!(typed));
     }
+    normalize_artifact_declarations(fields, &role_id, "input_artifacts")?;
+    normalize_artifact_declarations(fields, &role_id, "output_artifacts")?;
+    Ok(())
+}
+
+/// `acceptance` is a Runtime-verifiable mini-schema, not an unconstrained
+/// natural-language checklist. Preserve model-authored delivery intent, but
+/// move prose to `responsibility` before compilation so it cannot become an
+/// impossible evidence obligation. This is shape-based and works for every
+/// role name and language; compact unknown ASCII labels remain extensible
+/// evidence-backed criteria.
+fn is_freeform_acceptance_requirement(value: &str) -> bool {
+    const TYPED_FIELDS: &[&str] = &[
+        "summary",
+        "findings",
+        "plan",
+        "risks",
+        "unresolved",
+        "key_decisions",
+        "unresolved_or_risks",
+        "proposal",
+        "critique",
+        "checkpoint",
+        "implementation",
+        "mitigation",
+        "source_verification",
+        "review",
+        "evidence",
+    ];
+    let value = value.trim();
+    !value.starts_with("evidence_scope:")
+        && !TYPED_FIELDS.contains(&value)
+        && (value.chars().any(char::is_whitespace) || !value.is_ascii())
+}
+
+fn normalize_artifact_declarations(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    role_id: &str,
+    field: &str,
+) -> Result<(), String> {
+    let Some(raw) = fields.get(field).cloned() else {
+        return Ok(());
+    };
+    let normalized = match raw {
+        serde_json::Value::String(value) => vec![value],
+        serde_json::Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                serde_json::Value::String(value) => Ok(value),
+                other => Err(format!(
+                    "role `{role_id}` {field} items must be strings, got {}",
+                    json_type_name(&other)
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        serde_json::Value::Object(values) => values.into_iter().map(|(key, _)| key).collect(),
+        other => {
+            return Err(format!(
+                "role `{role_id}` {field} must be a string, array, or object, got {}",
+                json_type_name(&other)
+            ))
+        }
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut canonical: Vec<String> = Vec::new();
+    for artifact in normalized {
+        let artifact = artifact.trim();
+        if artifact.is_empty() {
+            return Err(format!(
+                "role `{role_id}` {field} cannot contain an empty artifact"
+            ));
+        }
+        if seen.insert(artifact.to_string()) {
+            canonical.push(artifact.to_string());
+        }
+    }
+    fields.insert(field.to_string(), serde_json::json!(canonical));
     Ok(())
 }
 
@@ -1101,6 +1378,10 @@ impl TemplateCandidateCompiler {
                     } else {
                         role.acceptance.clone()
                     },
+                    dataflow: TeamRoleDataflowContract {
+                        inputs: role.input_artifacts.clone(),
+                        outputs: role.output_artifacts.clone(),
+                    },
                 },
             });
         }
@@ -1112,6 +1393,7 @@ impl TemplateCandidateCompiler {
                 to_role_id: dependency.to.clone(),
             })
             .collect::<Vec<_>>();
+        validate_candidate_dependency_dataflow(&roles, &dependencies)?;
         let result_fields = if proposal.result_fields.is_empty() {
             vec!["summary".to_string(), "evidence".to_string()]
         } else {
@@ -1182,6 +1464,7 @@ impl TemplateCandidateCompiler {
                 "grant_ceiling": role.grant_ceiling.iter().map(|capability| format!("{capability:?}").to_ascii_lowercase()).collect::<Vec<_>>(),
                 "cardinality": format!("{:?}", role.cardinality),
                 "acceptance": role.task_contract.acceptance,
+                "dataflow": role.task_contract.dataflow,
             })).collect::<Vec<_>>(),
             "dependencies": manifest.dependencies.iter().map(|dependency| json!({
                 "from": dependency.from_role_id,
@@ -1201,6 +1484,51 @@ impl TemplateCandidateCompiler {
             preview,
         })
     }
+}
+
+/// Validate the declared producer/consumer artifact contracts for a new
+/// turn-scoped Team. This deliberately has no knowledge of role names,
+/// display labels, behavior facets, or "final" positions: every directed
+/// edge is valid only when the producer publishes an artifact the consumer
+/// explicitly requests. The manifest repeats this check so a frozen snapshot
+/// remains self-validating after restart.
+fn validate_candidate_dependency_dataflow(
+    roles: &[TeamRoleDefinition],
+    dependencies: &[TeamRoleDependency],
+) -> Result<(), String> {
+    let by_id = roles
+        .iter()
+        .map(|role| (role.role_id.as_str(), role))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for dependency in dependencies {
+        let producer = by_id.get(dependency.from_role_id.as_str()).ok_or_else(|| {
+            format!(
+                "dependency producer `{}` is undeclared",
+                dependency.from_role_id
+            )
+        })?;
+        let consumer = by_id.get(dependency.to_role_id.as_str()).ok_or_else(|| {
+            format!(
+                "dependency consumer `{}` is undeclared",
+                dependency.to_role_id
+            )
+        })?;
+        let outputs = &producer.task_contract.dataflow.outputs;
+        let inputs = &consumer.task_contract.dataflow.inputs;
+        if outputs.is_empty() || inputs.is_empty() {
+            return Err(format!(
+                "role dependency `{}` -> `{}` requires explicit producer output_artifacts and consumer input_artifacts",
+                dependency.from_role_id, dependency.to_role_id
+            ));
+        }
+        if !outputs.iter().any(|output| inputs.contains(output)) {
+            return Err(format!(
+                "role dependency `{}` -> `{}` has no matching producer output_artifacts and consumer input_artifacts",
+                dependency.from_role_id, dependency.to_role_id
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1321,6 +1649,8 @@ mod tests {
                     min_count: None,
                     max_count: None,
                     acceptance: vec!["findings".to_string(), "evidence".to_string()],
+                    input_artifacts: Vec::new(),
+                    output_artifacts: vec!["business_evidence".to_string()],
                     behavior: vec![RoleBehaviorFacet::ReacquireEvidence { required: true }],
                 },
                 ProposedRole {
@@ -1333,6 +1663,8 @@ mod tests {
                     min_count: None,
                     max_count: None,
                     acceptance: vec!["summary".to_string(), "evidence".to_string()],
+                    input_artifacts: vec!["business_evidence".to_string()],
+                    output_artifacts: vec!["summary".to_string(), "evidence".to_string()],
                     behavior: vec![
                         RoleBehaviorFacet::Reducer {
                             mode: "finally".to_string(),
@@ -1385,6 +1717,24 @@ mod tests {
             .all(|role| !role.grant_ceiling.contains(&AgentCapability::Write)));
         assert_eq!(candidate.preview["digest"], candidate.digest);
         assert!(candidate.manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_reversed_dependency_when_declared_dataflow_does_not_match() {
+        let (_temp, registry) = registry();
+        publish_agent(&registry, "cowd/explore");
+        publish_agent(&registry, "cowd/direct");
+        let mut proposal = business_tech_proposal();
+        proposal.dependencies = vec![ProposedDependency {
+            from: "cto".to_string(),
+            to: "business_expert".to_string(),
+        }];
+
+        let error =
+            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
+                .expect_err("a consumer cannot precede the producer of its declared artifact");
+        assert!(error.contains("role dependency `cto` -> `business_expert`"));
+        assert!(error.contains("producer output_artifacts"));
     }
 
     #[test]
@@ -1651,6 +2001,67 @@ mod tests {
     }
 
     #[test]
+    fn localized_role_names_become_internal_ids_without_losing_display_or_dataflow() {
+        let (_temp, registry) = registry();
+        let mut value = serde_json::json!({
+            "template_id": "cowd/localized-review",
+            "name": "本地化角色审查",
+            "team_display_name": "产品风险议会",
+            "roles": [
+                {
+                    "role_id": "接口取证员",
+                    "responsibility": "只读取证接口链路",
+                    "agent_definition_ref": "builtin/cowd/explore@1",
+                    "grant_ceiling": ["read"],
+                    "output_artifacts": ["interface_evidence"],
+                    "behavior": "evidence"
+                },
+                {
+                    "role_id": "结论裁决官",
+                    "responsibility": "综合上游证据并交付结论",
+                    "agent_definition_ref": "builtin/cowd/direct@1",
+                    "grant_ceiling": ["read"],
+                    "input_artifacts": ["interface_evidence"],
+                    "output_artifacts": ["summary", "evidence"],
+                    "behavior": "reducer, upstream, terminal"
+                }
+            ],
+            "dependencies": {"接口取证员": ["结论裁决官"]},
+            "result_fields": ["summary", "evidence"],
+            "instructions": "# 只读审查\n"
+        });
+
+        let notes = normalize_template_proposal(&mut value).expect("normalize localized ids");
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("non-machine role_id")));
+        let roles = value["roles"].as_array().expect("roles");
+        assert!(roles
+            .iter()
+            .all(|role| { role["role_id"].as_str().is_some_and(valid_role_id) }));
+        assert!(roles
+            .iter()
+            .any(|role| role["display_name"] == "接口取证员"));
+        assert!(roles
+            .iter()
+            .any(|role| role["display_name"] == "结论裁决官"));
+        let proposal: TeamTemplateProposal = serde_json::from_value(value).expect("proposal");
+        let candidate =
+            TemplateCandidateCompiler::compile(&registry, &proposal, PermissionMode::ReadOnly)
+                .expect("localized proposal compiles");
+        assert_eq!(candidate.manifest.dependencies.len(), 1);
+        assert!(candidate
+            .manifest
+            .roles
+            .iter()
+            .all(|role| role.role_id.is_ascii()));
+        assert!(candidate.manifest.roles.iter().any(|role| {
+            role.display_name.as_deref() == Some("接口取证员")
+                && role.task_contract.dataflow.outputs == ["interface_evidence"]
+        }));
+    }
+
+    #[test]
     fn normalize_template_proposal_accepts_wrapped_json_string_and_array() {
         let payload = serde_json::json!({
             "template_id": "cowd/biz-tech-dual-team-deliberation",
@@ -1731,6 +2142,43 @@ mod tests {
         let mut value = serde_json::json!(encoded);
         normalize_template_proposal(&mut value).expect("normalize raw JSON string");
         assert!(value.is_object());
+    }
+
+    #[test]
+    fn normalize_template_proposal_moves_freeform_acceptance_to_responsibility() {
+        let mut proposal = serde_json::json!({
+            "template_id": "workspace/freeform-acceptance",
+            "name": "freeform acceptance",
+            "roles": [{
+                "role_id": "arbitrary_role",
+                "responsibility": "inspect the bounded source",
+                "agent_definition_ref": "builtin/cowd/explore@1",
+                "grant_ceiling": ["read"],
+                "acceptance": [
+                    "每条信号均附可定位源码证据（路径+行号或片段）",
+                    "findings",
+                    "evidence_scope:read:crates/runtime/src/orchestration/mod.rs"
+                ],
+                "behavior": ["reacquire_evidence"]
+            }],
+            "result_fields": ["summary", "evidence"],
+            "instructions": "bounded inspection"
+        });
+
+        let notes = normalize_template_proposal(&mut proposal).expect("normalizes proposal");
+        assert_eq!(
+            proposal["roles"][0]["acceptance"],
+            serde_json::json!([
+                "findings",
+                "evidence_scope:read:crates/runtime/src/orchestration/mod.rs"
+            ])
+        );
+        assert!(proposal["roles"][0]["responsibility"]
+            .as_str()
+            .is_some_and(|value| value.contains("每条信号均附可定位源码证据")));
+        assert!(notes
+            .iter()
+            .any(|note| note.contains("moved free-form acceptance prose")));
     }
 
     #[test]
@@ -1834,6 +2282,7 @@ mod tests {
                     "grant_ceiling": "workspace-read",
                     "responsibility": "分析供应制造约束",
                     "acceptance": "findings",
+                    "output_artifacts": "business_evidence",
                     "behavior": "evidence"
                 },
                 {
@@ -1841,6 +2290,7 @@ mod tests {
                     "display_name": "CTO",
                     "grant_ceiling": "workspace-read-write",
                     "responsibility": "技术裁决",
+                    "output_artifacts": "technical_evidence",
                     "behavior": "evidence"
                 },
                 {
@@ -1849,6 +2299,8 @@ mod tests {
                     "team": "convergence",
                     "grant_ceiling": "workspace-read-write",
                     "responsibility": "汇总裁决",
+                    "input_artifacts": ["business_evidence", "technical_evidence"],
+                    "output_artifacts": ["summary", "evidence"],
                     "behavior": "reducer, upstream, terminal"
                 }
             ],

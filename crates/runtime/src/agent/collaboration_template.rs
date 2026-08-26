@@ -304,6 +304,7 @@ mod tests {
                     requires_write: false,
                     requires_external_facts: false,
                     requires_tool_evidence: true,
+                    required_workspace_evidence_scopes: Vec::new(),
                     requests_parallelism: false,
                     requests_multi_agent: false,
                     required_team_count: 0,

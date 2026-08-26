@@ -903,7 +903,12 @@ pub(crate) async fn reconcile_terminal_program_with(
         else {
             return Ok(());
         };
-        if program.control.lifecycle.is_terminal()
+        // `Planning` is the durable quarantine marker for a legacy Program
+        // whose frozen Team request cannot be reconstructed safely. It needs
+        // an explicit inspect/revise, not a terminal transition that would
+        // manufacture incomplete admission facts during startup.
+        if program.control.lifecycle == CollaborationProgramLifecycle::Planning
+            || program.control.lifecycle.is_terminal()
             || graph
                 .node_statuses
                 .values()
@@ -911,12 +916,25 @@ pub(crate) async fn reconcile_terminal_program_with(
         {
             return Ok(());
         }
-        let mut control = program.control.clone();
-        let every_required_team_completed = program.team_instances.iter().all(|instance| {
-            node_id_for_instance(program, &instance.instance_id).is_ok_and(|node_id| {
-                graph.node_statuses.get(node_id.as_str())
-                    == Some(&harness_contract::execution_graph::ExecutionNodeStatus::Completed)
+        let terminals = program
+            .team_instances
+            .iter()
+            .map(|instance| {
+                terminal_for_team_instance(&graph, program, &instance.instance_id)
+                    .map(|terminal| (instance.instance_id.clone(), terminal))
             })
+            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+        let mut control = program.control.clone();
+        for obligation in &mut control.obligations {
+            obligation.terminal = terminals.get(&obligation.instance_id).cloned();
+        }
+        let every_required_team_completed = program.team_instances.iter().all(|instance| {
+            terminals
+                .get(&instance.instance_id)
+                .is_some_and(|terminal| {
+                    terminal.node_status
+                        == harness_contract::execution_graph::ExecutionNodeStatus::Completed
+                })
         });
         control.lifecycle = if every_required_team_completed
             && control
@@ -929,8 +947,16 @@ pub(crate) async fn reconcile_terminal_program_with(
             CollaborationProgramLifecycle::Failed
         };
         control.waiting_relation = None;
-        control.blocker_ref = None;
-        control.next_action = None;
+        let failed = control.obligations.iter().find(|obligation| {
+            obligation.terminal.as_ref().is_some_and(|terminal| {
+                terminal.node_status
+                    != harness_contract::execution_graph::ExecutionNodeStatus::Completed
+            })
+        });
+        control.blocker_ref =
+            failed.map(|obligation| format!("team-instance:{}", obligation.instance_id));
+        control.next_action =
+            failed.map(|_| "inspect_collaboration_terminal_diagnostic".to_string());
         match supervisor
             .command(
                 graph_id,
@@ -951,6 +977,44 @@ pub(crate) async fn reconcile_terminal_program_with(
     Err("program_terminal_conflict_exhausted".to_string())
 }
 
+/// Derive one compact Program terminal from the graph's already durable node
+/// result. This is deliberately called only after the root graph itself is
+/// terminal, so it performs no model/provider await and no nested scheduling.
+fn terminal_for_team_instance(
+    graph: &ExecutionGraph,
+    program: &CollaborationProgram,
+    instance_id: &str,
+) -> Result<harness_contract::execution_graph::TeamExecutionTerminal, String> {
+    let node_id = node_id_for_instance(program, instance_id)?;
+    let node_status =
+        graph.node_statuses.get(&node_id).copied().ok_or_else(|| {
+            format!("program_terminal_missing_node_status:{instance_id}:{node_id}")
+        })?;
+    let result = graph.node_results.get(&node_id);
+    let failure = result.and_then(|result| result.failure.as_ref());
+    let failure_kind = failure.map(|failure| failure.kind.clone()).or_else(|| {
+        (node_status != harness_contract::execution_graph::ExecutionNodeStatus::Completed)
+            .then(|| format!("team_node_{node_status:?}").to_ascii_lowercase())
+    });
+    let failure_message = failure.map(|failure| failure.message.clone()).or_else(|| {
+        (node_status != harness_contract::execution_graph::ExecutionNodeStatus::Completed)
+            .then(|| format!("Team execution node `{node_id}` ended as {node_status:?}"))
+    });
+    Ok(harness_contract::execution_graph::TeamExecutionTerminal {
+        node_status,
+        failure_kind,
+        failure_message,
+        retryable: failure.is_some_and(|failure| failure.retryable),
+        evidence_refs: failure
+            .map(|failure| failure.evidence_refs.clone())
+            .or_else(|| result.map(|result| result.evidence_refs.clone()))
+            .unwrap_or_default(),
+        finished_at_ms: result.map_or_else(crate::tool_invocation::now_ms, |result| {
+            result.finished_at_ms
+        }),
+    })
+}
+
 /// Project durable node waiting state into the Program control plane. Only
 /// graph states are consumed here: no provider/resource-manager internals are
 /// guessed or copied into Program truth.
@@ -958,6 +1022,7 @@ pub(crate) async fn reconcile_program_wait_state_with(
     graph_id: &str,
     supervisor: &RuntimeExecutionSupervisor,
     graphs: &ExecutionGraphStateStore,
+    teams: &TeamRuntime,
 ) -> Result<(), String> {
     for _ in 0..MAX_CAS_ATTEMPTS {
         let graph = match graphs.load_async(graph_id).await {
@@ -979,12 +1044,76 @@ pub(crate) async fn reconcile_program_wait_state_with(
             (*status == harness_contract::execution_graph::ExecutionNodeStatus::WaitingApproval)
                 .then_some(node_id.clone())
         });
-        let all_admitted = program
-            .control
+        // Releases before durable Program admission could persist a Planning
+        // control record (or an incomplete active record) next to an otherwise
+        // valid graph. Rebuild the control state from the frozen Team requests
+        // before projecting a wait state. Never invent a role or use a display
+        // label: `admission_control` reads the exact graph-bound requests.
+        let needs_backfill = program.control.lifecycle == CollaborationProgramLifecycle::Planning
+            || program.control.resource_ledger.revision != program.revision
+            || program.control.resource_ledger.parallel_demand == 0
+            || program.control.resource_ledger.deadline_at_ms == 0
+            || program.control.obligations.len() != program.team_instances.len();
+        let mut control = if needs_backfill {
+            tracing::warn!(
+                graph_id,
+                lifecycle = ?program.control.lifecycle,
+                "backfilling incomplete durable collaboration Program control"
+            );
+            match admission_control(&graph, program, teams) {
+                Ok(control) => control,
+                Err(error) => {
+                    // Do not invent missing role endpoints or mutate a frozen
+                    // Team request just to make an old graph runnable. Seal
+                    // this irreparable legacy Program in a valid Planning
+                    // state and let startup continue for every other graph.
+                    // A later inspect/revise flow can surface the exact
+                    // deterministic reason and submit a new semantic plan.
+                    let quarantine =
+                        harness_contract::execution_graph::CollaborationProgramControlState {
+                            lifecycle: CollaborationProgramLifecycle::Planning,
+                            obligations: Vec::new(),
+                            resource_ledger: Default::default(),
+                            waiting_relation: None,
+                            blocker_ref: Some(format!("legacy_program_replan_required:{error}")),
+                            next_action: Some(
+                                "inspect_and_revise_the_semantic_team_plan".to_string(),
+                            ),
+                        };
+                    if quarantine != program.control {
+                        match supervisor
+                            .command(
+                                graph_id,
+                                ExecutionGraphCommand::UpdateCollaborationProgramControl {
+                                    expected_revision: graph.revision,
+                                    control: Box::new(quarantine),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(_) => return Ok(()),
+                            Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
+                                crate::execution_core::graph::ExecutionCommitError::StaleRevision {
+                                    ..
+                                },
+                            )) => continue,
+                            Err(commit_error) => {
+                                return Err(format!(
+                                    "program_wait_quarantine_commit_failed:{commit_error}"
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        } else {
+            program.control.clone()
+        };
+        let all_admitted = control
             .obligations
             .iter()
             .all(|obligation| obligation.state == TeamAdmissionState::Admitted);
-        let mut control = program.control.clone();
         if let Some(node_id) = approval_node {
             control.lifecycle = CollaborationProgramLifecycle::AwaitingApproval;
             control.waiting_relation = Some("approval".to_string());
@@ -1031,6 +1160,7 @@ pub(crate) async fn reconcile_program_wait_state_with(
 pub(crate) async fn reconcile_terminal_programs_on_startup(
     supervisor: &RuntimeExecutionSupervisor,
     graphs: &ExecutionGraphStateStore,
+    teams: &TeamRuntime,
     limit: usize,
 ) -> Result<usize, String> {
     let mut cursor = None;
@@ -1046,7 +1176,7 @@ pub(crate) async fn reconcile_terminal_programs_on_startup(
             if examined >= limit {
                 break;
             }
-            reconcile_program_wait_state_with(graph_id, supervisor, graphs).await?;
+            reconcile_program_wait_state_with(graph_id, supervisor, graphs, teams).await?;
             reconcile_terminal_program_with(graph_id, supervisor, graphs).await?;
             examined = examined.saturating_add(1);
         }
@@ -1115,6 +1245,7 @@ fn admission_control(
             state: TeamAdmissionState::Admitting,
             child_graph_ref: None,
             reason_kind: None,
+            terminal: None,
             reservation,
             revision: program.revision,
         });

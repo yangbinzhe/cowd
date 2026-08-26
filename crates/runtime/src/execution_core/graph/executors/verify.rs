@@ -219,13 +219,11 @@ impl NodeExecutor for VerifyNodeExecutor {
                             })
                         });
                     let retained_upstream = consumes_upstream
-                        && !upstream_evidence.is_empty()
-                        && upstream_evidence.iter().any(|(ref_type, id)| {
-                            result.evidence_refs.iter().any(|reference| {
-                                reference.evidence_ref.ref_type == ref_type.as_str()
-                                    && reference.evidence_ref.id == id.as_str()
-                            })
-                        });
+                        && retained_runtime_attached_upstream_evidence(
+                            result,
+                            &packet.evidence_refs,
+                            &upstream_evidence,
+                        );
                     let evidence_satisfied =
                         (requires_new_tool_evidence && produced_evidence) || retained_upstream;
                     let role = packet.team_role_assignment();
@@ -407,12 +405,17 @@ impl NodeExecutor for VerifyNodeExecutor {
 }
 
 /// Return whether a Team delivery criterion is compiled as Runtime-backed
-/// scoped evidence rather than a structured presentation field.
+/// evidence rather than a structured presentation field.
 ///
 /// This mirrors the explicit structured field set in
 /// `team::instantiation::team_acceptance_contract`. Unknown user-defined
-/// labels are intentionally evidence-backed there; requiring a matching JSON
-/// property here would create a second, model-fragile acceptance language.
+/// labels and typed `evidence_scope:` declarations are both evidence-backed
+/// there. Requiring a matching JSON property (or a textual equality between
+/// a role-local path alias and the Team's workspace-canonical alias) would
+/// create a second, model-fragile acceptance language. The caller only uses
+/// this after every required role slot has a satisfied typed Runtime
+/// acceptance evaluation and durable Team evidence, so this cannot grant
+/// evidence that the role-level evaluator did not verify.
 fn is_runtime_evidence_backed_team_criterion(criterion: &str) -> bool {
     !matches!(
         criterion.trim().to_ascii_lowercase().as_str(),
@@ -431,7 +434,7 @@ fn is_runtime_evidence_backed_team_criterion(criterion: &str) -> bool {
             | "source_verification"
             | "review"
             | "evidence"
-    ) && !criterion.trim().starts_with("evidence_scope:")
+    )
 }
 
 fn produced_team_evidence(
@@ -461,6 +464,37 @@ fn produced_team_evidence(
                         reference.evidence_ref.id.clone(),
                     ))))
     })
+}
+
+/// A cross-Team handoff is attached to a child Team's immutable Agent packet
+/// before that Team graph is created.  It therefore has no *intra-Team* edge
+/// to rediscover at this verifier.  Accept it only when the completed Agent
+/// result retained one of those durable Runtime-attached inputs.  This keeps
+/// the proof tied to the exact parent handoff while allowing a reducer-only
+/// Team to perform no redundant workspace read.
+fn retained_runtime_attached_upstream_evidence(
+    result: &ExecutionNodeResult,
+    packet_evidence: &[EvidenceAccessRef],
+    intra_team_upstream: &BTreeSet<(String, String)>,
+) -> bool {
+    let is_retained = |reference: &EvidenceAccessRef| {
+        result.evidence_refs.iter().any(|result_reference| {
+            result_reference.evidence_ref == reference.evidence_ref
+                && crate::agent_result_validator::is_materialized_durable_evidence(result_reference)
+        })
+    };
+    intra_team_upstream.iter().any(|(ref_type, id)| {
+        result.evidence_refs.iter().any(|reference| {
+            reference.evidence_ref.ref_type == *ref_type
+                && reference.evidence_ref.id == *id
+                && crate::agent_result_validator::is_materialized_durable_evidence(reference)
+        })
+    }) || packet_evidence
+        .iter()
+        .filter(|reference| {
+            crate::agent_result_validator::is_materialized_durable_evidence(reference)
+        })
+        .any(is_retained)
 }
 
 #[cfg(test)]
@@ -739,6 +773,33 @@ mod tests {
     }
 
     #[test]
+    fn upstream_reducer_accepts_runtime_attached_cross_team_evidence() {
+        let handed_off = evidence("cross-team-terminal");
+        let mut result = ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some("agent-return:reducer".to_string()),
+            summary: Some("synthesized only from the handoff".to_string()),
+            evidence_refs: vec![handed_off.clone()],
+            failure: None,
+            usage: ExecutionUsage::default(),
+            finished_at_ms: 1,
+        };
+
+        assert!(retained_runtime_attached_upstream_evidence(
+            &result,
+            std::slice::from_ref(&handed_off),
+            &BTreeSet::new(),
+        ));
+
+        result.evidence_refs.clear();
+        assert!(!retained_runtime_attached_upstream_evidence(
+            &result,
+            std::slice::from_ref(&handed_off),
+            &BTreeSet::new(),
+        ));
+    }
+
+    #[test]
     fn custom_team_delivery_labels_are_evidence_backed_not_model_json_fields() {
         assert!(is_runtime_evidence_backed_team_criterion("evidence_paths"));
         assert!(is_runtime_evidence_backed_team_criterion(
@@ -749,7 +810,7 @@ mod tests {
         ));
         assert!(!is_runtime_evidence_backed_team_criterion("summary"));
         assert!(!is_runtime_evidence_backed_team_criterion("evidence"));
-        assert!(!is_runtime_evidence_backed_team_criterion(
+        assert!(is_runtime_evidence_backed_team_criterion(
             "evidence_scope:read:src"
         ));
     }

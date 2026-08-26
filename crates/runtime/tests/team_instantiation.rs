@@ -336,7 +336,7 @@ fn builtin_template_default_pointer_resolves_the_verified_stable_release() {
         instantiated.template_ref.template_id.as_str(),
         "builtin/cowd/parallel-research-synthesis"
     );
-    assert_eq!(instantiated.template_ref.revision, 2);
+    assert_eq!(instantiated.template_ref.revision, 3);
 }
 
 #[test]

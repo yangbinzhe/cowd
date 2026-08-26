@@ -78,15 +78,26 @@ impl RootControlPlanePhase {
 
 /// Render the one-shot, Runtime-owned root-admission instruction.
 ///
-/// A workstream is the unit that compiles to a Team.  Keeping that distinction
-/// explicit prevents a provider from putting several apparent Team roles into
-/// one `focuses` array, which would still be exactly one proposed Team and
-/// must correctly fail the cardinality gate.
-fn root_collaboration_decision_instruction(required_team_count: u8) -> String {
+/// A workstream is the unit that compiles to one Team. Named roles therefore
+/// belong in that workstream's turn-scoped `template`, not in sibling
+/// workstreams and not in the compatibility `focuses` array.
+fn root_collaboration_decision_instruction(
+    required_team_count: u8,
+    required_workspace_evidence_scopes: &[String],
+) -> String {
+    let required_scope_clause = if required_workspace_evidence_scopes.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " The user explicitly named these immutable evidence targets: {}. Include every one exactly as an `evidence_scope:` entry across the proposed Team workstreams and their evidence-producing roles; do not substitute a log, directory, or similarly named file.",
+            required_workspace_evidence_scopes.join(", ")
+        )
+    };
     format!(
-        "Root collaboration admission is pending. Call `{}` exactly once now; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team, so do not put several Teams into one workstream. Give every workstream a distinct `workstream_id` and `objective`; express A/B parallelism and later synthesis only with `depends_on` between those workstream ids. Omit `focuses` entirely at root: `focuses` is not a Team list, and invented role ids are rejected. Include only `decision_id`, `intent`, `reason`, and `workstreams` (each with `workstream_id`, `objective`, optional `depends_on`, and optional `evidence_contract`). Runtime—not the model—binds templates, roles, identities, permissions, resources, graph nodes, and execution. This is not `runtime_orchestrate`.",
+        "Root collaboration admission is pending. Call `{}` exactly once now; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team. Give every workstream a distinct `workstream_id` and `objective`, and encode every bounded evidence source in its supported `evidence_contract` as `evidence_scope:read:project/src/file.rs` (or `evidence_scope:network:*`); never use `read:.` or a session id as evidence. Each evidence-producing template role must repeat only its own source as the same `evidence_scope:` entry in that role's `acceptance`, so parallel roles are not forced to read each other's files. `acceptance` is a typed Runtime-verification contract, not prose: use only supported labels (`summary`, `findings`, `plan`, `risks`, `unresolved`, `key_decisions`, `proposal`, `critique`, `checkpoint`, `implementation`, `mitigation`, `source_verification`, `review`, `evidence`) plus that role's `evidence_scope:` entry. Put explanatory or semantic requirements in `responsibility` or `instructions`, never in `acceptance`; unknown prose is intentionally rejected when it has no bounded evidence scope. Express every cross-Team ordering and handoff only with consumer-workstream `depends_on` entries naming upstream `workstream_id`s. A template `dependencies` array is strictly local: it may name only role_ids declared inside that same template. Never put a role from another Team into a template dependency; Runtime carries cross-Team receipts and terminal evidence across the workstream edge. Omit `focuses` entirely at root. If the user expressly supplied a Team name, role name, responsibility, or organizational relationship, put one complete, turn-scoped custom `template` on that Team workstream: preserve every user identifier verbatim in `team_display_name` and each role `display_name`; include all requested roles in the one template's `roles` array, with a distinct slug `role_id`, responsibility, read-only `grant_ceiling` unless the task requires more, explicit typed `behavior` for every role (independent evidence roles use `reacquire_evidence` or `verification`; a final synthesizer uses `reducer`, `upstream_consumption`, and `terminal_candidate`). Every local template dependency is directional `{{from: upstream_producer, to: downstream_consumer}}`: `from` must finish before `to` can start. Include local dependencies only when both roles belong to this Team, result_fields `[\"summary\",\"evidence\"]`, evidence_required true, and instructions. A custom template is not catalog publication and must not wait for template approval. Do not split roles from one requested Team into multiple workstreams. Runtime validates the template, resolves safe Agent definitions, clips permissions, binds identities/resources, and creates the immutable snapshot. This is not `runtime_orchestrate`.",
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
     )
+    + &required_scope_clause
 }
 
 /// Runtime-owned host for the standard provider-backed conversation engine.
@@ -1141,12 +1152,12 @@ where
                 .is_some_and(|control| control.provider_constraint == "judge"),
             team_orchestration_requests: 0,
             collaboration_started: false,
-            verified_team_ids: BTreeSet::new(),
             collaboration_committed_write: false,
             pending_root_control_plane_receipt: None,
             pending_root_control_plane_requirement: None,
             root_control_plane_phase: RootControlPlanePhase::default(),
             pending_root_control_plane_phase: None,
+            root_evidence_scope_repairs: 0,
             root_write_replans: 0,
             root_language_replan_attempted: false,
             nested_orchestration_forbidden: execution_parent.is_some()
@@ -2175,7 +2186,7 @@ async fn submit_selected_program_intent(
         return Ok(false);
     }
     if let Some(receipt) = strategy.collaboration_receipt.as_ref() {
-        let recovered_team_ids = orchestration_receipt_team_ids(receipt);
+        let recovered_team_ids = completed_program_team_ids_from_receipt(receipt);
         let recovered_committed_write = receipt
             .get("committed_write")
             .and_then(serde_json::Value::as_bool)
@@ -2216,7 +2227,6 @@ async fn submit_selected_program_intent(
         );
         {
             let mut state = turn_state.lock().await;
-            state.verified_team_ids.extend(recovered_team_ids);
             state.collaboration_committed_write |= recovered_committed_write;
             for evidence in recovered_observed_evidence {
                 if !state
@@ -2229,6 +2239,11 @@ async fn submit_selected_program_intent(
             state
                 .committed_workspace_write_scopes
                 .extend(recovered_write_scopes);
+            // This is not a second lifecycle cache: it only records that the
+            // current parent turn has already consumed a durable Program
+            // projection.  Program terminal state remains in the receipt and
+            // graph, never in a host-maintained Team-id set.
+            state.collaboration_started |= receipt.get("collaboration_program").is_some();
             state.persistent_collaboration_context.push(item);
         }
         if parent_goal_satisfied {
@@ -2395,7 +2410,6 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
     .flatten()
 }
 
-#[cfg(test)]
 fn completed_orchestration_terminal_summary(
     calls: &[ModelToolCall],
     messages: &[ConversationMessage],
@@ -2816,9 +2830,54 @@ fn is_cjk_character(character: char) -> bool {
     )
 }
 
-fn orchestration_receipt_team_ids(receipt: &serde_json::Value) -> BTreeSet<String> {
-    let mut ids = receipt
-        .pointer("/collaboration_program/completed_required_instance_ids")
+/// Extract completed required instances from the bounded Program terminal
+/// projection.  This deliberately refuses legacy `team_ids` and free-form
+/// Team summaries: those are presentation/transport details and must never
+/// become the host's lifecycle authority.
+fn completed_program_team_ids(messages: &[ConversationMessage]) -> BTreeSet<String> {
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error: false,
+                ..
+            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+                || tool_name.eq_ignore_ascii_case(
+                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+                ) =>
+            {
+                orchestration_receipt_json(output)
+            }
+            _ => None,
+        })
+        .flat_map(|receipt| completed_program_team_ids_from_receipt(&receipt))
+        .collect()
+}
+
+fn has_completed_program_terminal(messages: &[ConversationMessage]) -> bool {
+    !completed_program_team_ids(messages).is_empty()
+}
+
+fn completed_program_team_ids_from_receipt(receipt: &serde_json::Value) -> BTreeSet<String> {
+    let Some(program) = receipt.get("collaboration_program") else {
+        return BTreeSet::new();
+    };
+    let lifecycle = program.get("lifecycle").and_then(serde_json::Value::as_str);
+    if !matches!(lifecycle, Some("completed") | Some("partial")) {
+        return BTreeSet::new();
+    }
+    if program
+        .get("terminal_diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|diagnostics| !diagnostics.is_empty())
+    {
+        return BTreeSet::new();
+    }
+    let ids = program
+        .get("completed_required_instance_ids")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flat_map(|ids| ids.iter())
@@ -2826,69 +2885,15 @@ fn orchestration_receipt_team_ids(receipt: &serde_json::Value) -> BTreeSet<Strin
         .filter(|id| !id.trim().is_empty())
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
-    if ids.is_empty() {
-        ids = receipt
-            .get("team_ids")
-            .or_else(|| receipt.pointer("/evidence/team_ids"))
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flat_map(|ids| ids.iter())
-            .filter_map(serde_json::Value::as_str)
-            .filter(|id| !id.trim().is_empty())
-            .map(str::to_string)
-            .collect::<BTreeSet<_>>();
+    let required_count = program
+        .get("required_team_count")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok());
+    if required_count.is_none_or(|count| ids.len() >= count.max(1)) {
+        ids
+    } else {
+        BTreeSet::new()
     }
-    if ids.is_empty() {
-        if let Some(id) = receipt
-            .get("team_id")
-            .or_else(|| receipt.pointer("/evidence/team_id"))
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| !id.trim().is_empty())
-        {
-            ids.insert(id.to_string());
-        }
-    }
-    ids
-}
-
-fn verified_orchestration_team_ids(messages: &[ConversationMessage]) -> BTreeSet<String> {
-    let mut executions = BTreeSet::new();
-    for (tool_use_id, receipt) in messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_use_id,
-                tool_name,
-                output,
-                is_error: false,
-            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
-                || tool_name.eq_ignore_ascii_case(
-                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-                ) =>
-            {
-                orchestration_receipt_json(output).map(|receipt| (tool_use_id, receipt))
-            }
-            _ => None,
-        })
-    {
-        if verified_team_terminal_summary(&receipt).is_none() {
-            continue;
-        }
-        let ids = orchestration_receipt_team_ids(&receipt);
-        if ids.is_empty() {
-            let execution_id = receipt
-                .pointer("/evidence/graph_id")
-                .or_else(|| receipt.pointer("/execution/graph_id"))
-                .or_else(|| receipt.get("team_execution_id"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(tool_use_id);
-            executions.insert(execution_id.to_string());
-        } else {
-            executions.extend(ids);
-        }
-    }
-    executions
 }
 
 fn parent_merge_actuals(
@@ -3196,7 +3201,6 @@ struct TurnGraphState {
     evaluation_judge_only: bool,
     team_orchestration_requests: usize,
     collaboration_started: bool,
-    verified_team_ids: BTreeSet<String>,
     collaboration_committed_write: bool,
     /// A root Turn that was explicitly required to collaborate but exhausted
     /// its one control-plane repair records this durable receipt only after
@@ -3213,6 +3217,11 @@ struct TurnGraphState {
     /// A ToolBatch stages its phase advance here; `after_commit` publishes it
     /// and only then makes it visible to the following model node.
     pending_root_control_plane_phase: Option<RootControlPlanePhase>,
+    /// A root collaboration proposal that substitutes an explicitly named
+    /// source is retried once with the immutable source contract made
+    /// explicit. This is separate from a Team lease: an invalid proposal
+    /// never starts a Team and must not consume the Team execution budget.
+    root_evidence_scope_repairs: u8,
     root_write_replans: u8,
     root_language_replan_attempted: bool,
     nested_orchestration_forbidden: bool,
@@ -3958,16 +3967,24 @@ where
         let mut runtime = self.runtime.lock().await;
         let required_control_plane = {
             let state = self.state.lock().await;
-            if state.execution_role.is_delegated_leaf() || !state.verified_team_ids.is_empty() {
+            if state.execution_role.is_delegated_leaf()
+                || state.collaboration_started
+                || has_completed_program_terminal(&state.tool_results)
+            {
                 None
             } else {
                 state.task_understanding.as_ref().and_then(|value| {
-                    (value.required_team_count > 0)
-                        .then_some((value.required_team_count, state.root_control_plane_phase))
+                    (value.required_team_count > 0).then_some((
+                        value.required_team_count,
+                        state.root_control_plane_phase,
+                        value.required_workspace_evidence_scopes.clone(),
+                    ))
                 })
             }
         };
-        if let Some((required_team_count, local_phase)) = required_control_plane {
+        if let Some((required_team_count, local_phase, required_workspace_evidence_scopes)) =
+            required_control_plane
+        {
             let (session_id, turn_id) = {
                 let state = self.state.lock().await;
                 (state.session_id.clone(), state.turn_id.clone())
@@ -4018,7 +4035,10 @@ where
                         ),
                         ContextSourceKind::Task,
                         ContextRole::Instruction,
-                        root_collaboration_decision_instruction(required_team_count),
+                        root_collaboration_decision_instruction(
+                            required_team_count,
+                            &required_workspace_evidence_scopes,
+                        ),
                     );
                     item.authority = ContextAuthority::System;
                     item.visibility = ContextVisibility::Private;
@@ -4879,10 +4899,8 @@ where
                                 state.execution_role.is_delegated_leaf(),
                                 state.evaluation_judge_only,
                             );
-                        let mut verified_team_ids = state.verified_team_ids.clone();
-                        verified_team_ids
-                            .extend(verified_orchestration_team_ids(&state.tool_results));
-                        let verified_team_executions = verified_team_ids.len();
+                        let verified_team_executions =
+                            completed_program_team_ids(&state.tool_results).len();
                         if verified_team_executions < required_team_executions {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
@@ -5726,6 +5744,96 @@ where
                                 node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
                                 vec![node]
                             }
+                        } else if let Some(missing_scopes) =
+                            missing_root_collaboration_evidence_scopes(
+                                &calls,
+                                state
+                                    .task_understanding
+                                    .as_ref()
+                                    .map_or(&[], |understanding| {
+                                        understanding.required_workspace_evidence_scopes.as_slice()
+                                    }),
+                            )
+                        {
+                            state.assistant_messages.pop();
+                            state.pending_transcript.remove(&ticket.node_id);
+                            let required_scopes = state.task_understanding.as_ref().map_or_else(
+                                Vec::new,
+                                |understanding| {
+                                    understanding.required_workspace_evidence_scopes.clone()
+                                },
+                            );
+                            if state.root_evidence_scope_repairs == 0 {
+                                state.root_evidence_scope_repairs = 1;
+                                let reason = format!(
+                                    "Runtime rejected the root collaboration proposal because it substituted or omitted user-named immutable evidence scope(s): [{}]. Submit the same required Team count again, preserving every exact scope in [{}] as evidence_scope entries; do not replace them with logs, directories, or generated artifacts.",
+                                    missing_scopes.join(", "),
+                                    required_scopes.join(", "),
+                                );
+                                state.content.push_str("\n\n");
+                                state.content.push_str(&reason);
+                                let mut item = ContextItem::new(
+                                    format!(
+                                        "runtime-root-evidence-scope-recovery:{}",
+                                        ticket.node_id
+                                    ),
+                                    ContextSourceKind::Task,
+                                    ContextRole::Instruction,
+                                    reason.clone(),
+                                );
+                                item.authority = ContextAuthority::System;
+                                item.visibility = ContextVisibility::Private;
+                                item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                                next_model_context = Some(item);
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Replan,
+                                        reason,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                vec![dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "root-evidence-scope-recovery-model",
+                                    ExecutionNodeKind::InlineModel,
+                                    "inline_model",
+                                    "inline_model",
+                                )]
+                            } else {
+                                let reason = format!(
+                                    "root collaboration proposal repeatedly omitted immutable user-named evidence scope(s): [{}]",
+                                    missing_scopes.join(", "),
+                                );
+                                state.pending_root_control_plane_receipt = Some(reason.clone());
+                                state.terminal_override =
+                                    Some((GoalCompletion::Partial, reason.clone()));
+                                model_intervention =
+                                    Some(harness_contract::goal::RuntimeIntervention {
+                                        goal_id: state.goal_id.clone(),
+                                        kind: RuntimeInterventionKind::Block,
+                                        reason,
+                                        evidence_refs: vec![format!(
+                                            "execution_node:{}",
+                                            ticket.node_id
+                                        )],
+                                        expected_graph_revision: None,
+                                    });
+                                let mut node = dynamic_node(
+                                    ticket,
+                                    state.iterations,
+                                    "root-evidence-scope-block-synthesize",
+                                    ExecutionNodeKind::Synthesize,
+                                    crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+                                    "inline_model",
+                                );
+                                node.executor_kind = crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+                                vec![node]
+                            }
                         } else if requests_team_orchestration(&calls) {
                             if !team_orchestration_request_available(
                                 &state.content,
@@ -6417,6 +6525,89 @@ where
     }
 }
 
+fn root_team_terminal_requires_text_only(
+    delegated_leaf: bool,
+    required_team_count: u8,
+    newly_completed_program_team_ids: &BTreeSet<String>,
+) -> bool {
+    !delegated_leaf && required_team_count > 0 && !newly_completed_program_team_ids.is_empty()
+}
+
+/// Return missing user-named source scopes for a typed root admission call.
+///
+/// The scope is intentionally carried by the user objective rather than a
+/// catalog template or a role name. A valid custom template may put its
+/// evidence contract either on the Team workstream or on the individual role
+/// that is responsible for reading it, so both declarations are accepted.
+/// `None` means this batch does not contain the typed root-admission transport
+/// (or the user did not name source paths); it must not affect ordinary tools.
+fn missing_root_collaboration_evidence_scopes(
+    calls: &[ModelToolCall],
+    required_workspace_evidence_scopes: &[String],
+) -> Option<Vec<String>> {
+    if required_workspace_evidence_scopes.is_empty() {
+        return None;
+    }
+    let call = calls.iter().find(|call| {
+        call.name.eq_ignore_ascii_case(
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+        )
+    })?;
+    // This admission guard owns only source-scope coverage, not the complete
+    // template codec. Parsing the whole model proposal here made its outcome
+    // accidentally depend on unrelated, later-validated template fields.
+    // Read only the two supported evidence locations as JSON; Gateway still
+    // performs the authoritative typed schema and template validation before
+    // a Program can be admitted.
+    let payload = serde_json::from_str::<serde_json::Value>(&call.input).ok()?;
+    let declared = payload
+        .get("workstreams")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|workstream| {
+            workstream
+                .get("evidence_contract")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .chain(
+                    workstream
+                        .pointer("/template/roles")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|role| {
+                            role.get("acceptance")
+                                .and_then(serde_json::Value::as_array)
+                                .into_iter()
+                                .flatten()
+                        }),
+                )
+        })
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|criterion| criterion.trim().strip_prefix("evidence_scope:"))
+        .map(str::trim)
+        .collect::<BTreeSet<_>>();
+    Some(
+        required_workspace_evidence_scopes
+            .iter()
+            .filter(|scope| {
+                let scope = scope.trim();
+                // Compatibility providers can wrap the typed tool input
+                // before this model-step boundary while the immutable raw
+                // native-call payload is still retained. Treat that raw
+                // payload as a bounded fallback only for the exact typed
+                // token; Gateway's typed compiler remains the authority for
+                // where the token is placed in the final template.
+                !declared.contains(scope)
+                    && !call.input.contains(&format!("evidence_scope:{scope}"))
+            })
+            .cloned()
+            .collect(),
+    )
+}
+
 fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
     calls.iter().any(is_team_orchestration_call)
 }
@@ -6566,6 +6757,32 @@ fn tool_nodes_for_calls(
         .collect()
 }
 
+/// Runtime-authored exact-read recovery is not a model tool request, yet a
+/// follow-up OpenAI-compatible model request must still see a valid
+/// assistant-tool-call → tool-result transcript pair.  These ids are minted
+/// exclusively by the Runtime recovery compilers below; model-supplied ids
+/// never receive this synthetic transcript frame.
+fn runtime_authored_tool_batch(calls: &[ModelToolCall]) -> bool {
+    !calls.is_empty()
+        && calls.iter().all(|call| {
+            call.id.starts_with("runtime-focus-verify-")
+                || call.id.starts_with("runtime-eval-exact-read-")
+        })
+}
+
+fn runtime_authored_tool_call_message(calls: &[ModelToolCall]) -> ConversationMessage {
+    ConversationMessage::assistant(
+        calls
+            .iter()
+            .map(|call| ContentBlock::ToolUse {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+            })
+            .collect(),
+    )
+}
+
 struct TurnToolBatchBackend<C: ApiClient, T: ToolExecutor> {
     runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
@@ -6657,6 +6874,15 @@ where
                     .iter()
                     .map(|invocation| (invocation.invocation_id.clone(), invocation.clone()))
                     .collect::<std::collections::HashMap<_, _>>();
+                // A permissive session profile is an authorization ceiling,
+                // never permission to contradict a read-only user objective.
+                // Keep this decision at the governed effect boundary so it
+                // applies to every mutating tool descriptor, including tools
+                // added after this host is compiled; no role, template, or
+                // tool-name branch is involved.
+                let task_requires_workspace_write = runtime
+                    .active_turn_strategy()
+                    .is_none_or(|strategy| strategy.decision.strategy.understanding.requires_write);
                 let governed_compilation = crate::GovernedToolCompiler.compile_partial(
                     self.services.workspace_root(),
                     &requests,
@@ -6708,6 +6934,20 @@ where
                         .find(|invocation| invocation.invocation_id == call.id)
                     {
                         let descriptor = invocation.effect.clone();
+                        if !task_requires_workspace_write
+                            && descriptor.required_permission
+                                != harness_contract::tool::ToolPermissionMode::ReadOnly
+                        {
+                            gaps.insert(
+                                call.id.clone(),
+                                synthetic_capability_gap(
+                                    &descriptor,
+                                    runtime.active_permission_mode(),
+                                    "the active user task is read-only; Runtime rejects mutating tool effects even under a full-trust session profile".to_string(),
+                                ),
+                            );
+                            continue;
+                        }
                         let request_id = format!("{}:{}:{}", session_id, call.id, ticket.attempt);
                         match runtime
                             .negotiate_tool_authorization(
@@ -6810,10 +7050,6 @@ where
                 &precompleted,
             )
             .await;
-            // A child orchestration receipt is evidence for the parent graph,
-            // never the parent's root answer. The root presentation gate must
-            // consume the complete parent projection after all work continues.
-            let orchestration_terminal_summary: Option<String> = None;
             let GovernedToolBatchResult {
                 messages: governed_messages,
                 invocations,
@@ -6821,6 +7057,17 @@ where
                 max_concurrency_observed,
                 parallel_batches,
             } = governed;
+            // Preserve the full, durable orchestration receipt long enough to
+            // derive a verified Program terminal. The model-facing compactor
+            // deliberately replaces large JSON with an elided summary, so
+            // parsing only `messages` below used to turn a completed Team
+            // Program into an apparent missing control-plane proposal.
+            let orchestration_terminal_summary = completed_orchestration_terminal_summary(
+                &calls,
+                &governed_messages,
+                self.services.workspace_root(),
+                true,
+            );
             // Graph scheduling executes outside the legacy adapter. Before
             // the next model node sees the result, route its raw output
             // through the same durable evidence and context-ledger path used
@@ -7009,12 +7256,24 @@ where
                 state.pending_focus_terminal_candidate.is_some(),
             )
         };
-        let satisfied_focus_acceptance_scope_keys = typed_satisfied_focus_acceptance_scope_keys(
+        let mut satisfied_focus_acceptance_scope_keys = typed_satisfied_focus_acceptance_scope_keys(
             &focus_acceptance_scopes,
             &successful_observed_evidence,
             &prior_observed_evidence,
             self.services.path_identity_resolver(),
         );
+        // A deterministic Focus prefetch is compiled by Runtime and reaches
+        // this point only after its governed ToolBatch produced a successful
+        // tool-result receipt. In-process delegated executors can retain that
+        // receipt before their typed evidence snapshot is visible to this
+        // host; recognize the exact Runtime-authored call here so a completed
+        // read is never spuriously re-requested from the provider. This is
+        // deliberately limited to exact scopes in the immutable role contract.
+        satisfied_focus_acceptance_scope_keys.extend(successful_runtime_focus_scope_keys(
+            &calls,
+            &successful_call_ids,
+            &focus_acceptance_scopes,
+        ));
         let verified_focus_acceptance_scope_keys = satisfied_focus_acceptance_scope_keys
             .iter()
             .filter(|scope| {
@@ -7037,8 +7296,16 @@ where
             bounded_evidence_role && failed == 0 && !scope_keys.is_empty() && newly_scoped == 0;
         let mut automatic_focus_verification = None;
         let mut state = self.state.lock().await;
+        // A successful Team-admission call has already created the durable
+        // Program authority.  Keep only this turn-local "do not submit the
+        // same admission again" marker; completion is still read exclusively
+        // from the typed Program terminal projection below.
+        state.collaboration_started |= calls
+            .iter()
+            .any(|call| successful_call_ids.contains(&call.id) && is_team_orchestration_call(call));
         let root_control_plane_required = !state.execution_role.is_delegated_leaf()
-            && state.verified_team_ids.is_empty()
+            && !state.collaboration_started
+            && !has_completed_program_terminal(&state.tool_results)
             && state
                 .task_understanding
                 .as_ref()
@@ -7251,7 +7518,23 @@ where
             state.consecutive_low_novelty_batches = 0;
         }
         let has_successful_tool_evidence = state.successful_tool_calls > 0;
+        let newly_completed_program_team_ids = completed_program_team_ids(&result.messages);
+        let completed_root_team_this_batch = root_team_terminal_requires_text_only(
+            state.execution_role.is_delegated_leaf(),
+            state
+                .task_understanding
+                .as_ref()
+                .map_or(0, |understanding| understanding.required_team_count),
+            &newly_completed_program_team_ids,
+        );
         state.tool_results.extend(result.messages);
+        if completed_root_team_this_batch {
+            // `submit_collaboration_decision` synchronously returns only once
+            // its Team terminal is verified. The parent model's remaining job
+            // is presentation, not another graph mutation or workspace call.
+            state.force_text_only_next_model = true;
+            state.force_reasoning_effort_next_model = Some("none".to_string());
+        }
         if focus_synthesis_ready {
             if let Some(item) = focus_synthesis_evidence_context_item(
                 &ticket.node_id,
@@ -7553,23 +7836,23 @@ where
                 match kind {
                     RuntimeInterventionKind::Synthesize => {
                         let focus_terminal_candidate = if focus_synthesis_ready {
-                            let retained = state.pending_focus_terminal_candidate.take().and_then(
-                                |candidate| {
-                                    normalized_team_terminal_candidate(
-                                        &candidate,
-                                        &state.focus_required_output_fields,
-                                    )
-                                },
-                            );
-                            retained.or_else(|| {
-                                runtime_verified_implementation_terminal_candidate(
-                                    &state.focus_required_output_fields,
-                                    &state.focus_observed_resource_scopes,
-                                    &state.write_attempt_paths,
-                                    &state.tool_results,
-                                    self.services.workspace_root(),
-                                )
-                            })
+                            // This candidate was written before Runtime
+                            // executed a mandatory Focus recovery. Reusing it
+                            // after the receipt closes can preserve stale
+                            // prose such as "one more read is needed" in a
+                            // successful Team terminal. Discard it at the
+                            // evidence boundary: a write role may use the
+                            // deterministic receipt-backed carrier below;
+                            // every other role receives one text-only model
+                            // synthesis grounded in the committed receipt.
+                            state.pending_focus_terminal_candidate.take();
+                            runtime_verified_implementation_terminal_candidate(
+                                &state.focus_required_output_fields,
+                                &state.focus_observed_resource_scopes,
+                                &state.write_attempt_paths,
+                                &state.tool_results,
+                                self.services.workspace_root(),
+                            )
                         } else {
                             None
                         };
@@ -7699,7 +7982,13 @@ where
     }
 
     async fn after_commit(&self, ticket: &NodeExecutionTicket) -> Result<(), NodeExecutorError> {
-        let (messages, root_control_plane_phase, session_id, turn_id) = {
+        let runtime_authored_calls = decode_tool_batch(&ticket.payload_ref)
+            .map(|(calls, _)| calls)
+            .map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: format!("tool batch persistent payload is invalid after commit: {error}"),
+            })?;
+        let (mut messages, root_control_plane_phase, session_id, turn_id) = {
             let mut state = self.state.lock().await;
             let phase = state.pending_root_control_plane_phase.take();
             if let Some(phase) = phase {
@@ -7715,6 +8004,17 @@ where
                 state.turn_id.clone(),
             )
         };
+        if runtime_authored_tool_batch(&runtime_authored_calls) {
+            // These reads were scheduled by Runtime to close a bounded
+            // evidence contract, rather than emitted by a provider.  Make
+            // their provenance explicit while preserving the wire protocol's
+            // required assistant tool-call predecessor for the committed
+            // tool-result messages.
+            messages.insert(
+                0,
+                runtime_authored_tool_call_message(&runtime_authored_calls),
+            );
+        }
         self.runtime
             .lock()
             .await
@@ -10796,7 +11096,7 @@ fn focus_acceptance_is_met(
 fn should_force_focus_synthesis(
     focus_acceptance_met: bool,
     required_scopes: &[String],
-    repeated_evidence_saturation: bool,
+    _repeated_evidence_saturation: bool,
     has_retained_terminal_candidate: bool,
 ) -> bool {
     if !focus_acceptance_met {
@@ -10809,11 +11109,16 @@ fn should_force_focus_synthesis(
     if has_retained_terminal_candidate {
         return true;
     }
-    let read_only = !required_scopes.is_empty()
-        && required_scopes
-            .iter()
-            .all(|scope| scope.starts_with("read:"));
-    !read_only || repeated_evidence_saturation
+    // A bounded read-only role has no additional acceptance obligation once
+    // its exact scope is proven.  Leaving native tools enabled here invites
+    // the provider to keep rediscovering the same source and, worse, lets a
+    // later malformed/exhausted request turn a successful receipt into a
+    // blocked Team.  Move directly to the text-only terminal presentation;
+    // the synthesis still has every retained receipt in context.
+    //
+    // This is about the role's immutable evidence contract, not its display
+    // name, template, or any catalog-specific behavior.
+    !required_scopes.is_empty()
 }
 
 fn should_recover_missing_required_write(
@@ -11645,6 +11950,47 @@ fn focus_verification_tool_calls(
         .collect()
 }
 
+/// Return only Focus acceptance scopes proven by a successful,
+/// Runtime-authored exact `read_file` call in the current ToolBatch.
+///
+/// This is a receipt bridge, not an authorization bypass: arbitrary
+/// model-generated reads never enter it, and a scope is returned only when it
+/// already belongs to the immutable role contract and the matching tool
+/// result is successful.
+fn successful_runtime_focus_scope_keys(
+    calls: &[ModelToolCall],
+    successful_call_ids: &BTreeSet<String>,
+    required_scopes: &[String],
+) -> BTreeSet<String> {
+    calls
+        .iter()
+        .filter(|call| {
+            call.id.starts_with("runtime-focus-verify-")
+                && call.name == "read_file"
+                && successful_call_ids.contains(&call.id)
+        })
+        .filter_map(|call| {
+            serde_json::from_str::<serde_json::Value>(&call.input)
+                .ok()
+                .and_then(|input| {
+                    input
+                        .get("path")
+                        .and_then(|path| path.as_str())
+                        .map(str::to_string)
+                })
+        })
+        .flat_map(|path| {
+            required_scopes.iter().filter_map(move |scope| {
+                let scoped_path = scope
+                    .strip_prefix("read:")
+                    .or_else(|| scope.strip_prefix("verify_after_write:"))
+                    .or_else(|| scope.strip_prefix("verify_upstream_change:"));
+                (scoped_path == Some(path.as_str())).then(|| scope.clone())
+            })
+        })
+        .collect()
+}
+
 /// A `read:` Focus may authorize either a file or a directory. `read_file`
 /// cannot satisfy the latter when passed the directory itself, so choose one
 /// deterministic regular descendant for the Runtime-authored verification.
@@ -11748,7 +12094,7 @@ fn should_prefetch_focus_verification(
         && !pending_scopes.is_empty()
         && pending_scopes
             .iter()
-            .all(|scope| scope.starts_with("verify_upstream_change:"))
+            .all(|scope| scope.starts_with("read:") || scope.starts_with("verify_upstream_change:"))
 }
 
 fn typed_satisfied_focus_acceptance_scope_keys(
@@ -15107,13 +15453,20 @@ mod tests {
     }
 
     #[test]
-    fn verified_team_receipt_count_ignores_failed_and_duplicate_executions() {
+    fn program_terminal_count_ignores_failed_and_duplicate_receipts() {
         let verified = serde_json::json!({
             "status": "completed",
             "working_state_verified": true,
             "team_execution_id": "team-graph-1",
             "terminal_summary": "Checked conclusion.",
             "execution": {"terminal_result_available": true},
+            "collaboration_program": {
+                "program_id": "program-1",
+                "lifecycle": "completed",
+                "required_team_count": 1,
+                "completed_required_instance_ids": ["research:1"],
+                "terminal_diagnostics": []
+            },
             "delivery_envelope": {
                 "envelope_id": "team-envelope-1",
                 "revision": 1,
@@ -15157,7 +15510,7 @@ mod tests {
             ConversationMessage::tool_result("team-2", "runtime_orchestrate", failed, true),
         ];
 
-        assert_eq!(verified_orchestration_team_ids(&messages).len(), 1);
+        assert_eq!(completed_program_team_ids(&messages).len(), 1);
     }
 
     #[tokio::test]
@@ -15998,7 +16351,7 @@ mod tests {
     }
 
     #[test]
-    fn only_first_step_upstream_review_is_prefetched() {
+    fn only_first_step_bounded_focus_evidence_is_prefetched() {
         let scopes = vec!["verify_upstream_change:fixtures/target.txt".to_string()];
         assert!(should_prefetch_focus_verification(
             true, true, false, &scopes
@@ -16015,6 +16368,38 @@ mod tests {
             false,
             &["verify_after_write:fixtures/target.txt".into()]
         ));
+        assert!(should_prefetch_focus_verification(
+            true,
+            true,
+            false,
+            &["read:fixtures/target.txt".into()]
+        ));
+    }
+
+    #[test]
+    fn runtime_prefetched_exact_read_closes_only_its_matching_focus_scope() {
+        let calls = vec![ModelToolCall {
+            id: "runtime-focus-verify-2-0".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "fixtures/target.txt"}).to_string(),
+            depends_on: Vec::new(),
+        }];
+        let required = vec![
+            "read:fixtures/target.txt".to_string(),
+            "read:fixtures/other.txt".to_string(),
+        ];
+        let satisfied = successful_runtime_focus_scope_keys(
+            &calls,
+            &BTreeSet::from(["runtime-focus-verify-2-0".to_string()]),
+            &required,
+        );
+        assert_eq!(
+            satisfied,
+            BTreeSet::from(["read:fixtures/target.txt".to_string()])
+        );
+        assert!(
+            successful_runtime_focus_scope_keys(&calls, &BTreeSet::new(), &required).is_empty()
+        );
     }
 
     #[test]
@@ -16680,12 +17065,64 @@ mod tests {
     }
 
     #[test]
-    fn root_collaboration_instruction_makes_team_cardinality_and_focus_boundary_explicit() {
-        let instruction = root_collaboration_decision_instruction(3);
+    fn root_collaboration_instruction_makes_team_cardinality_and_custom_role_boundary_explicit() {
+        let instruction = root_collaboration_decision_instruction(3, &[]);
         assert!(instruction.contains("exactly 3 `workstreams`"));
         assert!(instruction.contains("one workstream is one proposed Team"));
         assert!(instruction.contains("Omit `focuses` entirely at root"));
+        assert!(instruction.contains("turn-scoped custom `template`"));
+        assert!(instruction.contains("Do not split roles from one requested Team"));
+        assert!(instruction.contains("`acceptance` is a typed Runtime-verification contract"));
+        assert!(instruction.contains("never in `acceptance`"));
         assert!(instruction.contains("submit_collaboration_decision"));
+    }
+
+    #[test]
+    fn root_collaboration_scope_guard_accepts_exact_named_sources_and_rejects_substitution() {
+        let required = vec![
+            "read:crates/runtime/src/conversation/host.rs".to_string(),
+            "read:crates/harness-contract/src/orchestration.rs".to_string(),
+        ];
+        let call = |evidence_contract: &str| ModelToolCall {
+            id: "proposal".to_string(),
+            name: harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+                .to_string(),
+            input: format!(
+                r#"{{"decision_id":"source-coverage","intent":"team","workstreams":[{{"workstream_id":"source","objective":"read named source","evidence_contract":[{evidence_contract}],"managed_agent_escalation":"none"}}],"reason":"test"}}"#
+            ),
+            depends_on: Vec::new(),
+        };
+        assert_eq!(
+            missing_root_collaboration_evidence_scopes(
+                &[call(
+                    r#""evidence_scope:read:crates/runtime/src/conversation/host.rs","evidence_scope:read:crates/harness-contract/src/orchestration.rs""#,
+                )],
+                &required,
+            ),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            missing_root_collaboration_evidence_scopes(
+                &[call(
+                    r#""evidence_scope:read:cowd-test-evidence/workspace-check-v702.log""#
+                )],
+                &required,
+            ),
+            Some(required)
+        );
+    }
+
+    #[test]
+    fn completed_root_team_forces_a_text_only_presentation_turn() {
+        let verified = BTreeSet::from(["runtime-team:audited".to_string()]);
+        assert!(root_team_terminal_requires_text_only(false, 1, &verified));
+        assert!(!root_team_terminal_requires_text_only(true, 1, &verified));
+        assert!(!root_team_terminal_requires_text_only(false, 0, &verified));
+        assert!(!root_team_terminal_requires_text_only(
+            false,
+            1,
+            &BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -17071,14 +17508,18 @@ mod tests {
     }
 
     #[test]
-    fn read_only_focus_converges_on_evidence_saturation_not_first_file() {
+    fn bounded_focus_converges_when_its_exact_evidence_contract_is_complete() {
         let read_scope = vec!["read:crates/runtime".to_string()];
 
-        assert!(!should_force_focus_synthesis(
+        assert!(
+            should_force_focus_synthesis(true, &read_scope, false, false,),
+            "a completed exact read contract must immediately enter text-only synthesis"
+        );
+        assert!(should_force_focus_synthesis(
             true,
-            &read_scope,
+            &["verify_upstream_change:crates/runtime".to_string()],
             false,
-            false
+            false,
         ));
         assert!(
             should_force_focus_synthesis(true, &read_scope, false, true),

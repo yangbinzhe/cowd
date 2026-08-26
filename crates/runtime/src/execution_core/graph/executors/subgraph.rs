@@ -164,10 +164,28 @@ impl NodeExecutor for TeamSubgraphExecutor {
         request.upstream_artifact_refs.sort();
         request.upstream_artifact_refs.dedup();
         if !summaries.is_empty() {
-            request.objective.push_str(
-                "\n\n## Verified predecessor artifacts\nUse these committed root-graph results as upstream evidence. Preserve unresolved conflicts explicitly.\n",
+            let predecessor_context = format!(
+                "## Verified predecessor artifacts\nUse these committed root-graph results as upstream evidence. Preserve unresolved conflicts explicitly.\n{}",
+                summaries.join("\n")
             );
-            request.objective.push_str(&summaries.join("\n"));
+            request.objective.push_str("\n\n");
+            request.objective.push_str(&predecessor_context);
+            // Focus plans are compiled before this child node becomes ready.
+            // Agent prompts consume their shared baselines rather than the
+            // Team graph's top-level objective, so attaching handoff text
+            // only above would make a downstream Team claim its Runtime
+            // inputs were absent even though the immutable request carried
+            // their evidence refs.  Copy this Runtime-derived context into
+            // every role baseline; it is a governed handoff, never model text.
+            for focus_plan in &mut request.focus_partition_plans {
+                if !focus_plan
+                    .shared_baseline
+                    .iter()
+                    .any(|item| item == &predecessor_context)
+                {
+                    focus_plan.shared_baseline.push(predecessor_context.clone());
+                }
+            }
         }
         let payload_ref =
             serde_json::to_string(&request).map_err(|error| NodeExecutorError::Invalid {
@@ -195,7 +213,7 @@ impl NodeExecutor for TeamSubgraphExecutor {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
-        let request = self.request(&ticket.node_id, &ticket.payload_ref)?;
+        let mut request = self.request(&ticket.node_id, &ticket.payload_ref)?;
         let child_graph_id = format!("team-graph:{}", request.team_id);
         let teams = self
             .teams
@@ -211,6 +229,19 @@ impl NodeExecutor for TeamSubgraphExecutor {
                     executor_kind: Self::KIND.to_string(),
                     node_id: ticket.node_id.clone(),
                 })?;
+        // `start` may be called before every dependency has a terminal
+        // parent result. Re-materialize immediately before admission so a
+        // ready cross-Team consumer receives the actual completed handoff,
+        // rather than the empty snapshot from its first scheduling attempt.
+        let parent_graph = teams
+            .graph_state_store()
+            .load_async(ticket.graph_id.clone())
+            .await
+            .map_err(|error| NodeExecutorError::Poll {
+                node_id: ticket.node_id.clone(),
+                reason: format!("load current cross-Team predecessor context: {error}"),
+            })?;
+        attach_current_predecessor_context(&mut request, &parent_graph, &ticket.node_id);
         crate::orchestration::collaboration_coordinator::record_incoming_cross_team_deliveries(
             &ticket.graph_id,
             &ticket.node_id,
@@ -501,6 +532,74 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// Attach only the results that are already committed on dependency edges of
+/// the parent graph. This is called again at admission time because scheduler
+/// ticket creation can precede the producer's terminal commit.
+fn attach_current_predecessor_context(
+    request: &mut TeamInstantiationRequest,
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    consumer_node_id: &str,
+) {
+    let mut summaries = Vec::new();
+    for edge in graph
+        .edges
+        .iter()
+        .filter(|edge| edge.kind.is_dependency() && edge.to == consumer_node_id)
+    {
+        let Some(result) = graph.node_results.get(&edge.from) else {
+            continue;
+        };
+        request
+            .upstream_evidence_refs
+            .extend(result.evidence_refs.iter().cloned());
+        if let Some(result_ref) = result
+            .result_ref
+            .as_deref()
+            .filter(|reference| is_durable_artifact_locator(reference))
+        {
+            request.upstream_artifact_refs.push(result_ref.to_string());
+        }
+        if let Some(summary) = result.summary.as_deref() {
+            summaries.push(format!(
+                "{}: {}",
+                edge.from,
+                summary.chars().take(4_000).collect::<String>()
+            ));
+        }
+    }
+    request.upstream_evidence_refs.sort_by(|left, right| {
+        left.evidence_ref
+            .ref_type
+            .cmp(&right.evidence_ref.ref_type)
+            .then_with(|| left.evidence_ref.id.cmp(&right.evidence_ref.id))
+    });
+    request
+        .upstream_evidence_refs
+        .dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
+    request.upstream_artifact_refs.sort();
+    request.upstream_artifact_refs.dedup();
+    if summaries.is_empty() {
+        return;
+    }
+    let predecessor_context = format!(
+        "## Verified predecessor artifacts\nUse these committed root-graph results as upstream evidence. Preserve unresolved conflicts explicitly.\n{}",
+        summaries.join("\n")
+    );
+    if !request.objective.contains(&predecessor_context) {
+        request.objective.push_str("\n\n");
+        request.objective.push_str(&predecessor_context);
+    }
+    for focus_plan in &mut request.focus_partition_plans {
+        if !focus_plan
+            .shared_baseline
+            .iter()
+            .any(|item| item == &predecessor_context)
+        {
+            focus_plan.shared_baseline.push(predecessor_context.clone());
+        }
+    }
+}
+
 fn is_durable_artifact_locator(reference: &str) -> bool {
     reference
         .strip_prefix("artifact:")
@@ -532,7 +631,8 @@ mod tests {
         ExecutionUsage,
     };
     use harness_contract::team::{
-        TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
+        FocusPartitionPlan, FocusPartitionSlot, TeamSelectionMode, TeamTemplateDefinitionId,
+        TeamTemplateSelector,
     };
     use std::sync::{Arc, Weak};
 
@@ -584,7 +684,25 @@ mod tests {
             display_name: None,
             role_display_overrides: Vec::new(),
             cardinality_overrides: Vec::new(),
-            focus_partition_plans: Vec::new(),
+            focus_partition_plans: vec![FocusPartitionPlan {
+                role_id: "consumer".to_string(),
+                shared_baseline: vec!["bounded consumer task".to_string()],
+                slots: vec![FocusPartitionSlot {
+                    focus_id: "consume-handoff".to_string(),
+                    boundary: "upstream terminal only".to_string(),
+                    evidence_responsibility: "synthesize supplied evidence".to_string(),
+                    capability_cropped_refs: vec!["read:crates/runtime".to_string()],
+                    scope_hash: harness_contract::team::focus_scope_hash(
+                        "consumer",
+                        "upstream terminal only",
+                        &["read:crates/runtime".to_string()],
+                    ),
+                    overlap_budget_bp: 0,
+                    novelty_target_bp: 1,
+                    output_contract: vec!["summary".to_string()],
+                    output_acceptance: vec!["summary".to_string()],
+                }],
+            }],
             requires_managed_collaboration_escalation: false,
             permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
             model_lease: "test-model".to_string(),
@@ -696,5 +814,9 @@ mod tests {
         assert!(materialized
             .objective
             .contains("Team inline result remains available as a bounded summary."));
+        assert!(materialized.focus_partition_plans[0]
+            .shared_baseline
+            .iter()
+            .any(|item| item.contains("Team A verified the runtime boundary.")));
     }
 }

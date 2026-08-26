@@ -1694,6 +1694,7 @@ impl RuntimeServices {
         let outcome_projection_store = graph_state_store.clone();
         let settled_outcome_service = Arc::clone(&outcome_service);
         let settled_lineage_supervisor = Arc::clone(&execution_supervisor);
+        let settled_team_runtime = Arc::clone(&team_runtime);
         execution_supervisor
             .install_graph_settled_observer(move |graph_id| {
                 let graph_id = graph_id.to_string();
@@ -1704,11 +1705,13 @@ impl RuntimeServices {
                 let lineage_supervisor = Arc::clone(&settled_lineage_supervisor);
                 let coordinator_store = graph_store.clone();
                 let coordinator_supervisor = Arc::clone(&lineage_supervisor);
+                let coordinator_teams = Arc::clone(&settled_team_runtime);
                 tokio::spawn(async move {
                     if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_program_wait_state_with(
                         &graph_id,
                         coordinator_supervisor.as_ref(),
                         &coordinator_store,
+                        coordinator_teams.as_ref(),
                     )
                     .await
                     {
@@ -5047,6 +5050,7 @@ impl RuntimeServices {
         crate::orchestration::collaboration_coordinator::reconcile_terminal_programs_on_startup(
             self.execution_supervisor.as_ref(),
             &self.graph_state_store,
+            self.team_runtime.as_ref(),
             256,
         )
         .await

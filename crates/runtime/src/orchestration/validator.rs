@@ -272,18 +272,26 @@ fn validate_operation_shape(
             }
             if request.template_proposal.is_some()
                 && request.proposal.as_ref().is_some_and(|proposal| {
-                    proposal
+                    let team_count = proposal
                         .nodes
                         .iter()
                         .filter(|node| node.recipe == CapabilityRecipeId::Team)
-                        .count()
-                        != 1
+                        .count();
+                    if team_count == 1 {
+                        return false;
+                    }
+                    request
+                        .template_proposal
+                        .as_ref()
+                        .and_then(|proposal| proposal.get("teams"))
+                        .and_then(serde_json::Value::as_array)
+                        .is_none_or(|templates| templates.len() != team_count)
                 })
             {
                 reject(
                     status,
                     findings,
-                    "ephemeral_template_requires_exactly_one_team_node",
+                    "ephemeral_template_requires_matching_named_team_bindings",
                 );
             }
         }
@@ -779,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_propose_template_requires_exactly_one_team_node() {
+    fn custom_propose_template_requires_matching_named_team_bindings() {
         let mut command = RuntimeOrchestrationCommand {
             intent: "run a turn-scoped custom Team".to_string(),
             model_lease: None,
@@ -814,7 +822,8 @@ mod tests {
         let mut findings = Vec::new();
         validate_operation_shape(&command, &mut status, &mut findings);
         assert_eq!(status, "rejected");
-        assert!(findings.contains(&"ephemeral_template_requires_exactly_one_team_node".to_string()));
+        assert!(findings
+            .contains(&"ephemeral_template_requires_matching_named_team_bindings".to_string()));
 
         command.template_proposal = None;
         let mut status = "accepted".to_string();
