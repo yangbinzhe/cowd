@@ -1475,12 +1475,7 @@ fn projected_team_health(projections: &[Value]) -> ProjectedTeamHealth {
         .count();
     let failed_agents = agents
         .values()
-        .filter(|status| {
-            matches!(
-                status.as_str(),
-                "blocked" | "failed" | "cancelled" | "canceled"
-            )
-        })
+        .filter(|status| projected_status_name_is_failure(status))
         .count();
     let completed_teams = teams
         .values()
@@ -1577,9 +1572,26 @@ fn projected_status(value: &Value) -> Option<&str> {
 }
 
 fn projected_status_is_failure(value: &Value) -> bool {
+    projected_status(value).is_some_and(projected_status_name_is_failure)
+}
+
+/// `partial` is a durable terminal outcome, but it does not satisfy a Team's
+/// required completion contract. Treat it like every other unsuccessful
+/// terminal status so the evaluator reports the real contract gap promptly
+/// instead of polling a graph that can no longer make progress.
+fn projected_status_name_is_failure(status: &str) -> bool {
     matches!(
-        projected_status(value),
-        Some("blocked" | "failed" | "cancelled" | "canceled")
+        status,
+        "partial"
+            | "blocked"
+            | "failed"
+            | "cancelled"
+            | "canceled"
+            | "skipped"
+            | "timed_out"
+            | "timeout"
+            | "unavailable"
+            | "error"
     )
 }
 
@@ -2129,6 +2141,18 @@ mod tests {
             })],
         );
         assert!(!result.passed);
+    }
+
+    #[test]
+    fn partial_team_is_terminal_unsuccessful_not_pending_work() {
+        let health = projected_team_health(&[json!({
+            "agents": [{"id": "agent-1", "status": "completed"}],
+            "teams": [{"id": "team-1", "status": "partial"}],
+        })]);
+
+        assert_eq!(health.failed_teams, 1);
+        assert!(!health.has_pending_work());
+        assert!(!health.satisfies(1));
     }
 
     #[test]
