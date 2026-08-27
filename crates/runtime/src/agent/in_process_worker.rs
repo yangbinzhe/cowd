@@ -2925,10 +2925,15 @@ fn structured_field_materialized(
     field: harness_contract::team::TeamStructuredOutputField,
     value: Option<&serde_json::Value>,
 ) -> bool {
-    if field == harness_contract::team::TeamStructuredOutputField::Risks {
+    if matches!(
+        field,
+        harness_contract::team::TeamStructuredOutputField::Risks
+            | harness_contract::team::TeamStructuredOutputField::Unresolved
+    ) {
         // An explicit empty list is a meaningful reviewed conclusion: no
-        // risks were identified. The key must still be present; omission,
-        // null, or an empty prose string remains non-materialized.
+        // risks or unresolved work were identified. The key must still be
+        // present; omission, null, or an empty prose string remains
+        // non-materialized.
         value.is_some_and(|value| {
             matches!(value, serde_json::Value::Array(_)) || materialized_json_value(value)
         })
@@ -3342,11 +3347,7 @@ fn normalize_verified_narrative_terminal(
         .collect::<Vec<_>>();
     required_fields.sort_by_key(|field| field.as_str());
     required_fields.dedup();
-    if required_fields.is_empty()
-        || !required_fields
-            .iter()
-            .all(|field| narrative_field_can_be_normalized(*field))
-    {
+    if required_fields.is_empty() {
         return;
     }
 
@@ -3382,10 +3383,11 @@ fn narrative_field_for_requirement(
 }
 
 /// A terminal answer may carry these presentation fields as natural language
-/// after Runtime has independently verified the corresponding facts.  The
+/// after Runtime has independently verified the corresponding facts. The
 /// remaining fields represent a deliberate risk/unknown/legacy declaration;
-/// silently manufacturing one from generic prose would hide information and
-/// remains forbidden.
+/// they must already be present in the Agent's structured terminal result.
+/// A mixed contract may therefore preserve an explicit declaration while
+/// Runtime supplies only a missing presentation field such as `review`.
 const fn narrative_field_can_be_normalized(
     field: harness_contract::team::TeamStructuredOutputField,
 ) -> bool {
@@ -3408,11 +3410,7 @@ fn normalized_narrative_terminal_body(
     candidate: &str,
     fields: &[harness_contract::team::TeamStructuredOutputField],
 ) -> Option<String> {
-    if fields.is_empty()
-        || !fields
-            .iter()
-            .all(|field| narrative_field_can_be_normalized(*field))
-    {
+    if fields.is_empty() {
         return None;
     }
     let body = candidate.trim();
@@ -3428,6 +3426,13 @@ fn normalized_narrative_terminal_body(
     for field in fields {
         if structured_field_materialized(*field, output.get(field.as_str())) {
             continue;
+        }
+        // Never manufacture a risk, unknown, or decision declaration. This
+        // check is deliberately per-field: a valid explicit `unresolved: []`
+        // must not prevent Runtime from adding a receipt-backed `review` to
+        // the same terminal result.
+        if !narrative_field_can_be_normalized(*field) {
+            return None;
         }
         let value = match field {
             harness_contract::team::TeamStructuredOutputField::Findings => output
@@ -3458,7 +3463,7 @@ fn normalized_narrative_terminal_body(
             | harness_contract::team::TeamStructuredOutputField::Unresolved
             | harness_contract::team::TeamStructuredOutputField::KeyDecisions
             | harness_contract::team::TeamStructuredOutputField::UnresolvedOrRisks => {
-                return None;
+                unreachable!("non-presentation terminal fields are rejected before normalization")
             }
         };
         output.insert(field.as_str().to_string(), value);
@@ -5199,6 +5204,24 @@ mod tests {
             .is_none(),
             "Runtime must not invent an unresolved conclusion that the Agent omitted"
         );
+        let mixed_contract = normalized_narrative_terminal_body(
+            "Terminal review completed from three fresh source receipts.\n\n{\"unresolved\":[]}",
+            &[
+                TeamStructuredOutputField::Review,
+                TeamStructuredOutputField::Unresolved,
+            ],
+        )
+        .expect("an explicit unresolved declaration may coexist with a Runtime-normalized review");
+        let mixed_output =
+            serde_json::from_str::<serde_json::Value>(&mixed_contract).expect("normalized JSON");
+        assert_eq!(mixed_output["unresolved"], serde_json::json!([]));
+        assert!(structured_field_materialized(
+            TeamStructuredOutputField::Unresolved,
+            mixed_output.get("unresolved"),
+        ));
+        assert!(mixed_output["review"]
+            .as_str()
+            .is_some_and(|review| review.contains("Terminal review completed")));
         assert!(normalized_narrative_terminal_body(
             "<synthesized_terminal evidence_committed=1 />",
             &[TeamStructuredOutputField::Findings],
