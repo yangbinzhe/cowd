@@ -27,6 +27,20 @@ fn group_theory_research_scenario_enabled() -> bool {
     )
 }
 
+/// An operator may isolate named production-path scenarios without changing
+/// the default suite. This is useful for a costly, focused provider exercise
+/// whose result must not be obscured by an unrelated scenario's verdict.
+fn selected_live_scenario_ids() -> Option<BTreeSet<String>> {
+    let selected = std::env::var("COWD_EVAL_LIVE_SCENARIOS")
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    (!selected.is_empty()).then_some(selected)
+}
+
 /// Run production-path scenarios against an explicitly supplied, isolated
 /// Gateway. This runner never constructs Runtime objects or fakes receipts:
 /// every result is derived from public Gateway responses and durable messages.
@@ -278,7 +292,7 @@ impl LiveScenarioRunner {
         if group_theory_research_scenario_enabled() {
             scenario_specs.push(LiveScenarioSpec {
                 id: "live_group_theory_ai_research_simulation",
-                prompt: "这是一个必须在本次隔离执行环境中完成的深度任务：调研群论在当前 AI 中的应用，并形成可复核的测试测评方案。必须实际启动**恰好四个**协作 Team，不能把 Team 职责压缩成模型文本。Team A（数学与方法审查）负责明确群、群作用、表示、invariance/equivariance 的可证伪定义；Team B（应用调研）负责分别评估视觉/3D、科学机器学习或分子材料、机器人或控制等应用，并区分已读取证据与推断；Team C（实验与评测）负责设计并执行一个只读工具可证实的 C4 对称性保持/破坏对照，给出指标、预期、局限与复现步骤；Team D（综合与风险）必须在收到 A、B、C 的经过授权的结构化证据交接之后，比较收益、失败模式、适用边界并输出最终建议。A、B、C 可以并行；不得在三份事实交接完成前开始 D 的实质综合。不得编造论文、链接、实验结果或工具输出；无法通过本次只读工具取得的外部事实必须标为待验证。最终结论需明确包含 `C4`、列出至少三个本工作区实际读取到的完整 `crates/.../*.rs` 源码路径，并说明研究、调研、分析、处理、模拟各环节的输入/输出。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；不要调用 bash 或任何写工具。",
+                prompt: "这是一个必须在本次隔离执行环境中完成的深度任务：调研群论在当前 AI 中的应用，并形成可复核的测试测评方案。必须实际启动**恰好四个**协作 Team，不能把 Team 职责压缩成模型文本。每个 Team 恰好一个只读研究角色；不要为角色声明 `output_artifacts`、自定义 acceptance 或无资源绑定的 `evidence` 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中以实际完整 `crates/.../*.rs` 路径的 `evidence_scope` 表达。Team A（数学与方法审查）负责明确群、群作用、表示、invariance/equivariance 的可证伪定义；Team B（应用调研）负责分别评估视觉/3D、科学机器学习或分子材料、机器人或控制等应用，并区分已读取证据与推断；Team C（实验与评测）负责设计 C4 对称性保持/破坏对照的指标、预期、局限与可复现步骤（只读环境不得声称已写入或执行外部实验）；Team D（综合与风险）必须在收到 A、B、C 的经过授权的结构化证据交接之后，比较收益、失败模式、适用边界并输出最终建议。A、B、C 可以并行；不得在三份事实交接完成前开始 D 的实质综合。不得编造论文、链接、实验结果或工具输出；无法通过本次只读工具取得的外部事实必须标为待验证。最终结论需明确包含 `C4`、列出至少三个本工作区实际读取到的完整 `crates/.../*.rs` 源码路径，并说明研究、调研、分析、处理、模拟各环节的输入/输出。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 4,
                     minimum_claimed_cross_team_edges: 3,
@@ -286,6 +300,15 @@ impl LiveScenarioRunner {
                 timeout: LiveScenarioTimeout::team(),
             });
         }
+        let selected_scenario_ids = selected_live_scenario_ids();
+        let scenario_specs = scenario_specs
+            .into_iter()
+            .filter(|spec| {
+                selected_scenario_ids
+                    .as_ref()
+                    .is_none_or(|selected| selected.contains(spec.id))
+            })
+            .collect::<Vec<_>>();
         let scenarios = scenario_specs
             .into_iter()
             .map(|spec| self.run_scenario(spec))
@@ -294,11 +317,24 @@ impl LiveScenarioRunner {
             .iter()
             .filter(|scenario| scenario.get("status").and_then(Value::as_str) == Some("passed"))
             .count();
-        let collaboration_comparison = collaboration_comparison(&scenarios);
+        let comparison_requested = scenarios.iter().any(|scenario| {
+            scenario.get("scenario_id").and_then(Value::as_str)
+                == Some("live_single_architecture_baseline")
+        }) && scenarios.iter().any(|scenario| {
+            scenario.get("scenario_id").and_then(Value::as_str) == Some("live_team_projection")
+        });
+        let collaboration_comparison = comparison_requested
+            .then(|| collaboration_comparison(&scenarios))
+            .unwrap_or_else(|| {
+                json!({
+                    "status": "skipped",
+                    "reason": "baseline/team projection pair was not selected",
+                })
+            });
         let comparison_passed = collaboration_comparison
             .get("status")
             .and_then(Value::as_str)
-            == Some("passed");
+            .is_some_and(|status| matches!(status, "passed" | "skipped"));
         let metrics = aggregate_scenario_metrics(&scenarios);
         json!({
             "kind": "harness_eval.live_gateway_scenarios",
@@ -310,6 +346,7 @@ impl LiveScenarioRunner {
             "health_status": if health_passed { "passed" } else { "failed" },
             "health_observations": health_observations,
             "scenario_count": scenarios.len(),
+            "selected_scenario_ids": selected_scenario_ids,
             "passed": passed,
             "failed": scenarios.len().saturating_sub(passed),
             "metrics": metrics,

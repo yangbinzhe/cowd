@@ -7322,8 +7322,9 @@ where
                 // when it correctly recognized a retryable compiler receipt.
                 // Make the repair an explicit, bounded next-step contract so
                 // the control plane cannot terminate between diagnosis and
-                // the one permitted corrected semantic submission.
-                if state.team_orchestration_requests < 1 {
+                // the corrected semantic submissions permitted for this root
+                // admission.
+                if state.team_orchestration_requests < ROOT_CONTROL_PLANE_REPAIR_BUDGET {
                     state.team_orchestration_requests =
                         state.team_orchestration_requests.saturating_add(1);
                     state.force_tool_allowlist_next_model = Some(BTreeSet::from([
@@ -7331,7 +7332,9 @@ where
                             .to_string(),
                     ]));
                     let reason = format!(
-                        "Runtime requires one corrected semantic collaboration submission now. The only retryable compiler diagnostic is `{diagnostic}`. Call submit_collaboration_decision in this next response with a complete replacement decision; repair exactly the diagnostic's field paths and allowed repairs, preserve valid workstreams, and do not write a conclusion or invoke any other tool."
+                        "Runtime requires a corrected semantic collaboration submission now (bounded attempt {}/{}). The only retryable compiler diagnostic is `{diagnostic}`. Call submit_collaboration_decision in this next response with a complete replacement decision; repair exactly the diagnostic's field paths and allowed repairs, preserve valid workstreams, and do not write a conclusion or invoke any other tool.",
+                        state.team_orchestration_requests,
+                        ROOT_CONTROL_PLANE_REPAIR_BUDGET,
                     );
                     let mut item = ContextItem::new(
                         format!("runtime-root-collaboration-repair:{}", ticket.node_id),
