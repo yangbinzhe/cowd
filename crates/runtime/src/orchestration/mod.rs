@@ -2688,6 +2688,40 @@ fn result_from_outcome(
         decision.validation_findings.sort();
         decision.validation_findings.dedup();
     }
+    // A graph-level admission failure is distinct from a compiler rejection:
+    // its decision id now names an immutable, terminal Program.  Retrying the
+    // same id merely replays that Program, so return a typed recovery contract
+    // that tells the root control plane to create a fresh semantic decision.
+    if outcome.status == "blocked"
+        && outcome
+            .execution
+            .get("collaboration_diagnostics")
+            .and_then(Value::as_array)
+            .is_some_and(|diagnostics| !diagnostics.is_empty())
+    {
+        let mut failure_kinds = outcome
+            .execution
+            .get("collaboration_diagnostics")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|diagnostic| diagnostic.get("failure_kind").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        failure_kinds.sort();
+        failure_kinds.dedup();
+        decision.recovery_hints.push(RecoveryHint {
+            code: "collaboration_terminal_program_replan".to_string(),
+            message: format!(
+                "The submitted Program reached a terminal admission failure ({}). Repair the semantic fields and resubmit a complete replacement with a fresh decision_id; the previous decision_id is immutable.",
+                if failure_kinds.is_empty() {
+                    "unspecified".to_string()
+                } else {
+                    failure_kinds.join(", ")
+                }
+            ),
+            retryable: true,
+        });
+    }
     let mut evidence = outcome.evidence;
     if let Some(lease_id) = decision
         .budget

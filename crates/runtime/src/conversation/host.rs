@@ -7331,10 +7331,17 @@ where
                         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
                             .to_string(),
                     ]));
+                    let terminal_program_replan =
+                        diagnostic == "collaboration_terminal_program_replan";
                     let reason = format!(
-                        "Runtime requires a corrected semantic collaboration submission now (bounded attempt {}/{}). The only retryable compiler diagnostic is `{diagnostic}`. Call submit_collaboration_decision in this next response with a complete replacement decision; repair exactly the diagnostic's field paths and allowed repairs, preserve valid workstreams, and do not write a conclusion or invoke any other tool.",
+                        "Runtime requires a corrected semantic collaboration submission now (bounded attempt {}/{}). The retryable Runtime diagnostic is `{diagnostic}`. Call submit_collaboration_decision in this next response with a complete replacement decision; repair exactly the diagnostic's field paths and allowed repairs, preserve valid workstreams, {}and do not write a conclusion or invoke any other tool.",
                         state.team_orchestration_requests,
                         ROOT_CONTROL_PLANE_REPAIR_BUDGET,
+                        if terminal_program_replan {
+                            "use a fresh unique decision_id because the previous Program is terminal, "
+                        } else {
+                            "retain the current decision_id because no Program was admitted, "
+                        },
                     );
                     let mut item = ContextItem::new(
                         format!("runtime-root-collaboration-repair:{}", ticket.node_id),
@@ -11042,10 +11049,10 @@ fn failed_tool_names(messages: &[ConversationMessage]) -> Vec<String> {
     names
 }
 
-/// Return the one bounded, model-repairable compiler diagnostic from a failed
-/// semantic admission receipt.  Gateway deliberately exposes this compact
-/// receipt instead of an executable graph, so this parser must use the typed
-/// recovery hint rather than infer state from prose.
+/// Return the one bounded, model-repairable semantic admission diagnostic from
+/// a failed receipt. Gateway deliberately exposes this compact receipt instead
+/// of an executable graph, so this parser uses typed recovery hints rather
+/// than inferring state from provider prose.
 fn retryable_collaboration_compile_diagnostic(messages: &[ConversationMessage]) -> Option<String> {
     messages
         .iter()
@@ -11075,7 +11082,10 @@ fn retryable_collaboration_compile_diagnostic(messages: &[ConversationMessage]) 
                                 == Some(true))
                             .then(|| hint.get("code").and_then(serde_json::Value::as_str))
                             .flatten()
-                            .filter(|code| code.starts_with("collaboration_compile_"))
+                            .filter(|code| {
+                                code.starts_with("collaboration_compile_")
+                                    || *code == "collaboration_terminal_program_replan"
+                            })
                             .map(str::to_string)
                         })
                     })
@@ -17315,6 +17325,20 @@ mod tests {
         assert_eq!(
             retryable_collaboration_compile_diagnostic(&messages).as_deref(),
             Some("collaboration_compile_completion_terminal_role_missing")
+        );
+    }
+
+    #[test]
+    fn terminal_program_replan_receipt_is_identified_without_parsing_provider_prose() {
+        let messages = vec![ConversationMessage::tool_result(
+            "team",
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+            r#"runtime orchestration blocked: {"kind":"runtime_orchestration_rejected","recovery_hints":[{"code":"collaboration_terminal_program_replan","retryable":true}]}"#,
+            true,
+        )];
+        assert_eq!(
+            retryable_collaboration_compile_diagnostic(&messages).as_deref(),
+            Some("collaboration_terminal_program_replan")
         );
     }
 

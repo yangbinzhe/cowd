@@ -176,6 +176,7 @@ pub fn compile_turn_scoped_intent(
             )
             .into());
         }
+        validate_concrete_evidence_scopes(workstream_index, workstream, services)?;
         let compiled_team = compile_team(
             workstream_index,
             &workstream.workstream_id,
@@ -286,6 +287,91 @@ pub fn compile_turn_scoped_intent(
         template_proposal: serde_json::json!({ "teams": team_entries }),
         semantic_intent,
     })
+}
+
+/// Evidence scopes become root-node resource leases.  Reject a malformed or
+/// unavailable source here, before a Program graph and its decision identity
+/// are persisted.  Otherwise a literal glob can pass semantic lowering and
+/// only fail while the scheduler acquires a resource, leaving a terminal
+/// Program that a corrected submission cannot replace under the same
+/// decision id.
+fn validate_concrete_evidence_scopes(
+    workstream_index: usize,
+    workstream: &harness_contract::orchestration::ModelCollaborationWorkstreamV2,
+    services: &RuntimeServices,
+) -> Result<(), IntentCompilerError> {
+    let criteria = workstream
+        .evidence_contract
+        .iter()
+        .enumerate()
+        .map(|(index, criterion)| {
+            (
+                format!("workstreams[{workstream_index}].evidence_contract[{index}]"),
+                criterion,
+            )
+        })
+        .chain(workstream.team.roles.iter().enumerate().flat_map(|(role_index, role)| {
+            role.acceptance.iter().enumerate().map(move |(criterion_index, criterion)| {
+                (
+                    format!(
+                        "workstreams[{workstream_index}].team.roles[{role_index}].acceptance[{criterion_index}]"
+                    ),
+                    criterion,
+                )
+            })
+        }));
+    for (field_path, criterion) in criteria {
+        let ModelSemanticAcceptanceCriterion::EvidenceScope {
+            operation,
+            resource,
+        } = criterion
+        else {
+            continue;
+        };
+        let operation = operation.trim();
+        let resource = resource.trim();
+        if !matches!(operation, "read" | "list" | "recursive" | "glob") {
+            let mut diagnostic = CollaborationCompileDiagnostic::validation(
+                "evidence_scope_operation_unsupported",
+                format!("{field_path}.operation"),
+            );
+            diagnostic.semantic_ids = vec![workstream.workstream_id.clone(), operation.to_string()];
+            diagnostic.allowed_repairs = vec![
+                "use_read_list_recursive_or_glob_operation".to_string(),
+                "supply_concrete_existing_workspace_resource".to_string(),
+            ];
+            return Err(diagnostic.into());
+        }
+        if resource.is_empty() || resource.contains(['*', '?', '[', ']', '{', '}']) {
+            let mut diagnostic = CollaborationCompileDiagnostic::validation(
+                "evidence_scope_resource_must_be_concrete",
+                format!("{field_path}.resource"),
+            );
+            diagnostic.semantic_ids = vec![workstream.workstream_id.clone(), resource.to_string()];
+            diagnostic.allowed_repairs = vec![
+                "replace_glob_with_one_existing_workspace_path".to_string(),
+                "use_multiple_evidence_scope_criteria_for_multiple_sources".to_string(),
+            ];
+            return Err(diagnostic.into());
+        }
+        if services
+            .path_identity_resolver()
+            .compile_obligation(&format!("{operation}:{resource}"))
+            .is_err()
+        {
+            let mut diagnostic = CollaborationCompileDiagnostic::validation(
+                "evidence_scope_resource_unavailable",
+                format!("{field_path}.resource"),
+            );
+            diagnostic.semantic_ids = vec![workstream.workstream_id.clone(), resource.to_string()];
+            diagnostic.allowed_repairs = vec![
+                "replace_with_one_existing_workspace_path".to_string(),
+                "remove_the_unavailable_evidence_scope".to_string(),
+            ];
+            return Err(diagnostic.into());
+        }
+    }
+    Ok(())
 }
 
 fn validate_workstream_artifact_contract(
@@ -1131,6 +1217,15 @@ mod tests {
         }
     }
 
+    fn install_source_fixture(services: &RuntimeServices) {
+        let source = services
+            .workspace_root()
+            .join("crates/runtime/src/orchestration/mod.rs");
+        std::fs::create_dir_all(source.parent().expect("source parent"))
+            .expect("source fixture directory");
+        std::fs::write(&source, "// source fixture").expect("source fixture");
+    }
+
     #[test]
     fn arbitrary_localized_role_id_becomes_a_stable_machine_id() {
         assert_eq!(
@@ -1162,6 +1257,7 @@ mod tests {
     #[test]
     fn compiles_arbitrary_role_names_to_exact_bound_snapshot() {
         let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
         let compiled = compile_turn_scoped_intent(&request(), &decision(), &services)
             .expect("semantic compilation");
         let roles = &compiled.template_proposal["teams"][0]["template"]["roles"];
@@ -1198,8 +1294,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_glob_evidence_scope_before_program_admission() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut invalid = decision();
+        invalid.workstreams[0].team.roles[0].acceptance =
+            vec![ModelSemanticAcceptanceCriterion::EvidenceScope {
+                operation: "read".to_string(),
+                resource: "crates/**/*.rs".to_string(),
+            }];
+
+        let error = compile_turn_scoped_intent(&request(), &invalid, &services)
+            .expect_err("wildcard source scopes must fail before graph creation");
+        let IntentCompilerError::Diagnostic(diagnostic) = error else {
+            panic!("expected semantic diagnostic");
+        };
+        assert_eq!(diagnostic.code, "evidence_scope_resource_must_be_concrete");
+        assert_eq!(
+            diagnostic.field_paths,
+            vec!["workstreams[0].team.roles[0].acceptance[0].resource"]
+        );
+    }
+
+    #[test]
+    fn rejects_unavailable_evidence_scope_before_program_admission() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut invalid = decision();
+        invalid.workstreams[0].team.roles[0].acceptance =
+            vec![ModelSemanticAcceptanceCriterion::EvidenceScope {
+                operation: "read".to_string(),
+                resource: "crates/runtime/src/does-not-exist.rs".to_string(),
+            }];
+
+        let error = compile_turn_scoped_intent(&request(), &invalid, &services)
+            .expect_err("missing source scopes must fail before graph creation");
+        let IntentCompilerError::Diagnostic(diagnostic) = error else {
+            panic!("expected semantic diagnostic");
+        };
+        assert_eq!(diagnostic.code, "evidence_scope_resource_unavailable");
+        assert_eq!(
+            diagnostic.field_paths,
+            vec!["workstreams[0].team.roles[0].acceptance[0].resource"]
+        );
+    }
+
+    #[test]
     fn workstream_artifact_contract_must_match_the_team_terminal_result() {
         let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
         let mut invalid = decision();
         invalid.workstreams[0]
             .evidence_contract
@@ -1226,6 +1367,7 @@ mod tests {
     #[test]
     fn terminal_result_artifacts_become_terminal_role_acceptance() {
         let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
         let mut valid = decision();
         valid.workstreams[0]
             .evidence_contract
@@ -1252,6 +1394,7 @@ mod tests {
     #[test]
     fn rejects_unknown_tool_without_role_or_builtin_fallback() {
         let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
         let mut invalid = decision();
         invalid.workstreams[0].team.roles[0].required_tools = vec!["nonexistent_tool".to_string()];
         let error = compile_turn_scoped_intent(&request(), &invalid, &services)
@@ -1263,6 +1406,7 @@ mod tests {
     #[test]
     fn rejects_missing_skill_without_substituting_an_agent() {
         let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
         let mut invalid = decision();
         invalid.workstreams[0].team.roles[0].required_skills = vec!["skill/unknown@1".to_string()];
         let error = compile_turn_scoped_intent(&request(), &invalid, &services)
