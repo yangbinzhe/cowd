@@ -47,6 +47,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const PROVIDER_PROTOCOL_RECOVERY_BUDGET: u8 = 1;
+/// A provider can legally return prose despite a named-tool wire constraint.
+/// Permit two bounded root admission repairs before reporting a durable
+/// incomplete result. This budget applies only before any Team Program exists;
+/// it never expands follow-up Team authority after a collaboration starts.
+const ROOT_CONTROL_PLANE_REPAIR_BUDGET: usize = 2;
 
 /// The root collaboration contract has a deliberately small, durable control
 /// plane. Capability discovery is useful, but it must not satisfy the action
@@ -2603,10 +2608,10 @@ fn team_orchestration_request_available(
     collaboration_started: bool,
     team_orchestration_requests: usize,
 ) -> bool {
-    if team_orchestration_requests >= 1 {
-        return false;
+    if !collaboration_started {
+        return team_orchestration_requests < ROOT_CONTROL_PLANE_REPAIR_BUDGET;
     }
-    !collaboration_started || objective_requests_followup_team(objective)
+    team_orchestration_requests == 0 && objective_requests_followup_team(objective)
 }
 
 fn required_team_execution_count_for_execution_context(
@@ -3215,7 +3220,7 @@ struct TurnGraphState {
     collaboration_started: bool,
     collaboration_committed_write: bool,
     /// A root Turn that was explicitly required to collaborate but exhausted
-    /// its one control-plane repair records this durable receipt only after
+    /// its bounded root control-plane repairs records this durable receipt only after
     /// the model node itself commits. It is intentionally distinct from a
     /// collaboration Program receipt: no Program was admitted.
     pending_root_control_plane_receipt: Option<String>,
@@ -4925,12 +4930,14 @@ where
                         if verified_team_executions < required_team_executions {
                             state.assistant_messages.pop();
                             state.pending_transcript.remove(&ticket.node_id);
-                            // A required control-plane proposal gets exactly
-                            // one Runtime-owned repair. Repeating the same
-                            // root prompt a second time only burns another
-                            // model round and cannot create a durable Program
-                            // without the native receipt.
-                            if state.team_orchestration_requests < 1 {
+                            // Compatibility providers can return prose even
+                            // with a named-tool wire constraint. Retry the
+                            // Runtime-owned semantic admission a small,
+                            // explicit number of times before reporting the
+                            // missing native receipt; no retry creates a
+                            // hidden Program.
+                            if state.team_orchestration_requests < ROOT_CONTROL_PLANE_REPAIR_BUDGET
+                            {
                                 state.team_orchestration_requests =
                                     state.team_orchestration_requests.saturating_add(1);
                                 let catalog_hint = self
@@ -4967,13 +4974,14 @@ where
                                     .collect::<Vec<_>>()
                                     .join("；");
                                 let reason = format!(
-                                    "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请提交一次 submit_collaboration_decision：只填写本任务的独立 workstreams、它们的 depends_on、objective、evidence_contract 与必要 focuses；Runtime 会绑定模板、身份、权限与物理图。不要输出总结文本，也不要发送 runtime_orchestrate 的完整图提案（尝试 {}）。",
+                                "团队编排尚未完成：当前 turn 还没有任何已验证的团队执行。{}请提交一次 submit_collaboration_decision：只填写本任务的独立 workstreams、它们的 depends_on、objective、evidence_contract 与必要 focuses；Runtime 会绑定模板、身份、权限与物理图。不要输出总结文本，也不要发送 runtime_orchestrate 的完整图提案（受控尝试 {}/{}）。",
                                     if catalog_hint.is_empty() {
                                         String::new()
                                     } else {
                                         format!("当前已发布的用户模板：{catalog_hint}。")
                                     },
-                                    state.team_orchestration_requests
+                                    state.team_orchestration_requests,
+                                    ROOT_CONTROL_PLANE_REPAIR_BUDGET,
                                 );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&reason);
@@ -5008,7 +5016,7 @@ where
                                 )];
                             }
                             let reason = format!(
-                                "missing_control_plane_proposal: explicit Team acceptance is incomplete after one required control-plane repair; verified {verified_team_executions} of {required_team_executions} required Team execution(s)"
+                                "missing_control_plane_proposal: explicit Team acceptance is incomplete after {ROOT_CONTROL_PLANE_REPAIR_BUDGET} bounded control-plane repairs; verified {verified_team_executions} of {required_team_executions} required Team execution(s)"
                             );
                             state.pending_root_control_plane_receipt = Some(reason.clone());
                             state.terminal_override =
@@ -15346,6 +15354,16 @@ mod tests {
             "必须启动 Team 完成一次架构审查",
             false,
             0
+        ));
+        assert!(team_orchestration_request_available(
+            "必须启动 Team 完成一次架构审查",
+            false,
+            1
+        ));
+        assert!(!team_orchestration_request_available(
+            "必须启动 Team 完成一次架构审查",
+            false,
+            ROOT_CONTROL_PLANE_REPAIR_BUDGET
         ));
         assert_eq!(
             required_team_execution_count_for_execution_context(2, true, false),
