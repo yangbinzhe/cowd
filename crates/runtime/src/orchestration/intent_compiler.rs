@@ -183,9 +183,26 @@ pub fn compile_turn_scoped_intent(
             &catalog,
             request.constraints.permission_ceiling,
         )?;
+        validate_workstream_artifact_contract(
+            workstream_index,
+            workstream,
+            &compiled_team.template.result_fields,
+        )?;
         let mut evidence_contract = workstream
             .evidence_contract
             .iter()
+            // A Team snapshot owns its terminal artifact/structured-output
+            // contract.  Copying every workstream criterion into the parent
+            // Team-node acceptance created a second, conflicting contract:
+            // DeepSeek could satisfy the role snapshot but the Team verifier
+            // later demanded an unrelated `unresolved` field.  Only source
+            // scope criteria are root-node lease requirements.
+            .filter(|criterion| {
+                matches!(
+                    criterion,
+                    ModelSemanticAcceptanceCriterion::EvidenceScope { .. }
+                )
+            })
             .map(criterion_key)
             .collect::<Vec<_>>();
         // Role-local scope requirements must be promoted to the Team lease so
@@ -269,6 +286,32 @@ pub fn compile_turn_scoped_intent(
         template_proposal: serde_json::json!({ "teams": team_entries }),
         semantic_intent,
     })
+}
+
+fn validate_workstream_artifact_contract(
+    workstream_index: usize,
+    workstream: &harness_contract::orchestration::ModelCollaborationWorkstreamV2,
+    team_result_fields: &[String],
+) -> Result<(), IntentCompilerError> {
+    for (criterion_index, criterion) in workstream.evidence_contract.iter().enumerate() {
+        let ModelSemanticAcceptanceCriterion::Artifact { artifact } = criterion else {
+            continue;
+        };
+        if team_result_fields.iter().any(|field| field == artifact) {
+            continue;
+        }
+        let mut diagnostic = CollaborationCompileDiagnostic::validation(
+            "workstream_artifact_not_in_team_result",
+            format!("workstreams[{workstream_index}].evidence_contract[{criterion_index}]"),
+        );
+        diagnostic.semantic_ids = vec![workstream.workstream_id.clone(), artifact.clone()];
+        diagnostic.allowed_repairs = vec![
+            "add_artifact_to_team_result_and_terminal_role_output".to_string(),
+            "remove_nonterminal_workstream_artifact_criterion".to_string(),
+        ];
+        return Err(diagnostic.into());
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1135,6 +1178,32 @@ mod tests {
         assert_eq!(
             compiled.semantic_intent.lifecycle,
             CollaborationIntentLifecycle::TurnScoped
+        );
+    }
+
+    #[test]
+    fn workstream_artifact_contract_must_match_the_team_terminal_result() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut invalid = decision();
+        invalid.workstreams[0]
+            .evidence_contract
+            .push(ModelSemanticAcceptanceCriterion::Artifact {
+                artifact: "unresolved".to_string(),
+            });
+
+        let error = compile_turn_scoped_intent(&request(), &invalid, &services)
+            .expect_err("a workstream cannot demand an artifact the Team never emits");
+        let diagnostic = match error {
+            IntentCompilerError::Diagnostic(diagnostic) => diagnostic,
+            other => panic!("expected semantic diagnostic, got {other}"),
+        };
+        assert_eq!(diagnostic.code, "workstream_artifact_not_in_team_result");
+        assert_eq!(
+            diagnostic.allowed_repairs,
+            vec![
+                "add_artifact_to_team_result_and_terminal_role_output",
+                "remove_nonterminal_workstream_artifact_criterion",
+            ]
         );
     }
 

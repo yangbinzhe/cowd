@@ -331,9 +331,64 @@ pub async fn submit_collaboration_escalation(
     let mut patch = escalation.as_add_team_patch(program_id);
     if let Some(template_proposal) = escalation.template_proposal.clone() {
         attach_escalated_ephemeral_template(&graph, &mut patch, template_proposal, services)?;
+    } else {
+        attach_source_ephemeral_template_for_escalation(
+            &graph,
+            expected_source_attempt,
+            &mut patch,
+        )?;
     }
     submit_attested_collaboration_intent_patch(graph_id, expected_source_attempt, &patch, services)
         .await
+}
+
+/// An Agent-triggered follow-up is an additive Program revision, not a new
+/// model template-selection opportunity.  When its source Team was a
+/// turn-scoped custom Team, clone that already-frozen snapshot onto the
+/// follow-up patch.  The older implementation attempted to recover a catalog
+/// selector from an arbitrary root seed and rejected every such escalation
+/// with `patch_target_seed_has_ephemeral_template_selector`.
+fn attach_source_ephemeral_template_for_escalation(
+    graph: &ExecutionGraph,
+    expected_source_attempt: &str,
+    patch: &mut harness_contract::execution_graph::CollaborationIntentPatch,
+) -> Result<(), String> {
+    let harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam { team } =
+        &mut patch.operation
+    else {
+        return Err("escalation_source_template_requires_add_team_operation".to_string());
+    };
+    if team.ephemeral_template.is_some() {
+        return Err("escalation_source_template_snapshot_must_be_runtime_owned".to_string());
+    }
+    let source_seed = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+                &node.payload_ref,
+            )
+            .ok()
+        })
+        .filter(|request| {
+            expected_source_attempt.starts_with(&format!("team-graph:{}:", request.team_id))
+        })
+        .collect::<Vec<_>>();
+    let [source_seed] = source_seed.as_slice() else {
+        return Err("escalation_source_attempt_has_no_unique_parent_team_seed".to_string());
+    };
+    if !expected_source_attempt
+        .strip_prefix(&format!("team-graph:{}:", source_seed.team_id))
+        .is_some_and(|suffix| suffix.rsplit_once(":attempt:").is_some())
+    {
+        return Err("escalation_source_attempt_is_not_a_fenced_team_agent_attempt".to_string());
+    }
+    if let harness_contract::team::TeamTemplateSelector::Ephemeral { snapshot } =
+        &source_seed.template_selector
+    {
+        team.ephemeral_template = Some((**snapshot).clone());
+    }
+    Ok(())
 }
 
 fn attach_escalated_ephemeral_template(
@@ -4543,6 +4598,68 @@ mod tests {
             .as_ref()
             .and_then(|metadata| metadata.collaboration_program.as_ref())
             .expect("registered Program");
+        let source_seed = registered
+            .nodes
+            .iter()
+            .find_map(|node| {
+                serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+                    &node.payload_ref,
+                )
+                .ok()
+            })
+            .expect("registered source Team request");
+        let source_attempt = format!(
+            "team-graph:{}:role-evidence-researcher:1:attempt:1",
+            source_seed.team_id
+        );
+        let recovery_escalation =
+            harness_contract::execution_graph::CollaborationEscalationRequest {
+                base_revision: program.revision,
+                source_attempt: source_attempt.clone(),
+                request_kind: "add_team".to_string(),
+                reason: "independent evidence review is required".to_string(),
+                evidence_refs: Vec::new(),
+                digest: "c".repeat(64),
+                requested_add_team: Some(
+                    harness_contract::execution_graph::CollaborationEscalationAddTeam {
+                        semantic_node_id: "runtime-derived-review".to_string(),
+                        objective: "independently review the bounded research evidence".to_string(),
+                        depends_on: vec!["research".to_string()],
+                        resource_scopes: vec!["network:*".to_string()],
+                        output_artifacts: vec!["independent-review".to_string()],
+                        evidence_contract: vec!["summary".to_string(), "evidence".to_string()],
+                        required: true,
+                        parallelism_hint: 1,
+                    },
+                ),
+                template_proposal: None,
+            };
+        let mut recovery_patch = recovery_escalation.as_add_team_patch(program.program_id.clone());
+        attach_source_ephemeral_template_for_escalation(
+            &registered,
+            &source_attempt,
+            &mut recovery_patch,
+        )
+        .expect("managed escalation inherits the source immutable snapshot");
+        let runtime_derived = match &recovery_patch.operation {
+            harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam {
+                team,
+            } => team,
+            _ => unreachable!("escalation creates an AddTeam patch"),
+        };
+        assert_eq!(
+            runtime_derived
+                .ephemeral_template
+                .as_ref()
+                .expect("source snapshot is copied")
+                .template_digest,
+            match &source_seed.template_selector {
+                harness_contract::team::TeamTemplateSelector::Ephemeral { snapshot } => {
+                    snapshot.template_digest.clone()
+                }
+                _ => panic!("custom source Team must retain its ephemeral snapshot"),
+            }
+        );
         let escalation = harness_contract::execution_graph::CollaborationEscalationRequest {
             base_revision: program.revision,
             source_attempt: "team-agent:research:attempt:1".to_string(),
