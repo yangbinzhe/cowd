@@ -9,6 +9,7 @@ use harness_contract::execution_graph::{
     CollaborationProgramLifecycle, ExecutionEdge, ExecutionGraph, ExecutionGraphCommand,
     TeamAdmissionObligation, TeamAdmissionState,
 };
+use sha2::{Digest, Sha256};
 
 use crate::execution_core::ExecutionStateStoreError;
 use crate::{ExecutionGraphStateStore, RuntimeExecutionSupervisor, RuntimeServices, TeamRuntime};
@@ -884,7 +885,522 @@ pub(crate) async fn reconcile_terminal_program(
         services.execution_supervisor().as_ref(),
         services.graph_state_store(),
     )
-    .await
+    .await?;
+    record_terminal_experience_episode(graph_id, services).await
+}
+
+async fn record_terminal_experience_episode(
+    graph_id: &str,
+    services: &RuntimeServices,
+) -> Result<(), String> {
+    let graph = services
+        .graph_state_store()
+        .load_async(graph_id)
+        .await
+        .map_err(|error| format!("experience_episode_graph_load_failed:{error}"))?;
+    let Some(program) = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+    else {
+        return Ok(());
+    };
+    if !program.control.lifecycle.is_terminal() {
+        return Ok(());
+    }
+    let episode = terminal_experience_episode(&graph, program, services.workspace_key());
+    let stream_id = format!("evolution:experience:{}", episode.episode_id);
+    let store = services.event_store();
+    store
+        .append_transaction(crate::AppendTransactionRequest {
+            // A terminal Program revision has exactly one episode. The stable
+            // transaction id makes normal retry and restart converge before
+            // the stream revision is evaluated.
+            transaction_id: format!("collaboration-experience:{}", episode.episode_id),
+            expected_streams: vec![crate::ExpectedStreamRevision {
+                stream_id: stream_id.clone(),
+                // An episode stream is private to one deterministic terminal
+                // Program revision and therefore has exactly one event. Keep
+                // this expectation stable so a crash replay has the identical
+                // request hash; a foreign extra event fails closed as stale.
+                expected_revision: 0,
+            }],
+            events: vec![crate::RuntimeTransactionEventInput {
+                event: crate::RuntimeEventInput {
+                    stream_id: stream_id.clone(),
+                    scope: crate::RuntimeEventScope::Evolution,
+                    kind: "evolution.collaboration_experience.recorded.v1".to_string(),
+                    status: Some(
+                        if episode.is_pattern_eligible() {
+                            "eligible"
+                        } else {
+                            "ineligible"
+                        }
+                        .to_string(),
+                    ),
+                    actor: Some("collaboration-terminal-projector".to_string()),
+                    refs: vec![crate::RuntimeEventRef {
+                        kind: "collaboration_program".to_string(),
+                        id: program.program_id.clone(),
+                    }],
+                    payload: serde_json::json!({"episode": episode}),
+                },
+                idempotency_key: Some(format!("episode:{}", episode.episode_id)),
+                schema_version: 1,
+            }],
+        })
+        .map_err(|error| format!("experience_episode_append_failed:{error}"))?;
+    refresh_collaboration_semantic_patterns(services)
+}
+
+/// Rebuild advisory pattern aggregates from the durable terminal episode
+/// family. This is intentionally a projection, not a planner or scheduler:
+/// it can only write a name-free summary after three distinct eligible turns.
+fn refresh_collaboration_semantic_patterns(services: &RuntimeServices) -> Result<(), String> {
+    let store = services.event_store();
+    let events = store
+        .replay_scope_kind(
+            crate::RuntimeEventScope::Evolution,
+            "evolution.collaboration_experience.recorded.v1",
+        )
+        .map_err(|error| format!("experience_pattern_replay_failed:{error}"))?;
+    let mut episodes_by_signature = std::collections::BTreeMap::<
+        String,
+        std::collections::BTreeMap<
+            String,
+            harness_contract::evolution::CollaborationExperienceEpisode,
+        >,
+    >::new();
+    for event in events {
+        let Some(value) = event.payload.get("episode") else {
+            continue;
+        };
+        let Ok(episode) = serde_json::from_value::<
+            harness_contract::evolution::CollaborationExperienceEpisode,
+        >(value.clone()) else {
+            continue;
+        };
+        if !episode.is_pattern_eligible() {
+            continue;
+        }
+        episodes_by_signature
+            .entry(episode.semantic_signature.digest())
+            .or_default()
+            .insert(episode.episode_id.clone(), episode);
+    }
+    for (signature_digest, episodes) in episodes_by_signature {
+        let Some(first) = episodes.values().next() else {
+            continue;
+        };
+        let qualifying_episode_ids = episodes.keys().cloned().collect::<Vec<_>>();
+        let distinct_turn_ref_hashes = episodes
+            .values()
+            .map(|episode| episode.turn_ref_hash.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let pattern = harness_contract::evolution::CollaborationSemanticPattern {
+            schema_version: harness_contract::evolution::COLLABORATION_PATTERN_SCHEMA_VERSION,
+            pattern_id: harness_contract::evolution::CollaborationSemanticPattern::deterministic_id(
+                &signature_digest,
+            ),
+            pattern_revision: qualifying_episode_ids.len().min(u64::MAX as usize) as u64,
+            signature_digest,
+            semantic_signature: first.semantic_signature.clone().normalized(),
+            semantic_suggestion: harness_contract::evolution::SemanticCollaborationSuggestion {
+                required_capability_ids: first.semantic_signature.required_capability_ids.clone(),
+                required_skill_ids: first.semantic_signature.required_skill_ids.clone(),
+                required_tool_capabilities: first
+                    .semantic_signature
+                    .required_tool_capabilities
+                    .clone(),
+                dependency_shapes: first.semantic_signature.dependency_shapes.clone(),
+                acceptance_kinds: first.semantic_signature.acceptance_kinds.clone(),
+                result_field_shapes: first.semantic_signature.result_field_shapes.clone(),
+            },
+            evidence_summary: harness_contract::evolution::PatternEvidenceSummary {
+                eligible_episode_count: qualifying_episode_ids.len().min(u32::MAX as usize) as u32,
+                distinct_turn_count: distinct_turn_ref_hashes.len().min(u32::MAX as usize) as u32,
+                evidence_ref_count: episodes
+                    .values()
+                    .flat_map(|episode| episode.evidence_refs.iter())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    .min(u32::MAX as usize) as u32,
+                coverage_basis_points: 10_000,
+            },
+            lifecycle: harness_contract::evolution::SemanticPatternLifecycle::Advisory,
+            support_count: qualifying_episode_ids.len().min(u32::MAX as usize) as u32,
+            qualifying_episode_ids,
+            distinct_turn_ref_hashes,
+            latest_completed_at_ms: episodes
+                .values()
+                .map(|episode| episode.completed_at_ms)
+                .max()
+                .unwrap_or_default(),
+        };
+        if !pattern.is_actionable() {
+            continue;
+        }
+        let stream_id = format!("evolution:pattern:{}", pattern.pattern_id);
+        let payload = serde_json::json!({"pattern": pattern});
+        let payload_digest = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                serde_json::to_vec(&payload)
+                    .map_err(|error| format!("experience_pattern_payload_failed:{error}"))?
+            )
+        );
+        let existing = store
+            .list_stream(&stream_id)
+            .map_err(|error| format!("experience_pattern_stream_read_failed:{error}"))?;
+        if existing
+            .last()
+            .is_some_and(|event| event.payload == payload)
+        {
+            continue;
+        }
+        let mut appended = false;
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let expected_revision = store
+                .stream_revision(&stream_id)
+                .map_err(|error| format!("experience_pattern_stream_revision_failed:{error}"))?;
+            match store.append_transaction(crate::AppendTransactionRequest {
+                transaction_id: format!("collaboration-pattern:{}:{}", stream_id, payload_digest),
+                expected_streams: vec![crate::ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision,
+                }],
+                events: vec![crate::RuntimeTransactionEventInput {
+                    event: crate::RuntimeEventInput {
+                        stream_id: stream_id.clone(),
+                        scope: crate::RuntimeEventScope::Evolution,
+                        kind: "evolution.collaboration_pattern.projected.v1".to_string(),
+                        status: Some("advisory".to_string()),
+                        actor: Some("collaboration-experience-projector".to_string()),
+                        refs: Vec::new(),
+                        payload: payload.clone(),
+                    },
+                    idempotency_key: Some(format!("pattern:{payload_digest}")),
+                    schema_version: 1,
+                }],
+            }) {
+                Ok(_) => {
+                    appended = true;
+                    break;
+                }
+                Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => continue,
+                Err(error) => {
+                    return Err(format!("experience_pattern_append_failed:{error}"));
+                }
+            }
+        }
+        if !appended {
+            return Err("experience_pattern_projection_conflict_exhausted".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn terminal_experience_episode(
+    graph: &ExecutionGraph,
+    program: &CollaborationProgram,
+    reference_salt: &str,
+) -> harness_contract::evolution::CollaborationExperienceEpisode {
+    let intent = program.semantic_intent.as_ref();
+    let mut workstream_shapes = intent
+        .map(|intent| {
+            intent
+                .teams
+                .iter()
+                .enumerate()
+                .map(|(ordinal, team)| {
+                    let roles = &team.roles;
+                    harness_contract::evolution::SemanticWorkstreamShape {
+                        ordinal: ordinal.min(u16::MAX as usize) as u16,
+                        multiplicity_min: 1,
+                        multiplicity_max: 1,
+                        required_capability_ids: roles
+                            .iter()
+                            .flat_map(|role| role.required_capabilities.clone())
+                            .collect(),
+                        required_skill_ids: roles
+                            .iter()
+                            .flat_map(|role| role.required_skills.clone())
+                            .collect(),
+                        required_tool_capabilities: roles
+                            .iter()
+                            .flat_map(|role| role.required_tools.clone())
+                            .collect(),
+                        acceptance_kinds: Vec::new(),
+                        result_field_shapes: roles
+                            .iter()
+                            .flat_map(|role| role.output_artifacts.clone())
+                            .collect(),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut capability_ids = workstream_shapes
+        .iter()
+        .flat_map(|shape| shape.required_capability_ids.clone())
+        .collect::<Vec<_>>();
+    let mut skill_ids = workstream_shapes
+        .iter()
+        .flat_map(|shape| shape.required_skill_ids.clone())
+        .collect::<Vec<_>>();
+    let mut tool_ids = workstream_shapes
+        .iter()
+        .flat_map(|shape| shape.required_tool_capabilities.clone())
+        .collect::<Vec<_>>();
+    let mut result_shapes = workstream_shapes
+        .iter()
+        .flat_map(|shape| shape.result_field_shapes.clone())
+        .collect::<Vec<_>>();
+    let workstream_ordinals = intent
+        .map(|intent| {
+            intent
+                .teams
+                .iter()
+                .enumerate()
+                .map(|(ordinal, team)| {
+                    (
+                        team.workstream_id.as_str(),
+                        ordinal.min(u16::MAX as usize) as u16,
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let instance_workstreams = program
+        .team_instances
+        .iter()
+        .map(|instance| {
+            (
+                instance.instance_id.as_str(),
+                instance.semantic_node_id.as_str(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let dependency_shapes = program
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            let producer = instance_workstreams.get(edge.from.as_str())?;
+            let consumer = instance_workstreams.get(edge.to.as_str())?;
+            Some(harness_contract::evolution::SemanticDependencyShape {
+                producer_ordinal: *workstream_ordinals.get(producer)?,
+                consumer_ordinal: *workstream_ordinals.get(consumer)?,
+                required_artifact_kinds: edge.input_contract.required_artifact_kinds.clone(),
+                required_fact_kinds: edge
+                    .input_contract
+                    .required_fact_kinds
+                    .iter()
+                    .map(|kind| format!("{kind:?}"))
+                    .collect(),
+                requires_committed_effect: edge.input_contract.require_committed_effect,
+                requires_satisfied_acceptance: edge.input_contract.require_satisfied_acceptance,
+            })
+        })
+        .collect();
+    let signature = harness_contract::evolution::CollaborationSemanticSignature {
+        normalizer_revision: 1,
+        workstream_shapes: std::mem::take(&mut workstream_shapes),
+        dependency_shapes,
+        required_capability_ids: std::mem::take(&mut capability_ids),
+        required_skill_ids: std::mem::take(&mut skill_ids),
+        required_tool_capabilities: std::mem::take(&mut tool_ids),
+        acceptance_kinds: Vec::new(),
+        result_field_shapes: std::mem::take(&mut result_shapes),
+    }
+    .normalized();
+    let terminal_evidence = program
+        .control
+        .obligations
+        .iter()
+        .flat_map(|obligation| {
+            obligation
+                .terminal
+                .iter()
+                .flat_map(|terminal| terminal.evidence_refs.iter())
+                .map(|reference| {
+                    format!(
+                        "{}:{}",
+                        reference.evidence_ref.ref_type, reference.evidence_ref.id
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let evidence_refs = terminal_evidence
+        .iter()
+        .map(|reference| {
+            // Evidence identifiers are opaque runtime references.  Retain
+            // only a bounded, safe token in the experience payload so a
+            // malformed upstream identifier can never turn this projection
+            // into a transcript or secret carrier.
+            format!("evidence:sha256:{:x}", Sha256::digest(reference.as_bytes()))
+        })
+        .collect::<Vec<_>>();
+    let required = program
+        .team_instances
+        .iter()
+        .filter(|team| team.required)
+        .count() as u32;
+    let satisfied = program
+        .control
+        .obligations
+        .iter()
+        .filter(|obligation| {
+            obligation.state == TeamAdmissionState::Admitted
+                && obligation.terminal.as_ref().is_some_and(|terminal| {
+                    terminal.node_status
+                        == harness_contract::execution_graph::ExecutionNodeStatus::Completed
+                })
+        })
+        .count() as u32;
+    let completed = program.control.lifecycle == CollaborationProgramLifecycle::Completed;
+    let delivery_and_presentation_agree =
+        graph.delivery_envelope.as_ref().is_some_and(|delivery| {
+            graph
+                .terminal_presentation
+                .as_ref()
+                .is_some_and(|presentation| {
+                    presentation.state
+                        == harness_contract::outcome::TerminalPresentationState::Committed
+                        && presentation.envelope_id == delivery.envelope_id
+                        && presentation.envelope_revision == delivery.revision
+                })
+        });
+    let cross_team_handoffs_complete = program
+        .edges
+        .iter()
+        .all(|edge| edge.state == harness_contract::execution_graph::CrossTeamEdgeState::Claimed);
+    let durable_terminal_evidence = program.control.obligations.iter().all(|obligation| {
+        obligation.terminal.as_ref().is_some_and(|terminal| {
+            terminal
+                .evidence_refs
+                .iter()
+                .all(|reference| reference.is_durable())
+        })
+    });
+    let has_safe_evidence_refs = !evidence_refs.is_empty();
+    let hash_reference = |value: &str| {
+        if value.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "sha256:{:x}",
+                Sha256::digest(
+                    format!("collaboration-experience/v1\\0{reference_salt}\\0{value}").as_bytes()
+                )
+            )
+        }
+    };
+    harness_contract::evolution::CollaborationExperienceEpisode {
+        schema_version: harness_contract::evolution::COLLABORATION_EXPERIENCE_SCHEMA_VERSION,
+        episode_id: harness_contract::evolution::CollaborationExperienceEpisode::deterministic_id(
+            &program.program_id,
+            program.revision,
+        ),
+        session_ref_hash: hash_reference(
+            intent
+                .map(|value| value.source_session_ref.as_str())
+                .filter(|reference| !reference.trim().is_empty())
+                .or_else(|| {
+                    graph
+                        .lineage
+                        .as_ref()
+                        .map(|lineage| lineage.session_id.as_str())
+                })
+                .unwrap_or_default(),
+        ),
+        turn_ref_hash: hash_reference(
+            intent
+                .map(|value| value.source_turn_ref.as_str())
+                .filter(|reference| !reference.trim().is_empty())
+                .or_else(|| {
+                    graph
+                        .lineage
+                        .as_ref()
+                        .map(|lineage| lineage.turn_id.as_str())
+                })
+                .unwrap_or_default(),
+        ),
+        program_id: program.program_id.clone(),
+        program_revision: program.revision,
+        intent_digest: intent
+            .map(|value| value.intent_digest.clone())
+            .unwrap_or_default(),
+        binding_digest: intent
+            .map(|value| value.binding_digest.clone())
+            .unwrap_or_default(),
+        capacity_profile_digest: program
+            .control
+            .resource_ledger
+            .capacity_profile_digest
+            .clone(),
+        approval_policy_digest: String::new(),
+        semantic_signature: signature,
+        outcome: match program.control.lifecycle {
+            CollaborationProgramLifecycle::Completed => {
+                harness_contract::evolution::CollaborationExperienceOutcome::Completed
+            }
+            CollaborationProgramLifecycle::Partial => {
+                harness_contract::evolution::CollaborationExperienceOutcome::Partial
+            }
+            CollaborationProgramLifecycle::Cancelled => {
+                harness_contract::evolution::CollaborationExperienceOutcome::Cancelled
+            }
+            CollaborationProgramLifecycle::Blocked
+                if program.control.obligations.iter().any(|obligation| {
+                    obligation.reason_kind.as_deref().is_some_and(|reason| {
+                        reason.contains("rejected") || reason.contains("policy")
+                    })
+                }) =>
+            {
+                harness_contract::evolution::CollaborationExperienceOutcome::Denied
+            }
+            CollaborationProgramLifecycle::Blocked => {
+                harness_contract::evolution::CollaborationExperienceOutcome::BindingGap
+            }
+            _ => harness_contract::evolution::CollaborationExperienceOutcome::Failed,
+        },
+        evidence_refs,
+        coverage: harness_contract::evolution::CollaborationEvidenceCoverage {
+            required_obligation_count: required,
+            satisfied_obligation_count: satisfied,
+            coverage_basis_points: if required == 0 {
+                0
+            } else {
+                (satisfied.saturating_mul(10_000) / required) as u16
+            },
+            reusable: completed
+                && required == satisfied
+                && delivery_and_presentation_agree
+                && cross_team_handoffs_complete
+                && durable_terminal_evidence
+                && has_safe_evidence_refs,
+        },
+        latency_ms: 0,
+        resource_summary: harness_contract::evolution::CollaborationResourceSummary {
+            parallel_demand: program.control.resource_ledger.parallel_demand,
+            context_reservation_tokens: program.control.resource_ledger.context_reservation_tokens,
+            output_reservation_tokens: program.control.resource_ledger.output_reservation_tokens,
+        },
+        completed_at_ms: program
+            .control
+            .obligations
+            .iter()
+            .filter_map(|obligation| {
+                obligation
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| terminal.finished_at_ms)
+            })
+            .max()
+            .unwrap_or_default(),
+    }
 }
 
 pub(crate) async fn reconcile_terminal_program_with(
@@ -1160,15 +1676,14 @@ pub(crate) async fn reconcile_program_wait_state_with(
 /// A restarted non-terminal Program still needs its durable approval/admission
 /// wait state projected before the regular graph recovery pump resumes it.
 pub(crate) async fn reconcile_terminal_programs_on_startup(
-    supervisor: &RuntimeExecutionSupervisor,
-    graphs: &ExecutionGraphStateStore,
-    teams: &TeamRuntime,
+    services: &RuntimeServices,
     limit: usize,
 ) -> Result<usize, String> {
     let mut cursor = None;
     let mut examined = 0usize;
     while examined < limit {
-        let page = graphs
+        let page = services
+            .graph_state_store()
             .graph_ids_page(cursor.take(), limit.saturating_sub(examined).max(1))
             .map_err(|error| format!("program_startup_page_failed:{error}"))?;
         if page.is_empty() {
@@ -1178,8 +1693,14 @@ pub(crate) async fn reconcile_terminal_programs_on_startup(
             if examined >= limit {
                 break;
             }
-            reconcile_program_wait_state_with(graph_id, supervisor, graphs, teams).await?;
-            reconcile_terminal_program_with(graph_id, supervisor, graphs).await?;
+            reconcile_program_wait_state_with(
+                graph_id,
+                services.execution_supervisor().as_ref(),
+                services.graph_state_store(),
+                services.team_runtime().as_ref(),
+            )
+            .await?;
+            reconcile_terminal_program(graph_id, services).await?;
             examined = examined.saturating_add(1);
         }
         let (graph_id, commit_cursor) = page
@@ -1697,5 +2218,254 @@ mod tests {
                     claim.consumer_node_id == "consumer" && claim.consumer_attempt == 1
                 })
         }));
+    }
+
+    #[test]
+    fn pattern_projection_requires_distinct_turns_and_is_idempotent() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let store = services.event_store();
+        let signature = harness_contract::evolution::CollaborationSemanticSignature {
+            normalizer_revision: 1,
+            workstream_shapes: Vec::new(),
+            dependency_shapes: Vec::new(),
+            required_capability_ids: vec!["cap.read".to_string()],
+            required_skill_ids: Vec::new(),
+            required_tool_capabilities: Vec::new(),
+            acceptance_kinds: vec!["evidence".to_string()],
+            result_field_shapes: vec!["report".to_string()],
+        }
+        .normalized();
+        for revision in 1..=3_u64 {
+            let episode = harness_contract::evolution::CollaborationExperienceEpisode {
+                schema_version:
+                    harness_contract::evolution::COLLABORATION_EXPERIENCE_SCHEMA_VERSION,
+                episode_id:
+                    harness_contract::evolution::CollaborationExperienceEpisode::deterministic_id(
+                        &format!("program-{revision}"),
+                        revision,
+                    ),
+                session_ref_hash: "sha256:session".to_string(),
+                turn_ref_hash: format!("sha256:turn-{revision}"),
+                program_id: format!("program-{revision}"),
+                program_revision: revision,
+                intent_digest: "sha256:intent".to_string(),
+                binding_digest: "sha256:binding".to_string(),
+                capacity_profile_digest: "sha256:capacity".to_string(),
+                approval_policy_digest: "sha256:approval".to_string(),
+                semantic_signature: signature.clone(),
+                outcome: harness_contract::evolution::CollaborationExperienceOutcome::Completed,
+                evidence_refs: vec![format!("evidence:{revision}")],
+                coverage: harness_contract::evolution::CollaborationEvidenceCoverage {
+                    required_obligation_count: 1,
+                    satisfied_obligation_count: 1,
+                    coverage_basis_points: 10_000,
+                    reusable: true,
+                },
+                latency_ms: 1,
+                resource_summary: harness_contract::evolution::CollaborationResourceSummary {
+                    parallel_demand: 1,
+                    context_reservation_tokens: 1,
+                    output_reservation_tokens: 1,
+                },
+                completed_at_ms: revision,
+            };
+            store
+                .append(crate::RuntimeEventInput {
+                    stream_id: format!("evolution:experience:{}", episode.episode_id),
+                    scope: crate::RuntimeEventScope::Evolution,
+                    kind: "evolution.collaboration_experience.recorded.v1".to_string(),
+                    status: Some("eligible".to_string()),
+                    actor: Some("test".to_string()),
+                    refs: Vec::new(),
+                    payload: serde_json::json!({"episode": episode}),
+                })
+                .expect("episode event");
+        }
+        refresh_collaboration_semantic_patterns(&services).expect("first pattern projection");
+        let pattern_id =
+            harness_contract::evolution::CollaborationSemanticPattern::deterministic_id(
+                &signature.digest(),
+            );
+        let stream_id = format!("evolution:pattern:{pattern_id}");
+        let first = store.list_stream(&stream_id).expect("pattern stream");
+        assert_eq!(first.len(), 1);
+        let pattern: harness_contract::evolution::CollaborationSemanticPattern =
+            serde_json::from_value(first[0].payload["pattern"].clone()).expect("pattern payload");
+        assert!(pattern.is_actionable());
+        assert_eq!(pattern.distinct_turn_ref_hashes.len(), 3);
+        refresh_collaboration_semantic_patterns(&services).expect("replay pattern projection");
+        assert_eq!(
+            store.list_stream(&stream_id).expect("pattern stream").len(),
+            1,
+            "replay cannot append a second equivalent advisory revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_episode_is_singleton_across_reconcile_and_startup_replay() {
+        use harness_contract::execution_graph::{
+            CollaborationTeamInstance, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+            ExecutionOrchestrationMetadata, ProgramResourceLedger,
+            TeamAdmissionResourceReservation, TeamExecutionTerminal,
+        };
+
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let mut graph = ExecutionGraph::new("terminal episode root");
+        graph.id = "terminal-episode-root".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.delivery_envelope = Some(harness_contract::outcome::DeliveryEnvelope {
+            envelope_id: "delivery:terminal-episode-root".to_string(),
+            revision: 1,
+            objective_id: "terminal-episode-root".to_string(),
+            pipeline_status: harness_contract::outcome::PipelineStatus::Completed,
+            delivery_status: harness_contract::outcome::DeliveryStatus::Satisfied,
+            branch_terminals: Vec::new(),
+            verified_receipts: Vec::new(),
+            verified_artifacts: Vec::new(),
+            verified_effects: Vec::new(),
+            coverage: Default::default(),
+            unresolved: Vec::new(),
+            conflicts: Vec::new(),
+            cancellation: None,
+            user_answer_contract: Default::default(),
+            created_at_ms: 1,
+        });
+        graph.terminal_presentation = Some(harness_contract::outcome::TerminalPresentation {
+            presentation_id: "presentation:terminal-episode-root".to_string(),
+            attempt_id: "attempt:terminal-episode-root".to_string(),
+            envelope_id: "delivery:terminal-episode-root".to_string(),
+            envelope_revision: 1,
+            state: harness_contract::outcome::TerminalPresentationState::Committed,
+            answer_origin: harness_contract::outcome::AnswerOrigin::ProgrammaticFallback,
+            source_execution_id: Some("terminal-episode-root".to_string()),
+            narrator_model: None,
+            narrator_provider: None,
+            models_attempted: Vec::new(),
+            validation: Default::default(),
+            fallback_reason: None,
+            generated_at_ms: 1,
+            committed_at_ms: Some(1),
+        });
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "{}");
+        node.id = "team-node".to_string();
+        node.idempotency_key = "team-node-key".to_string();
+        graph.nodes.push(node);
+        graph
+            .node_statuses
+            .insert("team-node".to_string(), ExecutionNodeStatus::Completed);
+        graph.orchestration = Some(ExecutionOrchestrationMetadata {
+            mutation_id: "terminal-episode-test".to_string(),
+            applied_mutation_ids: Vec::new(),
+            collaboration_escalations: Vec::new(),
+            semantic_revision: 1,
+            source_generation: 1,
+            completion: Default::default(),
+            collaboration_program: Some(CollaborationProgram {
+                program_id: "terminal-episode-program".to_string(),
+                revision: 1,
+                required_team_count: 1,
+                team_instances: vec![CollaborationTeamInstance {
+                    instance_id: "team:1".to_string(),
+                    semantic_node_id: "team".to_string(),
+                    required: true,
+                }],
+                edges: Vec::new(),
+                semantic_node_instances: std::collections::BTreeMap::new(),
+                semantic_intent: None,
+                control: CollaborationProgramControlState {
+                    lifecycle: CollaborationProgramLifecycle::Completed,
+                    obligations: vec![TeamAdmissionObligation {
+                        instance_id: "team:1".to_string(),
+                        binding_ref: "team-binding:sha256:fixture".to_string(),
+                        state: TeamAdmissionState::Admitted,
+                        child_graph_ref: Some("child:team:1".to_string()),
+                        reason_kind: None,
+                        terminal: Some(TeamExecutionTerminal {
+                            node_status: ExecutionNodeStatus::Completed,
+                            failure_kind: None,
+                            failure_message: None,
+                            retryable: false,
+                            evidence_refs: vec![
+                                harness_contract::context::EvidenceAccessRef::durable(
+                                    harness_contract::reality::EvidenceRef::durable(
+                                        "terminal-proof",
+                                    ),
+                                    "sha256:terminal-proof",
+                                    1,
+                                    "application/json",
+                                    "terminal-proof",
+                                    "workspace",
+                                ),
+                            ],
+                            finished_at_ms: 1,
+                        }),
+                        reservation: TeamAdmissionResourceReservation {
+                            context_reservation_tokens: 1,
+                            output_reservation_tokens: 1,
+                            parallel_demand: 1,
+                        },
+                        revision: 1,
+                    }],
+                    resource_ledger: ProgramResourceLedger {
+                        context_reservation_tokens: 1,
+                        output_reservation_tokens: 1,
+                        parallel_demand: 1,
+                        deadline_at_ms: 1,
+                        confidence_basis_points: 10_000,
+                        revision: 1,
+                        capacity_profile_id: "fixture".to_string(),
+                        capacity_profile_revision: 1,
+                        capacity_profile_digest: "sha256:fixture".to_string(),
+                        resolved_parallel_ceiling: 1,
+                    },
+                    waiting_relation: None,
+                    blocker_ref: None,
+                    next_action: None,
+                },
+            }),
+        });
+        let graph = services
+            .commit_service()
+            .register_graph(graph)
+            .expect("terminal graph registered")
+            .graph;
+        reconcile_terminal_program(&graph.id, &services)
+            .await
+            .expect("first terminal reconciliation");
+        reconcile_terminal_program(&graph.id, &services)
+            .await
+            .expect("duplicate terminal reconciliation");
+        reconcile_terminal_programs_on_startup(&services, 16)
+            .await
+            .expect("startup replay");
+        let episode_id =
+            harness_contract::evolution::CollaborationExperienceEpisode::deterministic_id(
+                "terminal-episode-program",
+                1,
+            );
+        assert_eq!(
+            services
+                .event_store()
+                .list_stream(&format!("evolution:experience:{episode_id}"))
+                .expect("episode stream")
+                .len(),
+            1,
+            "normal retry and startup replay converge on the terminal episode transaction"
+        );
+        let episode_event = services
+            .event_store()
+            .list_stream(&format!("evolution:experience:{episode_id}"))
+            .expect("episode stream")
+            .pop()
+            .expect("episode event");
+        let episode: harness_contract::evolution::CollaborationExperienceEpisode =
+            serde_json::from_value(episode_event.payload["episode"].clone())
+                .expect("episode payload");
+        assert!(episode.coverage.reusable);
+        assert!(episode.is_pattern_eligible());
+        assert!(episode
+            .evidence_refs
+            .iter()
+            .all(|reference| reference.starts_with("evidence:sha256:")));
     }
 }

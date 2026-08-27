@@ -285,6 +285,13 @@ async fn stable_requires_approved_canary_and_eligible_observation_before_human_p
             "approved",
         )
         .expect("proposal approved");
+    let baseline = services
+        .definition_registry()
+        .resolve_agent(
+            &definition_id,
+            RevisionSelector::ExactApprovedRevision { revision: 1 },
+        )
+        .expect("baseline definition");
     let candidate = services
         .register_evolution_candidate(EvolutionCandidateIntent {
             candidate_id: "candidate-stable-v2".to_string(),
@@ -296,7 +303,11 @@ async fn stable_requires_approved_canary_and_eligible_observation_before_human_p
                 )
                 .expect("revision"),
             },
-            baseline_revision: 1,
+            evaluation_baseline: runtime::EvolutionEvaluationBaseline::PublishedRevision {
+                subject_ref: format!("agent-definition:{}", definition_id.as_str()),
+                revision: 1,
+                content_digest: baseline.revision.content_digest,
+            },
             source_evidence_refs: vec![EvidenceRef::observed("agent_run", "baseline")],
             canary_policy: CanaryRolloutPolicy {
                 traffic_basis_points: 10_000,

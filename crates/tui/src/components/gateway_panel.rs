@@ -641,6 +641,11 @@ impl GatewayPanel {
                     .and_then(|value| value.get("reviews"))
                     .and_then(serde_json::Value::as_array)
                     .map_or(0, Vec::len);
+                let advisory_patterns = payload
+                    .get("collaboration_patterns")
+                    .and_then(|value| value.get("patterns"))
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
                 let candidate_items = payload
                     .get("candidates")
                     .and_then(|value| value.get("candidates"))
@@ -719,6 +724,7 @@ impl GatewayPanel {
                         + proposals
                         + candidates as u64
                         + reviews as u64
+                        + advisory_patterns as u64
                         > 0
                     {
                         "active".to_string()
@@ -727,7 +733,7 @@ impl GatewayPanel {
                     },
                 );
                 self.evolution_summary = Some(format!(
-                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} eligible={evaluated_eligible} eval_blocked={evaluation_blocked} release_reviews={reviews} pending_release={} projector=running:{projector_running}/lag:{projector_lag}/dead:{projector_dead_letters}",
+                    "signals={signals} diagnoses={diagnoses} missions={missions} proposals={proposals} candidates={candidates} eligible={evaluated_eligible} eval_blocked={evaluation_blocked} advisory_patterns={advisory_patterns} release_reviews={reviews} pending_release={} projector=running:{projector_running}/lag:{projector_lag}/dead:{projector_dead_letters}",
                     self.pending_release_review_ids.len(),
                 ));
                 self.action_status = Some("evolution.overview succeeded".to_string());
@@ -2521,6 +2527,7 @@ mod tests {
                 {"candidate_id": "candidate-1", "lifecycle": "evaluated_eligible"}
             ]},
             "sandbox_evals": {"count": 1},
+            "collaboration_patterns": {"patterns": [{"pattern_id": "pattern-1"}]},
             "reviews": {"reviews": []},
         })));
 
@@ -2530,6 +2537,11 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("eligible=1"));
+        assert!(panel
+            .evolution_summary
+            .as_deref()
+            .unwrap_or_default()
+            .contains("advisory_patterns=1"));
         assert_eq!(
             panel.selected_evolution_case_id().as_deref(),
             Some("case-1")

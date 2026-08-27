@@ -14,6 +14,7 @@ pub mod triage;
 
 pub use candidate_kind::{
     candidate_kind_from_proposal, candidate_kinds_from_root_cause, EvolutionCandidateKind,
+    EvolutionPromotionRoute,
 };
 pub use capability_goal::EvolutionCapabilityGoal;
 pub use case::{
@@ -29,10 +30,11 @@ pub use governance::{
     CanaryObservationReport, CanaryRolloutPolicy, EvaluationDirection,
     EvaluationPolicyChangeIntent, EvaluationPolicyChangeReview, EvolutionCandidateIntent,
     EvolutionCandidateLifecycle, EvolutionCandidateSubject, EvolutionComparisonDimension,
-    EvolutionComparisonReportV2, EvolutionEvalRunner, EvolutionEvaluationReadiness,
-    EvolutionGovernanceCandidate, EvolutionGovernanceError, EvolutionGovernanceService,
-    EvolutionReleaseAssignment, ReleaseChangeAction, ReleaseChangeRequest, ReleaseChangeReview,
-    ReleaseChangeReviewClass, ReleaseChangeReviewDecision, ReleaseChangeReviewStatus,
+    EvolutionComparisonReportV2, EvolutionEvalRunner, EvolutionEvaluationBaseline,
+    EvolutionEvaluationReadiness, EvolutionGovernanceCandidate, EvolutionGovernanceError,
+    EvolutionGovernanceService, EvolutionReleaseAssignment, ReleaseChangeAction,
+    ReleaseChangeRequest, ReleaseChangeReview, ReleaseChangeReviewClass,
+    ReleaseChangeReviewDecision, ReleaseChangeReviewStatus,
 };
 pub use lifecycle::{EvolutionLifecycleDraft, EvolutionLifecycleService};
 pub use mission::{EvolutionMission, EvolutionMissionStatus};

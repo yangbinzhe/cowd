@@ -121,6 +121,10 @@ fn now_ms() -> u64 {
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/api/evolution/overview", get(evolution_overview_handler))
+        .route(
+            "/api/evolution/collaboration-patterns",
+            get(evolution_collaboration_patterns_handler),
+        )
         .route("/api/evolution/cases", get(evolution_cases_handler))
         .route(
             "/api/evolution/cases/:id",
@@ -229,6 +233,18 @@ async fn evolution_overview_handler(
         .services
         .evolution
         .overview(&runtime)
+        .map(Json)
+        .map_err(evolution_error)
+}
+
+async fn evolution_collaboration_patterns_handler(
+    AxumState(state): AxumState<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let runtime = runtime_services(&state)?;
+    state
+        .services
+        .evolution
+        .collaboration_patterns(&runtime)
         .map(Json)
         .map_err(evolution_error)
 }
@@ -495,7 +511,7 @@ struct EvolutionCandidateRegistrationRequest {
     candidate_id: String,
     proposal_id: String,
     subject: runtime::EvolutionCandidateSubject,
-    baseline_revision: u64,
+    evaluation_baseline: runtime::EvolutionEvaluationBaseline,
     source_evidence_refs: Vec<harness_contract::reality::EvidenceRef>,
     #[serde(default)]
     canary_policy: runtime::CanaryRolloutPolicy,
@@ -513,7 +529,7 @@ async fn evolution_candidate_create_handler(
             candidate_id: request.candidate_id,
             proposal_id: request.proposal_id,
             subject: request.subject,
-            baseline_revision: request.baseline_revision,
+            evaluation_baseline: request.evaluation_baseline,
             source_evidence_refs: request.source_evidence_refs,
             canary_policy: request.canary_policy,
         })

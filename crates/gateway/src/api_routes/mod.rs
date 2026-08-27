@@ -3350,6 +3350,23 @@ pub(crate) mod tests {
         assert_eq!(candidates_json["owner"], "runtime");
         assert!(candidates_json["candidates"].is_array());
 
+        let patterns = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/evolution/collaboration-patterns")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patterns.status(), StatusCode::OK);
+        let patterns_body = to_bytes(patterns.into_body(), usize::MAX).await.unwrap();
+        let patterns_json: serde_json::Value = serde_json::from_slice(&patterns_body).unwrap();
+        assert_eq!(patterns_json["kind"], "evolution.collaboration_patterns");
+        assert_eq!(patterns_json["advisory_only"], true);
+        assert!(patterns_json["patterns"].is_array());
+
         let chain = app
             .clone()
             .oneshot(

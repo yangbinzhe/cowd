@@ -200,6 +200,11 @@ fn candidate() -> EvolutionGovernanceCandidate {
         subject: EvolutionCandidateSubject::AgentDefinition {
             revision_ref: AgentDefinitionRevisionRef::new(definition_id, 2).expect("revision"),
         },
+        evaluation_baseline: Some(runtime::EvolutionEvaluationBaseline::PublishedRevision {
+            subject_ref: "agent-definition:workspace/cowd/eval-agent".to_string(),
+            revision: 1,
+            content_digest: "sha256:baseline".to_string(),
+        }),
         baseline_revision: 1,
         evaluation_contract: EvaluationContract::single_release_gate(
             "evolution/agent-definition",

@@ -1046,6 +1046,11 @@ fn closure_candidate() -> Result<runtime::EvolutionGovernanceCandidate, String> 
     Ok(runtime::EvolutionGovernanceCandidate {
         candidate_id: "harness-eval-closure-candidate".to_string(),
         subject: runtime::EvolutionCandidateSubject::AgentDefinition { revision_ref },
+        evaluation_baseline: Some(runtime::EvolutionEvaluationBaseline::PublishedRevision {
+            subject_ref: "agent-definition:workspace/cowd/harness-eval".to_string(),
+            revision: 1,
+            content_digest: "sha256:baseline".to_string(),
+        }),
         baseline_revision: 1,
         evaluation_contract,
         evaluation_policy_floor: harness_contract::evaluation::EvaluationPolicyFloor::default(),

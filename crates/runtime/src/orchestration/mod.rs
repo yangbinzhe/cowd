@@ -4338,9 +4338,7 @@ mod tests {
             .graph;
 
         let examined = collaboration_coordinator::reconcile_terminal_programs_on_startup(
-            services.execution_supervisor().as_ref(),
-            services.graph_state_store(),
-            services.team_runtime().as_ref(),
+            services.as_ref(),
             16,
         )
         .await

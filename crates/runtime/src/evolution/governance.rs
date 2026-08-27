@@ -35,6 +35,10 @@ const CANDIDATE_STREAM_PREFIX: &str = "evolution:candidate:";
 const REVIEW_STREAM_PREFIX: &str = "evolution:review:";
 const EVALUATION_POLICY_REVIEW_STREAM_PREFIX: &str = "evolution:evaluation-policy-review:";
 
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 fn pending_evolution_approval(
     approval_id: String,
     source: ApprovalSource,
@@ -72,6 +76,34 @@ pub enum EvolutionCandidateSubject {
     TeamTemplate {
         revision_ref: TeamTemplateRevisionRef,
     },
+}
+
+/// Immutable comparison origin selected and verified by Runtime. A newly
+/// synthesized revision may use a frozen set of successful semantic episodes
+/// only when there is no published revision to compare against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvolutionEvaluationBaseline {
+    PublishedRevision {
+        subject_ref: String,
+        revision: u64,
+        content_digest: String,
+    },
+    EpisodeSet {
+        semantic_signature_digest: String,
+        episode_ids: Vec<String>,
+        aggregate_digest: String,
+    },
+}
+
+impl EvolutionEvaluationBaseline {
+    #[must_use]
+    pub fn published_revision(&self) -> Option<u64> {
+        match self {
+            Self::PublishedRevision { revision, .. } => Some(*revision),
+            Self::EpisodeSet { .. } => None,
+        }
+    }
 }
 
 impl EvolutionCandidateSubject {
@@ -136,6 +168,12 @@ pub struct EvolutionGovernanceCandidate {
     pub candidate_id: String,
     pub proposal_id: String,
     pub subject: EvolutionCandidateSubject,
+    /// New writers always emit this versioned baseline. The scalar remains
+    /// deserialize-only compatibility for old durable candidate events and is
+    /// normalized on recovery before the candidate is returned to readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_baseline: Option<EvolutionEvaluationBaseline>,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub baseline_revision: u64,
     /// Immutable baseline contract resolved by Runtime before the candidate
     /// enters governance. Gateway and a candidate artifact never choose this
@@ -185,7 +223,7 @@ pub struct EvolutionCandidateIntent {
     pub candidate_id: String,
     pub proposal_id: String,
     pub subject: EvolutionCandidateSubject,
-    pub baseline_revision: u64,
+    pub evaluation_baseline: EvolutionEvaluationBaseline,
     pub source_evidence_refs: Vec<EvidenceRef>,
     #[serde(default)]
     pub canary_policy: CanaryRolloutPolicy,
@@ -200,7 +238,7 @@ pub(crate) struct EvolutionCandidateRegistration {
     pub candidate_id: String,
     pub proposal_id: String,
     pub subject: EvolutionCandidateSubject,
-    pub baseline_revision: u64,
+    pub evaluation_baseline: EvolutionEvaluationBaseline,
     pub evaluation_contract: EvaluationContract,
     pub evaluation_scenario_digest: String,
     pub source_evidence_refs: Vec<EvidenceRef>,
@@ -738,7 +776,7 @@ impl EvolutionGovernanceService {
         if let Ok(existing) = self.candidate(&registration.candidate_id) {
             let same_registration = existing.proposal_id == registration.proposal_id
                 && existing.subject == registration.subject
-                && existing.baseline_revision == registration.baseline_revision
+                && existing.evaluation_baseline.as_ref() == Some(&registration.evaluation_baseline)
                 && existing.evaluation_contract == registration.evaluation_contract
                 && existing.evaluation_scenario_digest == registration.evaluation_scenario_digest
                 && existing.source_evidence_refs == registration.source_evidence_refs
@@ -757,7 +795,9 @@ impl EvolutionGovernanceService {
             candidate_id: registration.candidate_id,
             proposal_id: registration.proposal_id,
             subject: registration.subject,
-            baseline_revision: registration.baseline_revision,
+            evaluation_baseline: Some(registration.evaluation_baseline),
+            // New candidate events contain only `evaluation_baseline`.
+            baseline_revision: 0,
             evaluation_contract: registration.evaluation_contract,
             evaluation_policy_floor: self.evaluation_policy_floor(),
             evaluation_scenario_digest: registration.evaluation_scenario_digest,
@@ -1300,7 +1340,10 @@ impl EvolutionGovernanceService {
             action: ReleaseChangeAction::PromoteCanary,
             candidate_id: Some(candidate.candidate_id.clone()),
             subject: candidate.subject.clone(),
-            baseline_revision: Some(candidate.baseline_revision),
+            baseline_revision: candidate
+                .evaluation_baseline
+                .as_ref()
+                .and_then(EvolutionEvaluationBaseline::published_revision),
             candidate_revision: subject_revision(&candidate.subject),
             comparison_report_ref: Some(report_ref.clone()),
             comparison_report_digest: candidate.comparison_report_digest.clone(),
@@ -1571,7 +1614,10 @@ impl EvolutionGovernanceService {
             action: ReleaseChangeAction::PromoteStable,
             candidate_id: Some(candidate.candidate_id.clone()),
             subject: candidate.subject.clone(),
-            baseline_revision: Some(candidate.baseline_revision),
+            baseline_revision: candidate
+                .evaluation_baseline
+                .as_ref()
+                .and_then(EvolutionEvaluationBaseline::published_revision),
             candidate_revision: subject_revision(&candidate.subject),
             comparison_report_ref: candidate.comparison_report_ref.clone(),
             comparison_report_digest: candidate.comparison_report_digest.clone(),
@@ -2380,6 +2426,22 @@ fn materialize_candidate(
             _ => {}
         }
     }
+    candidate.map(normalize_legacy_candidate)
+}
+
+fn normalize_legacy_candidate(
+    mut candidate: EvolutionGovernanceCandidate,
+) -> EvolutionGovernanceCandidate {
+    if candidate.evaluation_baseline.is_none() && candidate.baseline_revision > 0 {
+        candidate.evaluation_baseline = Some(EvolutionEvaluationBaseline::PublishedRevision {
+            subject_ref: candidate.subject.release_target_ref(),
+            revision: candidate.baseline_revision,
+            // Historical events cannot be retroactively made immutable by a
+            // guessed digest. The services layer resolves this exact revision
+            // before any evaluator or release action can use it.
+            content_digest: String::new(),
+        });
+    }
     candidate
 }
 
@@ -2628,6 +2690,11 @@ mod tests {
                 )
                 .unwrap(),
             },
+            evaluation_baseline: Some(EvolutionEvaluationBaseline::PublishedRevision {
+                subject_ref: "agent-definition:workspace/cowd/researcher".to_string(),
+                revision: 1,
+                content_digest: "sha256:baseline".to_string(),
+            }),
             baseline_revision: 1,
             evaluation_contract: harness_contract::evaluation::EvaluationContract {
                 scenario_refs: vec!["evolution/protected".to_string()],
@@ -2830,7 +2897,9 @@ mod tests {
             candidate_id: candidate.candidate_id,
             proposal_id: candidate.proposal_id,
             subject: candidate.subject,
-            baseline_revision: candidate.baseline_revision,
+            evaluation_baseline: candidate
+                .evaluation_baseline
+                .expect("test candidate has versioned baseline"),
             evaluation_contract: candidate.evaluation_contract,
             evaluation_scenario_digest: candidate.evaluation_scenario_digest,
             source_evidence_refs: candidate.source_evidence_refs,
@@ -2851,6 +2920,77 @@ mod tests {
             Err(EvolutionGovernanceError::Store(message))
                 if message.contains("different immutable inputs")
         ));
+    }
+
+    #[test]
+    fn new_registration_emits_versioned_baseline_and_legacy_event_recovers() {
+        let service = service();
+        let fixture = candidate();
+        let registration = EvolutionCandidateRegistration {
+            candidate_id: fixture.candidate_id.clone(),
+            proposal_id: fixture.proposal_id.clone(),
+            subject: fixture.subject.clone(),
+            evaluation_baseline: fixture
+                .evaluation_baseline
+                .clone()
+                .expect("test candidate has baseline"),
+            evaluation_contract: fixture.evaluation_contract.clone(),
+            evaluation_scenario_digest: fixture.evaluation_scenario_digest.clone(),
+            source_evidence_refs: fixture.source_evidence_refs.clone(),
+            canary_policy: fixture.canary_policy.clone(),
+        };
+        let registered = service
+            .register_candidate(registration)
+            .expect("registered");
+        assert!(registered.evaluation_baseline.is_some());
+        assert_eq!(registered.baseline_revision, 0);
+        let event = service
+            .event_store
+            .list_stream(&candidate_stream(&registered.candidate_id))
+            .expect("candidate event")
+            .pop()
+            .expect("created event");
+        let serialized = event.payload["candidate"].clone();
+        assert!(serialized.get("evaluation_baseline").is_some());
+        assert!(serialized.get("baseline_revision").is_none());
+
+        let mut legacy = candidate();
+        legacy.candidate_id = "legacy-baseline-candidate".to_string();
+        legacy.evaluation_baseline = None;
+        let legacy = service
+            .create_candidate(legacy)
+            .expect("legacy write fixture");
+        assert!(matches!(
+            legacy.evaluation_baseline,
+            Some(EvolutionEvaluationBaseline::PublishedRevision { revision: 1, .. })
+        ));
+
+        let episode_set = EvolutionCandidateRegistration {
+            candidate_id: "episode-set-baseline-candidate".to_string(),
+            proposal_id: "proposal-episode-set".to_string(),
+            subject: fixture.subject,
+            evaluation_baseline: EvolutionEvaluationBaseline::EpisodeSet {
+                semantic_signature_digest: "sha256:semantic".to_string(),
+                episode_ids: vec![
+                    "experience:one".to_string(),
+                    "experience:two".to_string(),
+                    "experience:three".to_string(),
+                ],
+                aggregate_digest: "sha256:episodes".to_string(),
+            },
+            evaluation_contract: fixture.evaluation_contract,
+            evaluation_scenario_digest: fixture.evaluation_scenario_digest,
+            source_evidence_refs: fixture.source_evidence_refs,
+            canary_policy: fixture.canary_policy,
+        };
+        let episode_candidate = service
+            .register_candidate(episode_set)
+            .expect("episode-set registration stays governed");
+        assert!(matches!(
+            episode_candidate.evaluation_baseline,
+            Some(EvolutionEvaluationBaseline::EpisodeSet { .. })
+        ));
+        assert_eq!(episode_candidate.baseline_revision, 0);
     }
 
     #[test]

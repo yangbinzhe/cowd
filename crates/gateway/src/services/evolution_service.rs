@@ -93,6 +93,9 @@ impl EvolutionService {
         let reviews = runtime
             .recent_evolution_release_reviews(PAGE_LIMIT)
             .map_err(internal)?;
+        let patterns = runtime
+            .collaboration_semantic_patterns(PAGE_LIMIT)
+            .map_err(internal)?;
         let state_count = |state: &str| index.state_counts.get(state).copied().unwrap_or_default();
         let proposed = state_count("proposed");
         let diagnosed = state_count("diagnosed").saturating_add(proposed);
@@ -124,6 +127,26 @@ impl EvolutionService {
                 "total_known": false,
                 "reviews": reviews,
             },
+            "collaboration_patterns": {
+                "recent_count": patterns.len(),
+                "advisory_only": true,
+                "patterns": patterns,
+            },
+        }))
+    }
+
+    pub(crate) fn collaboration_patterns(
+        &self,
+        runtime: &runtime::RuntimeServices,
+    ) -> Result<Value, EvolutionServiceError> {
+        let patterns = runtime
+            .collaboration_semantic_patterns(100)
+            .map_err(internal)?;
+        Ok(json!({
+            "kind": "evolution.collaboration_patterns",
+            "envelope": self.envelope("collaboration_patterns"),
+            "advisory_only": true,
+            "patterns": patterns,
         }))
     }
 

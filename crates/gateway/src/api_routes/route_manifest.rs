@@ -170,6 +170,7 @@ mod tests {
         assert!(has("GET", "/api/skills/:id/active-pointer"));
         assert!(!has("POST", "/api/skills/maintenance/evaluate"));
         assert!(has("GET", "/api/evolution/evaluation-policy"));
+        assert!(has("GET", "/api/evolution/collaboration-patterns"));
         assert!(has("GET", "/api/evolution/evaluation-policy/reviews"));
         assert!(has(
             "POST",

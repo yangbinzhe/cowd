@@ -22,6 +22,20 @@ pub enum EvolutionCandidateKind {
     ArchitecturePlan,
 }
 
+/// Typed owner routing for a proposed reusable asset. This is intentionally
+/// not a string capability claim: only the three named owner paths are
+/// executable/governed, while every other advertised kind is explicit about
+/// the absence of a generic promotion adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvolutionPromotionRoute {
+    AgentDefinitionGovernance,
+    TeamTemplateGovernance,
+    SkillRevisionGovernance,
+    KnowledgeCandidateOnly,
+    PromotionAdapterUnavailable,
+}
+
 impl EvolutionCandidateKind {
     pub const ALL: [Self; 14] = [
         Self::AgentDefinition,
@@ -77,6 +91,26 @@ impl EvolutionCandidateKind {
             Self::SurfaceProjection => "SurfaceProjectionPromotion",
             Self::CodePatch => "CodePatchPromotion",
             Self::ArchitecturePlan => "ArchitecturePlanPromotion",
+        }
+    }
+
+    #[must_use]
+    pub const fn promotion_route(self) -> EvolutionPromotionRoute {
+        match self {
+            Self::AgentDefinition => EvolutionPromotionRoute::AgentDefinitionGovernance,
+            Self::TeamTemplate => EvolutionPromotionRoute::TeamTemplateGovernance,
+            Self::SkillPackage => EvolutionPromotionRoute::SkillRevisionGovernance,
+            Self::MemoryGovernance => EvolutionPromotionRoute::KnowledgeCandidateOnly,
+            Self::RuntimePolicy
+            | Self::ContextPolicy
+            | Self::RealityGovernance
+            | Self::ToolContract
+            | Self::SessionPolicy
+            | Self::ProviderProfile
+            | Self::EvalScenario
+            | Self::SurfaceProjection
+            | Self::CodePatch
+            | Self::ArchitecturePlan => EvolutionPromotionRoute::PromotionAdapterUnavailable,
         }
     }
 
@@ -164,4 +198,30 @@ pub fn candidate_kind_from_goal_ids(goal_ids: &[String]) -> Option<EvolutionCand
     goal_ids
         .iter()
         .find_map(|goal_id| candidate_kind_from_goal_id(goal_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_advertised_kind_has_an_explicit_promotion_route() {
+        for kind in EvolutionCandidateKind::ALL {
+            match kind.promotion_route() {
+                EvolutionPromotionRoute::AgentDefinitionGovernance
+                | EvolutionPromotionRoute::TeamTemplateGovernance
+                | EvolutionPromotionRoute::SkillRevisionGovernance
+                | EvolutionPromotionRoute::KnowledgeCandidateOnly
+                | EvolutionPromotionRoute::PromotionAdapterUnavailable => {}
+            }
+        }
+        assert_eq!(
+            EvolutionCandidateKind::SkillPackage.promotion_route(),
+            EvolutionPromotionRoute::SkillRevisionGovernance
+        );
+        assert_eq!(
+            EvolutionCandidateKind::CodePatch.promotion_route(),
+            EvolutionPromotionRoute::PromotionAdapterUnavailable
+        );
+    }
 }

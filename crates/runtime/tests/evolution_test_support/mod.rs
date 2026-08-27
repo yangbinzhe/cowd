@@ -15,7 +15,7 @@ use harness_contract::{
         AgentDefinitionManifest, AgentDefinitionRevisionRef, AgentExecutorPolicy, AgentModelPolicy,
         AgentOutputContract, CognitiveReadScope, CognitiveWriteMode, DefinitionScope,
         ReleaseAssignment, ReleaseAssignmentStatus, ReleaseAuthorization, ReleaseChannel,
-        RevisionLifecycle,
+        RevisionLifecycle, RevisionSelector,
     },
     evaluation::EvaluationContract,
     reality::EvidenceRef,
@@ -32,8 +32,8 @@ use runtime::{
     agent::definition::{AgentDefinitionStore, RegisteredAgentDefinitionLayout},
     CanaryObservationReport, CanaryRolloutPolicy, DecisionLeaseExpectation,
     EvolutionCandidateIntent, EvolutionCandidateSubject, EvolutionComparisonDimension,
-    EvolutionComparisonReportV2, EvolutionEvalRunner, ReleaseChangeReview, RuntimeServices,
-    VerifiedDecisionLease, VerifiedPrincipal,
+    EvolutionComparisonReportV2, EvolutionEvalRunner, EvolutionEvaluationBaseline,
+    ReleaseChangeReview, RuntimeServices, VerifiedDecisionLease, VerifiedPrincipal,
 };
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -114,6 +114,19 @@ pub async fn try_register_and_evaluate(
     let candidate_ref =
         AgentDefinitionRevisionRef::new(fixture.definition_id.clone(), candidate_revision)
             .map_err(|error| error.to_string())?;
+    let baseline_ref =
+        AgentDefinitionRevisionRef::new(fixture.definition_id.clone(), baseline_revision)
+            .map_err(|error| error.to_string())?;
+    let baseline = fixture
+        .services
+        .definition_registry()
+        .resolve_agent(
+            &fixture.definition_id,
+            RevisionSelector::ExactApprovedRevision {
+                revision: baseline_ref.revision,
+            },
+        )
+        .map_err(|error| error.to_string())?;
     let signal = fixture
         .services
         .record_evolution_signal(runtime::EvolutionSignal::eval_failure(
@@ -157,7 +170,11 @@ pub async fn try_register_and_evaluate(
             subject: EvolutionCandidateSubject::AgentDefinition {
                 revision_ref: candidate_ref,
             },
-            baseline_revision,
+            evaluation_baseline: EvolutionEvaluationBaseline::PublishedRevision {
+                subject_ref: format!("agent-definition:{}", fixture.definition_id.as_str()),
+                revision: baseline_revision,
+                content_digest: baseline.revision.content_digest,
+            },
             source_evidence_refs: vec![EvidenceRef::observed(
                 "agent_run",
                 format!("{candidate_id}:baseline"),

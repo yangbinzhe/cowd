@@ -596,6 +596,7 @@ fn explicit_surface_consumers(route: &GatewayRouteManifestEntry) -> Vec<String> 
         ("GET", "/api/harness-eval/reports/:id/artifacts"),
         ("GET", "/api/harness-eval/reports/:id/gate"),
         ("GET", "/api/evolution/missions/:id/detail"),
+        ("GET", "/api/evolution/collaboration-patterns"),
         ("GET", "/api/evolution/chain/:id"),
         ("POST", "/api/evolution/reviews"),
         ("GET", "/api/evolution/reviews/:id"),
@@ -2580,7 +2581,7 @@ mod tests {
         assert_eq!(contract.capability_count, manifest.len());
         assert!(contract.coverage.route_contract_parity);
         assert!(contract.coverage.p1_count > 0);
-        assert_eq!(contract.coverage.webui_required_count, 21);
+        assert_eq!(contract.coverage.webui_required_count, 22);
         assert_eq!(contract.coverage.tui_required_count, 11);
         assert_eq!(contract.coverage.ai_tool_count, 0);
         assert!(contract.capabilities.iter().any(|capability| {

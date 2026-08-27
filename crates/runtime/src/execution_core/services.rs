@@ -4294,6 +4294,42 @@ impl RuntimeServices {
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
 
+    /// Read-only advisory patterns derived from terminal collaboration episodes.
+    /// Runtime never treats this projection as an executable selector.
+    pub fn collaboration_semantic_patterns(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<harness_contract::evolution::CollaborationSemanticPattern>, RuntimeServicesError>
+    {
+        let events = self
+            .event_store
+            .replay_scope_stream_prefix(RuntimeEventScope::Evolution, "evolution:pattern:")
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let mut latest = BTreeMap::new();
+        for event in events {
+            if event.kind != "evolution.collaboration_pattern.projected.v1" {
+                continue;
+            }
+            let Some(pattern) = event.payload.get("pattern").and_then(|value| {
+                serde_json::from_value::<harness_contract::evolution::CollaborationSemanticPattern>(
+                    value.clone(),
+                )
+                .ok()
+            }) else {
+                continue;
+            };
+            latest.insert(pattern.pattern_id.clone(), pattern);
+        }
+        let mut patterns = latest.into_values().collect::<Vec<_>>();
+        patterns.sort_by(|left, right| {
+            right
+                .latest_completed_at_ms
+                .cmp(&left.latest_completed_at_ms)
+        });
+        patterns.truncate(limit);
+        Ok(patterns)
+    }
+
     pub fn evolution_candidates(
         &self,
     ) -> Result<Vec<crate::EvolutionGovernanceCandidate>, RuntimeServicesError> {
@@ -4485,67 +4521,157 @@ impl RuntimeServices {
                 "evolution proposal must be approved before candidate registration".to_string(),
             ));
         }
-        let evaluation_contract = match &intent.subject {
-            crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
-                if intent.baseline_revision >= revision_ref.revision {
-                    return Err(RuntimeServicesError::Invariant(
-                        "evolution candidate revision must be newer than its baseline".to_string(),
-                    ));
-                }
-                let candidate = self
-                    .definition_registry
-                    .agents()
-                    .read_revision(revision_ref)
-                    .map_err(DefinitionRegistryError::Agent)?;
-                let baseline = harness_contract::agent::AgentDefinitionRevisionRef::new(
-                    revision_ref.definition_id.clone(),
-                    intent.baseline_revision,
-                )
-                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-                let baseline = self
-                    .definition_registry
-                    .agents()
-                    .read_revision(&baseline)
-                    .map_err(DefinitionRegistryError::Agent)?;
-                if !candidate
-                    .revision
-                    .manifest
-                    .evaluation
-                    .is_noninferior_to(&baseline.revision.manifest.evaluation)
+        let evaluation_baseline = intent.evaluation_baseline.clone();
+        let published_baseline_revision = match &evaluation_baseline {
+            crate::EvolutionEvaluationBaseline::PublishedRevision {
+                subject_ref,
+                revision,
+                content_digest,
+            } => {
+                if subject_ref != &intent.subject.release_target_ref()
+                    || content_digest.trim().is_empty()
                 {
                     return Err(RuntimeServicesError::Invariant(
-                        "candidate Agent Definition weakens the baseline evaluation contract; submit a separate policy review"
+                        "published evaluation baseline does not identify this immutable release target"
                             .to_string(),
                     ));
                 }
-                baseline.revision.manifest.evaluation.clone()
+                Some((*revision, content_digest.as_str()))
             }
-            crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
-                if intent.baseline_revision >= revision_ref.revision {
+            crate::EvolutionEvaluationBaseline::EpisodeSet {
+                semantic_signature_digest,
+                episode_ids,
+                aggregate_digest,
+            } => {
+                let distinct = episode_ids
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                if semantic_signature_digest.trim().is_empty()
+                    || aggregate_digest.trim().is_empty()
+                    || episode_ids.len() < 3
+                    || distinct.len() != episode_ids.len()
+                    || episode_ids.iter().any(|id| id.trim().is_empty())
+                {
                     return Err(RuntimeServicesError::Invariant(
-                        "evolution candidate revision must be newer than its baseline".to_string(),
+                        "episode evaluation baseline is incomplete or below the distinct-turn floor"
+                            .to_string(),
                     ));
                 }
+                let expected_digest = harness_contract::evolution::collaboration_episode_set_digest(
+                    semantic_signature_digest,
+                    episode_ids,
+                );
+                if &expected_digest != aggregate_digest {
+                    return Err(RuntimeServicesError::Invariant(
+                        "episode evaluation baseline aggregate digest is invalid".to_string(),
+                    ));
+                }
+                let requested_ids = episode_ids
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let pattern_exists = self
+                    .collaboration_semantic_patterns(usize::MAX)?
+                    .into_iter()
+                    .any(|pattern| {
+                        pattern.is_actionable()
+                            && pattern.signature_digest == *semantic_signature_digest
+                            && requested_ids.is_subset(
+                                &pattern
+                                    .qualifying_episode_ids
+                                    .iter()
+                                    .collect::<std::collections::BTreeSet<_>>(),
+                            )
+                    });
+                if !pattern_exists {
+                    return Err(RuntimeServicesError::Invariant(
+                        "episode evaluation baseline is not backed by an advisory pattern"
+                            .to_string(),
+                    ));
+                }
+                None
+            }
+        };
+        let evaluation_contract = match &intent.subject {
+            crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
+                let candidate = self
+                    .definition_registry
+                    .agents()
+                    .read_revision(revision_ref)
+                    .map_err(DefinitionRegistryError::Agent)?;
+                if let Some((baseline_revision, expected_digest)) = published_baseline_revision {
+                    if baseline_revision >= revision_ref.revision {
+                        return Err(RuntimeServicesError::Invariant(
+                            "evolution candidate revision must be newer than its baseline"
+                                .to_string(),
+                        ));
+                    }
+                    let baseline = harness_contract::agent::AgentDefinitionRevisionRef::new(
+                        revision_ref.definition_id.clone(),
+                        baseline_revision,
+                    )
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                    let baseline = self
+                        .definition_registry
+                        .agents()
+                        .read_revision(&baseline)
+                        .map_err(DefinitionRegistryError::Agent)?;
+                    if baseline.revision.content_digest != expected_digest {
+                        return Err(RuntimeServicesError::Invariant(
+                            "published evaluation baseline content digest changed".to_string(),
+                        ));
+                    }
+                    if !candidate
+                        .revision
+                        .manifest
+                        .evaluation
+                        .is_noninferior_to(&baseline.revision.manifest.evaluation)
+                    {
+                        return Err(RuntimeServicesError::Invariant(
+                            "candidate Agent Definition weakens the baseline evaluation contract; submit a separate policy review"
+                                .to_string(),
+                        ));
+                    }
+                    baseline.revision.manifest.evaluation.clone()
+                } else {
+                    candidate.revision.manifest.evaluation.clone()
+                }
+            }
+            crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
                 let candidate = self
                     .definition_registry
                     .teams()
                     .read_revision(revision_ref)
                     .map_err(DefinitionRegistryError::Team)?;
-                let baseline = harness_contract::team::TeamTemplateRevisionRef::new(
-                    revision_ref.template_id.clone(),
-                    intent.baseline_revision,
-                )
-                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-                let baseline = self
-                    .definition_registry
-                    .teams()
-                    .read_revision(&baseline)
-                    .map_err(DefinitionRegistryError::Team)?;
-                ensure_team_evaluation_contract_noninferior(
-                    &baseline.revision.manifest,
-                    &candidate.revision.manifest,
-                )?;
-                baseline.revision.manifest.evaluation.clone()
+                if let Some((baseline_revision, expected_digest)) = published_baseline_revision {
+                    if baseline_revision >= revision_ref.revision {
+                        return Err(RuntimeServicesError::Invariant(
+                            "evolution candidate revision must be newer than its baseline"
+                                .to_string(),
+                        ));
+                    }
+                    let baseline = harness_contract::team::TeamTemplateRevisionRef::new(
+                        revision_ref.template_id.clone(),
+                        baseline_revision,
+                    )
+                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                    let baseline = self
+                        .definition_registry
+                        .teams()
+                        .read_revision(&baseline)
+                        .map_err(DefinitionRegistryError::Team)?;
+                    if baseline.revision.content_digest != expected_digest {
+                        return Err(RuntimeServicesError::Invariant(
+                            "published evaluation baseline content digest changed".to_string(),
+                        ));
+                    }
+                    ensure_team_evaluation_contract_noninferior(
+                        &baseline.revision.manifest,
+                        &candidate.revision.manifest,
+                    )?;
+                    baseline.revision.manifest.evaluation.clone()
+                } else {
+                    candidate.revision.manifest.evaluation.clone()
+                }
             }
         };
         let proposal_id = intent.proposal_id;
@@ -4573,7 +4699,7 @@ impl RuntimeServices {
                 candidate_id: intent.candidate_id,
                 proposal_id: proposal_id.clone(),
                 subject: intent.subject,
-                baseline_revision: intent.baseline_revision,
+                evaluation_baseline,
                 evaluation_contract,
                 evaluation_scenario_digest: readiness.scenario_bundle_digest,
                 source_evidence_refs: intent.source_evidence_refs,
@@ -4754,9 +4880,19 @@ impl RuntimeServices {
                 "scenario is absent from the candidate's immutable evaluation contract".to_string(),
             ));
         }
+        let baseline_revision = candidate
+            .evaluation_baseline
+            .as_ref()
+            .and_then(crate::EvolutionEvaluationBaseline::published_revision)
+            .ok_or_else(|| {
+                RuntimeServicesError::Invariant(
+                    "episode-set evolution baseline requires its dedicated outcome evaluator"
+                        .to_string(),
+                )
+            })?;
         let baseline_ref = harness_contract::agent::AgentDefinitionRevisionRef::new(
             revision_ref.definition_id.clone(),
-            candidate.baseline_revision,
+            baseline_revision,
         )
         .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         let baseline = self
@@ -4854,11 +4990,19 @@ impl RuntimeServices {
                 "scenario is absent from the candidate's immutable evaluation contract".to_string(),
             ));
         }
-        let baseline_ref = TeamTemplateRevisionRef::new(
-            revision_ref.template_id.clone(),
-            candidate.baseline_revision,
-        )
-        .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let baseline_revision = candidate
+            .evaluation_baseline
+            .as_ref()
+            .and_then(crate::EvolutionEvaluationBaseline::published_revision)
+            .ok_or_else(|| {
+                RuntimeServicesError::Invariant(
+                    "episode-set evolution baseline requires its dedicated outcome evaluator"
+                        .to_string(),
+                )
+            })?;
+        let baseline_ref =
+            TeamTemplateRevisionRef::new(revision_ref.template_id.clone(), baseline_revision)
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         let baseline_request = evolution_team_request(
             &candidate,
             scenario,
@@ -5099,10 +5243,7 @@ impl RuntimeServices {
             .reconcile_preparing_bindings_on_startup(256)
             .map_err(RuntimeServicesError::Mission)?;
         crate::orchestration::collaboration_coordinator::reconcile_terminal_programs_on_startup(
-            self.execution_supervisor.as_ref(),
-            &self.graph_state_store,
-            self.team_runtime.as_ref(),
-            256,
+            self, 256,
         )
         .await
         .map_err(RuntimeServicesError::Invariant)?;
@@ -8555,7 +8696,11 @@ mod tests {
                 subject: crate::EvolutionCandidateSubject::AgentDefinition {
                     revision_ref: candidate_revision.revision.revision_ref.clone(),
                 },
-                baseline_revision: 1,
+                evaluation_baseline: crate::EvolutionEvaluationBaseline::PublishedRevision {
+                    subject_ref: format!("agent-definition:{}", definition_id.as_str()),
+                    revision: 1,
+                    content_digest: baseline.revision.content_digest.clone(),
+                },
                 source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
                     "agent_run",
                     "baseline",
