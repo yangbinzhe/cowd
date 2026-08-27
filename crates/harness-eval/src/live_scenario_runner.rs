@@ -1377,7 +1377,10 @@ impl ProjectedTeamHealth {
         if minimum_teams == 0 {
             return true;
         }
-        self.agent_count >= minimum_teams.saturating_mul(2)
+        // Team templates may legitimately have one role. Requiring two
+        // Agents per Team was an evaluator-only assumption that rejected a
+        // fully completed, Runtime-attested single-role escalation Team.
+        self.agent_count >= minimum_teams
             && self.completed_agents == self.agent_count
             && self.failed_agents == 0
             && self.team_count >= minimum_teams
@@ -2201,6 +2204,16 @@ mod tests {
         assert_eq!(health.completed_teams, 1);
         assert_eq!(health.agent_count, 4);
         assert_eq!(health.completed_agents, 4);
+    }
+
+    #[test]
+    fn projected_team_health_accepts_completed_single_role_teams() {
+        let health = projected_team_health(&[json!({
+            "agents": [{"id": "agent-1", "status": "completed"}],
+            "teams": [{"id": "team-1", "status": "completed"}],
+        })]);
+
+        assert!(health.satisfies(1));
     }
 
     #[test]
