@@ -567,6 +567,20 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        let selected_scenario_count = live
+            .get("selected_scenario_ids")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        // A full deep suite requires broad coverage.  A caller may explicitly
+        // select a costly isolated scenario, however; that focused run must
+        // be judged against exactly the selected set rather than an impossible
+        // three-scenario threshold.  An empty or unknown selection still
+        // fails because the observed count cannot satisfy the requirement.
+        let required_live_scenarios = if selected_scenario_count > 0 {
+            selected_scenario_count
+        } else {
+            3
+        };
         let all_traces_complete = live_scenarios.iter().all(|scenario| {
             scenario.get("status").and_then(Value::as_str) == Some("passed")
                 && scenario
@@ -585,13 +599,14 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         items.push(HarnessEvalReportGateItem::new(
             "deep_live_gateway_scenarios",
             live.get("status").and_then(Value::as_str) == Some("passed")
-                && live_scenarios.len() >= 3
+                && live_scenarios.len() >= required_live_scenarios
                 && all_traces_complete,
             true,
             format!(
-                "live_status={}, scenarios={}, complete_traces={}",
+                "live_status={}, scenarios={}, required_scenarios={}, complete_traces={}",
                 live.get("status").and_then(Value::as_str).unwrap_or("missing"),
                 live_scenarios.len(),
+                required_live_scenarios,
                 all_traces_complete
             ),
             "run deep evaluation against an explicit isolated COWD_EVAL_GATEWAY_URL and retain durable session, terminal, execution and cursor traces for every live scenario",
@@ -739,6 +754,34 @@ mod gate_tests {
             "passed"
         );
         assert_eq!(item("token_usage_nonzero_or_estimated").status, "passed");
+    }
+
+    #[test]
+    fn deep_gate_accepts_a_complete_explicitly_selected_live_scenario() {
+        let report = json!({
+            "level": "deep",
+            "live_gateway_scenarios": {
+                "status": "passed",
+                "selected_scenario_ids": ["live_group_theory_ai_research_simulation"],
+                "scenarios": [{
+                    "status": "passed",
+                    "production_trace": {
+                        "session_id": "session-1",
+                        "terminal_id": "terminal-1",
+                        "execution_id": "execution-1"
+                    }
+                }]
+            }
+        });
+
+        let gate = evaluate_report_gate(&report);
+        let item = gate
+            .items
+            .iter()
+            .find(|item| item.name == "deep_live_gateway_scenarios")
+            .expect("gate item");
+        assert_eq!(item.status, "passed");
+        assert!(item.evidence.contains("required_scenarios=1"));
     }
 }
 
