@@ -1470,7 +1470,7 @@ mod tests {
     #[test]
     fn renders_canonical_admission_outcome_and_evidence_without_prose_inference() {
         let corpus: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../harness-contract/tests/fixtures/projection-v2/materialization.json"
+            "../../../harness-contract/tests/fixtures/projection-v3/materialization.json"
         ))
         .expect("canonical projection corpus");
         let projection: crate::protocol::ExecutionProjection =

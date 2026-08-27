@@ -35,11 +35,10 @@ use harness_contract::team::{
     TeamStructuredOutputField, TeamTemplateSelector,
 };
 
-/// Hard ceiling for AgentTask nodes in one immutable Team graph.
-///
-/// Runtime capacity is intentionally absent: ResourceManager owns admission
-/// and queues nodes when the currently available capacity is insufficient.
-const MAX_TEAM_GRAPH_AGENT_NODES: usize = 32;
+/// Allocation-safety guard for AgentTask nodes in one immutable Team graph.
+/// Runtime capacity is supplied by the frozen admission profile; this value is
+/// only a non-operational representability maximum.
+const MAX_TEAM_GRAPH_AGENT_NODES: usize = crate::MAX_REPRESENTABLE_TEAM_AGENT_NODES;
 pub(crate) const DEFAULT_PARENT_EXECUTION_TOKEN_BUDGET: u64 = 65_536;
 
 pub(crate) fn bounded_parent_execution_budget(
@@ -254,6 +253,15 @@ impl TeamInstantiationService {
         let (focus_plans, mut focus_repairs) =
             focus_partition_plans(&request, &manifest.roles, &manifest.role_aliases)?;
         let active_roles = active_template_roles(&request, &manifest.roles, &focus_plans)?;
+        if let Some(capacity) = request.execution_capacity.as_ref() {
+            if active_roles.len() > capacity.max_team_roles {
+                return Err(format!(
+                    "team_role_count_exceeds_capacity:{}>{}",
+                    active_roles.len(),
+                    capacity.max_team_roles
+                ));
+            }
+        }
         validate_active_role_dependencies(&active_roles, &manifest.dependencies)?;
         let binding_overrides = role_binding_overrides(&request, &active_roles)?;
         let cardinality_overrides = role_cardinality_overrides(&request, &active_roles)?;
@@ -301,6 +309,14 @@ impl TeamInstantiationService {
                 .ok_or_else(|| "Team graph Agent node count overflowed".to_string())
         })?;
         ensure_static_graph_ceiling(0, planned_agent_slots)?;
+        if let Some(capacity) = request.execution_capacity.as_ref() {
+            if planned_agent_slots > capacity.max_agent_nodes_per_team {
+                return Err(format!(
+                    "team_role_instances_exceed_capacity:{}>{}",
+                    planned_agent_slots, capacity.max_agent_nodes_per_team
+                ));
+            }
+        }
         validate_finite_team_budget_capacity(
             &request.execution_budget.budget_id,
             request.execution_budget.predicted_tokens(),
@@ -384,6 +400,16 @@ impl TeamInstantiationService {
                 cardinality_overrides.get(&role.role_id),
                 focus_plans.get(&role.role_id),
             )?;
+            if let Some(capacity) = request.execution_capacity.as_ref() {
+                if focuses.len() > capacity.max_role_instances_per_team {
+                    return Err(format!(
+                        "team_role_instances_exceed_capacity:{}:{}>{}",
+                        role.role_id,
+                        focuses.len(),
+                        capacity.max_role_instances_per_team
+                    ));
+                }
+            }
             let role_definition = self
                 .registry
                 .resolve_agent(
@@ -1124,7 +1150,7 @@ fn ensure_static_graph_ceiling(
         .ok_or_else(|| "Team graph Agent node count overflowed".to_string())?;
     if requested > MAX_TEAM_GRAPH_AGENT_NODES {
         return Err(format!(
-            "Team graph requests {requested} Agent nodes, exceeding the static ceiling of {MAX_TEAM_GRAPH_AGENT_NODES}"
+            "Team graph requests {requested} Agent nodes, exceeding the representability guard of {MAX_TEAM_GRAPH_AGENT_NODES}"
         ));
     }
     Ok(())
@@ -2152,9 +2178,9 @@ mod acceptance_contract_tests {
     }
 
     #[test]
-    fn static_graph_ceiling_accepts_boundary_and_rejects_overflow() {
-        assert!(ensure_static_graph_ceiling(24, 8).is_ok());
-        assert!(ensure_static_graph_ceiling(25, 8).is_err());
+    fn representability_guard_accepts_boundary_and_rejects_overflow() {
+        assert!(ensure_static_graph_ceiling(MAX_TEAM_GRAPH_AGENT_NODES - 8, 8,).is_ok());
+        assert!(ensure_static_graph_ceiling(MAX_TEAM_GRAPH_AGENT_NODES, 1).is_err());
     }
 
     #[test]

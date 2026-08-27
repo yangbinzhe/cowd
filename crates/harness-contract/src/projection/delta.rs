@@ -10,8 +10,11 @@ use super::{
     EXECUTION_PROJECTION_SCHEMA_VERSION,
 };
 use crate::execution_graph::{
-    ExecutionEdgeProjection, ExecutionNodeProjection, ExecutionParentBinding, ExecutionServiceClass,
+    ExecutionEdgeProjection, ExecutionNodeProjection, ExecutionOrchestrationMetadata,
+    ExecutionParentBinding, ExecutionServiceClass,
 };
+use crate::outcome::{DeliveryEnvelope, TerminalPresentation};
+use crate::turn::CancellationReceipt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +76,12 @@ pub enum ProjectionOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_execution: Option<ExecutionParentBinding>,
     },
+    /// Replaces the complete immutable Program control/provenance record from
+    /// the same graph revision as the surrounding delta.
+    ReplaceGraphOrchestration {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        orchestration: Option<ExecutionOrchestrationMetadata>,
+    },
     ReplaceGraphTopology {
         node_ids: Vec<String>,
         edges: Vec<ExecutionEdgeProjection>,
@@ -119,6 +128,17 @@ pub enum ProjectionOperation {
         terminal_result_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         live: Option<ExecutionLiveState>,
+    },
+    /// Atomically replaces every terminal-delivery fact derived from the
+    /// same durable graph/cursor materialization. A client never combines a
+    /// new envelope with an older presentation or cancellation receipt.
+    SetDeliveryTruth {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_envelope: Option<DeliveryEnvelope>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        terminal_presentation: Option<TerminalPresentation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cancellation_receipt: Option<CancellationReceipt>,
     },
     AdvanceCursor {
         cursor: u64,
@@ -255,6 +275,9 @@ fn apply_operation(
                 .parent_execution
                 .clone_from(parent_execution);
         }
+        ProjectionOperation::ReplaceGraphOrchestration { orchestration } => {
+            projection.graph.orchestration.clone_from(orchestration);
+        }
         ProjectionOperation::ReplaceGraphTopology { node_ids, edges } => {
             let retained = node_ids.iter().collect::<BTreeSet<_>>();
             projection
@@ -334,6 +357,19 @@ fn apply_operation(
             if live.is_some() {
                 projection.live.clone_from(live);
             }
+        }
+        ProjectionOperation::SetDeliveryTruth {
+            delivery_envelope,
+            terminal_presentation,
+            cancellation_receipt,
+        } => {
+            projection.delivery_envelope.clone_from(delivery_envelope);
+            projection
+                .terminal_presentation
+                .clone_from(terminal_presentation);
+            projection
+                .cancellation_receipt
+                .clone_from(cancellation_receipt);
         }
         ProjectionOperation::AdvanceCursor { cursor } => {
             if *cursor < projection.cursor {
@@ -457,9 +493,9 @@ mod tests {
 
     fn corpus() -> GoldenCorpus {
         serde_json::from_str(include_str!(
-            "../../tests/fixtures/projection-v2/materialization.json"
+            "../../tests/fixtures/projection-v3/materialization.json"
         ))
-        .expect("projection v2 golden corpus")
+        .expect("projection v3 golden corpus")
     }
 
     #[test]
@@ -521,6 +557,56 @@ mod tests {
             .any(|operation| matches!(operation, ProjectionOperation::AdvanceCursor { .. })));
         let actual = reduce_projection_delta(&corpus.initial, &corpus.delta).expect("valid delta");
         assert_eq!(actual, corpus.expected);
+    }
+
+    #[test]
+    fn delivery_truth_replaces_all_terminal_facts_as_one_reducer_operation() {
+        let corpus = corpus();
+        let delivery_envelope: crate::outcome::DeliveryEnvelope =
+            serde_json::from_value(serde_json::json!({
+                "envelope_id": "envelope-v3",
+                "revision": 3,
+                "objective_id": "objective-v3",
+                "created_at_ms": 30
+            }))
+            .expect("minimal delivery envelope");
+        let terminal_presentation: crate::outcome::TerminalPresentation =
+            serde_json::from_value(serde_json::json!({
+                "presentation_id": "presentation-v3",
+                "attempt_id": "attempt-v3",
+                "envelope_id": "envelope-v3",
+                "envelope_revision": 3,
+                "state": "committed",
+                "answer_origin": "terminal_narrator",
+                "generated_at_ms": 31,
+                "committed_at_ms": 32
+            }))
+            .expect("minimal terminal presentation");
+        let cancellation_receipt: crate::turn::CancellationReceipt =
+            serde_json::from_value(serde_json::json!({
+                "cancellation_id": "cancel-v3",
+                "session_id": "session-golden",
+                "turn_id": "turn-golden",
+                "execution_id": "execution-golden",
+                "actor_id": "user-v3",
+                "requested_at_ms": 33
+            }))
+            .expect("minimal cancellation receipt");
+
+        let mut delta = corpus.delta.clone();
+        delta.operations.insert(
+            delta.operations.len() - 1,
+            ProjectionOperation::SetDeliveryTruth {
+                delivery_envelope: Some(delivery_envelope.clone()),
+                terminal_presentation: Some(terminal_presentation.clone()),
+                cancellation_receipt: Some(cancellation_receipt.clone()),
+            },
+        );
+        let actual = reduce_projection_delta(&corpus.initial, &delta).expect("valid delta");
+
+        assert_eq!(actual.delivery_envelope, Some(delivery_envelope));
+        assert_eq!(actual.terminal_presentation, Some(terminal_presentation));
+        assert_eq!(actual.cancellation_receipt, Some(cancellation_receipt));
     }
 
     #[test]

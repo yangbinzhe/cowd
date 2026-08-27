@@ -859,6 +859,16 @@ pub struct ProgramResourceLedger {
     pub deadline_at_ms: u64,
     pub confidence_basis_points: u16,
     pub revision: u64,
+    /// Immutable profile identity captured at collaboration admission. Empty
+    /// values denote a historical pre-v0.9.706 Program only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub capacity_profile_id: String,
+    #[serde(default)]
+    pub capacity_profile_revision: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub capacity_profile_digest: String,
+    #[serde(default)]
+    pub resolved_parallel_ceiling: u16,
 }
 
 /// Durable control-plane state.  Existing pre-0821 graph metadata decodes as
@@ -1898,6 +1908,10 @@ mod dependency_policy_tests {
                     deadline_at_ms: 123,
                     confidence_basis_points: 8_000,
                     revision: 7,
+                    capacity_profile_id: String::new(),
+                    capacity_profile_revision: 0,
+                    capacity_profile_digest: String::new(),
+                    resolved_parallel_ceiling: 0,
                 },
                 waiting_relation: None,
                 blocker_ref: None,

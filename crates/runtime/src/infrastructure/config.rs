@@ -4035,6 +4035,101 @@ fn parse_optional_runtime_control_config(
             config.policy.agent.min_collaboration_score = score;
         }
     }
+    if let Some(capacity_value) = control.get("capacity") {
+        let capacity = expect_object(capacity_value, "merged settings.runtime.control.capacity")?;
+        if let Some(profile_id) = optional_string(
+            capacity,
+            "profile_id",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.profile_id = profile_id.to_string();
+        }
+        if let Some(revision) = optional_u64(
+            capacity,
+            "revision",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.revision = revision;
+        }
+        if let Some(value) = optional_usize(
+            capacity,
+            "max_program_teams",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.max_program_teams = value;
+        }
+        if let Some(value) = optional_usize(
+            capacity,
+            "max_team_roles",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.max_team_roles = value;
+        }
+        if let Some(value) = optional_usize(
+            capacity,
+            "max_role_instances_per_team",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.max_role_instances_per_team = value;
+        }
+        if let Some(value) = optional_usize(
+            capacity,
+            "max_agent_nodes_per_team",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.max_agent_nodes_per_team = value;
+        }
+        if let Some(value) = optional_usize(
+            capacity,
+            "max_pending_instance",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.max_pending_instance = value;
+        }
+        if let Some(value) = optional_usize(
+            capacity,
+            "max_pending_per_class",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.max_pending_per_class = value;
+        }
+        if let Some(value) = optional_usize(
+            capacity,
+            "max_pending_per_key",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.max_pending_per_key = value;
+        }
+        if let Some(value) = optional_u64(
+            capacity,
+            "admission_aging_interval_ms",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.admission_aging_interval_ms = value;
+        }
+        if let Some(value) = optional_u64(
+            capacity,
+            "user_team_veto_window_ms",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.user_team_veto_window_ms = value;
+        }
+        if let Some(value) = optional_usize(
+            capacity,
+            "max_semantic_revisions_per_turn",
+            "merged settings.runtime.control.capacity",
+        )? {
+            config.policy.capacity.max_semantic_revisions_per_turn = value;
+        }
+        config
+            .policy
+            .capacity
+            .validate()
+            .map_err(|message| ConfigError::Invalid {
+                key: "merged settings.runtime.control.capacity".to_string(),
+                message,
+            })?;
+    }
     if let Some(task_value) = control.get("task") {
         let task = expect_object(task_value, "merged settings.runtime.control.task")?;
         if let Some(enabled) = optional_bool(
@@ -5294,6 +5389,12 @@ approval:
                   },
                   "memory": {
                     "max_candidates_per_turn": 3
+                  },
+                  "capacity": {
+                    "profile_id": "research-narrow",
+                    "revision": 3,
+                    "max_agent_nodes_per_team": 12,
+                    "max_pending_per_key": 128
                   }
                 }
               }
@@ -5313,6 +5414,10 @@ approval:
         assert_eq!(runtime.policy.task.max_failures_before_review, 1);
         assert_eq!(runtime.policy.context.collaboration_budget_tokens, 16_000);
         assert_eq!(runtime.policy.memory.max_candidates_per_turn, 3);
+        assert_eq!(runtime.policy.capacity.profile_id, "research-narrow");
+        assert_eq!(runtime.policy.capacity.revision, 3);
+        assert_eq!(runtime.policy.capacity.max_agent_nodes_per_team, 12);
+        assert_eq!(runtime.policy.capacity.max_pending_per_key, 128);
         assert_eq!(runtime.policy.mission_schedule.tick_interval_ms, 1_500);
         assert_eq!(runtime.policy.mission_schedule.grace_ms, 120_000);
 

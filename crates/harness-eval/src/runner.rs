@@ -795,6 +795,11 @@ fn evaluate_mission_runtime_collaboration_closure() -> Value {
             allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
+            execution_capacity: Some(
+                runtime_services
+                    .execution_capacity_profile()
+                    .team_snapshot(),
+            ),
         },
     ) {
         Ok(team_plan) => team_plan,

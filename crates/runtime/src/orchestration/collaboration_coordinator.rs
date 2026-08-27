@@ -1205,6 +1205,7 @@ fn admission_control(
     let mut context_reservation_tokens = 0u64;
     let mut output_reservation_tokens = 0u64;
     let mut parallel_demand = 0u64;
+    let mut capacity_snapshot = None;
     for instance in &program.team_instances {
         let node_id = node_id_for_instance(program, &instance.instance_id)?;
         let node = graph
@@ -1216,6 +1217,17 @@ fn admission_control(
             &node.payload_ref,
         )
         .map_err(|error| format!("program_team_request_invalid:{node_id}:{error}"))?;
+        let request_capacity = request
+            .execution_capacity
+            .as_ref()
+            .ok_or_else(|| format!("program_team_capacity_snapshot_missing:{node_id}"))?;
+        if let Some(existing) = capacity_snapshot.as_ref() {
+            if existing != request_capacity {
+                return Err("program_team_capacity_snapshot_mismatch".to_string());
+            }
+        } else {
+            capacity_snapshot = Some(request_capacity.clone());
+        }
         let team_plan = teams.plan(request.clone())?;
         let binding = team_plan
             .binding
@@ -1252,6 +1264,8 @@ fn admission_control(
             revision: program.revision,
         });
     }
+    let capacity_snapshot =
+        capacity_snapshot.ok_or_else(|| "program_capacity_snapshot_missing".to_string())?;
     Ok(CollaborationProgramControlState {
         lifecycle: CollaborationProgramLifecycle::Admitting,
         obligations,
@@ -1262,6 +1276,11 @@ fn admission_control(
             deadline_at_ms,
             confidence_basis_points: 10_000,
             revision: program.revision,
+            capacity_profile_id: capacity_snapshot.profile_id,
+            capacity_profile_revision: capacity_snapshot.revision,
+            capacity_profile_digest: capacity_snapshot.digest,
+            resolved_parallel_ceiling: u16::try_from(capacity_snapshot.max_parallel_agents)
+                .unwrap_or(u16::MAX),
         },
         waiting_relation: Some("team_admission".to_string()),
         blocker_ref: None,

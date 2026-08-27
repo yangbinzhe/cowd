@@ -77,6 +77,20 @@ runtime:
       review_on_conflict: true
       require_positive_lift: true
       min_collaboration_score: 50
+    # 一次协作准入冻结的容量与确认窗口；ResourceManager 仍是唯一排队者。
+    capacity:
+      profile_id: "default-balanced"
+      revision: 1
+      max_program_teams: 32
+      max_team_roles: 32
+      max_role_instances_per_team: 32
+      max_agent_nodes_per_team: 32
+      max_pending_instance: 4096
+      max_pending_per_class: 2048
+      max_pending_per_key: 512
+      admission_aging_interval_ms: 5000
+      user_team_veto_window_ms: 5000
+      max_semantic_revisions_per_turn: 2
     task:
       auto_phase_for_yolo: true
       review_after_each_phase: true

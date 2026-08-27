@@ -25,9 +25,9 @@ pub use definition::{
 };
 pub use instantiation::{
     focus_scope_hash, FocusPartitionPlan, FocusPartitionSlot, TeamAcceptanceCheck,
-    TeamAcceptanceRequirement, TeamInstantiationRequest, TeamRoleBindingOverride,
-    TeamRoleCardinalityOverride, TeamSelectionMode, TeamStrategyBinding, TeamStructuredOutputField,
-    TeamTemplateSelector,
+    TeamAcceptanceRequirement, TeamExecutionCapacitySnapshot, TeamInstantiationRequest,
+    TeamRoleBindingOverride, TeamRoleCardinalityOverride, TeamSelectionMode, TeamStrategyBinding,
+    TeamStructuredOutputField, TeamTemplateSelector,
 };
 
 /// A graph-derived role trace exposed to projections. It is not an executable

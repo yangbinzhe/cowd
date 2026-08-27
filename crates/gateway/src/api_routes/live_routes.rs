@@ -1023,6 +1023,7 @@ async fn run_execution_source(
             matches!(
                 operation,
                 harness_contract::projection::ProjectionOperation::SetTerminal { .. }
+                    | harness_contract::projection::ProjectionOperation::SetDeliveryTruth { .. }
             )
         });
         cursor = delta.target_cursor;
@@ -1240,6 +1241,7 @@ async fn run_execution_source(
                     matches!(
                         operation,
                         harness_contract::projection::ProjectionOperation::SetTerminal { .. }
+                            | harness_contract::projection::ProjectionOperation::SetDeliveryTruth { .. }
                     )
                 });
                 cursor = delta.target_cursor;

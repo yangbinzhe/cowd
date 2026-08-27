@@ -37,10 +37,36 @@ use serde_json::{json, Value};
 
 const MAX_REVISION_CAS_ATTEMPTS: usize = 3;
 const EPHEMERAL_TEMPLATE_TTL_MS: u64 = 60 * 60 * 1000;
-/// A user-directed custom Team may be vetoed, but confirmation must not turn
-/// into an indefinite scheduler barrier. The queue records the window and
-/// automatically grants this one invocation only when it expires.
-const ORCHESTRATION_VETO_WINDOW_MS: u64 = 5_000;
+
+/// A revision of an admitted Program must reuse the capacity facts captured
+/// by its first admission. Hot-reloaded process policy may govern later
+/// Programs, never an already durable Program revision.
+fn capacity_snapshot_from_existing_program(
+    graph: &ExecutionGraph,
+) -> Result<harness_contract::team::TeamExecutionCapacitySnapshot, String> {
+    let mut snapshot = None;
+    for node in &graph.nodes {
+        if node.kind != ExecutionNodeKind::Subgraph {
+            continue;
+        }
+        let Ok(request) = serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+            &node.payload_ref,
+        ) else {
+            continue;
+        };
+        let current = request
+            .execution_capacity
+            .ok_or_else(|| format!("program_team_capacity_snapshot_missing:{}", node.id))?;
+        if let Some(existing) = snapshot.as_ref() {
+            if existing != &current {
+                return Err("program_team_capacity_snapshot_mismatch".to_string());
+            }
+        } else {
+            snapshot = Some(current);
+        }
+    }
+    snapshot.ok_or_else(|| "program_capacity_snapshot_missing".to_string())
+}
 
 pub use compiler::CompiledOrchestration;
 pub use planner::RuntimeOrchestrationPlan;
@@ -1264,12 +1290,13 @@ fn compile_orchestration_with_repair(
             .max(u16::try_from(configured_provider_concurrency.min(effective)).unwrap_or(u16::MAX));
     }
     for round in 0..=2 {
-        match compiler::compile_orchestration(
+        match compiler::compile_orchestration_with_capacity(
             request_id,
             &attempt,
             &effective_plan,
             parent_execution.as_ref().cloned(),
             Some(services.team_runtime().as_ref()),
+            Some(&services.execution_capacity_profile().team_snapshot()),
         ) {
             Ok(compiled) => return Ok(compiled),
             Err(error) => {
@@ -1398,6 +1425,52 @@ async fn revise(
             .map_or_else(BTreeMap::new, |program| {
                 program.semantic_node_instances.clone()
             });
+        let frozen_capacity = if graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .is_some()
+        {
+            capacity_snapshot_from_existing_program(&graph)?
+        } else {
+            services.execution_capacity_profile().team_snapshot()
+        };
+        if let Some(program) = graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+        {
+            let retired = proposal
+                .retired_collaboration_instance_ids
+                .iter()
+                .filter(|instance_id| {
+                    program
+                        .team_instances
+                        .iter()
+                        .any(|instance| &instance.instance_id == *instance_id)
+                })
+                .count();
+            let added = proposal
+                .nodes
+                .iter()
+                .filter(|node| node.recipe == CapabilityRecipeId::Team)
+                .try_fold(0usize, |total, node| {
+                    total.checked_add(usize::from(node.multiplicity))
+                })
+                .ok_or_else(|| "program_team_count_overflow".to_string())?;
+            let resulting = program
+                .team_instances
+                .len()
+                .checked_sub(retired)
+                .and_then(|active| active.checked_add(added))
+                .ok_or_else(|| "program_team_count_overflow".to_string())?;
+            if resulting > frozen_capacity.max_program_teams {
+                return Err(format!(
+                    "program_team_count_exceeds_capacity:{resulting}>{}",
+                    frozen_capacity.max_program_teams
+                ));
+            }
+        }
         let mut revision_repairs = Vec::new();
         let mut mutation = compiler::compile_graph_mutation(
             request_id,
@@ -1407,6 +1480,7 @@ async fn revise(
             graph_id,
             graph.parent_execution.as_ref(),
             services.team_runtime().as_ref(),
+            Some(&frozen_capacity),
             &existing_semantic_node_instances,
             &mut revision_repairs,
         )
@@ -2337,8 +2411,11 @@ async fn submit_approval(
     let timeout_policy = user_directed_custom_team
         .then_some(ApprovalTimeoutPolicy::AutoApproveOnce)
         .unwrap_or(ApprovalTimeoutPolicy::Pending);
+    let veto_window_ms = services
+        .execution_capacity_profile()
+        .user_team_veto_window_ms;
     let expires_at_ms = user_directed_custom_team
-        .then(|| crate::tool_invocation::now_ms().saturating_add(ORCHESTRATION_VETO_WINDOW_MS));
+        .then(|| crate::tool_invocation::now_ms().saturating_add(veto_window_ms));
     services.approval_queue().submit_scoped_with_deadline(
         approval_id.clone(),
         SubmitGlobalApprovalRequest {
@@ -2430,27 +2507,19 @@ async fn submit_approval(
     } else if user_directed_custom_team
         && decision == crate::approval_router::ApprovalDecision::Human
     {
-        // A confirmation profile reserves a real veto interval: an external
-        // UI decision may approve/deny while this bounded wait polls the one
-        // durable queue record. On expiry the queue produces a scoped
-        // timeout-policy grant, so an explicit Team request cannot stall
-        // merely because the user did not answer.
-        let deadline =
-            crate::tool_invocation::now_ms().saturating_add(ORCHESTRATION_VETO_WINDOW_MS);
-        loop {
-            let status = services
-                .approval_queue()
-                .get(&approval_id)
-                .map(|approval| approval.status);
-            if !matches!(status, Some(crate::GlobalApprovalStatus::Pending)) {
-                break;
-            }
-            if crate::tool_invocation::now_ms() >= deadline {
-                services.approval_queue().timeout(&approval_id)?;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
+        // A confirmation profile reserves a real veto interval. The existing
+        // ApprovalCoordinator owns the durable wait and is woken by either a
+        // human decision or the queue's single deadline worker; no admission
+        // task polls queue state or holds a graph/resource lock while waiting.
+        services
+            .approval_coordinator()
+            .wait_for_existing_execution(
+                &approval_id,
+                crate::CancellationToken::new(),
+                None,
+                std::time::Duration::from_millis(veto_window_ms),
+            )
+            .await?;
     }
     request.constraints.approval_id = Some(approval_id);
     Ok(())
@@ -3597,7 +3666,7 @@ mod tests {
     }
 
     #[test]
-    fn hundred_teams_remain_bounded_root_subgraphs() {
+    fn team_count_above_frozen_capacity_is_rejected() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         ensure_test_mission(&services);
         let nodes = (0..100)
@@ -3623,18 +3692,10 @@ mod tests {
             None,
             Some(services.team_runtime().as_ref()),
         )
-        .expect("bounded root compiles");
-        assert_eq!(compiled.graph.nodes.len(), 100);
-        assert!(compiled.graph.nodes.iter().all(|node| {
-            node.kind == harness_contract::execution_graph::ExecutionNodeKind::Subgraph
-                && serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
-                    &node.payload_ref,
-                )
-                .is_ok()
-        }));
-        assert!(compiled.graph.nodes.iter().all(|node| {
-            node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-        }));
+        .expect_err("frozen capacity rejects an oversized model hint");
+        assert!(compiled
+            .to_string()
+            .contains("program_team_count_exceeds_capacity:100>32"));
     }
 
     #[test]
@@ -4502,6 +4563,17 @@ mod tests {
         let patch_plan = planner::plan_runtime_orchestration(&patch_request);
         let patch_proposal = patch_request.proposal.as_ref().expect("patch proposal");
         let existing_instances = program.semantic_node_instances.clone();
+        let frozen_capacity = registered
+            .nodes
+            .iter()
+            .find_map(|node| {
+                serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+                    &node.payload_ref,
+                )
+                .ok()
+                .and_then(|request| request.execution_capacity)
+            })
+            .expect("existing Program Team carries a frozen capacity snapshot");
         let mut repairs = Vec::new();
         let mut mutation = compiler::compile_graph_mutation(
             "patch-revision",
@@ -4511,6 +4583,7 @@ mod tests {
             &registered.id,
             registered.parent_execution.as_ref(),
             services.team_runtime().as_ref(),
+            Some(&frozen_capacity),
             &existing_instances,
             &mut repairs,
         )

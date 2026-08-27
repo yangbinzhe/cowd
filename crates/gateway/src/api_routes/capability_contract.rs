@@ -441,9 +441,9 @@ fn gateway_openapi_document_from_contract(
             "capability_count": contract.capability_count,
             "coverage": contract.coverage
         },
-        "x-cowd-projection-v2-golden": serde_json::from_str::<Value>(include_str!(
-            "../../../harness-contract/tests/fixtures/projection-v2/materialization.json"
-        )).expect("canonical projection v2 fixture must be valid JSON")
+        "x-cowd-projection-v3-golden": serde_json::from_str::<Value>(include_str!(
+            "../../../harness-contract/tests/fixtures/projection-v3/materialization.json"
+        )).expect("canonical projection v3 fixture must be valid JSON")
     })
 }
 
@@ -2815,7 +2815,7 @@ mod tests {
             &delta_schema["properties"]["operations"],
             "#/components/schemas/ProjectionOperation"
         ));
-        let golden = &document["x-cowd-projection-v2-golden"];
+        let golden = &document["x-cowd-projection-v3-golden"];
         assert_eq!(
             golden["delta"]["schema_version"],
             harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION

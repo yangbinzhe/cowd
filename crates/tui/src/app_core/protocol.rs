@@ -746,9 +746,9 @@ mod tests {
         }
 
         let corpus: Corpus = serde_json::from_str(include_str!(
-            "../../../harness-contract/tests/fixtures/projection-v2/materialization.json"
+            "../../../harness-contract/tests/fixtures/projection-v3/materialization.json"
         ))
-        .expect("canonical projection v2 corpus");
+        .expect("canonical projection v3 corpus");
         let mut reducer = ExecutionProjectionReducer::default();
         assert_eq!(
             reducer.install_snapshot(&corpus.initial),

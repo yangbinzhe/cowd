@@ -579,6 +579,10 @@ const RUNTIME_CONTROL_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Object,
     },
     FieldSpec {
+        name: "capacity",
+        expected: FieldType::Object,
+    },
+    FieldSpec {
         name: "task",
         expected: FieldType::Object,
     },
@@ -615,6 +619,57 @@ const RUNTIME_CONTROL_AGENT_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "min_collaboration_score",
+        expected: FieldType::Number,
+    },
+];
+
+const RUNTIME_CONTROL_CAPACITY_FIELDS: &[FieldSpec] = &[
+    FieldSpec {
+        name: "profile_id",
+        expected: FieldType::String,
+    },
+    FieldSpec {
+        name: "revision",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_program_teams",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_team_roles",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_role_instances_per_team",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_agent_nodes_per_team",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_pending_instance",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_pending_per_class",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_pending_per_key",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "admission_aging_interval_ms",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "user_team_veto_window_ms",
+        expected: FieldType::Number,
+    },
+    FieldSpec {
+        name: "max_semantic_revisions_per_turn",
         expected: FieldType::Number,
     },
 ];
@@ -945,6 +1000,15 @@ pub fn validate_config_file(
                     agent,
                     RUNTIME_CONTROL_AGENT_FIELDS,
                     "runtime.control.agent",
+                    source,
+                    &path_display,
+                ));
+            }
+            if let Some(capacity) = control.get("capacity").and_then(JsonValue::as_object) {
+                result.merge(validate_object_keys(
+                    capacity,
+                    RUNTIME_CONTROL_CAPACITY_FIELDS,
+                    "runtime.control.capacity",
                     source,
                     &path_display,
                 ));

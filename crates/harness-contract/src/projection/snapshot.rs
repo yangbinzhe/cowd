@@ -18,8 +18,8 @@ use crate::strategy::{
 };
 use crate::turn::CancellationReceipt;
 
-pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 2;
-pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 2;
+pub const EXECUTION_PROJECTION_SCHEMA_VERSION: u32 = 3;
+pub const EXECUTION_PROJECTION_REDUCER_VERSION: u32 = 3;
 pub const STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(

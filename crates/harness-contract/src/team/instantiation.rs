@@ -216,6 +216,42 @@ pub struct TeamStrategyBinding {
     pub turn_ref: String,
 }
 
+/// Immutable execution-capacity facts frozen by Runtime before a Team is
+/// planned. This is evidence for the one ResourceManager admission policy;
+/// it is not a Team-local queue or mutable configuration handle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamExecutionCapacitySnapshot {
+    pub schema_version: u16,
+    pub profile_id: String,
+    pub revision: u64,
+    pub digest: String,
+    pub max_program_teams: usize,
+    pub max_team_roles: usize,
+    pub max_role_instances_per_team: usize,
+    pub max_agent_nodes_per_team: usize,
+    pub max_parallel_agents: usize,
+}
+
+impl TeamExecutionCapacitySnapshot {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version == 0
+            || self.profile_id.trim().is_empty()
+            || self.revision == 0
+            || self.digest.trim().is_empty()
+            || self.max_program_teams == 0
+            || self.max_team_roles == 0
+            || self.max_role_instances_per_team == 0
+            || self.max_agent_nodes_per_team == 0
+            || self.max_parallel_agents == 0
+        {
+            return Err(ValidationError::InvalidContract {
+                message: "Team capacity snapshot is incomplete".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Complete Team request accepted by Runtime.  All fields are declarative
 /// ceilings or user intent.  It intentionally has no graph nodes, executor
 /// names, mutable Agent runtime IDs, or surface-owned context payloads.
@@ -285,6 +321,11 @@ pub struct TeamInstantiationRequest {
     /// Durable artifact locators committed by predecessor root-graph nodes.
     #[serde(default)]
     pub upstream_artifact_refs: Vec<String>,
+    /// New Runtime admissions always carry this immutable snapshot. `None`
+    /// is retained only so historical serialized Team requests remain
+    /// decodable; Runtime never synthesizes a current profile for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_capacity: Option<TeamExecutionCapacitySnapshot>,
 }
 
 impl TeamInstantiationRequest {
@@ -312,6 +353,9 @@ impl TeamInstantiationRequest {
             .map_err(|message| ValidationError::InvalidContract {
                 message: message.to_string(),
             })?;
+        if let Some(snapshot) = &self.execution_capacity {
+            snapshot.validate()?;
+        }
         if self.execution_budget.deadline_at_ms != self.deadline_at_ms {
             return Err(ValidationError::InvalidContract {
                 message: "Team deadline must equal its parent execution budget deadline"
@@ -728,6 +772,7 @@ mod tests {
             allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
+            execution_capacity: None,
         }
     }
 

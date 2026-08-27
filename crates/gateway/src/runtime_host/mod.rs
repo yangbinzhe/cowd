@@ -1836,6 +1836,14 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
             )
             .hot_state_config(runtime_config.hot_state().clone())
             .approval_config(runtime_config.approval().clone())
+            .collaboration_capacity(
+                runtime_config.runtime_control().policy.capacity.clone(),
+                runtime_config
+                    .runtime_control()
+                    .policy
+                    .agent
+                    .max_parallel_agents,
+            )
             .skill_revision_pointer_cache(Arc::clone(&skill_revision_pointer_cache))
             .session_ports(
                 session_runtime_port.clone(),

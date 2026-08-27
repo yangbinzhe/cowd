@@ -848,8 +848,9 @@ pub use context_runtime::{
     CONTEXT_RENDER_FORMATTER_VERSION, PERSISTED_CONTEXT_ENVELOPE_SCHEMA_VERSION,
 };
 pub use runtime_control::{
-    AgentControlPolicy, ContextControlPolicy, MemoryControlPolicy, MissionSchedulePolicy,
-    ObservabilityPolicy, RuntimeControlPolicy, TaskControlPolicy,
+    AgentControlPolicy, CollaborationCapacityPolicy, ContextControlPolicy,
+    ExecutionCapacityProfile, MemoryControlPolicy, MissionSchedulePolicy, ObservabilityPolicy,
+    RuntimeControlPolicy, TaskControlPolicy, MAX_REPRESENTABLE_TEAM_AGENT_NODES,
 };
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -173,6 +173,9 @@ fn materialize_delta_operations(
             service_class: graph.service_class,
             parent_execution: graph.parent_execution.clone(),
         });
+        operations.push(ProjectionOperation::ReplaceGraphOrchestration {
+            orchestration: graph.orchestration.clone(),
+        });
         if topology_changed {
             operations.push(ProjectionOperation::ReplaceGraphTopology {
                 node_ids: graph
@@ -196,6 +199,20 @@ fn materialize_delta_operations(
         );
         operations.push(ProjectionOperation::ReplaceAvailableCommands {
             commands: available_commands_for_graph(graph),
+        });
+    }
+    if graph_changed || !events.is_empty() {
+        operations.push(ProjectionOperation::SetDeliveryTruth {
+            delivery_envelope: graph.delivery_envelope.clone(),
+            terminal_presentation: graph.terminal_presentation.clone(),
+            cancellation_receipt: services
+                .latest_cancellation_receipt_for_execution(
+                    scope.session_id.as_deref().unwrap_or_default(),
+                    execution_id,
+                    scope.turn_id.as_deref().unwrap_or_default(),
+                )
+                .ok()
+                .flatten(),
         });
     }
 

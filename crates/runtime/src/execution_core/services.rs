@@ -166,6 +166,8 @@ pub struct RuntimeServicesBuilder {
     mission_schedule_policy: crate::MissionSchedulePolicy,
     hot_state_config: crate::execution_core::hot_state::HotStateConfig,
     approval_config: ApprovalConfig,
+    collaboration_capacity: crate::CollaborationCapacityPolicy,
+    collaboration_max_parallel_agents: usize,
     projection_lanes: Vec<crate::RuntimeProjectionLane>,
 }
 
@@ -735,6 +737,17 @@ impl RuntimeServicesBuilder {
     }
 
     #[must_use]
+    pub fn collaboration_capacity(
+        mut self,
+        policy: crate::CollaborationCapacityPolicy,
+        max_parallel_agents: usize,
+    ) -> Self {
+        self.collaboration_capacity = policy;
+        self.collaboration_max_parallel_agents = max_parallel_agents;
+        self
+    }
+
+    #[must_use]
     pub fn provider_resource_config(mut self, config: crate::ProviderResourceConfig) -> Self {
         self.provider_resource_config = config;
         self
@@ -1029,6 +1042,8 @@ impl RuntimeServicesBuilder {
             self.mission_schedule_policy,
             self.hot_state_config,
             self.approval_config,
+            self.collaboration_capacity,
+            self.collaboration_max_parallel_agents,
             definition_registry,
             task_aggregate_service,
             self.projection_lanes,
@@ -1131,6 +1146,7 @@ pub struct RuntimeServices {
     execution_supervisor: Arc<crate::RuntimeExecutionSupervisor>,
     approval_queue: Arc<ApprovalQueue>,
     approval_coordinator: Arc<ApprovalCoordinator>,
+    execution_capacity_profile: Arc<crate::ExecutionCapacityProfile>,
     evolution_governance: Arc<crate::EvolutionGovernanceService>,
     evolution_discovery: Arc<crate::evolution::EvolutionDiscoveryService>,
     evolution_analyst: Arc<crate::evolution::analyst::EvolutionAnalystService>,
@@ -1289,6 +1305,9 @@ impl RuntimeServices {
             mission_schedule_policy: crate::MissionSchedulePolicy::default(),
             hot_state_config: crate::execution_core::hot_state::HotStateConfig::default(),
             approval_config: ApprovalConfig::default(),
+            collaboration_capacity: crate::CollaborationCapacityPolicy::default(),
+            collaboration_max_parallel_agents: crate::AgentControlPolicy::default()
+                .max_parallel_agents,
             projection_lanes: Vec::new(),
         }
     }
@@ -1351,6 +1370,8 @@ impl RuntimeServices {
             crate::MissionSchedulePolicy::default(),
             crate::execution_core::hot_state::HotStateConfig::default(),
             ApprovalConfig::default(),
+            crate::CollaborationCapacityPolicy::default(),
+            crate::AgentControlPolicy::default().max_parallel_agents,
             definition_registry,
             task_aggregate_service,
             Vec::new(),
@@ -1405,6 +1426,8 @@ impl RuntimeServices {
         mission_schedule_policy: crate::MissionSchedulePolicy,
         hot_state_config: crate::execution_core::hot_state::HotStateConfig,
         approval_config: ApprovalConfig,
+        collaboration_capacity: crate::CollaborationCapacityPolicy,
+        collaboration_max_parallel_agents: usize,
         definition_registry: Arc<RuntimeDefinitionRegistry>,
         task_aggregate_service: Arc<crate::TaskAggregateService>,
         mut projection_lanes: Vec<crate::RuntimeProjectionLane>,
@@ -1532,7 +1555,26 @@ impl RuntimeServices {
             )
         });
         resource_quotas.extend(provider_generation.quotas.iter().cloned());
-        let resource_manager = Arc::new(ExecutionResourceManager::new(resource_quotas.clone()));
+        let execution_capacity_profile = crate::ExecutionCapacityProfile::resolve(
+            &collaboration_capacity,
+            collaboration_max_parallel_agents,
+        )
+        .map_err(RuntimeServicesError::Invariant)?;
+        let resource_manager = Arc::new(
+            ExecutionResourceManager::with_admission_policy(
+                resource_quotas.clone(),
+                crate::execution_core::graph::ExecutionAdmissionPolicy {
+                    revision: execution_capacity_profile.revision,
+                    max_pending_instance: execution_capacity_profile.max_pending_instance,
+                    max_pending_per_class: execution_capacity_profile.max_pending_per_class,
+                    max_pending_per_key: execution_capacity_profile.max_pending_per_key,
+                    aging_interval: std::time::Duration::from_millis(
+                        execution_capacity_profile.admission_aging_interval_ms,
+                    ),
+                },
+            )
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?,
+        );
         resource_manager
             .reconcile_quotas(resource_quotas, provider_generation.reserves)
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
@@ -1562,9 +1604,12 @@ impl RuntimeServices {
         let execution_supervisor = Arc::new(crate::RuntimeExecutionSupervisor::new(graph_runner));
         tool_execution_plane.bind_supervisor(&execution_supervisor);
         let deadline_supervisor = Arc::clone(&execution_supervisor);
+        let deadline_approval_coordinator = Arc::clone(&approval_coordinator);
         approval_queue.install_deadline_scheduler(Arc::new(move |approval_id| {
             let supervisor = Arc::clone(&deadline_supervisor);
+            let approval_coordinator = Arc::clone(&deadline_approval_coordinator);
             Box::pin(async move {
+                approval_coordinator.notify_decision(&approval_id);
                 if let Some((graph_id, _)) =
                     crate::execution_core::graph::executors::parse_graph_approval_id(&approval_id)
                 {
@@ -1811,6 +1856,7 @@ impl RuntimeServices {
             execution_supervisor,
             approval_queue,
             approval_coordinator,
+            execution_capacity_profile: Arc::new(execution_capacity_profile),
             evolution_governance,
             evolution_discovery,
             evolution_analyst,
@@ -3442,6 +3488,9 @@ impl RuntimeServices {
     pub fn approval_coordinator(&self) -> &Arc<ApprovalCoordinator> {
         &self.approval_coordinator
     }
+    pub fn execution_capacity_profile(&self) -> &Arc<crate::ExecutionCapacityProfile> {
+        &self.execution_capacity_profile
+    }
 
     pub fn publish_session_execution_policy(
         &self,
@@ -4817,6 +4866,7 @@ impl RuntimeServices {
             "baseline",
             sample_index,
             self.mission_runtime.default_mission_id(),
+            self.execution_capacity_profile().team_snapshot(),
         );
         let candidate_request = evolution_team_request(
             &candidate,
@@ -4825,6 +4875,7 @@ impl RuntimeServices {
             "candidate",
             sample_index,
             self.mission_runtime.default_mission_id(),
+            self.execution_capacity_profile().team_snapshot(),
         );
         let started = Instant::now();
         let baseline = self
@@ -6367,6 +6418,7 @@ impl RuntimeServices {
                         .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
                     upstream_evidence_refs: Vec::new(),
                     upstream_artifact_refs: Vec::new(),
+                    execution_capacity: Some(self.execution_capacity_profile().team_snapshot()),
                 };
                 self.team_runtime
                     .ensure_root_task(&request)
@@ -7060,6 +7112,7 @@ fn evolution_team_request(
     side: &str,
     sample_index: u32,
     mission_id: &str,
+    execution_capacity: harness_contract::team::TeamExecutionCapacitySnapshot,
 ) -> TeamInstantiationRequest {
     let identity = format!(
         "evolution-eval:{}:{}:{}:{}:{}",
@@ -7107,6 +7160,7 @@ fn evolution_team_request(
         allow_whole_workspace_scope: false,
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
+        execution_capacity: Some(execution_capacity),
     }
 }
 
@@ -10335,6 +10389,7 @@ mod tests {
             allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
+            execution_capacity: None,
         }
     }
 

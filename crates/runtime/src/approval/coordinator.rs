@@ -160,6 +160,22 @@ impl ApprovalCoordinator {
         self.waits.count()
     }
 
+    /// Await a durable approval that a Runtime admission has already created.
+    ///
+    /// This is intentionally the only waiting bridge for non-Tool execution
+    /// decisions as well: callers do not poll `ApprovalQueue`, and the queue's
+    /// deadline worker wakes this coordinator through `notify_decision`.
+    pub async fn wait_for_existing_execution(
+        &self,
+        approval_id: &str,
+        cancellation: CancellationToken,
+        control_notify: Option<Arc<Notify>>,
+        timeout: Duration,
+    ) -> Result<ApprovalResolution, String> {
+        self.wait_for_resolution(approval_id, cancellation, control_notify, timeout)
+            .await
+    }
+
     /// Resolve a tool capability gap through an existing Grant, bounded
     /// Steward decision, or canonical human approval.
     #[allow(clippy::too_many_arguments)]
@@ -331,6 +347,12 @@ impl ApprovalCoordinator {
             approval_id,
         };
         loop {
+            // Register the wake before inspecting durable state. Without this
+            // ordering, a decision committed between `get(Pending)` and
+            // `notified()` is a lost Notify wake and can strand a confirmation
+            // waiter until an unrelated timeout/cancellation arrives.
+            let mut decision_notify = std::pin::pin!(waiter.notified());
+            decision_notify.as_mut().enable();
             let request = self
                 .queue
                 .get(approval_id)
@@ -384,7 +406,7 @@ impl ApprovalCoordinator {
                         reason: receipt.message,
                     });
                 }
-                () = waiter.notified() => {}
+                () = &mut decision_notify => {}
                 () = wait_for_control(control_notify.as_ref()) => {
                     let receipt = self.queue.cancel(
                         approval_id,
@@ -576,6 +598,40 @@ mod tests {
         }
     }
 
+    fn submit_pending_execution(
+        coordinator: &ApprovalCoordinator,
+        approval_id: &str,
+        timeout_policy: ApprovalTimeoutPolicy,
+    ) {
+        coordinator
+            .queue()
+            .submit_scoped(
+                approval_id,
+                SubmitGlobalApprovalRequest {
+                    source: source(),
+                    context: context(approval_id),
+                    action: "team_admission".to_string(),
+                    summary: "confirm Team admission".to_string(),
+                    risk: TaskRisk::High,
+                    domain: ApprovalDomain::Execution,
+                    blocks_execution: true,
+                    evidence_refs: vec!["test.team.admission".to_string()],
+                    timeout_policy,
+                },
+            )
+            .expect("pending execution approval");
+    }
+
+    async fn wait_until_registered(coordinator: &ApprovalCoordinator) {
+        for _ in 0..32 {
+            if coordinator.active_waiter_count() == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("approval waiter did not register");
+    }
+
     #[test]
     fn steward_never_approves_secret_or_external_mutation() {
         let mut secret = descriptor(ToolEffectKind::Read);
@@ -667,6 +723,100 @@ mod tests {
             ApprovalResolution::ControlRequested { .. }
         ));
         assert!(coordinator.queue().pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn existing_execution_veto_wakes_waiter_and_releases_it() {
+        let coordinator = coordinator(ApprovalProfile::Balanced);
+        let approval_id = "team-veto";
+        submit_pending_execution(
+            &coordinator,
+            approval_id,
+            ApprovalTimeoutPolicy::AutoApproveOnce,
+        );
+        let waiting = Arc::clone(&coordinator);
+        let task = tokio::spawn(async move {
+            waiting
+                .wait_for_existing_execution(
+                    approval_id,
+                    CancellationToken::new(),
+                    None,
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+
+        wait_until_registered(&coordinator).await;
+        coordinator
+            .queue()
+            .decide_surface_human(
+                "operator:test",
+                ApprovalDecisionCommand {
+                    approval_id: approval_id.to_string(),
+                    approved: false,
+                    skip: false,
+                    reason: "explicit veto".to_string(),
+                    scope: ApprovalGrantScope::Once,
+                    actor: ApprovalDecisionActor {
+                        kind: ApprovalDecisionActorKind::Human,
+                        actor_id: "ignored-by-surface".to_string(),
+                    },
+                    evidence_refs: vec!["test.explicit-veto".to_string()],
+                },
+            )
+            .expect("human veto");
+        coordinator.notify_decision(approval_id);
+
+        assert!(matches!(
+            task.await.expect("waiter task").expect("resolution"),
+            ApprovalResolution::Denied { .. }
+        ));
+        assert_eq!(coordinator.active_waiter_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn existing_execution_timeout_and_cancel_release_waiters() {
+        let coordinator = coordinator(ApprovalProfile::Balanced);
+        let timeout_id = "team-timeout";
+        submit_pending_execution(
+            &coordinator,
+            timeout_id,
+            ApprovalTimeoutPolicy::AutoApproveOnce,
+        );
+        let timed_out = coordinator
+            .wait_for_existing_execution(
+                timeout_id,
+                CancellationToken::new(),
+                None,
+                Duration::from_millis(1),
+            )
+            .await
+            .expect("timeout resolution");
+        assert!(matches!(timed_out, ApprovalResolution::Approved { .. }));
+        assert_eq!(coordinator.active_waiter_count(), 0);
+
+        let cancel_id = "team-cancel";
+        submit_pending_execution(&coordinator, cancel_id, ApprovalTimeoutPolicy::Pending);
+        let cancellation = CancellationToken::new();
+        let waiting = Arc::clone(&coordinator);
+        let cancellation_task = cancellation.clone();
+        let task = tokio::spawn(async move {
+            waiting
+                .wait_for_existing_execution(
+                    cancel_id,
+                    cancellation_task,
+                    None,
+                    Duration::from_secs(1),
+                )
+                .await
+        });
+        wait_until_registered(&coordinator).await;
+        cancellation.cancel();
+        assert!(matches!(
+            task.await.expect("cancel task").expect("resolution"),
+            ApprovalResolution::Cancelled { .. }
+        ));
+        assert_eq!(coordinator.active_waiter_count(), 0);
     }
 
     #[test]

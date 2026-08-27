@@ -1,6 +1,6 @@
 {
   "initial": {
-    "schema_version": 2,
+    "schema_version": 3,
     "execution_id": "execution-golden",
     "revision": 1,
     "cursor": 1,
@@ -113,8 +113,8 @@
     ]
   },
   "delta": {
-    "schema_version": 2,
-    "reducer_version": 2,
+    "schema_version": 3,
+    "reducer_version": 3,
     "execution_id": "execution-golden",
     "from_revision": 1,
     "target_revision": 2,
@@ -422,7 +422,7 @@
     "resync_reason": null
   },
   "expected": {
-    "schema_version": 2,
+    "schema_version": 3,
     "execution_id": "execution-golden",
     "revision": 2,
     "cursor": 2,

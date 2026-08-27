@@ -70,6 +70,55 @@ pub fn compile_orchestration(
     parent_execution: Option<ExecutionParentBinding>,
     team_runtime: Option<&TeamRuntime>,
 ) -> Result<CompiledOrchestration, OrchestrationCompileError> {
+    #[cfg(test)]
+    let test_capacity = harness_contract::team::TeamExecutionCapacitySnapshot {
+        schema_version: 1,
+        profile_id: "unit-test".to_string(),
+        revision: 1,
+        digest: "sha256:unit-test-capacity".to_string(),
+        max_program_teams: 32,
+        max_team_roles: 32,
+        max_role_instances_per_team: 32,
+        max_agent_nodes_per_team: 32,
+        max_parallel_agents: 42,
+    };
+    #[cfg(test)]
+    let execution_capacity = Some(&test_capacity);
+    #[cfg(not(test))]
+    let execution_capacity = None;
+    if execution_capacity.is_none()
+        && request.proposal.as_ref().is_some_and(|proposal| {
+            proposal
+                .nodes
+                .iter()
+                .any(|node| node.recipe == CapabilityRecipeId::Team)
+        })
+    {
+        return Err(OrchestrationCompileError::InvalidProposal(
+            "runtime_capacity_snapshot_required_for_team_compilation".to_string(),
+        ));
+    }
+    compile_orchestration_with_capacity(
+        request_id,
+        request,
+        plan,
+        parent_execution,
+        team_runtime,
+        execution_capacity,
+    )
+}
+
+/// Runtime admissions call this entry point with their resolved capacity
+/// profile. The compatibility entry point above never creates a default
+/// profile and remains only for historical fixtures.
+pub fn compile_orchestration_with_capacity(
+    request_id: &str,
+    request: &RuntimeOrchestrationCommand,
+    plan: &RuntimeOrchestrationPlan,
+    parent_execution: Option<ExecutionParentBinding>,
+    team_runtime: Option<&TeamRuntime>,
+    execution_capacity: Option<&harness_contract::team::TeamExecutionCapacitySnapshot>,
+) -> Result<CompiledOrchestration, OrchestrationCompileError> {
     if request.operation != RuntimeOrchestrationOperation::Propose {
         return Err(OrchestrationCompileError::OperationDoesNotCompile(
             request.operation.as_str(),
@@ -79,6 +128,26 @@ pub fn compile_orchestration(
         .proposal
         .as_ref()
         .ok_or(OrchestrationCompileError::MissingProposal)?;
+    if let Some(capacity) = execution_capacity {
+        let requested_team_instances = proposal
+            .nodes
+            .iter()
+            .filter(|node| node.recipe == CapabilityRecipeId::Team)
+            .try_fold(0usize, |total, node| {
+                total.checked_add(usize::from(node.multiplicity))
+            })
+            .ok_or_else(|| {
+                OrchestrationCompileError::InvalidProposal(
+                    "program_team_count_overflow".to_string(),
+                )
+            })?;
+        if requested_team_instances > capacity.max_program_teams {
+            return Err(OrchestrationCompileError::InvalidProposal(format!(
+                "program_team_count_exceeds_capacity:{requested_team_instances}>{}",
+                capacity.max_program_teams
+            )));
+        }
+    }
     let lineage = request.lineage.clone().ok_or_else(|| {
         OrchestrationCompileError::InvalidProposal(
             "orchestration proposal requires canonical execution lineage".to_string(),
@@ -102,6 +171,7 @@ pub fn compile_orchestration(
         &graph_id,
         parent_execution.as_ref(),
         team_runtime.ok_or(OrchestrationCompileError::TeamRuntimeRequired)?,
+        execution_capacity,
         &BTreeMap::new(),
         &mut repairs,
     )?;
@@ -368,6 +438,7 @@ pub fn compile_graph_mutation(
     graph_id: &str,
     root_parent: Option<&ExecutionParentBinding>,
     team_runtime: &TeamRuntime,
+    execution_capacity: Option<&harness_contract::team::TeamExecutionCapacitySnapshot>,
     existing_semantic_node_instances: &BTreeMap<String, Vec<String>>,
     repairs: &mut Vec<String>,
 ) -> Result<CompiledGraphMutation, OrchestrationCompileError> {
@@ -394,6 +465,7 @@ pub fn compile_graph_mutation(
                 &node_id,
                 root_parent,
                 team_runtime,
+                execution_capacity,
                 repairs,
             )?);
         }
@@ -475,6 +547,7 @@ fn compile_semantic_node(
     node_id: &str,
     root_parent: Option<&ExecutionParentBinding>,
     team_runtime: &TeamRuntime,
+    execution_capacity: Option<&harness_contract::team::TeamExecutionCapacitySnapshot>,
     repairs: &mut Vec<String>,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
     let mut node = match semantic.recipe {
@@ -488,6 +561,7 @@ fn compile_semantic_node(
             node_id,
             root_parent,
             team_runtime,
+            execution_capacity,
             repairs,
         ),
         CapabilityRecipeId::SessionDispatch => {
@@ -603,6 +677,7 @@ fn compile_team_subgraph_node(
     node_id: &str,
     _root_parent: Option<&ExecutionParentBinding>,
     team_runtime: &TeamRuntime,
+    execution_capacity: Option<&harness_contract::team::TeamExecutionCapacitySnapshot>,
     repairs: &mut Vec<String>,
 ) -> Result<ExecutionNodeSpec, OrchestrationCompileError> {
     // A custom snapshot is the executable contract. Do not even parse the
@@ -696,7 +771,10 @@ fn compile_team_subgraph_node(
             request,
             semantic,
             deadline_at_ms,
-            request.constraints.max_parallel_agents.unwrap_or(32),
+            // The initial estimate is recomputed after immutable Team
+            // topology resolution below.  Never invent a compiler-local
+            // capacity default here.
+            request.constraints.max_parallel_agents.unwrap_or(1),
             1,
         ),
         deadline_at_ms,
@@ -708,6 +786,7 @@ fn compile_team_subgraph_node(
             .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
+        execution_capacity: execution_capacity.cloned(),
     };
     // The first plan resolves the published template and exposes the real
     // role-branch cardinality. A team with N template roles needs a predicted
@@ -726,10 +805,25 @@ fn compile_team_subgraph_node(
     // the only useful default is the resolved Team topology itself.  Global
     // tenant/device capacity is deliberately *not* duplicated here: the
     // ResourceManager remains its single admission owner.
+    if let (Some(requested), Some(capacity)) =
+        (request.constraints.max_parallel_agents, execution_capacity)
+    {
+        if requested > capacity.max_parallel_agents {
+            return Err(OrchestrationCompileError::InvalidProposal(format!(
+                "team_parallelism_exceeds_capacity:{requested}>{}",
+                capacity.max_parallel_agents
+            )));
+        }
+    }
     let max_parallel = request
         .constraints
         .max_parallel_agents
         .unwrap_or(role_branch_count)
+        .min(
+            execution_capacity
+                .map(|capacity| capacity.max_parallel_agents)
+                .unwrap_or(usize::MAX),
+        )
         .max(1);
     // A Team deadline is a durable liveness budget, not a template-specific
     // fixed timeout and not an unbounded sentinel.  It expands with the
