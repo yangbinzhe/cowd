@@ -15,6 +15,18 @@ use crate::{session_actor::SessionActor, HarnessEvalRunnerOptions};
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Keep the expensive, real-provider research exercise opt-in.  It is a
+/// production-path acceptance scenario, but should not silently add provider
+/// usage to the standard regression suite.
+fn group_theory_research_scenario_enabled() -> bool {
+    matches!(
+        std::env::var("COWD_EVAL_GROUP_THEORY_RESEARCH")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
 /// Run production-path scenarios against an explicitly supplied, isolated
 /// Gateway. This runner never constructs Runtime objects or fakes receipts:
 /// every result is derived from public Gateway responses and durable messages.
@@ -222,7 +234,7 @@ impl LiveScenarioRunner {
         let health_passed = health_observations
             .values()
             .all(|observation| observation["status"] == "passed");
-        let scenarios = [
+        let mut scenario_specs = vec![
             LiveScenarioSpec {
                 id: "live_direct_terminal",
                 prompt: "只回答 7 乘以 8 的结果。不要调用工具，不要组队。",
@@ -262,10 +274,22 @@ impl LiveScenarioRunner {
                 },
                 timeout: LiveScenarioTimeout::team(),
             },
-        ]
-        .into_iter()
-        .map(|spec| self.run_scenario(spec))
-        .collect::<Vec<_>>();
+        ];
+        if group_theory_research_scenario_enabled() {
+            scenario_specs.push(LiveScenarioSpec {
+                id: "live_group_theory_ai_research_simulation",
+                prompt: "这是一个必须在本次隔离执行环境中完成的深度任务：调研群论在当前 AI 中的应用，并形成可复核的测试测评方案。必须实际启动**恰好四个**协作 Team，不能把 Team 职责压缩成模型文本。Team A（数学与方法审查）负责明确群、群作用、表示、invariance/equivariance 的可证伪定义；Team B（应用调研）负责分别评估视觉/3D、科学机器学习或分子材料、机器人或控制等应用，并区分已读取证据与推断；Team C（实验与评测）负责设计并执行一个只读工具可证实的 C4 对称性保持/破坏对照，给出指标、预期、局限与复现步骤；Team D（综合与风险）必须在收到 A、B、C 的经过授权的结构化证据交接之后，比较收益、失败模式、适用边界并输出最终建议。A、B、C 可以并行；不得在三份事实交接完成前开始 D 的实质综合。不得编造论文、链接、实验结果或工具输出；无法通过本次只读工具取得的外部事实必须标为待验证。最终结论需明确包含 `C4`、列出至少三个本工作区实际读取到的完整 `crates/.../*.rs` 源码路径，并说明研究、调研、分析、处理、模拟各环节的输入/输出。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；不要调用 bash 或任何写工具。",
+                acceptance: LiveAcceptance::ArchitectureQuality {
+                    minimum_teams: 4,
+                    minimum_claimed_cross_team_edges: 3,
+                },
+                timeout: LiveScenarioTimeout::team(),
+            });
+        }
+        let scenarios = scenario_specs
+            .into_iter()
+            .map(|spec| self.run_scenario(spec))
+            .collect::<Vec<_>>();
         let passed = scenarios
             .iter()
             .filter(|scenario| scenario.get("status").and_then(Value::as_str) == Some("passed"))
