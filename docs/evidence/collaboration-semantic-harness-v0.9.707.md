@@ -7,7 +7,7 @@
 | Episode and signature contract | Passed (deterministic) | Starts only after both v0.9.706 tags and clean worktrees; core tag `7202ae1b`, Edge tag `eb60d5f`; terminal event uses a deterministic Runtime transaction id, salted opaque Session/Turn hashes, delivery/presentation agreement and durable evidence gating |
 | Durable projector and pattern aggregation | Passed (deterministic) | Replays terminal episode events only; three distinct eligible turns produce an advisory-only pattern event, fenced by signature stream revision |
 | Advisory precedence and governed promotion | Passed (deterministic) | Pattern contains no executable subject; versioned `PublishedRevision` / verified `EpisodeSet` baseline has legacy recovery mapping and fails closed when the frozen set is not backed by a durable advisory pattern |
-| Real-provider, real-browser and multi-Team acceptance | In progress | Two isolated real-provider runs completed; direct/tool/single-architecture checks passed, while explicit Team admission was not submitted by the provider. A source-level control-plane repair is being revalidated on a new immutable candidate. |
+| Real-provider, real-browser and multi-Team acceptance | Failed — release blocked | Four isolated real-provider runs completed. Direct, tool-evidence and single-architecture scenarios passed, but Team projection and managed escalation did not produce the required completed Teams or claimed cross-Team edges. No `v0.9.707` tag may be created from this evidence. |
 
 ## Version boundary
 
@@ -42,6 +42,38 @@ record. This phase has not claimed provider or browser terminal acceptance.
   presentation, capability-parity, raw-payload, secondary-section and
   acceptance gates. OpenAPI isolation and broader end-to-end gates remain in
   progress.
+
+## Real-provider acceptance — failed, retained as release evidence
+
+The isolated `harness-eval-real-qwen.sh` lane ran against configured provider
+`gpt-5.6-terra` and wrote authorized real-model reports under ignored local
+artifacts:
+
+- `target/acceptance/real-qwen/runs/v0.9.707-1787812781-mission-harness-deep/report.json`
+- `target/acceptance/real-qwen/runs/v0.9.707-1787813179-mission-harness-deep/report.json`
+- `target/acceptance/real-qwen/runs/v0.9.707-1787814093-mission-harness-deep/report.json`
+
+The first two runs established the reproducible symptom: direct terminal,
+tool-evidence and single-architecture scenarios passed, but Team projection
+and managed escalation recorded zero completed Teams, Agents, and claimed
+cross-Team edges. The Provider endpoint also had transient connection failures
+at run start; a permitted rerun after it recovered produced the same Team
+gate failure.
+
+Two bounded source repairs were then committed to fresh immutable candidates:
+`a7feb16e` forces the native `submit_collaboration_decision` action for an
+explicit Team requirement, and `152d4783` makes the required
+`team.team_key` visible in the Runtime-owned schema instruction. The final
+run recorded a real `submit_collaboration_decision` invocation, but the
+Provider-produced semantic contract remained rejected by the typed compiler
+and its one bounded correction still did not admit a Program. The final live
+report therefore remains `failed` (3/5 scenarios passed) with zero completed
+Teams and zero claimed cross-Team edges. This is a hard terminal-acceptance
+failure, not a passing Provider/browser substitute.
+
+Consequently the version is deliberately **not tagged** and neither repository
+is pushed. The deterministic code and WebUI gates remain valid evidence only;
+they do not close the real-provider/multi-Team requirement.
 
 ## Allowlist amendment
 
