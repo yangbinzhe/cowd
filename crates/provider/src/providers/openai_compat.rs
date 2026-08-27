@@ -1770,13 +1770,23 @@ fn translate_message(
                 }
             }
             // A reasoning-only history frame is not a valid Chat Completions
-            // assistant message for every OpenAI-compatible provider.  In
-            // particular DeepSeek rejects `content: null` without tool_calls,
-            // even when reasoning_content is present.  Reasoning is private
-            // continuation state, not a user-visible assistant turn, so omit
-            // the orphan frame instead of poisoning every subsequent retry.
+            // assistant message for every OpenAI-compatible provider.  For
+            // providers that do not require a reasoning round trip, omit it
+            // instead of poisoning every subsequent retry.  DeepSeek thinking
+            // mode is the exception: its returned assistant frame, including
+            // private `reasoning_content`, is required continuation state even
+            // when there is no visible content or tool call.  It accepts an
+            // explicit empty content string for that wire shape.
             if text.trim().is_empty() && tool_calls.is_empty() {
-                Vec::new()
+                if require_reasoning_content_roundtrip && !reasoning.is_empty() {
+                    vec![serde_json::json!({
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": reasoning,
+                    })]
+                } else {
+                    Vec::new()
+                }
             } else {
                 let mut msg = serde_json::json!({
                     "role": "assistant",
@@ -4309,7 +4319,7 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_only_assistant_history_is_omitted_for_chat_compatibility() {
+    fn reasoning_only_assistant_history_is_omitted_for_generic_chat_compatibility() {
         use crate::types::{InputContentBlock, InputMessage};
 
         let request = MessageRequest {
@@ -4337,6 +4347,39 @@ mod tests {
             "reasoning-only assistant frame must be dropped"
         );
         assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn deepseek_reasoning_only_assistant_history_roundtrips_reasoning_content() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![
+                InputMessage::user_text("continue"),
+                InputMessage {
+                    role: "assistant".to_string(),
+                    content: vec![InputContentBlock::Thinking {
+                        thinking: "private continuation state".to_string(),
+                        signature: None,
+                    }],
+                },
+            ],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
+        let messages = payload["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "");
+        assert_eq!(
+            messages[1]["reasoning_content"],
+            "private continuation state"
+        );
+        assert!(messages[1].get("tool_calls").is_none());
     }
 
     /// Regression: assistant messages WITH tool calls must still include
