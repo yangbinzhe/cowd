@@ -52,6 +52,14 @@ pub struct OpenAiCompatConfig {
     pub wire_protocol: OpenAiWireProtocol,
     /// Whether this endpoint supports OpenAI-compatible streamed usage chunks.
     pub request_stream_usage: bool,
+    /// Whether assistant tool-call continuations must retain the
+    /// `reasoning_content` field, including an explicitly empty value.
+    ///
+    /// Some thinking-mode compatible APIs validate this field's presence on
+    /// every replayed assistant tool-call frame. Keeping this capability on
+    /// the transport configuration makes the rule reusable without changing
+    /// the shared runtime message model.
+    pub requires_reasoning_content_roundtrip: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -76,6 +84,7 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_XAI_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: false,
+            requires_reasoning_content_roundtrip: false,
         }
     }
 
@@ -88,6 +97,7 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: true,
+            requires_reasoning_content_roundtrip: false,
         }
     }
 
@@ -102,6 +112,7 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_MOONSHOT_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: false,
+            requires_reasoning_content_roundtrip: false,
         }
     }
 
@@ -116,6 +127,7 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: true,
+            requires_reasoning_content_roundtrip: true,
         }
     }
 
@@ -1492,8 +1504,12 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             "content": system,
         }));
     }
+    let require_reasoning_content_roundtrip = config.requires_reasoning_content_roundtrip;
     for message in &request.messages {
-        messages.extend(translate_message(message));
+        messages.extend(translate_message(
+            message,
+            require_reasoning_content_roundtrip,
+        ));
     }
     // Sanitize: drop any `role:"tool"` message that does not have a valid
     // paired `role:"assistant"` with a `tool_calls` entry carrying the same
@@ -1724,7 +1740,10 @@ fn translate_user_message_for_responses(message: &InputMessage) -> Vec<Value> {
     entries
 }
 
-fn translate_message(message: &InputMessage) -> Vec<Value> {
+fn translate_message(
+    message: &InputMessage,
+    require_reasoning_content_roundtrip: bool,
+) -> Vec<Value> {
     match message.role.as_str() {
         "assistant" => {
             let mut text = String::new();
@@ -1765,7 +1784,9 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 });
                 // DeepSeek requires reasoning_content to be passed back in
                 // subsequent requests when thinking mode is enabled.
-                if !reasoning.is_empty() {
+                if !reasoning.is_empty()
+                    || (require_reasoning_content_roundtrip && !tool_calls.is_empty())
+                {
                     msg["reasoning_content"] = json!(reasoning);
                 }
                 // Only include tool_calls when non-empty: some providers reject
@@ -2911,21 +2932,32 @@ mod tests {
             &MessageRequest {
                 model: "grok-3".to_string(),
                 max_tokens: 64,
-                messages: vec![InputMessage {
-                    role: "user".to_string(),
-                    content: vec![
-                        InputContentBlock::Text {
+                messages: vec![
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::Text {
                             text: "hello".to_string(),
-                        },
-                        InputContentBlock::ToolResult {
+                        }],
+                    },
+                    InputMessage {
+                        role: "assistant".to_string(),
+                        content: vec![InputContentBlock::ToolUse {
+                            id: "tool_1".to_string(),
+                            name: "weather".to_string(),
+                            input: json!({"city": "Shanghai"}),
+                        }],
+                    },
+                    InputMessage {
+                        role: "user".to_string(),
+                        content: vec![InputContentBlock::ToolResult {
                             tool_use_id: "tool_1".to_string(),
                             content: vec![ToolResultContentBlock::Json {
                                 value: json!({"ok": true}),
                             }],
                             is_error: false,
-                        },
-                    ],
-                }],
+                        }],
+                    },
+                ],
                 system: Some("be helpful".to_string()),
                 tools: Some(vec![ToolDefinition {
                     name: "weather".to_string(),
@@ -2941,7 +2973,8 @@ mod tests {
 
         assert_eq!(payload["messages"][0]["role"], json!("system"));
         assert_eq!(payload["messages"][1]["role"], json!("user"));
-        assert_eq!(payload["messages"][2]["role"], json!("tool"));
+        assert_eq!(payload["messages"][2]["role"], json!("assistant"));
+        assert_eq!(payload["messages"][3]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
     }
@@ -4337,6 +4370,68 @@ mod tests {
             .expect("assistant message with tool calls must include tool_calls field");
         assert!(tool_calls.is_array());
         assert_eq!(tool_calls.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deepseek_tool_continuation_keeps_reasoning_content_field_even_when_empty() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "Cargo.toml"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
+        let assistant = payload["messages"]
+            .as_array()
+            .and_then(|messages| messages.first())
+            .expect("assistant continuation message");
+        assert_eq!(assistant["reasoning_content"], "");
+        assert!(assistant["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn deepseek_tool_continuation_roundtrips_captured_reasoning_content() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![
+                    InputContentBlock::Thinking {
+                        thinking: "private continuation state".to_string(),
+                        signature: None,
+                    },
+                    InputContentBlock::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({"path": "Cargo.toml"}),
+                    },
+                ],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
+        let assistant = payload["messages"]
+            .as_array()
+            .and_then(|messages| messages.first())
+            .expect("assistant continuation message");
+        assert_eq!(assistant["reasoning_content"], "private continuation state");
+        assert!(assistant["tool_calls"].is_array());
     }
 
     /// Orphaned tool messages (no preceding assistant `tool_calls`) must be
