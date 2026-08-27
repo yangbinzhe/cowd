@@ -62,5 +62,7 @@ record. This phase has not claimed provider or browser terminal acceptance.
 - `crates/runtime/src/conversation/host.rs` is added after the real-provider
   evidence exposed a generic admission gap: an explicit Team requirement now
   forces the already-active native `submit_collaboration_decision` schema on
-  its first provider request. This preserves user-authored Team semantics and
-  creates no Runtime-synthesized Team, scheduler, template, or release owner.
+  its first provider request, and its Runtime-owned micro-instruction includes
+  the mandatory `team.team_key` field discovered by the rejected real request.
+  This preserves user-authored Team semantics and creates no Runtime-synthesized
+  Team, scheduler, template, or release owner.
