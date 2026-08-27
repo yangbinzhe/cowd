@@ -104,13 +104,20 @@ struct CapabilityMapping {
 fn capability_mapping(capability: &str) -> CapabilityMapping {
     match capability {
         "read" => CapabilityMapping {
-            tools: &["read_file", "context_retrieve"],
+            tools: &[
+                "read_file",
+                "read_many",
+                "workspace_snapshot",
+                "context_retrieve",
+            ],
             required_mode: PermissionMode::ReadOnly,
         },
         "search" => CapabilityMapping {
             tools: &[
                 "grep_search",
+                "grep_many",
                 "glob_search",
+                "glob_many",
                 "tool_search",
                 "context_retrieve",
             ],
@@ -177,7 +184,12 @@ mod tests {
 
         assert_eq!(resolved.permission_mode, PermissionMode::ReadOnly);
         assert!(resolved.allowed_tools.contains("read_file"));
+        assert!(resolved.allowed_tools.contains("read_many"));
+        assert!(resolved.allowed_tools.contains("workspace_snapshot"));
         assert!(resolved.allowed_tools.contains("grep_search"));
+        assert!(resolved.allowed_tools.contains("grep_many"));
+        assert!(resolved.allowed_tools.contains("glob_search"));
+        assert!(resolved.allowed_tools.contains("glob_many"));
         assert!(resolved.allowed_tools.contains("tool_search"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
         assert!(resolved
