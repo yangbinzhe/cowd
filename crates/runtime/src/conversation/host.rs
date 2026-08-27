@@ -48,10 +48,10 @@ use sha2::{Digest, Sha256};
 
 const PROVIDER_PROTOCOL_RECOVERY_BUDGET: u8 = 1;
 /// A provider can legally return prose despite a named-tool wire constraint.
-/// Permit two bounded root admission repairs before reporting a durable
+/// Permit three bounded root admission repairs before reporting a durable
 /// incomplete result. This budget applies only before any Team Program exists;
 /// it never expands follow-up Team authority after a collaboration starts.
-const ROOT_CONTROL_PLANE_REPAIR_BUDGET: usize = 2;
+const ROOT_CONTROL_PLANE_REPAIR_BUDGET: usize = 3;
 
 /// The root collaboration contract has a deliberately small, durable control
 /// plane. Capability discovery is useful, but it must not satisfy the action
