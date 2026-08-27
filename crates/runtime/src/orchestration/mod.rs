@@ -3222,7 +3222,7 @@ mod tests {
         request.proposal = None;
         request.collaboration_intent = Some(ModelCollaborationControlDecisionV2 {
             schema_version: 2,
-            decision_id: "ambiguous-terminal".to_string(),
+            decision_id: "missing-terminal-output".to_string(),
             intent: "perform a semantic review".to_string(),
             reason: "exercise the compiler rejection receipt".to_string(),
             workstreams: vec![ModelCollaborationWorkstreamV2 {
@@ -3265,7 +3265,7 @@ mod tests {
                 .expect("semantic decision"),
             &services,
         )
-        .expect_err("the terminal role is intentionally ambiguous");
+        .expect_err("the terminal role intentionally omits the required output");
 
         let result = rejected_intent_compiler_result(&request, error);
 
@@ -3274,7 +3274,7 @@ mod tests {
             .decision
             .validation_findings
             .iter()
-            .any(|finding| { finding.contains("ambiguous_completion_gap") }));
+            .any(|finding| { finding.contains("completion_terminal_role_missing") }));
         assert!(!result
             .decision
             .validation_findings
@@ -3282,7 +3282,7 @@ mod tests {
             .any(|finding| { finding.contains("propose_requires_only_graph_proposal") }));
         assert_eq!(
             result.decision.recovery_hints[0].code,
-            "collaboration_compile_ambiguous_completion_gap"
+            "collaboration_compile_completion_terminal_role_missing"
         );
         assert!(result.decision.recovery_hints[0].retryable);
     }

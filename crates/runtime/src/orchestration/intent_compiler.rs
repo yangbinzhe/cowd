@@ -320,6 +320,10 @@ fn compile_team(
     let dependencies = validate_role_dependencies(team, &canonical_ids, workstream_index)?;
     let incoming = incoming_dependencies(&dependencies);
     let outgoing = outgoing_dependencies(&dependencies);
+    // Runtime's durable Team contract represents required evidence as an
+    // `evidence` result artifact. The model-facing V2 guidance names this
+    // invariant explicitly, while the compiler preserves it even if a client
+    // omitted the redundant result-field spelling.
     let mut result_fields = canonical_set(&team.result.required_artifacts);
     if team.result.evidence_required && !result_fields.iter().any(|field| field == "evidence") {
         result_fields.push("evidence".to_string());
@@ -701,12 +705,34 @@ fn terminal_role_id(
             .then(|| canonical_id.clone())
         })
         .collect::<Vec<_>>();
-    if candidates.len() != 1 {
-        return Err(CollaborationCompileDiagnostic::validation(
-            "ambiguous_completion_gap",
-            format!("workstreams[{workstream_index}].team.result"),
-        )
-        .into());
+    if candidates.is_empty() {
+        let terminal_roles = team
+            .roles
+            .iter()
+            .filter_map(|role| {
+                let canonical_id = canonical_ids.get(&role.role_id)?;
+                (outgoing.get(canonical_id).copied().unwrap_or_default() == 0)
+                    .then(|| role.role_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut diagnostic = CollaborationCompileDiagnostic::validation(
+            "completion_terminal_role_missing",
+            format!("workstreams[{workstream_index}].team.roles[*].output_artifacts"),
+        );
+        diagnostic.semantic_ids = terminal_roles;
+        diagnostic.allowed_repairs =
+            vec!["assign_every_required_result_artifact_to_one_terminal_role".to_string()];
+        return Err(diagnostic.into());
+    }
+    if candidates.len() > 1 {
+        let mut diagnostic = CollaborationCompileDiagnostic::validation(
+            "completion_terminal_role_ambiguous",
+            format!("workstreams[{workstream_index}].team.dependencies"),
+        );
+        diagnostic.semantic_ids = candidates;
+        diagnostic.allowed_repairs =
+            vec!["retain_exactly_one_terminal_role_for_required_result_artifacts".to_string()];
+        return Err(diagnostic.into());
     }
     Ok(candidates.into_iter().next())
 }

@@ -7139,6 +7139,8 @@ where
         let tool_calls = result.messages.len() as u64;
         let failed = result.failed;
         let failed_tools = failed_tool_names(&result.messages);
+        let retryable_collaboration_diagnostic =
+            retryable_collaboration_compile_diagnostic(&result.messages);
         let successful_call_ids = successful_tool_call_ids(&result.messages);
         let action_fingerprint = tool_batch_fingerprint(&calls);
         let goal_id = self.state.lock().await.goal_id.clone();
@@ -7306,6 +7308,34 @@ where
                 // the ToolBatch itself is durable. `after_commit` publishes
                 // the matching Session event and then advances live state.
                 state.pending_root_control_plane_phase = Some(next_phase);
+            }
+            if let Some(diagnostic) = retryable_collaboration_diagnostic.as_deref() {
+                // The provider may return prose after a tool-result turn even
+                // when it correctly recognized a retryable compiler receipt.
+                // Make the repair an explicit, bounded next-step contract so
+                // the control plane cannot terminate between diagnosis and
+                // the one permitted corrected semantic submission.
+                if state.team_orchestration_requests < 1 {
+                    state.team_orchestration_requests =
+                        state.team_orchestration_requests.saturating_add(1);
+                    state.force_tool_allowlist_next_model = Some(BTreeSet::from([
+                        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+                            .to_string(),
+                    ]));
+                    let reason = format!(
+                        "Runtime requires one corrected semantic collaboration submission now. The only retryable compiler diagnostic is `{diagnostic}`. Call submit_collaboration_decision in this next response with a complete replacement decision; repair exactly the diagnostic's field paths and allowed repairs, preserve valid workstreams, and do not write a conclusion or invoke any other tool."
+                    );
+                    let mut item = ContextItem::new(
+                        format!("runtime-root-collaboration-repair:{}", ticket.node_id),
+                        ContextSourceKind::Task,
+                        ContextRole::Instruction,
+                        reason,
+                    );
+                    item.authority = ContextAuthority::System;
+                    item.visibility = ContextVisibility::Private;
+                    item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
+                    state.pending_next_model_context.push(item);
+                }
             }
         }
         state.max_tool_concurrency_observed = state
@@ -10999,6 +11029,47 @@ fn failed_tool_names(messages: &[ConversationMessage]) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+/// Return the one bounded, model-repairable compiler diagnostic from a failed
+/// semantic admission receipt.  Gateway deliberately exposes this compact
+/// receipt instead of an executable graph, so this parser must use the typed
+/// recovery hint rather than infer state from prose.
+fn retryable_collaboration_compile_diagnostic(messages: &[ConversationMessage]) -> Option<String> {
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .find_map(|block| {
+            let ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error: true,
+                ..
+            } = block
+            else {
+                return None;
+            };
+            if !tool_name.eq_ignore_ascii_case(
+                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+            ) {
+                return None;
+            }
+            orchestration_receipt_json(output).and_then(|receipt| {
+                receipt
+                    .get("recovery_hints")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|hints| {
+                        hints.iter().find_map(|hint| {
+                            (hint.get("retryable").and_then(serde_json::Value::as_bool)
+                                == Some(true))
+                            .then(|| hint.get("code").and_then(serde_json::Value::as_str))
+                            .flatten()
+                            .filter(|code| code.starts_with("collaboration_compile_"))
+                            .map(str::to_string)
+                        })
+                    })
+            })
+        })
 }
 
 /// A governed action is identified by its tool name and canonical input, not
@@ -17210,6 +17281,20 @@ mod tests {
             ConversationMessage::tool_result("c", "read_file", "ok", false),
         ];
         assert_eq!(failed_tool_names(&messages), vec!["runtime_orchestrate"]);
+    }
+
+    #[test]
+    fn retryable_semantic_receipt_is_identified_without_parsing_provider_prose() {
+        let messages = vec![ConversationMessage::tool_result(
+            "team",
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+            r#"runtime orchestration rejected: {"kind":"runtime_orchestration_rejected","recovery_hints":[{"code":"collaboration_compile_completion_terminal_role_missing","retryable":true}]}"#,
+            true,
+        )];
+        assert_eq!(
+            retryable_collaboration_compile_diagnostic(&messages).as_deref(),
+            Some("collaboration_compile_completion_terminal_role_missing")
+        );
     }
 
     #[test]
