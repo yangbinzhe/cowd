@@ -56,7 +56,10 @@ const PROVIDER_PROTOCOL_RECOVERY_BUDGET: u8 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum RootControlPlanePhase {
-    /// The first request may inspect the current catalog or submit a proposal.
+    /// Historical recovery marker for an admission that had not yet submitted
+    /// a semantic proposal. New explicit-Team turns still use the same typed
+    /// submission requirement as `ProposalOnly`: a catalog inspection cannot
+    /// satisfy a user-required Team execution.
     #[default]
     CapabilityOrProposal,
     /// A successful catalog inspection committed; the next request must
@@ -70,8 +73,9 @@ enum RootControlPlanePhase {
 impl RootControlPlanePhase {
     const fn required_tool_choice(self) -> &'static str {
         match self {
-            Self::CapabilityOrProposal => "runtime_capabilities|submit_collaboration_decision",
-            Self::ProposalOnly | Self::ProposalSubmitted => "submit_collaboration_decision",
+            Self::CapabilityOrProposal | Self::ProposalOnly | Self::ProposalSubmitted => {
+                "submit_collaboration_decision"
+            }
         }
     }
 }
@@ -4011,10 +4015,8 @@ where
                     ),
                 })?;
             match phase {
-                RootControlPlanePhase::CapabilityOrProposal => {
-                    runtime.require_next_model_orchestration_only();
-                }
-                RootControlPlanePhase::ProposalOnly => {
+                RootControlPlanePhase::CapabilityOrProposal
+                | RootControlPlanePhase::ProposalOnly => {
                     runtime.require_next_model_named_tool_action(
                         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
                     );
@@ -17062,6 +17064,11 @@ mod tests {
         assert_eq!(
             phase.required_tool_choice(),
             harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
+        );
+        assert_eq!(
+            RootControlPlanePhase::CapabilityOrProposal.required_tool_choice(),
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+            "an explicit Team request cannot be satisfied by catalog inspection alone"
         );
     }
 

@@ -7,7 +7,7 @@
 | Episode and signature contract | Passed (deterministic) | Starts only after both v0.9.706 tags and clean worktrees; core tag `7202ae1b`, Edge tag `eb60d5f`; terminal event uses a deterministic Runtime transaction id, salted opaque Session/Turn hashes, delivery/presentation agreement and durable evidence gating |
 | Durable projector and pattern aggregation | Passed (deterministic) | Replays terminal episode events only; three distinct eligible turns produce an advisory-only pattern event, fenced by signature stream revision |
 | Advisory precedence and governed promotion | Passed (deterministic) | Pattern contains no executable subject; versioned `PublishedRevision` / verified `EpisodeSet` baseline has legacy recovery mapping and fails closed when the frozen set is not backed by a durable advisory pattern |
-| Real-provider, real-browser and multi-Team acceptance | Pending | Must use isolated source Gateway and fresh Sessions |
+| Real-provider, real-browser and multi-Team acceptance | In progress | Two isolated real-provider runs completed; direct/tool/single-architecture checks passed, while explicit Team admission was not submitted by the provider. A source-level control-plane repair is being revalidated on a new immutable candidate. |
 
 ## Version boundary
 
@@ -59,3 +59,8 @@ record. This phase has not claimed provider or browser terminal acceptance.
 - `crates/tui/src/components/gateway_panel.rs` is added only to project the
   existing read-only Evolution overview's advisory-pattern count in the TUI;
   it cannot select or activate a pattern.
+- `crates/runtime/src/conversation/host.rs` is added after the real-provider
+  evidence exposed a generic admission gap: an explicit Team requirement now
+  forces the already-active native `submit_collaboration_decision` schema on
+  its first provider request. This preserves user-authored Team semantics and
+  creates no Runtime-synthesized Team, scheduler, template, or release owner.
