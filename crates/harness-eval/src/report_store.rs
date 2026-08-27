@@ -411,8 +411,14 @@ impl HarnessEvalReportStore {
                 write_provider_round_artifacts(&report, &provider_rounds_dir)?;
             }
         }
-        report["report_gate"] = serde_json::to_value(evaluate_report_gate(&report))
-            .map_err(|error| error.to_string())?;
+        let report_gate = evaluate_report_gate(&report);
+        report["report_gate"] =
+            serde_json::to_value(&report_gate).map_err(|error| error.to_string())?;
+        // A report review can repair an evaluator bug or add missing durable
+        // evidence. Keep the top-level status as the canonical projection of
+        // the recomputed gate so consumers never see a stale failed report
+        // alongside a passing gate.
+        report["status"] = Value::String(report_gate.status);
         fs::write(
             &report_path,
             serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?,
@@ -1070,6 +1076,42 @@ mod tests {
             .artifacts
             .iter()
             .any(|path| path.ends_with("evidence/evidence-manifest.json")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn review_reprojects_top_level_status_from_the_recomputed_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "cowd-harness-eval-review-status-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).expect("create review directory");
+        fs::write(
+            root.join("report.json"),
+            serde_json::to_string(&serde_json::json!({
+                "level": "quick",
+                "status": "passed"
+            }))
+            .expect("serialize report"),
+        )
+        .expect("write report");
+
+        HarnessEvalReportStore::review_report_dir(
+            &root,
+            HarnessEvalRunnerOptions {
+                level: crate::HarnessEvalLevel::Deep,
+                provider: None,
+                budget: Some("review".to_string()),
+                allow_real_model: false,
+            },
+        )
+        .expect("review report");
+
+        let reviewed = serde_json::from_str::<Value>(
+            &fs::read_to_string(root.join("report.json")).expect("read reviewed report"),
+        )
+        .expect("parse reviewed report");
+        assert_eq!(reviewed["status"], reviewed["report_gate"]["status"]);
         let _ = fs::remove_dir_all(root);
     }
 }
