@@ -124,28 +124,8 @@ fn validate_root_evidence_scope_coverage(
     if required.is_empty() {
         return Ok(());
     }
-    let mut proposed = decision_input
-        .workstreams
-        .iter()
-        .flat_map(|workstream| {
-            workstream.evidence_contract.iter().chain(
-                workstream
-                    .team
-                    .roles
-                    .iter()
-                    .flat_map(|role| role.acceptance.iter()),
-            )
-        })
-        .filter_map(|criterion| match criterion {
-            harness_contract::orchestration::ModelSemanticAcceptanceCriterion::EvidenceScope {
-                operation,
-                resource,
-            } => Some(format!("{}:{}", operation.trim(), resource.trim())),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    proposed.sort();
-    proposed.dedup();
+    let proposed =
+        harness_contract::orchestration::model_collaboration_evidence_scopes(decision_input);
     let missing = required
         .into_iter()
         .filter(|scope| !proposed.contains(scope))
@@ -154,7 +134,7 @@ fn validate_root_evidence_scope_coverage(
         Ok(())
     } else {
         Err(ToolError::new(format!(
-            "root collaboration decision omitted user-required bounded evidence scope(s): {}; every requested source must appear as an exact evidence_scope:read:<path> in a Team workstream or role acceptance",
+            "root collaboration decision omitted user-required bounded evidence scope(s): {}; every requested source must appear as an exact typed evidence_scope criterion in a semantic Team workstream or role acceptance",
             missing.join(", ")
         )))
     }
@@ -915,12 +895,20 @@ impl GatewayToolExecutor {
                 result.status.as_str(),
                 "rejected" | "unavailable" | "blocked" | "failed"
             ) {
-                let execution = serde_json::to_string(&result.execution)
-                    .unwrap_or_else(|_| "{\"type\":\"unserializable_execution\"}".to_string());
+                let receipt = serde_json::json!({
+                    "kind": "runtime_orchestration_rejected",
+                    "status": result.status,
+                    "validation_findings": result.decision.validation_findings,
+                    "recovery_hints": result.decision.recovery_hints,
+                    "next_model_guidance": result.next_model_guidance,
+                });
+                let receipt = serde_json::to_string(&receipt).unwrap_or_else(|_| {
+                    "{\"kind\":\"runtime_orchestration_rejected\",\"status\":\"unserializable\"}"
+                        .to_string()
+                });
                 return Err(ToolError::new(format!(
-                    "runtime orchestration {}: {}; execution={execution}",
-                    result.status,
-                    result.decision.validation_findings.join(", ")
+                    "runtime orchestration {}: {receipt}",
+                    result.status
                 )));
             }
             // The full orchestration graph is retained as durable raw tool

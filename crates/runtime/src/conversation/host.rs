@@ -82,24 +82,32 @@ impl RootControlPlanePhase {
 
 /// Render the one-shot, Runtime-owned root-admission instruction.
 ///
-/// A workstream is the unit that compiles to one Team. Named roles therefore
-/// belong in that workstream's turn-scoped `template`, not in sibling
-/// workstreams and not in the compatibility `focuses` array.
+/// A workstream is the unit that compiles to one Team. Named roles belong in
+/// its semantic `team.roles` array; Runtime derives the turn-scoped template.
 fn root_collaboration_decision_instruction(
     required_team_count: u8,
     required_workspace_evidence_scopes: &[String],
+    permission_ceiling: harness_contract::policy::PermissionMode,
 ) -> String {
     let required_scope_clause = if required_workspace_evidence_scopes.is_empty() {
         String::new()
     } else {
         format!(
-            " The user explicitly named these immutable evidence targets: {}. Include every one exactly as an `evidence_scope:` entry across the proposed Team workstreams and their evidence-producing roles; do not substitute a log, directory, or similarly named file.",
+            " The user explicitly named these immutable evidence targets: {}. Include every one exactly as a typed `{{\"kind\":\"evidence_scope\",\"operation\":...,\"resource\":...}}` criterion across the proposed Team workstreams and their evidence-producing roles; its operation/resource pair must reproduce the exact named scope. Do not substitute a log, directory, or similarly named file.",
             required_workspace_evidence_scopes.join(", ")
         )
     };
+    let allowed_capabilities =
+        harness_contract::orchestration::model_collaboration_capabilities_for_permission(
+            permission_ceiling,
+        )
+        .join(", ");
     format!(
-        "Root collaboration admission is pending. Call `{}` exactly once now; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team. Give every workstream a distinct `workstream_id`, `objective`, and a nonempty `team.team_key` (a stable lowercase slug); a workstream without its `team` object and `team_key` is invalid. Encode every bounded evidence source in its supported `evidence_contract` as `evidence_scope:read:project/src/file.rs` (or `evidence_scope:network:*`); never use `read:.` or a session id as evidence. Each evidence-producing template role must repeat only its own source as the same `evidence_scope:` entry in that role's `acceptance`, so parallel roles are not forced to read each other's files. `acceptance` is a typed Runtime-verification contract, not prose: use only supported labels (`summary`, `findings`, `plan`, `risks`, `unresolved`, `key_decisions`, `proposal`, `critique`, `checkpoint`, `implementation`, `mitigation`, `source_verification`, `review`, `evidence`) plus that role's `evidence_scope:` entry. Put explanatory or semantic requirements in `responsibility` or `instructions`, never in `acceptance`; unknown prose is intentionally rejected when it has no bounded evidence scope. Express every cross-Team ordering and handoff only with consumer-workstream `depends_on` entries naming upstream `workstream_id`s. A template `dependencies` array is strictly local: it may name only role_ids declared inside that same template. Never put a role from another Team into a template dependency; Runtime carries cross-Team receipts and terminal evidence across the workstream edge. Omit `focuses` entirely at root. If the user expressly supplied a Team name, role name, responsibility, or organizational relationship, put one complete, turn-scoped custom `template` on that Team workstream: preserve every user identifier verbatim in `team_display_name` and each role `display_name`; include all requested roles in the one template's `roles` array, with a distinct slug `role_id`, responsibility, read-only `grant_ceiling` unless the task requires more, explicit typed `behavior` for every role (independent evidence roles use `reacquire_evidence` or `verification`; a final synthesizer uses `reducer`, `upstream_consumption`, and `terminal_candidate`). Every local template dependency is directional `{{from: upstream_producer, to: downstream_consumer}}`: `from` must finish before `to` can start. Include local dependencies only when both roles belong to this Team, result_fields `[\"summary\",\"evidence\"]`, evidence_required true, and instructions. A custom template is not catalog publication and must not wait for template approval. Do not split roles from one requested Team into multiple workstreams. Runtime validates the template, resolves safe Agent definitions, clips permissions, binds identities/resources, and creates the immutable snapshot. This is not `runtime_orchestrate`.",
+        "Root collaboration admission is pending. Call `{}` exactly once in this provider turn; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team. Give every workstream a distinct `workstream_id`, `objective`, and a nonempty `team.team_key` (a stable lowercase slug). Preserve user-provided Team and role names in `team.display_name` and role `display_name`; use `role_id` only as a distinct machine key. The active permission ceiling is `{}`; each role's `required_capabilities` may contain only [{}]. Express cross-Team ordering only with consumer-workstream `depends_on`. Express local role handoffs only with `team.dependencies`; every dependency names two roles within that one Team and carries artifacts produced by `from` and consumed by `to`. Do not split roles from one requested Team into multiple workstreams. {} If the tool returns a retryable structured compile diagnostic, submit one complete corrected semantic decision on the next required provider turn; never retry unchanged. This is not `runtime_orchestrate`.",
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+        permission_ceiling.as_str(),
+        allowed_capabilities,
+        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE,
     )
     + &required_scope_clause
 }
@@ -4040,6 +4048,17 @@ where
                         root_collaboration_decision_instruction(
                             required_team_count,
                             &required_workspace_evidence_scopes,
+                            match runtime.permission_policy().active_mode() {
+                                crate::PermissionMode::ReadOnly => {
+                                    harness_contract::policy::PermissionMode::ReadOnly
+                                }
+                                crate::PermissionMode::WorkspaceWrite => {
+                                    harness_contract::policy::PermissionMode::WorkspaceWrite
+                                }
+                                crate::PermissionMode::DangerFullAccess => {
+                                    harness_contract::policy::PermissionMode::DangerFullAccess
+                                }
+                            },
                         ),
                     );
                     item.authority = ContextAuthority::System;
@@ -6538,7 +6557,7 @@ fn root_team_terminal_requires_text_only(
 /// Return missing user-named source scopes for a typed root admission call.
 ///
 /// The scope is intentionally carried by the user objective rather than a
-/// catalog template or a role name. A valid custom template may put its
+/// catalog template or a role name. A valid semantic decision may put its
 /// evidence contract either on the Team workstream or on the individual role
 /// that is responsible for reading it, so both declarations are accepted.
 /// `None` means this batch does not contain the typed root-admission transport
@@ -6555,55 +6574,19 @@ fn missing_root_collaboration_evidence_scopes(
             harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
         )
     })?;
-    // This admission guard owns only source-scope coverage, not the complete
-    // template codec. Parsing the whole model proposal here made its outcome
-    // accidentally depend on unrelated, later-validated template fields.
-    // Read only the two supported evidence locations as JSON; Gateway still
-    // performs the authoritative typed schema and template validation before
-    // a Program can be admitted.
-    let payload = serde_json::from_str::<serde_json::Value>(&call.input).ok()?;
-    let declared = payload
-        .get("workstreams")
-        .and_then(serde_json::Value::as_array)
+    let decision = serde_json::from_str::<
+        harness_contract::orchestration::ModelCollaborationControlDecisionV2,
+    >(&call.input)
+    .ok()?;
+    let declared = harness_contract::orchestration::model_collaboration_evidence_scopes(&decision)
         .into_iter()
-        .flatten()
-        .flat_map(|workstream| {
-            workstream
-                .get("evidence_contract")
-                .and_then(serde_json::Value::as_array)
-                .into_iter()
-                .flatten()
-                .chain(
-                    workstream
-                        .pointer("/template/roles")
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|role| {
-                            role.get("acceptance")
-                                .and_then(serde_json::Value::as_array)
-                                .into_iter()
-                                .flatten()
-                        }),
-                )
-        })
-        .filter_map(serde_json::Value::as_str)
-        .filter_map(|criterion| criterion.trim().strip_prefix("evidence_scope:"))
-        .map(str::trim)
         .collect::<BTreeSet<_>>();
     Some(
         required_workspace_evidence_scopes
             .iter()
             .filter(|scope| {
                 let scope = scope.trim();
-                // Compatibility providers can wrap the typed tool input
-                // before this model-step boundary while the immutable raw
-                // native-call payload is still retained. Treat that raw
-                // payload as a bounded fallback only for the exact typed
-                // token; Gateway's typed compiler remains the authority for
-                // where the token is placed in the final template.
                 !declared.contains(scope)
-                    && !call.input.contains(&format!("evidence_scope:{scope}"))
             })
             .cloned()
             .collect(),
@@ -17074,15 +17057,19 @@ mod tests {
 
     #[test]
     fn root_collaboration_instruction_makes_team_cardinality_and_custom_role_boundary_explicit() {
-        let instruction = root_collaboration_decision_instruction(3, &[]);
+        let instruction = root_collaboration_decision_instruction(
+            3,
+            &[],
+            harness_contract::policy::PermissionMode::ReadOnly,
+        );
         assert!(instruction.contains("exactly 3 `workstreams`"));
         assert!(instruction.contains("one workstream is one proposed Team"));
         assert!(instruction.contains("nonempty `team.team_key`"));
-        assert!(instruction.contains("Omit `focuses` entirely at root"));
-        assert!(instruction.contains("turn-scoped custom `template`"));
+        assert!(instruction.contains("team.roles"));
+        assert!(instruction.contains("only [read, search]"));
+        assert!(instruction.contains("JSON objects tagged by `kind`"));
+        assert!(instruction.contains("Do not send a template"));
         assert!(instruction.contains("Do not split roles from one requested Team"));
-        assert!(instruction.contains("`acceptance` is a typed Runtime-verification contract"));
-        assert!(instruction.contains("never in `acceptance`"));
         assert!(instruction.contains("submit_collaboration_decision"));
     }
 
@@ -17097,14 +17084,14 @@ mod tests {
             name: harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
                 .to_string(),
             input: format!(
-                r#"{{"decision_id":"source-coverage","intent":"team","workstreams":[{{"workstream_id":"source","objective":"read named source","evidence_contract":[{evidence_contract}],"managed_agent_escalation":"none"}}],"reason":"test"}}"#
+                r#"{{"schema_version":2,"decision_id":"source-coverage","intent":"team","workstreams":[{{"workstream_id":"source","objective":"read named source","team":{{"team_key":"source-team","roles":[{{"role_id":"reader","responsibility":"read source","required_capabilities":["read"]}}]}},"evidence_contract":[{evidence_contract}],"managed_agent_escalation":"none"}}],"reason":"test"}}"#
             ),
             depends_on: Vec::new(),
         };
         assert_eq!(
             missing_root_collaboration_evidence_scopes(
                 &[call(
-                    r#""evidence_scope:read:crates/runtime/src/conversation/host.rs","evidence_scope:read:crates/harness-contract/src/orchestration.rs""#,
+                    r#"{"kind":"evidence_scope","operation":"read","resource":"crates/runtime/src/conversation/host.rs"},{"kind":"evidence_scope","operation":"read","resource":"crates/harness-contract/src/orchestration.rs"}"#,
                 )],
                 &required,
             ),
@@ -17113,7 +17100,7 @@ mod tests {
         assert_eq!(
             missing_root_collaboration_evidence_scopes(
                 &[call(
-                    r#""evidence_scope:read:cowd-test-evidence/workspace-check-v702.log""#
+                    r#"{"kind":"evidence_scope","operation":"read","resource":"cowd-test-evidence/workspace-check-v702.log"}"#
                 )],
                 &required,
             ),

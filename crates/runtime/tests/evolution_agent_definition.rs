@@ -14,7 +14,15 @@ async fn published_definition_revisions_are_registered_and_evaluated_through_run
         candidate.lifecycle,
         EvolutionCandidateLifecycle::EvaluatedEligible
     );
-    assert_eq!(candidate.baseline_revision, 1);
+    assert_eq!(
+        candidate
+            .evaluation_baseline
+            .as_ref()
+            .and_then(runtime::EvolutionEvaluationBaseline::published_revision),
+        Some(1),
+        "new candidate events carry the versioned immutable baseline; the scalar is legacy-only"
+    );
+    assert_eq!(candidate.baseline_revision, 0);
     assert!(candidate.comparison_report_ref.is_some());
     assert!(candidate.comparison_report_digest.is_some());
     assert!(fixture

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy};
 use crate::input_disposition::ModelInputDispositionBatch;
+use crate::policy::PermissionMode;
 
 pub const RUNTIME_ORCHESTRATE_TOOL_ID: &str = "runtime_orchestrate";
 /// Narrow root-admission port for a collaboration Program.  Unlike
@@ -10,6 +11,25 @@ pub const RUNTIME_ORCHESTRATE_TOOL_ID: &str = "runtime_orchestrate";
 /// It is deliberately a semantic decision only; Runtime compiles and owns
 /// all physical graph identities, leases, permissions, and receipts.
 pub const SUBMIT_COLLABORATION_DECISION_TOOL_ID: &str = "submit_collaboration_decision";
+
+/// The model-facing invariant shared by every surface that exposes the narrow
+/// collaboration admission port. Keep this beside the typed DTOs so a
+/// conversation prompt cannot drift into the old template-authoring protocol.
+pub const SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE: &str = "`submit_collaboration_decision` accepts only schema_version=2 semantic workstreams. One workstream contains `workstream_id`, `objective`, optional `depends_on`, optional typed `evidence_contract`, and a `team` with `team_key`, optional `display_name`, local typed `dependencies`, `result`, and `instructions`; its semantic roles are in `team.roles`. Every role needs `role_id`, optional `display_name`, `responsibility`, at least one `required_capabilities`, optional Skills/Tools, cardinality, typed acceptance, and artifact inputs/outputs. `acceptance` and `evidence_contract` are JSON objects tagged by `kind` (for example `{\"kind\":\"artifact\",\"artifact\":\"evidence\"}` or `{\"kind\":\"evidence_scope\",\"operation\":\"read\",\"resource\":\"path\"}`), never string labels. If `team.result.synthesis_required` is true, exactly one terminal role with no outgoing local dependency must output every `team.result.required_artifacts`. Do not send a template, behavior facet, Agent id, grant ceiling, lease, graph id, `team_display_name`, or `result_fields`: Runtime resolves and binds those physical details.";
+
+/// Capability identifiers a semantic role may request under an authenticated
+/// permission ceiling. Runtime's compiler and model-facing instruction share
+/// this vocabulary.
+#[must_use]
+pub const fn model_collaboration_capabilities_for_permission(
+    ceiling: PermissionMode,
+) -> &'static [&'static str] {
+    match ceiling {
+        PermissionMode::ReadOnly => &["read", "search"],
+        PermissionMode::WorkspaceWrite => &["read", "search", "write", "test"],
+        PermissionMode::DangerFullAccess => &["read", "search", "write", "test", "network"],
+    }
+}
 
 /// Versioned, model-authored collaboration semantics.  This is deliberately
 /// narrower than an executable Team template: models describe work, dataflow
@@ -144,6 +164,38 @@ pub struct ModelCollaborationControlDecisionV2 {
     pub intent: String,
     pub workstreams: Vec<ModelCollaborationWorkstreamV2>,
     pub reason: String,
+}
+
+/// Canonicalize the evidence scopes declared by a V2 semantic decision.
+/// Pre-execution root guards and Gateway admission must inspect these same
+/// typed fields, never a legacy string-token/template shape.
+#[must_use]
+pub fn model_collaboration_evidence_scopes(
+    decision: &ModelCollaborationControlDecisionV2,
+) -> Vec<String> {
+    let mut scopes = decision
+        .workstreams
+        .iter()
+        .flat_map(|workstream| {
+            workstream.evidence_contract.iter().chain(
+                workstream
+                    .team
+                    .roles
+                    .iter()
+                    .flat_map(|role| role.acceptance.iter()),
+            )
+        })
+        .filter_map(|criterion| match criterion {
+            ModelSemanticAcceptanceCriterion::EvidenceScope {
+                operation,
+                resource,
+            } => Some(format!("{}:{}", operation.trim(), resource.trim())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    scopes
 }
 
 #[derive(
@@ -781,5 +833,53 @@ mod tests {
             missing_policy.is_err(),
             "model must select none or required"
         );
+    }
+
+    #[test]
+    fn semantic_decision_contract_centralizes_capabilities_and_typed_evidence_scopes() {
+        let decision: ModelCollaborationControlDecisionV2 =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 2,
+                "decision_id": "scope-test",
+                "intent": "review",
+                "reason": "test canonical V2 helpers",
+                "workstreams": [{
+                    "workstream_id": "review",
+                    "objective": "read one bounded source",
+                    "evidence_contract": [{
+                        "kind": "evidence_scope",
+                        "operation": "read",
+                        "resource": "crates/runtime/src/lib.rs"
+                    }],
+                    "team": {
+                        "team_key": "review",
+                        "roles": [{
+                            "role_id": "reader",
+                            "responsibility": "read source",
+                            "required_capabilities": ["read"],
+                            "acceptance": [{
+                                "kind": "evidence_scope",
+                                "operation": "read",
+                                "resource": "crates/harness-contract/src/orchestration.rs"
+                            }]
+                        }]
+                    }
+                }]
+            }))
+            .expect("typed V2 semantic decision");
+
+        assert_eq!(
+            model_collaboration_evidence_scopes(&decision),
+            vec![
+                "read:crates/harness-contract/src/orchestration.rs".to_string(),
+                "read:crates/runtime/src/lib.rs".to_string(),
+            ]
+        );
+        assert_eq!(
+            model_collaboration_capabilities_for_permission(PermissionMode::ReadOnly),
+            ["read", "search"]
+        );
+        assert!(SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE.contains("Do not send a template"));
+        assert!(SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE.contains("JSON objects tagged by `kind`"));
     }
 }

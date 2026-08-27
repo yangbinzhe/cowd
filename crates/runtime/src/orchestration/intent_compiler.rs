@@ -909,15 +909,8 @@ fn canonical_tool_refs(values: &[String]) -> Vec<String> {
 }
 
 fn capability_allowed_by_ceiling(ceiling: PermissionMode, capability: &str) -> bool {
-    match capability {
-        "read" | "search" => true,
-        "write" | "test" => {
-            ceiling.permits(PermissionMode::WorkspaceWrite)
-                || ceiling.permits(PermissionMode::DangerFullAccess)
-        }
-        "network" => ceiling.permits(PermissionMode::DangerFullAccess),
-        _ => false,
-    }
+    harness_contract::orchestration::model_collaboration_capabilities_for_permission(ceiling)
+        .contains(&capability)
 }
 
 fn require_non_empty(value: &str, field_path: &str) -> Result<(), IntentCompilerError> {

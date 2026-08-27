@@ -405,7 +405,7 @@ impl RuntimeCapabilityManifest {
                     &[
                         "Inspect current Runtime state before changing an existing graph.",
                         "Propose semantic nodes and dependencies; revise by exact graph revision; never provide executors or leases.",
-                        "When the user names specific Teams or roles, use submit_collaboration_decision with one turn-scoped template per Team; use propose_template only when reusable catalog publication is explicitly wanted.",
+                        "When the user names specific Teams or roles, use submit_collaboration_decision with one semantic workstream per Team; use propose_template only when reusable catalog publication is explicitly wanted.",
                     ],
                 ),
                 capability(
@@ -505,12 +505,11 @@ pub fn runtime_capability_primer() -> String {
         "Orchestration capability contract (single source of truth, do not guess):".to_string(),
     );
     lines.push(
-        "TRIGGER RULE: if the user explicitly asks for a named Team, named roles, responsibilities, or an organizational relationship, use `submit_collaboration_decision` when that native schema is active. It creates the real Program graph directly from one turn-scoped template per named Team; do not inspect or select a catalog template first. Use `runtime_capabilities(detail=team_templates)` followed by `runtime_orchestrate(propose)` only when the user expressly selected an already-published catalog template."
+        "TRIGGER RULE: if the user explicitly asks for a named Team, named roles, responsibilities, or an organizational relationship, use `submit_collaboration_decision` when that native schema is active. It creates the real Program graph directly from one semantic workstream per named Team; do not inspect or select a catalog template first. Use `runtime_capabilities(detail=team_templates)` followed by `runtime_orchestrate(propose)` only when the user expressly selected an already-published catalog template."
             .to_string(),
     );
     lines.push(
-        "TRIGGER RULE (custom teams): preserve every user-supplied Team and role identifier exactly and call `submit_collaboration_decision`, never a parallel `runtime_orchestrate(propose)` copy. Submit schema_version=2 with one semantic workstream per Team: role responsibility, required capabilities/Skills/Tools, cardinality, typed acceptance, producer-to-consumer dependencies and result intent. Do not supply behavior facets, Agent ids, grant ceilings, leases or templates. Runtime validates semantics, resolves exact approved Definitions, derives immutable behavior/bindings and never publishes the turn-scoped Team. Use a catalog template only when the user expressly selected it; use `propose_template` only when publication/reuse is expressly requested. Never silently replace a custom Team with a builtin template."
-            .to_string(),
+        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE.to_string(),
     );
     lines.push("- Before proposing a reusable catalog Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values. A user-named turn-scoped Team instead goes through `submit_collaboration_decision`; it never publishes a catalog revision.".to_string());
     lines.push(

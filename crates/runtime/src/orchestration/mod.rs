@@ -643,17 +643,48 @@ fn rejected_intent_compiler_result(
     request: &RuntimeOrchestrationCommand,
     error: intent_compiler::IntentCompilerError,
 ) -> RuntimeOrchestrationResult {
-    let plan = planner::plan_runtime_orchestration(request);
-    let mut decision = validator::validate_request(
-        request,
-        &plan.execution_decision,
-        plan.model_proposal.as_ref(),
-        None,
-    );
-    decision.status = "rejected".to_string();
-    decision
-        .validation_findings
-        .push(format!("collaboration_compile_diagnostic:{error}"));
+    let recovery_hints = match &error {
+        intent_compiler::IntentCompilerError::Diagnostic(diagnostic) => vec![RecoveryHint {
+            code: format!("collaboration_compile_{}", diagnostic.code),
+            message: format!(
+                "Repair only {:?}; allowed repair: {}.",
+                diagnostic.field_paths,
+                diagnostic.allowed_repairs.join(", ")
+            ),
+            retryable: diagnostic.repairability == "model_revise",
+        }],
+        intent_compiler::IntentCompilerError::Internal(_) => vec![RecoveryHint {
+            code: "collaboration_compile_internal".to_string(),
+            message: "Runtime could not compile the semantic decision; retain the submission evidence and retry only after Runtime recovery.".to_string(),
+            retryable: false,
+        }],
+    };
+    // A semantic submission intentionally reaches this point before a graph
+    // proposal exists. Running the generic Propose validator here used to add
+    // `propose_requires_only_graph_proposal`, a false primary diagnosis that
+    // instructed the model to use the very graph payload this narrow port
+    // forbids. The compiler diagnostic is the sole authoritative rejection.
+    let decision = RuntimeOrchestrationDecision {
+        selected_pattern: ExecutionPattern::Collaborate,
+        selected_template: None,
+        reason: "Runtime rejected the semantic collaboration decision before graph lowering"
+            .to_string(),
+        policy_gates: Vec::new(),
+        validation_findings: vec![format!("collaboration_compile_diagnostic:{error}")],
+        adjustments: Vec::new(),
+        required_approval: None,
+        recovery_hints,
+        budget: json!({
+            "requested_max_parallel_agents": request.constraints.max_parallel_agents,
+            "parallelism_owner": "runtime_execution_resource_manager",
+        }),
+        permission: json!({
+            "requires_write": request.constraints.requires_write.unwrap_or(false),
+            "permission_ceiling": request.constraints.permission_ceiling,
+            "risk": request.constraints.risk.clone().unwrap_or_else(|| "low".to_string()),
+        }),
+        status: "rejected".to_string(),
+    };
     result_without_runtime(request, decision)
 }
 
@@ -3177,6 +3208,83 @@ mod tests {
         assert_eq!(intent.decision_id, "runtime-v2-semantic-admission");
         assert!(intent.ai_composed);
         assert_eq!(intent.teams[0].roles.len(), 2);
+    }
+
+    #[test]
+    fn semantic_compile_rejection_does_not_invent_a_generic_graph_proposal_error() {
+        use harness_contract::orchestration::{
+            ModelCollaborationControlDecisionV2, ModelCollaborationWorkstreamV2, ModelRoleIntent,
+            ModelTeamResultIntent, ModelTurnScopedTeamIntent,
+        };
+
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut request = proposal(Vec::new());
+        request.proposal = None;
+        request.collaboration_intent = Some(ModelCollaborationControlDecisionV2 {
+            schema_version: 2,
+            decision_id: "ambiguous-terminal".to_string(),
+            intent: "perform a semantic review".to_string(),
+            reason: "exercise the compiler rejection receipt".to_string(),
+            workstreams: vec![ModelCollaborationWorkstreamV2 {
+                workstream_id: "review".to_string(),
+                objective: "produce a reviewed summary".to_string(),
+                depends_on: Vec::new(),
+                output_artifacts: vec!["summary".to_string()],
+                evidence_contract: Vec::new(),
+                managed_agent_escalation: Default::default(),
+                team: ModelTurnScopedTeamIntent {
+                    team_key: "review".to_string(),
+                    display_name: None,
+                    instructions: String::new(),
+                    result: ModelTeamResultIntent {
+                        required_artifacts: vec!["summary".to_string()],
+                        evidence_required: false,
+                        synthesis_required: true,
+                    },
+                    roles: vec![ModelRoleIntent {
+                        role_id: "reviewer".to_string(),
+                        display_name: None,
+                        responsibility: "review evidence".to_string(),
+                        required_capabilities: vec!["read".to_string()],
+                        required_skills: Vec::new(),
+                        required_tools: Vec::new(),
+                        cardinality: Default::default(),
+                        acceptance: Vec::new(),
+                        input_artifacts: Vec::new(),
+                        output_artifacts: vec!["evidence".to_string()],
+                    }],
+                    dependencies: Vec::new(),
+                },
+            }],
+        });
+        let error = intent_compiler::compile_turn_scoped_intent(
+            &request,
+            request
+                .collaboration_intent
+                .as_ref()
+                .expect("semantic decision"),
+            &services,
+        )
+        .expect_err("the terminal role is intentionally ambiguous");
+
+        let result = rejected_intent_compiler_result(&request, error);
+
+        assert_eq!(result.status, "rejected");
+        assert!(result
+            .decision
+            .validation_findings
+            .iter()
+            .any(|finding| { finding.contains("ambiguous_completion_gap") }));
+        assert!(!result
+            .decision
+            .validation_findings
+            .iter()
+            .any(|finding| { finding.contains("propose_requires_only_graph_proposal") }));
+        assert_eq!(
+            result.decision.recovery_hints[0].code,
+            "collaboration_compile_ambiguous_completion_gap"
+        );
+        assert!(result.decision.recovery_hints[0].retryable);
     }
 
     #[test]
