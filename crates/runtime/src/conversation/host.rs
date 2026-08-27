@@ -6589,16 +6589,18 @@ fn missing_root_collaboration_evidence_scopes(
     let declared = harness_contract::orchestration::model_collaboration_evidence_scopes(&decision)
         .into_iter()
         .collect::<BTreeSet<_>>();
-    Some(
-        required_workspace_evidence_scopes
-            .iter()
-            .filter(|scope| {
-                let scope = scope.trim();
-                !declared.contains(scope)
-            })
-            .cloned()
-            .collect(),
-    )
+    let missing = required_workspace_evidence_scopes
+        .iter()
+        .filter(|scope| {
+            let scope = scope.trim();
+            !declared.contains(scope)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    // `Some` is the rejection signal for the caller. Returning `Some([])`
+    // therefore turns a complete proposal into a false missing-evidence
+    // rejection and prevents any Team from being admitted.
+    (!missing.is_empty()).then_some(missing)
 }
 
 fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
@@ -17197,7 +17199,7 @@ mod tests {
                 )],
                 &required,
             ),
-            Some(Vec::new())
+            None
         );
         assert_eq!(
             missing_root_collaboration_evidence_scopes(
