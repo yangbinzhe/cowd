@@ -287,13 +287,8 @@ impl NodeExecutor for VerifyNodeExecutor {
                             let Some(field) = object.get(required.as_str()) else {
                                 continue;
                             };
-                            let materialized = match field {
-                                serde_json::Value::Null => false,
-                                serde_json::Value::String(value) => !value.trim().is_empty(),
-                                serde_json::Value::Array(values) => !values.is_empty(),
-                                serde_json::Value::Object(values) => !values.is_empty(),
-                                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
-                            };
+                            let materialized =
+                                structured_team_contract_field_materialized(required, field);
                             if materialized {
                                 satisfied_team_criteria.insert(required_normalized);
                             }
@@ -435,6 +430,34 @@ fn is_runtime_evidence_backed_team_criterion(criterion: &str) -> bool {
             | "review"
             | "evidence"
     )
+}
+
+/// Keep Team verification aligned with the Agent terminal evaluator: an
+/// explicit empty list is a materialized conclusion for `risks` and
+/// `unresolved`, whereas omission and null are not. This prevents a verifier
+/// from rejecting an already accepted Agent result merely because it restates
+/// the same structured contract with different empty-value semantics.
+fn structured_team_contract_field_materialized(criterion: &str, value: &serde_json::Value) -> bool {
+    if matches!(
+        criterion.trim().to_ascii_lowercase().as_str(),
+        "risks" | "unresolved"
+    ) {
+        return matches!(value, serde_json::Value::Array(_))
+            || match value {
+                serde_json::Value::Null => false,
+                serde_json::Value::String(value) => !value.trim().is_empty(),
+                serde_json::Value::Object(values) => !values.is_empty(),
+                serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+                serde_json::Value::Array(_) => unreachable!("arrays returned above"),
+            };
+    }
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::String(value) => !value.trim().is_empty(),
+        serde_json::Value::Array(values) => !values.is_empty(),
+        serde_json::Value::Object(values) => !values.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+    }
 }
 
 fn produced_team_evidence(
@@ -812,6 +835,22 @@ mod tests {
         assert!(!is_runtime_evidence_backed_team_criterion("evidence"));
         assert!(is_runtime_evidence_backed_team_criterion(
             "evidence_scope:read:src"
+        ));
+    }
+
+    #[test]
+    fn explicit_empty_unresolved_list_satisfies_the_team_contract() {
+        assert!(structured_team_contract_field_materialized(
+            "unresolved",
+            &serde_json::json!([]),
+        ));
+        assert!(structured_team_contract_field_materialized(
+            "risks",
+            &serde_json::json!([]),
+        ));
+        assert!(!structured_team_contract_field_materialized(
+            "unresolved",
+            &serde_json::Value::Null,
         ));
     }
 }
