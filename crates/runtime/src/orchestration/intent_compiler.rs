@@ -393,7 +393,17 @@ fn compile_team(
             &outgoing,
             terminal_role.as_deref(),
         );
-        let acceptance = canonical_acceptance(role);
+        // `output_artifacts` are not merely dependency-routing labels for a
+        // terminal role.  They are the Team's promised terminal result
+        // schema, so they must lower into that role's Runtime-verifiable
+        // acceptance contract as well.  Otherwise a model can declare (for
+        // example) `unresolved` in the Team result, the compiler can select
+        // it as terminal producer, and the Team verifier will later demand a
+        // field that no Agent was ever required to materialize.
+        let acceptance = canonical_acceptance(
+            role,
+            (terminal_role.as_deref() == Some(canonical_id)).then_some(result_fields.as_slice()),
+        );
         roles.push(ProposedRole {
             role_id: canonical_id.clone(),
             display_name: Some(
@@ -903,12 +913,18 @@ fn has_cycle(nodes: Vec<String>, edges: &[CanonicalDependency]) -> bool {
     seen != nodes.len()
 }
 
-fn canonical_acceptance(role: &ModelRoleIntent) -> Vec<String> {
+fn canonical_acceptance(
+    role: &ModelRoleIntent,
+    terminal_result_fields: Option<&[String]>,
+) -> Vec<String> {
     let mut values = role
         .acceptance
         .iter()
         .map(criterion_key)
         .collect::<Vec<_>>();
+    if let Some(fields) = terminal_result_fields {
+        values.extend(fields.iter().cloned());
+    }
     if values.is_empty() {
         values.push("evidence".to_string());
     }
@@ -1205,6 +1221,32 @@ mod tests {
                 "remove_nonterminal_workstream_artifact_criterion",
             ]
         );
+    }
+
+    #[test]
+    fn terminal_result_artifacts_become_terminal_role_acceptance() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut valid = decision();
+        valid.workstreams[0]
+            .evidence_contract
+            .push(ModelSemanticAcceptanceCriterion::Artifact {
+                artifact: "unresolved".to_string(),
+            });
+        valid.workstreams[0]
+            .team
+            .result
+            .required_artifacts
+            .push("unresolved".to_string());
+        valid.workstreams[0].team.roles[1]
+            .output_artifacts
+            .push("unresolved".to_string());
+
+        let compiled = compile_turn_scoped_intent(&request(), &valid, &services)
+            .expect("the terminal role declares every Team result artifact");
+        let roles = &compiled.template_proposal["teams"][0]["template"]["roles"];
+        assert!(roles[1]["acceptance"]
+            .as_array()
+            .is_some_and(|criteria| criteria.iter().any(|value| value == "unresolved")));
     }
 
     #[test]
