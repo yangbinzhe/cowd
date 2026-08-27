@@ -215,17 +215,20 @@ if ss -ltn | rg -q ":${PORT}\\b"; then
   echo "isolated Gateway port $PORT is already in use" >&2
   exit 2
 fi
-# The Gateway is the system under test.  Building only harness-eval after the
-# Gateway starts leaves an old `target/debug/cowd` serving the scenario and
-# silently evaluates a previous candidate.  The default binary is therefore
-# rebuilt before every real run.  An explicit COWD_BIN remains an operator
-# supplied immutable artifact and must already be executable.
+# The Gateway and harness evaluator are both part of the system under test.
+# Building only harness-eval after the Gateway starts leaves an old
+# `target/debug/cowd` serving the scenario; conversely, rebuilding only Cowd
+# can make the evaluator send a stale fixture. Build both before every real
+# run so the recorded candidate SHA, Gateway, and scenario prompt are one
+# immutable candidate. An explicit COWD_BIN remains an operator-supplied
+# immutable Gateway artifact and must already be executable.
 if [[ -z "${COWD_BIN:-}" ]]; then
   cargo build -p cli --bin cowd
 elif [[ ! -x "$BIN" ]]; then
   echo "COWD_BIN is not executable: $BIN" >&2
   exit 2
 fi
+cargo build -p harness-eval --bin harness-eval
 GATEWAY_BINARY_SHA256="$(sha256sum "$BIN" | awk '{print $1}')"
 printf 'Gateway binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" >&2
 
