@@ -370,28 +370,19 @@ impl LiveScenarioRunner {
             );
         };
         let terminal_wait = terminal;
-        let timeline = self.get_json(&format!(
-            "/api/runtime/timeline?session_id={session_id}&limit=500"
-        ));
-        trace.push(trace_json_entry(
-            "GET",
-            format!("/api/runtime/timeline?session_id={session_id}&limit=500"),
-            Value::Null,
-            &timeline,
-        ));
-        let timeline = timeline.unwrap_or_else(|error| json!({"error": error}));
-        // The public projection makes child execution lineage explicit. A
-        // session ingress graph often delegates provider/tool/team work to
-        // descendants, so reporting only the root would incorrectly claim
-        // zero model rounds and zero token/tool usage for a real execution.
-        let projections = execution_id
-            .as_deref()
-            .map(|id| self.execution_lineage_projections(id, &mut trace))
-            .unwrap_or_default();
         let response_text = message_text(&terminal_wait.message);
-        let mut acceptance = spec
-            .acceptance
-            .evaluate(&response_text, &timeline, &projections);
+        let descendant_wait = self.wait_for_descendant_team_acceptance(
+            spec.acceptance,
+            &response_text,
+            &session_id,
+            execution_id_ref,
+            started,
+            &timeout,
+            &mut trace,
+        );
+        let timeline = descendant_wait.timeline;
+        let projections = descendant_wait.projections;
+        let mut acceptance = descendant_wait.acceptance;
         let terminal_id = terminal_wait
             .message
             .get("id")
@@ -438,7 +429,10 @@ impl LiveScenarioRunner {
             "runtime_commit_cursor": commit_cursor,
             "elapsed_ms": started.elapsed().as_millis(),
             "metrics": metrics,
-            "timeout": terminal_wait.report,
+            "timeout": {
+                "root_terminal_wait": terminal_wait.report,
+                "descendant_team_wait": descendant_wait.report,
+            },
             "session_actor_cleanup": cleanup,
             "trace": trace,
             "production_trace": {
@@ -676,6 +670,93 @@ impl LiveScenarioRunner {
             projections.push(projection);
         }
         projections
+    }
+
+    /// Root ingress completion is not a global join: a collaboration Program
+    /// may still have Team descendants running after its durable synthesis is
+    /// materialized. Team-oriented acceptance therefore observes the complete
+    /// execution lineage until its evidence passes or all known Team work is
+    /// terminal. This keeps evaluator cleanup from canceling valid work.
+    fn wait_for_descendant_team_acceptance(
+        &self,
+        acceptance: LiveAcceptance,
+        response_text: &str,
+        session_id: &str,
+        root_execution_id: &str,
+        scenario_started: Instant,
+        timeout: &LiveScenarioTimeout,
+        trace: &mut Vec<Value>,
+    ) -> DescendantTeamWait {
+        let wait_started = Instant::now();
+        let mut observations = 0_usize;
+        loop {
+            let timeline_path = format!("/api/runtime/timeline?session_id={session_id}&limit=500");
+            let timeline_response = self.get_json(&timeline_path);
+            trace.push(trace_json_entry(
+                "GET",
+                timeline_path,
+                Value::Null,
+                &timeline_response,
+            ));
+            let timeline = timeline_response.unwrap_or_else(|error| json!({"error": error}));
+            // The public projection makes child execution lineage explicit. A
+            // session ingress graph often delegates provider/tool/team work to
+            // descendants, so reporting only the root would incorrectly claim
+            // zero model rounds and zero token/tool usage for a real execution.
+            let projections = self.execution_lineage_projections(root_execution_id, trace);
+            let result = acceptance.evaluate(response_text, &timeline, &projections);
+            observations = observations.saturating_add(1);
+
+            if !acceptance.requires_descendant_team_closure() || result.passed {
+                return DescendantTeamWait {
+                    timeline,
+                    projections,
+                    acceptance: result,
+                    report: json!({
+                        "required": acceptance.requires_descendant_team_closure(),
+                        "elapsed_ms": wait_started.elapsed().as_millis(),
+                        "observations": observations,
+                        "terminal_reason": if acceptance.requires_descendant_team_closure() {
+                            "team_acceptance_satisfied"
+                        } else {
+                            "not_required"
+                        },
+                    }),
+                };
+            }
+
+            let health = projected_team_health(&projections);
+            if !health.has_pending_work() {
+                return DescendantTeamWait {
+                    timeline,
+                    projections,
+                    acceptance: result,
+                    report: json!({
+                        "required": true,
+                        "elapsed_ms": wait_started.elapsed().as_millis(),
+                        "observations": observations,
+                        "terminal_reason": "team_lineage_terminal_without_acceptance",
+                        "team_health": health.to_value(),
+                    }),
+                };
+            }
+
+            if scenario_started.elapsed() >= timeout.max_wait {
+                return DescendantTeamWait {
+                    timeline,
+                    projections,
+                    acceptance: result,
+                    report: json!({
+                        "required": true,
+                        "elapsed_ms": wait_started.elapsed().as_millis(),
+                        "observations": observations,
+                        "terminal_reason": "scenario_max_wait_elapsed_while_team_descendants_running",
+                        "team_health": health.to_value(),
+                    }),
+                };
+            }
+            thread::sleep(self.poll_interval);
+        }
     }
 
     /// Evaluation timeouts must not leave a real graph running after its
@@ -1101,6 +1182,13 @@ struct TerminalWait {
     report: Value,
 }
 
+struct DescendantTeamWait {
+    timeline: Value,
+    projections: Vec<Value>,
+    acceptance: LiveAcceptanceResult,
+    report: Value,
+}
+
 #[derive(Clone, Copy)]
 enum LiveAcceptance {
     Contains(&'static str),
@@ -1116,6 +1204,19 @@ enum LiveAcceptance {
 }
 
 impl LiveAcceptance {
+    fn requires_descendant_team_closure(self) -> bool {
+        matches!(
+            self,
+            Self::ArchitectureQuality {
+                minimum_teams: 1..,
+                ..
+            } | Self::EscalatedTeam {
+                minimum_teams: 1..,
+                ..
+            }
+        )
+    }
+
     fn evaluate(
         self,
         response: &str,
@@ -1282,6 +1383,23 @@ impl ProjectedTeamHealth {
             && self.team_count >= minimum_teams
             && self.completed_teams == self.team_count
             && self.failed_teams == 0
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.completed_agents.saturating_add(self.failed_agents) < self.agent_count
+            || self.completed_teams.saturating_add(self.failed_teams) < self.team_count
+    }
+
+    fn to_value(&self) -> Value {
+        json!({
+            "agents": self.agent_count,
+            "completed_agents": self.completed_agents,
+            "failed_agents": self.failed_agents,
+            "teams": self.team_count,
+            "completed_teams": self.completed_teams,
+            "failed_teams": self.failed_teams,
+            "has_pending_work": self.has_pending_work(),
+        })
     }
 }
 
@@ -2059,6 +2177,37 @@ mod tests {
         assert_eq!(health.completed_teams, 1);
         assert_eq!(health.agent_count, 4);
         assert_eq!(health.completed_agents, 4);
+    }
+
+    #[test]
+    fn team_acceptance_waits_for_running_descendant_work() {
+        let health = projected_team_health(&[json!({
+            "agents": [
+                {"id": "agent-complete", "status": "completed"},
+                {"id": "agent-running", "status": "running"}
+            ],
+            "teams": [
+                {"id": "team-complete", "status": "completed"},
+                {"id": "team-running", "status": "running"}
+            ]
+        })]);
+
+        assert!(health.has_pending_work());
+        assert!(LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 1,
+            minimum_claimed_cross_team_edges: 0,
+        }
+        .requires_descendant_team_closure());
+        assert!(LiveAcceptance::EscalatedTeam {
+            minimum_teams: 3,
+            minimum_escalations: 1,
+        }
+        .requires_descendant_team_closure());
+        assert!(!LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 0,
+            minimum_claimed_cross_team_edges: 0,
+        }
+        .requires_descendant_team_closure());
     }
 
     #[test]
