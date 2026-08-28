@@ -143,6 +143,54 @@ mod tests {
     }
 
     #[test]
+    fn explicit_four_lane_topology_is_not_vetoed_by_the_automatic_cost_gate() {
+        let graph = ModelWorkGraphCompiler
+            .compile(ModelWorkPlan {
+                objective: "four explicitly required Teams".to_string(),
+                graph_id: None,
+                nodes: vec![
+                    analysis("one"),
+                    analysis("two"),
+                    analysis("three"),
+                    analysis("four"),
+                ],
+            })
+            .expect("compile");
+        let automatic = ModelWorkGraphEstimator.estimate(
+            &graph,
+            &ModelWorkEstimateInput {
+                provider_effective_limit: 4,
+                provider_available: 4,
+                agent_available: 4,
+                provider_samples: 5,
+                ..ModelWorkEstimateInput::default()
+            },
+        );
+        assert_eq!(automatic.topology, ModelWorkTopology::Downgraded);
+        assert!(automatic
+            .reasons
+            .iter()
+            .any(|reason| reason == "token_amplification_above_threshold"));
+
+        let explicit = ModelWorkGraphEstimator.estimate(
+            &graph,
+            &ModelWorkEstimateInput {
+                provider_effective_limit: 4,
+                provider_available: 4,
+                agent_available: 4,
+                provider_samples: 5,
+                user_mandated_topology: true,
+                ..ModelWorkEstimateInput::default()
+            },
+        );
+        assert_eq!(explicit.topology, ModelWorkTopology::Pipelined);
+        assert!(explicit
+            .reasons
+            .iter()
+            .any(|reason| reason == "user_mandated_topology_retained_with_cost_warning"));
+    }
+
+    #[test]
     fn quorum_contract_compiles_optional_read_only_lanes() {
         let mut left = analysis("left");
         left.required = false;

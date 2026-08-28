@@ -10,6 +10,8 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+const DEFAULT_MAX_TRACKED_TASKS: usize = 4_096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum GatewayTaskKind {
     HttpServer,
@@ -60,6 +62,10 @@ pub(crate) struct GatewayTaskHealthSnapshot {
     pub(crate) shutdown_phase: String,
     pub(crate) shutdown_failures: Vec<String>,
     pub(crate) active: usize,
+    pub(crate) capacity: usize,
+    pub(crate) available: usize,
+    pub(crate) rejected: u64,
+    pub(crate) overloaded: bool,
     pub(crate) oldest_active_age_ms: Option<u64>,
     pub(crate) forced_aborts: usize,
     pub(crate) active_by_kind: BTreeMap<String, usize>,
@@ -74,6 +80,8 @@ pub(crate) enum GatewayTaskSpawnError {
     SessionClosed(String),
     #[error("Gateway background task requires a Tokio runtime")]
     RuntimeUnavailable,
+    #[error("Gateway background task capacity exhausted ({active}/{limit})")]
+    Overloaded { active: usize, limit: usize },
 }
 
 struct GatewayTaskEntry {
@@ -132,8 +140,9 @@ pub(crate) struct GatewayRuntimeTaskSet {
     state: Mutex<GatewayTaskSetState>,
     next_id: AtomicU64,
     rejected: AtomicU64,
-    completion_tx: mpsc::UnboundedSender<GatewayTaskCompletion>,
-    completion_rx: Mutex<Option<mpsc::UnboundedReceiver<GatewayTaskCompletion>>>,
+    max_tasks: usize,
+    completion_tx: mpsc::Sender<GatewayTaskCompletion>,
+    completion_rx: Mutex<Option<mpsc::Receiver<GatewayTaskCompletion>>>,
     reaper: Mutex<Option<JoinHandle<()>>>,
     reaper_cancellation: runtime::CancellationToken,
     shutdown_gate: tokio::sync::RwLock<()>,
@@ -163,11 +172,17 @@ impl std::fmt::Debug for GatewayRuntimeTaskSet {
 
 impl GatewayRuntimeTaskSet {
     pub(crate) fn new(default_timeout: Duration) -> Arc<Self> {
-        let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+        Self::new_with_capacity(default_timeout, DEFAULT_MAX_TRACKED_TASKS)
+    }
+
+    pub(crate) fn new_with_capacity(default_timeout: Duration, max_tasks: usize) -> Arc<Self> {
+        let max_tasks = max_tasks.max(1);
+        let (completion_tx, completion_rx) = mpsc::channel(max_tasks);
         Arc::new(Self {
             state: Mutex::new(GatewayTaskSetState::default()),
             next_id: AtomicU64::new(1),
             rejected: AtomicU64::new(0),
+            max_tasks,
             completion_tx,
             completion_rx: Mutex::new(Some(completion_rx)),
             reaper: Mutex::new(None),
@@ -280,6 +295,14 @@ impl GatewayRuntimeTaskSet {
                 _ => GatewayTaskSpawnError::Closed,
             });
         }
+        let active = state.tasks.len().saturating_add(state.settling.len());
+        if active >= self.max_tasks {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+            return Err(GatewayTaskSpawnError::Overloaded {
+                active,
+                limit: self.max_tasks,
+            });
+        }
         let cancellation = runtime::CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let outcome = Arc::new(AtomicU8::new(0));
@@ -293,7 +316,9 @@ impl GatewayRuntimeTaskSet {
             }
             let panicked = AssertUnwindSafe(future).catch_unwind().await.is_err();
             task_outcome.store(if panicked { 2 } else { 1 }, Ordering::Release);
-            let _ = completion_tx.send(GatewayTaskCompletion { id, panicked });
+            let _ = completion_tx
+                .send(GatewayTaskCompletion { id, panicked })
+                .await;
         });
 
         state.tasks.insert(
@@ -447,11 +472,17 @@ impl GatewayRuntimeTaskSet {
             oldest_active_age_ms =
                 Some(oldest_active_age_ms.map_or(age, |oldest: u64| oldest.max(age)));
         }
+        let active = state.tasks.len().saturating_add(state.settling.len());
+        let rejected = self.rejected.load(Ordering::Relaxed);
         GatewayTaskHealthSnapshot {
             phase: task_phase_label(state.phase),
             shutdown_phase: state.shutdown_phase.clone(),
             shutdown_failures: state.shutdown_failures.clone(),
-            active: state.tasks.len().saturating_add(state.settling.len()),
+            active,
+            capacity: self.max_tasks,
+            available: self.max_tasks.saturating_sub(active),
+            rejected,
+            overloaded: active >= self.max_tasks,
             oldest_active_age_ms,
             forced_aborts: state.completed.forced_aborts,
             active_by_kind,
@@ -1164,5 +1195,65 @@ mod tests {
         assert!(!body_finished.load(Ordering::SeqCst));
         assert_eq!(report.joined, 0);
         assert_eq!(report.forced_aborts, 1);
+    }
+
+    #[tokio::test]
+    async fn capacity_rejects_excess_work_before_its_future_is_built() {
+        let tasks = GatewayRuntimeTaskSet::new_with_capacity(Duration::from_secs(1), 2);
+        for _ in 0..2 {
+            tasks
+                .spawn(
+                    GatewayTaskKind::EvalWorker,
+                    None,
+                    move |cancellation| async move {
+                        cancellation.cancelled().await;
+                    },
+                )
+                .unwrap();
+        }
+        let built = Arc::new(AtomicBool::new(false));
+        let built_on_admission = Arc::clone(&built);
+
+        assert_eq!(
+            tasks.spawn(GatewayTaskKind::EvalWorker, None, move |_| {
+                built_on_admission.store(true, Ordering::SeqCst);
+                async {}
+            }),
+            Err(GatewayTaskSpawnError::Overloaded {
+                active: 2,
+                limit: 2
+            })
+        );
+        assert!(!built.load(Ordering::SeqCst));
+        let health = tasks.health();
+        assert_eq!(health.capacity, 2);
+        assert_eq!(health.active, 2);
+        assert_eq!(health.available, 0);
+        assert_eq!(health.rejected, 1);
+        assert!(health.overloaded);
+
+        tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completed_task_returns_capacity_through_the_bounded_reaper() {
+        let tasks = GatewayRuntimeTaskSet::new_with_capacity(Duration::from_secs(1), 1);
+        tasks
+            .spawn(GatewayTaskKind::EventLoopProbe, None, |_| async {})
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while tasks.health().available == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded completion reaper must return task capacity");
+
+        tasks
+            .spawn(GatewayTaskKind::EventLoopProbe, None, |_| async {})
+            .expect("capacity should be reusable after completion");
+        let report = tasks.shutdown().await;
+        assert_eq!(report.forced_aborts, 0);
+        assert_eq!(report.rejected, 0);
     }
 }

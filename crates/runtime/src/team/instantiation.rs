@@ -91,6 +91,7 @@ fn compile_required_acceptance(
                 }
             }
             TeamAcceptanceCheck::StructuredField { .. }
+            | TeamAcceptanceCheck::StructuredArtifact { .. }
             | TeamAcceptanceCheck::UpstreamReview
             | TeamAcceptanceCheck::UpstreamEvidence => {}
         }
@@ -1162,7 +1163,17 @@ fn terminal_candidate_acceptance(
     terminal_candidate: bool,
 ) -> Vec<String> {
     if terminal_candidate {
-        acceptance.extend(team_result_fields.iter().cloned());
+        let typed_artifacts = acceptance
+            .iter()
+            .filter_map(|criterion| criterion.strip_prefix("artifact:"))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        acceptance.extend(
+            team_result_fields
+                .iter()
+                .filter(|field| !typed_artifacts.contains(field.as_str()))
+                .cloned(),
+        );
     }
     acceptance.sort();
     acceptance.dedup();
@@ -1293,6 +1304,18 @@ pub(crate) fn team_acceptance_contract(
                 "proposal" => structured(criterion, TeamStructuredOutputField::Proposal),
                 "critique" => structured(criterion, TeamStructuredOutputField::Critique),
                 "checkpoint" => structured(criterion, TeamStructuredOutputField::Checkpoint),
+                _ if criterion.starts_with("artifact:") => {
+                    let name = criterion.trim_start_matches("artifact:").trim();
+                    if name.is_empty() {
+                        return Err("Team structured artifact name is empty".to_string());
+                    }
+                    TeamAcceptanceRequirement {
+                        criterion: criterion.clone(),
+                        check: TeamAcceptanceCheck::StructuredArtifact {
+                            name: name.to_string(),
+                        },
+                    }
+                }
                 "implementation" => TeamAcceptanceRequirement {
                     criterion: criterion.clone(),
                     check: TeamAcceptanceCheck::WorkspaceChange {
@@ -1367,6 +1390,7 @@ pub(crate) fn team_acceptance_contract(
                 TeamAcceptanceCheck::WorkspaceChange { scopes, .. }
                 | TeamAcceptanceCheck::SourceVerification { scopes } => scopes.is_empty(),
                 TeamAcceptanceCheck::StructuredField { .. }
+                | TeamAcceptanceCheck::StructuredArtifact { .. }
                 | TeamAcceptanceCheck::UpstreamReview
                 | TeamAcceptanceCheck::UpstreamEvidence => false,
             };
@@ -2120,6 +2144,23 @@ mod acceptance_contract_tests {
             contract[0].check,
             TeamAcceptanceCheck::ScopedEvidence {
                 scopes: vec!["read:crates/runtime".to_string()]
+            }
+        );
+    }
+
+    #[test]
+    fn typed_custom_artifact_is_not_reclassified_as_source_evidence() {
+        let contract = team_acceptance_contract(
+            &["artifact:definitions_report".to_string()],
+            &[],
+            true,
+            false,
+        )
+        .expect("custom result artifacts do not require an unrelated source lease");
+        assert_eq!(
+            contract[0].check,
+            TeamAcceptanceCheck::StructuredArtifact {
+                name: "definitions_report".to_string(),
             }
         );
     }

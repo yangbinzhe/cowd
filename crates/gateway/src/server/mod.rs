@@ -39,7 +39,11 @@ impl From<std::num::ParseIntError> for ServerError {
 // ── Service management ───────────────────────────────────────────
 
 pub fn pid_file() -> PathBuf {
-    let dir = runtime::cowd_dirs::config_home_dir().join("run");
+    pid_file_for_config_home(&runtime::cowd_dirs::config_home_dir())
+}
+
+pub fn pid_file_for_config_home(config_home: &Path) -> PathBuf {
+    let dir = config_home.join("run");
     if let Err(error) = std::fs::create_dir_all(&dir) {
         tracing::warn!(path = %dir.display(), %error, "gateway run directory is unavailable");
     }
@@ -64,6 +68,10 @@ pub fn addr_file() -> PathBuf {
     pid_file().with_extension("addr")
 }
 
+pub fn addr_file_for_config_home(config_home: &Path) -> PathBuf {
+    pid_file_for_config_home(config_home).with_extension("addr")
+}
+
 fn status_pid_files() -> Vec<PathBuf> {
     let primary = pid_file();
     let legacy = legacy_runtime_pid_file();
@@ -83,7 +91,23 @@ pub struct ServerInfo {
 }
 
 pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
-    for pid_path in status_pid_files() {
+    get_server_status_from_paths(status_pid_files(), !config_home_overridden())
+}
+
+/// Resolve only the Gateway process metadata owned by an explicit AppState
+/// config home. Health probes must not discover a different process through
+/// ambient environment variables or the default listener.
+pub fn get_server_status_for_config_home(
+    config_home: &Path,
+) -> Result<Option<ServerInfo>, ServerError> {
+    get_server_status_from_paths(vec![pid_file_for_config_home(config_home)], false)
+}
+
+fn get_server_status_from_paths(
+    pid_paths: Vec<PathBuf>,
+    discover_default_listener: bool,
+) -> Result<Option<ServerInfo>, ServerError> {
+    for pid_path in pid_paths {
         if !pid_path.exists() {
             continue;
         }
@@ -121,7 +145,7 @@ pub fn get_server_status() -> Result<Option<ServerInfo>, ServerError> {
         }));
     }
 
-    if config_home_overridden() {
+    if !discover_default_listener {
         return Ok(None);
     }
 
@@ -490,5 +514,23 @@ mod tests {
             Some(value) => std::env::set_var("XDG_RUNTIME_DIR", value),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
+    }
+
+    #[test]
+    fn explicit_config_home_status_does_not_cross_discovery_scopes() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let pid_file = super::pid_file_for_config_home(first.path());
+        std::fs::write(&pid_file, std::process::id().to_string()).unwrap();
+        std::fs::write(pid_file.with_extension("addr"), "http://127.0.0.1:9999").unwrap();
+
+        let first_status = super::get_server_status_for_config_home(first.path())
+            .unwrap()
+            .expect("first scope owns current process metadata");
+        assert_eq!(first_status.pid, std::process::id());
+        assert_eq!(first_status.address, "http://127.0.0.1:9999");
+        assert!(super::get_server_status_for_config_home(second.path())
+            .unwrap()
+            .is_none());
     }
 }

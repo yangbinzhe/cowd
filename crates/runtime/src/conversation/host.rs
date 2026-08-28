@@ -5298,10 +5298,21 @@ where
                             && !reasoning_only_response
                             && !text.trim().is_empty()
                         {
-                            if let Some(normalized) = normalized_team_terminal_candidate(
+                            let normalized = normalized_team_terminal_candidate(
                                 &text,
                                 &state.focus_required_output_fields,
-                            ) {
+                            )
+                            .or_else(|| {
+                                (state.structured_output_replans > 0)
+                                    .then(|| {
+                                        normalized_declared_custom_terminal_after_recovery(
+                                            &text,
+                                            &state.focus_required_output_fields,
+                                        )
+                                    })
+                                    .flatten()
+                            });
+                            if let Some(normalized) = normalized {
                                 if normalized != text {
                                     text = normalized;
                                     let TurnGraphState {
@@ -5332,23 +5343,20 @@ where
                                         missing.join(", "),
                                         state.focus_required_output_fields.join(", "),
                                     );
-                                    state.force_text_only_next_model = true;
                                     state.content.push_str("\n\n");
                                     state.content.push_str(&instruction);
-                                    let mut item = ContextItem::new(
-                                        format!(
-                                            "runtime-structured-output-recovery:{}",
-                                            ticket.node_id
-                                        ),
-                                        ContextSourceKind::Task,
-                                        ContextRole::Instruction,
-                                        instruction.clone(),
-                                    );
-                                    item.authority = ContextAuthority::System;
-                                    item.visibility = ContextVisibility::Private;
-                                    item.evidence =
-                                        vec![format!("execution_node:{}", ticket.node_id)];
-                                    next_model_context = Some(item);
+                                    // A normal text-only continuation retains
+                                    // the exploratory assistant/tool history.
+                                    // Providers that have entered a broad
+                                    // inspection loop commonly ignore the
+                                    // presentation-only instruction and keep
+                                    // enumerating files. Reuse Runtime's
+                                    // evidence-only, zero-tool synthesis path
+                                    // so this single recovery sees the exact
+                                    // contract and committed receipts without
+                                    // the stale tool trajectory.
+                                    state.clean_terminal_synthesis_attempted = true;
+                                    state.clean_terminal_synthesis_next = true;
                                     model_intervention =
                                         Some(harness_contract::goal::RuntimeIntervention {
                                             goal_id: state.goal_id.clone(),
@@ -5363,7 +5371,7 @@ where
                                     Some(vec![dynamic_node(
                                         ticket,
                                         state.iterations,
-                                        "structured-output-recovery-model",
+                                        "structured-output-clean-recovery-model",
                                         ExecutionNodeKind::InlineModel,
                                         "inline_model",
                                         "inline_model",
@@ -12476,7 +12484,8 @@ fn structured_field_is_materialized(value: Option<&serde_json::Value>) -> bool {
 }
 
 fn missing_required_structured_fields(candidate: &str, required: &[String]) -> Vec<String> {
-    let output = crate::agent_in_process_worker::structured_agent_output(candidate);
+    let output =
+        crate::agent_in_process_worker::structured_agent_output_for_fields(candidate, required);
     required
         .iter()
         .filter(|field| {
@@ -12505,7 +12514,8 @@ fn normalized_team_terminal_candidate(candidate: &str, required: &[String]) -> O
         return None;
     }
     let mut object =
-        crate::agent_in_process_worker::structured_agent_output(body).unwrap_or_default();
+        crate::agent_in_process_worker::structured_agent_output_for_fields(body, required)
+            .unwrap_or_default();
     for required_field in required {
         if !missing_required_structured_field_from_object(&object, required_field) {
             continue;
@@ -12539,6 +12549,67 @@ fn normalized_team_terminal_candidate(candidate: &str, required: &[String]) -> O
         return None;
     }
     serde_json::to_string(&object).ok()
+}
+
+/// After one isolated, zero-tool presentation recovery, tolerate only missing
+/// Runtime-declared custom artifact wrappers. The provider must already have
+/// materialized every fixed field (especially evidence, risks and unresolved
+/// work); Runtime merely copies that recovered terminal wording under the
+/// declared transport key. Agent validation still requires fresh tool
+/// receipts or authenticated upstream evidence for the custom artifact.
+fn normalized_declared_custom_terminal_after_recovery(
+    candidate: &str,
+    required: &[String],
+) -> Option<String> {
+    let body = candidate.trim();
+    if body.is_empty()
+        || body.starts_with("<synthesized_terminal")
+        || body.contains("<tool_call>")
+        || body.contains("```tool_use")
+        || body.contains("<function=")
+    {
+        return None;
+    }
+    let mut object =
+        crate::agent_in_process_worker::structured_agent_output_for_fields(body, required)
+            .unwrap_or_default();
+    for field in required {
+        if !missing_required_structured_field_from_object(&object, field) {
+            continue;
+        }
+        if fixed_team_terminal_field(field) {
+            return None;
+        }
+        let value = object
+            .get("summary")
+            .or_else(|| object.get("findings"))
+            .filter(|value| structured_field_is_materialized(Some(value)))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String(body.to_string()));
+        object.insert(field.clone(), value);
+    }
+    serde_json::to_string(&object).ok()
+}
+
+fn fixed_team_terminal_field(field: &str) -> bool {
+    matches!(
+        field,
+        "evidence"
+            | "summary"
+            | "findings"
+            | "plan"
+            | "implementation"
+            | "source_verification"
+            | "review"
+            | "risks"
+            | "unresolved"
+            | "key_decisions"
+            | "unresolved_or_risks"
+            | "proposal"
+            | "critique"
+            | "mitigation"
+            | "checkpoint"
+    )
 }
 
 fn missing_required_structured_field_from_object(
@@ -13112,6 +13183,45 @@ mod tests {
             ),
             vec!["risks".to_string()]
         );
+        let custom = normalized_team_terminal_candidate(
+            "## applications_survey\nVerified survey.\n\n### Vision\nNested result.\n\n## evidence\ntool://read\n\n## summary\nDone.",
+            &[
+                "applications_survey".into(),
+                "evidence".into(),
+                "summary".into(),
+            ],
+        )
+        .expect("an exact Runtime-declared custom heading is a valid carrier");
+        let custom = serde_json::from_str::<serde_json::Value>(&custom).expect("custom carrier");
+        assert!(custom["applications_survey"]
+            .as_str()
+            .is_some_and(|value| value.contains("### Vision")));
+        assert_eq!(custom["evidence"], "tool://read");
+        assert_eq!(custom["summary"], "Done.");
+
+        let recovered_custom = normalized_declared_custom_terminal_after_recovery(
+            "## evidence\ntool://read\n\n## summary\nVerified memory findings.",
+            &[
+                "memory_findings_draft".into(),
+                "evidence".into(),
+                "summary".into(),
+            ],
+        )
+        .expect("one recovered summary may receive its declared custom wrapper");
+        let recovered_custom = serde_json::from_str::<serde_json::Value>(&recovered_custom)
+            .expect("recovered custom carrier");
+        assert_eq!(
+            recovered_custom["memory_findings_draft"],
+            "Verified memory findings."
+        );
+        assert!(
+            normalized_declared_custom_terminal_after_recovery(
+                "## summary\nReview complete.",
+                &["evidence".into(), "summary".into()],
+            )
+            .is_none(),
+            "fixed evidence may never be manufactured by presentation recovery"
+        );
     }
 
     #[test]
@@ -13552,6 +13662,55 @@ mod tests {
             Box::pin(stream::iter(vec![
                 Ok(AssistantEvent::TextDelta(
                     "<tool_call><function=read_file></function></tool_call>".to_string(),
+                )),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[derive(Clone)]
+    struct StructuredFocusCleanRecoveryClient {
+        attempts: Arc<AtomicUsize>,
+        saw_clean_terminal_prompt: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ApiClient for StructuredFocusCleanRecoveryClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let clean_terminal = request
+                .prompt
+                .trusted_system
+                .iter()
+                .any(|fragment| fragment.contains("Clean terminal synthesis"));
+            if clean_terminal {
+                self.saw_clean_terminal_prompt.store(true, Ordering::SeqCst);
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta(
+                        "## runtime_findings\nRuntime owns the verified boundary.\n\n## evidence\nreceipt://runtime-read\n\n## summary\nReview complete."
+                            .to_string(),
+                    )),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            if attempt > 0 {
+                // The test harness owns a root presentation and therefore
+                // invokes its narrator after the delegated-style graph. Keep
+                // that unrelated presentation deterministic; the assertion
+                // below still proves attempt 1 used the isolated path.
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::TextDelta(
+                        "{\"runtime_findings\":\"Runtime owns the verified boundary.\",\"evidence\":\"receipt://runtime-read\",\"summary\":\"Review complete.\"}"
+                            .to_string(),
+                    )),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "Let me enumerate more source files before I synthesize.".to_string(),
                 )),
                 Ok(AssistantEvent::MessageStop),
             ]))
@@ -15028,6 +15187,58 @@ mod tests {
         assert!(
             saw_clean_terminal_prompt.load(Ordering::SeqCst),
             "the last request must exclude the exploratory transcript and use the clean synthesis contract"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegated_structured_recovery_isolated_from_exploratory_history() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let saw_clean_terminal_prompt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            StructuredFocusCleanRecoveryClient {
+                attempts: Arc::clone(&attempts),
+                saw_clean_terminal_prompt: Arc::clone(&saw_clean_terminal_prompt),
+            },
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["review the bounded Runtime sources".to_string()],
+        )
+        .without_memory();
+        runtime.set_context_profile(ContextProfile::SubAgent);
+        runtime.set_delegated_focus_policy(
+            0,
+            Vec::new(),
+            vec![
+                "runtime_findings".to_string(),
+                "evidence".to_string(),
+                "summary".to_string(),
+            ],
+        );
+
+        let (_runtime, result) = submit_test_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "return runtime_findings, evidence, and summary",
+            &SharedPrompter::none(),
+            test_execution_lineage(),
+        )
+        .await;
+        let summary = result.expect("isolated structured recovery must complete the role");
+        let output = serde_json::from_str::<serde_json::Value>(&summary.final_answer)
+            .expect("normalized custom Team output");
+
+        assert_eq!(
+            output["runtime_findings"],
+            "Runtime owns the verified boundary."
+        );
+        assert_eq!(output["evidence"], "receipt://runtime-read");
+        assert_eq!(output["summary"], "Review complete.");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(
+            saw_clean_terminal_prompt.load(Ordering::SeqCst),
+            "format recovery must exclude the exploratory transcript"
         );
     }
 

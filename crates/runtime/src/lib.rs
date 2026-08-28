@@ -140,6 +140,11 @@ pub mod sandbox;
 #[path = "session/session.rs"]
 mod session;
 pub use session::workspace_sessions_dir;
+#[path = "session/session_turn_admission.rs"]
+mod session_turn_admission;
+pub use session_turn_admission::{
+    SessionTurnAdmissionLease, SessionTurnAdmissionPort, SessionTurnOutcome,
+};
 #[path = "agent/agent.rs"]
 pub mod agent;
 #[path = "agent/agent_capability.rs"]

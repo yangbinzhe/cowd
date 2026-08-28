@@ -40,6 +40,12 @@ pub enum TeamAcceptanceCheck {
     StructuredField {
         field: TeamStructuredOutputField,
     },
+    /// A model-declared result artifact whose name is not part of the
+    /// Runtime's fixed presentation vocabulary. The exact structured-output
+    /// key remains typed and is never reclassified as source evidence.
+    StructuredArtifact {
+        name: String,
+    },
     ScopedEvidence {
         scopes: Vec<String>,
     },

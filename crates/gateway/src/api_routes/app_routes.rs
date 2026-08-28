@@ -2492,7 +2492,9 @@ mod tests {
     #[ignore = "run via scripts/test/reference-app-performance.sh"]
     async fn reference_bundle_performance_contract() {
         const COLD_SAMPLES: usize = 100;
-        const HOT_SAMPLES: usize = 500;
+        const HOT_ROUNDS: usize = 6;
+        const HOT_SAMPLES_PER_ROUND: usize = 250;
+        const HOT_SAMPLES: usize = HOT_ROUNDS * HOT_SAMPLES_PER_ROUND;
 
         let bundle = PathBuf::from(
             std::env::var("COWD_REFERENCE_APP_BUNDLE")
@@ -2630,78 +2632,79 @@ mod tests {
             .pid
             .expect("hot worker pid");
 
-        let direct_cpu_before = process_and_worker_cpu_ticks(worker_pid);
-        let direct_wall_started = Instant::now();
         let mut direct_us = Vec::with_capacity(HOT_SAMPLES);
-        for _ in 0..HOT_SAMPLES {
-            let envelope = invocation_envelope(
-                &platform,
-                &workspace,
-                &principal,
-                &headers,
-                "reference-app",
-                &descriptor,
-                echo_input(),
-            )
-            .expect("direct envelope");
-            let started = Instant::now();
-            let response = send_worker(
-                lease.connection(),
-                lease.app_id(),
-                lease.generation().0.as_str(),
-                &envelope.request_id,
-                envelope.effective_deadline_unix_ms(),
-                Method::POST,
-                "/_cowd/v1/operations/reference-app.echo/invoke",
-                Some(&envelope),
-                Duration::from_secs(30),
-            )
-            .await
-            .expect("direct UDS response");
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = response
-                .into_body()
-                .collect()
-                .await
-                .expect("direct body")
-                .to_bytes();
-            let provider: AppProviderResponseV1 =
-                serde_json::from_slice(&body).expect("direct typed response");
-            provider.validate().expect("direct response contract");
-            direct_us.push(started.elapsed().as_micros());
-        }
-        let direct_wall = direct_wall_started.elapsed();
-        let direct_cpu_ticks =
-            process_and_worker_cpu_ticks(worker_pid).saturating_sub(direct_cpu_before);
-
-        let gateway_cpu_before = process_and_worker_cpu_ticks(worker_pid);
-        let gateway_wall_started = Instant::now();
         let mut gateway_us = Vec::with_capacity(HOT_SAMPLES);
-        for _ in 0..HOT_SAMPLES {
-            let started = Instant::now();
-            let response = proxy_unary(
-                &platform,
-                &workspace,
-                &principal,
-                &headers,
-                "reference-app",
-                "reference-app.echo",
-                echo_input(),
-                None,
-                None,
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::OK);
-            response
-                .into_body()
-                .collect()
-                .await
-                .expect("Gateway hot body");
-            gateway_us.push(started.elapsed().as_micros());
+        let mut direct_wall = Duration::ZERO;
+        let mut gateway_wall = Duration::ZERO;
+        let mut direct_cpu_ticks = 0_u64;
+        let mut gateway_cpu_ticks = 0_u64;
+        for round in 0..HOT_ROUNDS {
+            if round % 2 == 0 {
+                let cpu_before = process_and_worker_cpu_ticks(worker_pid);
+                let (wall, latencies) = measure_direct_hot_samples(
+                    &platform,
+                    &workspace,
+                    &principal,
+                    &headers,
+                    &lease,
+                    &descriptor,
+                    HOT_SAMPLES_PER_ROUND,
+                )
+                .await;
+                direct_wall += wall;
+                direct_us.extend(latencies);
+                direct_cpu_ticks = direct_cpu_ticks.saturating_add(
+                    process_and_worker_cpu_ticks(worker_pid).saturating_sub(cpu_before),
+                );
+
+                let cpu_before = process_and_worker_cpu_ticks(worker_pid);
+                let (wall, latencies) = measure_gateway_hot_samples(
+                    &platform,
+                    &workspace,
+                    &principal,
+                    &headers,
+                    HOT_SAMPLES_PER_ROUND,
+                )
+                .await;
+                gateway_wall += wall;
+                gateway_us.extend(latencies);
+                gateway_cpu_ticks = gateway_cpu_ticks.saturating_add(
+                    process_and_worker_cpu_ticks(worker_pid).saturating_sub(cpu_before),
+                );
+            } else {
+                let cpu_before = process_and_worker_cpu_ticks(worker_pid);
+                let (wall, latencies) = measure_gateway_hot_samples(
+                    &platform,
+                    &workspace,
+                    &principal,
+                    &headers,
+                    HOT_SAMPLES_PER_ROUND,
+                )
+                .await;
+                gateway_wall += wall;
+                gateway_us.extend(latencies);
+                gateway_cpu_ticks = gateway_cpu_ticks.saturating_add(
+                    process_and_worker_cpu_ticks(worker_pid).saturating_sub(cpu_before),
+                );
+
+                let cpu_before = process_and_worker_cpu_ticks(worker_pid);
+                let (wall, latencies) = measure_direct_hot_samples(
+                    &platform,
+                    &workspace,
+                    &principal,
+                    &headers,
+                    &lease,
+                    &descriptor,
+                    HOT_SAMPLES_PER_ROUND,
+                )
+                .await;
+                direct_wall += wall;
+                direct_us.extend(latencies);
+                direct_cpu_ticks = direct_cpu_ticks.saturating_add(
+                    process_and_worker_cpu_ticks(worker_pid).saturating_sub(cpu_before),
+                );
+            }
         }
-        let gateway_wall = gateway_wall_started.elapsed();
-        let gateway_cpu_ticks =
-            process_and_worker_cpu_ticks(worker_pid).saturating_sub(gateway_cpu_before);
         direct_us.sort_unstable();
         gateway_us.sort_unstable();
         let direct_p95_us = nearest_rank_u128(&direct_us, 95);
@@ -2832,6 +2835,7 @@ mod tests {
             "cold": {"samples": COLD_SAMPLES, "p95_us": cold_p95_us, "p99_us": cold_p99_us},
             "hot": {
                 "samples": HOT_SAMPLES,
+                "paired_rounds": HOT_ROUNDS,
                 "direct_p95_us": direct_p95_us,
                 "gateway_p95_us": gateway_p95_us,
                 "direct_rps": direct_rps,
@@ -2856,6 +2860,91 @@ mod tests {
         eprintln!("COWD_PERF_JSON {report}");
         lease.release().await;
         platform.shutdown().await.expect("performance shutdown");
+    }
+
+    async fn measure_direct_hot_samples(
+        platform: &GatewayAppPlatform,
+        workspace: &Path,
+        principal: &super::super::AuthenticatedPrincipal,
+        headers: &HeaderMap,
+        lease: &AppRuntimeLease<GatewayAppConnector>,
+        descriptor: &OperationDescriptorV1,
+        samples: usize,
+    ) -> (Duration, Vec<u128>) {
+        let wall_started = Instant::now();
+        let mut latencies = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let envelope = invocation_envelope(
+                platform,
+                workspace,
+                principal,
+                headers,
+                "reference-app",
+                descriptor,
+                echo_input(),
+            )
+            .expect("direct envelope");
+            let started = Instant::now();
+            let response = send_worker(
+                lease.connection(),
+                lease.app_id(),
+                lease.generation().0.as_str(),
+                &envelope.request_id,
+                envelope.effective_deadline_unix_ms(),
+                Method::POST,
+                "/_cowd/v1/operations/reference-app.echo/invoke",
+                Some(&envelope),
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("direct UDS response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("direct body")
+                .to_bytes();
+            let provider: AppProviderResponseV1 =
+                serde_json::from_slice(&body).expect("direct typed response");
+            provider.validate().expect("direct response contract");
+            latencies.push(started.elapsed().as_micros());
+        }
+        (wall_started.elapsed(), latencies)
+    }
+
+    async fn measure_gateway_hot_samples(
+        platform: &GatewayAppPlatform,
+        workspace: &Path,
+        principal: &super::super::AuthenticatedPrincipal,
+        headers: &HeaderMap,
+        samples: usize,
+    ) -> (Duration, Vec<u128>) {
+        let wall_started = Instant::now();
+        let mut latencies = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let started = Instant::now();
+            let response = proxy_unary(
+                platform,
+                workspace,
+                principal,
+                headers,
+                "reference-app",
+                "reference-app.echo",
+                echo_input(),
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("Gateway hot body");
+            latencies.push(started.elapsed().as_micros());
+        }
+        (wall_started.elapsed(), latencies)
     }
 
     fn echo_input() -> InvokeInput {

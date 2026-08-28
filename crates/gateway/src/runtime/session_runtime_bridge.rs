@@ -3,16 +3,13 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use futures::FutureExt;
 use harness_contract::turn::{InputRoutingDecision, SessionInputId, SessionInputStatus};
-use runtime::execution_core::graph::{
-    ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager, ResourceObservation,
-    ResourceResultClass,
-};
+use runtime::{SessionTurnAdmissionLease, SessionTurnAdmissionPort, SessionTurnOutcome};
 #[cfg(test)]
 use session::UnifiedSessionStore;
 use session::{OutboxFailureClass, SessionRuntimeInputStatus, SessionRuntimeOutboxRecord};
@@ -42,7 +39,7 @@ const CROSS_PROCESS_RECONCILIATION_FALLBACK: Duration = Duration::from_secs(30);
 struct GatewaySessionIngressExecutor {
     runtime: Arc<RuntimeService>,
     session: Arc<SessionService>,
-    resources: Arc<ExecutionResourceManager>,
+    admission: SessionTurnAdmissionPort,
     lease_lost: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -84,11 +81,7 @@ impl runtime::SessionIngressExecutor for GatewaySessionIngressExecutor {
             ));
         }
         record.claim_fence_epoch = durable.claim_fence_epoch;
-        let lease = self
-            .resources
-            .acquire(ExecutionResourceKind::SessionTurn, None)
-            .await
-            .map_err(|error| format!("SessionTurn admission failed: {error}"))?;
+        let lease = self.admission.acquire().await?;
         self.execute_ingress_with_lease(&record, content, lease)
             .await
     }
@@ -191,30 +184,20 @@ impl GatewaySessionIngressExecutor {
         &self,
         record: &session::SessionRuntimeOutboxRecord,
         content: &str,
-        lease: ExecutionResourceLease,
+        mut lease: SessionTurnAdmissionLease,
     ) -> Result<runtime::SessionIngressExecutionReceipt, String> {
-        let service_started = Instant::now();
-        let queue_wait = lease.queue_wait();
+        lease.begin_service();
         self.session
             .activate_worker_session(&record.session_id)
             .await?;
         self.restore_attached_inputs(record).await?;
         let outcome = self.runtime.execute_ingress_record(record, content).await;
         let result_class = if outcome.is_ok() {
-            ResourceResultClass::Completed
+            SessionTurnOutcome::Completed
         } else {
-            ResourceResultClass::Failed
+            SessionTurnOutcome::Failed
         };
-        drop(lease);
-        if let Err(error) = self.resources.record_observation(
-            &ExecutionResourceKind::SessionTurn,
-            ResourceObservation {
-                observed_at_ms: now_ms(),
-                queue_wait,
-                service_time: service_started.elapsed(),
-                result_class,
-            },
-        ) {
+        if let Err(error) = lease.finish(result_class) {
             tracing::warn!(%error, "failed to record SessionTurn resource observation");
         }
         outcome
@@ -463,7 +446,7 @@ impl SessionWorkerSupervisor {
         let ingress_runtime = GatewaySessionIngressExecutor {
             runtime: Arc::clone(&runtime_service),
             session: Arc::clone(&session_service),
-            resources: Arc::clone(runtime_service.runtime_services().resource_manager()),
+            admission: runtime_service.runtime_services().session_turn_admission(),
             lease_lost: Arc::clone(&claim_lease_lost),
         };
         let ingress_service = Arc::clone(&session_service);
@@ -1661,7 +1644,7 @@ async fn run_ingress_worker(
                     ).await;
                     break;
                 }
-                lease = executor.resources.acquire(ExecutionResourceKind::SessionTurn, None) => {
+                lease = executor.admission.acquire() => {
                     match lease {
                         Ok(lease) => lease,
                         Err(error) => {
@@ -1762,7 +1745,7 @@ async fn process_claimed_session_input(
     executor: GatewaySessionIngressExecutor,
     worker_id: String,
     record: SessionRuntimeOutboxRecord,
-    lease: ExecutionResourceLease,
+    lease: SessionTurnAdmissionLease,
 ) {
     let Some(claim_token) = record.claim_token.clone() else {
         tracing::error!(request_id = %record.request_id, "claimed Session input has no claim token");
@@ -2186,7 +2169,7 @@ async fn execute_primary_ingress_with_lease(
     claim_token: &str,
     mut revision: u64,
     content: &str,
-    lease: ExecutionResourceLease,
+    lease: SessionTurnAdmissionLease,
 ) {
     let execution = executor.execute_ingress_with_lease(record, content, lease);
     tokio::pin!(execution);

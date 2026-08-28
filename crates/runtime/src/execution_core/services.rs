@@ -5204,6 +5204,9 @@ impl RuntimeServices {
     pub fn resource_manager(&self) -> &Arc<ExecutionResourceManager> {
         &self.resource_manager
     }
+    pub fn session_turn_admission(&self) -> crate::SessionTurnAdmissionPort {
+        crate::SessionTurnAdmissionPort::new(Arc::clone(&self.resource_manager))
+    }
     pub fn tool_execution_plane(&self) -> &Arc<crate::ToolExecutionPlane> {
         &self.tool_execution_plane
     }

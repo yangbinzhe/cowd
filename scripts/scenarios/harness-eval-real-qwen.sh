@@ -186,7 +186,8 @@ fi
 CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
-EVIDENCE_KEY="$(printf '%s\n' "deep-real-v2" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" | sha256sum | awk '{print $1}')"
+SCENARIO_FINGERPRINT="$(printf '%s\n' "${COWD_EVAL_LIVE_SCENARIOS:-default}" "${COWD_EVAL_GROUP_THEORY_RESEARCH:-0}" | sha256sum | awk '{print $1}')"
+EVIDENCE_KEY="$(printf '%s\n' "deep-real-v3" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
 if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
   prior_evidence="$({
     find "$EVIDENCE_ROOT/runs" -type f -name report.json -exec jq -r --arg key "$EVIDENCE_KEY" '
@@ -252,7 +253,7 @@ cat >>"$CONFIG_HOME/config.yaml" <<EOF
 permissions:
   default_mode: danger-full-access
 memory:
-  enabled: false
+  enabled: true
 storage:
   backend: sqlite
 gateway:
@@ -296,6 +297,54 @@ for _ in {1..240}; do
   sleep 0.25
 done
 curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/healthz" >/dev/null
+
+# Process liveness precedes projector warm-up and control-plane latency
+# stabilization. Starting the evaluator in that interval creates a false
+# semantic-health failure even when the same isolated Gateway becomes ready a
+# moment later. Gate scenario admission on the exact fail-closed contracts the
+# evaluator will record; do not weaken or retry a failed scenario afterward.
+SEMANTIC_READY_TIMEOUT_SECS="${COWD_EVAL_SEMANTIC_READY_TIMEOUT_SECS:-180}"
+semantic_ready=0
+semantic_deadline=$((SECONDS + SEMANTIC_READY_TIMEOUT_SECS))
+control_plane_health='{}'
+surface_health='{}'
+while ((SECONDS < semantic_deadline)); do
+  control_plane_health="$(curl -fsS \
+    -H "Authorization: Bearer $TOKEN" \
+    "$BASE_URL/api/runtime/control-plane" 2>/dev/null || printf '{}')"
+  surface_health="$(curl -fsS \
+    -H "Authorization: Bearer $TOKEN" \
+    "$BASE_URL/api/surfaces/health" 2>/dev/null || printf '{}')"
+  if jq -e '
+      .readiness.production_ready == true and
+      .readiness.required_blocked == 0
+    ' >/dev/null <<<"$control_plane_health" \
+    && jq -e '
+      .host.status == "ready" and
+      .host.failed_count == 0 and
+      .host.circuit_open_count == 0 and
+      .host.task_ownership.overloaded == false
+    ' >/dev/null <<<"$surface_health"; then
+    semantic_ready=1
+    break
+  fi
+  kill -0 "$GATEWAY_PID" >/dev/null 2>&1 || {
+    sed -n '1,240p' "$GATEWAY_LOG" >&2 || true
+    exit 1
+  }
+  sleep 0.25
+done
+if [[ "$semantic_ready" -ne 1 ]]; then
+  jq -cn \
+    --argjson control "$control_plane_health" \
+    --argjson surface "$surface_health" \
+    '{
+      error: "isolated Gateway did not reach semantic readiness",
+      control_plane: ($control.readiness // {}),
+      surface_host: ($surface.host // {})
+    }' >&2
+  exit 1
+fi
 monitor_progress &
 PROGRESS_PID="$!"
 

@@ -13,10 +13,23 @@ fail() {
 version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
 inventory_version="$(sed -n 's/^release_version: //p' tests/test-governance/test-inventory.yaml)"
 readme_version="$(sed -n 's/^当前治理版本：`\([^`]*\)`.*/\1/p' tests/test-governance/README.md)"
+release_authority="$(sed -n 's/^release_authority: //p' tests/test-governance/test-inventory.yaml)"
+release_evidence="$(sed -n 's/^release_evidence: //p' tests/test-governance/test-inventory.yaml)"
 [[ "$inventory_version" == "$version" ]] \
   || fail "inventory version $inventory_version does not match workspace $version"
 [[ "$readme_version" == "$version" ]] \
   || fail "governance README version $readme_version does not match workspace $version"
+[[ -f "$release_authority" ]] \
+  || fail "release authority is missing: ${release_authority:-<unset>}"
+[[ -f "$release_evidence" ]] \
+  || fail "release evidence is missing: ${release_evidence:-<unset>}"
+[[ "$release_authority" == *"v${version}.md" ]] \
+  || fail "release authority does not identify workspace version $version: $release_authority"
+[[ "$release_evidence" == *"v${version}.md" ]] \
+  || fail "release evidence does not identify workspace version $version: $release_evidence"
+if [[ -f "$release_evidence" ]] && ! rg -q '^Release status: passed$' "$release_evidence"; then
+  fail "release evidence is not closed with 'Release status: passed'"
+fi
 
 if rg -n 'delete-candidate|planned[_-]v?[0-9]|planned_change|Compatibility aliases|gateway-slow|unit-fast' \
   tests/test-governance scripts/validate.sh scripts/test scripts/ci .github \

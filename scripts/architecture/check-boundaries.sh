@@ -41,6 +41,9 @@ scan_gateway_production() {
 check_empty "gateway second AI execution loop" \
   scan_gateway_production 'execute_model_tool_cycle|run_turn_async|run_prompt\(|run_repl\(|mod repl;|livecli'
 
+check_empty "gateway Session ingress must use the public Runtime admission port" \
+  bash -c 'awk "/#\[cfg\(test\)\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" crates/gateway/src/runtime/session_runtime_bridge.rs | rg -n "runtime::execution_core::graph|ExecutionResource(Kind|Lease|Manager)|ResourceObservation|ResourceResultClass" || true'
+
 check_empty "gateway removed process compatibility paths" \
   scan_gateway_production 'crate::daemon::|DaemonConfig|run_daemon|COWD_AUTH_BROKER_BIN|COWD_INTERNAL_PROCESS_BIN|cowd-auth-broker'
 

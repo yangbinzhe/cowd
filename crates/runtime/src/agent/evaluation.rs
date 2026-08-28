@@ -218,8 +218,9 @@ pub(crate) fn required_acceptance_for_packet(
                 }
             }
             TeamAcceptanceCheck::UpstreamReview => {}
-            TeamAcceptanceCheck::StructuredField { .. } | TeamAcceptanceCheck::UpstreamEvidence => {
-            }
+            TeamAcceptanceCheck::StructuredField { .. }
+            | TeamAcceptanceCheck::StructuredArtifact { .. }
+            | TeamAcceptanceCheck::UpstreamEvidence => {}
         }
     }
     scopes.sort();

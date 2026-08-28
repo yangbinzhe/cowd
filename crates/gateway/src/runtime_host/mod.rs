@@ -2416,7 +2416,16 @@ mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let dir = std::env::temp_dir().join(unique);
+        let configured = std::env::temp_dir().join(&unique);
+        // Linux sockaddr_un leaves only 107 bytes for a pathname (including
+        // every component supplied by TMPDIR). Keep enough headroom for the
+        // broker socket and its generation sidecars. This matters when a CI
+        // lane deliberately gives the suite a descriptive, isolated TMPDIR.
+        let dir = if configured.as_os_str().as_encoded_bytes().len() <= 80 {
+            configured
+        } else {
+            std::path::Path::new("/tmp").join(unique)
+        };
         fs::create_dir_all(&dir).expect("create temp webui dir");
         dir
     }

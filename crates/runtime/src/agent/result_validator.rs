@@ -1,6 +1,47 @@
 use harness_contract::acceptance::AcceptanceVerdict;
 use harness_contract::agent::{AgentReturnPacket, AgentTaskPacket, AgentTerminalStatus};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TeamEvidencePolicy {
+    pub requires_new_tool_evidence: bool,
+    pub consumes_upstream: bool,
+}
+
+/// Compile the evidence policy once for both Agent terminal admission and
+/// Team delivery verification. Keeping this classification shared prevents a
+/// role from becoming Completed under a weaker interpretation than the Team
+/// verifier applies to the same frozen packet.
+#[must_use]
+pub(crate) fn team_evidence_policy(
+    requirements: &[harness_contract::team::TeamAcceptanceRequirement],
+) -> TeamEvidencePolicy {
+    let consumes_upstream = requirements.iter().any(|requirement| {
+        matches!(
+            &requirement.check,
+            harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
+        )
+    });
+    let declares_custom_artifact = requirements.iter().any(|requirement| {
+        matches!(
+            &requirement.check,
+            harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { .. }
+        )
+    });
+    let requires_new_tool_evidence = requirements.iter().any(|requirement| {
+        matches!(
+            &requirement.check,
+            harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
+                | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { .. }
+                | harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. }
+                | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
+        )
+    }) || (declares_custom_artifact && !consumes_upstream);
+    TeamEvidencePolicy {
+        requires_new_tool_evidence,
+        consumes_upstream,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentResultValidationError {
     BindingMismatch,
@@ -99,21 +140,9 @@ pub fn validate_agent_return(
                             .all(|requirement| task.acceptance.contains(&requirement.criterion))
                 })
                 .ok_or(AgentResultValidationError::UnsatisfiedAcceptance)?;
-            let requires_new_tool_evidence = requirements.iter().any(|requirement| {
-                matches!(
-                    &requirement.check,
-                    harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
-                        | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { .. }
-                        | harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. }
-                        | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
-                )
-            });
-            let consumes_upstream = requirements.iter().any(|requirement| {
-                matches!(
-                    &requirement.check,
-                    harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
-                )
-            });
+            let evidence_policy = team_evidence_policy(&requirements);
+            let consumes_upstream = evidence_policy.consumes_upstream;
+            let requires_new_tool_evidence = evidence_policy.requires_new_tool_evidence;
             // Evidence refs are content-addressed. A fresh verification read
             // of unchanged upstream content therefore legitimately returns
             // the same ref. For Cowd-native Team agents the observed scopes
@@ -122,14 +151,18 @@ pub fn validate_agent_return(
             // when ref identity is unchanged.
             let fresh_runtime_tool_observed = returned.tool_calls > 0
                 && !returned.observed_acceptance.observed_evidence.is_empty();
-            let produced = returned.evidence_refs.iter().any(|evidence| {
-                is_materialized_durable_evidence(evidence)
-                    && (fresh_runtime_tool_observed
-                        || !task
-                            .evidence_refs
-                            .iter()
-                            .any(|input| input.evidence_ref == evidence.evidence_ref))
-            });
+            // A durable artifact is only evidence-producing when Runtime also
+            // observed a successful tool effect for this execution. Failed
+            // tool attempts are durably recorded for audit and therefore can
+            // introduce a new content address, but that failure artifact must
+            // never satisfy a Team acceptance contract. Keep this admission
+            // rule aligned with Team delivery verification so an Agent cannot
+            // become Completed and later make its Team terminal Partial.
+            let produced = fresh_runtime_tool_observed
+                && returned
+                    .evidence_refs
+                    .iter()
+                    .any(is_materialized_durable_evidence);
             if requires_new_tool_evidence && returned.tool_calls == 0 {
                 return Err(AgentResultValidationError::MissingToolExecution);
             }
@@ -343,6 +376,34 @@ mod tests {
     }
 
     #[test]
+    fn failed_tool_attempt_artifact_cannot_satisfy_team_evidence() {
+        let task = team_task();
+        let mut returned = team_return(&task);
+
+        // ToolHost persists failed outputs for audit, so both a call count and
+        // a new durable artifact can exist without any successful observed
+        // evidence. That combination must remain ineligible for acceptance.
+        returned.observed_acceptance.observed_evidence.clear();
+        let required = harness_contract::context::RequiredAcceptance {
+            criteria: task.acceptance.clone(),
+            evidence_obligations: Vec::new(),
+        };
+        let (_, evaluation) = crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
+            &required,
+            returned.observed_acceptance.satisfied_criteria.clone(),
+            returned.observed_acceptance.observed_evidence.clone(),
+        );
+        returned.acceptance_evaluation = Some(evaluation);
+
+        assert_eq!(returned.tool_calls, 1);
+        assert!(!returned.evidence_refs.is_empty());
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::MissingEvidence)
+        );
+    }
+
+    #[test]
     fn team_requires_every_runtime_evaluated_acceptance_criterion() {
         let task = team_task();
         let mut returned = team_return(&task);
@@ -416,6 +477,48 @@ mod tests {
             validate_agent_return(&task, &returned),
             Err(AgentResultValidationError::MissingEvidence)
         );
+    }
+
+    #[test]
+    fn custom_artifact_requires_fresh_tools_or_upstream_grounding() {
+        let mut task = team_task();
+        task.acceptance = vec!["artifact:runtime_findings".to_string()];
+        task.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+            criterion: "artifact:runtime_findings".to_string(),
+            check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                name: "runtime_findings".to_string(),
+            },
+        }];
+        let mut returned = team_return(&task);
+        returned.outcome = r#"{"runtime_findings":"receipt-grounded result"}"#.to_string();
+        assert_eq!(validate_agent_return(&task, &returned), Ok(()));
+
+        returned.tool_calls = 0;
+        assert_eq!(
+            validate_agent_return(&task, &returned),
+            Err(AgentResultValidationError::MissingToolExecution)
+        );
+
+        task.output_acceptance
+            .push(harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "upstream:evidence".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
+            });
+        task.acceptance.push("upstream:evidence".to_string());
+        let upstream = EvidenceAccessRef::durable(
+            EvidenceRef::observed("tool", "custom-upstream"),
+            "e".repeat(64),
+            1,
+            "application/json",
+            "artifact://art_result_validator_custom_upstream",
+            "session:session",
+        );
+        task.evidence_refs = vec![upstream.clone()];
+        let mut returned = team_return(&task);
+        returned.outcome = r#"{"runtime_findings":"upstream-grounded result"}"#.to_string();
+        returned.tool_calls = 0;
+        returned.evidence_refs = vec![upstream];
+        assert_eq!(validate_agent_return(&task, &returned), Ok(()));
     }
 
     #[test]

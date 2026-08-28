@@ -379,6 +379,12 @@ pub(crate) fn estimate_work_graph(
                 .nodes
                 .iter()
                 .any(|node| node.recipe == CapabilityRecipeId::Review),
+            user_mandated_topology: plan
+                .execution_decision
+                .strategy
+                .understanding
+                .required_team_count
+                > 0,
             ..ModelWorkEstimateInput::default()
         },
     )

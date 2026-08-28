@@ -821,7 +821,7 @@ fn terminal_role_id(
     result_fields: &[String],
     workstream_index: usize,
 ) -> Result<Option<String>, IntentCompilerError> {
-    if !team.result.synthesis_required {
+    if result_fields.is_empty() && !team.result.synthesis_required {
         return Ok(None);
     }
     if result_fields.is_empty() {
@@ -1009,7 +1009,7 @@ fn canonical_acceptance(
         .map(criterion_key)
         .collect::<Vec<_>>();
     if let Some(fields) = terminal_result_fields {
-        values.extend(fields.iter().cloned());
+        values.extend(fields.iter().map(|field| artifact_criterion_key(field)));
     }
     if values.is_empty() {
         values.push("evidence".to_string());
@@ -1025,7 +1025,7 @@ fn criterion_key(criterion: &ModelSemanticAcceptanceCriterion) -> String {
         // field names directly (`summary`, `evidence`, `findings`, ...). Keep
         // that compatibility at the lowering boundary; the semantic contract
         // retains the tagged `Artifact` form in provenance.
-        ModelSemanticAcceptanceCriterion::Artifact { artifact } => artifact.trim().to_string(),
+        ModelSemanticAcceptanceCriterion::Artifact { artifact } => artifact_criterion_key(artifact),
         ModelSemanticAcceptanceCriterion::EvidenceScope {
             operation,
             resource,
@@ -1042,6 +1042,32 @@ fn criterion_key(criterion: &ModelSemanticAcceptanceCriterion) -> String {
         ModelSemanticAcceptanceCriterion::IndependentReview { subject_role_id } => {
             format!("independent_review:{subject_role_id}")
         }
+    }
+}
+
+fn artifact_criterion_key(artifact: &str) -> String {
+    let artifact = artifact.trim();
+    if matches!(
+        artifact,
+        "evidence"
+            | "summary"
+            | "findings"
+            | "plan"
+            | "implementation"
+            | "source_verification"
+            | "review"
+            | "risks"
+            | "unresolved"
+            | "key_decisions"
+            | "unresolved_or_risks"
+            | "proposal"
+            | "critique"
+            | "mitigation"
+            | "checkpoint"
+    ) {
+        artifact.to_string()
+    } else {
+        format!("artifact:{artifact}")
     }
 }
 
@@ -1389,6 +1415,45 @@ mod tests {
         assert!(roles[1]["acceptance"]
             .as_array()
             .is_some_and(|criteria| criteria.iter().any(|value| value == "unresolved")));
+    }
+
+    #[test]
+    fn custom_result_artifact_has_a_terminal_carrier_without_source_evidence() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut valid = decision();
+        let workstream = &mut valid.workstreams[0];
+        workstream.output_artifacts = vec!["definitions_report".to_string()];
+        workstream.evidence_contract.clear();
+        workstream.team.result = ModelTeamResultIntent {
+            required_artifacts: vec!["definitions_report".to_string()],
+            evidence_required: false,
+            synthesis_required: false,
+        };
+        workstream.team.roles.truncate(1);
+        workstream.team.roles[0].acceptance.clear();
+        workstream.team.roles[0].required_tools.clear();
+        workstream.team.roles[0].output_artifacts = vec!["definitions_report".to_string()];
+        workstream.team.dependencies.clear();
+
+        let compiled = compile_turn_scoped_intent(&request(), &valid, &services)
+            .expect("a declared result artifact is structural, not implicit source evidence");
+        let role = &compiled.template_proposal["teams"][0]["template"]["roles"][0];
+        assert_eq!(
+            role["acceptance"],
+            serde_json::json!(["artifact:definitions_report"])
+        );
+        assert!(role["behavior"].as_array().is_some_and(|facets| facets
+            .iter()
+            .any(|facet| { facet["kind"] == "terminal_candidate" && facet["required"] == true })));
+    }
+
+    #[test]
+    fn evidence_artifact_keeps_the_runtime_provenance_contract() {
+        assert_eq!(artifact_criterion_key("evidence"), "evidence");
+        assert_eq!(
+            artifact_criterion_key("definitions_report"),
+            "artifact:definitions_report"
+        );
     }
 
     #[test]

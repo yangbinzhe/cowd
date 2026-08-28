@@ -3899,10 +3899,10 @@ mod tests {
         runtime_capability_context_item, semantic_checkpoint_resume_context_packet,
         session_db_resume_context_packet, slash_command_completion_candidates_with_sessions,
         status_context, strip_ansi_for_tui, suggestions::format_unknown_slash_command,
-        try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction, GatewayToolExecutor,
-        GitWorkspaceSummary, LocalHelpTopic, StatusUsage, DEFAULT_MODEL_ALIAS,
-        LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
+        truncate_for_banner, try_resolve_bare_skill_prompt, validate_no_args,
+        workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
+        GatewayAction, GatewayToolExecutor, GitWorkspaceSummary, LocalHelpTopic, StatusUsage,
+        DEFAULT_MODEL_ALIAS, LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
     };
 
     #[test]
@@ -4332,16 +4332,19 @@ memory:
     }
 
     struct ConfigHomeGuard {
-        original: Option<String>,
+        original: Option<std::ffi::OsString>,
+        _directory: tempfile::TempDir,
     }
 
     impl ConfigHomeGuard {
         fn new() -> Self {
-            let original = std::env::var("COWD_CONFIG_HOME").ok();
-            let tmp = std::env::temp_dir().join("cc-test-config-home");
-            let _ = fs::create_dir_all(&tmp);
-            std::env::set_var("COWD_CONFIG_HOME", &tmp);
-            Self { original }
+            let original = std::env::var_os("COWD_CONFIG_HOME");
+            let directory = tempfile::tempdir().expect("isolated Gateway test config home");
+            std::env::set_var("COWD_CONFIG_HOME", directory.path());
+            Self {
+                original,
+                _directory: directory,
+            }
         }
     }
 
@@ -4732,6 +4735,7 @@ memory:
 
     #[test]
     fn parses_permission_mode_flag() {
+        let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         let args = vec!["--permission-mode=read-only".to_string()];
         assert_eq!(
@@ -4884,6 +4888,9 @@ memory:
 
     #[test]
     fn rejects_removed_allowed_tool_aliases() {
+        let _guard = env_lock();
+        let _cfg_guard = ConfigHomeGuard::new();
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let error = parse_args(&["--allowedTools".to_string(), "read,glob".to_string()])
             .expect_err("legacy aliases must not bypass the canonical tool contract");
         assert!(error.contains("unsupported tool in --allowedTools: read"));
@@ -4891,6 +4898,9 @@ memory:
 
     #[test]
     fn rejects_unknown_allowed_tools() {
+        let _guard = env_lock();
+        let _cfg_guard = ConfigHomeGuard::new();
+        std::env::remove_var("COWD_PERMISSION_MODE");
         let error = parse_args(&[
             "--allowedTools".to_string(),
             "definitely_not_a_tool".to_string(),
@@ -4959,6 +4969,7 @@ memory:
 
     #[test]
     fn removed_login_and_logout_subcommands_error_helpfully() {
+        let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         let login = parse_args(&["login".to_string()]).expect_err("login should be removed");
         assert!(login.contains("providers"));
@@ -5136,6 +5147,7 @@ memory:
 
     #[test]
     fn direct_slash_commands_return_tui_guidance() {
+        let _guard = env_lock();
         let _cfg_guard = ConfigHomeGuard::new();
         for args in [
             vec!["/agents".to_string()],
@@ -5434,7 +5446,7 @@ memory:
         );
         assert_eq!(
             rows.get("directory").map(String::as_str),
-            Some(root.to_str().unwrap())
+            Some(truncate_for_banner(root.to_str().unwrap(), 59).as_str())
         );
         assert!(rows.contains_key("branch"));
         assert!(rows.contains_key("git"));

@@ -3199,6 +3199,13 @@ mod tests {
         };
 
         let services = RuntimeServices::in_memory().expect("runtime services");
+        let source = services
+            .workspace_root()
+            .join("crates/runtime/src/orchestration/mod.rs");
+        std::fs::create_dir_all(source.parent().expect("source fixture parent"))
+            .expect("source fixture directory");
+        std::fs::write(&source, "// deterministic orchestration evidence fixture")
+            .expect("source fixture");
         ensure_test_mission(&services);
         let mut request = proposal(Vec::new());
         request.collaboration_intent = Some(ModelCollaborationControlDecisionV2 {

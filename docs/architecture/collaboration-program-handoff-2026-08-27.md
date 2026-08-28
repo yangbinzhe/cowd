@@ -1,5 +1,10 @@
 # Cowd 自主编排与多 Team 协同交接计划（2026-08-27）
 
+> Historical handoff: superseded by
+> `docs/architecture/framework-core-hardening-v0.9.708.md`. The progress and
+> “next step” statements below describe the state on 2026-08-27 and are not a
+> current release-status source.
+
 ## 使用方式
 
 这是给下一个 Session 的连续执行交接，而不是已完成报告。新的执行者应先读

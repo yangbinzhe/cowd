@@ -1095,6 +1095,7 @@ fn packet_required_output_fields(packet: &AgentTaskPacket) -> Vec<String> {
             | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
                 Some(field.as_str().to_string())
             }
+            harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { name } => Some(name),
             harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => Some(
                 harness_contract::team::TeamStructuredOutputField::SourceVerification
                     .as_str()
@@ -2695,12 +2696,17 @@ fn system_prompt(
             .filter_map(|requirement| match &requirement.check {
                 harness_contract::team::TeamAcceptanceCheck::StructuredField { field }
                 | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
-                    Some(field.as_str())
+                    Some(field.as_str().to_string())
+                }
+                harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { name } => {
+                    Some(name.clone())
                 }
                 harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => {
-                    Some("source_verification")
+                    Some("source_verification".to_string())
                 }
-                harness_contract::team::TeamAcceptanceCheck::UpstreamReview => Some("review"),
+                harness_contract::team::TeamAcceptanceCheck::UpstreamReview => {
+                    Some("review".to_string())
+                }
                 harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
                 harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. } => None,
             })
@@ -2813,12 +2819,38 @@ fn derive_receipt_backed_satisfied_criteria(
             &owned_observed_evidence,
         )
     };
-    let output = structured_agent_output(&summary.final_answer);
+    let required_fields = packet_acceptance_contract(packet)
+        .iter()
+        .filter_map(|requirement| match &requirement.check {
+            harness_contract::team::TeamAcceptanceCheck::StructuredField { field }
+            | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
+                Some(field.as_str().to_string())
+            }
+            harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { name } => {
+                Some(name.clone())
+            }
+            harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => {
+                Some("source_verification".to_string())
+            }
+            harness_contract::team::TeamAcceptanceCheck::UpstreamReview => {
+                Some("review".to_string())
+            }
+            harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
+            | harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
+        })
+        .collect::<Vec<_>>();
+    let output = structured_agent_output_for_fields(&summary.final_answer, &required_fields);
     let field_present = |field: harness_contract::team::TeamStructuredOutputField| {
         let value = output
             .as_ref()
             .and_then(|object| object.get(field.as_str()));
         structured_field_materialized(field, value)
+    };
+    let artifact_present = |name: &str| {
+        output
+            .as_ref()
+            .and_then(|object| object.get(name))
+            .is_some_and(materialized_json_value)
     };
     let changes_in_scopes = |scopes: &[String]| {
         !changes.is_empty()
@@ -2842,6 +2874,9 @@ fn derive_receipt_backed_satisfied_criteria(
                 // the same source solely to populate a structured synthesis
                 // field would defeat the upstream-only acceptance contract.
                 (produced_evidence || upstream_evidence) && field_present(*field)
+            }
+            harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { name } => {
+                artifact_present(name)
             }
             harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { scopes } => {
                 produced_evidence
@@ -3320,6 +3355,121 @@ pub(crate) fn structured_agent_output(
     (!object.is_empty()).then_some(object)
 }
 
+/// Parse the fixed Team presentation contract plus any exact, Runtime-declared
+/// artifact names for this role. Custom names remain closed by default: an
+/// arbitrary JSON key or prose label is accepted only when it appears in the
+/// immutable role contract passed by Runtime.
+pub(crate) fn structured_agent_output_for_fields(
+    text: &str,
+    required: &[String],
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut output = structured_agent_output(text).unwrap_or_default();
+    if required.is_empty() {
+        return (!output.is_empty()).then_some(output);
+    }
+
+    let required_name = |candidate: &str| {
+        let normalized = candidate
+            .trim()
+            .trim_end_matches(':')
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '-'], "_");
+        required
+            .iter()
+            .find(|field| field.to_ascii_lowercase() == normalized)
+            .cloned()
+    };
+    let mut merge_required = |object: &serde_json::Map<String, serde_json::Value>| {
+        for required_field in required {
+            if output.contains_key(required_field) {
+                continue;
+            }
+            if let Some((_, value)) = object
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(required_field))
+            {
+                output.insert(required_field.clone(), value.clone());
+            }
+        }
+    };
+
+    // Exact JSON and the four supported provider envelopes may carry a custom
+    // artifact. Do not recursively trust arbitrary nested objects.
+    if let Some(serde_json::Value::Object(object)) = parse_first_contract_json(text) {
+        merge_required(&object);
+        for wrapper in ["output", "data", "response", "answer"] {
+            let Some(value) = object.get(wrapper) else {
+                continue;
+            };
+            match value {
+                serde_json::Value::Object(nested) => merge_required(nested),
+                serde_json::Value::String(encoded) => {
+                    if let Some(serde_json::Value::Object(nested)) =
+                        parse_first_contract_json(encoded)
+                    {
+                        merge_required(&nested);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Providers also commonly use exact Markdown sections. Unlike the fixed
+    // parser, this scanner treats non-contract subheadings as content so a
+    // rich custom report can contain its own hierarchy and tables.
+    let mut custom = serde_json::Map::new();
+    let mut active_field: Option<String> = None;
+    let mut active_lines = Vec::new();
+    let flush = |object: &mut serde_json::Map<String, serde_json::Value>,
+                 field: &mut Option<String>,
+                 lines: &mut Vec<&str>| {
+        if let Some(field) = field.take() {
+            let value = lines.join("\n").trim().to_string();
+            if !value.is_empty() {
+                object.insert(field, serde_json::Value::String(value));
+            }
+        }
+        lines.clear();
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let heading = trimmed
+            .strip_prefix('#')
+            .map(|value| value.trim_start_matches('#').trim())
+            .or_else(|| {
+                trimmed
+                    .strip_prefix("**")
+                    .and_then(|value| value.strip_suffix("**"))
+                    .map(str::trim)
+            });
+        let labeled = heading.map(|label| (label, None)).or_else(|| {
+            trimmed
+                .split_once(':')
+                .map(|(label, value)| (label, Some(value)))
+        });
+        if let Some((label, inline_value)) = labeled {
+            let label = label.trim().trim_start_matches(['-', '*']).trim();
+            if let Some(field) = required_name(label) {
+                flush(&mut custom, &mut active_field, &mut active_lines);
+                active_field = Some(field);
+                if let Some(value) = inline_value.filter(|value| !value.trim().is_empty()) {
+                    active_lines.push(value.trim());
+                }
+                continue;
+            }
+        }
+        if active_field.is_some() {
+            active_lines.push(line);
+        }
+    }
+    flush(&mut custom, &mut active_field, &mut active_lines);
+    merge_required(&custom);
+
+    (!output.is_empty()).then_some(output)
+}
+
 fn normalize_verified_narrative_terminal(
     packet: &AgentTaskPacket,
     tool_executor: &ScopedRuntimeToolExecutor,
@@ -3371,6 +3521,7 @@ fn narrative_field_for_requirement(
         | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
             Some(*field)
         }
+        harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { .. } => None,
         harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => {
             Some(harness_contract::team::TeamStructuredOutputField::SourceVerification)
         }
@@ -5178,6 +5329,45 @@ mod tests {
             .expect("last embedded contract object");
         assert!(output.get("implementation").is_none());
         assert_eq!(output["review"], "verified");
+    }
+
+    #[test]
+    fn declared_custom_artifact_accepts_exact_json_or_markdown_only() {
+        let required = vec![
+            "applications_survey".to_string(),
+            "evidence".to_string(),
+            "summary".to_string(),
+        ];
+        let markdown = concat!(
+            "## applications_survey\n",
+            "Survey body.\n\n",
+            "### Vision / 3D\n",
+            "Nested details remain part of the custom artifact.\n\n",
+            "## evidence\n",
+            "tool://read-1\n\n",
+            "## summary\n",
+            "Survey complete.\n",
+        );
+        let output = structured_agent_output_for_fields(markdown, &required)
+            .expect("declared custom Markdown artifact");
+        assert!(output["applications_survey"]
+            .as_str()
+            .is_some_and(|value| value.contains("### Vision / 3D")));
+        assert_eq!(output["evidence"], "tool://read-1");
+        assert_eq!(output["summary"], "Survey complete.");
+
+        let json = r#"{"applications_survey":{"vision":"verified"},"summary":"done"}"#;
+        let output = structured_agent_output_for_fields(json, &required)
+            .expect("declared custom JSON artifact");
+        assert_eq!(output["applications_survey"]["vision"], "verified");
+        assert_eq!(output["summary"], "done");
+
+        assert!(structured_agent_output_for_fields(
+            "## undeclared_artifact\nself reported",
+            &required,
+        )
+        .is_none());
+        assert!(structured_agent_output(r#"{"applications_survey":"self reported"}"#).is_none());
     }
 
     #[test]

@@ -28,10 +28,13 @@ pub enum RuntimeProjectionLatencyClass {
     Maintenance,
 }
 
-// Maintenance lanes are durable but never latency-critical.  Coalescing their
-// backlog passes for this short interval prevents a busy foreground stream
-// from turning each commit notification into a competing SQLite scan/write.
-const MAINTENANCE_BACKLOG_YIELD: Duration = Duration::from_millis(50);
+// Maintenance lanes are durable but never latency-critical. Coalescing their
+// backlog passes for this interval prevents a busy foreground stream from
+// turning each commit notification into a competing SQLite scan/write. At the
+// maximum 128-commit maintenance batch this still drains at least 640 commits
+// per second while leaving foreground writers three scheduling windows in a
+// typical 500ms burst.
+const MAINTENANCE_PASS_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProjectionDescriptor {
@@ -332,6 +335,16 @@ impl RuntimeEventReactor {
                     if cancellation.is_cancelled() {
                         break;
                     }
+                    // A maintenance lane is throughput-oriented, so debounce
+                    // every pass, including the first commit-triggered pass.
+                    // Sleeping only after a pass lets the first scan race a
+                    // foreground burst before coalescing can take effect.
+                    if lane.descriptor.latency_class == RuntimeProjectionLatencyClass::Maintenance {
+                        tokio::select! {
+                            _ = cancellation.cancelled() => break,
+                            _ = tokio::time::sleep(MAINTENANCE_PASS_INTERVAL) => {}
+                        }
+                    }
                     let permit = tokio::select! {
                         _ = cancellation.cancelled() => break,
                         permit = Arc::clone(&admission).acquire_owned() => match permit {
@@ -374,11 +387,9 @@ impl RuntimeEventReactor {
                                         tokio::task::yield_now().await;
                                     }
                                     RuntimeProjectionLatencyClass::Maintenance => {
-                                        // Maintenance projections share durable stores with
-                                        // foreground execution.  A short but real yield keeps
-                                        // catch-up progressing while giving foreground writers
-                                        // a scheduling window between bounded passes.
-                                        tokio::time::sleep(MAINTENANCE_BACKLOG_YIELD).await;
+                                        // The next loop iteration applies the
+                                        // same coalescing interval before every
+                                        // maintenance pass.
                                     }
                                 }
                                 continue;

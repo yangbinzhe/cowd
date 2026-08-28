@@ -1,5 +1,12 @@
 # v0.9.707 Governed Experience Reuse Evidence
 
+> Historical failed gate: this file truthfully records the failed evidence
+> available when it was written. `v0.9.707` was later tagged after additional
+> scenario work, but this document was never a closed release certificate.
+> `docs/evidence/framework-core-hardening-v0.9.708.md` owns the correction and
+> current release verdict; the historical rows below are intentionally not
+> rewritten as passes.
+
 ## Phase board
 
 | Gate | State | Evidence |

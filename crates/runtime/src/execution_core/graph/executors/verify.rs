@@ -171,8 +171,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                             )
                         })
                         .collect::<BTreeSet<_>>();
-                    let produced_evidence =
-                        produced_team_evidence(result, &packet.evidence_refs, &upstream_evidence);
+                    let produced_evidence = produced_team_evidence(result);
                     let completed_acceptance = result
                         .usage
                         .acceptance_evaluation
@@ -195,29 +194,12 @@ impl NodeExecutor for VerifyNodeExecutor {
                                 })
                         });
                     let typed_acceptance = typed_requirements.is_some();
-                    let requires_new_tool_evidence = typed_requirements
-                        .as_ref()
-                        .is_some_and(|requirements| {
-                            requirements.iter().any(|requirement| {
-                                matches!(
-                                    &requirement.check,
-                                    harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
-                                        ..
-                                    } | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange {
-                                        ..
-                                    } | harness_contract::team::TeamAcceptanceCheck::SourceVerification {
-                                        ..
-                                    } | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
-                                )
-                            })
-                        });
-                    let consumes_upstream =
-                        typed_requirements.as_ref().is_some_and(|requirements| {
-                            requirements.iter().any(|requirement| {
-                                requirement.check
-                                    == harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
-                            })
-                        });
+                    let evidence_policy = typed_requirements
+                        .as_deref()
+                        .map(crate::agent_result_validator::team_evidence_policy)
+                        .unwrap_or_default();
+                    let requires_new_tool_evidence = evidence_policy.requires_new_tool_evidence;
+                    let consumes_upstream = evidence_policy.consumes_upstream;
                     let retained_upstream = consumes_upstream
                         && retained_runtime_attached_upstream_evidence(
                             result,
@@ -460,11 +442,7 @@ fn structured_team_contract_field_materialized(criterion: &str, value: &serde_js
     }
 }
 
-fn produced_team_evidence(
-    result: &ExecutionNodeResult,
-    input_evidence: &[EvidenceAccessRef],
-    upstream_evidence: &BTreeSet<(String, String)>,
-) -> bool {
+fn produced_team_evidence(result: &ExecutionNodeResult) -> bool {
     // Content-addressed verification reads can legitimately retain the same
     // EvidenceRef as their upstream input. The Agent executor carries the
     // Runtime-derived tool/scoped usage into the committed node result, so a
@@ -476,17 +454,11 @@ fn produced_team_evidence(
             .observed_acceptance
             .observed_evidence
             .is_empty();
-    result.evidence_refs.iter().any(|reference| {
-        crate::agent_result_validator::is_materialized_durable_evidence(reference)
-            && (fresh_runtime_tool_observed
-                || (!input_evidence
-                    .iter()
-                    .any(|input| input.evidence_ref == reference.evidence_ref)
-                    && !upstream_evidence.contains(&(
-                        reference.evidence_ref.ref_type.clone(),
-                        reference.evidence_ref.id.clone(),
-                    ))))
-    })
+    fresh_runtime_tool_observed
+        && result
+            .evidence_refs
+            .iter()
+            .any(crate::agent_result_validator::is_materialized_durable_evidence)
 }
 
 /// A cross-Team handoff is attached to a child Team's immutable Agent packet
@@ -748,10 +720,6 @@ mod tests {
     #[test]
     fn team_verification_accepts_fresh_scoped_read_with_same_evidence_ref() {
         let shared = evidence("same-content");
-        let upstream = BTreeSet::from([(
-            shared.evidence_ref.ref_type.clone(),
-            shared.evidence_ref.id.clone(),
-        )]);
         let mut result = ExecutionNodeResult {
             status: ExecutionNodeStatus::Completed,
             result_ref: Some("agent-return:reviewer".to_string()),
@@ -781,18 +749,52 @@ mod tests {
             finished_at_ms: 1,
         };
 
-        assert!(produced_team_evidence(
-            &result,
-            std::slice::from_ref(&shared),
-            &upstream,
-        ));
+        assert!(produced_team_evidence(&result));
 
         result.usage.observed_acceptance.observed_evidence.clear();
-        assert!(!produced_team_evidence(
-            &result,
-            std::slice::from_ref(&shared),
-            &upstream,
-        ));
+        assert!(!produced_team_evidence(&result));
+    }
+
+    #[test]
+    fn team_verification_uses_agent_custom_artifact_evidence_policy() {
+        let requirements = vec![harness_contract::team::TeamAcceptanceRequirement {
+            criterion: "artifact:source_reads".to_string(),
+            check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                name: "source_reads".to_string(),
+            },
+        }];
+        let policy = crate::agent_result_validator::team_evidence_policy(&requirements);
+        assert!(policy.requires_new_tool_evidence);
+        assert!(!policy.consumes_upstream);
+
+        let mut result = ExecutionNodeResult {
+            status: ExecutionNodeStatus::Completed,
+            result_ref: Some("agent-return:researcher".to_string()),
+            summary: Some("source-backed artifact".to_string()),
+            evidence_refs: vec![evidence("new-audit-artifact")],
+            failure: None,
+            usage: ExecutionUsage {
+                tool_calls: 1,
+                ..ExecutionUsage::default()
+            },
+            finished_at_ms: 1,
+        };
+        assert!(!produced_team_evidence(&result));
+
+        result.usage.observed_acceptance.observed_evidence.push(
+            harness_contract::context::ObservedEvidence {
+                obligation_id: "successful-read".to_string(),
+                target: harness_contract::context::EvidenceTargetIdentity::Network {
+                    endpoint: "fixture".to_string(),
+                },
+                observed_at_sequence: 1,
+                tool_name: "read_file".to_string(),
+                provenance: harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
+                evidence_ref: None,
+                workspace_prior_state: None,
+            },
+        );
+        assert!(produced_team_evidence(&result));
     }
 
     #[test]

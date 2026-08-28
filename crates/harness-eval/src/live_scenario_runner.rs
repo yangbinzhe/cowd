@@ -118,6 +118,234 @@ struct LiveScenarioRunner {
     model: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum LiveHealthContract {
+    Gateway,
+    Runtime,
+    RuntimeOutbox,
+    RuntimeControlPlane,
+    EvolutionProjectors,
+    SurfaceHost,
+}
+
+fn health_check(name: &str, passed: bool, expected: Value, actual: Value) -> Value {
+    json!({
+        "name": name,
+        "passed": passed,
+        "expected": expected,
+        "actual": actual,
+    })
+}
+
+fn semantic_health_observation(path: &str, contract: LiveHealthContract, response: Value) -> Value {
+    let checks = match contract {
+        LiveHealthContract::Gateway => vec![health_check(
+            "gateway.status",
+            response.get("status").and_then(Value::as_str) == Some("healthy"),
+            json!("healthy"),
+            response.get("status").cloned().unwrap_or(Value::Null),
+        )],
+        LiveHealthContract::Runtime => vec![
+            health_check(
+                "runtime.ok",
+                response.get("ok").and_then(Value::as_bool) == Some(true),
+                json!(true),
+                response.get("ok").cloned().unwrap_or(Value::Null),
+            ),
+            health_check(
+                "runtime.execution.lifecycle",
+                response
+                    .pointer("/execution/lifecycle")
+                    .and_then(Value::as_str)
+                    == Some("open"),
+                json!("open"),
+                response
+                    .pointer("/execution/lifecycle")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "runtime.execution.last_error",
+                response
+                    .pointer("/execution/last_error")
+                    .is_some_and(Value::is_null),
+                Value::Null,
+                response
+                    .pointer("/execution/last_error")
+                    .cloned()
+                    .unwrap_or_else(|| json!("missing")),
+            ),
+        ],
+        LiveHealthContract::RuntimeOutbox => vec![health_check(
+            "runtime_outbox.healthy",
+            response.get("healthy").and_then(Value::as_bool) == Some(true),
+            json!(true),
+            response.get("healthy").cloned().unwrap_or(Value::Null),
+        )],
+        LiveHealthContract::RuntimeControlPlane => vec![
+            health_check(
+                "runtime_control_plane.production_ready",
+                response
+                    .pointer("/readiness/production_ready")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+                json!(true),
+                response
+                    .pointer("/readiness/production_ready")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "runtime_control_plane.required_blocked",
+                response
+                    .pointer("/readiness/required_blocked")
+                    .and_then(Value::as_u64)
+                    == Some(0),
+                json!(0),
+                response
+                    .pointer("/readiness/required_blocked")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        ],
+        LiveHealthContract::EvolutionProjectors => vec![
+            health_check(
+                "evolution_projector.worker_running",
+                response
+                    .pointer("/projector/worker_running")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+                json!(true),
+                response
+                    .pointer("/projector/worker_running")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "evolution_projector.consecutive_failures",
+                response
+                    .pointer("/projector/consecutive_failures")
+                    .and_then(Value::as_u64)
+                    == Some(0),
+                json!(0),
+                response
+                    .pointer("/projector/consecutive_failures")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "evolution_projector.dead_letter_count",
+                response
+                    .pointer("/projector/dead_letter_count")
+                    .and_then(Value::as_u64)
+                    == Some(0),
+                json!(0),
+                response
+                    .pointer("/projector/dead_letter_count")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "outcome_projector.worker_running",
+                response
+                    .pointer("/outcome_projector/worker_running")
+                    .and_then(Value::as_bool)
+                    == Some(true),
+                json!(true),
+                response
+                    .pointer("/outcome_projector/worker_running")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "outcome_projector.consecutive_failures",
+                response
+                    .pointer("/outcome_projector/consecutive_failures")
+                    .and_then(Value::as_u64)
+                    == Some(0),
+                json!(0),
+                response
+                    .pointer("/outcome_projector/consecutive_failures")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "outcome_projector.dlq_count",
+                response
+                    .pointer("/outcome_projector/dlq_count")
+                    .and_then(Value::as_u64)
+                    == Some(0),
+                json!(0),
+                response
+                    .pointer("/outcome_projector/dlq_count")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        ],
+        LiveHealthContract::SurfaceHost => vec![
+            health_check(
+                "surface_host.status",
+                response.get("status").and_then(Value::as_str) == Some("ready"),
+                json!("ready"),
+                response.get("status").cloned().unwrap_or(Value::Null),
+            ),
+            health_check(
+                "surface_host.failed_count",
+                response
+                    .pointer("/host/failed_count")
+                    .and_then(Value::as_u64)
+                    == Some(0),
+                json!(0),
+                response
+                    .pointer("/host/failed_count")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "surface_host.circuit_open_count",
+                response
+                    .pointer("/host/circuit_open_count")
+                    .and_then(Value::as_u64)
+                    == Some(0),
+                json!(0),
+                response
+                    .pointer("/host/circuit_open_count")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+            health_check(
+                "surface_host.task_ownership.overloaded",
+                response
+                    .pointer("/host/task_ownership/overloaded")
+                    .and_then(Value::as_bool)
+                    == Some(false),
+                json!(false),
+                response
+                    .pointer("/host/task_ownership/overloaded")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            ),
+        ],
+    };
+    let failed_checks = checks
+        .iter()
+        .filter(|check| check.get("passed").and_then(Value::as_bool) != Some(true))
+        .cloned()
+        .collect::<Vec<_>>();
+    json!({
+        "status": if failed_checks.is_empty() { "passed" } else { "failed" },
+        "path": path,
+        "reason": if failed_checks.is_empty() {
+            Value::Null
+        } else {
+            json!("HTTP transport succeeded but the endpoint semantic health contract failed")
+        },
+        "semantic_checks": checks,
+        "failed_checks": failed_checks,
+        "response": response,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RootExecutionTerminal {
     Pending,
@@ -218,24 +446,40 @@ fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
 impl LiveScenarioRunner {
     fn run(&self) -> Value {
         let health_observations = [
-            ("gateway", "/healthz"),
-            ("runtime", "/api/runtime/status"),
-            ("runtime_outbox", "/api/runtime/outbox"),
-            ("runtime_control_plane", "/api/runtime/control-plane"),
-            ("evolution_projector", "/api/evolution/signals"),
-            ("surface_host", "/api/surfaces/health"),
+            ("gateway", "/healthz", LiveHealthContract::Gateway),
+            (
+                "runtime",
+                "/api/runtime/status",
+                LiveHealthContract::Runtime,
+            ),
+            (
+                "runtime_outbox",
+                "/api/runtime/outbox",
+                LiveHealthContract::RuntimeOutbox,
+            ),
+            (
+                "runtime_control_plane",
+                "/api/runtime/control-plane",
+                LiveHealthContract::RuntimeControlPlane,
+            ),
+            (
+                "evolution_projector",
+                "/api/evolution/signals",
+                LiveHealthContract::EvolutionProjectors,
+            ),
+            (
+                "surface_host",
+                "/api/surfaces/health",
+                LiveHealthContract::SurfaceHost,
+            ),
         ]
         .into_iter()
-        .map(|(id, path)| {
+        .map(|(id, path, contract)| {
             let observed = self.get_json(path);
             (
                 id.to_string(),
                 match observed {
-                    Ok(response) => json!({
-                        "status": "passed",
-                        "path": path,
-                        "response": response,
-                    }),
+                    Ok(response) => semantic_health_observation(path, contract, response),
                     Err(error) => json!({
                         "status": "failed",
                         "path": path,
@@ -2064,6 +2308,80 @@ fn env_duration_millis(key: &str, default: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_health_contracts_accept_only_semantically_ready_payloads() {
+        let fixtures = [
+            (LiveHealthContract::Gateway, json!({"status": "healthy"})),
+            (
+                LiveHealthContract::Runtime,
+                json!({"ok": true, "execution": {"lifecycle": "open", "last_error": null}}),
+            ),
+            (LiveHealthContract::RuntimeOutbox, json!({"healthy": true})),
+            (
+                LiveHealthContract::RuntimeControlPlane,
+                json!({"readiness": {"production_ready": true, "required_blocked": 0}}),
+            ),
+            (
+                LiveHealthContract::EvolutionProjectors,
+                json!({
+                    "projector": {"worker_running": true, "consecutive_failures": 0, "dead_letter_count": 0},
+                    "outcome_projector": {"worker_running": true, "consecutive_failures": 0, "dlq_count": 0}
+                }),
+            ),
+            (
+                LiveHealthContract::SurfaceHost,
+                json!({
+                    "status": "ready",
+                    "host": {
+                        "failed_count": 0,
+                        "circuit_open_count": 0,
+                        "task_ownership": {"overloaded": false}
+                    }
+                }),
+            ),
+        ];
+        for (contract, payload) in fixtures {
+            let observation = semantic_health_observation("/probe", contract, payload);
+            assert_eq!(observation["status"], "passed", "{observation}");
+            assert_eq!(observation["failed_checks"], json!([]));
+        }
+    }
+
+    #[test]
+    fn http_success_with_non_ready_control_plane_fails_closed() {
+        let observation = semantic_health_observation(
+            "/api/runtime/control-plane",
+            LiveHealthContract::RuntimeControlPlane,
+            json!({
+                "status": "attention",
+                "readiness": {"production_ready": false, "required_blocked": 1}
+            }),
+        );
+
+        assert_eq!(observation["status"], "failed");
+        assert_eq!(observation["failed_checks"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            observation["reason"],
+            "HTTP transport succeeded but the endpoint semantic health contract failed"
+        );
+    }
+
+    #[test]
+    fn missing_health_fields_never_default_to_success() {
+        for contract in [
+            LiveHealthContract::Gateway,
+            LiveHealthContract::Runtime,
+            LiveHealthContract::RuntimeOutbox,
+            LiveHealthContract::RuntimeControlPlane,
+            LiveHealthContract::EvolutionProjectors,
+            LiveHealthContract::SurfaceHost,
+        ] {
+            let observation = semantic_health_observation("/probe", contract, json!({}));
+            assert_eq!(observation["status"], "failed", "{observation}");
+            assert!(!observation["failed_checks"].as_array().unwrap().is_empty());
+        }
+    }
 
     #[test]
     fn root_terminal_requires_completed_synthesis_not_child_progress() {

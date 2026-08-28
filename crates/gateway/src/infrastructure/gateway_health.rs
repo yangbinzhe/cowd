@@ -71,10 +71,11 @@ pub(crate) struct GatewayReadinessSnapshot {
 }
 
 pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSnapshot {
-    let (server_status, server_status_error) = match crate::server::get_server_status() {
-        Ok(status) => (status, None),
-        Err(error) => (None, Some(error.to_string())),
-    };
+    let (server_status, server_status_error) =
+        match crate::server::get_server_status_for_config_home(&state.config_home) {
+            Ok(status) => (status, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
     let static_webui = state.static_webui.clone();
     let runtime = GatewayRuntimeSnapshot {
         service_layer: state.services.has_minimum_service_contract(),
@@ -197,8 +198,12 @@ pub(crate) async fn gateway_health_snapshot(state: &AppState) -> GatewayHealthSn
             pid: server_status.as_ref().map(|info| info.pid),
             address: server_status.as_ref().map(|info| info.address.clone()),
             discovery_warning: process_discovery_warning,
-            pid_file: crate::server::pid_file().display().to_string(),
-            addr_file: crate::server::addr_file().display().to_string(),
+            pid_file: crate::server::pid_file_for_config_home(&state.config_home)
+                .display()
+                .to_string(),
+            addr_file: crate::server::addr_file_for_config_home(&state.config_home)
+                .display()
+                .to_string(),
         },
         static_webui,
         runtime,

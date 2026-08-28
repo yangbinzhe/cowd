@@ -24,6 +24,10 @@ pub struct ModelWorkEstimateInput {
     pub maximum_token_amplification_basis_points: u32,
     pub minimum_speedup_basis_points: u32,
     pub requires_cross_check: bool,
+    /// The user explicitly required this parallel/Team topology. Observed cost
+    /// may surface a warning, but only hard capacity may reject it. Automatic
+    /// topology selection remains governed by the optimization thresholds.
+    pub user_mandated_topology: bool,
 }
 
 impl Default for ModelWorkEstimateInput {
@@ -41,6 +45,7 @@ impl Default for ModelWorkEstimateInput {
             maximum_token_amplification_basis_points: 30_000,
             minimum_speedup_basis_points: 11_000,
             requires_cross_check: false,
+            user_mandated_topology: false,
         }
     }
 }
@@ -168,7 +173,7 @@ impl ModelWorkGraphEstimator {
             reasons.push("token_amplification_above_threshold".to_string());
         }
         let hard_rejected = projection.width > 1 && usable_width <= 1;
-        let observed_rejected = automatic
+        let optimization_rejected = automatic
             && reasons.iter().any(|reason| {
                 matches!(
                     reason.as_str(),
@@ -178,6 +183,10 @@ impl ModelWorkGraphEstimator {
                         | "token_amplification_above_threshold"
                 )
             });
+        if input.user_mandated_topology && optimization_rejected {
+            reasons.push("user_mandated_topology_retained_with_cost_warning".to_string());
+        }
+        let observed_rejected = !input.user_mandated_topology && optimization_rejected;
         let topology = if hard_rejected || observed_rejected {
             ModelWorkTopology::Downgraded
         } else if projection.width <= 1 {
