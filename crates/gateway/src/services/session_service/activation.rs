@@ -1506,8 +1506,8 @@ fn manifest_from_record(record: &SessionRecord) -> SessionRecoveryManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::active_session::ActiveSessionDirectory;
     use crate::event_bus::SessionProjectionHub;
-    use crate::gateway::HotSessionPool;
     use crate::services::session_service::presence::SessionPresenceLedger;
     use crate::services::session_service::repository::SessionRepository;
     use model_protocol::provider_config::{ProviderConfig, ProvidersConfig};
@@ -1540,7 +1540,7 @@ mod tests {
     ) -> (
         Arc<SessionActivationCoordinator>,
         Arc<session::UnifiedSessionStore>,
-        Arc<HotSessionPool>,
+        Arc<ActiveSessionDirectory>,
         Arc<SessionWorkingSetManager>,
     ) {
         test_manager_with_limits(max_active_sessions, max_active_sessions)
@@ -1552,11 +1552,11 @@ mod tests {
     ) -> (
         Arc<SessionActivationCoordinator>,
         Arc<session::UnifiedSessionStore>,
-        Arc<HotSessionPool>,
+        Arc<ActiveSessionDirectory>,
         Arc<SessionWorkingSetManager>,
     ) {
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
-        let active = Arc::new(HotSessionPool::with_max_sessions(
+        let active = Arc::new(ActiveSessionDirectory::with_max_sessions(
             runtime_max_active_sessions,
         ));
         let event_bus = SessionProjectionHub::new();

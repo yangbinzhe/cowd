@@ -14,8 +14,8 @@ use session::{
 };
 use tokio::sync::{Mutex, Notify};
 
+use crate::active_session::ActiveSessionDirectory;
 use crate::event_bus::SessionProjectionHub;
-use crate::gateway::HotSessionPool;
 use crate::runtime_entry::GatewayRuntimeEntry;
 
 type RuntimeEntry = Arc<Mutex<GatewayRuntimeEntry>>;
@@ -23,11 +23,11 @@ type RuntimeEntry = Arc<Mutex<GatewayRuntimeEntry>>;
 /// Unified session capability boundary for hot runtimes, durable session data,
 /// and frontend event fan-out.
 ///
-/// `UnifiedSessionStore` remains the durable source of truth. `HotSessionPool`
+/// `UnifiedSessionStore` remains the durable source of truth. `ActiveSessionDirectory`
 /// is the hot runtime cache, and `SessionProjectionHub` is the cross-frontend event
 /// transport.
 pub(crate) struct SessionRepository {
-    active_sessions: Arc<HotSessionPool>,
+    active_sessions: Arc<ActiveSessionDirectory>,
     unified_store: Option<Arc<UnifiedSessionStore>>,
     event_bus: Arc<SessionProjectionHub>,
     lifecycle_work_wake: Arc<Notify>,
@@ -37,7 +37,7 @@ pub(crate) struct SessionRepository {
 impl SessionRepository {
     #[must_use]
     pub(crate) fn new(
-        active_sessions: Arc<HotSessionPool>,
+        active_sessions: Arc<ActiveSessionDirectory>,
         unified_store: Option<Arc<UnifiedSessionStore>>,
         event_bus: Arc<SessionProjectionHub>,
     ) -> Self {
@@ -61,7 +61,7 @@ impl SessionRepository {
     }
 
     #[must_use]
-    pub(super) fn active_sessions(&self) -> Arc<HotSessionPool> {
+    pub(super) fn active_sessions(&self) -> Arc<ActiveSessionDirectory> {
         self.active_sessions.clone()
     }
 
@@ -110,6 +110,7 @@ impl SessionRepository {
         self.active_sessions.get(session_id)
     }
 
+    #[cfg(test)]
     pub(super) fn register_runtime(
         &self,
         session_id: String,
@@ -118,6 +119,7 @@ impl SessionRepository {
         self.active_sessions.register(session_id, runtime)
     }
 
+    #[cfg(test)]
     pub(super) fn remove_active_runtime(&self, session_id: &str) -> Option<RuntimeEntry> {
         self.active_sessions.remove(session_id)
     }
@@ -1046,12 +1048,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::SessionRepository;
+    use crate::active_session::ActiveSessionDirectory;
     use crate::event_bus::SessionProjectionHub;
-    use crate::gateway::HotSessionPool;
     use harness_contract::turn::{TurnId, TurnJournalEnvelope, TurnJournalPhase};
     #[test]
     fn kernel_shares_session_runtime_store_and_event_bus_handles() {
-        let active_sessions = Arc::new(HotSessionPool::new());
+        let active_sessions = Arc::new(ActiveSessionDirectory::new());
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let event_bus = SessionProjectionHub::new();
 
@@ -1072,7 +1074,7 @@ mod tests {
     #[test]
     fn kernel_exposes_active_runtime_registry_queries() {
         let kernel = SessionRepository::new(
-            Arc::new(HotSessionPool::new()),
+            Arc::new(ActiveSessionDirectory::new()),
             None,
             SessionProjectionHub::new(),
         );
@@ -1086,7 +1088,7 @@ mod tests {
     async fn kernel_queries_stored_session_records() {
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let kernel = SessionRepository::new(
-            Arc::new(HotSessionPool::new()),
+            Arc::new(ActiveSessionDirectory::new()),
             Some(store.clone()),
             SessionProjectionHub::new(),
         );
@@ -1118,7 +1120,7 @@ mod tests {
     async fn turn_journal_never_creates_a_missing_session() {
         let store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
         let kernel = SessionRepository::new(
-            Arc::new(HotSessionPool::new()),
+            Arc::new(ActiveSessionDirectory::new()),
             Some(store.clone()),
             SessionProjectionHub::new(),
         );

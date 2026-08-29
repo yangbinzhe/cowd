@@ -1,5 +1,5 @@
 {
   "id": "active-session",
-  "command": "cargo test -p gateway gateway::tests -- --test-threads=1",
+  "command": "cargo test -p gateway active_session::tests::directory_contract_performance_smoke -- --exact --test-threads=1",
   "env": { "CARGO_INCREMENTAL": "0" }
 }

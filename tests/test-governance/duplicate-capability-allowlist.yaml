@@ -1,25 +1,5 @@
 schema_version: 1
 candidates:
-  - id: gateway.active_session.parallel_carriers
-    phase: P3
-    classification: active_carrier
-    owner: gateway
-    sources:
-      - path: crates/gateway/src/runtime/runtime_service.rs
-        symbol: session_inputs
-        digest: 440eb492d35e181b326851a666bb1e133163526205736c28c7827a2c2002fb5e
-      - path: crates/gateway/src/runtime/runtime_service.rs
-        symbol: session_event_buses
-        digest: 440eb492d35e181b326851a666bb1e133163526205736c28c7827a2c2002fb5e
-      - path: crates/gateway/src/runtime/runtime_service.rs
-        symbol: session_models
-        digest: 440eb492d35e181b326851a666bb1e133163526205736c28c7827a2c2002fb5e
-      - path: crates/gateway/src/runtime/runtime_service.rs
-        symbol: session_execution_policies
-        digest: 440eb492d35e181b326851a666bb1e133163526205736c28c7827a2c2002fb5e
-      - path: crates/gateway/src/runtime/runtime_service.rs
-        symbol: session_policy_update_locks
-        digest: 440eb492d35e181b326851a666bb1e133163526205736c28c7827a2c2002fb5e
   - id: persistence.session.backend_semantics
     phase: P5
     classification: adapter_with_duplicated_semantics

@@ -4085,7 +4085,7 @@ mod tests {
         let event_bus = crate::event_bus::SessionProjectionHub::new();
         let repository = Arc::new(
             crate::services::session_service::repository::SessionRepository::new(
-                Arc::new(crate::gateway::HotSessionPool::new()),
+                Arc::new(crate::active_session::ActiveSessionDirectory::new()),
                 Some(Arc::clone(&store)),
                 event_bus,
             ),

@@ -94,6 +94,13 @@ fn collect_repository(
             continue;
         }
         let absolute = root.join(&relative);
+        // `git ls-files` intentionally retains index entries for worktree
+        // deletions. A phase which removes an oversized legacy source must be
+        // auditable before commit, so deleted paths are not read as live
+        // candidates.
+        if !absolute.is_file() {
+            continue;
+        }
         let source = fs::read_to_string(&absolute)
             .map_err(|error| format!("read {}: {error}", absolute.display()))?;
         let lines = source.lines().count();

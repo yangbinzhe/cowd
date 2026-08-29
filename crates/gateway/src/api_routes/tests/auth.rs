@@ -236,7 +236,7 @@ use super::*;
     }
 
     fn test_session_repository(
-        sessions: Arc<HotSessionPool>,
+        sessions: Arc<ActiveSessionDirectory>,
         store: Option<Arc<UnifiedSessionStore>>,
         event_bus: Arc<SessionProjectionHub>,
     ) -> Arc<SessionRepository> {
@@ -346,7 +346,7 @@ use super::*;
         tool_workspace_root: PathBuf,
         config_home: PathBuf,
     ) -> Arc<crate::services::GatewayServices> {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let runtime_services =
             runtime::RuntimeServices::in_memory().expect("test runtime services");
         let runtime_store = session_repository.test_unified_store().unwrap_or_else(|| {
@@ -419,7 +419,7 @@ use super::*;
     }
 
     pub(crate) fn test_state() -> Arc<AppState> {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new(); // returns Arc<Self>
         let session_store = Arc::new(
@@ -477,7 +477,7 @@ use super::*;
         surface_host: Option<Arc<crate::surface_host::SurfaceHost>>,
         workspace_root: PathBuf,
     ) -> Arc<AppState> {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
@@ -515,7 +515,7 @@ use super::*;
     }
 
     fn test_state_with_store(store: Arc<UnifiedSessionStore>) -> Arc<AppState> {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository =
@@ -540,7 +540,7 @@ use super::*;
         workspace_root: PathBuf,
         config_home: PathBuf,
     ) -> Arc<AppState> {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository =
@@ -628,7 +628,7 @@ use super::*;
     }
 
     fn test_state_with_workspace(workspace_root: PathBuf, config_home: PathBuf) -> Arc<AppState> {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let store = Arc::new(

@@ -2047,7 +2047,7 @@
 
     #[tokio::test]
     async fn auth_required_when_token_set() {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
@@ -2080,7 +2080,7 @@
 
     #[tokio::test]
     async fn system_routes_stay_protected_when_auth_token_set() {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
@@ -2113,7 +2113,7 @@
 
     #[tokio::test]
     async fn same_origin_headers_do_not_bypass_bearer_authentication() {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
@@ -2148,7 +2148,7 @@
 
     #[tokio::test]
     async fn cross_site_requests_still_require_bearer_auth() {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
@@ -2183,7 +2183,7 @@
 
     #[tokio::test]
     async fn profile_and_workspace_routes_stay_protected_when_auth_token_set() {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());
@@ -2225,7 +2225,7 @@
 
     #[tokio::test]
     async fn auth_passes_with_valid_token() {
-        let sessions = Arc::new(HotSessionPool::new());
+        let sessions = Arc::new(ActiveSessionDirectory::new());
         let tools = Arc::new(ToolCatalog::builtin());
         let event_bus = SessionProjectionHub::new();
         let session_repository = test_session_repository(sessions.clone(), None, event_bus.clone());

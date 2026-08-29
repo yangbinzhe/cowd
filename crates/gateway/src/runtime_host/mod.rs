@@ -2,7 +2,7 @@
 // Gateway foreground mode is a gateway process with an internal runtime host providing:
 //   - HTTP API (0.0.0.0:8642) + SSE streaming
 //   - Surface registry (builtin TUI/WebUI plus external JSONL sidecars)
-// Shared state: HotSessionPool, CognitiveContextManager, ToolCatalog, SessionProjectionHub
+// Shared state: ActiveSessionDirectory, CognitiveContextManager, ToolCatalog, SessionProjectionHub
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -26,7 +26,6 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::api_routes;
 use crate::event_bus::SessionProjectionHub;
-use crate::gateway::HotSessionPool;
 use crate::runtime_service::RuntimeService;
 use crate::services::session_service::presence::SessionPresenceLedger;
 use crate::services::session_service::repository::SessionRepository;
@@ -1478,8 +1477,8 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
     let started_at = Instant::now();
     // 0. Write PID file (removed on drop via guard)
     let _pid_guard = PidFileGuard::new()?;
-    let gateway_tasks =
-        crate::runtime_host::task_set::GatewayRuntimeTaskSet::new(Duration::from_secs(5));
+    let composition = crate::composition_root::GatewayCompositionRoot::new(Duration::from_secs(5));
+    let gateway_tasks = composition.gateway_tasks();
     let shutdown_coordinator = GatewayRuntimeShutdownCoordinator::new(Arc::clone(&gateway_tasks));
     let mut startup_registry =
         GatewayRuntimeStartupRegistry::new(Arc::clone(&shutdown_coordinator));
@@ -1539,7 +1538,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         health = %selected_storage.health_projection(),
         "selected storage topology is ready"
     );
-    let sessions = Arc::new(HotSessionPool::default());
+    let sessions = composition.active_sessions();
     let unified_store = Some(Arc::clone(&selected_storage.session_store));
     let cognitive: Option<Arc<CognitiveContextManager>> = match &config.memory_config {
         Some(mem_cfg) => {

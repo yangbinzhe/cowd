@@ -267,7 +267,7 @@ impl GatewayServices {
             baseline_runtime.resource_manager(),
         ));
         let task = TaskService::new();
-        let sessions = Arc::new(crate::gateway::HotSessionPool::default());
+        let sessions = Arc::new(crate::active_session::ActiveSessionDirectory::default());
         let session_repository = Arc::new(SessionRepository::new(
             Arc::clone(&sessions),
             None,

@@ -3281,7 +3281,7 @@ fn session_title(record: &SessionRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::HotSessionPool;
+    use crate::active_session::ActiveSessionDirectory;
     use crate::services::session_service::presence::SessionPresenceLedger;
 
     fn focus_record(metadata: serde_json::Value) -> SessionRecord {
@@ -3383,7 +3383,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_service_owns_attach_detach_lifecycle_projection() {
-        let sessions = Arc::new(HotSessionPool::default());
+        let sessions = Arc::new(ActiveSessionDirectory::default());
         let service = SessionService::for_tests(
             Arc::new(SessionRepository::new(
                 sessions,

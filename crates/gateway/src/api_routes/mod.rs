@@ -26,9 +26,9 @@ use serde::Serialize;
 use runtime::ProfileManager;
 use tools::ToolCatalog;
 
-use crate::event_bus::SessionProjectionHub;
 #[cfg(test)]
-use crate::gateway::HotSessionPool;
+use crate::active_session::ActiveSessionDirectory;
+use crate::event_bus::SessionProjectionHub;
 #[cfg(test)]
 use crate::services::session_service::repository::SessionRepository;
 use crate::services::GatewayServices;
@@ -891,8 +891,8 @@ pub mod test_support {
 
     use super::{api_router, live_routes, AppState};
     use crate::{
+        active_session::ActiveSessionDirectory,
         event_bus::SessionProjectionHub,
-        gateway::HotSessionPool,
         runtime_service::RuntimeService,
         services::session_service::{
             activation::SessionActivationCoordinator, presence::SessionPresenceLedger,
@@ -1022,7 +1022,7 @@ pub mod test_support {
                     &workspace_root,
                 )?,
             );
-            let sessions = Arc::new(HotSessionPool::new());
+            let sessions = Arc::new(ActiveSessionDirectory::new());
             let event_bus = SessionProjectionHub::new();
             let session_store = Arc::clone(&selected_storage.session_store);
             let session_repository = Arc::new(SessionRepository::new(

@@ -1576,7 +1576,7 @@ mod tests {
             Arc::new(session::UnifiedSessionStore::open_in_memory().expect("Session store"));
         let repository = Arc::new(
             crate::services::session_service::repository::SessionRepository::new(
-                Arc::new(crate::gateway::HotSessionPool::new()),
+                Arc::new(crate::active_session::ActiveSessionDirectory::new()),
                 Some(store),
                 crate::event_bus::SessionProjectionHub::new(),
             ),

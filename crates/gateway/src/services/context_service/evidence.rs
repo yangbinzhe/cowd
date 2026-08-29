@@ -545,7 +545,7 @@ mod tests {
         validated_artifact_selector, ContextService,
     };
     use crate::{
-        event_bus::SessionProjectionHub, gateway::HotSessionPool,
+        active_session::ActiveSessionDirectory, event_bus::SessionProjectionHub,
         services::session_service::repository::SessionRepository, services::SessionService,
     };
 
@@ -691,7 +691,7 @@ mod tests {
 
         let restarted_session = SessionService::for_tests(
             Arc::new(SessionRepository::new(
-                Arc::new(HotSessionPool::new()),
+                Arc::new(ActiveSessionDirectory::new()),
                 Some(store),
                 SessionProjectionHub::new(),
             )),
