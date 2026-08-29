@@ -16,40 +16,43 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
-            "/api/harness-eval/reports",
+            surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS.template(),
             get(harness_eval_reports_handler),
         )
         .route(
-            "/api/harness-eval/reports/latest",
+            surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS_LATEST.template(),
             get(harness_eval_latest_report_handler),
         )
         .route(
-            "/api/harness-eval/reports/:id",
+            surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS_BY_ID.template(),
             get(harness_eval_report_detail_handler),
         )
         .route(
-            "/api/harness-eval/reports/:id/artifacts",
+            surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS_BY_ID_ARTIFACTS.template(),
             get(harness_eval_report_artifacts_handler),
         )
         .route(
-            "/api/harness-eval/reports/:id/gate",
+            surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS_BY_ID_GATE.template(),
             get(harness_eval_report_gate_handler),
         )
         .route(
-            "/api/harness-eval/scenarios",
+            surface::gateway_api::paths::API_HARNESS_EVAL_SCENARIOS.template(),
             get(harness_eval_scenarios_handler),
         )
-        .route("/api/harness-eval/runs", get(harness_eval_runs_handler))
         .route(
-            "/api/harness-eval/runs",
+            surface::gateway_api::paths::API_HARNESS_EVAL_RUNS.template(),
+            get(harness_eval_runs_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_HARNESS_EVAL_RUNS.template(),
             post(harness_eval_start_run_handler),
         )
         .route(
-            "/api/harness-eval/runs/:id",
+            surface::gateway_api::paths::API_HARNESS_EVAL_RUNS_BY_ID.template(),
             get(harness_eval_run_detail_handler),
         )
         .route(
-            "/api/harness-eval/runs/:id/cancel",
+            surface::gateway_api::paths::API_HARNESS_EVAL_RUNS_BY_ID_CANCEL.template(),
             post(harness_eval_cancel_run_handler),
         )
 }

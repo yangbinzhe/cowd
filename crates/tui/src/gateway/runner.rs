@@ -3056,7 +3056,13 @@ fn dispatch_pending_app_transport_effects(
 }
 
 fn app_view_endpoint(app_id: &str, view_id: &str, operation: &str) -> String {
-    format!("/api/apps/{app_id}/tui/views/{view_id}/{operation}")
+    let path = match operation {
+        "actions" => surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_ACTIONS,
+        "open" => surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_OPEN,
+        "stream" => surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_STREAM,
+        unsupported => panic!("unsupported APP view operation `{unsupported}`"),
+    };
+    crate::gateway_client_routes::render_route(path, &[app_id.to_owned(), view_id.to_owned()])
 }
 
 async fn app_json_request_with_transient_retry(

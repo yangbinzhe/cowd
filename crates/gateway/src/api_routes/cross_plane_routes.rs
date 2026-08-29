@@ -24,50 +24,56 @@ use crate::services::{CrossPlaneExecutionRecord, GatewayCrossPlaneExecutor};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/cross-plane/summary", get(cross_plane_summary_handler))
         .route(
-            "/api/cross-plane/identities",
+            surface::gateway_api::paths::API_CROSS_PLANE_SUMMARY.template(),
+            get(cross_plane_summary_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CROSS_PLANE_IDENTITIES.template(),
             get(cross_plane_identities_handler).post(cross_plane_create_identity_handler),
         )
         .route(
-            "/api/cross-plane/identities/:id",
+            surface::gateway_api::paths::API_CROSS_PLANE_IDENTITIES_BY_ID.template(),
             delete(cross_plane_revoke_identity_handler),
         )
         .route(
-            "/api/cross-plane/grants",
+            surface::gateway_api::paths::API_CROSS_PLANE_GRANTS.template(),
             get(cross_plane_grants_handler).post(cross_plane_create_grant_handler),
         )
         .route(
-            "/api/cross-plane/grants/:id",
+            surface::gateway_api::paths::API_CROSS_PLANE_GRANTS_BY_ID.template(),
             delete(cross_plane_revoke_grant_handler),
         )
-        .route("/api/cross-plane/audit", get(cross_plane_audit_handler))
         .route(
-            "/api/cross-plane/action/adapters",
+            surface::gateway_api::paths::API_CROSS_PLANE_AUDIT.template(),
+            get(cross_plane_audit_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CROSS_PLANE_ACTION_ADAPTERS.template(),
             get(cross_plane_action_adapters_handler),
         )
         .route(
-            "/api/cross-plane/action/executions",
+            surface::gateway_api::paths::API_CROSS_PLANE_ACTION_EXECUTIONS.template(),
             get(cross_plane_action_executions_handler),
         )
         .route(
-            "/api/cross-plane/action/executions/:id",
+            surface::gateway_api::paths::API_CROSS_PLANE_ACTION_EXECUTIONS_BY_ID.template(),
             get(cross_plane_action_execution_get_handler),
         )
         .route(
-            "/api/cross-plane/policy/simulate",
+            surface::gateway_api::paths::API_CROSS_PLANE_POLICY_SIMULATE.template(),
             post(cross_plane_policy_simulate_handler),
         )
         .route(
-            "/api/cross-plane/action/preflight",
+            surface::gateway_api::paths::API_CROSS_PLANE_ACTION_PREFLIGHT.template(),
             post(cross_plane_action_preflight_handler),
         )
         .route(
-            "/api/cross-plane/action/execute",
+            surface::gateway_api::paths::API_CROSS_PLANE_ACTION_EXECUTE.template(),
             post(cross_plane_action_execute_handler),
         )
         .route(
-            "/api/cross-plane/identity/resolve",
+            surface::gateway_api::paths::API_CROSS_PLANE_IDENTITY_RESOLVE.template(),
             post(cross_plane_identity_resolve_handler),
         )
 }

@@ -43,34 +43,56 @@ const APP_STATIC_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; script-src
 
 pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::AppState>> {
     Router::new()
-        .route("/api/apps", get(list_apps))
-        .route("/api/apps/:app_id", get(get_app))
-        .route("/api/apps/:app_id/logs", get(get_app_logs))
-        .route("/api/apps/:app_id/restart", post(restart_app))
         .route(
-            "/api/apps/:app_id/operations/:operation_id/invoke",
+            surface::gateway_api::paths::API_APPS.template(),
+            get(list_apps),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPS_BY_APP_ID.template(),
+            get(get_app),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_LOGS.template(),
+            get(get_app_logs),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_RESTART.template(),
+            post(restart_app),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_OPERATIONS_BY_OPERATION_ID_INVOKE
+                .template(),
             post(invoke_operation),
         )
         .route(
-            "/api/apps/:app_id/operations/:operation_id/stream",
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_OPERATIONS_BY_OPERATION_ID_STREAM
+                .template(),
             post(stream_operation),
         )
-        .route("/api/apps/:app_id/receipts/:receipt_id", get(get_receipt))
         .route(
-            "/api/apps/:app_id/subscriptions/:subscription_id/ack",
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_RECEIPTS_BY_RECEIPT_ID.template(),
+            get(get_receipt),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_SUBSCRIPTIONS_BY_SUBSCRIPTION_ID_ACK
+                .template(),
             post(ack_subscription),
         )
         .route(
-            "/api/apps/:app_id/subscriptions/:subscription_id",
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_SUBSCRIPTIONS_BY_SUBSCRIPTION_ID
+                .template(),
             delete(cancel_subscription),
         )
-        .route("/api/apps/:app_id/tui/views/:view_id/open", post(tui_open))
         .route(
-            "/api/apps/:app_id/tui/views/:view_id/actions",
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_OPEN.template(),
+            post(tui_open),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_ACTIONS.template(),
             post(tui_action),
         )
         .route(
-            "/api/apps/:app_id/tui/views/:view_id/stream",
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_STREAM.template(),
             post(tui_stream),
         )
         .layer(Extension(platform))
@@ -84,8 +106,14 @@ pub(super) fn router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::App
 /// `/api` session cookie into an untrusted APP document.
 pub(super) fn static_router(platform: Arc<GatewayAppPlatform>) -> Router<Arc<super::AppState>> {
     Router::new()
-        .route("/apps/:app_id", get(serve_index))
-        .route("/apps/:app_id/*path", get(serve_asset))
+        .route(
+            surface::gateway_api::paths::APPS_BY_APP_ID.template(),
+            get(serve_index),
+        )
+        .route(
+            surface::gateway_api::paths::APPS_BY_APP_ID_WILDCARD_PATH.template(),
+            get(serve_asset),
+        )
         .layer(Extension(platform))
 }
 

@@ -27,23 +27,6 @@ use harness_contract::{
 
 use super::{runtime_routes, AppState};
 
-/// Build-generated metadata for literal Axum route registrations. The build
-/// script watches every route source and emits this registry once; runtime
-/// contract/OpenAPI consumers never parse Rust source text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GeneratedRouteMetadata {
-    pub(crate) method: &'static str,
-    pub(crate) path: &'static str,
-    pub(crate) source: &'static str,
-    pub(crate) handler: &'static str,
-}
-
-include!(concat!(env!("OUT_DIR"), "/gateway_route_registry.rs"));
-
-pub(crate) fn generated_route_metadata() -> &'static [GeneratedRouteMetadata] {
-    GENERATED_ROUTE_METADATA
-}
-
 pub(crate) struct TypedRouteSpec<Request, Query, Response> {
     pub(crate) method: &'static str,
     pub(crate) path: &'static str,
@@ -54,10 +37,13 @@ pub(crate) struct TypedRouteSpec<Request, Query, Response> {
 }
 
 impl<Request, Query, Response> TypedRouteSpec<Request, Query, Response> {
-    const fn new(method: &'static str, path: &'static str, operation_id: &'static str) -> Self {
+    const fn new(
+        route: surface::gateway_api::GatewayRouteSpec,
+        operation_id: &'static str,
+    ) -> Self {
         Self {
-            method,
-            path,
+            method: route.method().as_str(),
+            path: route.path().template(),
             operation_id,
             _request: PhantomData,
             _query: PhantomData,
@@ -131,8 +117,7 @@ impl StableRouteMetadata {
 fn execution_projection_snapshot_spec(
 ) -> TypedRouteSpec<(), runtime_routes::ExecutionProjectionQuery, ExecutionProjection> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/runtime/executions/:id",
+        surface::gateway_api::routes::GET_API_RUNTIME_EXECUTIONS_BY_ID,
         "runtime_execution_projection_get",
     )
 }
@@ -140,8 +125,7 @@ fn execution_projection_snapshot_spec(
 fn execution_projection_command_spec(
 ) -> TypedRouteSpec<ExecutionCommandRequest, (), ExecutionCommandReceipt> {
     TypedRouteSpec::new(
-        "POST",
-        "/api/runtime/executions/:id/commands",
+        surface::gateway_api::routes::POST_API_RUNTIME_EXECUTIONS_BY_ID_COMMANDS,
         "runtime_execution_projection_command",
     )
 }
@@ -149,92 +133,98 @@ fn execution_projection_command_spec(
 fn execution_activity_detail_spec(
 ) -> TypedRouteSpec<(), runtime_routes::ExecutionActivityQuery, ExecutionActivityDetailProjection> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/runtime/executions/:id/activity",
+        surface::gateway_api::routes::GET_API_RUNTIME_EXECUTIONS_BY_ID_ACTIVITY,
         "runtime_execution_activity_get",
     )
 }
 
 fn send_message_spec() -> TypedRouteSpec<(), (), ()> {
-    TypedRouteSpec::new("POST", "/api/sessions/:id/messages", "session_message_send")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_MESSAGES,
+        "session_message_send",
+    )
 }
 
 fn session_input_projection_spec() -> TypedRouteSpec<(), (), SessionInputProjection> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/:id/input-projection",
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_INPUT_PROJECTION,
         "session_input_projection_get",
     )
 }
 
 fn session_turn_inbox_spec() -> TypedRouteSpec<(), (), TurnInboxSnapshot> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/:id/turn-inbox",
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_TURN_INBOX,
         "session_turn_inbox_get",
     )
 }
 
 fn session_turn_inbox_by_turn_spec() -> TypedRouteSpec<(), (), TurnInboxSnapshot> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/:id/turns/:turn_id/inbox",
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_TURNS_BY_TURN_ID_INBOX,
         "session_turn_inbox_by_turn_get",
     )
 }
 
 fn session_input_cancel_spec() -> TypedRouteSpec<(), (), ()> {
     TypedRouteSpec::new(
-        "POST",
-        "/api/sessions/:id/inputs/:input_id/cancel",
+        surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_INPUTS_BY_INPUT_ID_CANCEL,
         "session_input_cancel",
     )
 }
 
 fn session_input_reclassify_spec() -> TypedRouteSpec<(), (), ()> {
     TypedRouteSpec::new(
-        "POST",
-        "/api/sessions/:id/inputs/:input_id/reclassify",
+        surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_INPUTS_BY_INPUT_ID_RECLASSIFY,
         "session_input_reclassify",
     )
 }
 
 fn session_cancel_spec() -> TypedRouteSpec<(), (), ()> {
-    TypedRouteSpec::new("POST", "/api/sessions/:id/cancel", "session_turn_cancel")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_CANCEL,
+        "session_turn_cancel",
+    )
 }
 
 fn session_compact_spec() -> TypedRouteSpec<(), (), ()> {
-    TypedRouteSpec::new("POST", "/api/sessions/:id/compact", "session_compact")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::POST_API_SESSIONS_BY_ID_COMPACT,
+        "session_compact",
+    )
 }
 
 fn slash_dispatch_spec() -> TypedRouteSpec<(), (), ()> {
-    TypedRouteSpec::new("POST", "/api/slash/dispatch", "slash_dispatch")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::POST_API_SLASH_DISPATCH,
+        "slash_dispatch",
+    )
 }
 
 fn auth_verify_spec() -> TypedRouteSpec<(), (), ()> {
-    TypedRouteSpec::new("GET", "/api/auth/verify", "auth_verify")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::GET_API_AUTH_VERIFY,
+        "auth_verify",
+    )
 }
 
 fn session_execution_indices_spec() -> TypedRouteSpec<(), (), SessionExecutionIndicesProjection> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/executions",
+        surface::gateway_api::routes::GET_API_SESSIONS_EXECUTIONS,
         "session_execution_indices_get",
     )
 }
 
 fn session_execution_index_spec() -> TypedRouteSpec<(), (), SessionExecutionIndexProjection> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/:id/execution",
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_EXECUTION,
         "session_execution_index_get",
     )
 }
 
 fn session_execution_live_spec() -> TypedRouteSpec<(), (), ExecutionLiveUpdate> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/:id/execution/live",
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_EXECUTION_LIVE,
         "session_execution_live_get",
     )
 }
@@ -242,8 +232,7 @@ fn session_execution_live_spec() -> TypedRouteSpec<(), (), ExecutionLiveUpdate> 
 fn session_execution_policy_get_spec(
 ) -> TypedRouteSpec<(), (), harness_contract::policy::SessionExecutionPolicyResponse> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/:id/execution-policy",
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_EXECUTION_POLICY,
         "session_execution_policy_get",
     )
 }
@@ -254,22 +243,30 @@ fn session_execution_policy_put_spec() -> TypedRouteSpec<
     harness_contract::policy::SessionExecutionPolicyResponse,
 > {
     TypedRouteSpec::new(
-        "PUT",
-        "/api/sessions/:id/execution-policy",
+        surface::gateway_api::routes::PUT_API_SESSIONS_BY_ID_EXECUTION_POLICY,
         "session_execution_policy_put",
     )
 }
 
 fn approval_pending_spec() -> TypedRouteSpec<(), super::approval_routes::ApprovalPendingQuery, ()> {
-    TypedRouteSpec::new("GET", "/api/approval/pending", "approval_pending_get")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::GET_API_APPROVAL_PENDING,
+        "approval_pending_get",
+    )
 }
 
 fn approval_exact_spec() -> TypedRouteSpec<(), (), ()> {
-    TypedRouteSpec::new("GET", "/api/approval/:id", "approval_exact_get")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::GET_API_APPROVAL_BY_ID,
+        "approval_exact_get",
+    )
 }
 
 fn approval_respond_spec() -> TypedRouteSpec<(), (), ()> {
-    TypedRouteSpec::new("POST", "/api/approval/respond", "approval_respond_post")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::POST_API_APPROVAL_RESPOND,
+        "approval_respond_post",
+    )
 }
 
 fn session_history_index_spec() -> TypedRouteSpec<
@@ -278,65 +275,71 @@ fn session_history_index_spec() -> TypedRouteSpec<
     SessionHistoryIndexProjection,
 > {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/:id/history-index",
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_HISTORY_INDEX,
         "session_history_index_get",
     )
 }
 
 fn session_evidence_spec() -> TypedRouteSpec<(), (), SessionEvidenceProjection> {
-    TypedRouteSpec::new("GET", "/api/sessions/:id/evidence", "session_evidence_get")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_EVIDENCE,
+        "session_evidence_get",
+    )
 }
 
 fn turn_evidence_spec() -> TypedRouteSpec<(), (), TurnEvidenceProjection> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/sessions/:id/turns/:turn_id/evidence",
+        surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_TURNS_BY_TURN_ID_EVIDENCE,
         "session_turn_evidence_get",
     )
 }
 
 fn live_create_spec() -> TypedRouteSpec<CreateLiveSubscriptionRequest, (), LiveSubscription> {
     TypedRouteSpec::new(
-        "POST",
-        "/api/runtime/live-subscriptions",
+        surface::gateway_api::routes::POST_API_RUNTIME_LIVE_SUBSCRIPTIONS,
         "runtime_live_subscription_create",
     )
 }
 
 fn live_patch_spec() -> TypedRouteSpec<PatchLiveSubscriptionRequest, (), LiveSubscription> {
     TypedRouteSpec::new(
-        "PATCH",
-        "/api/runtime/live-subscriptions/:id",
+        surface::gateway_api::routes::PATCH_API_RUNTIME_LIVE_SUBSCRIPTIONS_BY_ID,
         "runtime_live_subscription_patch",
     )
 }
 
 fn live_delete_spec() -> TypedRouteSpec<(), (), ()> {
     TypedRouteSpec::new(
-        "DELETE",
-        "/api/runtime/live-subscriptions/:id",
+        surface::gateway_api::routes::DELETE_API_RUNTIME_LIVE_SUBSCRIPTIONS_BY_ID,
         "runtime_live_subscription_delete",
     )
 }
 
 fn live_stream_spec() -> TypedRouteSpec<(), (), LiveEnvelope> {
-    TypedRouteSpec::new("GET", "/api/runtime/live/:id", "runtime_live_stream_get")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::GET_API_RUNTIME_LIVE_BY_ID,
+        "runtime_live_stream_get",
+    )
 }
 
 fn mission_control_snapshot_spec() -> TypedRouteSpec<(), (), MissionMaterializedSnapshot> {
-    TypedRouteSpec::new("GET", "/api/mission/control", "mission_control_get")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::GET_API_MISSION_CONTROL,
+        "mission_control_get",
+    )
 }
 
 fn mission_control_command_spec() -> TypedRouteSpec<MissionCommand, (), MissionMaterializedSnapshot>
 {
-    TypedRouteSpec::new("POST", "/api/mission/control", "mission_control_command")
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::POST_API_MISSION_CONTROL,
+        "mission_control_command",
+    )
 }
 
 fn mission_control_delta_spec() -> TypedRouteSpec<(), (), MissionProjectionDelta> {
     TypedRouteSpec::new(
-        "GET",
-        "/api/mission/control/delta",
+        surface::gateway_api::routes::GET_API_MISSION_CONTROL_DELTA,
         "mission_control_delta_get",
     )
 }
@@ -421,32 +424,31 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
             .metadata(Some("MissionCommand"), "MissionCommandResponse", false)
             .with_writer(SessionWriterPolicy::Conditional),
         mission_control_delta_spec().metadata(None, "MissionProjectionDelta", false),
-        TypedRouteSpec::<(), (), ()>::new("GET", "/api/tasks", "task_list").metadata(
-            None,
-            "TaskListResponse",
-            false,
-        ),
-        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/start", "task_start").metadata(
-            Some("StartTaskRequest"),
-            "TaskAggregate",
-            false,
-        ),
-        TypedRouteSpec::<(), (), ()>::new("GET", "/api/tasks/:id", "task_detail").metadata(
-            None,
-            "TaskDetailResponse",
-            false,
-        ),
-        TypedRouteSpec::<(), (), ()>::new("GET", "/api/tasks/:id/turns", "task_turns").metadata(
-            None,
-            "TaskTurnsResponse",
-            false,
-        ),
-        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/focus", "task_focus")
-            .metadata(Some("TaskFocusRequest"), "SessionFocusReceipt", false)
-            .with_writer(SessionWriterPolicy::Required),
+        TypedRouteSpec::<(), (), ()>::new(surface::gateway_api::routes::GET_API_TASKS, "task_list")
+            .metadata(None, "TaskListResponse", false),
         TypedRouteSpec::<(), (), ()>::new(
-            "POST",
-            "/api/tasks/mission/preview",
+            surface::gateway_api::routes::POST_API_TASKS_START,
+            "task_start",
+        )
+        .metadata(Some("StartTaskRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            surface::gateway_api::routes::GET_API_TASKS_BY_ID,
+            "task_detail",
+        )
+        .metadata(None, "TaskDetailResponse", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            surface::gateway_api::routes::GET_API_TASKS_BY_ID_TURNS,
+            "task_turns",
+        )
+        .metadata(None, "TaskTurnsResponse", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_FOCUS,
+            "task_focus",
+        )
+        .metadata(Some("TaskFocusRequest"), "SessionFocusReceipt", false)
+        .with_writer(SessionWriterPolicy::Required),
+        TypedRouteSpec::<(), (), ()>::new(
+            surface::gateway_api::routes::POST_API_TASKS_MISSION_PREVIEW,
             "task_mission_batch_preview",
         )
         .metadata(
@@ -455,8 +457,7 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
             false,
         ),
         TypedRouteSpec::<(), (), ()>::new(
-            "POST",
-            "/api/tasks/mission/commit",
+            surface::gateway_api::routes::POST_API_TASKS_MISSION_COMMIT,
             "task_mission_batch_commit",
         )
         .metadata(
@@ -465,8 +466,7 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
             false,
         ),
         TypedRouteSpec::<(), (), ()>::new(
-            "POST",
-            "/api/tasks/:id/mission/preview",
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_MISSION_PREVIEW,
             "task_mission_preview",
         )
         .metadata(
@@ -475,8 +475,7 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
             false,
         ),
         TypedRouteSpec::<(), (), ()>::new(
-            "POST",
-            "/api/tasks/:id/mission/commit",
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_MISSION_COMMIT,
             "task_mission_commit",
         )
         .metadata(
@@ -485,43 +484,47 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
             false,
         ),
         TypedRouteSpec::<(), (), ()>::new(
-            "GET",
-            "/api/tasks/mission/organization",
+            surface::gateway_api::routes::GET_API_TASKS_MISSION_ORGANIZATION,
             "mission_organization_list",
         )
         .metadata(None, "MissionOrganizationResponse", false),
-        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/phases", "task_phase_start")
-            .metadata(Some("StartTaskPhaseRequest"), "TaskAggregate", false),
         TypedRouteSpec::<(), (), ()>::new(
-            "POST",
-            "/api/tasks/:id/phases/:phase_id/artifacts",
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_PHASES,
+            "task_phase_start",
+        )
+        .metadata(Some("StartTaskPhaseRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_PHASES_BY_PHASE_ID_ARTIFACTS,
             "task_phase_artifact_record",
         )
         .metadata(Some("TaskPhaseArtifactRequest"), "TaskAggregate", false),
         TypedRouteSpec::<(), (), ()>::new(
-            "POST",
-            "/api/tasks/:id/phases/:phase_id/review",
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_PHASES_BY_PHASE_ID_REVIEW,
             "task_phase_review",
         )
         .metadata(Some("TaskPhaseReviewRequest"), "TaskAggregate", false),
-        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/cancel", "task_cancel").metadata(
-            Some("TaskTransitionRequest"),
-            "TaskAggregate",
-            false,
-        ),
-        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/complete", "task_complete")
-            .metadata(Some("TaskTransitionRequest"), "TaskAggregate", false),
-        TypedRouteSpec::<(), (), ()>::new("POST", "/api/tasks/:id/failure", "task_failure")
-            .metadata(Some("TaskFailureRequest"), "TaskAggregate", false),
         TypedRouteSpec::<(), (), ()>::new(
-            "GET",
-            "/api/sessions/:id/task-focus",
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_CANCEL,
+            "task_cancel",
+        )
+        .metadata(Some("TaskTransitionRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_COMPLETE,
+            "task_complete",
+        )
+        .metadata(Some("TaskTransitionRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            surface::gateway_api::routes::POST_API_TASKS_BY_ID_FAILURE,
+            "task_failure",
+        )
+        .metadata(Some("TaskFailureRequest"), "TaskAggregate", false),
+        TypedRouteSpec::<(), (), ()>::new(
+            surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_TASK_FOCUS,
             "session_task_focus_get",
         )
         .metadata(None, "TaskFocusProjection", false),
         TypedRouteSpec::<(), (), ()>::new(
-            "PUT",
-            "/api/sessions/:id/task-focus",
+            surface::gateway_api::routes::PUT_API_SESSIONS_BY_ID_TASK_FOCUS,
             "session_task_focus_set",
         )
         .metadata(
@@ -531,8 +534,7 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         )
         .with_writer(SessionWriterPolicy::Required),
         TypedRouteSpec::<(), (), ()>::new(
-            "DELETE",
-            "/api/sessions/:id/task-focus",
+            surface::gateway_api::routes::DELETE_API_SESSIONS_BY_ID_TASK_FOCUS,
             "session_task_focus_clear",
         )
         .metadata(
@@ -542,14 +544,12 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         )
         .with_writer(SessionWriterPolicy::Required),
         TypedRouteSpec::<(), (), ()>::new(
-            "GET",
-            "/api/sessions/:id/mission-focus",
+            surface::gateway_api::routes::GET_API_SESSIONS_BY_ID_MISSION_FOCUS,
             "session_mission_focus_get",
         )
         .metadata(None, "MissionFocusProjection", false),
         TypedRouteSpec::<(), (), ()>::new(
-            "PUT",
-            "/api/sessions/:id/mission-focus",
+            surface::gateway_api::routes::PUT_API_SESSIONS_BY_ID_MISSION_FOCUS,
             "session_mission_focus_set",
         )
         .metadata(
@@ -559,8 +559,7 @@ pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
         )
         .with_writer(SessionWriterPolicy::Required),
         TypedRouteSpec::<(), (), ()>::new(
-            "DELETE",
-            "/api/sessions/:id/mission-focus",
+            surface::gateway_api::routes::DELETE_API_SESSIONS_BY_ID_MISSION_FOCUS,
             "session_mission_focus_clear",
         )
         .metadata(

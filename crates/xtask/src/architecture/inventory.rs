@@ -45,9 +45,9 @@ impl CapabilityInventory {
                 self.runtime_modules.len()
             ));
         }
-        if self.gateway_routes.len() != 479 {
+        if self.gateway_routes.len() != 482 {
             return Err(format!(
-                "Gateway route inventory drifted: expected 479, got {}",
+                "Gateway route inventory drifted: expected 482, got {}",
                 self.gateway_routes.len()
             ));
         }
@@ -103,7 +103,8 @@ fn collect(roots: &Roots) -> Result<CapabilityInventory, String> {
         .filter_map(first_quoted)
         .map(str::to_owned)
         .collect();
-    let gateway_routes = collect_routes(&roots.core.join("crates/gateway/src/api_routes"))?;
+    let gateway_routes =
+        collect_routes(&roots.core.join("crates/surface/src/gateway_api/catalog.rs"))?;
     let tool_source = read(roots.core.join("crates/tools/src/registry/tool_specs.rs"))?;
     let tool_body = tool_source
         .split_once("pub fn mvp_tool_specs()")
@@ -236,7 +237,10 @@ fn collect_api_paths(root: &Path) -> Result<Vec<String>, String> {
             continue;
         }
         let source = read(file)?;
-        let mut tail = source.as_str();
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map_or(source.as_str(), |(production, _)| production);
+        let mut tail = production;
         while let Some(index) = tail.find("\"/api/") {
             let value = &tail[index + 1..];
             if let Some(end) = value.find('"') {
@@ -250,78 +254,82 @@ fn collect_api_paths(root: &Path) -> Result<Vec<String>, String> {
     Ok(paths.into_iter().collect())
 }
 
-fn collect_routes(root: &Path) -> Result<Vec<String>, String> {
-    let mut routes = BTreeSet::new();
-    for file in recursive_files(root, "rs")? {
-        let name = file
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        if matches!(name, "route_manifest.rs" | "route_registry.rs") {
+fn collect_routes(catalog: &Path) -> Result<Vec<String>, String> {
+    let source = read(catalog)?;
+    let (path_section, route_tail) = source
+        .split_once("pub mod routes {")
+        .ok_or_else(|| "Surface route catalog has no routes module".to_owned())?;
+    let route_section = route_tail
+        .split_once("pub const GATEWAY_PATHS")
+        .map(|(section, _)| section)
+        .ok_or_else(|| "Surface route catalog has no path inventory".to_owned())?;
+
+    let mut paths = std::collections::BTreeMap::new();
+    for declaration in const_declarations(path_section) {
+        if !declaration.contains("GatewayPathKey") {
             continue;
         }
-        let source = read(file)?;
-        let mut offset = 0;
-        while let Some(index) = source[offset..].find(".route(") {
-            let start = offset + index + ".route(".len();
-            let Some(end) = route_call_end(&source, start) else {
-                break;
-            };
-            let call = source[start..end].trim_start();
-            let Some(path_tail) = call.strip_prefix('"') else {
-                offset = end;
-                continue;
-            };
-            let Some(path_end) = path_tail.find('"') else {
-                break;
-            };
-            let path = &path_tail[..path_end];
-            let handlers = &path_tail[path_end + 1..];
-            for (needle, method) in [
-                ("get(", "GET"),
-                ("post(", "POST"),
-                ("put(", "PUT"),
-                ("patch(", "PATCH"),
-                ("delete(", "DELETE"),
-            ] {
-                if handlers.contains(needle) {
-                    routes.insert(format!("{method} {path}"));
-                }
-            }
-            offset = end;
+        let identifier = const_identifier(declaration)?;
+        let values = quoted_values(declaration);
+        let path = values
+            .last()
+            .ok_or_else(|| format!("path declaration `{identifier}` has no template"))?;
+        paths.insert(identifier.to_owned(), (*path).to_owned());
+    }
+
+    let mut routes = BTreeSet::new();
+    for declaration in const_declarations(route_section) {
+        if !declaration.contains("GatewayRouteSpec") {
+            continue;
         }
+        let method = ["Delete", "Get", "Patch", "Post", "Put"]
+            .into_iter()
+            .find(|method| declaration.contains(&format!("GatewayHttpMethod::{method}")))
+            .ok_or_else(|| format!("route declaration has no method: {declaration}"))?
+            .to_ascii_uppercase();
+        let path_key = declaration
+            .split("paths::")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                    .next()
+            })
+            .ok_or_else(|| format!("route declaration has no path key: {declaration}"))?;
+        let path = paths
+            .get(path_key)
+            .ok_or_else(|| format!("route references unknown path key `{path_key}`"))?;
+        routes.insert(format!("{method} {path}"));
     }
     Ok(routes.into_iter().collect())
 }
 
-fn route_call_end(source: &str, start: usize) -> Option<usize> {
-    let mut depth = 1usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (relative, character) in source[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match character {
-            '"' => in_string = true,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(start + relative);
-                }
-            }
-            _ => {}
-        }
+fn const_declarations(source: &str) -> Vec<&str> {
+    source
+        .split("pub const ")
+        .skip(1)
+        .filter_map(|tail| tail.split_once(';').map(|(declaration, _)| declaration))
+        .collect()
+}
+
+fn const_identifier(declaration: &str) -> Result<&str, String> {
+    declaration
+        .split(|character: char| character == ':' || character.is_whitespace())
+        .find(|part| !part.is_empty())
+        .ok_or_else(|| format!("invalid const declaration: {declaration}"))
+}
+
+fn quoted_values(source: &str) -> Vec<&str> {
+    let mut values = Vec::new();
+    let mut tail = source;
+    while let Some(start) = tail.find('"') {
+        let value = &tail[start + 1..];
+        let Some(end) = value.find('"') else {
+            break;
+        };
+        values.push(&value[..end]);
+        tail = &value[end + 1..];
     }
-    None
+    values
 }
 
 fn recursive_files(root: &Path, extension: &str) -> Result<Vec<PathBuf>, String> {
@@ -393,13 +401,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_parser_handles_chained_methods() {
-        let source = r#"Router::new().route("/api/example", get(read).post(write))"#;
-        let root = std::env::temp_dir().join(format!("cowd-route-parser-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("example_routes.rs"), source).unwrap();
-        let routes = collect_routes(&root).unwrap();
+    fn route_catalog_parser_resolves_public_path_keys() {
+        let source = r#"
+pub mod paths {
+    pub const API_EXAMPLE: GatewayPathKey = GatewayPathKey::new("api_example", "/api/example");
+}
+pub mod routes {
+    pub const GET_API_EXAMPLE: GatewayRouteSpec = GatewayRouteSpec::new(
+        "get_api_example", GatewayHttpMethod::Get, paths::API_EXAMPLE,
+    );
+    pub const POST_API_EXAMPLE: GatewayRouteSpec = GatewayRouteSpec::new(
+        "post_api_example", GatewayHttpMethod::Post, paths::API_EXAMPLE,
+    );
+}
+pub const GATEWAY_PATHS: &[GatewayPathKey] = &[];
+"#;
+        let file =
+            std::env::temp_dir().join(format!("cowd-route-catalog-{}.rs", std::process::id()));
+        std::fs::write(&file, source).unwrap();
+        let routes = collect_routes(&file).unwrap();
         assert_eq!(routes, vec!["GET /api/example", "POST /api/example"]);
-        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(file).unwrap();
     }
 }

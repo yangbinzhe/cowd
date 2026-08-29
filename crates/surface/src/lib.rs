@@ -18,6 +18,8 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod gateway_api;
+
 pub mod message;
 pub mod message_ledger;
 

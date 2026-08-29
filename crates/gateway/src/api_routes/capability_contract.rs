@@ -441,10 +441,16 @@ fn gateway_openapi_document_from_contract(
             "capability_count": contract.capability_count,
             "coverage": contract.coverage
         },
-        "x-cowd-projection-v3-golden": serde_json::from_str::<Value>(include_str!(
-            "../../../harness-contract/tests/fixtures/projection-v3/materialization.json"
-        )).expect("canonical projection v3 fixture must be valid JSON")
+        "x-cowd-route-catalog-digest": surface::gateway_api::gateway_route_catalog_digest(),
+        "x-cowd-projection-v3-golden": projection_v3_golden()
     })
+}
+
+fn projection_v3_golden() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../harness-contract/tests/fixtures/projection-v3/materialization.json"
+    ))
+    .expect("canonical projection v3 fixture must be valid JSON")
 }
 
 fn insert_canonical_schema<T: schemars::JsonSchema>(schemas: &mut Map<String, Value>, name: &str) {
@@ -2635,6 +2641,27 @@ mod tests {
             document["x-cowd-contract"]["route_count"],
             document["x-cowd-contract"]["capability_count"]
         );
+        assert_eq!(
+            document["x-cowd-route-catalog-digest"],
+            surface::gateway_api::gateway_route_catalog_digest()
+        );
+    }
+
+    #[test]
+    fn openapi_schema_golden_is_stable() {
+        let document = gateway_openapi_document();
+        let schemas = document["components"]["schemas"]
+            .as_object()
+            .expect("OpenAPI schemas");
+        let exceptional = surface::gateway_api::EXCEPTIONAL_GATEWAY_SCHEMAS;
+        assert_eq!(exceptional.owner, "gateway.api-contract");
+        assert_eq!(exceptional.schema_names.len(), 67);
+        for name in exceptional.schema_names {
+            assert!(
+                schemas.contains_key(*name),
+                "missing exceptional schema {name}"
+            );
+        }
     }
 
     #[test]

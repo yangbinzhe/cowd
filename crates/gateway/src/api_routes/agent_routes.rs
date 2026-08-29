@@ -14,48 +14,72 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/agents/catalog", get(agent_catalog_handler))
-        .route("/api/agents/directory", get(agent_directory_handler))
-        .route("/api/agents/discover", get(agent_discover_handler))
-        .route("/api/agents/assemble", post(agent_assemble_handler))
-        .route("/api/agents/self-models", get(agent_self_models_handler))
-        .route("/api/team-templates", get(team_templates_handler))
         .route(
-            "/api/team-templates/instantiate",
+            surface::gateway_api::paths::API_AGENTS_CATALOG.template(),
+            get(agent_catalog_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_AGENTS_DIRECTORY.template(),
+            get(agent_directory_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_AGENTS_DISCOVER.template(),
+            get(agent_discover_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_AGENTS_ASSEMBLE.template(),
+            post(agent_assemble_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_AGENTS_SELF_MODELS.template(),
+            get(agent_self_models_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TEAM_TEMPLATES.template(),
+            get(team_templates_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TEAM_TEMPLATES_INSTANTIATE.template(),
             post(team_template_instantiate_handler),
         )
         .route(
-            "/api/runtime/teams/:id/working-state",
+            surface::gateway_api::paths::API_RUNTIME_TEAMS_BY_ID_WORKING_STATE.template(),
             get(team_working_state_handler),
         )
         .route(
-            "/api/agents/execution-graphs",
+            surface::gateway_api::paths::API_AGENTS_EXECUTION_GRAPHS.template(),
             get(execution_graphs_handler),
         )
-        .route("/api/runtime/agents", get(runtime_agents_list_handler))
-        .route("/api/runtime/agents/:id", get(runtime_agent_detail_handler))
         .route(
-            "/api/runtime/agents/:id/events",
+            surface::gateway_api::paths::API_RUNTIME_AGENTS.template(),
+            get(runtime_agents_list_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID.template(),
+            get(runtime_agent_detail_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID_EVENTS.template(),
             get(runtime_agent_events_handler),
         )
         .route(
-            "/api/runtime/agents/:id/cancel",
+            surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID_CANCEL.template(),
             post(runtime_agent_cancel_handler),
         )
         .route(
-            "/api/runtime/agents/:id/input",
+            surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID_INPUT.template(),
             post(runtime_agent_input_handler),
         )
         .route(
-            "/api/runtime/agents/:id/interrupt",
+            surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID_INTERRUPT.template(),
             post(runtime_agent_interrupt_handler),
         )
         .route(
-            "/api/runtime/agents/:id/shutdown",
+            surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID_SHUTDOWN.template(),
             post(runtime_agent_shutdown_handler),
         )
         .route(
-            "/api/tasks/:id/execution-graph",
+            surface::gateway_api::paths::API_TASKS_BY_ID_EXECUTION_GRAPH.template(),
             get(task_execution_graph_handler),
         )
 }

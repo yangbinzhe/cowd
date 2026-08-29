@@ -14,25 +14,46 @@ use crate::services::reality_service::RealityFlowQuery;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/reality/status", get(reality_status_handler))
         .route(
-            "/api/reality/capabilities",
+            surface::gateway_api::paths::API_REALITY_STATUS.template(),
+            get(reality_status_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_REALITY_CAPABILITIES.template(),
             get(reality_capabilities_handler),
         )
-        .route("/api/reality/static", get(reality_static_handler))
-        .route("/api/reality/flow", get(reality_flow_handler))
         .route(
-            "/api/reality/recall/report",
+            surface::gateway_api::paths::API_REALITY_STATIC.template(),
+            get(reality_static_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_REALITY_FLOW.template(),
+            get(reality_flow_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_REALITY_RECALL_REPORT.template(),
             get(reality_recall_report_handler),
         )
         .route(
-            "/api/reality/context/envelope",
+            surface::gateway_api::paths::API_REALITY_CONTEXT_ENVELOPE.template(),
             get(reality_context_envelope_handler),
         )
-        .route("/api/reality/evidence/:id", get(reality_evidence_handler))
-        .route("/api/reality/promotions", get(reality_promotions_handler))
-        .route("/api/reality/governance", get(reality_governance_handler))
-        .route("/api/reality/boundaries", get(reality_boundaries_handler))
+        .route(
+            surface::gateway_api::paths::API_REALITY_EVIDENCE_BY_ID.template(),
+            get(reality_evidence_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_REALITY_PROMOTIONS.template(),
+            get(reality_promotions_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_REALITY_GOVERNANCE.template(),
+            get(reality_governance_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_REALITY_BOUNDARIES.template(),
+            get(reality_boundaries_handler),
+        )
 }
 
 async fn reality_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

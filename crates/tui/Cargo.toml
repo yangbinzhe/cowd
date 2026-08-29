@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 cowd-app-protocol = { path = "../app-protocol" }
 harness-contract = { path = "../harness-contract" }
+surface = { path = "../surface" }
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3"

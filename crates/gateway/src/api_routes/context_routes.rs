@@ -15,26 +15,32 @@ use crate::services::ContextServiceError;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/context/current", get(context_current_handler))
         .route(
-            "/api/context/:envelope_id",
+            surface::gateway_api::paths::API_CONTEXT_CURRENT.template(),
+            get(context_current_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CONTEXT_BY_ENVELOPE_ID.template(),
             get(get_context_envelope_handler),
         )
         .route(
-            "/api/sessions/:id/context",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_CONTEXT.template(),
             get(get_session_context_history),
         )
         .route(
-            "/api/sessions/:id/context/recommendations",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_CONTEXT_RECOMMENDATIONS.template(),
             get(get_context_recommendation_stats).post(record_context_recommendation_action),
         )
-        .route("/api/evidence/resolve", get(resolve_evidence_ref_handler))
         .route(
-            "/api/evidence/resolve/batch",
+            surface::gateway_api::paths::API_EVIDENCE_RESOLVE.template(),
+            get(resolve_evidence_ref_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EVIDENCE_RESOLVE_BATCH.template(),
             post(resolve_evidence_refs_batch_handler),
         )
         .route(
-            "/api/evidence/projections",
+            surface::gateway_api::paths::API_EVIDENCE_PROJECTIONS.template(),
             get(list_evidence_audit_projections),
         )
 }

@@ -21,110 +21,122 @@ use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
-            "/api/mission/control",
+            surface::gateway_api::paths::API_MISSION_CONTROL.template(),
             get(mission_control_handler).post(execute_mission_control_command_handler),
         )
         .route(
-            "/api/mission/control/summary",
+            surface::gateway_api::paths::API_MISSION_CONTROL_SUMMARY.template(),
             get(mission_control_summary_handler),
         )
         .route(
-            "/api/mission/control/delta",
+            surface::gateway_api::paths::API_MISSION_CONTROL_DELTA.template(),
             get(mission_control_delta_handler),
         )
         .route(
-            "/api/mission/control/sessions/bridge",
+            surface::gateway_api::paths::API_MISSION_CONTROL_SESSIONS_BRIDGE.template(),
             post(bridge_mission_session_handler),
         )
         .route(
-            "/api/mission/control/interpret",
+            surface::gateway_api::paths::API_MISSION_CONTROL_INTERPRET.template(),
             post(interpret_mission_command_handler),
         )
         .route(
-            "/api/mission/control/teams",
+            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS.template(),
             get(collaboration_runs_handler),
         )
         .route(
-            "/api/mission/control/teams/:team_id/run",
+            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_RUN.template(),
             get(collaboration_run_handler),
         )
         .route(
-            "/api/mission/control/teams/:team_id/cancel",
+            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_CANCEL.template(),
             post(cancel_team_runtime_handler),
         )
         .route(
-            "/api/mission/control/teams/:team_id/execution",
+            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EXECUTION.template(),
             get(team_execution_plan_handler),
         )
         .route(
-            "/api/mission/control/teams/:team_id/evidence",
+            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EVIDENCE.template(),
             get(team_mission_evidence_handler),
         )
         .route(
-            "/api/mission/control/agents/:agent_id/events",
+            surface::gateway_api::paths::API_MISSION_CONTROL_AGENTS_BY_AGENT_ID_EVENTS.template(),
             get(agent_mission_events_handler),
         )
-        .route("/api/mission/projection", get(mission_projection_handler))
         .route(
-            "/api/mission/schedules",
+            surface::gateway_api::paths::API_MISSION_PROJECTION.template(),
+            get(mission_projection_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MISSION_SCHEDULES.template(),
             get(mission_schedules_handler).post(create_mission_schedule_handler),
         )
         .route(
-            "/api/mission/schedules/tick",
+            surface::gateway_api::paths::API_MISSION_SCHEDULES_TICK.template(),
             post(tick_mission_schedules_handler),
         )
         .route(
-            "/api/mission/schedules/:id/pause",
+            surface::gateway_api::paths::API_MISSION_SCHEDULES_BY_ID_PAUSE.template(),
             post(pause_mission_schedule_handler),
         )
         .route(
-            "/api/mission/schedules/:id/resume",
+            surface::gateway_api::paths::API_MISSION_SCHEDULES_BY_ID_RESUME.template(),
             post(resume_mission_schedule_handler),
         )
         .route(
-            "/api/mission/schedules/:id/run",
+            surface::gateway_api::paths::API_MISSION_SCHEDULES_BY_ID_RUN.template(),
             post(run_mission_schedule_handler),
         )
         .route(
-            "/api/mission/schedules/:id",
+            surface::gateway_api::paths::API_MISSION_SCHEDULES_BY_ID.template(),
             axum::routing::patch(update_mission_schedule_handler)
                 .delete(delete_mission_schedule_handler),
         )
         .route(
-            "/api/mission/sessions",
+            surface::gateway_api::paths::API_MISSION_SESSIONS.template(),
             get(mission_projection_handler).post(start_mission_session_handler),
         )
         .route(
-            "/api/mission/sessions/:id",
+            surface::gateway_api::paths::API_MISSION_SESSIONS_BY_ID.template(),
             get(mission_session_detail_handler),
         )
         .route(
-            "/api/mission/sessions/:id/switch",
+            surface::gateway_api::paths::API_MISSION_SESSIONS_BY_ID_SWITCH.template(),
             post(switch_mission_session_handler),
         )
         .route(
-            "/api/mission/sessions/:id/background",
+            surface::gateway_api::paths::API_MISSION_SESSIONS_BY_ID_BACKGROUND.template(),
             post(background_mission_session_handler),
         )
         .route(
-            "/api/mission/sessions/:id/pause",
+            surface::gateway_api::paths::API_MISSION_SESSIONS_BY_ID_PAUSE.template(),
             post(pause_mission_session_handler),
         )
         .route(
-            "/api/mission/sessions/:id/close",
+            surface::gateway_api::paths::API_MISSION_SESSIONS_BY_ID_CLOSE.template(),
             post(close_mission_session_handler),
         )
         .route(
-            "/api/mission/approvals",
+            surface::gateway_api::paths::API_MISSION_APPROVALS.template(),
             get(mission_approvals_handler).post(submit_mission_approval_handler),
         )
         .route(
-            "/api/mission/approvals/:id/decision",
+            surface::gateway_api::paths::API_MISSION_APPROVALS_BY_ID_DECISION.template(),
             post(decide_mission_approval_handler),
         )
-        .route("/api/mission/relations", get(mission_relations_handler))
-        .route("/api/mission/conflicts", get(mission_conflicts_handler))
-        .route("/api/mission/proxies", post(upsert_mission_proxy_handler))
+        .route(
+            surface::gateway_api::paths::API_MISSION_RELATIONS.template(),
+            get(mission_relations_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MISSION_CONFLICTS.template(),
+            get(mission_conflicts_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MISSION_PROXIES.template(),
+            post(upsert_mission_proxy_handler),
+        )
 }
 
 async fn mission_projection_handler(

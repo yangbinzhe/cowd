@@ -23,43 +23,70 @@ use super::{
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/tasks", get(tasks_status_handler))
         .route(
-            "/api/tasks/mission/preview",
+            surface::gateway_api::paths::API_TASKS.template(),
+            get(tasks_status_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TASKS_MISSION_PREVIEW.template(),
             post(preview_tasks_mission_handler),
         )
         .route(
-            "/api/tasks/mission/commit",
+            surface::gateway_api::paths::API_TASKS_MISSION_COMMIT.template(),
             post(commit_tasks_mission_handler),
         )
         .route(
-            "/api/tasks/mission/organization",
+            surface::gateway_api::paths::API_TASKS_MISSION_ORGANIZATION.template(),
             get(mission_organization_handler),
         )
-        .route("/api/tasks/start", post(start_task_handler))
-        .route("/api/tasks/:id", get(task_detail_handler))
-        .route("/api/tasks/:id/turns", get(task_turns_handler))
-        .route("/api/tasks/:id/focus", post(focus_task_handler))
         .route(
-            "/api/tasks/:id/mission/preview",
+            surface::gateway_api::paths::API_TASKS_START.template(),
+            post(start_task_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TASKS_BY_ID.template(),
+            get(task_detail_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TASKS_BY_ID_TURNS.template(),
+            get(task_turns_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TASKS_BY_ID_FOCUS.template(),
+            post(focus_task_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TASKS_BY_ID_MISSION_PREVIEW.template(),
             post(preview_task_mission_handler),
         )
         .route(
-            "/api/tasks/:id/mission/commit",
+            surface::gateway_api::paths::API_TASKS_BY_ID_MISSION_COMMIT.template(),
             post(commit_task_mission_handler),
         )
-        .route("/api/tasks/:id/phases", post(start_task_phase_handler))
         .route(
-            "/api/tasks/:id/phases/:phase_id/artifacts",
+            surface::gateway_api::paths::API_TASKS_BY_ID_PHASES.template(),
+            post(start_task_phase_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TASKS_BY_ID_PHASES_BY_PHASE_ID_ARTIFACTS.template(),
             post(record_task_phase_artifact_handler),
         )
         .route(
-            "/api/tasks/:id/phases/:phase_id/review",
+            surface::gateway_api::paths::API_TASKS_BY_ID_PHASES_BY_PHASE_ID_REVIEW.template(),
             post(review_task_phase_handler),
         )
-        .route("/api/tasks/:id/cancel", post(cancel_task_handler))
-        .route("/api/tasks/:id/complete", post(complete_task_handler))
-        .route("/api/tasks/:id/failure", post(record_task_failure_handler))
+        .route(
+            surface::gateway_api::paths::API_TASKS_BY_ID_CANCEL.template(),
+            post(cancel_task_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TASKS_BY_ID_COMPLETE.template(),
+            post(complete_task_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TASKS_BY_ID_FAILURE.template(),
+            post(record_task_failure_handler),
+        )
 }
 
 #[derive(Deserialize)]

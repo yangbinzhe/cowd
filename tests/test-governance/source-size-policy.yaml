@@ -15,7 +15,6 @@ generated:
 transitional:
   - { repository: core, path: crates/runtime/src/conversation/conversation.rs, phase: P4 }
   - { repository: core, path: crates/runtime/src/conversation/host.rs, phase: P4 }
-  - { repository: core, path: crates/gateway/src/api_routes/mod.rs, phase: P2 }
   - { repository: core, path: crates/session/src/persistence/sqlite.rs, phase: P5 }
   - { repository: core, path: crates/session-postgres/src/lib.rs, phase: P5 }
   - { repository: core, path: crates/runtime/src/execution_core/services.rs, phase: P4 }
@@ -31,7 +30,6 @@ transitional:
   - { repository: core, path: crates/runtime-postgres/src/lib.rs, phase: P5 }
   - { repository: core, path: crates/memory/src/kernel/cognitive.rs, phase: P5 }
   - { repository: core, path: crates/runtime/src/execution_core/graph/commit_service.rs, phase: P4 }
-  - { repository: core, path: crates/harness-contract/src/strategy/mod.rs, phase: P2-P4 }
   - { repository: core, path: crates/matrix/repository/src/sqlite_repository.rs, phase: P5 }
   - { repository: core, path: crates/runtime/src/orchestration/mod.rs, phase: P4 }
   - { repository: core, path: crates/gateway/src/runtime/session_runtime_bridge.rs, phase: P3 }

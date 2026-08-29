@@ -9,8 +9,14 @@ use super::AppState;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/growth/status", get(growth_status_handler))
-        .route("/api/growth/events", get(growth_events_handler))
+        .route(
+            surface::gateway_api::paths::API_GROWTH_STATUS.template(),
+            get(growth_status_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_GROWTH_EVENTS.template(),
+            get(growth_events_handler),
+        )
 }
 
 async fn growth_status_handler(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {

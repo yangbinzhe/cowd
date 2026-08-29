@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -49,6 +50,20 @@ def git(root: Path, *arguments: str) -> str:
     return subprocess.check_output(["git", *arguments], cwd=root, text=True).strip()
 
 
+def worktree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(subprocess.check_output(["git", "diff", "--binary", "HEAD", "--"], cwd=root))
+    untracked = git(root, "ls-files", "--others", "--exclude-standard").splitlines()
+    for relative in sorted(filter(None, untracked)):
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        path = root / relative
+        if path.is_file():
+            digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def run_workload(root: Path, workload: dict, warmups: int, runs: int) -> dict:
     command = workload["command"]
     environment = os.environ.copy()
@@ -89,7 +104,7 @@ def run(args: argparse.Namespace) -> None:
         for line in status
         if not any(line.split(maxsplit=1)[-1].startswith(prefix) for prefix in allowed)
     ]
-    if manifest["environment"].get("require_clean_worktree") and unexpected:
+    if manifest["environment"].get("require_clean_worktree") and unexpected and args.mode == "baseline":
         raise SystemExit(f"performance run has unexpected dirty paths: {unexpected}")
     workloads = []
     for entry in manifest["workloads"]:
@@ -103,6 +118,7 @@ def run(args: argparse.Namespace) -> None:
         "mode": args.mode,
         "head": git(root, "rev-parse", "HEAD"),
         "tree": git(root, "rev-parse", "HEAD^{tree}"),
+        "worktree_digest": worktree_digest(root),
         "governance_dirty_paths": status,
         "workloads": workloads,
     }

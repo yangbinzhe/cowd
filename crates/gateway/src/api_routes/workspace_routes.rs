@@ -13,29 +13,50 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/workspace", get(workspace_handler))
-        .route("/api/workspaces", get(workspaces_handler))
         .route(
-            "/api/workspace/files",
+            surface::gateway_api::paths::API_WORKSPACE.template(),
+            get(workspace_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_WORKSPACES.template(),
+            get(workspaces_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_WORKSPACE_FILES.template(),
             get(workspace_files_handler)
                 .post(create_workspace_file_handler)
                 .delete(delete_workspace_path_handler),
         )
-        .route("/api/workspace/dirs", post(create_workspace_dir_handler))
-        .route("/api/workspace/meta", get(workspace_meta_handler))
-        .route("/api/workspace/rename", post(rename_workspace_path_handler))
         .route(
-            "/api/workspace/download",
+            surface::gateway_api::paths::API_WORKSPACE_DIRS.template(),
+            post(create_workspace_dir_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_WORKSPACE_META.template(),
+            get(workspace_meta_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_WORKSPACE_RENAME.template(),
+            post(rename_workspace_path_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_WORKSPACE_DOWNLOAD.template(),
             get(download_workspace_path_handler),
         )
-        .route("/api/upload", post(upload_workspace_file_handler))
-        .route("/api/file/raw", get(raw_workspace_file_handler))
         .route(
-            "/api/sessions/:id/attachments",
+            surface::gateway_api::paths::API_UPLOAD.template(),
+            post(upload_workspace_file_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_FILE_RAW.template(),
+            get(raw_workspace_file_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_ATTACHMENTS.template(),
             get(list_session_attachments_handler).post(add_session_attachment_handler),
         )
         .route(
-            "/api/sessions/:id/attachments/:ref_id",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_ATTACHMENTS_BY_REF_ID.template(),
             delete(delete_session_attachment_handler),
         )
 }

@@ -16,11 +16,26 @@ use super::{
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/slash", get(slash_catalog_handler))
-        .route("/api/slash/history", get(slash_history_handler))
-        .route("/api/slash/resolve", post(slash_resolve_handler))
-        .route("/api/slash/dispatch", post(slash_dispatch_handler))
-        .route("/api/slash/:id", get(slash_detail_handler))
+        .route(
+            surface::gateway_api::paths::API_SLASH.template(),
+            get(slash_catalog_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SLASH_HISTORY.template(),
+            get(slash_history_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SLASH_RESOLVE.template(),
+            post(slash_resolve_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SLASH_DISPATCH.template(),
+            post(slash_dispatch_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SLASH_BY_ID.template(),
+            get(slash_detail_handler),
+        )
 }
 
 #[derive(Deserialize)]

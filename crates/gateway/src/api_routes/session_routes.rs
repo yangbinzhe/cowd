@@ -22,79 +22,112 @@ use crate::services::{
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/sessions", get(list_sessions).post(create_session))
         .route(
-            "/api/sessions/executions",
+            surface::gateway_api::paths::API_SESSIONS.template(),
+            get(list_sessions).post(create_session),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_EXECUTIONS.template(),
             get(list_running_session_execution_indices),
         )
-        .route("/api/sessions/search", get(search_messages_handler))
-        .route("/api/sessions/:id/evidence", get(get_session_evidence))
         .route(
-            "/api/sessions/:id/execution-policy",
+            surface::gateway_api::paths::API_SESSIONS_SEARCH.template(),
+            get(search_messages_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_EVIDENCE.template(),
+            get(get_session_evidence),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_EXECUTION_POLICY.template(),
             get(get_session_execution_policy).put(put_session_execution_policy),
         )
         .route(
-            "/api/sessions/execution-policy-defaults",
+            surface::gateway_api::paths::API_SESSIONS_EXECUTION_POLICY_DEFAULTS.template(),
             get(get_execution_policy_defaults).put(put_execution_policy_defaults),
         )
         .route(
-            "/api/sessions/:id/task-focus",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_TASK_FOCUS.template(),
             get(get_task_focus_handler)
                 .put(set_task_focus_handler)
                 .delete(clear_task_focus_handler),
         )
         .route(
-            "/api/sessions/:id/mission-focus",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_MISSION_FOCUS.template(),
             get(get_mission_focus_handler)
                 .put(set_mission_focus_handler)
                 .delete(clear_mission_focus_handler),
         )
         .route(
-            "/api/sessions/:id/ensure",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_ENSURE.template(),
             post(ensure_surface_session_handler),
         )
-        .route("/api/sessions/:id/branch", post(branch_session_handler))
-        .route("/api/sessions/:id/archive", post(archive_session_handler))
-        .route("/api/sessions/:id/attach", post(attach_session_handler))
-        .route("/api/sessions/:id/detach", post(detach_session_handler))
         .route(
-            "/api/sessions/:id/lifecycle",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_BRANCH.template(),
+            post(branch_session_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_ARCHIVE.template(),
+            post(archive_session_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_ATTACH.template(),
+            post(attach_session_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_DETACH.template(),
+            post(detach_session_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_LIFECYCLE.template(),
             get(session_lifecycle_handler),
         )
-        .route("/api/sessions/:id/replay", get(replay_session_handler))
         .route(
-            "/api/sessions/:id/cancel",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_REPLAY.template(),
+            get(replay_session_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_CANCEL.template(),
             post(cancel_session_turn_handler),
         )
         .route(
-            "/api/sessions/:id/finalize",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_FINALIZE.template(),
             post(finalize_session_turn_handler),
         )
         .route(
-            "/api/sessions/:id",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID.template(),
             get(get_session)
                 .patch(update_session_handler)
                 .delete(delete_session),
         )
-        .route("/api/sessions/:id/events", get(get_session_events))
         .route(
-            "/api/sessions/:id/execution",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_EVENTS.template(),
+            get(get_session_events),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_EXECUTION.template(),
             get(get_session_execution_index),
         )
         .route(
-            "/api/sessions/:id/execution/live",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_EXECUTION_LIVE.template(),
             get(get_session_execution_live),
         )
         .route(
-            "/api/sessions/:id/history-index",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_HISTORY_INDEX.template(),
             get(get_session_history_index),
         )
         .route(
-            "/api/sessions/:id/turns/:turn_id/evidence",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_TURNS_BY_TURN_ID_EVIDENCE.template(),
             get(get_turn_evidence),
         )
-        .route("/api/sessions/:id/compact", post(compact_session_handler))
-        .route("/api/sessions/:id/stats", get(get_session_stats_handler))
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_COMPACT.template(),
+            post(compact_session_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_STATS.template(),
+            get(get_session_stats_handler),
+        )
 }
 
 async fn get_session_execution_policy(

@@ -20,24 +20,54 @@ use super::{
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/health", get(health_handler))
-        .route("/healthz", get(gateway_health_handler))
-        .route("/readyz", get(gateway_ready_handler))
-        .route("/api/webui/manifest", get(webui_manifest_handler))
+        .route(
+            surface::gateway_api::paths::HEALTH.template(),
+            get(health_handler),
+        )
+        .route(
+            surface::gateway_api::paths::HEALTHZ.template(),
+            get(gateway_health_handler),
+        )
+        .route(
+            surface::gateway_api::paths::READYZ.template(),
+            get(gateway_ready_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_WEBUI_MANIFEST.template(),
+            get(webui_manifest_handler),
+        )
         // Schema and route inventory are static documentation, not runtime
         // control data. Keeping them public allows typed clients to generate
         // against a Gateway before a local human credential exists; all
         // operational endpoints remain behind the authenticated router.
-        .route("/api/gateway/route-manifest", get(route_manifest_handler))
         .route(
-            "/api/gateway/capability-contract",
+            surface::gateway_api::paths::API_GATEWAY_ROUTE_MANIFEST.template(),
+            get(route_manifest_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_GATEWAY_CAPABILITY_CONTRACT.template(),
             get(capability_contract_handler),
         )
-        .route("/api/gateway/openapi.json", get(openapi_handler))
-        .route("/api/gateway/openai-tools", get(openai_tools_handler))
-        .route("/api/auth/login", post(login_handler))
-        .route("/api/auth/verify", get(verify_handler))
-        .route("/api/auth/logout", post(logout_handler))
+        .route(
+            surface::gateway_api::paths::API_GATEWAY_OPENAPI_JSON.template(),
+            get(openapi_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_GATEWAY_OPENAI_TOOLS.template(),
+            get(openai_tools_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_AUTH_LOGIN.template(),
+            post(login_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_AUTH_VERIFY.template(),
+            get(verify_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_AUTH_LOGOUT.template(),
+            post(logout_handler),
+        )
 }
 
 async fn health_handler() -> &'static str {

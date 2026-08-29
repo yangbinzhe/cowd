@@ -85,35 +85,35 @@ fn require_runtime_maintenance(
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
-            "/api/runtime/managed-agents",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS.template(),
             get(managed_agent_projection_handler),
         )
         .route(
-            "/api/runtime/managed-agents/definitions",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_DEFINITIONS.template(),
             get(managed_agent_definitions_handler).post(managed_agent_definition_create_handler),
         )
         .route(
-            "/api/runtime/managed-agents/definitions/:id",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_DEFINITIONS_BY_ID.template(),
             delete(managed_agent_definition_delete_handler),
         )
         .route(
-            "/api/runtime/managed-agents/:id/trigger",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_BY_ID_TRIGGER.template(),
             post(managed_agent_manual_trigger_handler),
         )
         .route(
-            "/api/runtime/managed-agents/:id/health/reset",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_BY_ID_HEALTH_RESET.template(),
             post(managed_agent_health_reset_handler),
         )
         .route(
-            "/api/runtime/managed-agents/dispatch",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_DISPATCH.template(),
             post(managed_agent_dispatch_handler),
         )
         .route(
-            "/api/runtime/managed-agents/events",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_EVENTS.template(),
             post(managed_agent_event_handler),
         )
         .route(
-            "/api/runtime/managed-agents/effects",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_EFFECTS.template(),
             get(managed_agent_effects_handler),
         )
 }

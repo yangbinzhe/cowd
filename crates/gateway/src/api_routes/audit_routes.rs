@@ -10,7 +10,10 @@ use axum::{
 use super::{AppState, AuthenticatedPrincipal};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/audit/export", get(audit_export_handler))
+    Router::new().route(
+        surface::gateway_api::paths::API_AUDIT_EXPORT.template(),
+        get(audit_export_handler),
+    )
 }
 
 async fn audit_export_handler(

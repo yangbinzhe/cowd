@@ -17,38 +17,38 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/platforms", get(list_platforms_handler))
-        .route("/api/platforms/:name", get(get_platform_handler))
+        .route(surface::gateway_api::paths::API_PLATFORMS.template(), get(list_platforms_handler))
+        .route(surface::gateway_api::paths::API_PLATFORMS_BY_NAME.template(), get(get_platform_handler))
         .route(
-            "/api/message-connectors",
+            surface::gateway_api::paths::API_MESSAGE_CONNECTORS.template(),
             get(list_message_connectors_handler),
         )
         .route(
-            "/api/message-connectors/:name/status",
+            surface::gateway_api::paths::API_MESSAGE_CONNECTORS_BY_NAME_STATUS.template(),
             get(get_message_connector_status_handler),
         )
         .route(
-            "/api/message-connectors/:name/repair",
+            surface::gateway_api::paths::API_MESSAGE_CONNECTORS_BY_NAME_REPAIR.template(),
             post(repair_message_connector_handler),
         )
         .route(
-            "/api/message-connectors/wechat-ilink/accounts",
+            surface::gateway_api::paths::API_MESSAGE_CONNECTORS_WECHAT_ILINK_ACCOUNTS.template(),
             get(wechat_ilink_accounts_handler),
         )
         .route(
-            "/api/message-connectors/wechat-ilink/actions/account.login_qr.start",
+            surface::gateway_api::paths::API_MESSAGE_CONNECTORS_WECHAT_ILINK_ACTIONS_ACCOUNT_LOGIN_QR_START.template(),
             post(wechat_ilink_qr_start_handler),
         )
         .route(
-            "/api/message-connectors/wechat-ilink/actions/account.login_qr.poll",
+            surface::gateway_api::paths::API_MESSAGE_CONNECTORS_WECHAT_ILINK_ACTIONS_ACCOUNT_LOGIN_QR_POLL.template(),
             post(wechat_ilink_qr_poll_handler),
         )
         .route(
-            "/api/message-endpoints",
+            surface::gateway_api::paths::API_MESSAGE_ENDPOINTS.template(),
             get(list_message_endpoints_handler),
         )
-        .route("/api/message-routes", get(list_message_routes_handler))
-        .route("/api/message-bindings", get(list_message_bindings_handler))
+        .route(surface::gateway_api::paths::API_MESSAGE_ROUTES.template(), get(list_message_routes_handler))
+        .route(surface::gateway_api::paths::API_MESSAGE_BINDINGS.template(), get(list_message_bindings_handler))
 }
 
 #[derive(Debug, Deserialize)]

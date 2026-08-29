@@ -15,21 +15,42 @@ use crate::services::ApprovalPendingFilter;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/approval/pending", get(approval_pending_handler))
-        .route("/api/approval/respond", post(approval_respond_handler))
-        .route("/api/approval/prune", post(approval_prune_handler))
-        .route("/api/approval/risk-receipt", post(risk_receipt_handler))
         .route(
-            "/api/approval/config",
+            surface::gateway_api::paths::API_APPROVAL_PENDING.template(),
+            get(approval_pending_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPROVAL_RESPOND.template(),
+            post(approval_respond_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPROVAL_PRUNE.template(),
+            post(approval_prune_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPROVAL_RISK_RECEIPT.template(),
+            post(risk_receipt_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPROVAL_CONFIG.template(),
             get(approval_config_handler).put(update_approval_config_handler),
         )
-        .route("/api/approval/history", get(approval_history_handler))
-        .route("/api/approval/grants", get(approval_grants_handler))
         .route(
-            "/api/approval/grants/:id/revoke",
+            surface::gateway_api::paths::API_APPROVAL_HISTORY.template(),
+            get(approval_history_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPROVAL_GRANTS.template(),
+            get(approval_grants_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_APPROVAL_GRANTS_BY_ID_REVOKE.template(),
             post(approval_grant_revoke_handler),
         )
-        .route("/api/approval/:id", get(approval_exact_handler))
+        .route(
+            surface::gateway_api::paths::API_APPROVAL_BY_ID.template(),
+            get(approval_exact_handler),
+        )
 }
 
 #[derive(Deserialize)]

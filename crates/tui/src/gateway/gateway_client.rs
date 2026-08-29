@@ -718,7 +718,10 @@ async fn sync_tui_live_subscription(
         match tui_live_request(
             transport,
             reqwest::Method::PATCH,
-            &format!("/api/runtime/live-subscriptions/{}", active.id),
+            &crate::gateway_client_routes::runtime::for_runtime_entity(
+                surface::gateway_api::paths::API_RUNTIME_LIVE_SUBSCRIPTIONS_BY_ID,
+                active.id.to_string(),
+            ),
             serde_json::json!({
                 "expected_revision": active.revision,
                 "idempotency_key": format!(
@@ -755,7 +758,7 @@ async fn create_tui_live_subscription(
     tui_live_request(
         transport,
         reqwest::Method::POST,
-        "/api/runtime/live-subscriptions",
+        surface::gateway_api::paths::API_RUNTIME_LIVE_SUBSCRIPTIONS.template(),
         serde_json::json!({
             "surface_instance": transport.observer_id,
             "selector": selector,
@@ -996,7 +999,9 @@ impl GatewayApiClient {
 
     /// Load and validate the Gateway-owned dynamic APP catalog.
     pub async fn app_catalog(&self) -> Result<AppCatalogV1, GatewayApiError> {
-        let value = self.get_json("/api/apps").await?;
+        let value = self
+            .get_json(surface::gateway_api::paths::API_APPS.template())
+            .await?;
         let catalog: AppCatalogV1 = serde_json::from_value(value)
             .map_err(|error| GatewayApiError::Contract(format!("invalid APP catalog: {error}")))?;
         catalog
@@ -1014,7 +1019,10 @@ impl GatewayApiClient {
             .validate()
             .map_err(|error| GatewayApiError::Contract(error.to_string()))?;
         let value = self
-            .get_json(&format!("/api/apps/{}", url_encode(&entry.app_id.0)))
+            .get_json(&crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_APPS_BY_APP_ID,
+                &[(url_encode(&entry.app_id.0)).to_string()],
+            ))
             .await?;
         let detail: GatewayAppDetailResponseV1 = serde_json::from_value(value)
             .map_err(|error| GatewayApiError::Contract(format!("invalid APP detail: {error}")))?;
@@ -1072,23 +1080,30 @@ impl GatewayApiClient {
     }
 
     pub async fn runtime_control_plane(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/runtime/control-plane").await
+        self.get_json(surface::gateway_api::paths::API_RUNTIME_CONTROL_PLANE.template())
+            .await
     }
 
     pub async fn status(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/runtime/status").await
+        self.get_json(surface::gateway_api::paths::API_RUNTIME_STATUS.template())
+            .await
     }
 
     pub async fn gateway_manifest(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/webui/manifest").await
+        self.get_json(surface::gateway_api::paths::API_WEBUI_MANIFEST.template())
+            .await
     }
 
     pub async fn slash_projection(
         &self,
         surface: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/slash?surface={}", url_encode(surface)))
-            .await
+        self.get_json(&crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_SLASH,
+            &[],
+            &format!("surface={}", url_encode(surface)),
+        ))
+        .await
     }
 
     pub async fn slash_resolve(
@@ -1097,7 +1112,7 @@ impl GatewayApiClient {
         surface: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/slash/resolve",
+            surface::gateway_api::paths::API_SLASH_RESOLVE.template(),
             serde_json::json!({
                 "input": input,
                 "surface": surface,
@@ -1113,7 +1128,7 @@ impl GatewayApiClient {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/slash/dispatch",
+            surface::gateway_api::paths::API_SLASH_DISPATCH.template(),
             serde_json::json!({
                 "command": command,
                 "args": args,
@@ -1123,7 +1138,8 @@ impl GatewayApiClient {
     }
 
     pub async fn runtime_snapshot(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/runtime/snapshot").await
+        self.get_json(surface::gateway_api::paths::API_RUNTIME_SNAPSHOT.template())
+            .await
     }
 
     pub async fn list_sessions(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -1131,8 +1147,10 @@ impl GatewayApiClient {
         let mut sessions = Vec::new();
         loop {
             let page = self
-                .get_json(&format!(
-                    "/api/sessions?limit=200&offset={offset}&sort=updated_at&order=desc"
+                .get_json(&crate::gateway_client_routes::route_with_query(
+                    surface::gateway_api::paths::API_SESSIONS,
+                    &[],
+                    &format!("limit=200&offset={offset}&sort=updated_at&order=desc"),
                 ))
                 .await?;
             let page_sessions = page
@@ -1171,7 +1189,8 @@ impl GatewayApiClient {
                 body["execution_policy_preset"] = serde_json::Value::String(preset.to_string());
             }
         }
-        self.post_json("/api/sessions", body).await
+        self.post_json(surface::gateway_api::paths::API_SESSIONS.template(), body)
+            .await
     }
 
     pub async fn rename_session(
@@ -1181,7 +1200,10 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
             .patch_json(
-                &format!("/api/sessions/{}", url_encode(session_id)),
+                &crate::gateway_client_routes::session::for_session(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID,
+                    url_encode(session_id),
+                ),
                 serde_json::json!({ "title": title }),
             )
             .await?;
@@ -1196,7 +1218,10 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
             .patch_json(
-                &format!("/api/sessions/{}", url_encode(session_id)),
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID,
+                    &[(url_encode(session_id)).to_string()],
+                ),
                 serde_json::json!({ "model": model }),
             )
             .await?;
@@ -1208,8 +1233,11 @@ impl GatewayApiClient {
         &self,
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.delete_json(&format!("/api/sessions/{}", url_encode(session_id)))
-            .await
+        self.delete_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID,
+            &[(url_encode(session_id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn branch_session(
@@ -1217,7 +1245,10 @@ impl GatewayApiClient {
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/sessions/{}/branch", url_encode(session_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_BRANCH,
+                &[(url_encode(session_id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
@@ -1228,7 +1259,10 @@ impl GatewayApiClient {
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
-            .get_json(&format!("/api/sessions/{}/stats", url_encode(session_id)))
+            .get_json(&crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_STATS,
+                &[(url_encode(session_id)).to_string()],
+            ))
             .await?;
         validate_session_json_identity(session_id, &value, "session stats")?;
         Ok(value)
@@ -1239,9 +1273,9 @@ impl GatewayApiClient {
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/input-projection",
-                url_encode(session_id)
+            .get_json(&crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_INPUT_PROJECTION,
+                &[(url_encode(session_id)).to_string()],
             ))
             .await?;
         validate_session_json_identity(session_id, &value, "session input projection")?;
@@ -1256,10 +1290,12 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
             .post_json(
-                &format!(
-                    "/api/sessions/{}/inputs/{}/cancel",
-                    url_encode(session_id),
-                    url_encode(input_id)
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID_INPUTS_BY_INPUT_ID_CANCEL,
+                    &[
+                        (url_encode(session_id)).to_string(),
+                        (url_encode(input_id)).to_string(),
+                    ],
                 ),
                 serde_json::json!({ "reason": reason }),
             )
@@ -1278,10 +1314,10 @@ impl GatewayApiClient {
             .map(|value| format!("?turn_id={}", url_encode(value)))
             .unwrap_or_default();
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/turn-inbox{}",
-                url_encode(session_id),
-                suffix
+            .get_json(&crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_TURN_INBOX,
+                &[url_encode(session_id)],
+                &suffix,
             ))
             .await?;
         validate_session_json_identity(session_id, &value, "turn inbox")?;
@@ -1295,7 +1331,10 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         require_gateway_session_operation_ok(
             self.post_json(
-                &format!("/api/sessions/{}/ensure", url_encode(session_id)),
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID_ENSURE,
+                    &[(url_encode(session_id)).to_string()],
+                ),
                 serde_json::json!({ "model": model }),
             )
             .await?,
@@ -1311,10 +1350,10 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<SessionMessagesPage, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/messages?from_seq={from_sequence}&limit={}",
-                url_encode(session_id),
-                limit.min(500)
+            .get_json(&crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_MESSAGES,
+                &[(url_encode(session_id)).to_string()],
+                &format!("from_seq={from_sequence}&limit={}", limit.min(500)),
             ))
             .await?;
         let page: SessionMessagesPage = serde_json::from_value(value).map_err(|error| {
@@ -1331,10 +1370,10 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<SessionMessagesPage, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/messages?offset={offset}&limit={}",
-                url_encode(session_id),
-                limit.min(500)
+            .get_json(&crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_MESSAGES,
+                &[(url_encode(session_id)).to_string()],
+                &format!("offset={offset}&limit={}", limit.min(500)),
             ))
             .await?;
         let page: SessionMessagesPage = serde_json::from_value(value).map_err(|error| {
@@ -1366,9 +1405,10 @@ impl GatewayApiClient {
         session_id: &str,
     ) -> Result<crate::protocol::SessionHistoryIndexProjection, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/history-index?metadata_limit=128&card_limit=64",
-                url_encode(session_id)
+            .get_json(&crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_HISTORY_INDEX,
+                &[(url_encode(session_id)).to_string()],
+                "metadata_limit=128&card_limit=64",
             ))
             .await?;
         let projection =
@@ -1390,9 +1430,9 @@ impl GatewayApiClient {
         session_id: &str,
     ) -> Result<crate::protocol::SessionExecutionIndexProjection, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/execution",
-                url_encode(session_id)
+            .get_json(&crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_EXECUTION,
+                &[(url_encode(session_id)).to_string()],
             ))
             .await?;
         let index: crate::protocol::SessionExecutionIndexProjection = serde_json::from_value(value)
@@ -1413,9 +1453,9 @@ impl GatewayApiClient {
         session_id: &str,
     ) -> Result<harness_contract::policy::SessionExecutionPolicyResponse, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/execution-policy",
-                url_encode(session_id)
+            .get_json(&crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_EXECUTION_POLICY,
+                &[(url_encode(session_id)).to_string()],
             ))
             .await?;
         let response = serde_json::from_value::<
@@ -1442,7 +1482,10 @@ impl GatewayApiClient {
     ) -> Result<harness_contract::policy::SessionExecutionPolicyResponse, GatewayApiError> {
         let value = self
             .put_json(
-                &format!("/api/sessions/{}/execution-policy", url_encode(session_id)),
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID_EXECUTION_POLICY,
+                    &[(url_encode(session_id)).to_string()],
+                ),
                 serde_json::json!({
                     "preset": preset,
                     "expected_revision": expected_revision,
@@ -1474,7 +1517,10 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
             .post_json(
-                &format!("/api/sessions/{}/messages", url_encode(session_id)),
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID_MESSAGES,
+                    &[(url_encode(session_id)).to_string()],
+                ),
                 serde_json::json!({
                     "content": content,
                     "resource_ids": resource_ids,
@@ -1545,7 +1591,8 @@ impl GatewayApiClient {
     }
 
     pub async fn workspace_overview(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/workspace").await
+        self.get_json(surface::gateway_api::paths::API_WORKSPACE.template())
+            .await
     }
 
     pub async fn workspace_files(
@@ -1553,8 +1600,14 @@ impl GatewayApiClient {
         dir: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let path = match dir.map(str::trim).filter(|dir| !dir.is_empty()) {
-            Some(dir) => format!("/api/workspace/files?dir={}", url_encode(dir)),
-            None => "/api/workspace/files".to_string(),
+            Some(dir) => crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_WORKSPACE_FILES,
+                &[],
+                &format!("dir={}", url_encode(dir)),
+            ),
+            None => surface::gateway_api::paths::API_WORKSPACE_FILES
+                .template()
+                .to_string(),
         };
         self.get_json(&path).await
     }
@@ -1565,8 +1618,17 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let mut path = match dir.map(str::trim).filter(|dir| !dir.is_empty()) {
-            Some(dir) => format!("/api/workspace/files?dir={}", url_encode(dir)),
-            None => "/api/workspace/files?".to_string(),
+            Some(dir) => crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_WORKSPACE_FILES,
+                &[],
+                &format!("dir={}", url_encode(dir)),
+            ),
+            None => crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_WORKSPACE_FILES,
+                &[],
+                "",
+            )
+            .to_string(),
         };
         if !path.ends_with('?') && !path.ends_with('&') {
             path.push('&');
@@ -1582,7 +1644,7 @@ impl GatewayApiClient {
         content: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/workspace/files",
+            surface::gateway_api::paths::API_WORKSPACE_FILES.template(),
             serde_json::json!({ "path": path, "content": content }),
         )
         .await
@@ -1592,16 +1654,23 @@ impl GatewayApiClient {
         &self,
         path: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/workspace/dirs", serde_json::json!({ "path": path }))
-            .await
+        self.post_json(
+            surface::gateway_api::paths::API_WORKSPACE_DIRS.template(),
+            serde_json::json!({ "path": path }),
+        )
+        .await
     }
 
     pub async fn delete_workspace_path(
         &self,
         path: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.delete_json(&format!("/api/workspace/files?path={}", url_encode(path)))
-            .await
+        self.delete_json(&crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_WORKSPACE_FILES,
+            &[],
+            &format!("path={}", url_encode(path)),
+        ))
+        .await
     }
 
     pub async fn rename_workspace_path(
@@ -1610,21 +1679,26 @@ impl GatewayApiClient {
         to: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/workspace/rename",
+            surface::gateway_api::paths::API_WORKSPACE_RENAME.template(),
             serde_json::json!({ "path": path, "to": to }),
         )
         .await
     }
 
     pub async fn workspace_meta(&self, path: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/workspace/meta?path={}", url_encode(path)))
-            .await
+        self.get_json(&crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_WORKSPACE_META,
+            &[],
+            &format!("path={}", url_encode(path)),
+        ))
+        .await
     }
 
     pub async fn download_workspace_path(&self, path: &str) -> Result<Vec<u8>, GatewayApiError> {
-        self.get_bytes(&format!(
-            "/api/workspace/download?path={}",
-            url_encode(path)
+        self.get_bytes(&crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_WORKSPACE_DOWNLOAD,
+            &[],
+            &format!("path={}", url_encode(path)),
         ))
         .await
     }
@@ -1635,7 +1709,11 @@ impl GatewayApiClient {
         max_bytes: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let bytes = self
-            .get_bytes(&format!("/api/file/raw?path={}", url_encode(path)))
+            .get_bytes(&crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_FILE_RAW,
+                &[],
+                &format!("path={}", url_encode(path)),
+            ))
             .await?;
         let truncated = bytes.len() > max_bytes;
         let slice = if truncated {
@@ -1685,9 +1763,9 @@ impl GatewayApiClient {
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/attachments",
-                url_encode(session_id)
+            .get_json(&crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_ATTACHMENTS,
+                &[(url_encode(session_id)).to_string()],
             ))
             .await?;
         validate_session_json_identity(session_id, &value, "session attachment list")?;
@@ -1703,7 +1781,10 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
             .post_json(
-                &format!("/api/sessions/{}/attachments", url_encode(session_id)),
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID_ATTACHMENTS,
+                    &[(url_encode(session_id)).to_string()],
+                ),
                 serde_json::json!({
                     "path": path,
                     "kind": kind,
@@ -1721,10 +1802,12 @@ impl GatewayApiClient {
         ref_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
-            .delete_json(&format!(
-                "/api/sessions/{}/attachments/{}",
-                url_encode(session_id),
-                url_encode(ref_id)
+            .delete_json(&crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_ATTACHMENTS_BY_REF_ID,
+                &[
+                    (url_encode(session_id)).to_string(),
+                    (url_encode(ref_id)).to_string(),
+                ],
             ))
             .await?;
         validate_session_json_identity(session_id, &value, "delete session attachment receipt")?;
@@ -1756,7 +1839,10 @@ impl GatewayApiClient {
             .clone();
         let value = self
             .post_json(
-                &format!("/api/sessions/{}/cancel", url_encode(session_id)),
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID_CANCEL,
+                    &[(url_encode(session_id)).to_string()],
+                ),
                 serde_json::json!({
                     "reason": reason,
                     "cancellation_id": cancellation_id,
@@ -1901,7 +1987,10 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         require_gateway_session_operation_ok(
             self.post_json(
-                &format!("/api/sessions/{}/attach", url_encode(session_id)),
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID_ATTACH,
+                    &[(url_encode(session_id)).to_string()],
+                ),
                 serde_json::json!({ "surface": surface, "role": role }),
             )
             .await?,
@@ -1917,7 +2006,10 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         require_gateway_session_operation_ok(
             self.post_json(
-                &format!("/api/sessions/{}/detach", url_encode(session_id)),
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_SESSIONS_BY_ID_DETACH,
+                    &[(url_encode(session_id)).to_string()],
+                ),
                 serde_json::json!({ "surface": surface }),
             )
             .await?,
@@ -1933,15 +2025,18 @@ impl GatewayApiClient {
         match session_id {
             Some(session_id) => {
                 let value = self
-                    .get_json(&format!(
-                        "/api/sessions/{}/lifecycle",
-                        url_encode(session_id)
+                    .get_json(&crate::gateway_client_routes::render_route(
+                        surface::gateway_api::paths::API_SESSIONS_BY_ID_LIFECYCLE,
+                        &[(url_encode(session_id)).to_string()],
                     ))
                     .await?;
                 validate_session_json_identity(session_id, &value, "session lifecycle snapshot")?;
                 Ok(value)
             }
-            None => self.get_json("/api/runtime/snapshot").await,
+            None => {
+                self.get_json(surface::gateway_api::paths::API_RUNTIME_SNAPSHOT.template())
+                    .await
+            }
         }
     }
 
@@ -1952,9 +2047,10 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let value = self
-            .get_json(&format!(
-                "/api/sessions/{}/replay?from_sequence={from_sequence}&limit={limit}",
-                url_encode(session_id)
+            .get_json(&crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_REPLAY,
+                &[(url_encode(session_id)).to_string()],
+                &format!("from_sequence={from_sequence}&limit={limit}"),
             ))
             .await?;
         validate_session_json_identity(session_id, &value, "session replay")?;
@@ -1962,62 +2058,76 @@ impl GatewayApiClient {
     }
 
     pub async fn cowd_capabilities(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/cowd/capabilities").await
+        self.get_json(surface::gateway_api::paths::API_COWD_CAPABILITIES.template())
+            .await
     }
 
     pub async fn cowd_projection(
         &self,
         surface: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/cowd/projection?surface={}",
-            url_encode(surface)
+        self.get_json(&crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_COWD_PROJECTION,
+            &[],
+            &format!("surface={}", url_encode(surface)),
         ))
         .await
     }
 
     pub async fn cowd_surfaces(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/cowd/surfaces").await
+        self.get_json(surface::gateway_api::paths::API_COWD_SURFACES.template())
+            .await
     }
 
     pub async fn cowd_release_gate(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/cowd/release-gate").await
+        self.get_json(surface::gateway_api::paths::API_COWD_RELEASE_GATE.template())
+            .await
     }
 
     pub async fn gateway_capability_contract(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/gateway/capability-contract").await
+        self.get_json(surface::gateway_api::paths::API_GATEWAY_CAPABILITY_CONTRACT.template())
+            .await
     }
 
     pub async fn gateway_openai_tools(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/gateway/openai-tools").await
+        self.get_json(surface::gateway_api::paths::API_GATEWAY_OPENAI_TOOLS.template())
+            .await
     }
 
     pub async fn structured_sources(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/cowd/structured/sources").await
+        self.get_json(surface::gateway_api::paths::API_COWD_STRUCTURED_SOURCES.template())
+            .await
     }
 
     pub async fn structured_facts(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/cowd/structured/facts").await
+        self.get_json(surface::gateway_api::paths::API_COWD_STRUCTURED_FACTS.template())
+            .await
     }
 
     pub async fn structured_evidence(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/cowd/structured/evidence").await
+        self.get_json(surface::gateway_api::paths::API_COWD_STRUCTURED_EVIDENCE.template())
+            .await
     }
 
     pub async fn structured_watermarks(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/cowd/structured/watermarks").await
+        self.get_json(surface::gateway_api::paths::API_COWD_STRUCTURED_WATERMARKS.template())
+            .await
     }
 
     pub async fn structured_ingest_plan(
         &self,
         input: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/cowd/structured/ingest-plan", input)
-            .await
+        self.post_json(
+            surface::gateway_api::paths::API_COWD_STRUCTURED_INGEST_PLAN.template(),
+            input,
+        )
+        .await
     }
 
     pub async fn runtime_session_leases(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/runtime/session-leases").await
+        self.get_json(surface::gateway_api::paths::API_RUNTIME_SESSION_LEASES.template())
+            .await
     }
 
     pub async fn acquire_runtime_session_lease(
@@ -2027,7 +2137,7 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         require_gateway_session_operation_ok(
             self.post_json(
-                "/api/runtime/session-leases/acquire",
+                surface::gateway_api::paths::API_RUNTIME_SESSION_LEASES_ACQUIRE.template(),
                 serde_json::json!({
                     "session_id": session_id,
                     "mode": mode,
@@ -2045,7 +2155,7 @@ impl GatewayApiClient {
     ) -> Result<serde_json::Value, GatewayApiError> {
         require_gateway_session_operation_ok(
             self.post_json(
-                "/api/runtime/session-leases/release",
+                surface::gateway_api::paths::API_RUNTIME_SESSION_LEASES_RELEASE.template(),
                 serde_json::json!({
                     "session_id": session_id,
                 }),
@@ -2057,27 +2167,34 @@ impl GatewayApiClient {
     }
 
     pub async fn runtime_effective_config(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/runtime/config/effective").await
+        self.get_json(surface::gateway_api::paths::API_RUNTIME_CONFIG_EFFECTIVE.template())
+            .await
     }
 
     pub async fn config(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/config").await
+        self.get_json(surface::gateway_api::paths::API_CONFIG.template())
+            .await
     }
 
     pub async fn config_providers(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/config/providers").await
+        self.get_json(surface::gateway_api::paths::API_CONFIG_PROVIDERS.template())
+            .await
     }
 
     pub async fn update_config_model(
         &self,
         model: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.put_json("/api/config", serde_json::json!({ "model": model }))
-            .await
+        self.put_json(
+            surface::gateway_api::paths::API_CONFIG.template(),
+            serde_json::json!({ "model": model }),
+        )
+        .await
     }
 
     pub async fn config_reload_status(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/runtime/config/reload/status").await
+        self.get_json(surface::gateway_api::paths::API_RUNTIME_CONFIG_RELOAD_STATUS.template())
+            .await
     }
 
     pub async fn runtime_timeline(
@@ -2085,10 +2202,10 @@ impl GatewayApiClient {
         session_id: &str,
         limit: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/runtime/timeline?session_id={}&limit={}",
-            url_encode(session_id),
-            limit
+        self.get_json(&crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_RUNTIME_TIMELINE,
+            &[],
+            &format!("session_id={}&limit={}", url_encode(session_id), limit),
         ))
         .await
     }
@@ -2100,9 +2217,10 @@ impl GatewayApiClient {
     ) -> Result<harness_contract::projection::ExecutionProjection, GatewayApiError> {
         let scope = if full { "full" } else { "summary" };
         let value = self
-            .get_json(&format!(
-                "/api/runtime/executions/{}?detail_scope={scope}",
-                url_encode(execution_id)
+            .get_json(&crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_RUNTIME_EXECUTIONS_BY_ID,
+                &[(url_encode(execution_id)).to_string()],
+                &format!("detail_scope={scope}"),
             ))
             .await?;
         let projection: harness_contract::projection::ExecutionProjection =
@@ -2490,9 +2608,9 @@ impl GatewayApiClient {
             .map_err(|error| GatewayApiError::Url(error.to_string()))?;
         let value = self
             .post_json(
-                &format!(
-                    "/api/runtime/executions/{}/commands",
-                    url_encode(execution_id)
+                &crate::gateway_client_routes::render_route(
+                    surface::gateway_api::paths::API_RUNTIME_EXECUTIONS_BY_ID_COMMANDS,
+                    &[(url_encode(execution_id)).to_string()],
                 ),
                 body,
             )
@@ -2505,37 +2623,49 @@ impl GatewayApiClient {
         session_id: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let path = match session_id {
-            Some(id) if !id.trim().is_empty() => {
-                format!("/api/context/current?session_id={}", url_encode(id))
-            }
-            _ => "/api/context/current".to_string(),
+            Some(id) if !id.trim().is_empty() => crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_CONTEXT_CURRENT,
+                &[],
+                &format!("session_id={}", url_encode(id)),
+            ),
+            _ => surface::gateway_api::paths::API_CONTEXT_CURRENT
+                .template()
+                .to_string(),
         };
         self.get_json(&path).await
     }
 
     pub async fn memory_status(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/memory/status").await
-    }
-
-    pub async fn memory_maintenance(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/memory/maintenance").await
-    }
-
-    pub async fn run_memory_maintenance(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/memory/maintenance", serde_json::json!({}))
+        self.get_json(surface::gateway_api::paths::API_MEMORY_STATUS.template())
             .await
     }
 
+    pub async fn memory_maintenance(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(surface::gateway_api::paths::API_MEMORY_MAINTENANCE.template())
+            .await
+    }
+
+    pub async fn run_memory_maintenance(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.post_json(
+            surface::gateway_api::paths::API_MEMORY_MAINTENANCE.template(),
+            serde_json::json!({}),
+        )
+        .await
+    }
+
     pub async fn memory_knowledge_candidates(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/memory/knowledge/candidates").await
+        self.get_json(surface::gateway_api::paths::API_MEMORY_KNOWLEDGE_CANDIDATES.template())
+            .await
     }
 
     pub async fn reality_status(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/reality/status").await
+        self.get_json(surface::gateway_api::paths::API_REALITY_STATUS.template())
+            .await
     }
 
     pub async fn reality_capabilities(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/reality/capabilities").await
+        self.get_json(surface::gateway_api::paths::API_REALITY_CAPABILITIES.template())
+            .await
     }
 
     pub async fn reality_flow(
@@ -2543,31 +2673,40 @@ impl GatewayApiClient {
         session_id: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         let path = match session_id.map(str::trim).filter(|id| !id.is_empty()) {
-            Some(id) => format!("/api/reality/flow?session_id={}", url_encode(id)),
-            None => "/api/reality/flow".to_string(),
+            Some(id) => crate::gateway_client_routes::route_with_query(
+                surface::gateway_api::paths::API_REALITY_FLOW,
+                &[],
+                &format!("session_id={}", url_encode(id)),
+            ),
+            None => surface::gateway_api::paths::API_REALITY_FLOW
+                .template()
+                .to_string(),
         };
         self.get_json(&path).await
     }
 
     pub async fn reality_boundaries(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/reality/boundaries").await
+        self.get_json(surface::gateway_api::paths::API_REALITY_BOUNDARIES.template())
+            .await
     }
 
     pub async fn reality_governance(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/reality/governance").await
+        self.get_json(surface::gateway_api::paths::API_REALITY_GOVERNANCE.template())
+            .await
     }
 
     pub async fn task_status(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/tasks").await
+        self.get_json(surface::gateway_api::paths::API_TASKS.template())
+            .await
     }
 
     pub async fn session_task_focus(
         &self,
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/sessions/{}/task-focus",
-            url_encode(session_id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_TASK_FOCUS,
+            &[(url_encode(session_id)).to_string()],
         ))
         .await
     }
@@ -2579,7 +2718,10 @@ impl GatewayApiClient {
         expected_revision: u64,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.put_json(
-            &format!("/api/sessions/{}/task-focus", url_encode(session_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_TASK_FOCUS,
+                &[(url_encode(session_id)).to_string()],
+            ),
             serde_json::json!({
                 "task_id": task_id,
                 "expected_revision": expected_revision,
@@ -2594,7 +2736,10 @@ impl GatewayApiClient {
         expected_revision: u64,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.delete_json_with_body(
-            &format!("/api/sessions/{}/task-focus", url_encode(session_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_TASK_FOCUS,
+                &[(url_encode(session_id)).to_string()],
+            ),
             serde_json::json!({ "expected_revision": expected_revision }),
         )
         .await
@@ -2604,9 +2749,9 @@ impl GatewayApiClient {
         &self,
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/sessions/{}/mission-focus",
-            url_encode(session_id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_MISSION_FOCUS,
+            &[(url_encode(session_id)).to_string()],
         ))
         .await
     }
@@ -2618,7 +2763,10 @@ impl GatewayApiClient {
         expected_revision: u64,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.put_json(
-            &format!("/api/sessions/{}/mission-focus", url_encode(session_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_MISSION_FOCUS,
+                &[(url_encode(session_id)).to_string()],
+            ),
             serde_json::json!({
                 "mission_id": mission_id,
                 "expected_revision": expected_revision,
@@ -2633,23 +2781,32 @@ impl GatewayApiClient {
         expected_revision: u64,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.delete_json_with_body(
-            &format!("/api/sessions/{}/mission-focus", url_encode(session_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SESSIONS_BY_ID_MISSION_FOCUS,
+                &[(url_encode(session_id)).to_string()],
+            ),
             serde_json::json!({ "expected_revision": expected_revision }),
         )
         .await
     }
 
     pub async fn pending_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/approval/pending").await
-    }
-
-    pub async fn approval_history(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/approval/history?limit=200&offset=0")
+        self.get_json(surface::gateway_api::paths::API_APPROVAL_PENDING.template())
             .await
     }
 
+    pub async fn approval_history(&self) -> Result<serde_json::Value, GatewayApiError> {
+        self.get_json(&crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_APPROVAL_HISTORY,
+            &[],
+            "limit=200&offset=0",
+        ))
+        .await
+    }
+
     pub async fn approval_grants(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/approval/grants").await
+        self.get_json(surface::gateway_api::paths::API_APPROVAL_GRANTS.template())
+            .await
     }
 
     pub async fn revoke_approval_grant(
@@ -2658,7 +2815,10 @@ impl GatewayApiClient {
         reason: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/approval/grants/{}/revoke", url_encode(grant_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_APPROVAL_GRANTS_BY_ID_REVOKE,
+                &[(url_encode(grant_id)).to_string()],
+            ),
             serde_json::json!({ "reason": reason }),
         )
         .await
@@ -2668,16 +2828,21 @@ impl GatewayApiClient {
         &self,
         approval_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/approval/{}", url_encode(approval_id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_APPROVAL_BY_ID,
+            &[(url_encode(approval_id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn mission_projection(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/mission/projection").await
+        self.get_json(surface::gateway_api::paths::API_MISSION_PROJECTION.template())
+            .await
     }
 
     pub async fn mission_control(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/mission/control").await
+        self.get_json(surface::gateway_api::paths::API_MISSION_CONTROL.template())
+            .await
     }
 
     async fn mission_control_snapshot(
@@ -2696,47 +2861,68 @@ impl GatewayApiClient {
         &self,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/schedules/tick", body).await
+        self.post_json(
+            surface::gateway_api::paths::API_MISSION_SCHEDULES_TICK.template(),
+            body,
+        )
+        .await
     }
 
     pub async fn apply_runtime_recovery(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/runtime/events/recover", serde_json::json!({}))
-            .await
+        self.post_json(
+            surface::gateway_api::paths::API_RUNTIME_EVENTS_RECOVER.template(),
+            serde_json::json!({}),
+        )
+        .await
     }
 
     pub async fn mission_session_detail(
         &self,
         session_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/mission/sessions/{}", url_encode(session_id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_MISSION_SESSIONS_BY_ID,
+            &[(url_encode(session_id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn mission_approvals(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/mission/approvals").await
+        self.get_json(surface::gateway_api::paths::API_MISSION_APPROVALS.template())
+            .await
     }
 
     pub async fn mission_relations(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/mission/relations").await
+        self.get_json(surface::gateway_api::paths::API_MISSION_RELATIONS.template())
+            .await
     }
 
     pub async fn submit_mission_approval(
         &self,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/approvals", body).await
+        self.post_json(
+            surface::gateway_api::paths::API_MISSION_APPROVALS.template(),
+            body,
+        )
+        .await
     }
 
     pub async fn execute_mission_command(
         &self,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/control", body).await
+        self.post_json(
+            surface::gateway_api::paths::API_MISSION_CONTROL.template(),
+            body,
+        )
+        .await
     }
 
     /// Read the Runtime-owned catalog of runnable Team template revisions.
     pub async fn team_templates(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/team-templates").await
+        self.get_json(surface::gateway_api::paths::API_TEAM_TEMPLATES.template())
+            .await
     }
 
     /// Submit declarative Team intent. Gateway forwards it to Runtime, which
@@ -2745,17 +2931,20 @@ impl GatewayApiClient {
         &self,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/team-templates/instantiate", body)
-            .await
+        self.post_json(
+            surface::gateway_api::paths::API_TEAM_TEMPLATES_INSTANTIATE.template(),
+            body,
+        )
+        .await
     }
 
     pub async fn team_working_state(
         &self,
         team_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/runtime/teams/{}/working-state",
-            url_encode(team_id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_RUNTIME_TEAMS_BY_ID_WORKING_STATE,
+            &[(url_encode(team_id)).to_string()],
         ))
         .await
     }
@@ -2766,9 +2955,9 @@ impl GatewayApiClient {
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/mission/approvals/{}/decision",
-                url_encode(approval_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_MISSION_APPROVALS_BY_ID_DECISION,
+                &[(url_encode(approval_id)).to_string()],
             ),
             body,
         )
@@ -2779,7 +2968,11 @@ impl GatewayApiClient {
         &self,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/mission/proxies", body).await
+        self.post_json(
+            surface::gateway_api::paths::API_MISSION_PROXIES.template(),
+            body,
+        )
+        .await
     }
 
     pub async fn runtime_agent_input(
@@ -2788,7 +2981,10 @@ impl GatewayApiClient {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/runtime/agents/{}/input", url_encode(agent_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID_INPUT,
+                &[(url_encode(agent_id)).to_string()],
+            ),
             serde_json::json!({ "payload": payload }),
         )
         .await
@@ -2800,7 +2996,10 @@ impl GatewayApiClient {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/runtime/agents/{}/interrupt", url_encode(agent_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID_INTERRUPT,
+                &[(url_encode(agent_id)).to_string()],
+            ),
             serde_json::json!({ "payload": payload }),
         )
         .await
@@ -2812,7 +3011,10 @@ impl GatewayApiClient {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/runtime/agents/{}/shutdown", url_encode(agent_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_RUNTIME_AGENTS_BY_ID_SHUTDOWN,
+                &[(url_encode(agent_id)).to_string()],
+            ),
             serde_json::json!({ "payload": payload }),
         )
         .await
@@ -2826,7 +3028,7 @@ impl GatewayApiClient {
         reason: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/approval/respond",
+            surface::gateway_api::paths::API_APPROVAL_RESPOND.template(),
             serde_json::json!({
                 "id": id,
                 "approved": approved,
@@ -2843,7 +3045,10 @@ impl GatewayApiClient {
         expected_revision: u64,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/tasks/{}/cancel", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_TASKS_BY_ID_CANCEL,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({
                 "expected_revision": expected_revision,
                 "note": "cancelled from TUI",
@@ -2859,7 +3064,10 @@ impl GatewayApiClient {
         expected_revision: u64,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/tasks/{}/complete", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_TASKS_BY_ID_COMPLETE,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({
                 "expected_revision": expected_revision,
                 "note": "completed from TUI",
@@ -2870,16 +3078,17 @@ impl GatewayApiClient {
     }
 
     pub async fn cross_plane_summary(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/cross-plane/summary").await
+        self.get_json(surface::gateway_api::paths::API_CROSS_PLANE_SUMMARY.template())
+            .await
     }
 
     pub async fn cross_plane_execution_receipt(
         &self,
         receipt_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        let path = format!(
-            "/api/cross-plane/action/executions/{}",
-            url_encode(receipt_id)
+        let path = crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_CROSS_PLANE_ACTION_EXECUTIONS_BY_ID,
+            &[(url_encode(receipt_id)).to_string()],
         );
         let response: serde_json::Value = self.get_json(&path).await?;
         Ok(response
@@ -2889,11 +3098,13 @@ impl GatewayApiClient {
     }
 
     pub async fn connector_accounts(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/connectors/accounts").await
+        self.get_json(surface::gateway_api::paths::API_CONNECTORS_ACCOUNTS.template())
+            .await
     }
 
     pub async fn connector_capabilities(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/connectors/capabilities").await
+        self.get_json(surface::gateway_api::paths::API_CONNECTORS_CAPABILITIES.template())
+            .await
     }
 
     pub async fn connector_resources(
@@ -2902,7 +3113,11 @@ impl GatewayApiClient {
         limit: usize,
         offset: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        let mut path = format!("/api/connectors/resources?limit={limit}&offset={offset}");
+        let mut path = crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_CONNECTORS_RESOURCES,
+            &[],
+            &format!("limit={limit}&offset={offset}"),
+        );
         if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
             path.push_str("&q=");
             path.push_str(&url_encode(query));
@@ -2911,16 +3126,17 @@ impl GatewayApiClient {
     }
 
     pub async fn message_connectors(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/message-connectors").await
+        self.get_json(surface::gateway_api::paths::API_MESSAGE_CONNECTORS.template())
+            .await
     }
 
     pub async fn message_connector_status(
         &self,
         name: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/message-connectors/{}/status",
-            url_encode(name)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_MESSAGE_CONNECTORS_BY_NAME_STATUS,
+            &[(url_encode(name)).to_string()],
         ))
         .await
     }
@@ -2930,55 +3146,78 @@ impl GatewayApiClient {
         name: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/message-connectors/{}/repair", url_encode(name)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_MESSAGE_CONNECTORS_BY_NAME_REPAIR,
+                &[(url_encode(name)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
     }
 
     pub async fn message_endpoints(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/message-endpoints").await
+        self.get_json(surface::gateway_api::paths::API_MESSAGE_ENDPOINTS.template())
+            .await
     }
 
     pub async fn message_routes(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/message-routes").await
+        self.get_json(surface::gateway_api::paths::API_MESSAGE_ROUTES.template())
+            .await
     }
 
     pub async fn message_bindings(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/message-bindings").await
+        self.get_json(surface::gateway_api::paths::API_MESSAGE_BINDINGS.template())
+            .await
     }
 
     pub async fn surface_registry(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/surfaces").await
+        self.get_json(surface::gateway_api::paths::API_SURFACES.template())
+            .await
     }
 
     pub async fn surface_health_summary(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/surfaces/health").await
+        self.get_json(surface::gateway_api::paths::API_SURFACES_HEALTH.template())
+            .await
     }
 
     pub async fn surface_detail(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_routes(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/routes", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_ROUTES,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_resources(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/resources", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_RESOURCES,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_status(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/status", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_STATUS,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_health(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/health", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_HEALTH,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_health_check(
@@ -2986,7 +3225,10 @@ impl GatewayApiClient {
         id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/surfaces/{}/health-check", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_HEALTH_CHECK,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
@@ -2994,7 +3236,10 @@ impl GatewayApiClient {
 
     pub async fn surface_start(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/surfaces/{}/start", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_START,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
@@ -3002,7 +3247,10 @@ impl GatewayApiClient {
 
     pub async fn surface_stop(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/surfaces/{}/stop", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_STOP,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
@@ -3010,7 +3258,10 @@ impl GatewayApiClient {
 
     pub async fn surface_restart(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/surfaces/{}/restart", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_RESTART,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
@@ -3018,30 +3269,45 @@ impl GatewayApiClient {
 
     pub async fn surface_repair(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/surfaces/{}/repair", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_REPAIR,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
     }
 
     pub async fn surface_events(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/events", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_EVENTS,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_inbox(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/inbox", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_INBOX,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_outbox(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/outbox", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_OUTBOX,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_messages(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/messages", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_MESSAGES,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn surface_archive_messages(
@@ -3050,7 +3316,10 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/surfaces/{}/messages/archive", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_MESSAGES_ARCHIVE,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({ "limit": limit }),
         )
         .await
@@ -3062,9 +3331,9 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/surfaces/{}/messages/purge-archived-events",
-                url_encode(id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_MESSAGES_PURGE_ARCHIVED_EVENTS,
+                &[(url_encode(id)).to_string()],
             ),
             serde_json::json!({ "limit": limit }),
         )
@@ -3072,8 +3341,13 @@ impl GatewayApiClient {
     }
 
     pub async fn surface_deliveries(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/surfaces/{}/deliveries", url_encode(id)))
-            .await
+        self.get_json(
+            &crate::gateway_client_routes::platform::for_platform_entity(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_DELIVERIES,
+                url_encode(id),
+            ),
+        )
+        .await
     }
 
     pub async fn surface_outbox_delivery(
@@ -3081,10 +3355,12 @@ impl GatewayApiClient {
         id: &str,
         delivery_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/surfaces/{}/outbox/{}",
-            url_encode(id),
-            url_encode(delivery_id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_OUTBOX_BY_DELIVERY_ID,
+            &[
+                (url_encode(id)).to_string(),
+                (url_encode(delivery_id)).to_string(),
+            ],
         ))
         .await
     }
@@ -3095,10 +3371,12 @@ impl GatewayApiClient {
         message_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/surfaces/{}/inbox/{}/replay",
-                url_encode(id),
-                url_encode(message_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_INBOX_BY_MESSAGE_ID_REPLAY,
+                &[
+                    (url_encode(id)).to_string(),
+                    (url_encode(message_id)).to_string(),
+                ],
             ),
             serde_json::json!({}),
         )
@@ -3111,10 +3389,12 @@ impl GatewayApiClient {
         delivery_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/surfaces/{}/outbox/{}/retry",
-                url_encode(id),
-                url_encode(delivery_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_OUTBOX_BY_DELIVERY_ID_RETRY,
+                &[
+                    (url_encode(id)).to_string(),
+                    (url_encode(delivery_id)).to_string(),
+                ],
             ),
             serde_json::json!({}),
         )
@@ -3128,10 +3408,12 @@ impl GatewayApiClient {
         reason: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/surfaces/{}/outbox/{}/dead-letter",
-                url_encode(id),
-                url_encode(delivery_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_OUTBOX_BY_DELIVERY_ID_DEAD_LETTER,
+                &[
+                    (url_encode(id)).to_string(),
+                    (url_encode(delivery_id)).to_string(),
+                ],
             ),
             serde_json::json!({ "reason": reason }),
         )
@@ -3147,7 +3429,10 @@ impl GatewayApiClient {
         metadata: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/surfaces/{}/send", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_SEND,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({
                 "recipient": recipient,
                 "thread": thread,
@@ -3165,7 +3450,10 @@ impl GatewayApiClient {
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/surfaces/{}/action", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_SURFACES_BY_ID_ACTION,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({
                 "action": action,
                 "payload": payload,
@@ -3175,16 +3463,25 @@ impl GatewayApiClient {
     }
 
     pub async fn skill_runs(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/skills/runs").await
+        self.get_json(surface::gateway_api::paths::API_SKILLS_RUNS.template())
+            .await
     }
 
     pub async fn skill_projection(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/skills/projection?surface=tui").await
+        self.get_json(&crate::gateway_client_routes::route_with_query(
+            surface::gateway_api::paths::API_SKILLS_PROJECTION,
+            &[],
+            "surface=tui",
+        ))
+        .await
     }
 
     pub async fn skill_run_detail(&self, id: &str) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/skills/runs/{}", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_SKILLS_RUNS_BY_ID,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn skill_action(
@@ -3193,40 +3490,51 @@ impl GatewayApiClient {
         action: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
+        let path = match action {
+            "plan" => surface::gateway_api::paths::API_SKILLS_BY_ID_ACTIONS_PLAN,
+            "run" => surface::gateway_api::paths::API_SKILLS_BY_ID_ACTIONS_RUN,
+            "validate" => surface::gateway_api::paths::API_SKILLS_BY_ID_ACTIONS_VALIDATE,
+            unsupported => {
+                return Err(GatewayApiError::Contract(format!(
+                    "unsupported skill action `{unsupported}`"
+                )))
+            }
+        };
         self.post_json(
-            &format!(
-                "/api/skills/{}/actions/{}",
-                url_encode(id),
-                url_encode(action)
-            ),
+            &crate::gateway_client_routes::render_route(path, &[url_encode(id)]),
             payload,
         )
         .await
     }
 
     pub async fn harness_eval_latest_report(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/harness-eval/reports/latest").await
+        self.get_json(surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS_LATEST.template())
+            .await
     }
 
     pub async fn harness_eval_reports(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/harness-eval/reports").await
+        self.get_json(surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS.template())
+            .await
     }
 
     pub async fn harness_eval_report(
         &self,
         id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/harness-eval/reports/{}", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS_BY_ID,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn harness_eval_report_artifacts(
         &self,
         id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/harness-eval/reports/{}/artifacts",
-            url_encode(id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS_BY_ID_ARTIFACTS,
+            &[(url_encode(id)).to_string()],
         ))
         .await
     }
@@ -3235,9 +3543,9 @@ impl GatewayApiClient {
         &self,
         id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/harness-eval/reports/{}/gate",
-            url_encode(id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_HARNESS_EVAL_REPORTS_BY_ID_GATE,
+            &[(url_encode(id)).to_string()],
         ))
         .await
     }
@@ -3246,8 +3554,11 @@ impl GatewayApiClient {
         &self,
         id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/harness-eval/runs/{}", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_HARNESS_EVAL_RUNS_BY_ID,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn harness_eval_run_smoke(&self) -> Result<serde_json::Value, GatewayApiError> {
@@ -3268,7 +3579,7 @@ impl GatewayApiClient {
         objective: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/harness-eval/runs",
+            surface::gateway_api::paths::API_HARNESS_EVAL_RUNS.template(),
             serde_json::json!({
                 "level": level,
                 "budget": budget,
@@ -3285,26 +3596,34 @@ impl GatewayApiClient {
         id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/harness-eval/runs/{}/cancel", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_HARNESS_EVAL_RUNS_BY_ID_CANCEL,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
     }
 
     pub async fn evolution_signals(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/signals").await
+        self.get_json(surface::gateway_api::paths::API_EVOLUTION_SIGNALS.template())
+            .await
     }
 
     pub async fn evolution_overview(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/overview").await
+        self.get_json(surface::gateway_api::paths::API_EVOLUTION_OVERVIEW.template())
+            .await
     }
 
     pub async fn evolution_case_detail(
         &self,
         case_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/evolution/cases/{}", url_encode(case_id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_EVOLUTION_CASES_BY_ID,
+            &[(url_encode(case_id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn evolution_analyze_case(
@@ -3312,27 +3631,32 @@ impl GatewayApiClient {
         case_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/evolution/cases/{}/analyze", url_encode(case_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_EVOLUTION_CASES_BY_ID_ANALYZE,
+                &[(url_encode(case_id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
     }
 
     pub async fn evolution_diagnoses(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/diagnoses").await
+        self.get_json(surface::gateway_api::paths::API_EVOLUTION_DIAGNOSES.template())
+            .await
     }
 
     pub async fn evolution_missions_summary(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/missions/summary").await
+        self.get_json(surface::gateway_api::paths::API_EVOLUTION_MISSIONS_SUMMARY.template())
+            .await
     }
 
     pub async fn evolution_mission_detail(
         &self,
         mission_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/evolution/missions/{}/detail",
-            url_encode(mission_id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_EVOLUTION_MISSIONS_BY_ID_DETAIL,
+            &[(url_encode(mission_id)).to_string()],
         ))
         .await
     }
@@ -3342,14 +3666,15 @@ impl GatewayApiClient {
         signal_ids: Vec<String>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/evolution/diagnoses",
+            surface::gateway_api::paths::API_EVOLUTION_DIAGNOSES.template(),
             serde_json::json!({ "signal_ids": signal_ids }),
         )
         .await
     }
 
     pub async fn evolution_proposals(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/proposals").await
+        self.get_json(surface::gateway_api::paths::API_EVOLUTION_PROPOSALS.template())
+            .await
     }
 
     pub async fn evolution_create_proposal(
@@ -3357,7 +3682,7 @@ impl GatewayApiClient {
         signal_ids: Vec<String>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/evolution/proposals",
+            surface::gateway_api::paths::API_EVOLUTION_PROPOSALS.template(),
             serde_json::json!({ "signal_ids": signal_ids }),
         )
         .await
@@ -3367,9 +3692,9 @@ impl GatewayApiClient {
         &self,
         proposal_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/evolution/proposals/{}/skill-draft",
-            url_encode(proposal_id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_EVOLUTION_PROPOSALS_BY_ID_SKILL_DRAFT,
+            &[(url_encode(proposal_id)).to_string()],
         ))
         .await
     }
@@ -3378,21 +3703,25 @@ impl GatewayApiClient {
         &self,
         proposal_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/evolution/chain/{}", url_encode(proposal_id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_EVOLUTION_CHAIN_BY_ID,
+            &[(url_encode(proposal_id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn evolution_candidates(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/candidates").await
+        self.get_json(surface::gateway_api::paths::API_EVOLUTION_CANDIDATES.template())
+            .await
     }
 
     pub async fn evolution_candidate_detail(
         &self,
         candidate_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/evolution/candidates/{}",
-            url_encode(candidate_id)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_EVOLUTION_CANDIDATES_BY_ID,
+            &[(url_encode(candidate_id)).to_string()],
         ))
         .await
     }
@@ -3401,8 +3730,11 @@ impl GatewayApiClient {
         &self,
         registration: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/evolution/candidates", registration)
-            .await
+        self.post_json(
+            surface::gateway_api::paths::API_EVOLUTION_CANDIDATES.template(),
+            registration,
+        )
+        .await
     }
 
     pub async fn evolution_candidate_canary_review(
@@ -3410,9 +3742,9 @@ impl GatewayApiClient {
         candidate_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/evolution/candidates/{}/reviews/canary",
-                url_encode(candidate_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_EVOLUTION_CANDIDATES_BY_ID_REVIEWS_CANARY,
+                &[(url_encode(candidate_id)).to_string()],
             ),
             serde_json::json!({}),
         )
@@ -3426,9 +3758,9 @@ impl GatewayApiClient {
         candidate_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/evolution/candidates/{}/evaluate",
-                url_encode(candidate_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_EVOLUTION_CANDIDATES_BY_ID_EVALUATE,
+                &[(url_encode(candidate_id)).to_string()],
             ),
             serde_json::json!({}),
         )
@@ -3440,9 +3772,9 @@ impl GatewayApiClient {
         candidate_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/evolution/candidates/{}/reviews/stable",
-                url_encode(candidate_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_EVOLUTION_CANDIDATES_BY_ID_REVIEWS_STABLE,
+                &[(url_encode(candidate_id)).to_string()],
             ),
             serde_json::json!({}),
         )
@@ -3450,15 +3782,19 @@ impl GatewayApiClient {
     }
 
     pub async fn evolution_reviews(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/reviews").await
+        self.get_json(surface::gateway_api::paths::API_EVOLUTION_REVIEWS.template())
+            .await
     }
 
     pub async fn evolution_review_detail(
         &self,
         review_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/evolution/reviews/{}", url_encode(review_id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_EVOLUTION_REVIEWS_BY_ID,
+            &[(url_encode(review_id)).to_string()],
+        ))
+        .await
     }
 
     /// Queue pointer, rollback, or stop-Canary change through Runtime's
@@ -3467,7 +3803,11 @@ impl GatewayApiClient {
         &self,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/evolution/reviews", request).await
+        self.post_json(
+            surface::gateway_api::paths::API_EVOLUTION_REVIEWS.template(),
+            request,
+        )
+        .await
     }
 
     pub async fn evolution_review_decision(
@@ -3477,7 +3817,10 @@ impl GatewayApiClient {
         reason: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/evolution/reviews/{}/decision", url_encode(review_id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_EVOLUTION_REVIEWS_BY_ID_DECISION,
+                &[(url_encode(review_id)).to_string()],
+            ),
             serde_json::json!({ "decision": decision, "reason": reason }),
         )
         .await
@@ -3486,14 +3829,17 @@ impl GatewayApiClient {
     /// Read Runtime's protected evaluation-policy floor. The terminal never
     /// computes a release verdict or keeps a policy cache of its own.
     pub async fn evolution_evaluation_policy(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/evaluation-policy").await
+        self.get_json(surface::gateway_api::paths::API_EVOLUTION_EVALUATION_POLICY.template())
+            .await
     }
 
     pub async fn evolution_evaluation_policy_reviews(
         &self,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/evolution/evaluation-policy/reviews")
-            .await
+        self.get_json(
+            surface::gateway_api::paths::API_EVOLUTION_EVALUATION_POLICY_REVIEWS.template(),
+        )
+        .await
     }
 
     pub async fn evolution_evaluation_policy_review_decision(
@@ -3503,9 +3849,9 @@ impl GatewayApiClient {
         reason: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/evolution/evaluation-policy/reviews/{}/decision",
-                url_encode(review_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_EVOLUTION_EVALUATION_POLICY_REVIEWS_BY_ID_DECISION,
+                &[(url_encode(review_id)).to_string()],
             ),
             serde_json::json!({ "decision": decision, "reason": reason }),
         )
@@ -3515,7 +3861,8 @@ impl GatewayApiClient {
     /// Runtime-owned Managed Agent projection. This is deliberately a single
     /// aggregate read so TUI cannot stitch a second scheduler state together.
     pub async fn managed_agents(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/runtime/managed-agents").await
+        self.get_json(surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS.template())
+            .await
     }
 
     pub async fn dispatch_managed_agents(
@@ -3524,7 +3871,7 @@ impl GatewayApiClient {
         limit: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/runtime/managed-agents/dispatch",
+            surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_DISPATCH.template(),
             serde_json::json!({ "dispatcher_id": dispatcher_id, "limit": limit }),
         )
         .await
@@ -3536,9 +3883,9 @@ impl GatewayApiClient {
         request_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/runtime/managed-agents/{}/trigger",
-                url_encode(managed_agent_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_BY_ID_TRIGGER,
+                &[(url_encode(managed_agent_id)).to_string()],
             ),
             serde_json::json!({ "request_id": request_id }),
         )
@@ -3550,9 +3897,9 @@ impl GatewayApiClient {
         managed_agent_id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!(
-                "/api/runtime/managed-agents/{}/health/reset",
-                url_encode(managed_agent_id)
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_RUNTIME_MANAGED_AGENTS_BY_ID_HEALTH_RESET,
+                &[(url_encode(managed_agent_id)).to_string()],
             ),
             serde_json::json!({}),
         )
@@ -3563,9 +3910,9 @@ impl GatewayApiClient {
         &self,
         service: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!(
-            "/api/connectors/services/{}/tools",
-            url_encode(service)
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_CONNECTORS_SERVICES_BY_SERVICE_ID_TOOLS,
+            &[(url_encode(service)).to_string()],
         ))
         .await
     }
@@ -3576,7 +3923,10 @@ impl GatewayApiClient {
         request: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/connectors/services/{}/execute", url_encode(service)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_CONNECTORS_SERVICES_BY_SERVICE_ID_EXECUTE,
+                &[(url_encode(service)).to_string()],
+            ),
             request,
         )
         .await
@@ -3588,7 +3938,7 @@ impl GatewayApiClient {
         state: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/connectors/resources/revalidate",
+            surface::gateway_api::paths::API_CONNECTORS_RESOURCES_REVALIDATE.template(),
             serde_json::json!({
                 "reference": reference,
                 "state": state,
@@ -3603,7 +3953,7 @@ impl GatewayApiClient {
         session_id: Option<&str>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/connectors/resources/promote-memory",
+            surface::gateway_api::paths::API_CONNECTORS_RESOURCES_PROMOTE_MEMORY.template(),
             serde_json::json!({
                 "reference": reference,
                 "session_id": session_id,
@@ -3616,28 +3966,38 @@ impl GatewayApiClient {
         &self,
         action: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/cross-plane/action/preflight", action)
-            .await
+        self.post_json(
+            surface::gateway_api::paths::API_CROSS_PLANE_ACTION_PREFLIGHT.template(),
+            action,
+        )
+        .await
     }
 
     pub async fn execute_cross_plane_action(
         &self,
         request: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/cross-plane/action/execute", request)
-            .await
+        self.post_json(
+            surface::gateway_api::paths::API_CROSS_PLANE_ACTION_EXECUTE.template(),
+            request,
+        )
+        .await
     }
 
     pub async fn cross_plane_policy_simulate(
         &self,
         action: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json("/api/cross-plane/policy/simulate", action)
-            .await
+        self.post_json(
+            surface::gateway_api::paths::API_CROSS_PLANE_POLICY_SIMULATE.template(),
+            action,
+        )
+        .await
     }
 
     pub async fn tool_registry(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/tools").await
+        self.get_json(surface::gateway_api::paths::API_TOOLS.template())
+            .await
     }
 
     pub async fn tool_execute(
@@ -3647,7 +4007,7 @@ impl GatewayApiClient {
         mode: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/tools/execute",
+            surface::gateway_api::paths::API_TOOLS_EXECUTE.template(),
             serde_json::json!({
                 "name": name,
                 "input": input,
@@ -3658,7 +4018,8 @@ impl GatewayApiClient {
     }
 
     pub async fn tool_cache_stats(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/tools/cache").await
+        self.get_json(surface::gateway_api::paths::API_TOOLS_CACHE.template())
+            .await
     }
 
     pub async fn tool_batch_readonly(
@@ -3667,7 +4028,7 @@ impl GatewayApiClient {
         max_concurrency: usize,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/tools/batch-readonly",
+            surface::gateway_api::paths::API_TOOLS_BATCH_READONLY.template(),
             serde_json::json!({
                 "calls": calls,
                 "max_concurrency": max_concurrency,
@@ -3681,7 +4042,7 @@ impl GatewayApiClient {
         edits: Vec<serde_json::Value>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/tools/mutations/preview",
+            surface::gateway_api::paths::API_TOOLS_MUTATIONS_PREVIEW.template(),
             serde_json::json!({ "edits": edits }),
         )
         .await
@@ -3693,7 +4054,7 @@ impl GatewayApiClient {
         expected_hashes: serde_json::Value,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/tools/mutations/apply",
+            surface::gateway_api::paths::API_TOOLS_MUTATIONS_APPLY.template(),
             serde_json::json!({
                 "edits": edits,
                 "expected_hashes": expected_hashes,
@@ -3703,7 +4064,8 @@ impl GatewayApiClient {
     }
 
     pub async fn tool_checkpoints(&self) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json("/api/tools/checkpoints").await
+        self.get_json(surface::gateway_api::paths::API_TOOLS_CHECKPOINTS.template())
+            .await
     }
 
     pub async fn tool_checkpoint_create(
@@ -3711,7 +4073,7 @@ impl GatewayApiClient {
         label: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/tools/checkpoints",
+            surface::gateway_api::paths::API_TOOLS_CHECKPOINTS.template(),
             serde_json::json!({ "label": label }),
         )
         .await
@@ -3721,8 +4083,11 @@ impl GatewayApiClient {
         &self,
         id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&format!("/api/tools/checkpoints/{}/diff", url_encode(id)))
-            .await
+        self.get_json(&crate::gateway_client_routes::render_route(
+            surface::gateway_api::paths::API_TOOLS_CHECKPOINTS_BY_ID_DIFF,
+            &[(url_encode(id)).to_string()],
+        ))
+        .await
     }
 
     pub async fn tool_checkpoint_restore(
@@ -3730,7 +4095,10 @@ impl GatewayApiClient {
         id: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            &format!("/api/tools/checkpoints/{}/restore", url_encode(id)),
+            &crate::gateway_client_routes::render_route(
+                surface::gateway_api::paths::API_TOOLS_CHECKPOINTS_BY_ID_RESTORE,
+                &[(url_encode(id)).to_string()],
+            ),
             serde_json::json!({}),
         )
         .await
@@ -3742,7 +4110,7 @@ impl GatewayApiClient {
         selected_tools: Vec<String>,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/tools/intent-plan",
+            surface::gateway_api::paths::API_TOOLS_INTENT_PLAN.template(),
             serde_json::json!({
                 "prompt": prompt,
                 "selected_tools": selected_tools,
@@ -3756,7 +4124,7 @@ impl GatewayApiClient {
         prompt: &str,
     ) -> Result<serde_json::Value, GatewayApiError> {
         self.post_json(
-            "/api/tools/context-fanout/plan",
+            surface::gateway_api::paths::API_TOOLS_CONTEXT_FANOUT_PLAN.template(),
             serde_json::json!({ "prompt": prompt }),
         )
         .await
@@ -4091,7 +4459,7 @@ fn validate_app_path(path: &str) -> Result<(), AppTransportFailure> {
         .split('/')
         .any(|segment| matches!(segment, "." | ".."))
         || percent_lower.contains("%2e");
-    if path_without_query.starts_with("/api/")
+    if path_without_query.starts_with(surface::gateway_api::API_PREFIX)
         && !path.contains("://")
         && !path.contains('\\')
         && !path.contains('\r')
@@ -4125,7 +4493,10 @@ fn validate_app_route_identifier(value: &str, maximum: usize) -> Result<(), AppT
 }
 
 fn app_view_stream_path(app_id: &str, view_id: &str) -> String {
-    format!("/api/apps/{app_id}/tui/views/{view_id}/stream")
+    crate::gateway_client_routes::render_route(
+        surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_STREAM,
+        &[(app_id).to_string(), (view_id).to_string()],
+    )
 }
 
 fn app_headers(
@@ -4251,7 +4622,7 @@ fn normalize_base_url(mut base_url: String) -> Result<String, GatewayApiError> {
     Ok(base_url)
 }
 
-fn url_encode(value: &str) -> String {
+pub(crate) fn url_encode(value: &str) -> String {
     value
         .bytes()
         .flat_map(|b| match b {

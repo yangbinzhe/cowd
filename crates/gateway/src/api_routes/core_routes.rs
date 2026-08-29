@@ -25,29 +25,44 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/cowd/capabilities", get(capabilities_handler))
-        .route("/api/cowd/projection", get(projection_handler))
-        .route("/api/cowd/surfaces", get(surfaces_handler))
-        .route("/api/cowd/release-gate", get(release_gate_handler))
         .route(
-            "/api/cowd/structured/sources",
+            surface::gateway_api::paths::API_COWD_CAPABILITIES.template(),
+            get(capabilities_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_COWD_PROJECTION.template(),
+            get(projection_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_COWD_SURFACES.template(),
+            get(surfaces_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_COWD_RELEASE_GATE.template(),
+            get(release_gate_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_COWD_STRUCTURED_SOURCES.template(),
             get(structured_sources_handler),
         )
         .route(
-            "/api/cowd/structured/sources/:id",
+            surface::gateway_api::paths::API_COWD_STRUCTURED_SOURCES_BY_ID.template(),
             get(structured_source_get_handler),
         )
         .route(
-            "/api/cowd/structured/ingest-plan",
+            surface::gateway_api::paths::API_COWD_STRUCTURED_INGEST_PLAN.template(),
             post(structured_ingest_plan_handler),
         )
-        .route("/api/cowd/structured/facts", get(structured_facts_handler))
         .route(
-            "/api/cowd/structured/evidence",
+            surface::gateway_api::paths::API_COWD_STRUCTURED_FACTS.template(),
+            get(structured_facts_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_COWD_STRUCTURED_EVIDENCE.template(),
             get(structured_evidence_handler),
         )
         .route(
-            "/api/cowd/structured/watermarks",
+            surface::gateway_api::paths::API_COWD_STRUCTURED_WATERMARKS.template(),
             get(structured_watermarks_handler),
         )
 }

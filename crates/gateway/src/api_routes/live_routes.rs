@@ -53,14 +53,17 @@ type HmacSha256 = Hmac<Sha256>;
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
-            "/api/runtime/live-subscriptions",
+            surface::gateway_api::paths::API_RUNTIME_LIVE_SUBSCRIPTIONS.template(),
             post(create_live_subscription),
         )
         .route(
-            "/api/runtime/live-subscriptions/:id",
+            surface::gateway_api::paths::API_RUNTIME_LIVE_SUBSCRIPTIONS_BY_ID.template(),
             patch(patch_live_subscription).delete(delete_live_subscription),
         )
-        .route("/api/runtime/live/:id", get(get_live_stream))
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_LIVE_BY_ID.template(),
+            get(get_live_stream),
+        )
 }
 
 #[derive(Debug, Clone)]

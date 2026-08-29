@@ -13,48 +13,66 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/tools", get(tools_handler))
-        .route("/api/tools/execute", post(tool_execute_handler))
-        .route("/api/tools/cache", get(tool_cache_handler))
         .route(
-            "/api/tools/batch-readonly",
+            surface::gateway_api::paths::API_TOOLS.template(),
+            get(tools_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TOOLS_EXECUTE.template(),
+            post(tool_execute_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TOOLS_CACHE.template(),
+            get(tool_cache_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TOOLS_BATCH_READONLY.template(),
             post(tool_batch_readonly_handler),
         )
         .route(
-            "/api/tools/mutations/preview",
+            surface::gateway_api::paths::API_TOOLS_MUTATIONS_PREVIEW.template(),
             post(tool_mutation_preview_handler),
         )
         .route(
-            "/api/tools/mutations/apply",
+            surface::gateway_api::paths::API_TOOLS_MUTATIONS_APPLY.template(),
             post(tool_mutation_apply_handler),
         )
         .route(
-            "/api/tools/checkpoints",
+            surface::gateway_api::paths::API_TOOLS_CHECKPOINTS.template(),
             get(tool_checkpoints_handler).post(tool_checkpoint_create_handler),
         )
         .route(
-            "/api/tools/checkpoints/:id/diff",
+            surface::gateway_api::paths::API_TOOLS_CHECKPOINTS_BY_ID_DIFF.template(),
             get(tool_checkpoint_diff_handler),
         )
         .route(
-            "/api/tools/checkpoints/:id/restore",
+            surface::gateway_api::paths::API_TOOLS_CHECKPOINTS_BY_ID_RESTORE.template(),
             post(tool_checkpoint_restore_handler),
         )
-        .route("/api/tools/intent-plan", post(tool_intent_plan_handler))
         .route(
-            "/api/tools/context-fanout/plan",
+            surface::gateway_api::paths::API_TOOLS_INTENT_PLAN.template(),
+            post(tool_intent_plan_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_TOOLS_CONTEXT_FANOUT_PLAN.template(),
             post(tool_context_fanout_plan_handler),
         )
         .route(
-            "/api/config",
+            surface::gateway_api::paths::API_CONFIG.template(),
             get(config_handler).put(update_config_handler),
         )
-        .route("/api/config/providers", get(config_providers_handler))
         .route(
-            "/api/config/provider-catalog",
+            surface::gateway_api::paths::API_CONFIG_PROVIDERS.template(),
+            get(config_providers_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CONFIG_PROVIDER_CATALOG.template(),
             get(config_provider_catalog_handler),
         )
-        .route("/api/usage", get(usage_handler))
+        .route(
+            surface::gateway_api::paths::API_USAGE.template(),
+            get(usage_handler),
+        )
 }
 
 #[derive(Deserialize)]

@@ -33,6 +33,8 @@ pub mod event;
 pub mod events;
 #[path = "gateway/gateway_client.rs"]
 pub mod gateway_client;
+#[path = "gateway/client/mod.rs"]
+pub(crate) mod gateway_client_routes;
 pub mod keybind;
 pub mod layout;
 #[path = "rendering/md_renderer.rs"]

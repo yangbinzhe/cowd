@@ -14,11 +14,17 @@ use super::{api_error, AppState, ErrorResponse};
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
-            "/api/profiles",
+            surface::gateway_api::paths::API_PROFILES.template(),
             get(profiles_handler).post(create_profile_handler),
         )
-        .route("/api/profiles/switch", post(switch_profile_handler))
-        .route("/api/profiles/:id", delete(delete_profile_handler))
+        .route(
+            surface::gateway_api::paths::API_PROFILES_SWITCH.template(),
+            post(switch_profile_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_PROFILES_BY_ID.template(),
+            delete(delete_profile_handler),
+        )
 }
 
 #[derive(Deserialize)]

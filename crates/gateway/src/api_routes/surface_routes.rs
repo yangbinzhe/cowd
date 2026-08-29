@@ -15,72 +15,122 @@ use super::{api_error, AppState, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/surfaces", get(list_surfaces_handler))
-        .route("/api/surfaces/health", get(surface_health_handler))
-        .route("/api/surfaces/:id", get(get_surface_handler))
-        .route("/api/surfaces/:id/routes", get(get_surface_routes_handler))
         .route(
-            "/api/surfaces/:id/resources",
+            surface::gateway_api::paths::API_SURFACES.template(),
+            get(list_surfaces_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_HEALTH.template(),
+            get(surface_health_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID.template(),
+            get(get_surface_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_ROUTES.template(),
+            get(get_surface_routes_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_RESOURCES.template(),
             get(get_surface_resources_handler),
         )
-        .route("/api/surfaces/:id/status", get(get_surface_status_handler))
-        .route("/api/surfaces/:id/health", get(get_surface_health_handler))
         .route(
-            "/api/surfaces/:id/health-check",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_STATUS.template(),
+            get(get_surface_status_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_HEALTH.template(),
+            get(get_surface_health_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_HEALTH_CHECK.template(),
             post(post_surface_health_check_handler),
         )
-        .route("/api/surfaces/:id/events", get(get_surface_events_handler))
-        .route("/api/surfaces/:id/start", post(start_surface_handler))
-        .route("/api/surfaces/:id/stop", post(stop_surface_handler))
-        .route("/api/surfaces/:id/restart", post(restart_surface_handler))
-        .route("/api/surfaces/:id/repair", post(repair_surface_handler))
-        .route("/api/surfaces/:id/send", post(send_surface_handler))
-        .route("/api/surfaces/:id/action", post(action_surface_handler))
-        .route("/api/surfaces/:id/inbox", get(get_surface_inbox_handler))
-        .route("/api/surfaces/:id/outbox", get(get_surface_outbox_handler))
         .route(
-            "/api/surfaces/:id/outbox/:delivery_id",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_EVENTS.template(),
+            get(get_surface_events_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_START.template(),
+            post(start_surface_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_STOP.template(),
+            post(stop_surface_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_RESTART.template(),
+            post(restart_surface_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_REPAIR.template(),
+            post(repair_surface_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_SEND.template(),
+            post(send_surface_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_ACTION.template(),
+            post(action_surface_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_INBOX.template(),
+            get(get_surface_inbox_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_OUTBOX.template(),
+            get(get_surface_outbox_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SURFACES_BY_ID_OUTBOX_BY_DELIVERY_ID.template(),
             get(get_surface_outbox_delivery_handler),
         )
         .route(
-            "/api/surfaces/:id/messages",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_MESSAGES.template(),
             get(get_surface_messages_handler),
         )
         .route(
-            "/api/surfaces/:id/messages/archive",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_MESSAGES_ARCHIVE.template(),
             post(archive_surface_messages_handler),
         )
         .route(
-            "/api/surfaces/:id/messages/purge-archived-events",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_MESSAGES_PURGE_ARCHIVED_EVENTS
+                .template(),
             post(purge_archived_surface_messages_handler),
         )
         .route(
-            "/api/surfaces/:id/deliveries",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_DELIVERIES.template(),
             get(get_surface_deliveries_handler),
         )
         .route(
-            "/api/surfaces/:id/trigger-events",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_TRIGGER_EVENTS.template(),
             get(get_surface_trigger_events_handler),
         )
         .route(
-            "/api/surfaces/:id/trigger-events/retry",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_TRIGGER_EVENTS_RETRY.template(),
             post(retry_surface_trigger_event_handler),
         )
         .route(
-            "/api/surfaces/:id/inbox/:message_id/replay",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_INBOX_BY_MESSAGE_ID_REPLAY.template(),
             post(replay_surface_inbox_handler),
         )
         .route(
-            "/api/surfaces/:id/outbox/:delivery_id/retry",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_OUTBOX_BY_DELIVERY_ID_RETRY.template(),
             post(retry_surface_outbox_handler),
         )
         .route(
-            "/api/surfaces/:id/outbox/:delivery_id/dead-letter",
+            surface::gateway_api::paths::API_SURFACES_BY_ID_OUTBOX_BY_DELIVERY_ID_DEAD_LETTER
+                .template(),
             post(dead_letter_surface_outbox_handler),
         )
-        .route("/s/:surface/*path", get(surface_static_handler))
         .route(
-            "/surface-callback/:surface/*path",
+            surface::gateway_api::paths::S_BY_SURFACE_WILDCARD_PATH.template(),
+            get(surface_static_handler),
+        )
+        .route(
+            surface::gateway_api::paths::SURFACE_CALLBACK_BY_SURFACE_WILDCARD_PATH.template(),
             get(surface_callback_handler).post(surface_callback_handler),
         )
 }

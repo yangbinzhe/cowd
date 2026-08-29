@@ -111,6 +111,10 @@ required-features = ["test-support"]
 name = "team_template_routes"
 required-features = ["test-support"]
 
+[[test]]
+name = "route_contract_parity"
+required-features = ["test-support"]
+
 [lints.rust]
 unsafe_code = "allow"
 

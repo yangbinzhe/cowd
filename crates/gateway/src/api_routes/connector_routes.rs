@@ -38,45 +38,62 @@ use tools::*;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/connectors/summary", get(connector_summary_handler))
-        .route("/api/connectors/accounts", get(connector_accounts_handler))
         .route(
-            "/api/connectors/capabilities",
+            surface::gateway_api::paths::API_CONNECTORS_SUMMARY.template(),
+            get(connector_summary_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CONNECTORS_ACCOUNTS.template(),
+            get(connector_accounts_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CONNECTORS_CAPABILITIES.template(),
             get(connector_capabilities_handler),
         )
-        .route("/api/connectors/mcp/servers", get(mcp_servers_handler))
         .route(
-            "/api/connectors/resources",
+            surface::gateway_api::paths::API_CONNECTORS_MCP_SERVERS.template(),
+            get(mcp_servers_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CONNECTORS_RESOURCES.template(),
             get(connector_resources_handler),
         )
-        .route("/api/connectors/sources", get(connector_sources_handler))
         .route(
-            "/api/connectors/sources/:adapter_id/state",
+            surface::gateway_api::paths::API_CONNECTORS_SOURCES.template(),
+            get(connector_sources_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CONNECTORS_SOURCES_BY_ADAPTER_ID_STATE.template(),
             get(connector_source_state_handler),
         )
         .route(
-            "/api/connectors/sources/:adapter_id/run-incremental",
+            surface::gateway_api::paths::API_CONNECTORS_SOURCES_BY_ADAPTER_ID_RUN_INCREMENTAL
+                .template(),
             axum::routing::post(connector_source_run_incremental_handler),
         )
         .route(
-            "/api/connectors/sources/:adapter_id/poll-events",
+            surface::gateway_api::paths::API_CONNECTORS_SOURCES_BY_ADAPTER_ID_POLL_EVENTS
+                .template(),
             axum::routing::post(connector_source_poll_events_handler),
         )
         .route(
-            "/api/connectors/resources/revalidate",
+            surface::gateway_api::paths::API_CONNECTORS_RESOURCES_REVALIDATE.template(),
             axum::routing::post(connector_resource_revalidate_handler),
         )
         .route(
-            "/api/connectors/resources/promote-memory",
+            surface::gateway_api::paths::API_CONNECTORS_RESOURCES_PROMOTE_MEMORY.template(),
             axum::routing::post(connector_resource_promote_memory_handler),
         )
-        .route("/api/connectors/services", get(connector_services_handler))
         .route(
-            "/api/connectors/services/:service_id/tools",
+            surface::gateway_api::paths::API_CONNECTORS_SERVICES.template(),
+            get(connector_services_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_CONNECTORS_SERVICES_BY_SERVICE_ID_TOOLS.template(),
             get(connector_service_tools_handler),
         )
         .route(
-            "/api/connectors/services/:service_id/execute",
+            surface::gateway_api::paths::API_CONNECTORS_SERVICES_BY_SERVICE_ID_EXECUTE.template(),
             axum::routing::post(connector_service_execute_handler),
         )
 }

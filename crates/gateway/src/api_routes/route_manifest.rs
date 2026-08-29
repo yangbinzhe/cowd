@@ -2,13 +2,13 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 
-use super::route_registry::{
-    generated_route_metadata, typed_route_metadata, GeneratedRouteMetadata,
+use super::{
+    binding::{GatewayRouteBinding, GATEWAY_ROUTE_BINDINGS},
+    route_registry::typed_route_metadata,
 };
 
-/// Public, deterministic route inventory. Its source is the build-generated
-/// registry plus the small typed registration family whose paths are Rust
-/// constants rather than literals. Runtime callers never inspect source text.
+/// Public, deterministic route inventory derived from the Surface route
+/// catalog and Gateway's handler binding adapter.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) struct GatewayRouteManifestEntry {
     pub(crate) method: String,
@@ -49,11 +49,11 @@ pub(crate) fn gateway_route_manifest_for_apps() -> Vec<GatewayRouteManifestEntry
 
 fn gateway_route_manifest_with_apps() -> Vec<GatewayRouteManifestEntry> {
     let mut entries = BTreeSet::new();
-    for route in generated_route_metadata() {
+    for route in GATEWAY_ROUTE_BINDINGS {
         entries.insert(manifest_entry(route));
     }
-    // Typed routes are registered through constant specs, so there is no
-    // literal `.route("...")` for the build generator to collect.
+    // Typed metadata enriches the Surface-owned transport declarations with
+    // schemas and writer policy; it never creates a second public route.
     for route in typed_route_metadata() {
         // Session execution/evidence routes have literal Axum registrations,
         // so the build-generated inventory already owns their manifest row.
@@ -78,16 +78,17 @@ fn gateway_route_manifest_with_apps() -> Vec<GatewayRouteManifestEntry> {
     entries.into_iter().collect()
 }
 
-fn manifest_entry(route: &GeneratedRouteMetadata) -> GatewayRouteManifestEntry {
+fn manifest_entry(binding: &GatewayRouteBinding) -> GatewayRouteManifestEntry {
+    let path = binding.route.path().template();
     GatewayRouteManifestEntry {
-        method: route.method.to_string(),
-        path: route.path.to_string(),
-        group: route_group(route.source),
+        method: binding.route.method().as_str().to_string(),
+        path: path.to_string(),
+        group: route_group(binding.source),
         owner: "gateway".to_string(),
-        criticality: route_criticality(route.path),
-        stability: route_stability(route.path),
-        source: route.source.to_string(),
-        handler: route.handler.to_string(),
+        criticality: route_criticality(path),
+        stability: route_stability(path),
+        source: binding.source.to_string(),
+        handler: binding.handler.to_string(),
         app: None,
     }
 }
@@ -210,7 +211,7 @@ mod tests {
                 && entry.handler == "route_manifest_handler"
                 && entry.source == "public_routes.rs"
         }));
-        assert!(generated_route_metadata().len() > 50);
+        assert_eq!(GATEWAY_ROUTE_BINDINGS.len(), 482);
     }
 
     #[test]

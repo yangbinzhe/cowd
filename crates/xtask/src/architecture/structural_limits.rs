@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, fs, path::Path, process::Command};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    process::Command,
+};
 
 use serde::Deserialize;
 use syn::{spanned::Spanned, visit::Visit};
@@ -23,7 +28,14 @@ struct StructuralPolicy {
 struct RustLimits<'a> {
     path: &'a str,
     policy: &'a StructuralPolicy,
-    violations: Vec<String>,
+    observations: Vec<LimitObservation>,
+}
+
+#[derive(Debug)]
+struct LimitObservation {
+    key: String,
+    value: usize,
+    message: String,
 }
 
 impl<'ast> Visit<'ast> for RustLimits<'_> {
@@ -59,11 +71,15 @@ impl<'ast> Visit<'ast> for RustLimits<'_> {
             self.policy.max_state_fields
         };
         if fields > limit {
-            self.violations.push(format!(
-                "{}:{} struct {name} has {fields} fields (max {limit})",
-                self.path,
-                node.span().start().line
-            ));
+            self.observations.push(LimitObservation {
+                key: format!("struct-fields:{name}"),
+                value: fields,
+                message: format!(
+                    "{}:{} struct {name} has {fields} fields (max {limit})",
+                    self.path,
+                    node.span().start().line
+                ),
+            });
         }
         syn::visit::visit_item_struct(self, node);
     }
@@ -81,19 +97,27 @@ impl RustLimits<'_> {
         let end = span.end().line;
         let lines = end.saturating_sub(start) + 1;
         if lines > self.policy.max_function_lines {
-            self.violations.push(format!(
-                "{}:{start} function {name} has {lines} lines (max {})",
-                self.path, self.policy.max_function_lines
-            ));
+            self.observations.push(LimitObservation {
+                key: format!("function-lines:{name}"),
+                value: lines,
+                message: format!(
+                    "{}:{start} function {name} has {lines} lines (max {})",
+                    self.path, self.policy.max_function_lines
+                ),
+            });
         }
         if public
             && (name == "new" || name.starts_with("with_"))
             && arguments > self.policy.max_constructor_arguments
         {
-            self.violations.push(format!(
-                "{}:{start} public constructor {name} has {arguments} arguments (max {})",
-                self.path, self.policy.max_constructor_arguments
-            ));
+            self.observations.push(LimitObservation {
+                key: format!("constructor-arguments:{name}"),
+                value: arguments,
+                message: format!(
+                    "{}:{start} public constructor {name} has {arguments} arguments (max {})",
+                    self.path, self.policy.max_constructor_arguments
+                ),
+            });
         }
     }
 }
@@ -139,6 +163,7 @@ fn check_repository(
     violations: &mut Vec<String>,
 ) -> Result<(), String> {
     let files = changed_files(root, base)?;
+    let mut current = Vec::new();
     for relative in files {
         if relative.extension().and_then(|value| value.to_str()) != Some("rs") {
             continue;
@@ -151,12 +176,75 @@ fn check_repository(
         let mut visitor = RustLimits {
             path: &normalized,
             policy,
-            violations: Vec::new(),
+            observations: Vec::new(),
         };
         visitor.visit_file(&syntax);
-        violations.extend(visitor.violations);
+        current.extend(visitor.observations);
+    }
+    if current.is_empty() {
+        return Ok(());
+    }
+    let baseline = baseline_allowances(root, base, policy)?;
+    for observation in current {
+        if !is_regression(&observation, &baseline) {
+            continue;
+        }
+        violations.push(observation.message);
     }
     Ok(())
+}
+
+fn is_regression(observation: &LimitObservation, baseline: &BTreeMap<String, usize>) -> bool {
+    baseline
+        .get(&observation.key)
+        .is_none_or(|allowed| observation.value > *allowed)
+}
+
+fn baseline_allowances(
+    root: &Path,
+    base: &str,
+    policy: &StructuralPolicy,
+) -> Result<BTreeMap<String, usize>, String> {
+    let output = Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", base])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("list baseline files in {}: {error}", root.display()))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let mut allowances = BTreeMap::new();
+    for relative in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|path| path.ends_with(".rs"))
+    {
+        let object = format!("{base}:{relative}");
+        let output = Command::new("git")
+            .args(["show", &object])
+            .current_dir(root)
+            .output()
+            .map_err(|error| format!("read baseline {object}: {error}"))?;
+        if !output.status.success() {
+            continue;
+        }
+        let source = String::from_utf8_lossy(&output.stdout);
+        let Ok(syntax) = syn::parse_file(&source) else {
+            continue;
+        };
+        let mut visitor = RustLimits {
+            path: relative,
+            policy,
+            observations: Vec::new(),
+        };
+        visitor.visit_file(&syntax);
+        for observation in visitor.observations {
+            allowances
+                .entry(observation.key)
+                .and_modify(|value: &mut usize| *value = (*value).max(observation.value))
+                .or_insert(observation.value);
+        }
+    }
+    Ok(allowances)
 }
 
 fn changed_files(root: &Path, base: &str) -> Result<Vec<std::path::PathBuf>, String> {
@@ -181,4 +269,31 @@ fn changed_files(root: &Path, base: &str) -> Result<Vec<std::path::PathBuf>, Str
         );
     }
     Ok(files.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structural_gate_allows_unchanged_debt_but_rejects_new_or_larger_debt() {
+        let baseline = BTreeMap::from([("function-lines:legacy".to_owned(), 300)]);
+        let observation = |key: &str, value| LimitObservation {
+            key: key.to_owned(),
+            value,
+            message: String::new(),
+        };
+        assert!(!is_regression(
+            &observation("function-lines:legacy", 300),
+            &baseline
+        ));
+        assert!(is_regression(
+            &observation("function-lines:legacy", 301),
+            &baseline
+        ));
+        assert!(is_regression(
+            &observation("function-lines:new", 251),
+            &baseline
+        ));
+    }
 }

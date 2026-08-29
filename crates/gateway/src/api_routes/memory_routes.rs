@@ -23,82 +23,130 @@ use super::{api_error, AppState, AuthenticatedPrincipal, ErrorResponse};
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/memory", get(memory_handler))
-        .route("/api/memory/status", get(memory_status_handler))
-        .route("/api/memory/search", get(memory_search_handler))
         .route(
-            "/api/memory/recall/explain",
+            surface::gateway_api::paths::API_MEMORY.template(),
+            get(memory_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_STATUS.template(),
+            get(memory_status_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_SEARCH.template(),
+            get(memory_search_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_RECALL_EXPLAIN.template(),
             get(memory_recall_explain_handler),
         )
-        .route("/api/memory/packet", get(memory_packet_handler))
-        .route("/api/memory/links", get(memory_links_handler))
-        .route("/api/memory/runtime", get(memory_runtime_handler))
         .route(
-            "/api/memory/context-envelope",
+            surface::gateway_api::paths::API_MEMORY_PACKET.template(),
+            get(memory_packet_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_LINKS.template(),
+            get(memory_links_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_RUNTIME.template(),
+            get(memory_runtime_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_CONTEXT_ENVELOPE.template(),
             get(memory_context_envelope_handler),
         )
         .route(
-            "/api/memory/context-envelope/:session_id",
+            surface::gateway_api::paths::API_MEMORY_CONTEXT_ENVELOPE_BY_SESSION_ID.template(),
             get(memory_context_envelope_session_handler),
         )
-        .route("/api/memory/knowledge", get(memory_knowledge_handler))
         .route(
-            "/api/memory/knowledge/health",
+            surface::gateway_api::paths::API_MEMORY_KNOWLEDGE.template(),
+            get(memory_knowledge_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_KNOWLEDGE_HEALTH.template(),
             get(memory_knowledge_health_handler),
         )
         .route(
-            "/api/memory/knowledge/namespaces",
+            surface::gateway_api::paths::API_MEMORY_KNOWLEDGE_NAMESPACES.template(),
             get(memory_knowledge_namespaces_handler),
         )
         .route(
-            "/api/memory/knowledge/conflicts",
+            surface::gateway_api::paths::API_MEMORY_KNOWLEDGE_CONFLICTS.template(),
             get(memory_knowledge_conflicts_handler),
         )
         .route(
-            "/api/memory/knowledge/maintenance",
+            surface::gateway_api::paths::API_MEMORY_KNOWLEDGE_MAINTENANCE.template(),
             get(memory_knowledge_maintenance_handler),
         )
         .route(
-            "/api/memory/knowledge/candidates",
+            surface::gateway_api::paths::API_MEMORY_KNOWLEDGE_CANDIDATES.template(),
             get(memory_knowledge_candidates_handler),
         )
         .route(
-            "/api/memory/knowledge/candidates/:id",
+            surface::gateway_api::paths::API_MEMORY_KNOWLEDGE_CANDIDATES_BY_ID.template(),
             get(memory_knowledge_candidate_handler),
         )
         .route(
-            "/api/memory/knowledge/candidates/:id/rollback",
+            surface::gateway_api::paths::API_MEMORY_KNOWLEDGE_CANDIDATES_BY_ID_ROLLBACK.template(),
             post(rollback_memory_knowledge_candidate_handler),
         )
-        .route("/api/memory/clusters", get(memory_clusters_handler))
-        .route("/api/memory/lifecycle/:id", get(memory_lifecycle_handler))
-        .route("/api/memory/stats", get(memory_stats_handler))
-        .route("/api/memory/layers", get(memory_layers_handler))
         .route(
-            "/api/memory/maintenance",
+            surface::gateway_api::paths::API_MEMORY_CLUSTERS.template(),
+            get(memory_clusters_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_LIFECYCLE_BY_ID.template(),
+            get(memory_lifecycle_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_STATS.template(),
+            get(memory_stats_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_LAYERS.template(),
+            get(memory_layers_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_MAINTENANCE.template(),
             get(memory_maintenance_handler).post(scan_memory_maintenance_handler),
         )
         .route(
-            "/api/memory/maintenance/:id",
+            surface::gateway_api::paths::API_MEMORY_MAINTENANCE_BY_ID.template(),
             patch(update_memory_maintenance_handler),
         )
-        .route("/api/memory/entities", get(memory_entities_handler))
-        .route("/api/memory/triples", get(memory_triples_handler))
-        .route("/api/memory/graph", get(memory_graph_handler))
         .route(
-            "/api/memory/symbol-links",
+            surface::gateway_api::paths::API_MEMORY_ENTITIES.template(),
+            get(memory_entities_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_TRIPLES.template(),
+            get(memory_triples_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_GRAPH.template(),
+            get(memory_graph_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_SYMBOL_LINKS.template(),
             get(memory_symbol_links_handler).post(create_memory_symbol_link_handler),
         )
-        .route("/api/memory/performance", get(performance_handler))
         .route(
-            "/api/memory/:layer",
+            surface::gateway_api::paths::API_MEMORY_PERFORMANCE.template(),
+            get(performance_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MEMORY_BY_LAYER.template(),
             get(memory_layer_handler).post(create_memory_entry_handler),
         )
         .route(
-            "/api/memory/:layer/:id",
+            surface::gateway_api::paths::API_MEMORY_BY_LAYER_BY_ID.template(),
             delete(delete_memory_entry_handler),
         )
-        .route("/api/memory/entry/:id", patch(update_memory_entry_handler))
+        .route(
+            surface::gateway_api::paths::API_MEMORY_ENTRY_BY_ID.template(),
+            patch(update_memory_entry_handler),
+        )
 }
 
 pub(crate) async fn memory_status_value(state: &AppState) -> serde_json::Value {

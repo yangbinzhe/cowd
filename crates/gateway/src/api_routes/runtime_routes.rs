@@ -150,69 +150,111 @@ impl From<runtime::DurableRuntimeEvent> for RuntimeEvent {
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/runtime/timeline", get(get_runtime_timeline))
         .route(
-            "/api/runtime/config/effective",
+            surface::gateway_api::paths::API_RUNTIME_TIMELINE.template(),
+            get(get_runtime_timeline),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_CONFIG_EFFECTIVE.template(),
             get(get_runtime_effective_config),
         )
         .route(
-            "/api/runtime/providers/reload",
+            surface::gateway_api::paths::API_RUNTIME_PROVIDERS_RELOAD.template(),
             post(reload_runtime_providers),
         )
-        .route("/api/runtime/config/reload", post(reload_runtime_config))
         .route(
-            "/api/runtime/upgrade/maintenance",
+            surface::gateway_api::paths::API_RUNTIME_CONFIG_RELOAD.template(),
+            post(reload_runtime_config),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_UPGRADE_MAINTENANCE.template(),
             get(get_upgrade_maintenance).post(enter_upgrade_maintenance),
         )
         .route(
-            "/api/runtime/upgrade/dispositions",
+            surface::gateway_api::paths::API_RUNTIME_UPGRADE_DISPOSITIONS.template(),
             post(record_upgrade_disposition),
         )
-        .route("/api/runtime/upgrade/inventory", get(get_upgrade_inventory))
-        .route("/api/runtime/upgrade/export", post(export_upgrade_manifest))
         .route(
-            "/api/runtime/config/reload/status",
+            surface::gateway_api::paths::API_RUNTIME_UPGRADE_INVENTORY.template(),
+            get(get_upgrade_inventory),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_UPGRADE_EXPORT.template(),
+            post(export_upgrade_manifest),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_CONFIG_RELOAD_STATUS.template(),
             get(get_runtime_config_reload_status),
         )
-        .route("/api/runtime/status", get(get_runtime_status))
-        .route("/api/runtime/outbox", get(get_runtime_outbox_status))
         .route(
-            "/api/runtime/outbox/:direction/:id/retry",
+            surface::gateway_api::paths::API_RUNTIME_STATUS.template(),
+            get(get_runtime_status),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_OUTBOX.template(),
+            get(get_runtime_outbox_status),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_OUTBOX_BY_DIRECTION_BY_ID_RETRY.template(),
             post(retry_runtime_outbox),
         )
-        .route("/api/runtime/events", get(get_runtime_events))
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_EVENTS.template(),
+            get(get_runtime_events),
+        )
         .merge(super::route_registry::register_execution_projection_routes(
             Router::new(),
         ))
         .route(
-            "/api/runtime/events/replay-report",
+            surface::gateway_api::paths::API_RUNTIME_EVENTS_REPLAY_REPORT.template(),
             get(get_runtime_events_replay_report),
         )
-        .route("/api/runtime/events/recover", post(recover_runtime_events))
-        .route("/api/runtime/snapshot", get(get_runtime_snapshot))
-        .route("/api/runtime/source-audit", get(get_runtime_source_audit))
         .route(
-            "/api/runtime/source-repair-plan",
+            surface::gateway_api::paths::API_RUNTIME_EVENTS_RECOVER.template(),
+            post(recover_runtime_events),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_SNAPSHOT.template(),
+            get(get_runtime_snapshot),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_SOURCE_AUDIT.template(),
+            get(get_runtime_source_audit),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_SOURCE_REPAIR_PLAN.template(),
             get(get_runtime_source_repair_plan),
         )
-        .route("/api/runtime/capabilities", get(get_runtime_capabilities))
-        .route("/api/runtime/control-plane", get(get_runtime_control_plane))
         .route(
-            "/api/runtime/turns",
+            surface::gateway_api::paths::API_RUNTIME_CAPABILITIES.template(),
+            get(get_runtime_capabilities),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_CONTROL_PLANE.template(),
+            get(get_runtime_control_plane),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_TURNS.template(),
             get(get_runtime_turns).post(submit_runtime_turn),
         )
-        .route("/api/runtime/turns/:id", get(get_runtime_turn))
-        .route("/api/runtime/turns/:id/cancel", post(cancel_runtime_turn))
         .route(
-            "/api/runtime/session-leases",
+            surface::gateway_api::paths::API_RUNTIME_TURNS_BY_ID.template(),
+            get(get_runtime_turn),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_TURNS_BY_ID_CANCEL.template(),
+            post(cancel_runtime_turn),
+        )
+        .route(
+            surface::gateway_api::paths::API_RUNTIME_SESSION_LEASES.template(),
             get(get_runtime_session_leases),
         )
         .route(
-            "/api/runtime/session-leases/acquire",
+            surface::gateway_api::paths::API_RUNTIME_SESSION_LEASES_ACQUIRE.template(),
             post(acquire_runtime_session_lease),
         )
         .route(
-            "/api/runtime/session-leases/release",
+            surface::gateway_api::paths::API_RUNTIME_SESSION_LEASES_RELEASE.template(),
             post(release_runtime_session_lease),
         )
 }

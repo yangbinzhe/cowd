@@ -120,100 +120,122 @@ fn now_ms() -> u64 {
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/evolution/overview", get(evolution_overview_handler))
         .route(
-            "/api/evolution/collaboration-patterns",
+            surface::gateway_api::paths::API_EVOLUTION_OVERVIEW.template(),
+            get(evolution_overview_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EVOLUTION_COLLABORATION_PATTERNS.template(),
             get(evolution_collaboration_patterns_handler),
         )
-        .route("/api/evolution/cases", get(evolution_cases_handler))
         .route(
-            "/api/evolution/cases/:id",
+            surface::gateway_api::paths::API_EVOLUTION_CASES.template(),
+            get(evolution_cases_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EVOLUTION_CASES_BY_ID.template(),
             get(evolution_case_detail_handler),
         )
         .route(
-            "/api/evolution/cases/:id/analyze",
+            surface::gateway_api::paths::API_EVOLUTION_CASES_BY_ID_ANALYZE.template(),
             post(evolution_case_analyze_handler),
         )
-        .route("/api/evolution/signals", get(evolution_signals_handler))
         .route(
-            "/api/evolution/signals",
+            surface::gateway_api::paths::API_EVOLUTION_SIGNALS.template(),
+            get(evolution_signals_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EVOLUTION_SIGNALS.template(),
             post(evolution_signal_create_handler),
         )
-        .route("/api/evolution/diagnoses", get(evolution_diagnoses_handler))
         .route(
-            "/api/evolution/diagnoses",
+            surface::gateway_api::paths::API_EVOLUTION_DIAGNOSES.template(),
+            get(evolution_diagnoses_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EVOLUTION_DIAGNOSES.template(),
             post(evolution_diagnosis_create_handler),
         )
         .route(
-            "/api/evolution/missions/summary",
+            surface::gateway_api::paths::API_EVOLUTION_MISSIONS_SUMMARY.template(),
             get(evolution_missions_summary_handler),
         )
         .route(
-            "/api/evolution/missions/:id/detail",
+            surface::gateway_api::paths::API_EVOLUTION_MISSIONS_BY_ID_DETAIL.template(),
             get(evolution_mission_detail_handler),
         )
-        .route("/api/evolution/proposals", get(evolution_proposals_handler))
         .route(
-            "/api/evolution/proposals",
+            surface::gateway_api::paths::API_EVOLUTION_PROPOSALS.template(),
+            get(evolution_proposals_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EVOLUTION_PROPOSALS.template(),
             post(evolution_proposal_create_handler),
         )
         .route(
-            "/api/evolution/proposals/:id",
+            surface::gateway_api::paths::API_EVOLUTION_PROPOSALS_BY_ID.template(),
             get(evolution_proposal_detail_handler),
         )
-        .route("/api/evolution/chain/:id", get(evolution_chain_handler))
         .route(
-            "/api/evolution/proposals/:id/decision",
+            surface::gateway_api::paths::API_EVOLUTION_CHAIN_BY_ID.template(),
+            get(evolution_chain_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EVOLUTION_PROPOSALS_BY_ID_DECISION.template(),
             post(evolution_proposal_decision_handler),
         )
         .route(
-            "/api/evolution/proposals/:id/skill-draft",
+            surface::gateway_api::paths::API_EVOLUTION_PROPOSALS_BY_ID_SKILL_DRAFT.template(),
             get(evolution_skill_draft_handler),
         )
         .route(
-            "/api/evolution/candidates",
+            surface::gateway_api::paths::API_EVOLUTION_CANDIDATES.template(),
             get(evolution_candidates_handler).post(evolution_candidate_create_handler),
         )
         .route(
-            "/api/evolution/candidates/:id",
+            surface::gateway_api::paths::API_EVOLUTION_CANDIDATES_BY_ID.template(),
             get(evolution_candidate_detail_handler),
         )
         .route(
-            "/api/evolution/candidates/:id/reviews/canary",
+            surface::gateway_api::paths::API_EVOLUTION_CANDIDATES_BY_ID_REVIEWS_CANARY.template(),
             post(evolution_candidate_canary_review_handler),
         )
         .route(
-            "/api/evolution/candidates/:id/evaluate",
+            surface::gateway_api::paths::API_EVOLUTION_CANDIDATES_BY_ID_EVALUATE.template(),
             post(evolution_candidate_evaluate_handler),
         )
         .route(
-            "/api/evolution/candidates/:id/reviews/stable",
+            surface::gateway_api::paths::API_EVOLUTION_CANDIDATES_BY_ID_REVIEWS_STABLE.template(),
             post(evolution_candidate_stable_review_handler),
         )
-        .route("/api/evolution/reviews", get(evolution_reviews_handler))
         .route(
-            "/api/evolution/reviews",
+            surface::gateway_api::paths::API_EVOLUTION_REVIEWS.template(),
+            get(evolution_reviews_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EVOLUTION_REVIEWS.template(),
             post(evolution_release_change_request_handler),
         )
         .route(
-            "/api/evolution/reviews/:id",
+            surface::gateway_api::paths::API_EVOLUTION_REVIEWS_BY_ID.template(),
             get(evolution_review_detail_handler),
         )
         .route(
-            "/api/evolution/reviews/:id/decision",
+            surface::gateway_api::paths::API_EVOLUTION_REVIEWS_BY_ID_DECISION.template(),
             post(evolution_review_decision_handler),
         )
         .route(
-            "/api/evolution/evaluation-policy",
+            surface::gateway_api::paths::API_EVOLUTION_EVALUATION_POLICY.template(),
             get(evolution_evaluation_policy_handler),
         )
         .route(
-            "/api/evolution/evaluation-policy/reviews",
+            surface::gateway_api::paths::API_EVOLUTION_EVALUATION_POLICY_REVIEWS.template(),
             get(evolution_evaluation_policy_reviews_handler)
                 .post(evolution_evaluation_policy_change_request_handler),
         )
         .route(
-            "/api/evolution/evaluation-policy/reviews/:id/decision",
+            surface::gateway_api::paths::API_EVOLUTION_EVALUATION_POLICY_REVIEWS_BY_ID_DECISION
+                .template(),
             post(evolution_evaluation_policy_decision_handler),
         )
 }

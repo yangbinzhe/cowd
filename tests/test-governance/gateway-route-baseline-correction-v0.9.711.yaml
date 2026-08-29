@@ -1,0 +1,17 @@
+schema_version: 1
+finding_id: F-12
+frozen_count: 479
+corrected_count: 482
+root_cause: >-
+  The legacy build.rs inventory parsed literal Axum registrations but skipped
+  route_registry.rs, even though runtime_routes mounted its typed router.
+omitted_routes:
+  - GET /api/runtime/executions/:id
+  - GET /api/runtime/executions/:id/activity
+  - POST /api/runtime/executions/:id/commands
+resolution:
+  authority: crates/surface/src/gateway_api/catalog.rs
+  binding: crates/gateway/src/api_routes/binding.rs
+  parity_test: crates/gateway/tests/route_contract_parity.rs
+  old_parser_deleted: true
+  capability_loss: false

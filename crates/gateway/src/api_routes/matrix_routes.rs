@@ -59,152 +59,179 @@ use source::*;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/matrix/health", get(matrix_health_handler))
         .route(
-            "/api/matrix/data-plane/health",
+            surface::gateway_api::paths::API_MATRIX_HEALTH.template(),
+            get(matrix_health_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MATRIX_DATA_PLANE_HEALTH.template(),
             get(matrix_data_plane_health_handler),
         )
         .route(
-            "/api/matrix/data-plane/ingest-plan",
+            surface::gateway_api::paths::API_MATRIX_DATA_PLANE_INGEST_PLAN.template(),
             post(matrix_data_plane_ingest_plan_handler),
         )
         .route(
-            "/api/matrix/source-packs/upsert",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_UPSERT.template(),
             post(matrix_source_pack_upsert_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID.template(),
             get(matrix_source_pack_get_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id/validate",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID_VALIDATE.template(),
             post(matrix_source_pack_validate_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id/ingest-file",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID_INGEST_FILE.template(),
             post(matrix_source_pack_ingest_file_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id/delta-plan",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID_DELTA_PLAN.template(),
             post(matrix_source_pack_delta_plan_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id/connector-runs/plan",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID_CONNECTOR_RUNS_PLAN
+                .template(),
             post(matrix_source_pack_connector_run_plan_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id/connector-runs/run",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID_CONNECTOR_RUNS_RUN
+                .template(),
             post(matrix_source_pack_connector_run_execute_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id/snapshots/plan",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID_SNAPSHOTS_PLAN.template(),
             post(matrix_source_snapshot_plan_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id/snapshots/run",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID_SNAPSHOTS_RUN.template(),
             post(matrix_source_snapshot_run_handler),
         )
         .route(
-            "/api/matrix/source-packs/:id/snapshots",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_PACKS_BY_ID_SNAPSHOTS.template(),
             get(matrix_source_pack_snapshots_handler),
         )
         .route(
-            "/api/matrix/connector-runs/:id",
+            surface::gateway_api::paths::API_MATRIX_CONNECTOR_RUNS_BY_ID.template(),
             get(matrix_connector_run_get_handler),
         )
         .route(
-            "/api/matrix/source-snapshots/:id",
+            surface::gateway_api::paths::API_MATRIX_SOURCE_SNAPSHOTS_BY_ID.template(),
             get(matrix_source_snapshot_get_handler),
         )
-        .route("/api/matrix/entities", get(matrix_entities_handler))
         .route(
-            "/api/matrix/entities/upsert",
+            surface::gateway_api::paths::API_MATRIX_ENTITIES.template(),
+            get(matrix_entities_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MATRIX_ENTITIES_UPSERT.template(),
             post(matrix_entity_upsert_handler),
         )
         .route(
-            "/api/matrix/entities/resolve-source-key",
+            surface::gateway_api::paths::API_MATRIX_ENTITIES_RESOLVE_SOURCE_KEY.template(),
             post(matrix_entity_resolve_source_key_handler),
         )
         .route(
-            "/api/matrix/entities/match-candidate",
+            surface::gateway_api::paths::API_MATRIX_ENTITIES_MATCH_CANDIDATE.template(),
             post(matrix_entity_match_candidate_handler),
         )
         .route(
-            "/api/matrix/entities/conflict-decision",
+            surface::gateway_api::paths::API_MATRIX_ENTITIES_CONFLICT_DECISION.template(),
             post(matrix_entity_conflict_decision_handler),
         )
-        .route("/api/matrix/entities/:id", get(matrix_entity_get_handler))
         .route(
-            "/api/matrix/entities/:id/relations",
+            surface::gateway_api::paths::API_MATRIX_ENTITIES_BY_ID.template(),
+            get(matrix_entity_get_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MATRIX_ENTITIES_BY_ID_RELATIONS.template(),
             get(matrix_entity_relations_handler),
         )
         .route(
-            "/api/matrix/entities/:id/impact-path",
+            surface::gateway_api::paths::API_MATRIX_ENTITIES_BY_ID_IMPACT_PATH.template(),
             get(matrix_entity_impact_path_handler),
         )
         .route(
-            "/api/matrix/relations/upsert",
+            surface::gateway_api::paths::API_MATRIX_RELATIONS_UPSERT.template(),
             post(matrix_relation_upsert_handler),
         )
-        .route("/api/matrix/facts/ingest", post(matrix_fact_ingest_handler))
-        .route("/api/matrix/metrics", get(matrix_metrics_handler))
-        .route("/api/matrix/metrics/:id", get(matrix_metric_detail_handler))
         .route(
-            "/api/matrix/metrics/:id/lineage",
+            surface::gateway_api::paths::API_MATRIX_FACTS_INGEST.template(),
+            post(matrix_fact_ingest_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MATRIX_METRICS.template(),
+            get(matrix_metrics_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MATRIX_METRICS_BY_ID.template(),
+            get(matrix_metric_detail_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MATRIX_METRICS_BY_ID_LINEAGE.template(),
             get(matrix_metric_lineage_handler),
         )
         .route(
-            "/api/matrix/metrics/attention-plan",
+            surface::gateway_api::paths::API_MATRIX_METRICS_ATTENTION_PLAN.template(),
             post(matrix_metric_attention_plan_handler),
         )
         .route(
-            "/api/matrix/metrics/snapshots/materialize",
+            surface::gateway_api::paths::API_MATRIX_METRICS_SNAPSHOTS_MATERIALIZE.template(),
             post(matrix_metric_snapshot_materialize_handler),
         )
         .route(
-            "/api/matrix/metrics/recompute",
+            surface::gateway_api::paths::API_MATRIX_METRICS_RECOMPUTE.template(),
             post(matrix_metric_recompute_handler),
         )
         .route(
-            "/api/matrix/metric-dependencies/upsert",
+            surface::gateway_api::paths::API_MATRIX_METRIC_DEPENDENCIES_UPSERT.template(),
             post(matrix_metric_dependency_upsert_handler),
         )
         .route(
-            "/api/matrix/metric-dependencies/affected-by-fact-type",
+            surface::gateway_api::paths::API_MATRIX_METRIC_DEPENDENCIES_AFFECTED_BY_FACT_TYPE
+                .template(),
             post(matrix_metric_affected_by_fact_type_handler),
         )
         .route(
-            "/api/matrix/compute/jobs/plan",
+            surface::gateway_api::paths::API_MATRIX_COMPUTE_JOBS_PLAN.template(),
             post(matrix_compute_job_plan_handler),
         )
         .route(
-            "/api/matrix/compute/jobs/:id",
+            surface::gateway_api::paths::API_MATRIX_COMPUTE_JOBS_BY_ID.template(),
             get(matrix_compute_job_get_handler),
         )
         .route(
-            "/api/matrix/compute/jobs/:id/run",
+            surface::gateway_api::paths::API_MATRIX_COMPUTE_JOBS_BY_ID_RUN.template(),
             post(matrix_compute_job_run_handler),
         )
-        .route("/api/matrix/changes", get(matrix_changes_handler))
         .route(
-            "/api/matrix/attention/hot",
+            surface::gateway_api::paths::API_MATRIX_CHANGES.template(),
+            get(matrix_changes_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MATRIX_ATTENTION_HOT.template(),
             get(matrix_attention_hot_handler),
         )
         .route(
-            "/api/matrix/evidence/build",
+            surface::gateway_api::paths::API_MATRIX_EVIDENCE_BUILD.template(),
             post(matrix_evidence_build_handler),
         )
-        .route("/api/matrix/evidence/:id", get(matrix_evidence_get_handler))
         .route(
-            "/api/matrix/evidence/:id/quality-gate",
+            surface::gateway_api::paths::API_MATRIX_EVIDENCE_BY_ID.template(),
+            get(matrix_evidence_get_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_MATRIX_EVIDENCE_BY_ID_QUALITY_GATE.template(),
             post(matrix_evidence_quality_gate_handler),
         )
         .route(
-            "/api/matrix/evidence/:id/context",
+            surface::gateway_api::paths::API_MATRIX_EVIDENCE_BY_ID_CONTEXT.template(),
             get(matrix_evidence_context_handler),
         )
         .route(
-            "/api/matrix/quality-gates/:id",
+            surface::gateway_api::paths::API_MATRIX_QUALITY_GATES_BY_ID.template(),
             get(matrix_quality_gate_get_handler),
         )
 }

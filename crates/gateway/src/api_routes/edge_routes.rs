@@ -14,17 +14,32 @@ use super::AppState;
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/edges", get(edge_registry_handler))
-        .route("/api/edges/health", get(edge_health_handler))
-        .route("/api/edges/reload", post(edge_reload_handler))
-        .route("/api/edges/surfaces", get(edge_surfaces_handler))
-        .route("/api/edges/connectors", get(edge_connectors_handler))
         .route(
-            "/api/edges/connectors/message",
+            surface::gateway_api::paths::API_EDGES.template(),
+            get(edge_registry_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EDGES_HEALTH.template(),
+            get(edge_health_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EDGES_RELOAD.template(),
+            post(edge_reload_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EDGES_SURFACES.template(),
+            get(edge_surfaces_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EDGES_CONNECTORS.template(),
+            get(edge_connectors_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_EDGES_CONNECTORS_MESSAGE.template(),
             get(edge_message_connectors_handler),
         )
         .route(
-            "/api/edges/connectors/source",
+            surface::gateway_api::paths::API_EDGES_CONNECTORS_SOURCE.template(),
             get(edge_source_connectors_handler),
         )
 }

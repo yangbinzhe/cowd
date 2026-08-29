@@ -138,6 +138,13 @@ pub fn harness_eval_worker_entry(args: &[String]) -> std::process::ExitCode {
 #[cfg(feature = "test-support")]
 pub mod test_support {
     pub use crate::api_routes::test_support::GatewayTestHarness;
+
+    pub fn route_contract_snapshots() -> (
+        std::collections::BTreeSet<(String, String)>,
+        std::collections::BTreeSet<(String, String)>,
+    ) {
+        crate::api_routes::route_contract_snapshots()
+    }
 }
 
 use std::collections::BTreeSet;

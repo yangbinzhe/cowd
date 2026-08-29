@@ -25,28 +25,32 @@ use super::{
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
-            "/api/sessions/:id/messages",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_MESSAGES.template(),
             get(get_session_messages).post(send_message),
         )
         .route(
-            "/api/sessions/:id/input-projection",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_INPUT_PROJECTION.template(),
             get(get_session_input_projection),
         )
         .route(
-            "/api/sessions/:id/inputs",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_INPUTS.template(),
             get(get_session_input_projection),
         )
-        .route("/api/sessions/:id/turn-inbox", get(get_turn_inbox))
         .route(
-            "/api/sessions/:id/turns/:turn_id/inbox",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_TURN_INBOX.template(),
+            get(get_turn_inbox),
+        )
+        .route(
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_TURNS_BY_TURN_ID_INBOX.template(),
             get(get_turn_inbox_by_path),
         )
         .route(
-            "/api/sessions/:id/inputs/:input_id/cancel",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_INPUTS_BY_INPUT_ID_CANCEL.template(),
             post(cancel_session_input),
         )
         .route(
-            "/api/sessions/:id/inputs/:input_id/reclassify",
+            surface::gateway_api::paths::API_SESSIONS_BY_ID_INPUTS_BY_INPUT_ID_RECLASSIFY
+                .template(),
             post(reclassify_session_input),
         )
 }

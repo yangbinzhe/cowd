@@ -23,66 +23,96 @@ use super::{
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/skills", post(skill_create_handler))
-        .route("/api/skills/install/plan", post(skill_install_plan_handler))
         .route(
-            "/api/skills/install/commit",
+            surface::gateway_api::paths::API_SKILLS.template(),
+            post(skill_create_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_INSTALL_PLAN.template(),
+            post(skill_install_plan_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_INSTALL_COMMIT.template(),
             post(skill_install_commit_handler),
         )
         .route(
-            "/api/skills/install/upload/plan",
+            surface::gateway_api::paths::API_SKILLS_INSTALL_UPLOAD_PLAN.template(),
             post(skill_upload_plan_handler),
         )
         .route(
-            "/api/skills/install/upload/commit",
+            surface::gateway_api::paths::API_SKILLS_INSTALL_UPLOAD_COMMIT.template(),
             post(skill_upload_commit_handler),
         )
-        .route("/api/skills/catalog", get(skills_catalog_handler))
-        .route("/api/skills/projection", get(skills_projection_handler))
-        .route("/api/skills/runs", get(skill_runs_handler))
-        .route("/api/skills/runs/:id", get(skill_run_detail_handler))
-        .route("/api/skills/maintenance", get(skill_maintenance_handler))
         .route(
-            "/api/skills/maintenance/:id",
+            surface::gateway_api::paths::API_SKILLS_CATALOG.template(),
+            get(skills_catalog_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_PROJECTION.template(),
+            get(skills_projection_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_RUNS.template(),
+            get(skill_runs_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_RUNS_BY_ID.template(),
+            get(skill_run_detail_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_MAINTENANCE.template(),
+            get(skill_maintenance_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_MAINTENANCE_BY_ID.template(),
             get(skill_maintenance_detail_handler),
         )
         .route(
-            "/api/skills/maintenance/:id/activation-reviews",
+            surface::gateway_api::paths::API_SKILLS_MAINTENANCE_BY_ID_ACTIVATION_REVIEWS.template(),
             post(skill_revision_activation_review_handler),
         )
         .route(
-            "/api/skills/:id/rollback-reviews",
+            surface::gateway_api::paths::API_SKILLS_BY_ID_ROLLBACK_REVIEWS.template(),
             post(skill_revision_rollback_review_handler),
         )
         .route(
-            "/api/skills/revision-reviews/:id",
+            surface::gateway_api::paths::API_SKILLS_REVISION_REVIEWS_BY_ID.template(),
             get(skill_revision_review_handler),
         )
         .route(
-            "/api/skills/revision-reviews/:id/decision",
+            surface::gateway_api::paths::API_SKILLS_REVISION_REVIEWS_BY_ID_DECISION.template(),
             post(skill_revision_review_decision_handler),
         )
         .route(
-            "/api/skills/:id/active-pointer",
+            surface::gateway_api::paths::API_SKILLS_BY_ID_ACTIVE_POINTER.template(),
             get(skill_active_pointer_handler),
         )
         .route(
-            "/api/skills/:id/actions/validate",
+            surface::gateway_api::paths::API_SKILLS_BY_ID_ACTIONS_VALIDATE.template(),
             post(skill_action_validate_handler),
         )
         .route(
-            "/api/skills/:id/actions/plan",
+            surface::gateway_api::paths::API_SKILLS_BY_ID_ACTIONS_PLAN.template(),
             post(skill_action_plan_handler),
         )
         .route(
-            "/api/skills/:id/actions/run",
+            surface::gateway_api::paths::API_SKILLS_BY_ID_ACTIONS_RUN.template(),
             post(skill_action_run_handler),
         )
-        .route("/api/skills/:id/translate", post(skill_translate_handler))
-        .route("/api/skills/:id/files", get(skill_files_handler))
-        .route("/api/skills/:id/files/raw", get(skill_file_raw_handler))
         .route(
-            "/api/skills/:id",
+            surface::gateway_api::paths::API_SKILLS_BY_ID_TRANSLATE.template(),
+            post(skill_translate_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_BY_ID_FILES.template(),
+            get(skill_files_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_BY_ID_FILES_RAW.template(),
+            get(skill_file_raw_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_SKILLS_BY_ID.template(),
             get(skill_get_handler).delete(skill_delete_handler),
         )
 }

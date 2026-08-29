@@ -18,14 +18,20 @@ use super::{
 
 pub(super) fn router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/resources", post(upload_resource_handler))
-        .route("/api/resources/:id", get(get_resource_handler))
         .route(
-            "/api/resources/:id/content",
+            surface::gateway_api::paths::API_RESOURCES.template(),
+            post(upload_resource_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_RESOURCES_BY_ID.template(),
+            get(get_resource_handler),
+        )
+        .route(
+            surface::gateway_api::paths::API_RESOURCES_BY_ID_CONTENT.template(),
             get(get_resource_content_handler),
         )
         .route(
-            "/api/resources/:id/evidence",
+            surface::gateway_api::paths::API_RESOURCES_BY_ID_EVIDENCE.template(),
             get(get_resource_evidence_handler),
         )
 }
