@@ -5073,7 +5073,14 @@ where
             .unwrap_or_default()
     }
 
-    fn clear_turn_tool_observations(&self) {
+    /// Start the runtime-owned state epoch for one top-level conversation turn.
+    ///
+    /// The Host must call this exactly once at turn admission, before any
+    /// graph-planned Runtime tool prefetch. A Provider model node is not a turn
+    /// boundary: receipts and governed plans created before the first Provider
+    /// request must remain live so the packed request can attest their actual
+    /// delivery.
+    pub(crate) fn begin_turn_runtime_epoch(&self) {
         if let Ok(mut guard) = self.turn_tool_observations.lock() {
             guard.clear();
         }
@@ -5091,6 +5098,19 @@ where
         }
         if let Ok(mut metrics) = self.turn_stable_prefix_metrics.lock() {
             metrics.reset();
+        }
+        if let Ok(mut plans) = self.turn_governed_tool_plans.lock() {
+            plans.clear();
+        }
+        if let Ok(mut preflight_compaction) = self.turn_preflight_compaction.lock() {
+            *preflight_compaction = None;
+        }
+        let budget = self.runtime_budget_plan();
+        if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+            ledger.reset(
+                budget.subsystem_budget_tokens,
+                budget.tool_result_budget.max_total_tokens as u64,
+            );
         }
     }
 
@@ -7131,20 +7151,6 @@ where
         }
         let started_at = Instant::now();
         if first_step {
-            self.clear_turn_tool_observations();
-            if let Ok(mut plans) = self.turn_governed_tool_plans.lock() {
-                plans.clear();
-            }
-            if let Ok(mut preflight_compaction) = self.turn_preflight_compaction.lock() {
-                *preflight_compaction = None;
-            }
-            let budget = self.runtime_budget_plan();
-            if let Ok(mut ledger) = self.turn_context_ledger.lock() {
-                ledger.reset(
-                    budget.subsystem_budget_tokens,
-                    budget.tool_result_budget.max_total_tokens as u64,
-                );
-            }
             self.record_turn_started(user_input);
             self.record_context_event("user_input", "user", &preview_chars(user_input, 200), 8);
             self.session
@@ -14628,6 +14634,143 @@ mod tests {
         assert!(runtime
             .packed_model_observation_candidates(&corrupted, 3, 2)
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_prefetch_receipt_survives_first_provider_node_and_is_turn_isolated() {
+        #[derive(Clone)]
+        struct FailThenCommitApi {
+            attempts: Arc<AtomicUsize>,
+            requests: Arc<std::sync::Mutex<Vec<ApiRequest>>>,
+        }
+
+        impl ApiClient for FailThenCommitApi {
+            fn stream(
+                &mut self,
+                request: ApiRequest,
+            ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>>
+            {
+                self.requests.lock().expect("requests").push(request);
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Box::pin(futures::stream::iter([Err(RuntimeError::new(
+                        "non-retryable provider rejection",
+                    ))]))
+                } else {
+                    Box::pin(futures::stream::iter([
+                        Ok(AssistantEvent::TextDelta(
+                            "grounded continuation committed".to_string(),
+                        )),
+                        Ok(AssistantEvent::MessageStop),
+                    ]))
+                }
+            }
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            FailThenCommitApi {
+                attempts: Arc::clone(&attempts),
+                requests: Arc::clone(&requests),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime.set_active_model("qwen3.8-max");
+
+        // Host admission starts the turn epoch before graph-owned Runtime
+        // prefetch creates this exact receipt and transcript entry.
+        runtime.begin_turn_runtime_epoch();
+        let raw_ref =
+            harness_contract::reality::EvidenceRef::observed("tool", "runtime-prefetch-raw-1");
+        let requirement =
+            ToolModelDeliveryRequirement::exact(vec!["required-agent-read".to_string()]);
+        let output = r#"{"content":"complete runtime-prefetched evidence","truncated":false}"#;
+        let receipt =
+            runtime.tool_model_receipt("read_file", output, false, &raw_ref, None, &requirement);
+        runtime
+            .record_generated_model_receipt(
+                "runtime-focus-verify-0-0",
+                "read_file",
+                &requirement,
+                &raw_ref,
+                &receipt,
+                false,
+            )
+            .expect("generated prefetch receipt");
+        runtime
+            .session
+            .write()
+            .await
+            .push_message(ConversationMessage::tool_result(
+                "runtime-focus-verify-0-0",
+                "read_file",
+                receipt.summary.clone(),
+                false,
+            ))
+            .expect("runtime-prefetched ToolResult transcript");
+        runtime
+            .begin_turn_strategy("prefetch-lifecycle-turn", "answer from exact evidence")
+            .expect("turn strategy admission");
+
+        let first = runtime
+            .execute_model_step("answer from exact evidence", true)
+            .await;
+        assert!(first.is_err(), "first Provider response must fail");
+        assert_eq!(
+            runtime
+                .turn_generated_model_receipts
+                .lock()
+                .expect("generated receipts")
+                .len(),
+            1,
+            "the first Provider node is not allowed to erase Runtime prefetch receipts"
+        );
+        assert!(
+            runtime.turn_model_observations().is_empty(),
+            "a failed Provider response must never promote packed candidates"
+        );
+
+        runtime
+            .execute_model_step("answer from exact evidence", false)
+            .await
+            .expect("same-turn valid redelivery must commit");
+        let observations = runtime.turn_model_observations();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].provider_invocation_id,
+            "runtime-focus-verify-0-0"
+        );
+        assert_eq!(observations[0].model, "qwen3.8-max");
+        assert!(observations[0].complete);
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request
+                .messages
+                .iter()
+                .any(|message| message.blocks.iter().any(|block| matches!(
+                    block,
+                    ContentBlock::ToolResult { tool_use_id, output, is_error: false, .. }
+                        if tool_use_id == "runtime-focus-verify-0-0"
+                            && output == &receipt.summary
+                )))));
+        drop(requests);
+
+        runtime.begin_turn_runtime_epoch();
+        assert!(runtime
+            .turn_generated_model_receipts
+            .lock()
+            .expect("generated receipts")
+            .is_empty());
+        assert!(runtime.turn_model_observations().is_empty());
+        assert!(runtime.turn_tool_observations().is_empty());
+        assert!(runtime.turn_evidence_audits().is_empty());
     }
     use fact_kernel::FactLedger;
     use std::sync::atomic::{AtomicUsize, Ordering};

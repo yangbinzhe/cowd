@@ -1022,6 +1022,10 @@ where
     if let Some(journal) = services.session_journal_port() {
         runtime = runtime.with_session_journal_port(journal);
     }
+    // This is the sole top-level turn boundary. Runtime-prefetched tool
+    // evidence may be created before the first Provider node, so no model-step
+    // path may reset these ledgers later in the same turn.
+    runtime.begin_turn_runtime_epoch();
     let evaluation_control = match evaluation_turn_control(content) {
         Ok(control) => control,
         Err(error) => return (runtime, Err(error)),

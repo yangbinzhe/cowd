@@ -369,7 +369,105 @@ Real-provider evidence, immutable commit/binary identity, release tag and
 branch synchronization remain release gates and are recorded only after the
 isolated `qwen3.8-max` execution completes.
 
-### 11.3 Identity and replay audit
+## 14. Real-provider failure amendment and re-audit (2026-08-29)
+
+Candidate `c6ef018c1f7382fae91a62da1de3abafa5569892`, release binary
+SHA-256 `1c0ab7b3e8a438543750d8dd6398d1be981c1bb5488cc777b8d6cb558b1d40a5`,
+was executed unchanged against only `qwen3.8-max` in an isolated Gateway. The
+run correctly failed closed and is negative evidence, not a release pass:
+
+- report:
+  `/tmp/cowd-qwen38-v0910-attested-final/runs/v0.9.710-1788001968-mission-harness-deep/report.json`;
+- isolated Gateway: `/tmp/cowd-real-qwen-gateway.niK82A`;
+- group-theory research scenario: failed before Team admission, 2 model rounds,
+  2 tool calls, 25,923 tokens;
+- six-Team scenario: failed after one bounded replan, 19 model rounds, 66 tool
+  calls, 3,240,049 tokens; the first four investigators and their v2
+  replacements all failed acceptance while their reviewers were correctly
+  blocked;
+- Provider wire artifacts contain complete non-omitted ToolResult bodies and
+  the model returned source-grounded findings, so this is neither a provider,
+  read execution, context-capacity, nor model-quality failure.
+
+### 14.1 Root cause
+
+Delegated exact evidence is intentionally prefetched by Runtime before the
+first Provider model node. `runtime-focus-verify-*` calls execute under the
+frozen Agent packet and are later represented as a valid assistant ToolUse +
+ToolResult pair in the Provider wire request. The generated exact-receipt
+ledger was populated correctly.
+
+However, `ConversationRuntime::execute_model_step(..., first_step = true)`
+called `clear_turn_tool_observations()` immediately before packing that first
+Provider request. `first_step` means "first Provider model node", not "start of
+the Runtime turn". It therefore erased every pre-model generated exact receipt.
+The subsequent request demonstrably carried the full ToolResults, but there
+was no generated-receipt candidate left to promote. Agent terminal evidence
+retained acquisition with `model_observation: None`, and evaluator revision 2
+correctly left the ProviderModel obligations unresolved.
+
+The differing obligation ids visible in the terminal trace are expected:
+ToolHost acquisition evidence has its own evidence identity, while matching to
+the required obligation is directional by typed target. They were initially
+suspected during triage but are not the cause.
+
+### 14.2 Approved lifecycle correction
+
+The turn ledger must be owned by the turn admission boundary, not by a model
+node:
+
+1. rename the reset operation to express a complete turn-observation epoch;
+2. invoke it exactly once in
+   `submit_owned_conversation_turn_with_ingress`, before any graph planning,
+   Runtime prefetch, early tool lane, Provider call or recovery node;
+3. remove the reset from `execute_model_step(first_step)`;
+4. retain all generated and confirmed receipt metadata across every model and
+   tool node in the same turn;
+5. a later top-level turn resets all observation, audit and metric ledgers
+   before it can execute, so no prior-turn attestation can leak;
+6. graph continuation/recovery inside the same turn never resets the epoch;
+   process recovery without the in-memory generated ledger remains fail-closed
+   until a real redelivery creates a new candidate.
+
+The correlation field called `provider_invocation_id` is the tool invocation
+identity carried in the Provider protocol transcript. It may originate from a
+Provider ToolUse or from the existing Runtime-authored, contract-bounded exact
+prefetch. Runtime-authored prefetch does not pretend that the model selected the
+tool: its graph event and reserved invocation namespace retain that origin.
+Both origins require the same non-omitted ToolResult membership, valid Provider
+response and assistant commit before semantic observation is attested.
+
+### 14.3 Strict amendment audit
+
+Audit result: **approved**. This is a lifecycle-owner correction inside the
+already frozen architecture, not a weakened acceptance rule.
+
+| Audit dimension | Result |
+| --- | --- |
+| authority | turn admission is the earliest boundary that owns both Runtime prefetch and Provider nodes |
+| concurrency | one reset occurs before workers exist; no new mutex, await, queue or scheduler is added |
+| recovery | same-turn graph retries preserve candidates; process loss still cannot fabricate confirmation |
+| isolation | a mandatory two-turn test proves old attestations are removed before new work |
+| semantics | complete acquisition alone still fails; only a packed request followed by valid commit promotes |
+| compatibility | Provider-driven ToolUse remains unchanged; ordinary bounded tools remain bounded |
+| resource use | metadata bounds and exact-context ceilings are unchanged |
+| evaluator | revision 2 and the single Agent verdict remain unchanged |
+
+Mandatory new tests before another live run:
+
+- Runtime prefetch before the first model step survives turn initialization and
+  is confirmed from the actual packed request;
+- first Provider failure does not promote, while a later valid same-turn
+  redelivery does;
+- a second top-level turn begins with empty generated/confirmed ledgers;
+- a Runtime-prefetched exact Agent read reaches a satisfied revision-2
+  terminal only with the attestation;
+- the same acquisition with no valid Provider continuation remains unresolved.
+
+No release evidence, tag or branch synchronization is allowed from candidate
+`c6ef018c`.
+
+### 14.4 Identity and replay audit
 
 - Provider invocation id is the only cross-plane correlation key. Content
   digest remains an integrity check inside one correlated call, never a join.
@@ -383,7 +481,7 @@ isolated `qwen3.8-max` execution completes.
 - The attestation is monotonic after valid response commit. Later failed or
   compacted attempts cannot erase it, but cannot widen its obligation set.
 
-### 11.4 Concurrency and lock audit
+### 14.5 Concurrency and lock audit
 
 - Tool execution remains parallel under the existing graph/ToolExecutionPlane.
 - Generated metadata writes hold a turn-local mutex for bounded insertion only.
@@ -395,7 +493,7 @@ isolated `qwen3.8-max` execution completes.
   attempt. Reverse iteration may stop when every pending id is found; there is
   no body-to-body quadratic comparison.
 
-### 11.5 Failure and recovery audit
+### 14.6 Failure and recovery audit
 
 | Boundary failure | Acquisition | Model observation | Terminal behavior |
 | --- | --- | --- | --- |
@@ -408,7 +506,7 @@ isolated `qwen3.8-max` execution completes.
 | Crash after Agent terminal commit | included in terminal digest | included | replay terminal; do not re-evaluate history |
 | Stale/foreign invocation | retained for audit only | join rejected | FrameworkInvalid or unresolved |
 
-### 11.6 Compatibility audit
+### 14.7 Compatibility audit
 
 - Trait compatibility defaults keep lightweight and non-Agent executors
   bounded and invocation-agnostic.
@@ -421,7 +519,7 @@ isolated `qwen3.8-max` execution completes.
 - The real-provider gate binds the final result to a clean candidate commit and
   binary hash, so tests cannot accidentally validate a prior build.
 
-### 11.7 Audit conclusion
+### 14.8 Audit conclusion
 
 The amended plan has one truth owner at every stage, a complete forward and
 reverse evidence path, bounded concurrency, explicit recovery semantics and an
@@ -430,3 +528,45 @@ deterministic fail-closed result. Implementation is authorized in P1-P5 as one
 coherent change set; P6 is verification-only. If P6 exposes a design change
 rather than an implementation defect, execution returns to this audit instead
 of patching during the test phase.
+
+## 15. Lifecycle correction conformance record (2026-08-29)
+
+Implementation matches the approved amendment without changing the evidence
+contract or evaluator:
+
+- `ConversationRuntime::begin_turn_runtime_epoch` is the single reset operation
+  for turn observations, audits, generated and confirmed model receipts, tool
+  exposure/stable-prefix metrics, governed plans, preflight compaction and the
+  turn context ledger;
+- `submit_owned_conversation_turn_with_ingress` calls it before evaluation
+  parsing, session projection, graph state construction or worker admission;
+- `execute_model_step_with_early_dispatch(first_step)` retains only
+  first-Provider-node work such as user transcript insertion and Skill
+  activation. It no longer owns any turn reset;
+- same-turn Provider failure and redelivery keep the candidate ledger, while a
+  later top-level turn clears both generated and confirmed attestations.
+
+The lifecycle regression recreates the original ordering with a reserved
+`runtime-focus-verify-*` invocation. It proves in one executable chain that:
+
+1. the prefetched complete receipt is present in both packed Provider requests;
+2. a failed first response leaves model observations empty;
+3. a valid same-turn redelivery commits exactly one complete attestation;
+4. the next turn epoch clears generated, confirmed, acquisition and audit
+   ledgers.
+
+Deterministic verification passed after the correction:
+
+- focused lifecycle regression: 1 passed;
+- Runtime library: 1,902 passed, 0 failed, 2 ignored;
+- the one unrelated graph callback timing failure from the first parallel run
+  passed five isolated repetitions and the complete rerun; no production
+  change was made for a non-reproducible failure;
+- `cargo check --workspace --all-targets`: passed without warnings;
+- architecture boundary gate: passed;
+- full workspace all-target regression, ten isolated Gateway global-environment
+  tests, standalone reference Bundle and generic APP proxy: passed.
+
+This corrected candidate is eligible for a new immutable real-provider run.
+It is not release-eligible until both required `qwen3.8-max` scenarios pass and
+their terminal evidence is audited.
