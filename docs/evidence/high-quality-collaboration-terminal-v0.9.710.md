@@ -55,6 +55,18 @@ The later exact-content run is also retained as rejected evidence even though ev
 | wall time | 896,278 ms |
 | human semantic audit | rejected: reviewers consumed investigator results but had no independent local source receipts and the terminal explicitly disclosed receipt-level rather than source-level review |
 
+The first independent-review run proved the Runtime repair but intentionally remains a failed evaluator record:
+
+| Observation | Value |
+|---|---|
+| report | `/tmp/cowd-qwen38-quality-v0910-independent/runs/v0.9.710-1787987102-mission-harness-deep/report.json` |
+| scenario | `/tmp/cowd-qwen38-quality-v0910-independent/runs/v0.9.710-1787987102-mission-harness-deep/live-scenarios/001-live_qwen38_large_scale_collaboration.json` |
+| candidate | `52027413` |
+| realized execution | 6/6 Teams and 12/12 Agents completed; 5 edges; 97 tool calls; no failure/recovery |
+| durable exact receipts | 24 distinct role receipts: investigator and reviewer each read all 12 paths to EOF |
+| failed gate | evaluator observed 0/12 independent paths because it matched only a role segment exactly equal to `investigator` or `reviewer`, while canonical role ids were `team-a-investigator`, `team-a-reviewer`, etc. |
+| disposition | evaluator bug fixed with delimiter-aware exact/suffix role-segment matching and a canonical-role-id regression; the failed report is not manually promoted and a fresh immutable-candidate run is required |
+
 ## Implemented gates
 
 - Agent semantic results are lossless and retain unknown structured fields.

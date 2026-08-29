@@ -1889,10 +1889,10 @@ fn collect_complete_exact_source_receipt_roles(
                 if let (Some(path), Some(digest), Some(receipt_id)) = (path, digest, receipt_id) {
                     if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                         let roles = receipt_roles.entry(path.to_string()).or_default();
-                        if receipt_id.contains(":investigator:") {
+                        if receipt_id_has_role(receipt_id, "investigator") {
                             roles.insert("investigator".to_string());
                         }
-                        if receipt_id.contains(":reviewer:") {
+                        if receipt_id_has_role(receipt_id, "reviewer") {
                             roles.insert("reviewer".to_string());
                         }
                     }
@@ -1904,6 +1904,15 @@ fn collect_complete_exact_source_receipt_roles(
         }
         _ => {}
     }
+}
+
+fn receipt_id_has_role(receipt_id: &str, required_role: &str) -> bool {
+    receipt_id.split(':').any(|segment| {
+        segment == required_role
+            || segment
+                .strip_suffix(required_role)
+                .is_some_and(|prefix| prefix.ends_with('-'))
+    })
 }
 
 fn collect_complete_exact_source_receipt_paths(value: &Value, paths: &mut BTreeSet<String>) {
@@ -3040,8 +3049,8 @@ mod tests {
 
         let mut receipts = Vec::new();
         for (index, path) in LARGE_SCALE_SOURCE_PATHS.iter().enumerate() {
-            receipts.push(receipt(path, index as u64 * 2 + 1, "investigator"));
-            receipts.push(receipt(path, index as u64 * 2 + 2, "reviewer"));
+            receipts.push(receipt(path, index as u64 * 2 + 1, "team-a-investigator"));
+            receipts.push(receipt(path, index as u64 * 2 + 2, "team-a-reviewer"));
         }
         assert_eq!(
             independently_reviewed_complete_source_receipt_paths(
@@ -3062,6 +3071,18 @@ mod tests {
             &[],
         )
         .is_empty());
+        assert!(receipt_id_has_role(
+            "agent-tool:graph:team-a-investigator:1:read_file:receipt",
+            "investigator"
+        ));
+        assert!(receipt_id_has_role(
+            "agent-tool:graph:reviewer:1:read_file:receipt",
+            "reviewer"
+        ));
+        assert!(!receipt_id_has_role(
+            "agent-tool:graph:receipt-reviewer-copy:1:read_file:receipt",
+            "reviewer"
+        ));
     }
 
     #[test]
