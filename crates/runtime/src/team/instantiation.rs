@@ -345,35 +345,27 @@ impl TeamInstantiationService {
                     RoleBehaviorFacet::TerminalCandidate { required: true }
                 )
             });
-            let requires_reacquisition = role.behavior.iter().any(|facet| {
-                matches!(
-                    facet,
-                    RoleBehaviorFacet::ReacquireEvidence { required: true }
-                )
-            });
             // `upstream_consumption` is a first-class behavior declaration.
             // A custom role must not also spell a particular reducer mode to
             // receive the Runtime-owned handoff and a zero-tool lease. An
             // explicit reacquisition behavior keeps the normal evidence path.
-            let upstream_only_consumer = (reducer_only_role
+            // A semantic verifier with an independently observable bounded
+            // source is also a producer: consuming the predecessor result
+            // does not waive its own evidence obligation.
+            let upstream_consumer_role = reducer_only_role
                 || role.behavior.iter().any(|facet| {
                     matches!(
                         facet,
                         RoleBehaviorFacet::UpstreamConsumption { required: true }
                     )
-                }))
-                && !requires_reacquisition;
-            let mut role_allowed_tools = if upstream_only_consumer {
-                Vec::new()
-            } else {
-                match evaluation_allowed_tools {
-                    Some(evaluation_tools) => evaluation_tools
-                        .iter()
-                        .filter(|tool| capability.allowed_tools.contains(*tool))
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                    None => capability.allowed_tools.iter().cloned().collect(),
-                }
+                });
+            let mut role_allowed_tools = match evaluation_allowed_tools {
+                Some(evaluation_tools) => evaluation_tools
+                    .iter()
+                    .filter(|tool| capability.allowed_tools.contains(*tool))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                None => capability.allowed_tools.iter().cloned().collect(),
             };
             if !role.task_contract.allowed_tool_contract_refs.is_empty() {
                 let required_tools = role
@@ -490,6 +482,17 @@ impl TeamInstantiationService {
                     &request.resource_scopes,
                     &focus_partition.capability_cropped_refs,
                 );
+                let requires_reacquisition =
+                    role_requires_independent_evidence_reacquisition(role, &node_resource_scopes);
+                let upstream_only_consumer = upstream_consumer_role && !requires_reacquisition;
+                if upstream_only_consumer
+                    && !role.task_contract.allowed_tool_contract_refs.is_empty()
+                {
+                    return Err(format!(
+                        "role `{}` declares Tool requirements but its bounded upstream-only contract forbids tool reacquisition",
+                        role.role_id
+                    ));
+                }
                 let resource_scopes =
                     role_bounded_evidence_scopes(&slot_acceptance, &node_resource_scopes);
                 // Collaboration escalation is a Runtime-assigned exception,
@@ -505,8 +508,11 @@ impl TeamInstantiationService {
                     && !upstream_only_consumer
                     && !escalation_assignee_selected;
                 escalation_assignee_selected |= requires_managed_collaboration_escalation;
-                let mut instance_allowed_tools =
-                    crop_tools_to_resource_lease(&role_allowed_tools, &resource_scopes);
+                let mut instance_allowed_tools = if upstream_only_consumer {
+                    Vec::new()
+                } else {
+                    crop_tools_to_resource_lease(&role_allowed_tools, &resource_scopes)
+                };
                 if !requires_managed_collaboration_escalation {
                     instance_allowed_tools
                         .retain(|tool| tool != "request_collaboration_escalation");
@@ -568,6 +574,12 @@ impl TeamInstantiationService {
                         focus_partition.output_contract.join(", "),
                         if upstream_only_consumer {
                             "Use only the canonical upstream results attached by Runtime. Those attached results are already authenticated and sufficient for this bounded synthesis: produce the requested conclusion now. No workspace, network, capability-discovery, tool-search, context-retrieval, or evidence-retrieval tool is authorized; do not request, simulate, or describe a future tool call, and do not say that you need to inspect access/capabilities/evidence before answering. Your success criterion is this Team's bounded Focus only. Peer Teams are outside your visibility and authority: never claim that another Team is missing, failed, incomplete, or needs to be rerun, and never judge whether the parent objective is complete. Return only this Team's positive verified conclusion plus genuine gaps inside this Team's own attached upstream results.\n"
+                        } else if requires_reacquisition
+                            && role.behavior.iter().any(|facet| {
+                                matches!(facet, RoleBehaviorFacet::Verification { .. })
+                            })
+                        {
+                            "Consume the canonical upstream result, then independently reacquire every bounded source assigned to this role through Runtime tools. Treat upstream claims as hypotheses until your own exact evidence receipts confirm or contradict them. Report disagreements explicitly; never replace independent verification with a review of receipt summaries alone.\n"
                         } else {
                             ""
                         },
@@ -587,6 +599,14 @@ impl TeamInstantiationService {
                         upstream_only_consumer
                             .then_some("upstream_evidence_only:no_tool_reacquisition".to_string()),
                     )
+                    .chain((requires_reacquisition
+                        && role.behavior.iter().any(|facet| {
+                            matches!(facet, RoleBehaviorFacet::Verification { .. })
+                        }))
+                    .then_some(
+                        "independent_verification:runtime_evidence_reacquisition_required"
+                            .to_string(),
+                    ))
                     .chain(request.strategy_binding.iter().flat_map(|binding| {
                         [
                             format!("strategy_decision_id:{}", binding.decision_id),
@@ -1188,6 +1208,50 @@ fn terminal_candidate_acceptance(
     acceptance.sort();
     acceptance.dedup();
     acceptance
+}
+
+/// Decide whether a role must produce fresh Runtime evidence rather than
+/// merely consume predecessor receipts.
+///
+/// An explicit `ReacquireEvidence` facet always wins. Semantic verification
+/// also requires reacquisition when the Team gave the role a bounded surface
+/// that Runtime can actually observe. This preserves zero-tool reducers for
+/// session-only synthesis while preventing an independent reviewer from
+/// being silently downgraded to a receipt summarizer.
+fn role_requires_independent_evidence_reacquisition(
+    role: &TeamRoleDefinition,
+    team_resource_scopes: &[String],
+) -> bool {
+    if role.behavior.iter().any(|facet| {
+        matches!(
+            facet,
+            RoleBehaviorFacet::ReacquireEvidence { required: true }
+        )
+    }) {
+        return true;
+    }
+
+    let verifies = role
+        .behavior
+        .iter()
+        .any(|facet| matches!(facet, RoleBehaviorFacet::Verification { .. }));
+    verifies
+        && team_resource_scopes
+            .iter()
+            .any(|scope| independently_observable_scope(scope))
+}
+
+fn independently_observable_scope(scope: &str) -> bool {
+    let scope = scope.trim();
+    if scope == "network:*" {
+        return true;
+    }
+    let Some((kind, target)) = scope.split_once(':') else {
+        return false;
+    };
+    matches!(kind, "read" | "write" | "workspace")
+        && !target.trim().is_empty()
+        && !matches!(target.trim(), "." | "./" | "*")
 }
 
 /// A custom Team may declare different evidence sources for arbitrary roles.
@@ -2063,6 +2127,89 @@ mod acceptance_contract_tests {
         assert!(matches!(
             requirements[0].check,
             TeamAcceptanceCheck::UpstreamEvidence
+        ));
+    }
+
+    fn role_with_behavior(behavior: Vec<RoleBehaviorFacet>) -> TeamRoleDefinition {
+        TeamRoleDefinition {
+            role_id: "semantic-role".to_string(),
+            display_name: None,
+            responsibility: "verify a bounded result".to_string(),
+            agent_definition_id: harness_contract::agent::AgentDefinitionId::new(
+                harness_contract::agent::DefinitionScope::Builtin,
+                "cowd/direct",
+            )
+            .expect("definition"),
+            agent_selector: RevisionSelector::ExactApprovedRevision { revision: 1 },
+            cardinality: RoleCardinalityPolicy::Fixed { count: 1 },
+            partition: RolePartitionPolicy::Single,
+            behavior,
+            grant_ceiling: vec![harness_contract::agent::AgentCapability::Read],
+            task_contract: harness_contract::team::TeamRoleTaskContract {
+                contract_ref: "custom/team-role/semantic-role@1".to_string(),
+                acceptance: vec!["evidence".to_string()],
+                allowed_tool_contract_refs: Vec::new(),
+                allowed_skill_refs: Vec::new(),
+                dataflow: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn semantic_verifier_reacquires_bounded_sources_even_with_upstream_input() {
+        let verifier = role_with_behavior(vec![
+            RoleBehaviorFacet::UpstreamConsumption { required: true },
+            RoleBehaviorFacet::Verification {
+                mode: "semantic_review".to_string(),
+            },
+        ]);
+        assert!(role_requires_independent_evidence_reacquisition(
+            &verifier,
+            &[
+                "session:session-1".to_string(),
+                "read:crates/runtime/src/lib.rs".to_string(),
+            ],
+        ));
+        assert!(role_requires_independent_evidence_reacquisition(
+            &verifier,
+            &["write:crates/runtime/src/lib.rs".to_string()],
+        ));
+        assert!(role_requires_independent_evidence_reacquisition(
+            &verifier,
+            &["network:*".to_string()],
+        ));
+    }
+
+    #[test]
+    fn semantic_verifier_without_observable_source_remains_upstream_only() {
+        let verifier = role_with_behavior(vec![
+            RoleBehaviorFacet::UpstreamConsumption { required: true },
+            RoleBehaviorFacet::Verification {
+                mode: "semantic_review".to_string(),
+            },
+        ]);
+        assert!(!role_requires_independent_evidence_reacquisition(
+            &verifier,
+            &["session:session-1".to_string(), "read:.".to_string()],
+        ));
+
+        let reducer = role_with_behavior(vec![RoleBehaviorFacet::Reducer {
+            mode: "semantic_aggregate".to_string(),
+        }]);
+        assert!(!role_requires_independent_evidence_reacquisition(
+            &reducer,
+            &["read:crates/runtime/src/lib.rs".to_string()],
+        ));
+    }
+
+    #[test]
+    fn explicit_reacquisition_remains_authoritative_without_a_source_hint() {
+        let producer = role_with_behavior(vec![RoleBehaviorFacet::ReacquireEvidence {
+            required: true,
+        }]);
+        assert!(role_requires_independent_evidence_reacquisition(
+            &producer,
+            &["session:session-1".to_string()],
         ));
     }
 

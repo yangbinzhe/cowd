@@ -10,6 +10,8 @@ The failure was architectural, not a Qwen-specific quality defect. Qwen 3.8-max 
 
 The first v0.9.710 real-provider rerun exposed a second, subtler false positive. The Program topology, durable delivery envelopes and root presentation all passed, but downstream Team E reported that it had not received the complete A/B terminal semantics and Team F reported the same for C/D/E. Three independent presentation limits were still acting as hidden semantic limits: predecessor Agent context was capped at 16,384 characters, cross-Team summaries were capped at 4,000 characters, and root receipt reconstruction kept at most 32 receipts with 4,000 characters per receipt and 48,000 characters overall. The dependency gate therefore proved scheduling order but not semantic handoff consumption.
 
+The next candidate proved complete semantic handoffs and exact EOF reads, yet exposed a third role-semantics defect. A model-derived reviewer carried both `Verification` and `UpstreamConsumption`, but Team instantiation classified every upstream consumer without an explicit `ReacquireEvidence` facet as a zero-tool reducer. The investigator produced valid whole-file receipts while the reviewer could only inspect the investigator's result and receipt summaries. A machine gate that deduplicated only by source path therefore accepted one producer receipt per file as “reviewed”. v0.9.710 now treats semantic verification over an independently observable bounded resource as an evidence-producing role at the final Agent-slot lease, not as an upstream-only reducer.
+
 ## Invariants
 
 1. Agent semantic results are lossless canonical data. Character limits may apply to raw tool previews, never to the authored result contract.
@@ -19,6 +21,7 @@ The first v0.9.710 real-provider rerun exposed a second, subtler false positive.
 5. Objective, structural and transport quality failures close fail-closed. One model repair is allowed; continued failure produces `Partial` plus an invalid presentation receipt, never a false `Satisfied` result.
 6. Runtime resource ceilings remain safety contracts. When a complete evidence packet cannot fit a provider context, preflight rejects the attempt explicitly; no hidden content deletion is permitted.
 7. Dependency satisfaction has two parts: the predecessor must be terminal and its complete semantic result must be materialized into the successor input. A topology-only wait is not a valid cross-Team handoff.
+8. Semantic verification has two independent inputs: the complete upstream result and fresh Runtime evidence from the verifier's own bounded lease. Reviewing a receipt summary is not equivalent to independently observing its source. Session-only synthesis remains a zero-tool upstream consumer.
 
 ## Canonical chain
 
@@ -66,6 +69,8 @@ The live six-Team Qwen scenario independently repeats the presentation checks in
 
 For objectives that require actual structured-handoff consumption, the Runtime and evaluator additionally reject missing-upstream admissions and require a positive conclusion that successor Teams consumed the complete upstream semantics. This turns semantic delivery into a tested acceptance property instead of inferring it from graph topology.
 
+For objectives that require independent source review, the evaluator groups durable exact-content receipts by canonical source path and typed role identity. Every target must have distinct investigator and reviewer receipts with a valid digest. Presentation must agree with those Runtime facts; a positive coverage phrase followed by a caveat that the reviewer did not read the source is rejected.
+
 ## Resource model
 
 “No character budget may reduce quality” does not mean unbounded memory allocation. The framework separates:
@@ -86,5 +91,7 @@ The following old behavior is removed rather than retained behind a flag:
 - the 12,000-character Program-wide Team-summary slice;
 - direct commitment of mechanically joined Team evidence bundles;
 - large-scale live acceptance based only on topology and non-empty response.
+- semantic `Verification` roles silently downgraded to zero-tool upstream reducers despite owning bounded readable scopes;
+- source-coverage acceptance based on one deduplicated receipt per path when independent review was required.
 
 Single-Team, explicitly validated `TeamSynthesizer` answer candidates remain eligible for direct reuse because they are already user-presentation objects, not multi-Team transport bundles.

@@ -2,9 +2,9 @@
 
 use harness_contract::agent::{AgentTaskPacket, DefinitionScope};
 use harness_contract::team::{
-    FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, TeamInstantiationRequest,
-    TeamRoleCardinalityOverride, TeamSelectionMode, TeamStrategyBinding, TeamTemplateDefinitionId,
-    TeamTemplateSelector,
+    FocusPartitionPlan, FocusPartitionSlot, RoleCardinalityPolicy, TeamAcceptanceCheck,
+    TeamInstantiationRequest, TeamRoleCardinalityOverride, TeamSelectionMode, TeamStrategyBinding,
+    TeamTemplateDefinitionId, TeamTemplateSelector,
 };
 use runtime::RuntimeServices;
 
@@ -283,6 +283,104 @@ fn runtime_upstream_context_reaches_default_focus_agent_packets_losslessly() {
             && packet.objective.contains("Verified predecessor artifacts")
             && !packet.objective.contains("upstream result truncated")
     }));
+}
+
+#[test]
+fn semantic_reviewer_packet_reacquires_bounded_source_evidence_independently() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let mut request = request(
+        "cowd/direct-executor",
+        services.mission_runtime().default_mission_id(),
+    );
+    request.resource_scopes = vec![
+        "read:crates/runtime/src/team/instantiation.rs".to_string(),
+        "session:session-team-instantiation".to_string(),
+    ];
+    let snapshot = runtime::orchestration::compile_ephemeral_team_template_snapshot(
+        serde_json::json!({
+            "template_id": "cowd/semantic-independent-review",
+            "name": "Semantic independent review",
+            "roles": [
+                {
+                    "role_id": "investigator",
+                    "responsibility": "inspect the bounded source",
+                    "agent_definition_ref": "builtin/cowd/explore@1",
+                    "grant_ceiling": ["read"],
+                    "fixed_count": 1,
+                    "acceptance": ["findings", "evidence"],
+                    "output_artifacts": ["findings", "evidence"],
+                    "behavior": [{"kind": "reacquire_evidence", "required": true}]
+                },
+                {
+                    "role_id": "reviewer",
+                    "responsibility": "independently verify investigator claims",
+                    "agent_definition_ref": "builtin/cowd/explore@1",
+                    "grant_ceiling": ["read"],
+                    "fixed_count": 1,
+                    "acceptance": ["findings", "evidence", "summary", "unresolved"],
+                    "input_artifacts": ["findings", "evidence"],
+                    "output_artifacts": ["findings", "evidence", "summary", "unresolved"],
+                    "behavior": [
+                        {"kind": "upstream_consumption", "required": true},
+                        {"kind": "verification", "mode": "semantic_review"},
+                        {"kind": "terminal_candidate", "required": true}
+                    ]
+                }
+            ],
+            "dependencies": [{"from": "investigator", "to": "reviewer"}],
+            "result_fields": ["findings", "evidence", "summary", "unresolved"],
+            "evidence_required": true,
+            "instructions": "Independently verify the same bounded source."
+        }),
+        &request.lineage,
+        harness_contract::policy::PermissionMode::ReadOnly,
+        "session-policy:session-team-instantiation:1".to_string(),
+        u64::MAX,
+        &services,
+    )
+    .expect("semantic review snapshot");
+    request.template_selector = TeamTemplateSelector::Ephemeral {
+        snapshot: Box::new(snapshot),
+    };
+
+    let plan = services
+        .team_runtime()
+        .plan(request)
+        .expect("semantic reviewer Team plan");
+    let reviewer = plan
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
+        .map(|node| {
+            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                .expect("AgentTask packet must decode")
+        })
+        .find(|packet| packet.node_id().contains(":reviewer:"))
+        .expect("reviewer packet");
+
+    assert!(reviewer
+        .allowed_tools
+        .iter()
+        .any(|tool| tool == "read_file"));
+    assert!(reviewer.constraints.iter().any(|constraint| {
+        constraint == "independent_verification:runtime_evidence_reacquisition_required"
+    }));
+    assert!(!reviewer
+        .constraints
+        .iter()
+        .any(|constraint| constraint == "upstream_evidence_only:no_tool_reacquisition"));
+    assert!(reviewer.output_acceptance.iter().any(|requirement| {
+        matches!(
+            &requirement.check,
+            TeamAcceptanceCheck::ScopedEvidence { scopes }
+                if scopes == &["read:crates/runtime/src/team/instantiation.rs".to_string()]
+        )
+    }));
+    assert_eq!(reviewer.required_acceptance.evidence_obligations.len(), 1);
+    assert!(reviewer
+        .objective
+        .contains("independently reacquire every bounded source"));
 }
 
 #[test]
