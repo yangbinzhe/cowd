@@ -1174,6 +1174,8 @@ pub struct RuntimeServices {
     provider_fallbacks: Arc<RwLock<Vec<String>>>,
     provider_transport_pool: Arc<crate::ProviderTransportPool>,
     provider_template_cache: Arc<crate::ProviderClientTemplateCache>,
+    evaluation_provider_token_leases:
+        Arc<crate::conversation::EvaluationProviderTokenLeaseRegistry>,
     tool_execution_host: Option<Arc<dyn crate::RuntimeExecutionHost>>,
     artifact_store: Arc<crate::ArtifactStore>,
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
@@ -1886,6 +1888,9 @@ impl RuntimeServices {
             ))),
             provider_transport_pool,
             provider_template_cache,
+            evaluation_provider_token_leases: Arc::new(
+                crate::conversation::EvaluationProviderTokenLeaseRegistry::default(),
+            ),
             tool_execution_host,
             artifact_store,
             memory_manager,
@@ -5203,6 +5208,11 @@ impl RuntimeServices {
     }
     pub fn resource_manager(&self) -> &Arc<ExecutionResourceManager> {
         &self.resource_manager
+    }
+    pub(crate) fn evaluation_provider_token_leases(
+        &self,
+    ) -> &Arc<crate::conversation::EvaluationProviderTokenLeaseRegistry> {
+        &self.evaluation_provider_token_leases
     }
     pub fn session_turn_admission(&self) -> crate::SessionTurnAdmissionPort {
         crate::SessionTurnAdmissionPort::new(Arc::clone(&self.resource_manager))

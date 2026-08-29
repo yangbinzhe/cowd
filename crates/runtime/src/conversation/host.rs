@@ -270,6 +270,10 @@ where
             let overrides = config.feature_config.model_context_windows();
             model_context_window_with_overrides(&active_model, Some(overrides))
         });
+        let evaluation_provider_token_lease = services
+            .evaluation_provider_token_leases()
+            .get(&config.session.session_id)
+            .map_err(|error| error.to_string())?;
         let system_prompt = canonical_host_system_prompt(config.system_prompt);
         let selected_memory_manager = services.memory_manager();
         let mut runtime = crate::ConversationRuntime::new_with_features_and_selected_memory(
@@ -317,6 +321,9 @@ where
         .with_provider_resource_config(services.provider_resource_config())
         .with_provider_fallback_policy(services.provider_fallback_policy())
         .with_approval_coordinator(Arc::clone(services.approval_coordinator()));
+        if let Some(lease) = evaluation_provider_token_lease {
+            runtime = runtime.with_evaluation_provider_token_lease(lease);
+        }
         if let Some(binding) = config.reality_binding {
             runtime = runtime
                 .with_reality_binding(services.reality_recall_port().as_ref().clone(), binding);
@@ -1026,16 +1033,21 @@ where
     // evidence may be created before the first Provider node, so no model-step
     // path may reset these ledgers later in the same turn.
     runtime.begin_turn_runtime_epoch();
+    let session = runtime.session_snapshot().await;
     let evaluation_control = match evaluation_turn_control(content) {
         Ok(control) => control,
         Err(error) => return (runtime, Err(error)),
     };
     let _evaluation_provider_token_guard = match evaluation_control.as_ref() {
-        Some(control) => match crate::conversation::install_evaluation_provider_token_lease(
+        Some(control) => match services.evaluation_provider_token_leases().install(
+            &session.session_id,
             &control.budget_lease_id,
             control.max_total_tokens,
         ) {
-            Ok(guard) => Some(guard),
+            Ok(guard) => {
+                runtime = runtime.with_evaluation_provider_token_lease(guard.lease());
+                Some(guard)
+            }
             Err(error) => return (runtime, Err(error)),
         },
         None => None,
@@ -1054,7 +1066,6 @@ where
         },
         None => None,
     };
-    let session = runtime.session_snapshot().await;
     let turn_transcript_start = session.message_count();
     let resolved_objective = resolve_session_turn_objective(&session, content);
     let session_id = session.session_id;
@@ -1786,7 +1797,9 @@ where
         let (parent_merge_cost_ms, parent_merge_count) =
             parent_merge_actuals(parent_merge_started_at, result.is_ok());
         let evaluation_budget = evaluation_control.as_ref().and_then(|control| {
-            crate::conversation::evaluation_provider_token_lease_snapshot()
+            _evaluation_provider_token_guard
+                .as_ref()
+                .and_then(|guard| guard.snapshot().ok())
                 .filter(|snapshot| snapshot.lease_id == control.budget_lease_id)
         });
         let (status, outcome) = match &result {
@@ -1810,9 +1823,9 @@ where
                 },
                 crate::execution_core::TurnStrategyActualOutcome {
                     duration_ms: end_to_end_duration_ms,
-                    // The evaluation lease is process-wide and reconciles
-                    // every parent, Team child, fallback and judge provider
-                    // request. Its typed totals are therefore authoritative
+                    // The evaluation lease is Session-scoped and reconciles
+                    // every bound parent, Team child, fallback and judge
+                    // provider request. Its typed totals are authoritative
                     // when installed; normal turns retain summary telemetry.
                     input_tokens: evaluation_budget
                         .as_ref()
@@ -14558,9 +14571,11 @@ mod tests {
             })
             .expect("valid test provider registry"),
         );
+        let mut session = Session::new();
+        session.session_id = lineage.session_id.clone();
         StandardRuntimeHost::new(StandardRuntimeHostConfig {
             runtime_services: services,
-            session: Session::new(),
+            session,
             provider_registry: registry,
             model: "test-model".to_string(),
             tool_definitions: Vec::new(),
@@ -14696,6 +14711,31 @@ mod tests {
             .runtime_ref()
             .memory_status()
             .is_some_and(|status| status.contains("composition root")));
+    }
+
+    #[test]
+    fn delegated_standard_host_binds_only_its_session_evaluation_lease() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let guard = services
+            .evaluation_provider_token_leases()
+            .install("session-test", "eval-session-test", 10_000)
+            .expect("session evaluation lease");
+        let lease = guard.lease();
+
+        let host = standard_host_with_services(Arc::clone(&services));
+        assert!(host
+            .runtime_ref()
+            .uses_evaluation_provider_token_lease(&lease));
+
+        drop(guard);
+        assert!(services
+            .evaluation_provider_token_leases()
+            .get("session-test")
+            .expect("registry read")
+            .is_none());
+        assert!(host
+            .runtime_ref()
+            .uses_evaluation_provider_token_lease(&lease));
     }
 
     #[test]

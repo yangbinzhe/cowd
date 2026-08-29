@@ -891,9 +891,12 @@ impl GatewayToolExecutor {
                 findings = ?result.decision.validation_findings,
                 "runtime orchestration request completed"
             );
-            if matches!(
-                result.status.as_str(),
-                "rejected" | "unavailable" | "blocked" | "failed"
+            if orchestration_tool_protocol_failed(
+                &result.status,
+                result
+                    .evidence
+                    .get("accepted")
+                    .and_then(serde_json::Value::as_bool),
             ) {
                 let receipt = serde_json::json!({
                     "kind": "runtime_orchestration_rejected",
@@ -911,6 +914,12 @@ impl GatewayToolExecutor {
                     result.status
                 )));
             }
+            // `blocked` and `failed` are admitted Program business
+            // terminals, not tool transport failures. Preserve their bounded
+            // typed receipt so the parent can see completed child Teams and
+            // the exact failed-child diagnostic. Collapsing that truth into a
+            // ToolError makes goal recovery falsely conclude that no checked
+            // evidence was retained.
             // The full orchestration graph is retained as durable raw tool
             // evidence by ConversationRuntime. The parent model receives the
             // typed terminal receipt only; otherwise a completed team graph
@@ -1724,6 +1733,11 @@ impl GatewayToolExecutor {
         request.capabilities.sort();
         request.capabilities.dedup();
     }
+}
+
+fn orchestration_tool_protocol_failed(status: &str, accepted: Option<bool>) -> bool {
+    matches!(status, "rejected" | "unavailable")
+        || (matches!(status, "blocked" | "failed") && accepted != Some(true))
 }
 
 fn resource_capability_keywords(kind: &str, mime: Option<&str>, intent: &str) -> Vec<String> {
@@ -3032,6 +3046,17 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn admitted_program_terminals_are_receipts_not_tool_protocol_failures() {
+        assert!(orchestration_tool_protocol_failed("rejected", None));
+        assert!(orchestration_tool_protocol_failed("unavailable", None));
+        assert!(orchestration_tool_protocol_failed("blocked", Some(false)));
+        assert!(orchestration_tool_protocol_failed("failed", None));
+        assert!(!orchestration_tool_protocol_failed("completed", Some(true)));
+        assert!(!orchestration_tool_protocol_failed("blocked", Some(true)));
+        assert!(!orchestration_tool_protocol_failed("failed", Some(true)));
     }
 
     #[test]

@@ -758,12 +758,20 @@ mod tests {
 
     #[test]
     fn team_verification_uses_agent_custom_artifact_evidence_policy() {
-        let requirements = vec![harness_contract::team::TeamAcceptanceRequirement {
-            criterion: "artifact:source_reads".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
-                name: "source_reads".to_string(),
+        let requirements = vec![
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "artifact:source_reads".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                    name: "source_reads".to_string(),
+                },
             },
-        }];
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "evidence".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                    scopes: vec!["read:src".to_string()],
+                },
+            },
+        ];
         let policy = crate::agent_result_validator::team_evidence_policy(&requirements);
         assert!(policy.requires_new_tool_evidence);
         assert!(!policy.consumes_upstream);

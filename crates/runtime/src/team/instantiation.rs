@@ -495,6 +495,18 @@ impl TeamInstantiationService {
                         role.role_id
                     ));
                 }
+                // Output materialization and source provenance are orthogonal
+                // contracts. Make the source mode explicit so the shared
+                // Agent/Team evidence policy never has to infer it from a
+                // custom artifact name. Runtime-attached predecessor results
+                // use UpstreamEvidence; a bounded read/network lease uses
+                // ScopedEvidence. A pure structured artifact with neither
+                // remains ungrounded and fails closed.
+                add_explicit_evidence_acceptance(
+                    &mut slot_acceptance,
+                    upstream_only_consumer,
+                    &node_resource_scopes,
+                );
                 let resource_scopes =
                     role_bounded_evidence_scopes(&slot_acceptance, &node_resource_scopes);
                 // Collaboration escalation is a Runtime-assigned exception,
@@ -1254,6 +1266,35 @@ fn independently_observable_scope(scope: &str) -> bool {
     matches!(kind, "read" | "write" | "workspace")
         && !target.trim().is_empty()
         && !matches!(target.trim(), "." | "./" | "*")
+}
+
+fn bounded_runtime_evidence_scope(scope: &str) -> bool {
+    let scope = scope.trim();
+    if scope == "network:*" {
+        return true;
+    }
+    let Some((kind, target)) = scope.split_once(':') else {
+        return false;
+    };
+    matches!(kind, "read" | "workspace")
+        && !target.trim().is_empty()
+        && !matches!(target.trim(), "." | "./" | "*")
+}
+
+fn add_explicit_evidence_acceptance(
+    acceptance: &mut Vec<String>,
+    upstream_only_consumer: bool,
+    resource_scopes: &[String],
+) {
+    if upstream_only_consumer
+        || resource_scopes
+            .iter()
+            .any(|scope| bounded_runtime_evidence_scope(scope))
+    {
+        acceptance.push("evidence".to_string());
+        acceptance.sort();
+        acceptance.dedup();
+    }
 }
 
 /// A custom Team may declare different evidence sources for arbitrary roles.
@@ -2130,6 +2171,46 @@ mod acceptance_contract_tests {
             requirements[0].check,
             TeamAcceptanceCheck::UpstreamEvidence
         ));
+    }
+
+    #[test]
+    fn evidence_mode_is_explicit_for_bounded_sources_and_upstream_synthesis() {
+        let mut source_acceptance = vec!["artifact:source_report".to_string()];
+        add_explicit_evidence_acceptance(
+            &mut source_acceptance,
+            false,
+            &["read:crates/runtime/src/lib.rs".to_string()],
+        );
+        assert_eq!(
+            source_acceptance,
+            vec!["artifact:source_report".to_string(), "evidence".to_string()]
+        );
+
+        let mut upstream_acceptance = vec!["artifact:final_report".to_string()];
+        add_explicit_evidence_acceptance(
+            &mut upstream_acceptance,
+            true,
+            &["read:.".to_string(), "session:session-1".to_string()],
+        );
+        let requirements = team_acceptance_contract(
+            &upstream_acceptance,
+            &["read:.".to_string(), "session:session-1".to_string()],
+            true,
+            true,
+        )
+        .expect("cross-Team synthesis binds to authenticated upstream evidence");
+        assert!(requirements.iter().any(|requirement| {
+            requirement.criterion == "evidence"
+                && requirement.check == TeamAcceptanceCheck::UpstreamEvidence
+        }));
+
+        let mut ungrounded = vec!["artifact:free_form".to_string()];
+        add_explicit_evidence_acceptance(
+            &mut ungrounded,
+            false,
+            &["read:.".to_string(), "session:session-1".to_string()],
+        );
+        assert_eq!(ungrounded, vec!["artifact:free_form".to_string()]);
     }
 
     fn role_with_behavior(behavior: Vec<RoleBehaviorFacet>) -> TeamRoleDefinition {

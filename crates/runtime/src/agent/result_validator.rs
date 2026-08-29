@@ -21,12 +21,6 @@ pub(crate) fn team_evidence_policy(
             harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
         )
     });
-    let declares_custom_artifact = requirements.iter().any(|requirement| {
-        matches!(
-            &requirement.check,
-            harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { .. }
-        )
-    });
     let requires_new_tool_evidence = requirements.iter().any(|requirement| {
         matches!(
             &requirement.check,
@@ -35,7 +29,7 @@ pub(crate) fn team_evidence_policy(
                 | harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. }
                 | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
         )
-    }) || (declares_custom_artifact && !consumes_upstream);
+    });
     TeamEvidencePolicy {
         requires_new_tool_evidence,
         consumes_upstream,
@@ -484,12 +478,21 @@ mod tests {
     fn custom_artifact_requires_fresh_tools_or_upstream_grounding() {
         let mut task = team_task();
         task.acceptance = vec!["artifact:runtime_findings".to_string()];
-        task.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
-            criterion: "artifact:runtime_findings".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
-                name: "runtime_findings".to_string(),
+        task.output_acceptance = vec![
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "artifact:runtime_findings".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                    name: "runtime_findings".to_string(),
+                },
             },
-        }];
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "evidence".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                    scopes: vec!["read:src".to_string()],
+                },
+            },
+        ];
+        task.acceptance.push("evidence".to_string());
         let mut returned = team_return(&task);
         returned.outcome = r#"{"runtime_findings":"receipt-grounded result"}"#.to_string();
         assert_eq!(validate_agent_return(&task, &returned), Ok(()));
@@ -500,12 +503,11 @@ mod tests {
             Err(AgentResultValidationError::MissingToolExecution)
         );
 
-        task.output_acceptance
-            .push(harness_contract::team::TeamAcceptanceRequirement {
-                criterion: "upstream:evidence".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
-            });
-        task.acceptance.push("upstream:evidence".to_string());
+        task.output_acceptance[1] = harness_contract::team::TeamAcceptanceRequirement {
+            criterion: "upstream:evidence".to_string(),
+            check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
+        };
+        task.acceptance[1] = "upstream:evidence".to_string();
         let upstream = EvidenceAccessRef::durable(
             EvidenceRef::observed("tool", "custom-upstream"),
             "e".repeat(64),

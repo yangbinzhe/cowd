@@ -144,6 +144,7 @@ pub fn compile_turn_scoped_intent(
         )
         .into());
     }
+    let cross_workstream_consumers = validate_cross_workstream_artifact_dataflow(decision)?;
     let lineage = request.lineage.as_ref().ok_or_else(|| {
         IntentCompilerError::Diagnostic(CollaborationCompileDiagnostic::validation(
             "collaboration_turn_lineage_missing",
@@ -181,6 +182,10 @@ pub fn compile_turn_scoped_intent(
             workstream_index,
             &workstream.workstream_id,
             &workstream.team,
+            cross_workstream_consumers
+                .get(&workstream.workstream_id)
+                .cloned()
+                .unwrap_or_default(),
             &catalog,
             request.constraints.permission_ceiling,
         )?;
@@ -287,6 +292,107 @@ pub fn compile_turn_scoped_intent(
         template_proposal: serde_json::json!({ "teams": team_entries }),
         semantic_intent,
     })
+}
+
+/// Validate and classify artifact flow that crosses Team boundaries before a
+/// Program identity is admitted. Local role-to-role artifacts remain owned by
+/// the Team dependency compiler; only inputs without a local producer need a
+/// workstream dependency and become cross-Team consumption behavior.
+fn validate_cross_workstream_artifact_dataflow(
+    decision: &ModelCollaborationControlDecisionV2,
+) -> Result<BTreeMap<String, BTreeSet<String>>, IntentCompilerError> {
+    let mut workstreams = BTreeMap::new();
+    for (index, workstream) in decision.workstreams.iter().enumerate() {
+        let id = workstream.workstream_id.trim();
+        if id.is_empty() {
+            return Err(CollaborationCompileDiagnostic::validation(
+                "collaboration_field_empty",
+                format!("workstreams[{index}].workstream_id"),
+            )
+            .into());
+        }
+        if workstreams.insert(id, workstream).is_some() {
+            return Err(CollaborationCompileDiagnostic::validation(
+                "duplicate_workstream_id",
+                format!("workstreams[{index}].workstream_id"),
+            )
+            .into());
+        }
+    }
+
+    let mut consumers = BTreeMap::<String, BTreeSet<String>>::new();
+    for (workstream_index, workstream) in decision.workstreams.iter().enumerate() {
+        let mut predecessor_outputs = BTreeSet::new();
+        for dependency in canonical_set(&workstream.depends_on) {
+            let Some(predecessor) = workstreams.get(dependency.as_str()) else {
+                return Err(CollaborationCompileDiagnostic::validation(
+                    "workstream_dependency_unknown",
+                    format!("workstreams[{workstream_index}].depends_on"),
+                )
+                .into());
+            };
+            predecessor_outputs.extend(canonical_set(&predecessor.output_artifacts));
+            predecessor_outputs.extend(canonical_set(&predecessor.team.result.required_artifacts));
+        }
+
+        let local_outputs = workstream
+            .team
+            .roles
+            .iter()
+            .flat_map(|role| role.output_artifacts.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        for (role_index, role) in workstream.team.roles.iter().enumerate() {
+            let cross_inputs = canonical_set(&role.input_artifacts)
+                .into_iter()
+                .filter(|artifact| !local_outputs.contains(artifact))
+                .collect::<Vec<_>>();
+            if cross_inputs.is_empty() {
+                continue;
+            }
+            if workstream.depends_on.is_empty() {
+                let mut diagnostic = CollaborationCompileDiagnostic::validation(
+                    "cross_workstream_input_without_dependency",
+                    format!(
+                        "workstreams[{workstream_index}].team.roles[{role_index}].input_artifacts"
+                    ),
+                );
+                diagnostic.semantic_ids =
+                    vec![workstream.workstream_id.clone(), role.role_id.clone()];
+                diagnostic.allowed_repairs = vec![
+                    "declare_the_producer_workstream_in_depends_on".to_string(),
+                    "remove_the_unbound_input_artifact".to_string(),
+                ];
+                return Err(diagnostic.into());
+            }
+            let missing = cross_inputs
+                .iter()
+                .filter(|artifact| !predecessor_outputs.contains(*artifact))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                let mut diagnostic = CollaborationCompileDiagnostic::validation(
+                    "cross_workstream_input_artifact_unproduced",
+                    format!(
+                        "workstreams[{workstream_index}].team.roles[{role_index}].input_artifacts"
+                    ),
+                );
+                diagnostic.semantic_ids = std::iter::once(workstream.workstream_id.clone())
+                    .chain(std::iter::once(role.role_id.clone()))
+                    .chain(missing)
+                    .collect();
+                diagnostic.allowed_repairs = vec![
+                    "bind_the_input_to_a_declared_predecessor_result_artifact".to_string(),
+                    "remove_the_unproduced_input_artifact".to_string(),
+                ];
+                return Err(diagnostic.into());
+            }
+            consumers
+                .entry(workstream.workstream_id.clone())
+                .or_default()
+                .insert(role.role_id.clone());
+        }
+    }
+    Ok(consumers)
 }
 
 /// Evidence scopes become root-node resource leases.  Reject a malformed or
@@ -411,6 +517,7 @@ fn compile_team(
     workstream_index: usize,
     workstream_id: &str,
     team: &harness_contract::orchestration::ModelTurnScopedTeamIntent,
+    cross_workstream_consumers: BTreeSet<String>,
     catalog: &[AgentCatalogEntry],
     ceiling: PermissionMode,
 ) -> Result<CompiledTeam, IntentCompilerError> {
@@ -479,6 +586,7 @@ fn compile_team(
             &incoming,
             &outgoing,
             terminal_role.as_deref(),
+            cross_workstream_consumers.contains(&role.role_id),
         );
         // `output_artifacts` are not merely dependency-routing labels for a
         // terminal role.  They are the Team's promised terminal result
@@ -814,10 +922,11 @@ fn derive_behavior(
     incoming: &BTreeMap<String, Vec<ModelCollaborationDependencyKind>>,
     outgoing: &BTreeMap<String, usize>,
     terminal_role: Option<&str>,
+    consumes_cross_workstream_input: bool,
 ) -> Vec<RoleBehaviorFacet> {
     let mut behavior = Vec::new();
     let incoming_kinds = incoming.get(canonical_id).cloned().unwrap_or_default();
-    if !incoming_kinds.is_empty() {
+    if !incoming_kinds.is_empty() || consumes_cross_workstream_input {
         behavior.push(RoleBehaviorFacet::UpstreamConsumption { required: true });
     }
     if incoming_kinds
@@ -1049,9 +1158,22 @@ fn canonical_acceptance(
     role: &ModelRoleIntent,
     terminal_result_fields: Option<&[String]>,
 ) -> Vec<String> {
+    let input_artifacts = canonical_set(&role.input_artifacts);
+    let output_artifacts = canonical_set(&role.output_artifacts);
     let mut values = role
         .acceptance
         .iter()
+        // Providers sometimes repeat a declared input artifact in
+        // `acceptance`. That is an input prerequisite, not an instruction to
+        // republish the predecessor's artifact. The cross-workstream dataflow
+        // validator below proves its producer and dependency; only artifacts
+        // owned by this role may become output acceptance fields.
+        .filter(|criterion| match criterion {
+            ModelSemanticAcceptanceCriterion::Artifact { artifact } => {
+                !input_artifacts.contains(artifact) || output_artifacts.contains(artifact)
+            }
+            _ => true,
+        })
         .map(criterion_key)
         .collect::<Vec<_>>();
     if let Some(fields) = terminal_result_fields {
@@ -1298,6 +1420,53 @@ mod tests {
         std::fs::write(&source, "// source fixture").expect("source fixture");
     }
 
+    fn append_cross_workstream_synthesizer(
+        decision: &mut ModelCollaborationControlDecisionV2,
+        input_artifact: &str,
+        depends_on: Vec<String>,
+    ) {
+        decision.workstreams.push(ModelCollaborationWorkstreamV2 {
+            workstream_id: "final-synthesis".to_string(),
+            objective: "synthesize the predecessor result".to_string(),
+            depends_on,
+            output_artifacts: vec!["final_recommendation".to_string()],
+            evidence_contract: Vec::new(),
+            managed_agent_escalation: ManagedAgentEscalationRequirement::None,
+            team: ModelTurnScopedTeamIntent {
+                team_key: "final-synthesis-team".to_string(),
+                display_name: None,
+                instructions: "use only the authenticated predecessor result".to_string(),
+                result: ModelTeamResultIntent {
+                    required_artifacts: vec!["final_recommendation".to_string()],
+                    evidence_required: false,
+                    synthesis_required: true,
+                },
+                roles: vec![ModelRoleIntent {
+                    role_id: "final-role".to_string(),
+                    display_name: None,
+                    responsibility: "produce the final recommendation".to_string(),
+                    required_capabilities: vec!["read".to_string()],
+                    required_skills: Vec::new(),
+                    required_tools: Vec::new(),
+                    cardinality: Default::default(),
+                    // An input-only artifact repeated here is redundant
+                    // provider syntax and must never become an output field.
+                    acceptance: vec![
+                        ModelSemanticAcceptanceCriterion::Artifact {
+                            artifact: input_artifact.to_string(),
+                        },
+                        ModelSemanticAcceptanceCriterion::Artifact {
+                            artifact: "final_recommendation".to_string(),
+                        },
+                    ],
+                    input_artifacts: vec![input_artifact.to_string()],
+                    output_artifacts: vec!["final_recommendation".to_string()],
+                }],
+                dependencies: Vec::new(),
+            },
+        });
+    }
+
     #[test]
     fn arbitrary_localized_role_id_becomes_a_stable_machine_id() {
         assert_eq!(
@@ -1305,6 +1474,54 @@ mod tests {
             canonical_role_id("架构审查员")
         );
         assert!(canonical_role_id("架构审查员").starts_with("role-"));
+    }
+
+    #[test]
+    fn cross_workstream_input_derives_upstream_behavior_without_republishing_input() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut valid = decision();
+        append_cross_workstream_synthesizer(
+            &mut valid,
+            "summary",
+            vec!["runtime-audit".to_string()],
+        );
+
+        let compiled = compile_turn_scoped_intent(&request(), &valid, &services)
+            .expect("typed cross-Team artifact flow compiles");
+        let role = &compiled.template_proposal["teams"][1]["template"]["roles"][0];
+        assert!(role["behavior"].as_array().is_some_and(|facets| facets
+            .iter()
+            .any(|facet| facet["kind"] == "upstream_consumption")));
+        assert_eq!(
+            role["acceptance"],
+            serde_json::json!(["artifact:final_recommendation"])
+        );
+    }
+
+    #[test]
+    fn cross_workstream_input_requires_a_declared_producer_dependency() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut missing_dependency = decision();
+        append_cross_workstream_synthesizer(&mut missing_dependency, "summary", Vec::new());
+        let error = compile_turn_scoped_intent(&request(), &missing_dependency, &services)
+            .expect_err("cross-Team input without depends_on must fail");
+        assert!(error
+            .to_string()
+            .contains("cross_workstream_input_without_dependency"));
+
+        let mut missing_artifact = decision();
+        append_cross_workstream_synthesizer(
+            &mut missing_artifact,
+            "not-produced",
+            vec!["runtime-audit".to_string()],
+        );
+        let error = compile_turn_scoped_intent(&request(), &missing_artifact, &services)
+            .expect_err("cross-Team input absent from predecessor result must fail");
+        assert!(error
+            .to_string()
+            .contains("cross_workstream_input_artifact_unproduced"));
     }
 
     #[test]

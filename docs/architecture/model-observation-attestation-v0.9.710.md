@@ -570,3 +570,206 @@ Deterministic verification passed after the correction:
 This corrected candidate is eligible for a new immutable real-provider run.
 It is not release-eligible until both required `qwen3.8-max` scenarios pass and
 their terminal evidence is audited.
+
+## 16. Cross-Team synthesis contract amendment (2026-08-29)
+
+Status: **implemented; deterministic gates passed; immutable live rerun pending**.
+This amendment was produced only after candidate
+`290da57c2319ff4980ec6fb1d707eab904ee311b` completed both isolated live
+scenarios. It supersedes any scenario-local workaround.
+
+### 16.1 Immutable live evidence and root cause
+
+The six-Team pressure scenario passed unchanged with 6/6 Teams, 12/12 Agents,
+five cross-Team edges, 97 tool calls and only `qwen3.8-max`. This proves the
+turn-epoch/provider-observation repair under a much larger execution.
+
+The group-theory scenario failed closed with 3/4 Teams completed. A, B and C
+each committed a verified artifact and D received all three complete Team
+delivery bundles. D then produced the requested synthesis fields after one
+presentation-format recovery, but its Agent terminal was rejected with
+`missing_acceptance=[]`, `runtime_change_receipts=0` and
+`observed_evidence_count=0`.
+
+The failure is a three-boundary framework defect:
+
+1. **Cross-Team dataflow was not lowered into role behavior.** The semantic
+   Program had three workstream `depends_on` edges and D declared all three
+   `input_artifacts`, but `derive_behavior` considered only dependencies inside
+   D's one-role Team. D therefore lacked the typed `UpstreamConsumption`
+   facet even though Runtime later attached the durable upstream results.
+2. **Output materialization was conflated with source acquisition.**
+   `team_evidence_policy` treated any custom `StructuredArtifact` as requiring
+   a new tool execution unless an explicit `UpstreamEvidence` check happened
+   to coexist. A synthesis artifact is an output schema, not a source lease.
+   Runtime consequently rejected a valid zero-tool reduction of authenticated
+   predecessor evidence.
+3. **A failed Program terminal was collapsed into a Tool transport error.**
+   Gateway discarded `RuntimeOrchestrationResult::model_receipt()` for
+   `failed`/`blocked` business terminals and returned only a small error. The
+   root goal policy therefore saw no checked evidence and generated the false
+   claim that no Team or source receipt existed, despite durable A/B/C
+   terminals in the Program projection.
+
+The submitted semantic intent also placed D's three input artifact names in
+its role `acceptance`. The compiler accepted them as if D must republish those
+inputs. This did not cause the final rejection after format recovery, but it
+is a contract-normalization defect that inflated D's output and token cost.
+
+### 16.2 Frozen target model
+
+The framework must keep four concepts orthogonal:
+
+```text
+workstream dependency + role input_artifacts
+  -> typed upstream-consumer binding
+  -> authenticated predecessor evidence attached by Runtime
+  -> zero-tool UpstreamEvidence acceptance
+  -> role-owned output_artifacts only
+  -> Team delivery
+
+Program business terminal (completed | partial | failed | blocked)
+  -> successful tool-protocol receipt containing truthful typed projection
+Tool execution/transport failure or semantic-plan rejection
+  -> ToolError eligible for bounded plan repair
+```
+
+The compiler, not role names or Provider prose, owns the first chain. Gateway,
+not the model, owns the second distinction.
+
+### 16.3 Approved implementation phases
+
+| Phase | Change | Mandatory proof |
+| --- | --- | --- |
+| S1 semantic dataflow | Validate every cross-workstream `input_artifacts` item against the declared result artifacts of its `depends_on` workstreams; derive `UpstreamConsumption` for the exact consuming role | missing producer, undeclared dependency and unrelated input all fail before Program admission; valid A/B/C -> D compiles |
+| S2 acceptance separation | Remove input-only artifact labels from role output acceptance; for an upstream-only consumer append one Runtime-owned `UpstreamEvidence` requirement; custom structured outputs no longer imply fresh acquisition by themselves | D requires only `final_recommendation` plus typed upstream evidence; source-producing A/B/C still require their scoped Provider-model observations |
+| S3 terminal truth | Return typed model receipts for executed `failed`/`blocked` Program business terminals; retain ToolError only for rejection/unavailability/transport failure | a 3-complete/1-failed Program exposes the three verified Team terminals and exact diagnostic; root cannot claim zero Teams/evidence |
+| S4 deterministic closure | Run focused compiler, instantiation, Agent admission, Team verifier, Gateway and terminal-recovery tests, then Runtime/full workspace gates | all adversarial cases pass in one unchanged candidate |
+| S5 immutable live closure | Commit/build once, record binary hash, rerun group-theory plus six-Team scenarios with only `qwen3.8-max` | 2/2 scenarios pass; no fallback, dangling work, false completion or contradictory terminal |
+| S6 release | Update evidence, commit/tag/sync/push/clean | `master == dev == v0.9.710`, both remotes verified, no surplus branch/worktree retained without audit |
+
+### 16.4 Strict architecture audit
+
+Audit result: **approved** with the following invariants. Implementation may
+now begin and may not widen this cone during verification.
+
+| Dimension | Audited decision |
+| --- | --- |
+| authority | Cross-Team behavior is derived only from typed `depends_on` plus exact `input_artifacts`; never from `synthesizer`, display text, responsibility prose or graph position alone |
+| input/output | Input artifacts are prerequisites and never become output fields. Output artifacts remain the only Provider-materialized Team result fields |
+| evidence | Upstream evidence is accepted only when Runtime attached a durable predecessor reference and the Agent returns the same reference; model prose cannot mint or replace it |
+| reacquisition | Explicit `ReacquireEvidence` or independent verification still wins and keeps tools/scoped observations; upstream consumption never downgrades a verifier |
+| scheduling | A consumer remains blocked on the existing evidence-ready graph join; no new scheduler, queue, lock or polling loop is introduced |
+| concurrency | Independent upstream Teams remain parallel. Dataflow validation is a bounded pre-admission pass over workstreams/artifact names |
+| recovery | Invalid semantic contracts fail before admission with a typed diagnostic. Admitted partial Programs preserve completed child truth and exact failed-child diagnostics |
+| compatibility | Local intra-Team reducers keep their current behavior. Workstreams with no typed inputs are unchanged. Historical durable results are not reinterpreted |
+| security | A model cannot smuggle a foreign artifact through `acceptance`; the producer must be in the declared dependency set and the reference is Runtime-attached |
+| resources | Removing duplicate input fields reduces Provider output/context. The bounded partial receipt reuses `model_receipt`; the recursive raw graph remains artifact-only |
+| verdict | `AcceptanceEvaluator` remains the single Agent verdict; Gateway transports terminal truth but never changes Team/Program status |
+
+### 16.5 Adversarial acceptance matrix
+
+- cross-workstream input with no `depends_on`: reject before admission;
+- input absent from every declared predecessor result: reject before admission;
+- input-only artifact repeated in model acceptance: normalize to input
+  prerequisite, never require it as an output field;
+- pure source-producing custom artifact with a scoped evidence contract:
+  require successful exact Provider-observed acquisition;
+- pure structured reasoning artifact with no source or upstream contract:
+  reject as ungrounded under the Team evidence gate;
+- upstream-only synthesis with durable attached results: zero tools, output
+  materialized, upstream references retained, accepted;
+- upstream-only synthesis missing one required predecessor: never scheduled;
+- upstream consumer with explicit independent reacquisition: tools remain
+  enabled and fresh evidence remains mandatory;
+- completed Program: normal typed success receipt;
+- admitted partial/failed Program: typed non-transport receipt preserving all
+  completed Team terminals and the failed Team diagnostic;
+- decode/compile/rejected/unavailable operation: ToolError and bounded semantic
+  repair, never a fabricated Program receipt;
+- partial receipt followed by root narration: claims must be a subset of the
+  typed child terminals and diagnostics.
+
+Any live failure that requires a new authority, scheduling or acceptance
+design returns to this section for re-audit before source changes. Scenario
+prompts, role-name heuristics, relaxed pass thresholds and harness-only
+exceptions are explicitly forbidden.
+
+### 16.6 Parallel verification amendment: evaluation lease isolation
+
+The unchanged full Runtime regression exposed two different Conversation
+tests failing only under parallel execution. In each failure an unrelated
+request was charged against the `eval-small` or `eval-rollback` lease installed
+by a budget unit test. Both tests passed repeatedly in isolation. Source audit
+confirmed that the evaluation lease was a process-wide `OnceLock<Mutex<_>>`,
+so every Conversation in the process implicitly consumed whichever lease was
+temporarily installed. This is not a test-threshold problem: a multi-session
+Gateway could apply one evaluation's paid budget to unrelated foreground work.
+
+The following correction is approved before implementation:
+
+```text
+RuntimeServices evaluation-lease registry
+  session_id -> Arc<EvaluationProviderTokenLease>
+root evaluation Turn installs one guarded entry and binds the same Arc
+delegated Agent host resolves the entry by its canonical parent session_id
+ConversationRuntime charges only its explicit optional Arc
+guard removes only its own session entry after the root Turn terminates
+```
+
+Strict audit invariants:
+
+- the lease remains Runtime-owned and the model/provider cannot select it;
+- root and delegated provider calls share one atomic counter by `Arc`, so
+  moving the scope does not double-count or weaken the hard total;
+- different Session IDs may run concurrently without observing or consuming
+  one another's lease;
+- duplicate installation for the same Session fails closed; guard teardown
+  removes only the exact registered lease and cannot erase a replacement;
+- a Conversation with no explicit binding never consults ambient process
+  state, eliminating parallel-test and foreground-session contamination;
+- the existing delegated parent budget remains an independent record-only
+  admission ledger; reservation rollback order is unchanged;
+- no scheduler, model policy, scenario prompt, token limit or pass threshold
+  changes are authorized.
+
+Mandatory proof is a focused two-session isolation test, the existing global
+failure/rollback tests, parallel Conversation tests, and then the unchanged
+full Runtime/workspace regression. Only after those pass may the immutable
+real-provider build begin.
+
+### 16.7 Implementation and deterministic conformance
+
+The implementation stayed inside the audited cone:
+
+- semantic compilation validates producer/dependency/input triples before
+  admission, derives `UpstreamConsumption` only for exact consuming roles and
+  removes input-only artifacts from output acceptance;
+- Team instantiation emits typed `UpstreamEvidence` for upstream consumers and
+  typed `ScopedEvidence` only for bounded source scopes; structured output
+  shape alone no longer fabricates a fresh-acquisition requirement;
+- Agent and Team verification retain one `AcceptanceEvaluator` verdict while
+  distinguishing authenticated upstream consumption from fresh Provider-tool
+  observation;
+- Gateway returns a typed receipt for admitted `failed`/`blocked` Programs and
+  keeps ToolError for rejected, unavailable and pre-admission failures;
+- evaluation Token leases are RuntimeServices-owned, keyed by canonical
+  Session ID and explicitly bound to every root/delegated Conversation.
+
+Deterministic evidence on the unchanged source candidate:
+
+- focused compiler, instantiation, Agent validator, Team verifier and Gateway
+  terminal tests: passed;
+- Session lease isolation, duplicate-registration rejection, delegated Host
+  propagation and rollback tests: passed;
+- Runtime library parallel regression: 1,907 passed, 0 failed, 2 ignored;
+- `cargo check --workspace --all-targets`: passed without warnings;
+- architecture boundary gate: passed;
+- full workspace all-target regression, ten isolated Gateway global-environment
+  tests, standalone reference Bundle and generic APP proxy: passed in 677 s.
+
+The quick governance lane also passed compilation and every architecture
+boundary, then correctly remained red because the release authority/evidence
+inventory still identifies v0.9.708. Those release records must not be advanced
+until the immutable Qwen run succeeds; they are an S6 gate, not a production
+or test defect.

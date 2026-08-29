@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -93,10 +93,6 @@ const fn provider_retry_is_fenced(
     prior_effect_receipt_observed || current_effect_receipts > 0
 }
 
-static EVALUATION_PROVIDER_TOKEN_LEASE: OnceLock<
-    std::sync::Mutex<Option<EvaluationProviderTokenLeaseState>>,
-> = OnceLock::new();
-
 #[derive(Debug)]
 struct EvaluationProviderTokenLeaseState {
     lease_id: String,
@@ -107,6 +103,96 @@ struct EvaluationProviderTokenLeaseState {
     cached_consumed: u64,
     outstanding: usize,
     breached: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct EvaluationProviderTokenLease {
+    state: std::sync::Mutex<EvaluationProviderTokenLeaseState>,
+}
+
+impl EvaluationProviderTokenLease {
+    fn new(lease_id: &str, limit: u64) -> Result<Self, RuntimeError> {
+        if lease_id.trim().is_empty() || limit == 0 || limit > 2_000_000 {
+            return Err(RuntimeError::new(
+                "evaluation provider token lease identity/limit is invalid",
+            ));
+        }
+        Ok(Self {
+            state: std::sync::Mutex::new(EvaluationProviderTokenLeaseState {
+                lease_id: lease_id.to_string(),
+                limit,
+                remaining: limit,
+                input_consumed: 0,
+                output_consumed: 0,
+                cached_consumed: 0,
+                outstanding: 0,
+                breached: false,
+            }),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<EvaluationProviderTokenLeaseSnapshot, RuntimeError> {
+        let lease = self
+            .state
+            .lock()
+            .map_err(|_| RuntimeError::new("evaluation provider token lease lock poisoned"))?;
+        Ok(EvaluationProviderTokenLeaseSnapshot {
+            lease_id: lease.lease_id.clone(),
+            limit: lease.limit,
+            consumed: lease.limit.saturating_sub(lease.remaining),
+            input_consumed: lease.input_consumed,
+            output_consumed: lease.output_consumed,
+            cached_consumed: lease.cached_consumed,
+            outstanding: lease.outstanding,
+            breached: lease.breached,
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EvaluationProviderTokenLeaseRegistry {
+    leases: std::sync::Mutex<BTreeMap<String, Arc<EvaluationProviderTokenLease>>>,
+}
+
+impl EvaluationProviderTokenLeaseRegistry {
+    pub(crate) fn install(
+        self: &Arc<Self>,
+        session_id: &str,
+        lease_id: &str,
+        limit: u64,
+    ) -> Result<EvaluationProviderTokenLeaseGuard, RuntimeError> {
+        if session_id.trim().is_empty() {
+            return Err(RuntimeError::new(
+                "evaluation provider token lease session identity is invalid",
+            ));
+        }
+        let lease = Arc::new(EvaluationProviderTokenLease::new(lease_id, limit)?);
+        let mut leases = self
+            .leases
+            .lock()
+            .map_err(|_| RuntimeError::new("evaluation provider token registry lock poisoned"))?;
+        if leases.contains_key(session_id) {
+            return Err(RuntimeError::new(format!(
+                "evaluation provider token lease already exists for session `{session_id}`"
+            )));
+        }
+        leases.insert(session_id.to_string(), Arc::clone(&lease));
+        Ok(EvaluationProviderTokenLeaseGuard {
+            session_id: session_id.to_string(),
+            registry: Arc::clone(self),
+            lease,
+        })
+    }
+
+    pub(crate) fn get(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Arc<EvaluationProviderTokenLease>>, RuntimeError> {
+        self.leases
+            .lock()
+            .map(|leases| leases.get(session_id).cloned())
+            .map_err(|_| RuntimeError::new("evaluation provider token registry lock poisoned"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,137 +208,93 @@ pub(crate) struct EvaluationProviderTokenLeaseSnapshot {
 }
 
 pub(crate) struct EvaluationProviderTokenLeaseGuard {
-    lease_id: String,
+    session_id: String,
+    registry: Arc<EvaluationProviderTokenLeaseRegistry>,
+    lease: Arc<EvaluationProviderTokenLease>,
 }
 
 impl Drop for EvaluationProviderTokenLeaseGuard {
     fn drop(&mut self) {
-        let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() else {
+        let Ok(mut leases) = self.registry.leases.lock() else {
             return;
         };
-        let Ok(mut lease) = lease.lock() else {
-            return;
-        };
-        if lease
-            .as_ref()
-            .is_some_and(|current| current.lease_id == self.lease_id && current.outstanding == 0)
+        if leases
+            .get(&self.session_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.lease))
         {
-            *lease = None;
+            leases.remove(&self.session_id);
         }
     }
 }
 
-pub(crate) fn install_evaluation_provider_token_lease(
-    lease_id: &str,
-    limit: u64,
-) -> Result<EvaluationProviderTokenLeaseGuard, RuntimeError> {
-    if lease_id.trim().is_empty() || limit == 0 || limit > 2_000_000 {
-        return Err(RuntimeError::new(
-            "evaluation provider token lease identity/limit is invalid",
-        ));
+impl EvaluationProviderTokenLeaseGuard {
+    pub(crate) fn lease(&self) -> Arc<EvaluationProviderTokenLease> {
+        Arc::clone(&self.lease)
     }
-    let lease = EVALUATION_PROVIDER_TOKEN_LEASE.get_or_init(|| std::sync::Mutex::new(None));
-    let mut lease = lease
-        .lock()
-        .map_err(|_| RuntimeError::new("evaluation provider token lease lock poisoned"))?;
-    if lease
-        .as_ref()
-        .is_some_and(|current| current.outstanding > 0)
-    {
-        return Err(RuntimeError::new(
-            "evaluation provider token lease cannot reset while a request is outstanding",
-        ));
-    }
-    *lease = Some(EvaluationProviderTokenLeaseState {
-        lease_id: lease_id.to_string(),
-        limit,
-        remaining: limit,
-        input_consumed: 0,
-        output_consumed: 0,
-        cached_consumed: 0,
-        outstanding: 0,
-        breached: false,
-    });
-    Ok(EvaluationProviderTokenLeaseGuard {
-        lease_id: lease_id.to_string(),
-    })
-}
 
-pub(crate) fn evaluation_provider_token_lease_snapshot(
-) -> Option<EvaluationProviderTokenLeaseSnapshot> {
-    EVALUATION_PROVIDER_TOKEN_LEASE
-        .get()
-        .and_then(|lease| lease.lock().ok())
-        .and_then(|lease| {
-            lease
-                .as_ref()
-                .map(|lease| EvaluationProviderTokenLeaseSnapshot {
-                    lease_id: lease.lease_id.clone(),
-                    limit: lease.limit,
-                    consumed: lease.limit.saturating_sub(lease.remaining),
-                    input_consumed: lease.input_consumed,
-                    output_consumed: lease.output_consumed,
-                    cached_consumed: lease.cached_consumed,
-                    outstanding: lease.outstanding,
-                    breached: lease.breached,
-                })
-        })
+    pub(crate) fn snapshot(&self) -> Result<EvaluationProviderTokenLeaseSnapshot, RuntimeError> {
+        self.lease.snapshot()
+    }
 }
 
 struct EvaluationProviderTokenReservation {
+    lease: Arc<EvaluationProviderTokenLease>,
     reserved: u64,
     reconciled: bool,
     dispatched: bool,
 }
 
 impl EvaluationProviderTokenReservation {
-    fn acquire(request: &mut ApiRequest) -> Result<Option<Self>, RuntimeError> {
-        let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() else {
+    fn acquire(
+        lease: Option<&Arc<EvaluationProviderTokenLease>>,
+        request: &mut ApiRequest,
+    ) -> Result<Option<Self>, RuntimeError> {
+        let Some(lease) = lease else {
             return Ok(None);
         };
-        let mut lease = lease
+        let mut state = lease
+            .state
             .lock()
             .map_err(|_| RuntimeError::new("evaluation provider token lease lock poisoned"))?;
-        let Some(lease) = lease.as_mut() else {
-            return Ok(None);
-        };
-        if lease.breached {
+        if state.breached {
             return Err(RuntimeError::new(format!(
                 "evaluation provider token lease `{}` is already breached",
-                lease.lease_id
+                state.lease_id
             )));
         }
         // Reserve a conservative upper bound before touching the provider.
         // Input estimation, protocol framing and the normal request safety
         // margin are all charged; the remainder becomes the provider-enforced
-        // maximum output. This lease is process-wide in the dedicated
-        // evaluator Gateway, so Team children and their parent share it.
+        // maximum output. The Session-scoped Arc is shared by Team children
+        // and their parent without charging unrelated conversations.
         let input_reserve = request
             .budget
             .input_total_tokens()
             .saturating_add(request.budget.protocol_overhead_tokens)
             .saturating_add(request.budget.safety_margin_tokens);
-        if input_reserve >= lease.remaining {
+        if input_reserve >= state.remaining {
             return Err(RuntimeError::new(format!(
                 "evaluation provider token lease `{}` has {} tokens remaining but request input reserves {}",
-                lease.lease_id, lease.remaining, input_reserve
+                state.lease_id, state.remaining, input_reserve
             )));
         }
         let output_reserve = request
             .budget
             .requested_output_tokens
-            .min(lease.remaining.saturating_sub(input_reserve));
+            .min(state.remaining.saturating_sub(input_reserve));
         if output_reserve == 0 {
             return Err(RuntimeError::new(format!(
                 "evaluation provider token lease `{}` has no output capacity",
-                lease.lease_id
+                state.lease_id
             )));
         }
         request.budget.requested_output_tokens = output_reserve;
         let reserved = input_reserve.saturating_add(output_reserve);
-        lease.remaining = lease.remaining.saturating_sub(reserved);
-        lease.outstanding = lease.outstanding.saturating_add(1);
+        state.remaining = state.remaining.saturating_sub(reserved);
+        state.outstanding = state.outstanding.saturating_add(1);
+        drop(state);
         Ok(Some(Self {
+            lease: Arc::clone(lease),
             reserved,
             reconciled: false,
             dispatched: false,
@@ -278,25 +320,21 @@ impl EvaluationProviderTokenReservation {
             // retaining the conservative charge.
             return;
         }
-        if let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() {
-            if let Ok(mut lease) = lease.lock() {
-                if let Some(lease) = lease.as_mut() {
-                    lease.input_consumed = lease.input_consumed.saturating_add(input);
-                    lease.output_consumed = lease.output_consumed.saturating_add(output);
-                    lease.cached_consumed = lease.cached_consumed.saturating_add(cached);
-                    if actual <= self.reserved {
-                        lease.remaining = lease
-                            .remaining
-                            .saturating_add(self.reserved.saturating_sub(actual))
-                            .min(lease.limit);
-                    } else {
-                        lease.breached = true;
-                        lease.remaining = 0;
-                    }
-                    lease.outstanding = lease.outstanding.saturating_sub(1);
-                    self.reconciled = true;
-                }
+        if let Ok(mut lease) = self.lease.state.lock() {
+            lease.input_consumed = lease.input_consumed.saturating_add(input);
+            lease.output_consumed = lease.output_consumed.saturating_add(output);
+            lease.cached_consumed = lease.cached_consumed.saturating_add(cached);
+            if actual <= self.reserved {
+                lease.remaining = lease
+                    .remaining
+                    .saturating_add(self.reserved.saturating_sub(actual))
+                    .min(lease.limit);
+            } else {
+                lease.breached = true;
+                lease.remaining = 0;
             }
+            lease.outstanding = lease.outstanding.saturating_sub(1);
+            self.reconciled = true;
         }
     }
 }
@@ -306,23 +344,19 @@ impl Drop for EvaluationProviderTokenReservation {
         if self.reconciled {
             return;
         }
-        if let Some(lease) = EVALUATION_PROVIDER_TOKEN_LEASE.get() {
-            if let Ok(mut lease) = lease.lock() {
-                if let Some(lease) = lease.as_mut() {
-                    if !self.dispatched {
-                        lease.remaining = lease
-                            .remaining
-                            .saturating_add(self.reserved)
-                            .min(lease.limit);
-                    }
-                    lease.outstanding = lease.outstanding.saturating_sub(1);
-                }
+        if let Ok(mut lease) = self.lease.state.lock() {
+            if !self.dispatched {
+                lease.remaining = lease
+                    .remaining
+                    .saturating_add(self.reserved)
+                    .min(lease.limit);
             }
+            lease.outstanding = lease.outstanding.saturating_sub(1);
         }
     }
 }
 
-/// One pre-dispatch reservation transaction across the process-wide
+/// One pre-dispatch reservation transaction across the explicitly bound
 /// evaluation budget and the delegated child budget. If either admission
 /// fails, every reservation already acquired by this function is dropped
 /// before the caller can reach Provider IO.
@@ -333,6 +367,7 @@ struct ProviderTokenReservationSet {
 
 impl ProviderTokenReservationSet {
     fn acquire(
+        evaluation_lease: Option<&Arc<EvaluationProviderTokenLease>>,
         delegated_budget: Option<&(
             crate::execution_core::budget::ParentExecutionBudgetLedger,
             harness_contract::context::ChildExecutionBudgetReservation,
@@ -340,7 +375,7 @@ impl ProviderTokenReservationSet {
         model: &str,
         request: &mut ApiRequest,
     ) -> Result<Self, RuntimeError> {
-        let evaluation = EvaluationProviderTokenReservation::acquire(request)?;
+        let evaluation = EvaluationProviderTokenReservation::acquire(evaluation_lease, request)?;
         let delegated = delegated_budget
             .map(|(ledger, child)| {
                 let input_reserve = request
@@ -3335,6 +3370,10 @@ pub struct ConversationRuntime<C, T> {
     model_context_window_source: provider::ModelContextWindowSource,
     model_context_windows: BTreeMap<String, u32>,
     provider_max_output_override: Option<u32>,
+    /// Hard evaluation budget explicitly bound to this Session execution
+    /// domain. Root and delegated conversations share the same Arc; unrelated
+    /// Sessions never consult ambient process state.
+    evaluation_provider_token_lease: Option<Arc<EvaluationProviderTokenLease>>,
     delegated_provider_budget: Option<(
         crate::execution_core::budget::ParentExecutionBudgetLedger,
         harness_contract::context::ChildExecutionBudgetReservation,
@@ -3877,6 +3916,7 @@ where
             provider_max_output_override: feature_config
                 .provider_resources()
                 .max_output_tokens_override(),
+            evaluation_provider_token_lease: None,
             delegated_provider_budget: None,
             calibrated_model_context_windows: std::sync::Mutex::new(BTreeMap::new()),
             hook_abort_signal: HookAbortSignal::default(),
@@ -4103,6 +4143,25 @@ where
     ) -> Self {
         self.provider_resource_config = config;
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_evaluation_provider_token_lease(
+        mut self,
+        lease: Arc<EvaluationProviderTokenLease>,
+    ) -> Self {
+        self.evaluation_provider_token_lease = Some(lease);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_evaluation_provider_token_lease(
+        &self,
+        lease: &Arc<EvaluationProviderTokenLease>,
+    ) -> bool {
+        self.evaluation_provider_token_lease
+            .as_ref()
+            .is_some_and(|bound| Arc::ptr_eq(bound, lease))
     }
 
     /// Install the immutable child share of a durable parent execution
@@ -4627,6 +4686,7 @@ where
                         }
                     };
                 let mut token_reservations = match ProviderTokenReservationSet::acquire(
+                    self.evaluation_provider_token_lease.as_ref(),
                     self.delegated_provider_budget.as_ref(),
                     &model,
                     &mut request,
@@ -7550,6 +7610,7 @@ where
             };
             request.reasoning_effort_override = one_shot_reasoning_effort.clone();
             let mut token_reservations = match ProviderTokenReservationSet::acquire(
+                self.evaluation_provider_token_lease.as_ref(),
                 self.delegated_provider_budget.as_ref(),
                 &model,
                 &mut request,
@@ -12429,11 +12490,11 @@ where
             }
             if let Some(receipt) = state.collaboration_receipt.as_ref() {
                 let metric = |name: &str| receipt.get(name).and_then(serde_json::Value::as_u64);
-                // A process-wide evaluation lease already includes Team
-                // children and every fallback request. Adding the receipt a
-                // second time inflated projected usage and broke the hard
-                // budget equality gate. Production turns have no evaluation
-                // lease and still merge child telemetry here.
+                // A Session-scoped evaluation lease already includes Team
+                // children and every fallback request bound to that Session.
+                // Adding the receipt a second time inflates projected usage
+                // and breaks the hard budget equality gate. Production turns
+                // have no evaluation lease and still merge child telemetry.
                 if outcome.evaluation_token_limit == 0 {
                     outcome.input_tokens = outcome
                         .input_tokens
@@ -14189,28 +14250,24 @@ impl ToolExecutor for StaticToolExecutor {
 
 #[cfg(test)]
 mod tests {
-
-    static TOKEN_RESERVATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     use super::{
         apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
         build_cc_memory_config_with_budget, canonicalize_model_tool_names,
         classify_model_step_intent, consume_provider_stream, conversation_message_text,
         current_turn_messages, deterministic_checkpoint_id, enforce_explicit_team_requirement,
-        eval_override_selection, evaluation_provider_token_lease_snapshot,
-        image_user_message_from_path, install_evaluation_provider_token_lease,
-        is_append_only_projection, is_runtime_team_orchestration_call,
-        memory_project_id_for_session, prepared_vision_payload, preview_chars,
-        provider_retry_is_fenced, provider_transport_policy, rate_per_second,
+        eval_override_selection, image_user_message_from_path, is_append_only_projection,
+        is_runtime_team_orchestration_call, memory_project_id_for_session, prepared_vision_payload,
+        preview_chars, provider_retry_is_fenced, provider_transport_policy, rate_per_second,
         required_team_orchestration_call, revalidate_context_binding,
         runtime_team_orchestration_count, turn_strategy_event_kind_allowed,
         unexposed_model_tool_names, vision_tool_model_receipt, vision_user_message, ApiClient,
         ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken, CognitiveContextManager,
         ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture, EarlyToolDispatchResult,
-        EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan,
-        ModelStreamReducer, ModelToolCall, ProviderContextInventory, ProviderTokenReservationSet,
-        RuntimeError, StaticToolExecutor, ToolExposureState, ToolModelDeliveryRequirement,
-        TurnStablePrefixMetrics, TurnToolExposureMetrics,
+        EarlyToolDispatcher, EarlyToolExecutionReceipt, EvaluationProviderTokenLeaseRegistry,
+        ModelStepIntent, ModelStepToolPlan, ModelStreamReducer, ModelToolCall,
+        ProviderContextInventory, ProviderTokenReservationSet, RuntimeError, StaticToolExecutor,
+        ToolExposureState, ToolModelDeliveryRequirement, TurnStablePrefixMetrics,
+        TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -15392,9 +15449,11 @@ mod tests {
 
     #[test]
     fn provider_reservation_set_records_delegated_admission_instead_of_blocking() {
-        let _guard = TOKEN_RESERVATION_TEST_LOCK.lock().unwrap();
-        let _lease = install_evaluation_provider_token_lease("eval-rollback", 1_000)
+        let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+        let guard = registry
+            .install("session-rollback", "eval-rollback", 1_000)
             .expect("install evaluation budget");
+        let lease = guard.lease();
         let child = harness_contract::context::ChildExecutionBudgetReservation::single(
             "delegated-small",
             "agent-small",
@@ -15411,6 +15470,7 @@ mod tests {
         let delegated = (ledger.clone(), child);
         let mut request = token_reservation_request();
         let reservation_set = ProviderTokenReservationSet::acquire(
+            Some(&lease),
             Some(&delegated),
             "claude-haiku-4-5-20251001",
             &mut request,
@@ -15422,10 +15482,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_reservation_set_leaves_delegated_untouched_when_global_admission_fails() {
-        let _guard = TOKEN_RESERVATION_TEST_LOCK.lock().unwrap();
-        let _lease = install_evaluation_provider_token_lease("eval-small", 30)
+    fn provider_reservation_set_leaves_delegated_untouched_when_evaluation_admission_fails() {
+        let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+        let guard = registry
+            .install("session-small", "eval-small", 30)
             .expect("install evaluation budget");
+        let lease = guard.lease();
         let child = harness_contract::context::ChildExecutionBudgetReservation::single(
             "delegated-untouched",
             "agent-untouched",
@@ -15442,16 +15504,54 @@ mod tests {
         let delegated = (ledger.clone(), child);
         let mut request = token_reservation_request();
         assert!(ProviderTokenReservationSet::acquire(
+            Some(&lease),
             Some(&delegated),
             "claude-haiku-4-5-20251001",
             &mut request
         )
         .is_err());
 
-        let global = evaluation_provider_token_lease_snapshot().expect("evaluation snapshot");
-        assert_eq!(global.consumed, 0);
-        assert_eq!(global.outstanding, 0);
+        let evaluation = guard.snapshot().expect("evaluation snapshot");
+        assert_eq!(evaluation.consumed, 0);
+        assert_eq!(evaluation.outstanding, 0);
         assert_eq!(ledger.snapshot().unwrap().reserved_tokens, 0);
+    }
+
+    #[test]
+    fn evaluation_provider_token_leases_are_isolated_by_session_binding() {
+        let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+        let small_guard = registry
+            .install("session-small", "eval-small", 30)
+            .expect("small lease");
+        let large_guard = registry
+            .install("session-large", "eval-large", 1_000)
+            .expect("large lease");
+        assert!(registry
+            .install("session-small", "duplicate", 1_000)
+            .is_err());
+
+        let small = small_guard.lease();
+        let large = large_guard.lease();
+        let mut rejected = token_reservation_request();
+        assert!(
+            ProviderTokenReservationSet::acquire(Some(&small), None, "test", &mut rejected)
+                .is_err()
+        );
+
+        let mut admitted = token_reservation_request();
+        let reservation =
+            ProviderTokenReservationSet::acquire(Some(&large), None, "test", &mut admitted)
+                .expect("large Session lease must admit independently");
+        assert_eq!(small_guard.snapshot().unwrap().consumed, 0);
+        assert!(large_guard.snapshot().unwrap().consumed > 0);
+        drop(reservation);
+        assert_eq!(large_guard.snapshot().unwrap().consumed, 0);
+
+        let mut unbound = token_reservation_request();
+        ProviderTokenReservationSet::acquire(None, None, "test", &mut unbound)
+            .expect("unbound Conversation must ignore every registered lease");
+        assert_eq!(small_guard.snapshot().unwrap().consumed, 0);
+        assert_eq!(large_guard.snapshot().unwrap().consumed, 0);
     }
 
     #[test]
