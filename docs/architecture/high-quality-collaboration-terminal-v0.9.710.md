@@ -8,6 +8,8 @@ The pre-v0.9.710 path treated bounded presentation strings as if they were canon
 
 The failure was architectural, not a Qwen-specific quality defect. Qwen 3.8-max made the defect observable by producing sufficiently broad results to cross both lossy boundaries.
 
+The first v0.9.710 real-provider rerun exposed a second, subtler false positive. The Program topology, durable delivery envelopes and root presentation all passed, but downstream Team E reported that it had not received the complete A/B terminal semantics and Team F reported the same for C/D/E. Three independent presentation limits were still acting as hidden semantic limits: predecessor Agent context was capped at 16,384 characters, cross-Team summaries were capped at 4,000 characters, and root receipt reconstruction kept at most 32 receipts with 4,000 characters per receipt and 48,000 characters overall. The dependency gate therefore proved scheduling order but not semantic handoff consumption.
+
 ## Invariants
 
 1. Agent semantic results are lossless canonical data. Character limits may apply to raw tool previews, never to the authored result contract.
@@ -16,6 +18,7 @@ The failure was architectural, not a Qwen-specific quality defect. Qwen 3.8-max 
 4. The final answer and the complete source carrier are committed atomically in the terminal artifact.
 5. Objective, structural and transport quality failures close fail-closed. One model repair is allowed; continued failure produces `Partial` plus an invalid presentation receipt, never a false `Satisfied` result.
 6. Runtime resource ceilings remain safety contracts. When a complete evidence packet cannot fit a provider context, preflight rejects the attempt explicitly; no hidden content deletion is permitted.
+7. Dependency satisfaction has two parts: the predecessor must be terminal and its complete semantic result must be materialized into the successor input. A topology-only wait is not a valid cross-Team handoff.
 
 ## Canonical chain
 
@@ -60,6 +63,8 @@ The deterministic gate checks facts that can be decided without a second subject
 - no direct multi-Team carrier bypass.
 
 The live six-Team Qwen scenario independently repeats the presentation checks in the evaluator. A structurally successful Program therefore cannot pass the release evidence gate with an empty, concatenated, truncated or incomplete answer.
+
+For objectives that require actual structured-handoff consumption, the Runtime and evaluator additionally reject missing-upstream admissions and require a positive conclusion that successor Teams consumed the complete upstream semantics. This turns semantic delivery into a tested acceptance property instead of inferring it from graph topology.
 
 ## Resource model
 

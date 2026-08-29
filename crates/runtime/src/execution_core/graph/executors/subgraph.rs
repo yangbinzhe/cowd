@@ -124,11 +124,7 @@ impl NodeExecutor for TeamSubgraphExecutor {
                 request.upstream_artifact_refs.push(result_ref.to_string());
             }
             if let Some(summary) = result.summary.as_deref() {
-                summaries.push(format!(
-                    "{}: {}",
-                    edge.from,
-                    summary.chars().take(4_000).collect::<String>()
-                ));
+                summaries.push(format!("{}: {}", edge.from, summary));
             }
         }
         if let Some(binding) = context.graph.continuation_binding.as_ref() {
@@ -560,11 +556,7 @@ fn attach_current_predecessor_context(
             request.upstream_artifact_refs.push(result_ref.to_string());
         }
         if let Some(summary) = result.summary.as_deref() {
-            summaries.push(format!(
-                "{}: {}",
-                edge.from,
-                summary.chars().take(4_000).collect::<String>()
-            ));
+            summaries.push(format!("{}: {}", edge.from, summary));
         }
     }
     request.upstream_evidence_refs.sort_by(|left, right| {
@@ -607,18 +599,9 @@ fn is_durable_artifact_locator(reference: &str) -> bool {
 }
 
 fn decode_team_terminal_summary(reference: &str) -> Option<String> {
-    const MAX_CHARS: usize = 4_000;
     let encoded = reference.strip_prefix("assistant_json:")?;
     let value = serde_json::from_str::<String>(encoded).ok()?;
-    let mut chars = value.trim().chars();
-    let summary = chars.by_ref().take(MAX_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        Some(format!(
-            "{summary}\n...[Team terminal result truncated; inspect durable evidence for full content]"
-        ))
-    } else {
-        Some(summary)
-    }
+    Some(value.trim().to_string())
 }
 
 #[cfg(test)]
@@ -637,15 +620,15 @@ mod tests {
     use std::sync::{Arc, Weak};
 
     #[test]
-    fn team_terminal_result_becomes_bounded_dependency_summary() {
+    fn team_terminal_result_remains_complete_dependency_evidence() {
         let encoded = serde_json::to_string(&format!("verified:{}", "x".repeat(5_000)))
             .expect("terminal result");
         let summary = decode_team_terminal_summary(&format!("assistant_json:{encoded}"))
             .expect("decoded summary");
 
         assert!(summary.starts_with("verified:"));
-        assert!(summary.contains("Team terminal result truncated"));
-        assert!(summary.chars().count() < 4_200);
+        assert_eq!(summary.chars().count(), "verified:".chars().count() + 5_000);
+        assert!(!summary.contains("truncated"));
         assert!(decode_team_terminal_summary("artifact:report").is_none());
     }
 
@@ -766,7 +749,10 @@ mod tests {
             ExecutionNodeResult {
                 status: harness_contract::execution_graph::ExecutionNodeStatus::Completed,
                 result_ref: Some("artifact:team-a:report".to_string()),
-                summary: Some("Team A verified the runtime boundary.".to_string()),
+                summary: Some(format!(
+                    "Team A verified the runtime boundary. {} COMPLETE_TEAM_A_TAIL",
+                    "evidence ".repeat(1_000)
+                )),
                 evidence_refs: vec![evidence],
                 failure: None,
                 usage: ExecutionUsage::default(),
@@ -812,12 +798,14 @@ mod tests {
         assert!(materialized
             .objective
             .contains("Team A verified the runtime boundary."));
+        assert!(materialized.objective.contains("COMPLETE_TEAM_A_TAIL"));
+        assert!(!materialized.objective.contains("truncated"));
         assert!(materialized
             .objective
             .contains("Team inline result remains available as a bounded summary."));
         assert!(materialized.focus_partition_plans[0]
             .shared_baseline
             .iter()
-            .any(|item| item.contains("Team A verified the runtime boundary.")));
+            .any(|item| item.contains("COMPLETE_TEAM_A_TAIL")));
     }
 }

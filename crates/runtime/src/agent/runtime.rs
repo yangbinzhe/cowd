@@ -1294,8 +1294,6 @@ impl AgentRuntime {
             return Ok(packet);
         }
 
-        let max_chars = predecessor_context_limit(packet.budget_lease.max_tokens);
-        let mut remaining = max_chars;
         let mut sections = Vec::new();
         for predecessor in predecessors {
             let predecessor_packet: AgentTaskPacket =
@@ -1315,10 +1313,6 @@ impl AgentRuntime {
                 .team_role_assignment()
                 .map(|assignment| assignment.identity.role_id.as_str())
                 .unwrap_or(&predecessor_packet.assignment.role_id);
-            let available = remaining.saturating_sub(96);
-            if available == 0 {
-                break;
-            }
             let upstream_outcome = if result.status == ExecutionNodeStatus::Completed {
                 result.summary.clone().unwrap_or_else(|| {
                     format!("completed upstream result {}", predecessor_packet.run_id())
@@ -1333,9 +1327,7 @@ impl AgentRuntime {
                         .unwrap_or_else(|| "no durable terminal summary".to_string())
                 )
             };
-            let outcome = truncate_context_text(&upstream_outcome, available);
-            remaining = remaining.saturating_sub(outcome.len().saturating_add(96));
-            sections.push(format!("### Upstream {role}\n{outcome}"));
+            sections.push(canonical_predecessor_section(role, &upstream_outcome));
         }
         if !sections.is_empty() {
             packet.objective.push_str(
@@ -2221,23 +2213,8 @@ fn binding_digest(binding: &AgentBindingSnapshot) -> Result<String, String> {
         .map_err(|error| format!("failed to encode Agent Binding: {error}"))
 }
 
-fn predecessor_context_limit(budget_tokens: u64) -> usize {
-    let derived = budget_tokens.saturating_div(5).saturating_mul(4) as usize;
-    if derived == 0 {
-        12_000
-    } else {
-        derived.clamp(1_024, 16_384)
-    }
-}
-
-fn truncate_context_text(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let retained = max_chars.saturating_sub(48);
-    let mut output = value.chars().take(retained).collect::<String>();
-    output.push_str("\n[upstream result truncated; canonical result remains in graph evidence]");
-    output
+fn canonical_predecessor_section(role: &str, outcome: &str) -> String {
+    format!("### Upstream {role}\n{outcome}")
 }
 
 fn live_lifecycle_phase(
@@ -2372,6 +2349,20 @@ mod tests {
     use crate::config::{ProviderConfig, ProvidersConfig};
     use harness_contract::agent::{AgentCapability, AgentDefinitionId, DefinitionScope};
     use harness_contract::context::ChildExecutionBudgetReservation;
+
+    #[test]
+    fn canonical_predecessor_section_preserves_complete_role_result() {
+        let outcome = format!(
+            "verified {} COMPLETE_INVESTIGATOR_TAIL",
+            "evidence ".repeat(4_000)
+        );
+        let section = canonical_predecessor_section("investigator", &outcome);
+
+        assert!(section.starts_with("### Upstream investigator\nverified"));
+        assert!(section.contains("COMPLETE_INVESTIGATOR_TAIL"));
+        assert!(!section.contains("truncated"));
+        assert_eq!(section.chars().count(), outcome.chars().count() + 26);
+    }
 
     struct CompletedBackend;
 

@@ -3945,7 +3945,7 @@ where
                     }
                     evidence.push_str(&early_evidence);
                 }
-                evidence.chars().take(48_000).collect::<String>()
+                evidence
             });
             let made_progress = std::mem::take(&mut state.last_verified_progress);
             let intervention = if clean_terminal_synthesis {
@@ -9369,6 +9369,33 @@ fn collaboration_answer_quality_findings(answer: &str, objective: &str) -> Vec<S
     if objective.contains("`C4`") && !trimmed.contains("C4") {
         findings.push("final answer is missing required C4 discussion".to_string());
     }
+    if objective.contains("实际消费") && objective.contains("结构化交接") {
+        let missing_handoff = [
+            "未能看到 team",
+            "没有显式的 team",
+            "缺少上游 team",
+            "未完成对 team",
+            "missing upstream",
+            "did not receive upstream",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+        let consumed_handoff = [
+            "结构化交接已完整消费",
+            "语义级交接已完成",
+            "实际消费了完整上游",
+            "完整上游语义交接",
+            "consumed the complete upstream",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker));
+        if missing_handoff || !consumed_handoff {
+            findings.push(
+                "final answer does not verify complete cross-Team semantic handoff consumption"
+                    .to_string(),
+            );
+        }
+    }
     findings.sort();
     findings.dedup();
     findings
@@ -11311,11 +11338,7 @@ fn early_tool_receipt_message(
 }
 
 fn terminal_evidence_digest(messages: &[ConversationMessage]) -> String {
-    const MAX_RECEIPTS: usize = 32;
-    const MAX_CHARS_PER_RECEIPT: usize = 4_000;
-    const MAX_TOTAL_CHARS: usize = 48_000;
-
-    let mut receipts = messages
+    let receipts = messages
         .iter()
         .flat_map(|message| message.blocks.iter())
         .filter_map(|block| match block {
@@ -11328,9 +11351,6 @@ fn terminal_evidence_digest(messages: &[ConversationMessage]) -> String {
             _ => None,
         })
         .collect::<Vec<_>>();
-    if receipts.len() > MAX_RECEIPTS {
-        receipts.drain(..receipts.len() - MAX_RECEIPTS);
-    }
 
     let mut seen = BTreeSet::new();
     let mut rendered = String::new();
@@ -11339,25 +11359,13 @@ fn terminal_evidence_digest(messages: &[ConversationMessage]) -> String {
         if !seen.insert(fingerprint) {
             continue;
         }
-        let body = output
-            .chars()
-            .take(MAX_CHARS_PER_RECEIPT)
-            .collect::<String>();
         let receipt = format!(
             "\n\n### Receipt {} · {} · {}\n{}",
             index + 1,
             tool_name,
             if is_error { "failed" } else { "completed" },
-            body,
+            output,
         );
-        if rendered
-            .chars()
-            .count()
-            .saturating_add(receipt.chars().count())
-            > MAX_TOTAL_CHARS
-        {
-            break;
-        }
         rendered.push_str(&receipt);
     }
     rendered.trim().to_string()
@@ -18635,6 +18643,18 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_quality_gate_rejects_topology_without_semantic_handoff() {
+        let objective = "Team E 必须实际消费 A/B 的完整结构化交接。";
+        let invalid = "Team E 未能看到 Team A/B 的结构化结果。";
+        let valid = "Team E 实际消费了完整上游语义交接，结构化交接已完整消费。";
+
+        assert!(collaboration_answer_quality_findings(invalid, objective)
+            .iter()
+            .any(|finding| finding.contains("semantic handoff")));
+        assert!(collaboration_answer_quality_findings(valid, objective).is_empty());
+    }
+
+    #[test]
     fn hierarchical_partition_never_slices_a_semantic_result() {
         let results = vec![
             "A".repeat(40),
@@ -18723,6 +18743,31 @@ mod tests {
         assert!(item
             .content
             .contains("Native structured output, JSON, Markdown headings"));
+    }
+
+    #[test]
+    fn terminal_evidence_digest_preserves_all_receipts_and_complete_content() {
+        let messages = (0..40)
+            .map(|index| {
+                ConversationMessage::tool_result(
+                    format!("read-{index}"),
+                    "read_file",
+                    format!(
+                        "receipt-{index} {} COMPLETE_RECEIPT_{index}",
+                        "source-content ".repeat(400)
+                    ),
+                    false,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let digest = terminal_evidence_digest(&messages);
+
+        assert!(digest.contains("receipt-0"));
+        assert!(digest.contains("COMPLETE_RECEIPT_0"));
+        assert!(digest.contains("receipt-39"));
+        assert!(digest.contains("COMPLETE_RECEIPT_39"));
+        assert_eq!(digest.matches("### Receipt ").count(), 40);
     }
 
     #[test]
