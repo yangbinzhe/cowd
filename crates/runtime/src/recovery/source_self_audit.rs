@@ -86,7 +86,7 @@ fn gateway_owns_surface_boundary(repo_root: &Path) -> SourceSelfAuditCheck {
     }) && route_source.as_deref().is_some_and(|source| {
         source.contains("surface::message")
             && source.contains("MessageConnectorContract")
-            && source.contains("/api/message-connectors")
+            && source.contains("API_MESSAGE_CONNECTORS.template()")
     });
     check(
         "gateway.owns_surface_boundary",
@@ -123,7 +123,8 @@ fn growth_routes_are_observable(repo_root: &Path) -> SourceSelfAuditCheck {
     let passed = routes_source.as_deref().is_some_and(|source| {
         source.contains("mod growth_routes") && source.contains("growth_routes::router()")
     }) && growth_source.as_deref().is_some_and(|source| {
-        source.contains("/api/growth/events") && source.contains("/api/growth/status")
+        source.contains("API_GROWTH_EVENTS.template()")
+            && source.contains("API_GROWTH_STATUS.template()")
     });
     check(
         "gateway.growth_observable",

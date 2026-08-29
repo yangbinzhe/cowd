@@ -13,20 +13,12 @@ generated:
     generator: surfaces/webui/scripts/generate-api.mjs
     source: surfaces/webui/scripts/generate-api.mjs
 transitional:
-  - { repository: core, path: crates/runtime/src/conversation/conversation.rs, phase: P4 }
-  - { repository: core, path: crates/runtime/src/conversation/host.rs, phase: P4 }
   - { repository: core, path: crates/session/src/persistence/sqlite.rs, phase: P5 }
   - { repository: core, path: crates/session-postgres/src/lib.rs, phase: P5 }
-  - { repository: core, path: crates/runtime/src/execution_core/services.rs, phase: P4 }
   - { repository: core, path: crates/tui/src/gateway/gateway_client.rs, phase: P2-P6 }
   - { repository: core, path: crates/tui/src/app_core/state.rs, phase: P6 }
   - { repository: core, path: crates/tui/src/app_core/app.rs, phase: P6 }
-  - { repository: core, path: crates/runtime/src/infrastructure/config.rs, phase: P4 }
   - { repository: core, path: crates/runtime/src/recovery/runtime_event_store.rs, phase: P5 }
-  - { repository: core, path: crates/runtime/src/agent/in_process_worker.rs, phase: P4 }
-  - { repository: core, path: crates/tools/src/execution/executor.rs, phase: P4 }
   - { repository: core, path: crates/runtime-postgres/src/lib.rs, phase: P5 }
   - { repository: core, path: crates/memory/src/kernel/cognitive.rs, phase: P5 }
-  - { repository: core, path: crates/runtime/src/execution_core/graph/commit_service.rs, phase: P4 }
   - { repository: core, path: crates/matrix/repository/src/sqlite_repository.rs, phase: P5 }
-  - { repository: core, path: crates/runtime/src/orchestration/mod.rs, phase: P4 }
