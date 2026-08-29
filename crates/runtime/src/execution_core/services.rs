@@ -6562,6 +6562,7 @@ impl RuntimeServices {
                         .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
                     upstream_evidence_refs: Vec::new(),
                     upstream_artifact_refs: Vec::new(),
+                    upstream_result_context: Vec::new(),
                     execution_capacity: Some(self.execution_capacity_profile().team_snapshot()),
                 };
                 self.team_runtime
@@ -7304,6 +7305,7 @@ fn evolution_team_request(
         allow_whole_workspace_scope: false,
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
+        upstream_result_context: Vec::new(),
         execution_capacity: Some(execution_capacity),
     }
 }
@@ -10537,6 +10539,7 @@ mod tests {
             allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
+            upstream_result_context: Vec::new(),
             execution_capacity: None,
         }
     }

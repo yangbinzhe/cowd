@@ -327,6 +327,14 @@ pub struct TeamInstantiationRequest {
     /// Durable artifact locators committed by predecessor root-graph nodes.
     #[serde(default)]
     pub upstream_artifact_refs: Vec<String>,
+    /// Complete Runtime-materialized semantic results from predecessor Team
+    /// nodes. This is separate from `objective` because delegated roles must
+    /// not inherit parent authority, and separate from artifact locators
+    /// because a locator alone does not give the model the authored result.
+    /// Runtime may fail provider preflight when this context is too large; it
+    /// must never silently slice or omit these values.
+    #[serde(default)]
+    pub upstream_result_context: Vec<String>,
     /// New Runtime admissions always carry this immutable snapshot. `None`
     /// is retained only so historical serialized Team requests remain
     /// decodable; Runtime never synthesizes a current profile for them.
@@ -464,7 +472,9 @@ impl TeamInstantiationRequest {
         if let Some(managed_invocation) = &self.managed_invocation {
             managed_invocation.validate()?;
         }
-        if (!self.upstream_evidence_refs.is_empty() || !self.upstream_artifact_refs.is_empty())
+        if (!self.upstream_evidence_refs.is_empty()
+            || !self.upstream_artifact_refs.is_empty()
+            || !self.upstream_result_context.is_empty())
             && self.parent_execution.is_none()
         {
             return Err(ValidationError::InvalidContract {
@@ -483,6 +493,10 @@ impl TeamInstantiationRequest {
                 message: "Team upstream evidence exceeds the bounded artifact contract".to_string(),
             });
         }
+        validate_unique_non_empty(
+            "team.upstream_result_context",
+            &self.upstream_result_context,
+        )?;
         if self.resource_scopes.iter().any(|scope| {
             let whole_workspace_form = matches!(
                 scope.as_str(),
@@ -778,6 +792,7 @@ mod tests {
             allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
+            upstream_result_context: Vec::new(),
             execution_capacity: None,
         }
     }

@@ -57,6 +57,7 @@ fn request(template_id: &str, mission_id: &str) -> TeamInstantiationRequest {
         allow_whole_workspace_scope: false,
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
+        upstream_result_context: Vec::new(),
         execution_capacity: None,
     }
 }
@@ -194,6 +195,12 @@ fn model_selected_focuses_activate_only_declared_template_roles() {
         services.mission_runtime().default_mission_id(),
     );
     request.selection_mode = TeamSelectionMode::ModelAssisted;
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: "mission-graph:parent".to_string(),
+        node_id: "team-explicit-consumer".to_string(),
+    });
+    request.upstream_result_context =
+        vec!["## Verified predecessor artifacts\nEXPLICIT_FOCUS_UPSTREAM_TAIL".to_string()];
     request.focus_partition_plans = vec![FocusPartitionPlan {
         role_id: "executor".to_string(),
         shared_baseline: vec!["bounded independent review".to_string()],
@@ -224,6 +231,58 @@ fn model_selected_focuses_activate_only_declared_template_roles() {
         plan.role_slots[0].focus_partition.focus_id,
         "runtime-review"
     );
+    assert!(plan.role_slots[0]
+        .focus_partition
+        .shared_baseline
+        .iter()
+        .any(|item| item.contains("EXPLICIT_FOCUS_UPSTREAM_TAIL")));
+    let packet = plan
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
+        .and_then(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok())
+        .expect("explicit-focus AgentTask packet must decode");
+    assert!(packet.objective.contains("EXPLICIT_FOCUS_UPSTREAM_TAIL"));
+}
+
+#[test]
+fn runtime_upstream_context_reaches_default_focus_agent_packets_losslessly() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let mut request = request(
+        "cowd/direct-executor",
+        services.mission_runtime().default_mission_id(),
+    );
+    request.parent_execution = Some(harness_contract::execution_graph::ExecutionParentBinding {
+        execution_id: "mission-graph:parent".to_string(),
+        node_id: "team-consumer".to_string(),
+    });
+    request.upstream_result_context = vec![format!(
+        "## Verified predecessor artifacts\n{} COMPLETE_UPSTREAM_TAIL",
+        "semantic-evidence ".repeat(4_000)
+    )];
+
+    let plan = services
+        .team_runtime()
+        .plan(request)
+        .expect("default-focus Team plans with Runtime handoff context");
+    let packets = plan
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
+        .map(|node| {
+            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                .expect("AgentTask packet must decode")
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!packets.is_empty());
+    assert!(packets.iter().all(|packet| {
+        packet.objective.contains("COMPLETE_UPSTREAM_TAIL")
+            && packet.objective.contains("Verified predecessor artifacts")
+            && !packet.objective.contains("upstream result truncated")
+    }));
 }
 
 #[test]

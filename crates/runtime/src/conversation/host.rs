@@ -9375,17 +9375,25 @@ fn collaboration_answer_quality_findings(answer: &str, objective: &str) -> Vec<S
             "没有显式的 team",
             "缺少上游 team",
             "未完成对 team",
+            "f 未通过",
+            "f 未能",
+            "f 的上游消费未",
+            "完整消费没有发生",
+            "完整消费未发生",
+            "不能被确认",
+            "不能确认",
+            "无法得到正面证明",
+            "语义载荷内容未",
+            "内容级载荷未",
+            "输入不完整",
             "missing upstream",
             "did not receive upstream",
         ]
         .iter()
         .any(|marker| normalized.contains(marker));
         let consumed_handoff = [
-            "结构化交接已完整消费",
-            "语义级交接已完成",
-            "实际消费了完整上游",
-            "完整上游语义交接",
-            "consumed the complete upstream",
+            "e/f 结构化交接已完整消费",
+            "teams e and f consumed the complete upstream",
         ]
         .iter()
         .any(|marker| normalized.contains(marker));
@@ -18646,12 +18654,23 @@ mod tests {
     fn collaboration_quality_gate_rejects_topology_without_semantic_handoff() {
         let objective = "Team E 必须实际消费 A/B 的完整结构化交接。";
         let invalid = "Team E 未能看到 Team A/B 的结构化结果。";
-        let valid = "Team E 实际消费了完整上游语义交接，结构化交接已完整消费。";
+        let valid = "E/F 结构化交接已完整消费。";
 
         assert!(collaboration_answer_quality_findings(invalid, objective)
             .iter()
             .any(|finding| finding.contains("semantic handoff")));
         assert!(collaboration_answer_quality_findings(valid, objective).is_empty());
+    }
+
+    #[test]
+    fn collaboration_quality_gate_rejects_negated_handoff_claim() {
+        let objective =
+            "必须实际消费上游结构化交接；若事实成立，原样声明 E/F 结构化交接已完整消费。";
+        let invalid = "F 未能消费完整上游；因此 E/F 结构化交接已完整消费不能被确认。";
+
+        assert!(collaboration_answer_quality_findings(invalid, objective)
+            .iter()
+            .any(|finding| finding.contains("semantic handoff")));
     }
 
     #[test]

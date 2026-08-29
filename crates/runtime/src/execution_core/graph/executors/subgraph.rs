@@ -166,21 +166,12 @@ impl NodeExecutor for TeamSubgraphExecutor {
             );
             request.objective.push_str("\n\n");
             request.objective.push_str(&predecessor_context);
-            // Focus plans are compiled before this child node becomes ready.
-            // Agent prompts consume their shared baselines rather than the
-            // Team graph's top-level objective, so attaching handoff text
-            // only above would make a downstream Team claim its Runtime
-            // inputs were absent even though the immutable request carried
-            // their evidence refs.  Copy this Runtime-derived context into
-            // every role baseline; it is a governed handoff, never model text.
-            for focus_plan in &mut request.focus_partition_plans {
-                if !focus_plan
-                    .shared_baseline
-                    .iter()
-                    .any(|item| item == &predecessor_context)
-                {
-                    focus_plan.shared_baseline.push(predecessor_context.clone());
-                }
+            if !request
+                .upstream_result_context
+                .iter()
+                .any(|item| item == &predecessor_context)
+            {
+                request.upstream_result_context.push(predecessor_context);
             }
         }
         let payload_ref =
@@ -581,14 +572,12 @@ fn attach_current_predecessor_context(
         request.objective.push_str("\n\n");
         request.objective.push_str(&predecessor_context);
     }
-    for focus_plan in &mut request.focus_partition_plans {
-        if !focus_plan
-            .shared_baseline
-            .iter()
-            .any(|item| item == &predecessor_context)
-        {
-            focus_plan.shared_baseline.push(predecessor_context.clone());
-        }
+    if !request
+        .upstream_result_context
+        .iter()
+        .any(|item| item == &predecessor_context)
+    {
+        request.upstream_result_context.push(predecessor_context);
     }
 }
 
@@ -702,6 +691,7 @@ mod tests {
             allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
+            upstream_result_context: Vec::new(),
             execution_capacity: None,
         };
         let mut predecessor =
@@ -803,8 +793,8 @@ mod tests {
         assert!(materialized
             .objective
             .contains("Team inline result remains available as a bounded summary."));
-        assert!(materialized.focus_partition_plans[0]
-            .shared_baseline
+        assert!(materialized
+            .upstream_result_context
             .iter()
             .any(|item| item.contains("COMPLETE_TEAM_A_TAIL")));
     }

@@ -19,7 +19,7 @@ const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 /// Default line window used when callers omit an explicit read limit.
 const DEFAULT_READ_LINE_LIMIT: usize = 1_000;
 
-const TRUNCATED_READ_GUIDANCE: &str = "This is a bounded window, not the whole file. Do not continue with consecutive read_file offsets to scan a large file. Use grep_search (or grep_many for independent patterns) to locate the relevant symbol or logic, then read only the matching region.";
+const TRUNCATED_READ_GUIDANCE: &str = "This is a bounded window, not the whole file. For ordinary analysis, use grep_search (or grep_many) to locate relevant logic instead of scanning consecutive offsets. If the task explicitly requires whole-file or EOF coverage, call read_file again with complete=true; complete mode is still protected by the file-size safety ceiling.";
 
 /// Maximum file size that can be written (10 MB).
 const MAX_WRITE_SIZE: usize = 10 * 1024 * 1024;
@@ -215,6 +215,7 @@ pub fn read_file(
     path: &str,
     offset: Option<usize>,
     limit: Option<usize>,
+    complete: bool,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = policy.resolve(path)?;
 
@@ -241,8 +242,22 @@ pub fn read_file(
 
     let content = fs::read_to_string(&absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
-    let start_index = offset.unwrap_or(0).min(lines.len());
-    let line_limit = limit.unwrap_or(DEFAULT_READ_LINE_LIMIT);
+    if complete && (offset.is_some() || limit.is_some()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "complete read_file mode cannot be combined with offset or limit",
+        ));
+    }
+    let start_index = if complete {
+        0
+    } else {
+        offset.unwrap_or(0).min(lines.len())
+    };
+    let line_limit = if complete {
+        lines.len()
+    } else {
+        limit.unwrap_or(DEFAULT_READ_LINE_LIMIT)
+    };
     let end_index = start_index.saturating_add(line_limit).min(lines.len());
     let selected = lines[start_index..end_index].join("\n");
     let truncated = end_index < lines.len();
@@ -704,8 +719,14 @@ mod tests {
             .expect("write should succeed");
         assert_eq!(write_output.kind, "create");
 
-        let read_output = read_file(&policy, path.to_string_lossy().as_ref(), Some(1), Some(1))
-            .expect("read should succeed");
+        let read_output = read_file(
+            &policy,
+            path.to_string_lossy().as_ref(),
+            Some(1),
+            Some(1),
+            false,
+        )
+        .expect("read should succeed");
         assert_eq!(read_output.file.content, "two");
     }
 
@@ -720,7 +741,7 @@ mod tests {
         write_file(&policy, path.to_string_lossy().as_ref(), &content)
             .expect("write should succeed");
 
-        let output = read_file(&policy, path.to_string_lossy().as_ref(), None, None)
+        let output = read_file(&policy, path.to_string_lossy().as_ref(), None, None, false)
             .expect("read should succeed");
 
         assert_eq!(output.file.num_lines, DEFAULT_READ_LINE_LIMIT);
@@ -732,6 +753,35 @@ mod tests {
             .guidance
             .as_deref()
             .is_some_and(|guidance| guidance.contains("grep_search")));
+    }
+
+    #[test]
+    fn explicit_complete_read_returns_the_whole_file_without_pagination() {
+        let path = temp_path("complete-read.txt");
+        let policy = policy_for(&path);
+        let content = (0..1_250)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_file(&policy, path.to_string_lossy().as_ref(), &content)
+            .expect("write should succeed");
+
+        let output = read_file(&policy, path.to_string_lossy().as_ref(), None, None, true)
+            .expect("explicit complete read should succeed");
+
+        assert_eq!(output.file.num_lines, 1_250);
+        assert_eq!(output.file.total_lines, 1_250);
+        assert!(output.file.content.ends_with("line-1249"));
+        assert!(!output.truncated);
+        assert!(output.guidance.is_none());
+        assert!(read_file(
+            &policy,
+            path.to_string_lossy().as_ref(),
+            Some(1),
+            None,
+            true,
+        )
+        .is_err());
     }
 
     #[test]
@@ -756,7 +806,7 @@ mod tests {
         let path = temp_path("binary-test.bin");
         let policy = policy_for(&path);
         std::fs::write(&path, b"\x00\x01\x02\x03binary content").expect("write should succeed");
-        let result = read_file(&policy, path.to_string_lossy().as_ref(), None, None);
+        let result = read_file(&policy, path.to_string_lossy().as_ref(), None, None, false);
         assert!(result.is_err());
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);

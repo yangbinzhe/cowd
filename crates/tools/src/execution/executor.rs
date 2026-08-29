@@ -927,7 +927,14 @@ fn run_read_file(lease: &ToolHostLease, input: ReadFileInput) -> Result<String, 
     let fingerprint = file_fingerprint(&resolved);
     let scope = file_cache_scope(&resolved);
     cached_json_tool(lease, "read_file", &input, &fingerprint, &scope, || {
-        read_file(lease.path_policy(), &input.path, input.offset, input.limit).map_err(io_to_string)
+        read_file(
+            lease.path_policy(),
+            &input.path,
+            input.offset,
+            input.limit,
+            input.complete,
+        )
+        .map_err(io_to_string)
     })
 }
 
@@ -1933,6 +1940,8 @@ struct ReadFileInput {
     path: String,
     offset: Option<usize>,
     limit: Option<usize>,
+    #[serde(default)]
+    complete: bool,
 }
 
 #[derive(Debug, Deserialize)]

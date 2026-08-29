@@ -159,13 +159,14 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_file",
-            description: "Read a bounded line window from a workspace text file. For large files, use grep_search first to locate relevant symbols or logic, then read only the matching region with explicit offset and limit. Do not sequentially scan a large file when search can answer the question.",
+            description: "Read a workspace text file. By default this returns a bounded line window; for ordinary large-file analysis, use grep_search first and read matching regions. When the task explicitly requires whole-file or EOF coverage, set complete=true to return the entire file under the file-size safety ceiling; complete cannot be combined with offset or limit.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
                     "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1 }
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "complete": { "type": "boolean", "default": false }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -174,7 +175,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read_many",
-            description: "Read multiple text files from the workspace in one ordered batch.",
+            description: "Read multiple text files from the workspace in one ordered batch. Each item supports complete=true for an explicitly required whole-file/EOF read under the file-size safety ceiling.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -185,7 +186,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "properties": {
                                 "path": { "type": "string" },
                                 "offset": { "type": "integer", "minimum": 0 },
-                                "limit": { "type": "integer", "minimum": 1 }
+                                "limit": { "type": "integer", "minimum": 1 },
+                                "complete": { "type": "boolean", "default": false }
                             },
                             "required": ["path"],
                             "additionalProperties": false
@@ -1115,6 +1117,11 @@ mod tests {
 
         assert!(read_file.description.contains("bounded"));
         assert!(read_file.description.contains("grep_search first"));
+        assert!(read_file.description.contains("complete=true"));
+        assert_eq!(
+            read_file.input_schema["properties"]["complete"]["type"],
+            "boolean"
+        );
         assert!(grep_search.description.contains("Preferred locator"));
     }
 

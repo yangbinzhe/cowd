@@ -792,6 +792,7 @@ fn compile_team_subgraph_node(
             .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
         upstream_evidence_refs: Vec::new(),
         upstream_artifact_refs: Vec::new(),
+        upstream_result_context: Vec::new(),
         execution_capacity: execution_capacity.cloned(),
     };
     // The first plan resolves the published template and exposes the real

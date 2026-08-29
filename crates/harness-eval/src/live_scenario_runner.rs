@@ -556,7 +556,7 @@ impl LiveScenarioRunner {
         if large_scale_collaboration_scenario_enabled() {
             scenario_specs.push(LiveScenarioSpec {
                 id: "live_qwen38_large_scale_collaboration",
-                prompt: "这是一次单 Program 大规模协同压力验收，必须由当前 Runtime 实际执行，禁止用根模型文本伪装 Team 或 Agent。必须创建**恰好六个**协作 Team；每个 Team 必须恰好包含两个只读角色：investigator 与 reviewer。investigator 先读取并分析本 Team 的源码范围；对分页或分段返回的大文件必须继续读取到 EOF，不能把首个窗口当作完整文件。reviewer 必须依赖 investigator，独立复核其完整证据，并作为该 Team 唯一 terminal role。terminal reviewer 必须在 `output_artifacts` 中声明 required result artifacts：`findings`、`source_paths`、`evidence`、`summary`、`unresolved`。不要添加自定义 acceptance，也不要添加无资源绑定的 evidence 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中用实际存在的完整源码路径作为 `evidence_scope`；禁止通配符。Team A（编排与 Program 真相）读取 `crates/runtime/src/orchestration/mod.rs` 和 `crates/runtime/src/orchestration/compiler.rs`；Team B（意图、模板与 Team 实例化）读取 `crates/runtime/src/orchestration/intent_compiler.rs` 和 `crates/runtime/src/team/instantiation.rs`；Team C（Agent 执行与结果验证）读取 `crates/runtime/src/agent/in_process_worker.rs` 和 `crates/runtime/src/agent/result_validator.rs`；Team D（Gateway 背压与语义健康）读取 `crates/gateway/src/runtime_host/task_set.rs` 和 `crates/gateway/src/infrastructure/gateway_health.rs`。A、B、C、D 必须作为第一波并行执行。Team E（对抗性交叉审查）读取 `crates/runtime/src/conversation/host.rs` 和 `crates/runtime/src/execution_core/graph/executors/verify.rs`，必须同时依赖并实际消费 A 与 B 的完整结构化交接，审查显式拓扑、证据资格和终态收敛，不能提前开始。Team F（容量、恢复与最终综合）读取 `crates/runtime/src/execution_core/services.rs` 和 `crates/runtime/src/recovery/runtime_event_reactor.rs`，必须同时依赖并实际消费 C、D、E 的完整结构化交接，比较正常、过载、取消、恢复和维护追赶路径，最后输出整体结论。Program 必须形成至少五条跨 Team 依赖：A→E、B→E、C→F、D→F、E→F。最终结论必须列出至少六个本次实际读取的完整源码路径，明确区分已验证事实、源码推断与未执行的模拟；给出并发波次、关键瓶颈、失效模式、容量边界和是否适合继续扩大规模的结论；还必须明确确认 E/F 已实际消费完整上游语义交接，而不是只等待依赖门。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；禁止 bash 和任何写工具。",
+                prompt: "这是一次单 Program 大规模协同压力验收，必须由当前 Runtime 实际执行，禁止用根模型文本伪装 Team 或 Agent。必须创建**恰好六个**协作 Team；每个 Team 必须恰好包含两个只读角色：investigator 与 reviewer。investigator 先读取并分析本 Team 的源码范围；所有目标文件都明确要求全文件覆盖，必须使用 read_file/read_many 的 `complete: true` 读取到 EOF，不能把首个窗口当作完整文件。reviewer 必须依赖 investigator，独立复核其完整证据，并作为该 Team 唯一 terminal role。terminal reviewer 必须在 `output_artifacts` 中声明 required result artifacts：`findings`、`source_paths`、`evidence`、`summary`、`unresolved`。不要添加自定义 acceptance，也不要添加无资源绑定的 evidence 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中用实际存在的完整源码路径作为 `evidence_scope`；禁止通配符。Team A（编排与 Program 真相）读取 `crates/runtime/src/orchestration/mod.rs` 和 `crates/runtime/src/orchestration/compiler.rs`；Team B（意图、模板与 Team 实例化）读取 `crates/runtime/src/orchestration/intent_compiler.rs` 和 `crates/runtime/src/team/instantiation.rs`；Team C（Agent 执行与结果验证）读取 `crates/runtime/src/agent/in_process_worker.rs` 和 `crates/runtime/src/agent/result_validator.rs`；Team D（Gateway 背压与语义健康）读取 `crates/gateway/src/runtime_host/task_set.rs` 和 `crates/gateway/src/infrastructure/gateway_health.rs`。A、B、C、D 必须作为第一波并行执行。Team E（对抗性交叉审查）读取 `crates/runtime/src/conversation/host.rs` 和 `crates/runtime/src/execution_core/graph/executors/verify.rs`，必须同时依赖并实际消费 A 与 B 的完整结构化交接，审查显式拓扑、证据资格和终态收敛，不能提前开始。Team F（容量、恢复与最终综合）读取 `crates/runtime/src/execution_core/services.rs` 和 `crates/runtime/src/recovery/runtime_event_reactor.rs`，必须同时依赖并实际消费 C、D、E 的完整结构化交接，比较正常、过载、取消、恢复和维护追赶路径，最后输出整体结论。Program 必须形成至少五条跨 Team 依赖：A→E、B→E、C→F、D→F、E→F。最终结论必须列出至少六个本次实际读取的完整源码路径，明确区分已验证事实、源码推断与未执行的模拟；给出并发波次、关键瓶颈、失效模式、容量边界和是否适合继续扩大规模的结论。若且仅若 E 与 F 都确实收到并使用了完整上游结果，最终结论必须原样给出验收声明“E/F 结构化交接已完整消费”；若事实不成立，禁止输出该声明且本任务不得判为完成。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；禁止 bash 和任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 6,
                     minimum_claimed_cross_team_edges: 5,
@@ -1661,7 +1661,7 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         "# Verified Team evidence bundle",
         "Runtime delivery facts:",
         "cowd.runtime.collaboration_evidence.v1",
-        "team-graph:",
+        "team-graph:runtime-team:",
     ]
     .iter()
     .all(|marker| !trimmed.contains(marker));
@@ -1676,6 +1676,17 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         "缺少上游 team",
         "未完成对 team",
         "未能完整看到上游",
+        "f 未通过",
+        "f 未能",
+        "f 的上游消费未",
+        "完整消费没有发生",
+        "完整消费未发生",
+        "不能被确认",
+        "不能确认",
+        "无法得到正面证明",
+        "语义载荷内容未",
+        "内容级载荷未",
+        "输入不完整",
         "missing upstream",
         "did not receive upstream",
     ]
@@ -1683,11 +1694,8 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
     .any(|marker| normalized.contains(marker));
     let handoff_consumed = !handoff_missing
         && [
-            "结构化交接已完整消费",
-            "语义级交接已完成",
-            "实际消费了完整上游",
-            "完整上游语义交接",
-            "consumed the complete upstream",
+            "e/f 结构化交接已完整消费",
+            "teams e and f consumed the complete upstream",
         ]
         .iter()
         .any(|marker| normalized.contains(marker));
@@ -2695,7 +2703,7 @@ mod tests {
 
     #[test]
     fn large_scale_presentation_gate_accepts_complete_synthesized_terminal() {
-        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\nE/F 实际消费了完整上游语义交接，结构化交接已完整消费。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
+        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\nE/F 结构化交接已完整消费。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
         assert!(large_scale_presentation_checks(response)
             .iter()
             .all(|check| check["passed"] == true));
@@ -2708,6 +2716,26 @@ mod tests {
 
         assert!(checks.iter().any(|check| {
             check["name"] == "presentation_cross_team_handoff_consumed" && check["passed"] == false
+        }));
+    }
+
+    #[test]
+    fn large_scale_presentation_gate_rejects_negated_handoff_claim() {
+        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\nF 未能消费完整上游，因此 E/F 结构化交接已完整消费不能被确认。\n\n## 源码推断\n推断。\n\n## 未执行的模拟\n未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
+        let checks = large_scale_presentation_checks(response);
+
+        assert!(checks.iter().any(|check| {
+            check["name"] == "presentation_cross_team_handoff_consumed" && check["passed"] == false
+        }));
+    }
+
+    #[test]
+    fn large_scale_transport_gate_allows_generic_source_identifier_examples() {
+        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\n源码中的通用图标识格式为 `team-graph:{team_id}`。E/F 结构化交接已完整消费。\n\n## 源码推断\n推断。\n\n## 未执行的模拟\n未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
+        let checks = large_scale_presentation_checks(response);
+
+        assert!(checks.iter().any(|check| {
+            check["name"] == "presentation_transport_clean" && check["passed"] == true
         }));
     }
 

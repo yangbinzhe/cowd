@@ -474,6 +474,7 @@ mod tests {
             allow_whole_workspace_scope: false,
             upstream_evidence_refs: Vec::new(),
             upstream_artifact_refs: Vec::new(),
+            upstream_result_context: Vec::new(),
             execution_capacity: None,
         }
     }

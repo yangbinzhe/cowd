@@ -396,11 +396,21 @@ impl TeamInstantiationService {
                 }
                 role_allowed_tools.retain(|tool| required_tools.contains(tool));
             }
-            let (focuses, cardinality_resolution) = resolve_focuses(
+            let (mut focuses, cardinality_resolution) = resolve_focuses(
                 role,
                 cardinality_overrides.get(&role.role_id),
                 focus_plans.get(&role.role_id),
             )?;
+            // Cross-Team semantics are Runtime-owned request data, not model
+            // focus annotations. Apply them after default/explicit focus
+            // resolution so an empty focus plan cannot erase the handoff.
+            for focus in &mut focuses {
+                for upstream in &request.upstream_result_context {
+                    if !focus.shared_baseline.iter().any(|item| item == upstream) {
+                        focus.shared_baseline.push(upstream.clone());
+                    }
+                }
+            }
             if let Some(capacity) = request.execution_capacity.as_ref() {
                 if focuses.len() > capacity.max_role_instances_per_team {
                     return Err(format!(
