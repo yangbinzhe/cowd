@@ -1596,18 +1596,30 @@ impl LiveAcceptance {
                 let quality = architecture_quality(timeline, projections);
                 let team_projection = team_health.satisfies(minimum_teams);
                 let edges_satisfied = claimed_cross_team_edges >= minimum_claimed_cross_team_edges;
+                let presentation_checks =
+                    if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 {
+                        large_scale_presentation_checks(response)
+                    } else {
+                        Vec::new()
+                    };
+                let presentation_satisfied = presentation_checks
+                    .iter()
+                    .all(|check| check["passed"].as_bool() == Some(true));
+                let mut checks = vec![
+                    json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
+                    json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
+                    json!({"name": "completed_evidence_team", "required": minimum_teams, "passed": team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
+                    json!({"name": "claimed_cross_team_edges", "required": minimum_claimed_cross_team_edges, "observed": claimed_cross_team_edges, "passed": edges_satisfied}),
+                ];
+                checks.extend(presentation_checks);
                 LiveAcceptanceResult {
                     passed: !response.trim().is_empty()
                         && quality.score >= quality.required
                         && team_projection
-                        && edges_satisfied,
+                        && edges_satisfied
+                        && presentation_satisfied,
                     quality: Some(quality.clone()),
-                    checks: vec![
-                        json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
-                        json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
-                        json!({"name": "completed_evidence_team", "required": minimum_teams, "passed": team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
-                        json!({"name": "claimed_cross_team_edges", "required": minimum_claimed_cross_team_edges, "observed": claimed_cross_team_edges, "passed": edges_satisfied}),
-                    ],
+                    checks,
                 }
             }
             Self::EscalatedTeam {
@@ -1630,6 +1642,65 @@ impl LiveAcceptance {
             }
         }
     }
+}
+
+fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
+    let trimmed = response.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    let source_paths = trimmed
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                !character.is_alphanumeric() && !matches!(character, '/' | '_' | '-' | '.')
+            })
+        })
+        .filter(|token| token.starts_with("crates/") && token.contains(".rs"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let transport_clean = [
+        "[truncated]",
+        "# Verified Team evidence bundle",
+        "Runtime delivery facts:",
+        "cowd.runtime.collaboration_evidence.v1",
+        "team-graph:",
+    ]
+    .iter()
+    .all(|marker| !trimmed.contains(marker));
+    let complete_ending = trimmed
+        .chars()
+        .last()
+        .is_some_and(|character| !character.is_alphanumeric())
+        && trimmed.matches("```").count() % 2 == 0;
+    let required_concepts = [
+        ("verified_facts", &["已验证事实", "verified facts"][..]),
+        (
+            "source_inference",
+            &["源码推断", "source-grounded inference"][..],
+        ),
+        (
+            "unexecuted_simulation",
+            &["未执行的模拟", "未执行模拟", "unexecuted simulation"][..],
+        ),
+        ("concurrency_waves", &["并发波次", "concurrency wave"][..]),
+        ("bottlenecks", &["关键瓶颈", "bottleneck"][..]),
+        ("failure_modes", &["失效模式", "failure mode"][..]),
+        ("capacity_boundaries", &["容量边界", "capacity bound"][..]),
+        (
+            "scale_recommendation",
+            &["扩大规模", "scale recommendation"][..],
+        ),
+    ];
+    let mut checks = vec![
+        json!({"name": "presentation_transport_clean", "passed": transport_clean}),
+        json!({"name": "presentation_complete_ending", "passed": complete_ending}),
+        json!({"name": "presentation_source_paths", "required": 6, "observed": source_paths.len(), "passed": source_paths.len() >= 6}),
+    ];
+    checks.extend(required_concepts.into_iter().map(|(name, markers)| {
+        let passed = markers
+            .iter()
+            .any(|marker| normalized.contains(&marker.to_ascii_lowercase()));
+        json!({"name": format!("presentation_{name}"), "passed": passed})
+    }));
+    checks
 }
 
 struct LiveAcceptanceResult {
@@ -2586,6 +2657,26 @@ mod tests {
             })],
         );
         assert_eq!(quality.score, quality.required);
+    }
+
+    #[test]
+    fn large_scale_presentation_gate_rejects_old_concatenated_terminal() {
+        let old = "team-runtime: # Verified Team evidence bundle\nRuntime delivery facts: 2/2\n[truncated]\n并发波次、关键瓶颈、失效模式、容量边界、扩大规模：Op";
+        let checks = large_scale_presentation_checks(old);
+        assert!(checks.iter().any(
+            |check| check["name"] == "presentation_transport_clean" && check["passed"] == false
+        ));
+        assert!(checks.iter().any(
+            |check| check["name"] == "presentation_complete_ending" && check["passed"] == false
+        ));
+    }
+
+    #[test]
+    fn large_scale_presentation_gate_accepts_complete_synthesized_terminal() {
+        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
+        assert!(large_scale_presentation_checks(response)
+            .iter()
+            .all(|check| check["passed"] == true));
     }
 
     #[test]

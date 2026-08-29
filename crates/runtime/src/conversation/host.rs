@@ -2416,7 +2416,7 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
     } else {
         typed_team_summaries
             .or(verified_evidence_bundle_summaries)
-            .map(|summaries| summaries.join("\n\n"))
+            .map(collaboration_evidence_carrier)
     };
     let verified_terminal_carrier = typed_candidate_verified && working_state_verified
         || typed_team_carrier_verified
@@ -2430,6 +2430,83 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
             .unwrap_or(false))
     .then_some(terminal_summary)
     .flatten()
+}
+
+const COLLABORATION_EVIDENCE_CARRIER_KIND: &str = "cowd.runtime.collaboration_evidence.v1";
+
+fn collaboration_evidence_carrier(team_results: Vec<String>) -> String {
+    serde_json::json!({
+        "kind": COLLABORATION_EVIDENCE_CARRIER_KIND,
+        "team_count": team_results.len(),
+        "team_results": team_results,
+        "presentation_contract": "root_model_synthesis_required"
+    })
+    .to_string()
+}
+
+fn is_collaboration_evidence_carrier(value: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some(COLLABORATION_EVIDENCE_CARRIER_KIND)
+}
+
+fn collaboration_carrier_results(value: &str) -> Option<Vec<String>> {
+    let carrier = serde_json::from_str::<serde_json::Value>(value).ok()?;
+    (carrier.get("kind").and_then(serde_json::Value::as_str)
+        == Some(COLLABORATION_EVIDENCE_CARRIER_KIND))
+    .then(|| {
+        carrier
+            .get("team_results")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Partition only between complete semantic results. The target controls
+/// provider routing, never result retention: no result string is sliced and an
+/// oversized single Team remains intact for explicit provider preflight.
+fn partition_complete_collaboration_results(
+    results: Vec<String>,
+    target_chars: usize,
+) -> Vec<Vec<String>> {
+    let mut partitions = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0_usize;
+    for result in results {
+        let result_chars = result.chars().count();
+        if !current.is_empty() && current_chars.saturating_add(result_chars) > target_chars {
+            partitions.push(std::mem::take(&mut current));
+            current_chars = 0;
+        }
+        current_chars = current_chars.saturating_add(result_chars);
+        current.push(result);
+    }
+    if !current.is_empty() {
+        partitions.push(current);
+    }
+    partitions
+}
+
+fn collaboration_synthesis_layer(results: Vec<String>, level: usize) -> String {
+    serde_json::json!({
+        "kind": "cowd.runtime.collaboration_synthesis_layer.v1",
+        "level": level,
+        "result_count": results.len(),
+        "results": results,
+        "presentation_contract": "further_root_synthesis_required"
+    })
+    .to_string()
 }
 
 fn completed_orchestration_terminal_summary(
@@ -9197,6 +9274,146 @@ fn qualified_root_answer(
     envelope.user_answer_contract.format != harness_contract::outcome::UserAnswerFormat::StrictJson
 }
 
+/// Deterministic fail-closed checks for a root collaboration presentation.
+/// These checks deliberately target transport leakage and objectively missing
+/// deliverables. They do not try to score prose style or replace model judgment.
+fn collaboration_answer_quality_findings(answer: &str, objective: &str) -> Vec<String> {
+    let trimmed = answer.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    let mut findings = Vec::new();
+    if trimmed.is_empty() {
+        findings.push("final answer is empty".to_string());
+        return findings;
+    }
+    for marker in [
+        "[truncated]",
+        "# Verified Team evidence bundle",
+        "Runtime delivery facts:",
+        COLLABORATION_EVIDENCE_CARRIER_KIND,
+        "root_model_synthesis_required",
+    ] {
+        if trimmed.contains(marker) {
+            findings.push(format!(
+                "Runtime transport marker leaked into final answer: {marker}"
+            ));
+        }
+    }
+    if trimmed.matches("```").count() % 2 != 0 {
+        findings.push("final answer contains an unclosed code fence".to_string());
+    }
+    if trimmed.chars().last().is_some_and(char::is_alphanumeric) {
+        findings.push("final answer appears to stop mid-sentence".to_string());
+    }
+
+    let source_paths = collaboration_source_paths(trimmed);
+    let required_source_paths = if objective.contains("至少六个") {
+        6
+    } else if objective.contains("至少三个") {
+        3
+    } else {
+        0
+    };
+    if source_paths.len() < required_source_paths {
+        findings.push(format!(
+            "final answer contains {} distinct source paths but the objective requires at least {required_source_paths}",
+            source_paths.len()
+        ));
+    }
+
+    for (objective_marker, answer_markers, label) in [
+        (
+            "已验证事实",
+            &["已验证事实", "verified facts"][..],
+            "verified facts",
+        ),
+        (
+            "源码推断",
+            &["源码推断", "source-grounded inference", "inference"][..],
+            "source inference",
+        ),
+        (
+            "未执行的模拟",
+            &[
+                "未执行的模拟",
+                "未执行模拟",
+                "unexecuted simulation",
+                "not executed",
+            ][..],
+            "unexecuted simulation",
+        ),
+        (
+            "并发波次",
+            &["并发波次", "concurrency wave"][..],
+            "concurrency waves",
+        ),
+        ("关键瓶颈", &["关键瓶颈", "bottleneck"][..], "bottlenecks"),
+        (
+            "失效模式",
+            &["失效模式", "failure mode"][..],
+            "failure modes",
+        ),
+        (
+            "容量边界",
+            &["容量边界", "capacity bound"][..],
+            "capacity boundaries",
+        ),
+    ] {
+        if objective.contains(objective_marker)
+            && !answer_markers
+                .iter()
+                .any(|marker| normalized.contains(&marker.to_ascii_lowercase()))
+        {
+            findings.push(format!("final answer is missing required {label}"));
+        }
+    }
+    if objective.contains("`C4`") && !trimmed.contains("C4") {
+        findings.push("final answer is missing required C4 discussion".to_string());
+    }
+    findings.sort();
+    findings.dedup();
+    findings
+}
+
+fn collaboration_source_paths(value: &str) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    let mut remaining = value;
+    while let Some(start) = remaining.find("crates/") {
+        let candidate = &remaining[start..];
+        let end = candidate
+            .char_indices()
+            .find_map(|(index, character)| {
+                (!character.is_ascii_alphanumeric() && !matches!(character, '/' | '_' | '-' | '.'))
+                    .then_some(index)
+            })
+            .unwrap_or(candidate.len());
+        let candidate = &candidate[..end];
+        if candidate.contains(".rs") {
+            paths.insert(candidate.to_string());
+        }
+        remaining = &remaining[start + "crates/".len()..];
+    }
+    paths
+}
+
+fn collaboration_intermediate_quality_findings(answer: &str, source: &str) -> Vec<String> {
+    let mut findings = collaboration_answer_quality_findings(answer, "");
+    let expected_paths = collaboration_source_paths(source);
+    let observed_paths = collaboration_source_paths(answer);
+    let missing_paths = expected_paths
+        .difference(&observed_paths)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_paths.is_empty() {
+        findings.push(format!(
+            "intermediate synthesis omitted source paths: {}",
+            missing_paths.join(", ")
+        ));
+    }
+    findings.sort();
+    findings.dedup();
+    findings
+}
+
 fn capability_gap_outcome(
     call: &ModelToolCall,
     category: crate::ToolSafetyCategory,
@@ -9346,6 +9563,163 @@ where
             }
         }
     }
+
+    /// Convert a verified Program evidence carrier into one coherent root
+    /// answer. A deterministic quality gate may request one repair draft; raw
+    /// Team bundles are never exposed as a successful fallback.
+    async fn terminal_collaboration_answer(
+        &self,
+        carrier: &str,
+        objective: &str,
+        envelope: &harness_contract::outcome::DeliveryEnvelope,
+        presentation_id: &str,
+        attempt_id: &str,
+    ) -> Result<(String, Option<String>, Vec<String>, String), String> {
+        const HIERARCHICAL_PACKET_TARGET_CHARS: usize = 64_000;
+        const HIERARCHICAL_PACKET_TRIGGER_CHARS: usize = 96_000;
+        const MAX_HIERARCHICAL_LEVELS: usize = 4;
+        let language = crate::conversation::user_reply_language(objective);
+        let mut synthesis_carrier = carrier.to_string();
+        let mut all_models_used = Vec::new();
+        if carrier.chars().count() > HIERARCHICAL_PACKET_TRIGGER_CHARS {
+            let mut layer_results = collaboration_carrier_results(carrier)
+                .filter(|results| !results.is_empty())
+                .ok_or_else(|| "collaboration evidence carrier has no Team results".to_string())?;
+            for level in 1..=MAX_HIERARCHICAL_LEVELS {
+                let partitions = partition_complete_collaboration_results(
+                    layer_results,
+                    HIERARCHICAL_PACKET_TARGET_CHARS,
+                );
+                if partitions.len() <= 1 {
+                    synthesis_carrier = collaboration_synthesis_layer(
+                        partitions.into_iter().next().unwrap_or_default(),
+                        level,
+                    );
+                    break;
+                }
+                let mut next_layer = Vec::with_capacity(partitions.len());
+                for (partition_index, partition) in partitions.into_iter().enumerate() {
+                    let source = collaboration_synthesis_layer(partition, level);
+                    let mut feedback = Vec::new();
+                    let mut accepted = None;
+                    for repair_attempt in 0..=1_u8 {
+                        let narration = {
+                            let mut runtime = self.runtime.lock().await;
+                            runtime
+                                .synthesize_collaboration_answer(
+                                    objective,
+                                    &source,
+                                    language,
+                                    &feedback,
+                                    true,
+                                    presentation_id,
+                                    &format!(
+                                        "{attempt_id}:layer:{level}:partition:{partition_index}:quality:{repair_attempt}"
+                                    ),
+                                    &envelope.envelope_id,
+                                    envelope.revision,
+                                )
+                                .await
+                        };
+                        let (answer, _model, models_used, _provider_attempt_id) =
+                            narration.map_err(|error| error.to_string())?;
+                        for model in models_used {
+                            if !all_models_used.contains(&model) {
+                                all_models_used.push(model);
+                            }
+                        }
+                        feedback = collaboration_intermediate_quality_findings(&answer, &source);
+                        if feedback.is_empty() {
+                            accepted = Some(answer);
+                            break;
+                        }
+                    }
+                    let answer = accepted.ok_or_else(|| {
+                        format!(
+                            "hierarchical collaboration synthesis level {level} partition {partition_index} failed quality gate: {}",
+                            feedback.join("; ")
+                        )
+                    })?;
+                    next_layer.push(format!(
+                        "Evidence-preserving synthesis layer {level}, partition {}:\n{answer}",
+                        partition_index + 1
+                    ));
+                }
+                synthesis_carrier = collaboration_synthesis_layer(next_layer.clone(), level);
+                if synthesis_carrier.chars().count() <= HIERARCHICAL_PACKET_TRIGGER_CHARS {
+                    break;
+                }
+                layer_results = next_layer;
+                if level == MAX_HIERARCHICAL_LEVELS {
+                    return Err(
+                        "hierarchical collaboration synthesis did not converge within four complete-result layers"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        let mut validation_feedback = Vec::new();
+        let mut last_error = None;
+        for repair_attempt in 0..=1_u8 {
+            let narration = {
+                let mut runtime = self.runtime.lock().await;
+                runtime
+                    .synthesize_collaboration_answer(
+                        objective,
+                        &synthesis_carrier,
+                        language,
+                        &validation_feedback,
+                        false,
+                        presentation_id,
+                        &format!("{attempt_id}:quality:{repair_attempt}"),
+                        &envelope.envelope_id,
+                        envelope.revision,
+                    )
+                    .await
+            };
+            match narration {
+                Ok((answer, model, models_used, provider_attempt_id)) => {
+                    for attempted in models_used {
+                        if !all_models_used.contains(&attempted) {
+                            all_models_used.push(attempted);
+                        }
+                    }
+                    validation_feedback = collaboration_answer_quality_findings(&answer, objective);
+                    if validation_feedback.is_empty() {
+                        return Ok((answer, model, all_models_used, provider_attempt_id));
+                    }
+                    if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+                        bus.emit(CowdEvent::TerminalDelivery {
+                            delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationSuperseded {
+                                presentation_id: presentation_id.to_string(),
+                                attempt_id: provider_attempt_id,
+                                reason: "collaboration_answer_quality_gate_rejected".to_string(),
+                            },
+                        });
+                    }
+                    last_error = Some(format!(
+                        "collaboration answer failed quality gate: {}",
+                        validation_feedback.join("; ")
+                    ));
+                }
+                Err(error) => {
+                    if self
+                        .runtime
+                        .lock()
+                        .await
+                        .cancellation_token()
+                        .is_cancelled()
+                    {
+                        return Err("terminal_presentation_cancelled".to_string());
+                    }
+                    last_error = Some(error.to_string());
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            "collaboration answer quality gate rejected every draft".to_string()
+        }))
+    }
 }
 
 #[async_trait]
@@ -9480,7 +9854,7 @@ where
             .as_ref()
             .map(|(completion, _)| *completion)
             .unwrap_or(GoalCompletion::Satisfied);
-        let envelope = projection.delivery_envelope.clone().unwrap_or_else(|| {
+        let mut envelope = projection.delivery_envelope.clone().unwrap_or_else(|| {
             terminal_delivery_envelope(
                 &projection,
                 &goal_id,
@@ -9587,10 +9961,27 @@ where
                 .as_ref()
                 .map(|(_, answer)| answer.as_str())
                 .unwrap_or("Execution ended without a qualified root answer candidate.");
-            match self
-                .terminal_narrated_answer(raw, &objective, &envelope, &presentation_id, &attempt_id)
+            let collaboration_carrier = is_collaboration_evidence_carrier(raw);
+            let narrated = if collaboration_carrier {
+                self.terminal_collaboration_answer(
+                    raw,
+                    &objective,
+                    &envelope,
+                    &presentation_id,
+                    &attempt_id,
+                )
                 .await
-            {
+            } else {
+                self.terminal_narrated_answer(
+                    raw,
+                    &objective,
+                    &envelope,
+                    &presentation_id,
+                    &attempt_id,
+                )
+                .await
+            };
+            match narrated {
                 Ok((answer, model, models_used, provider_attempt_id)) => (
                     answer,
                     harness_contract::outcome::AnswerOrigin::TerminalNarrator,
@@ -9603,6 +9994,26 @@ where
                     return Err(cancelled);
                 }
                 Err(fallback) => {
+                    let fallback = if collaboration_carrier {
+                        completion = GoalCompletion::Partial;
+                        envelope.delivery_status =
+                            harness_contract::outcome::DeliveryStatus::Partial;
+                        envelope
+                            .unresolved
+                            .push(harness_contract::outcome::DeliveryUnresolved {
+                                unresolved_id: format!(
+                                    "terminal-presentation:{}",
+                                    envelope.revision
+                                ),
+                                kind: "collaboration_answer_quality".to_string(),
+                                summary: fallback,
+                                source_execution_id: Some(ticket.graph_id.clone()),
+                                obligation_id: None,
+                            });
+                        "协作执行及完整证据均已保留，但根综合答案未通过完整性与清晰度质量门，框架已按部分完成关闭，未将原始 Team 证据包冒充最终答案。".to_string()
+                    } else {
+                        fallback
+                    };
                     let fallback_attempt_id = format!("{attempt_id}:fallback");
                     if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
                         bus.emit(CowdEvent::TerminalDelivery {
@@ -9752,8 +10163,14 @@ where
                         .collect()
                 },
                 validation: harness_contract::outcome::AnswerValidation {
-                    status: harness_contract::outcome::AnswerValidationStatus::Valid,
-                    findings: Vec::new(),
+                    status: if answer_origin
+                        == harness_contract::outcome::AnswerOrigin::ProgrammaticFallback
+                    {
+                        harness_contract::outcome::AnswerValidationStatus::Invalid
+                    } else {
+                        harness_contract::outcome::AnswerValidationStatus::Valid
+                    },
+                    findings: fallback_reason.clone().into_iter().collect(),
                     envelope_revision: Some(envelope.revision),
                 },
                 fallback_reason,
@@ -9881,9 +10298,18 @@ where
                 self.services.execution_live(&ticket.graph_id).as_ref(),
             );
             let terminal_id = format!("turn-terminal:{}", ingress.request_id);
+            let collaboration_evidence = terminal_override
+                .as_ref()
+                .map(|(_, value)| value.as_str())
+                .filter(|value| is_collaboration_evidence_carrier(value));
             let terminal_payload = serde_json::to_vec(&serde_json::json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "text": final_answer,
+                // The user-facing synthesis and its complete source carrier
+                // are committed atomically. Presentation limits can therefore
+                // never erase Team semantics or make the concise answer the
+                // only surviving copy of a complex Program result.
+                "collaboration_evidence": collaboration_evidence,
                 "delivery_envelope": envelope.clone(),
                 "terminal_presentation": presentation.clone(),
                 "answer_origin": presentation.answer_origin,
@@ -16921,7 +17347,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_team_evidence_bundles_bypass_a_failed_parent_provider() {
+    fn verified_team_evidence_bundles_require_root_synthesis() {
         let receipt = serde_json::json!({
             "status": "completed",
             "working_state_verified": true,
@@ -16959,6 +17385,7 @@ mod tests {
         });
         let summary = verified_team_terminal_summary(&receipt)
             .expect("every completed Team has a runtime-derived evidence bundle");
+        assert!(is_collaboration_evidence_carrier(&summary));
         assert!(summary.contains("team-runtime: # Verified Team evidence bundle"));
         assert!(summary.contains("crates/memory/src/store/mod.rs"));
 
@@ -18159,15 +18586,16 @@ mod tests {
             .to_string(),
             false,
         )];
-        let joined = completed_orchestration_terminal_summary(
+        let carrier = completed_orchestration_terminal_summary(
             &calls,
             &typed_children,
             workspace.path(),
             true,
         )
         .expect("all child Team carriers are verified");
-        assert!(joined.contains("team-a: First checked conclusion."));
-        assert!(joined.contains("team-b: Second checked conclusion."));
+        assert!(is_collaboration_evidence_carrier(&carrier));
+        assert!(carrier.contains("team-a: First checked conclusion."));
+        assert!(carrier.contains("team-b: Second checked conclusion."));
         assert_eq!(
             retained_orchestration_terminal_candidate(
                 &typed_children,
@@ -18175,9 +18603,68 @@ mod tests {
                 "combine the checked Team conclusions",
             )
             .as_deref(),
-            Some(joined.as_str()),
-            "a duplicate Team request must reuse the verified typed carrier without another model"
+            Some(carrier.as_str()),
+            "a duplicate Team request must reuse the verified typed carrier as synthesis evidence"
         );
+    }
+
+    #[test]
+    fn collaboration_quality_gate_rejects_truncation_and_incomplete_endings() {
+        let objective = "最终结论必须列出至少三个完整源码路径，明确区分已验证事实、源码推断与未执行的模拟，并给出并发波次、关键瓶颈、失效模式和容量边界。";
+        let invalid = "## 已验证事实\n- crates/runtime/src/lib.rs\n- crates/memory/src/lib.rs\n[truncated]\n源码推断、未执行的模拟、并发波次、关键瓶颈、失效模式、容量边界：Op";
+        let findings = collaboration_answer_quality_findings(invalid, objective);
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("[truncated]")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("stop mid-sentence")));
+        assert!(findings
+            .iter()
+            .any(|finding| finding.contains("requires at least 3")));
+    }
+
+    #[test]
+    fn collaboration_quality_gate_accepts_complete_required_sections() {
+        let objective = "最终结论必须列出至少三个完整源码路径，明确区分已验证事实、源码推断与未执行的模拟，并给出并发波次、关键瓶颈、失效模式和容量边界。";
+        let answer = "## 已验证事实\n- `crates/runtime/src/lib.rs`\n- `crates/memory/src/lib.rs`\n- `crates/gateway/src/lib.rs`\n\n## 源码推断\n边界由事件连接。\n\n## 未执行的模拟\n本次未执行压力模拟。\n\n## 并发波次、关键瓶颈、失效模式与容量边界\n结论完整。";
+        assert_eq!(
+            collaboration_answer_quality_findings(answer, objective),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn hierarchical_partition_never_slices_a_semantic_result() {
+        let results = vec![
+            "A".repeat(40),
+            "B".repeat(40),
+            "C".repeat(120),
+            "D".repeat(20),
+        ];
+        let partitions = partition_complete_collaboration_results(results.clone(), 64);
+        assert_eq!(partitions.concat(), results);
+        assert!(partitions.iter().flatten().all(|result| {
+            result
+                .chars()
+                .all(|character| matches!(character, 'A' | 'B' | 'C' | 'D'))
+        }));
+        assert!(partitions
+            .iter()
+            .any(|partition| partition == &vec!["C".repeat(120)]));
+    }
+
+    #[test]
+    fn intermediate_quality_gate_requires_every_source_path_to_survive() {
+        let source = "`crates/runtime/src/lib.rs` and `crates/memory/src/lib.rs`.";
+        let incomplete = "Preserved `crates/runtime/src/lib.rs`.";
+        assert!(
+            collaboration_intermediate_quality_findings(incomplete, source)
+                .iter()
+                .any(|finding| finding.contains("crates/memory/src/lib.rs"))
+        );
+        let complete = "Preserved `crates/runtime/src/lib.rs` and `crates/memory/src/lib.rs`.";
+        assert!(collaboration_intermediate_quality_findings(complete, source).is_empty());
     }
 
     #[test]

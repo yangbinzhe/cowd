@@ -1477,9 +1477,10 @@ pub struct ExecutionUsage {
 pub struct ExecutionNodeResult {
     pub status: ExecutionNodeStatus,
     pub result_ref: Option<String>,
-    /// Bounded semantic outcome for downstream collaborators. Raw model traces
+    /// Lossless semantic outcome for downstream collaborators. Raw model traces
     /// and complete tool payloads remain in evidence storage and are referenced
-    /// through `evidence_refs`.
+    /// through `evidence_refs`; the authored result contract itself is never
+    /// character-truncated or replaced with presentation sentinels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub evidence_refs: Vec<EvidenceAccessRef>,

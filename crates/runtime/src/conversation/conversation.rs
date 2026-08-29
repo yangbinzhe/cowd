@@ -4859,6 +4859,94 @@ where
         ))
     }
 
+    /// Synthesize one root answer from the complete, Runtime-verified results
+    /// of a collaboration Program. Team carriers are evidence inputs, never a
+    /// user-facing answer: the root model must reconcile them, distinguish
+    /// fact from inference, and close the original objective without exposing
+    /// Runtime transport syntax.
+    pub(crate) async fn synthesize_collaboration_answer(
+        &mut self,
+        objective: &str,
+        evidence_carrier: &str,
+        language: &str,
+        validation_feedback: &[String],
+        intermediate: bool,
+        presentation_id: &str,
+        attempt_id: &str,
+        envelope_id: &str,
+        envelope_revision: u64,
+    ) -> Result<(String, Option<String>, Vec<String>, String), RuntimeError> {
+        let feedback = if validation_feedback.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\nThe previous draft was rejected by the deterministic quality gate. Repair every finding:\n- {}",
+                validation_feedback.join("\n- ")
+            )
+        };
+        let stage_instruction = if intermediate {
+            "Produce a lossless intermediate synthesis for a later root merge. Preserve every material finding, source path, disagreement, risk, unresolved item and scope limitation from these complete inputs. Do not claim to be the overall final answer."
+        } else {
+            "Produce the final answer now."
+        };
+        let messages: HistoryView = vec![ConversationMessage::user_text(format!(
+            "Original task objective:\n{objective}\n\nComplete verified collaboration evidence carrier:\n{evidence_carrier}{feedback}\n\n{stage_instruction}"
+        ))]
+        .into();
+        let (step, terminal_attempt_id) = self
+            .execute_terminal_provider_step(
+                objective,
+                &format!(
+                    "## Root collaboration synthesis\n\
+                     You are the root synthesis authority for a completed multi-Team Program. Write a \
+                     high-quality, comprehensive final answer in the SAME LANGUAGE as the original \
+                     request (detected language: {language}). Treat every Team result as evidence, \
+                     not as prose to concatenate. Reconcile overlaps and disagreements; organize the \
+                     answer around the user's requested decisions and deliverables; explicitly separate \
+                     verified facts, source-grounded inference, and work or simulations that were not \
+                     actually executed. Preserve concrete source paths and material risks. Explain \
+                     concurrency waves, dependencies, bottlenecks, failure modes, capacity boundaries, \
+                     and the scale recommendation when the objective requests them. Never emit Runtime \
+                     Team ids, evidence-bundle headers, delivery counters, JSON transport wrappers, \
+                     `[truncated]`, tool calls, or promises to continue. Do not claim that unresolved \
+                     work is empty when any Team reports unresolved items. End with a complete conclusion; \
+                     never stop mid-sentence. Do not shorten or omit required content merely to satisfy \
+                     an arbitrary character target. When this is an intermediate synthesis layer, \
+                     preserve all material evidence for the next layer instead of pretending to \
+                     conclude the whole Program.",
+                ),
+                messages,
+                "root collaboration synthesis exposes no executable tools",
+                (!intermediate).then_some((
+                    presentation_id,
+                    attempt_id,
+                    envelope_id,
+                    envelope_revision,
+                )),
+            )
+            .await?;
+        let text = step
+            .assistant_message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        if text.trim().is_empty() {
+            return Err(RuntimeError::new(
+                "collaboration synthesizer returned no text",
+            ));
+        }
+        Ok((
+            text,
+            step.model,
+            step.models_used,
+            terminal_attempt_id.unwrap_or_else(|| attempt_id.to_string()),
+        ))
+    }
+
     /// Remove runtime-owned context items from a given source.
     pub fn clear_external_context_source(&self, source: ContextSourceKind) {
         if let Ok(mut guard) = self.external_context_items.lock() {

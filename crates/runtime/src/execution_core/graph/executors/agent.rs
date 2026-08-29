@@ -369,7 +369,7 @@ impl NodeExecutor for AgentTaskExecutor {
                 }
             )),
             summary: (!returned.outcome.trim().is_empty())
-                .then(|| bounded_semantic_summary(&returned.outcome)),
+                .then(|| canonical_semantic_summary(&returned.outcome)),
             evidence_refs,
             failure,
             usage,
@@ -491,96 +491,16 @@ fn durable_terminal_fact_ref(
     )
 }
 
-fn bounded_semantic_summary(value: &str) -> String {
-    const MAX_CHARS: usize = 2_000;
-    // `summary` is the bounded projection transported to Team verification.
-    // Blind character truncation turns a valid structured terminal into
-    // invalid JSON and drops late contract fields such as `unresolved: []`.
-    // Preserve the typed shape first; evidence bodies remain available through
-    // their durable references rather than this presentation projection.
+fn canonical_semantic_summary(value: &str) -> String {
+    // Agent terminal semantics are canonical result data, not a presentation
+    // preview. Never replace field values with truncation sentinels: doing so
+    // destroys the only graph-local value later Team and Program reducers can
+    // synthesize. Large raw tool payloads already live behind durable evidence
+    // references; the model-authored result itself must remain lossless.
     if let Some(output) = crate::agent_in_process_worker::structured_agent_output(value) {
-        let rendered = serde_json::to_string(&output).unwrap_or_else(|_| value.to_string());
-        if rendered.chars().count() <= MAX_CHARS {
-            return rendered;
-        }
-        return compact_structured_semantic_summary(output);
+        return serde_json::to_string(&output).unwrap_or_else(|_| value.to_string());
     }
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= MAX_CHARS {
-        return normalized;
-    }
-    let mut summary = normalized.chars().take(MAX_CHARS).collect::<String>();
-    summary.push_str(" ...");
-    summary
-}
-
-/// Build a small, valid JSON carrier for a large structured Agent terminal.
-///
-/// Each declared field survives with its materialization state intact. In
-/// particular an explicit empty `risks` or `unresolved` list is a meaningful
-/// reviewed conclusion and cannot be confused with an omitted field. The
-/// original, potentially large evidence prose is retained in the durable Agent
-/// result/evidence references and is deliberately not duplicated here.
-fn compact_structured_semantic_summary(
-    output: serde_json::Map<String, serde_json::Value>,
-) -> String {
-    const MAX_CHARS: usize = 2_000;
-    const CONTRACT_FIELDS: [&str; 15] = [
-        "summary",
-        "findings",
-        "evidence",
-        "plan",
-        "implementation",
-        "source_verification",
-        "review",
-        "risks",
-        "unresolved",
-        "key_decisions",
-        "unresolved_or_risks",
-        "proposal",
-        "critique",
-        "mitigation",
-        "checkpoint",
-    ];
-    let compact = output
-        .iter()
-        .map(|(key, value)| (key.clone(), compact_structured_value(value.clone())))
-        .collect::<serde_json::Map<_, _>>();
-    let rendered = serde_json::to_string(&compact).unwrap_or_else(|_| "{}".to_string());
-    if rendered.chars().count() <= MAX_CHARS {
-        return rendered;
-    }
-    // Unknown fields may be arbitrarily numerous and do not form part of the
-    // typed Team presentation contract. Preserve every known contract field
-    // rather than allowing those unknown keys to defeat the bounded carrier.
-    let contract_only = CONTRACT_FIELDS
-        .iter()
-        .filter_map(|field| {
-            output.get(*field).map(|value| {
-                (
-                    (*field).to_string(),
-                    compact_structured_value(value.clone()),
-                )
-            })
-        })
-        .collect::<serde_json::Map<_, _>>();
-    serde_json::to_string(&contract_only).unwrap_or_else(|_| "{}".to_string())
-}
-
-fn compact_structured_value(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(value) if value.trim().is_empty() => {
-            serde_json::Value::String(value)
-        }
-        serde_json::Value::String(_) => serde_json::Value::String("[truncated]".to_string()),
-        serde_json::Value::Array(values) if values.is_empty() => serde_json::Value::Array(values),
-        serde_json::Value::Array(_) => {
-            serde_json::Value::Array(vec![serde_json::Value::String("[truncated]".to_string())])
-        }
-        serde_json::Value::Object(values) if values.is_empty() => serde_json::Value::Object(values),
-        serde_json::Value::Object(_) => serde_json::json!({"truncated": true}),
-        scalar => scalar,
-    }
+    value.trim().to_string()
 }
 
 fn execution_status_for_agent_terminal(
@@ -828,46 +748,43 @@ mod tests {
     }
 
     #[test]
-    fn bounded_structured_summary_keeps_empty_unresolved_contract_field_valid() {
+    fn structured_summary_preserves_large_contract_fields_losslessly() {
         let terminal = format!(
             r#"{{"summary":"{}","evidence":"{}","unresolved":[]}}"#,
             "s".repeat(4_000),
             "e".repeat(4_000),
         );
 
-        let summary = bounded_semantic_summary(&terminal);
-        assert!(summary.chars().count() <= 2_000);
+        let summary = canonical_semantic_summary(&terminal);
         let output = crate::agent_in_process_worker::structured_agent_output(&summary)
-            .expect("bounded structured terminal remains valid JSON");
+            .expect("structured terminal remains valid JSON");
         assert_eq!(output.get("unresolved"), Some(&serde_json::json!([])));
         assert_eq!(
             output.get("summary"),
-            Some(&serde_json::json!("[truncated]"))
+            Some(&serde_json::json!("s".repeat(4_000)))
         );
         assert_eq!(
             output.get("evidence"),
-            Some(&serde_json::json!("[truncated]"))
+            Some(&serde_json::json!("e".repeat(4_000)))
         );
+        assert!(!summary.contains("[truncated]"));
     }
 
     #[test]
-    fn bounded_structured_summary_drops_unknown_overflow_before_contract_fields() {
+    fn structured_summary_preserves_unknown_fields_without_overflow_loss() {
         let unknown = (0..500)
             .map(|index| format!(r#""unknown_{index}":"value""#))
             .collect::<Vec<_>>()
             .join(",");
         let terminal = format!(r#"{{"summary":"complete","unresolved":[],{unknown}}}"#);
 
-        let summary = bounded_semantic_summary(&terminal);
-        assert!(summary.chars().count() <= 2_000);
+        let summary = canonical_semantic_summary(&terminal);
         let output = crate::agent_in_process_worker::structured_agent_output(&summary)
-            .expect("bounded structured terminal remains valid JSON");
-        assert_eq!(
-            output.get("summary"),
-            Some(&serde_json::json!("[truncated]"))
-        );
+            .expect("structured terminal remains valid JSON");
+        assert_eq!(output.get("summary"), Some(&serde_json::json!("complete")));
         assert_eq!(output.get("unresolved"), Some(&serde_json::json!([])));
-        assert!(!output.contains_key("unknown_0"));
+        assert_eq!(output.get("unknown_0"), Some(&serde_json::json!("value")));
+        assert_eq!(output.get("unknown_499"), Some(&serde_json::json!("value")));
     }
 
     #[test]

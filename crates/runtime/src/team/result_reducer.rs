@@ -84,7 +84,7 @@ impl TeamResultReducer {
 
         let envelope = build_delivery_envelope(&graph);
         // A graph reducer owns durable delivery facts, not a model-owned
-        // answer candidate. It may, however, retain a bounded evidence bundle
+        // answer candidate. It may, however, retain a lossless evidence bundle
         // derived solely from committed child summaries and observed workspace
         // paths. The parent uses that typed bundle only when every Team branch
         // has already satisfied the delivery contract; this prevents a
@@ -245,7 +245,7 @@ fn verified_team_evidence_bundle(
     let summarized_worker_count = summary.lines().filter(|line| line.starts_with('[')).count();
     (worker_count > 0 && summarized_worker_count == worker_count).then(|| {
         format!(
-            "# Verified Team evidence bundle\n\n## Risk status\n\nRisk: no unresolved delivery-contract findings in this completed Team.\n\n{summary}\n\n{}",
+            "# Verified Team evidence bundle\n\n## Delivery contract\n\nRuntime verification satisfied every declared delivery obligation for this Team. Semantic risks and unresolved research questions, if any, remain exactly as reported below.\n\n{summary}\n\n{}",
             mechanical_delivery_summary(envelope)
         )
     })
@@ -1076,7 +1076,10 @@ mod tests {
         let bundle = verified_team_evidence_bundle(&graph, &envelope)
             .expect("completed, evidenced Team branches produce a typed transport bundle");
         assert!(bundle.starts_with("# Verified Team evidence bundle"));
-        assert!(bundle.contains("Risk: no unresolved delivery-contract findings"));
+        assert!(
+            bundle.contains("Runtime verification satisfied every declared delivery obligation")
+        );
+        assert!(bundle.contains("Semantic risks and unresolved research questions"));
         assert!(bundle.contains("[branch-a] findings: structured finding A"));
     }
 

@@ -2126,16 +2126,6 @@ fn assess_team_subgraphs(
         focus_overlap_verified: true,
         ..TeamSubgraphAssessment::default()
     };
-    let completed_team_count = projection
-        .nodes
-        .iter()
-        .filter(|node| {
-            node.executor_kind == compiler::TEAM_SUBGRAPH_EXECUTOR
-                && node.status == ExecutionNodeStatus::Completed
-        })
-        .count()
-        .max(1);
-    let per_team_summary_chars = (12_000 / completed_team_count).clamp(512, 6_000);
     let parent_graph = services.graph_state_store().load(&projection.graph_id).ok();
     for node in projection.nodes.iter().filter(|node| {
         node.executor_kind == compiler::TEAM_SUBGRAPH_EXECUTOR
@@ -2284,12 +2274,11 @@ fn assess_team_subgraphs(
                     envelope.coverage.satisfied_obligation_ids.clear();
                 }
             }
-            let terminal_summary = node.summary.as_deref().map(|summary| {
-                summary
-                    .chars()
-                    .take(per_team_summary_chars)
-                    .collect::<String>()
-            });
+            // This receipt is the root synthesizer's canonical semantic input,
+            // not a UI preview. Keep the complete Team result; context packing
+            // may stage large byte payloads, but it must never silently change
+            // their meaning by slicing at an arbitrary character boundary.
+            let terminal_summary = node.summary.clone();
             let terminal_summary_kind = child_graph
                 .nodes
                 .iter()
