@@ -417,39 +417,14 @@ impl LiveExecutionRecord {
             }
         }
         if event.kind == "runtime.session.terminal_requested" {
-            self.live.terminal_ref = event
+            let terminal_ref = event
                 .payload
                 .get("payload_ref")
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned)
                 .or_else(|| self.live.terminal_ref.clone());
-            self.live.status = ExecutionLiveStatus::Complete;
-            self.live.status_detail = Some("durable terminal recovered".to_string());
-            self.live.error = None;
-            changed = true;
-        } else if let Some(status) = event.status.as_deref() {
-            let recovered = match status {
-                "completed" | "complete" => Some(ExecutionLiveStatus::Complete),
-                "failed" | "blocked" | "error" => Some(ExecutionLiveStatus::Error),
-                "cancelled" => Some(ExecutionLiveStatus::Cancelled),
-                "waiting_approval" => Some(ExecutionLiveStatus::WaitingApproval),
-                _ => None,
-            };
-            if let Some(status) = recovered {
-                self.live.status = status;
-                self.live.status_detail = Some(format!("durable {} recovered", event.kind));
-                if status == ExecutionLiveStatus::Error {
-                    self.live.error = event
-                        .payload
-                        .get("error")
-                        .or_else(|| event.payload.get("reason"))
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .or_else(|| Some(format!("durable {status:?} execution")));
-                } else {
-                    self.live.error = None;
-                }
-                changed = true;
+            if let Some(terminal_ref) = terminal_ref {
+                let _ = self.complete_recovered(terminal_ref);
             }
         }
         if changed {
@@ -1998,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_replays_canonical_events_after_the_live_checkpoint_cursor() {
+    fn restart_advances_canonical_cursor_without_granting_business_status_lifecycle_authority() {
         let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let execution_id = "execution-cursor-replay";
         let store = ExecutionLiveStore::new(Arc::clone(&event_store));
@@ -2055,7 +2030,11 @@ mod tests {
         let recovered = ExecutionLiveStore::new(Arc::clone(&event_store))
             .execution_live(execution_id)
             .expect("active checkpoint recovered");
-        assert_eq!(recovered.status, ExecutionLiveStatus::WaitingApproval);
+        assert_eq!(
+            recovered.status,
+            ExecutionLiveStatus::Queued,
+            "a graph/business status cannot mutate the owning live execution lifecycle"
+        );
         assert_eq!(
             event_store
                 .projection_checkpoint(&live_projection_id(execution_id))
@@ -2064,6 +2043,145 @@ mod tests {
                 .source_cursor,
             1
         );
+    }
+
+    #[test]
+    fn completed_child_event_cannot_precomplete_agent_before_finalizing() {
+        let mut record = LiveExecutionRecord::new(
+            "session-child-complete".to_string(),
+            "agent-run-child-complete".to_string(),
+            "turn-child-complete".to_string(),
+        );
+        assert!(record.transition(
+            ExecutionLiveStatus::CallingModel,
+            Some("agent model running".to_string())
+        ));
+        record.apply_durable_event(&DurableRuntimeEvent {
+            event_id: "child-node-completed".to_string(),
+            stream_id: "team-graph:child".to_string(),
+            sequence: 1,
+            scope: crate::RuntimeEventScope::ExecutionNode,
+            kind: "execution_node.transitioned".to_string(),
+            status: Some("completed".to_string()),
+            actor: Some("execution_commit_service".to_string()),
+            refs: vec![crate::RuntimeEventRef {
+                kind: "agent_run".to_string(),
+                id: record.execution_id.clone(),
+            }],
+            payload: serde_json::json!({"node_id": "investigator:1"}),
+            created_at_ms: current_time_ms(),
+            commit_cursor: 1,
+            transaction_id: "child-node-completed-tx".to_string(),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: Some("child-node-completed-key".to_string()),
+        });
+
+        assert_eq!(record.live.status, ExecutionLiveStatus::CallingModel);
+        assert!(record.transition(
+            ExecutionLiveStatus::Finalizing,
+            Some("synthesizing terminal".to_string())
+        ));
+    }
+
+    #[test]
+    fn generic_durable_status_vocabulary_never_owns_live_lifecycle() {
+        for (index, (kind, status)) in [
+            ("execution_graph.command_applied", "completed"),
+            ("tool.invocation.failed", "failed"),
+            ("knowledge.candidate.projector.failed.v1", "blocked"),
+            ("execution_graph.delta.v1", "cancelled"),
+            ("execution_node.transitioned", "waiting_approval"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut record = LiveExecutionRecord::new(
+                format!("session-generic-status-{index}"),
+                format!("execution-generic-status-{index}"),
+                format!("turn-generic-status-{index}"),
+            );
+            assert!(record.transition(
+                ExecutionLiveStatus::CallingModel,
+                Some("agent model running".to_string())
+            ));
+            record.apply_durable_event(&DurableRuntimeEvent {
+                event_id: format!("generic-status-{index}"),
+                stream_id: format!("nested-stream-{index}"),
+                sequence: 1,
+                scope: crate::RuntimeEventScope::ExecutionGraph,
+                kind: kind.to_string(),
+                status: Some(status.to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"reason": "nested business outcome"}),
+                created_at_ms: current_time_ms(),
+                commit_cursor: (index + 1).try_into().unwrap(),
+                transaction_id: format!("generic-status-tx-{index}"),
+                transaction_index: 0,
+                schema_version: 1,
+                idempotency_key: Some(format!("generic-status-key-{index}")),
+            });
+            assert_eq!(
+                record.live.status,
+                ExecutionLiveStatus::CallingModel,
+                "{kind} status={status} stole live lifecycle authority"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_session_terminal_is_the_only_durable_completion_authority() {
+        let mut record = LiveExecutionRecord::new(
+            "session-explicit-terminal".to_string(),
+            "execution-explicit-terminal".to_string(),
+            "turn-explicit-terminal".to_string(),
+        );
+        assert!(record.transition(
+            ExecutionLiveStatus::CallingModel,
+            Some("agent model running".to_string())
+        ));
+        assert!(record.transition(
+            ExecutionLiveStatus::Finalizing,
+            Some("synthesizing terminal".to_string())
+        ));
+        let terminal = DurableRuntimeEvent {
+            event_id: "terminal-requested".to_string(),
+            stream_id: "session-terminal:input".to_string(),
+            sequence: 1,
+            scope: crate::RuntimeEventScope::SessionInput,
+            kind: "runtime.session.terminal_requested".to_string(),
+            status: Some("pending_delivery".to_string()),
+            actor: Some("conversation_runtime".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"payload_ref": "terminal:durable"}),
+            created_at_ms: current_time_ms(),
+            commit_cursor: 2,
+            transaction_id: "terminal-requested-tx".to_string(),
+            transaction_index: 0,
+            schema_version: 1,
+            idempotency_key: Some("terminal-requested-key".to_string()),
+        };
+
+        let mut malformed = terminal.clone();
+        malformed.payload = serde_json::json!({});
+        record.apply_durable_event(&malformed);
+        assert_eq!(record.live.status, ExecutionLiveStatus::Finalizing);
+
+        record.apply_durable_event(&terminal);
+        assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
+        assert_eq!(
+            record.live.terminal_ref.as_deref(),
+            Some("terminal:durable")
+        );
+        let revision = record.live.revision;
+        record.apply_durable_event(&terminal);
+        assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
+        assert_eq!(
+            record.live.terminal_ref.as_deref(),
+            Some("terminal:durable")
+        );
+        assert_eq!(record.live.revision, revision);
     }
 
     #[test]

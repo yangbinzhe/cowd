@@ -773,3 +773,148 @@ boundary, then correctly remained red because the release authority/evidence
 inventory still identifies v0.9.708. Those release records must not be advanced
 until the immutable Qwen run succeeds; they are an S6 gate, not a production
 or test defect.
+
+## 17. Live acceptance and lifecycle authority amendment (2026-08-29)
+
+Status: **plan frozen and architecture-audited before source changes**. This
+amendment follows the first immutable paid-route rerun of candidate
+`ecaf4bc4dd1e0a3860c91d2d9c27537e41afdf42`, release binary SHA-256
+`467ca9d5b765d3774abe497ed04adcc3273b642253314374e728b44e8f53d1b7`.
+The source candidate and scenario inputs remained unchanged during the run.
+
+### 17.1 Immutable evidence and framework root causes
+
+The group-theory scenario passed with 4/4 Teams, 4/4 Agents, three cross-Team
+edges, 26 tool calls, 11 Provider rounds and 1,717,397 tokens. The six-Team
+pressure scenario completed 6/6 Teams and 12/12 Agents over five cross-Team
+edges, 97 tool calls, 25 Provider rounds and 8,560,712 tokens. Every one of the
+12 exact source paths was independently attested, only `qwen3.8-max` ran, and
+all architecture, handoff, transport, coverage, fact/inference/simulation,
+concurrency, bottleneck, failure-mode and capacity checks passed.
+
+The pressure report nevertheless failed one presentation check. Its terminal
+explicitly states that larger collaboration is suitable inside the current
+single-node boundary, lists the prerequisites for horizontal expansion and
+gives actionable scale-up/scale-out advice. The checker accepted only the
+literal fragments `扩大规模` or `scale recommendation`; it did not recognize
+`扩容`, `扩大协作规模` or `横向扩展`. Its positive unit test contained only the
+heading `扩大规模结论` followed by `结论完整`, proving both a false negative and
+a heading-only false positive. This is a semantic evidence-shape defect, not a
+model-quality failure.
+
+The same run emitted three rejected `Complete -> Finalizing` transitions.
+Canonical event inspection proves the sequence: a child
+`execution_node.transitioned(status=completed)` was replayed into the Agent's
+live record, the generic durable reducer mapped any `completed` status to the
+whole execution's `Complete`, and the normal terminal synthesizer then entered
+`Finalizing`. A child-node business status therefore stole lifecycle authority
+from the owning execution. The temporarily stale mission display is a derived
+projection symptom; no independent cache or polling defect is established.
+
+### 17.2 Frozen target model
+
+```text
+presentation concept evidence
+  = one bounded semantic block
+    containing a scale subject
+    AND an explicit decision, recommendation or prerequisite
+
+durable child/business event status
+  -> metrics, references and progress only
+explicit execution-terminal carrier
+  -> Complete | Error | Cancelled
+live Cowd lifecycle owner
+  -> Queued ... Finalizing -> terminal (monotonic)
+```
+
+The checker remains deterministic and local. It does not ask a second model to
+judge prose, inject an expected answer into the scenario or accept a keyword
+from an unrelated heading. The live reducer recognizes terminal authority by
+event kind, not by a generic `status` string shared by graph nodes, tools and
+business projections.
+
+### 17.3 Approved implementation phases
+
+| Phase | Change | Mandatory proof |
+| --- | --- | --- |
+| Q1 semantic concept predicate | Split terminal prose into bounded blocks and require the scale subject and a decision/action/prerequisite in the same block | the observed high-quality Qwen terminal passes; heading-only, subject-only and unrelated-block examples fail; affirmative and conditional/negative recommendations pass |
+| Q2 terminal event authority | Remove generic durable-status lifecycle mutation; recover terminal state only from explicit execution-terminal carriers while retaining graph id, tool metrics and cursor progress from all events | completed child node cannot pre-complete an Agent; its later `Finalizing` transition succeeds; canonical terminal recovery remains idempotent |
+| Q3 projection consistency | Exercise the real child-complete -> finalizing -> terminal sequence through replay and hot live state; treat mission lag as resolved only when the authoritative live sequence is correct | no `Complete -> Finalizing` warning, no false terminal, and the final terminal remains discoverable after restart |
+| Q4 deterministic closure | Run focused adversarial tests, Runtime library, all-target check, architecture boundary and unchanged full regression | all gates green on one unchanged candidate |
+| Q5 immutable live closure | Commit and build once, record commit/binary hash, then rerun both paid-route scenarios without source edits | 2/2 pass, only `qwen3.8-max`, no fallback, dangling work, false terminal or lifecycle warning |
+| Q6 release closure | Advance evidence and release authority only after Q5, then version/tag/sync/push/clean | `master == dev == v0.9.710`, both remotes and clean worktrees verified |
+
+### 17.4 Strict architecture audit
+
+Audit result: **approved**. Implementation is authorized only inside Q1-Q6.
+
+| Dimension | Audited invariant |
+| --- | --- |
+| semantic authority | A scale recommendation requires co-located subject plus decision/action semantics; a heading, isolated keyword or `结论完整` cannot satisfy it |
+| determinism | Matching is bounded string classification over one terminal; no Provider call, score threshold relaxation or scenario-specific terminal exception |
+| lifecycle authority | `Complete`, `Error` and `Cancelled` may be recovered only from explicit carriers that terminalize the same execution; child node, graph, tool and acceptance statuses never own the parent lifecycle |
+| state machine | `Complete -> Finalizing` remains forbidden. Allowing it would hide corruption and make terminal state non-monotonic |
+| recovery | Canonical terminal replay and checkpoint idempotence remain intact. Non-terminal durable events still restore metrics/references and advance the replay cursor |
+| concurrency | No new locks, scheduler, timer or polling loop. Classification is linear in bounded terminal text; replay remains linear in canonical events |
+| projection | Mission and Gateway consume Runtime-owned lifecycle truth; no cache TTL or forced-refresh patch is permitted without independent evidence |
+| compatibility | Historical explicit terminal carriers remain readable. Ambiguous historical `status=completed` events become non-terminal instead of fabricating completion |
+| security | Provider prose cannot mint Runtime terminal state, and a nested business event cannot terminate its parent through a shared status vocabulary |
+| resources | No second transcript, event ledger or model judge is added; existing bounded text and durable events are reused |
+
+### 17.5 Adversarial acceptance matrix
+
+- heading `扩大规模结论` plus `结论完整`: reject;
+- scale subject without a decision or prerequisite: reject;
+- decision text in a different paragraph from the scale subject: reject;
+- `适合继续扩大协作规模，但横向扩展必须先完成分片`: accept;
+- `暂不建议扩容，需先消除恢复串行瓶颈`: accept as a complete negative
+  recommendation;
+- English scale-up/scale-out recommendation with an explicit should/must/not
+  suitable decision: accept;
+- completed execution node followed by Agent finalization: Agent remains
+  non-terminal until its explicit terminal carrier;
+- completed graph checkpoint, tool call or acceptance event: never terminalizes
+  the Agent;
+- explicit `runtime.session.terminal_requested`: recover `Complete` and its
+  terminal reference idempotently;
+- restart before a terminal carrier: replay remains non-terminal and continues
+  from subsequent lifecycle events;
+- restart after a terminal carrier: final state remains terminal and monotonic.
+
+If implementation or Q4/Q5 reveals a new authority, scheduler, persistence or
+acceptance design requirement, work returns to this audit before further source
+changes. Adding one observed synonym, changing the prompt, weakening the pass
+bar, permitting terminal reversal or adding refresh timers is explicitly
+forbidden.
+
+### 17.6 Implementation and deterministic conformance
+
+Implementation remained inside the audited authority boundaries:
+
+- the scale check now classifies bounded non-heading semantic blocks and
+  requires a scale subject together with an explicit decision, action or
+  prerequisite;
+- heading-only, label-only and cross-paragraph keyword combinations fail;
+- the observed Qwen conclusion, complete positive/conditional guidance and a
+  complete negative recommendation pass without changing the scenario;
+- durable replay still restores graph identity, tool metrics and cursor
+  progress, but generic business status vocabulary no longer mutates live
+  lifecycle;
+- only `runtime.session.terminal_requested` with a durable payload reference
+  recovers completion, through the existing monotonic transition reducer;
+- malformed and duplicate terminal carriers are fail-closed/idempotent.
+
+Deterministic evidence on the unchanged implementation candidate:
+
+- Harness Eval library: 117 passed, 0 failed;
+- Runtime library: 1,910 passed, 0 failed, 2 ignored;
+- `cargo check --workspace --all-targets`: passed without warnings;
+- architecture boundary gate: passed;
+- full workspace all-target regression: passed;
+- ten isolated Gateway process-global environment tests: passed;
+- standalone reference Bundle, deterministic signing/tamper checks, generic
+  APP worker lifecycle and Gateway/TUI proxy: passed.
+
+The candidate may now be committed and built once for Q5. Release authority
+and version evidence remain deliberately unchanged until both immutable live
+scenarios pass and the Gateway log contains no lifecycle-authority warning.

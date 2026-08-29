@@ -1805,10 +1805,6 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         ("bottlenecks", &["关键瓶颈", "bottleneck"][..]),
         ("failure_modes", &["失效模式", "failure mode"][..]),
         ("capacity_boundaries", &["容量边界", "capacity bound"][..]),
-        (
-            "scale_recommendation",
-            &["扩大规模", "scale recommendation"][..],
-        ),
     ];
     let mut checks = vec![
         json!({"name": "presentation_transport_clean", "passed": transport_clean}),
@@ -1824,7 +1820,77 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
             .any(|marker| normalized.contains(&marker.to_ascii_lowercase()));
         json!({"name": format!("presentation_{name}"), "passed": passed})
     }));
+    checks.push(json!({
+        "name": "presentation_scale_recommendation",
+        "passed": has_scale_recommendation(trimmed),
+    }));
     checks
+}
+
+fn has_scale_recommendation(response: &str) -> bool {
+    const SCALE_SUBJECTS: &[&str] = &[
+        "扩大规模",
+        "扩大协作规模",
+        "更大规模",
+        "扩容",
+        "横向扩展",
+        "增加 team",
+        "增加 agent",
+        "scale recommendation",
+        "scale up",
+        "scale-up",
+        "scale out",
+        "scale-out",
+        "scalability",
+        "expand collaboration",
+    ];
+    const SCALE_DECISIONS: &[&str] = &[
+        "建议扩容",
+        "建议扩大",
+        "建议增加",
+        "建议继续",
+        "不建议",
+        "适合",
+        "不适合",
+        "可继续",
+        "可以继续",
+        "暂不",
+        "应先",
+        "需先",
+        "需要先",
+        "必须先",
+        "前提",
+        "recommend scaling",
+        "recommend scale",
+        "recommend expanding",
+        "do not recommend",
+        "should",
+        "must",
+        "suitable",
+        "unsuitable",
+        "can continue",
+        "prerequisite",
+        "not ready",
+    ];
+
+    let normalized_newlines = response.replace("\r\n", "\n").replace('\r', "\n");
+    normalized_newlines
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|block| !block.is_empty())
+        .map(|block| {
+            block
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase()
+        })
+        .filter(|block| !block.is_empty())
+        .any(|block| {
+            SCALE_SUBJECTS.iter().any(|marker| block.contains(marker))
+                && SCALE_DECISIONS.iter().any(|marker| block.contains(marker))
+        })
 }
 
 fn complete_exact_source_receipt_paths(
@@ -2997,10 +3063,31 @@ mod tests {
 
     #[test]
     fn large_scale_presentation_gate_accepts_complete_synthesized_terminal() {
-        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\n12/12 目标源码已完整读取到 EOF。\n12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF。\nE/F 结构化交接已完整消费。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
+        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\n12/12 目标源码已完整读取到 EOF。\n12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF。\nE/F 结构化交接已完整消费。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩容结论\n\n判定：适合在当前单节点边界内继续扩大协作规模，但横向扩展必须先完成持久层分片。";
         assert!(large_scale_presentation_checks(response)
             .iter()
             .all(|check| check["passed"] == true));
+    }
+
+    #[test]
+    fn scale_recommendation_requires_subject_and_decision_in_the_same_semantic_block() {
+        assert!(!has_scale_recommendation("## 扩大规模结论\n结论完整。"));
+        assert!(!has_scale_recommendation("- 扩容建议"));
+        assert!(!has_scale_recommendation(
+            "当前系统需要扩容。\n\n建议先完成持久层分片。"
+        ));
+        assert!(has_scale_recommendation(
+            "暂不建议扩容，需先消除恢复串行瓶颈。"
+        ));
+        assert!(has_scale_recommendation(
+            "The system is suitable to scale out, but must shard the event store first."
+        ));
+    }
+
+    #[test]
+    fn observed_qwen_scale_conclusion_is_semantically_complete() {
+        let observed = "判定：适合在当前单节点边界内继续扩大协作规模，但横向扩展存在明确架构前提。\n\n- 扩容建议：在单节点内可继续增加 Team/角色规模；若需跨节点横向扩展，应先行引入事件存储分片或 Postgres 后端。";
+        assert!(has_scale_recommendation(observed));
     }
 
     #[test]
