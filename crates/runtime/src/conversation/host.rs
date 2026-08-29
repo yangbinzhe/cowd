@@ -113,11 +113,12 @@ fn root_collaboration_decision_instruction(
         )
         .join(", ");
     format!(
-        "Root collaboration admission is pending. Call `{}` exactly once in this provider turn; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team. Give every workstream a distinct `workstream_id`, `objective`, and a nonempty `team.team_key` (a stable lowercase slug). Preserve user-provided Team and role names in `team.display_name` and role `display_name`; use `role_id` only as a distinct machine key. The active permission ceiling is `{}`; each role's `required_capabilities` may contain only [{}]. Express cross-Team ordering only with consumer-workstream `depends_on`. Express local role handoffs only with `team.dependencies`; every dependency names two roles within that one Team and carries artifacts produced by `from` and consumed by `to`. Do not split roles from one requested Team into multiple workstreams. {} If the tool returns a retryable structured compile diagnostic, submit one complete corrected semantic decision on the next required provider turn; never retry unchanged. This is not `runtime_orchestrate`.",
+        "Root collaboration admission is pending. Call `{}` exactly once in this provider turn; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team. Give every workstream a distinct `workstream_id`, `objective`, and a nonempty `team.team_key` (a stable lowercase slug). Preserve user-provided Team and role names in `team.display_name` and role `display_name`; use `role_id` only as a distinct machine key. The active permission ceiling is `{}`; each role's `required_capabilities` may contain only [{}]. Express cross-Team ordering only with consumer-workstream `depends_on`. Express local role handoffs only with `team.dependencies`; every dependency names two roles within that one Team and carries artifacts produced by `from` and consumed by `to`. Do not split roles from one requested Team into multiple workstreams. {} {} If the tool returns a retryable structured compile diagnostic, submit one complete corrected semantic decision on the next required provider turn; never retry unchanged. This is not `runtime_orchestrate`.",
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
         permission_ceiling.as_str(),
         allowed_capabilities,
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE,
+        harness_contract::orchestration::EXACT_FILE_EVIDENCE_GUIDANCE,
     )
     + &required_scope_clause
 }
@@ -12481,7 +12482,11 @@ fn focus_verification_tool_calls(
             (path != ".").then(|| ModelToolCall {
                 id: format!("runtime-focus-verify-{iteration}-{index}"),
                 name: "read_file".to_string(),
-                input: serde_json::json!({"path": path}).to_string(),
+                // ExactContent is a whole-object evidence contract. The
+                // default read window is useful for exploration but cannot
+                // close this obligation, even though it reports a full-file
+                // digest. Runtime therefore makes EOF intent explicit.
+                input: serde_json::json!({"path": path, "complete": true}).to_string(),
                 depends_on: Vec::new(),
             })
         })
@@ -12511,10 +12516,14 @@ fn successful_runtime_focus_scope_keys(
             serde_json::from_str::<serde_json::Value>(&call.input)
                 .ok()
                 .and_then(|input| {
-                    input
-                        .get("path")
-                        .and_then(|path| path.as_str())
-                        .map(str::to_string)
+                    (input.get("complete").and_then(serde_json::Value::as_bool) == Some(true))
+                        .then(|| {
+                            input
+                                .get("path")
+                                .and_then(|path| path.as_str())
+                                .map(str::to_string)
+                        })
+                        .flatten()
                 })
         })
         .flat_map(|path| {
@@ -17034,7 +17043,7 @@ mod tests {
         assert_eq!(calls[0].id, "runtime-focus-verify-7-0");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&calls[0].input).expect("read input"),
-            serde_json::json!({"path": "fixtures/source.txt"})
+            serde_json::json!({"path": "fixtures/source.txt", "complete": true})
         );
         assert!(focus_verification_tool_calls(
             &["workspace_change:src/lib.rs".into()],
@@ -17073,7 +17082,7 @@ mod tests {
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&calls[0].input).expect("read input"),
-            serde_json::json!({"path": "crates/gateway/Cargo.toml"})
+            serde_json::json!({"path": "crates/gateway/Cargo.toml", "complete": true})
         );
     }
 
@@ -17141,7 +17150,7 @@ mod tests {
         let calls = vec![ModelToolCall {
             id: "runtime-focus-verify-2-0".to_string(),
             name: "read_file".to_string(),
-            input: serde_json::json!({"path": "fixtures/target.txt"}).to_string(),
+            input: serde_json::json!({"path": "fixtures/target.txt", "complete": true}).to_string(),
             depends_on: Vec::new(),
         }];
         let required = vec![
@@ -17160,6 +17169,19 @@ mod tests {
         assert!(
             successful_runtime_focus_scope_keys(&calls, &BTreeSet::new(), &required).is_empty()
         );
+
+        let bounded_calls = vec![ModelToolCall {
+            id: "runtime-focus-verify-2-0".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({"path": "fixtures/target.txt"}).to_string(),
+            depends_on: Vec::new(),
+        }];
+        assert!(successful_runtime_focus_scope_keys(
+            &bounded_calls,
+            &BTreeSet::from(["runtime-focus-verify-2-0".to_string()]),
+            &required,
+        )
+        .is_empty());
     }
 
     #[test]

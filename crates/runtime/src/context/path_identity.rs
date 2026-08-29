@@ -492,6 +492,66 @@ impl WorkspacePathIdentityResolver {
         )
     }
 
+    /// Mint exact-content evidence only from a self-describing, complete
+    /// `read_file` output. A successful tool status or a requested path is
+    /// not proof that the whole file reached the caller: bounded reads are
+    /// intentionally rejected even when they carry the full-file digest.
+    pub fn observe_complete_read_tool_output(
+        &self,
+        tool_name: &str,
+        output: &serde_json::Value,
+        observed_at_sequence: u64,
+    ) -> Result<ObservedEvidence, WorkspacePathIdentityError> {
+        if tool_name != "read_file" {
+            return Err(WorkspacePathIdentityError::InvalidScope(format!(
+                "{tool_name} cannot mint exact file-read evidence"
+            )));
+        }
+        let file = output.get("file").ok_or_else(|| {
+            WorkspacePathIdentityError::InvalidScope("read output is missing file".to_string())
+        })?;
+        let complete = output.get("type").and_then(serde_json::Value::as_str) == Some("text")
+            && output.get("truncated").and_then(serde_json::Value::as_bool) == Some(false)
+            && file.get("startLine").and_then(serde_json::Value::as_u64) == Some(1)
+            && file.get("numLines").and_then(serde_json::Value::as_u64)
+                == file.get("totalLines").and_then(serde_json::Value::as_u64)
+            && file
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_some();
+        if !complete {
+            return Err(WorkspacePathIdentityError::InvalidScope(
+                "read output does not prove complete file coverage".to_string(),
+            ));
+        }
+        let digest = file
+            .get("sha256")
+            .and_then(serde_json::Value::as_str)
+            .filter(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| {
+                WorkspacePathIdentityError::InvalidScope(
+                    "complete read output is missing a valid sha256".to_string(),
+                )
+            })?;
+        let path = file
+            .get("filePath")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                WorkspacePathIdentityError::InvalidScope(
+                    "complete read output is missing filePath".to_string(),
+                )
+            })?;
+        self.observe_trusted_tool_output_file(
+            tool_name,
+            WorkspaceAccessMode::Read,
+            path,
+            digest,
+            observed_at_sequence,
+        )
+    }
+
     /// Snapshot a canonical scope emitted by a successful ToolHost adapter.
     /// Resolution uses only the frozen repository map and lexical workspace
     /// boundary; mutable filesystem state cannot rewrite the receipt.
@@ -1074,6 +1134,51 @@ mod tests {
             repo_relative.repository_relative_path,
             "crates/runtime/src/lib.rs"
         );
+    }
+
+    #[test]
+    fn exact_content_is_minted_only_from_structurally_complete_read_output() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("source.rs"), "one\ntwo\n").unwrap();
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let digest = format!("{:x}", Sha256::digest(b"one\ntwo\n"));
+        let complete = serde_json::json!({
+            "type": "text",
+            "truncated": false,
+            "file": {
+                "filePath": "source.rs",
+                "content": "one\ntwo\n",
+                "startLine": 1,
+                "numLines": 2,
+                "totalLines": 2,
+                "sha256": digest,
+            }
+        });
+        let observed = resolver
+            .observe_complete_read_tool_output("read_file", &complete, 7)
+            .expect("complete output should mint exact evidence");
+        assert!(matches!(
+            observed.target,
+            EvidenceTargetIdentity::Workspace { scope }
+                if scope.coverage == EvidenceCoverageKind::ExactContent
+        ));
+
+        let mut truncated = complete.clone();
+        truncated["truncated"] = serde_json::Value::Bool(true);
+        truncated["file"]["content"] = serde_json::Value::String("one\n".to_string());
+        truncated["file"]["numLines"] = serde_json::json!(1);
+        assert!(resolver
+            .observe_complete_read_tool_output("read_file", &truncated, 8)
+            .is_err());
+
+        let mut invalid_digest = complete.clone();
+        invalid_digest["file"]["sha256"] = serde_json::json!("not-a-digest");
+        assert!(resolver
+            .observe_complete_read_tool_output("read_file", &invalid_digest, 9)
+            .is_err());
+        assert!(resolver
+            .observe_complete_read_tool_output("grep_search", &complete, 10)
+            .is_err());
     }
 
     #[test]

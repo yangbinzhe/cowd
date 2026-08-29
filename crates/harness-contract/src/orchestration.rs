@@ -17,6 +17,12 @@ pub const SUBMIT_COLLABORATION_DECISION_TOOL_ID: &str = "submit_collaboration_de
 /// conversation prompt cannot drift into the old template-authoring protocol.
 pub const SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE: &str = "`submit_collaboration_decision` accepts only schema_version=2 semantic workstreams. One workstream contains `workstream_id`, `objective`, optional `depends_on`, optional typed `evidence_contract`, and a `team` with `team_key`, optional `display_name`, local typed `dependencies`, explicit `result`, and `instructions`; its semantic roles are in `team.roles`. Every role needs `role_id`, optional `display_name`, `responsibility`, at least one `required_capabilities`, optional Skills/Tools, cardinality, typed acceptance, and artifact inputs/outputs. `acceptance` and `evidence_contract` are JSON objects tagged by `kind` (for example `{\"kind\":\"artifact\",\"artifact\":\"evidence\"}` or `{\"kind\":\"evidence_scope\",\"operation\":\"read\",\"resource\":\"path\"}`), never string labels. An `evidence_scope` resource must be one concrete, existing workspace path; glob metacharacters such as `*`, `?`, `[`, `{` are not source evidence targets. Set every `team.result` explicitly. Every workstream-level `artifact` criterion must also be listed in `team.result.required_artifacts` and emitted by the one terminal role; use `evidence_scope` for source-reading requirements. Each declared result artifact is a required terminal structured field, not a routing-only label: for `unresolved`, emit an empty list when there are no open items rather than omitting the field. When `evidence_required` is true, `evidence` is a required result artifact: include it in `required_artifacts` and make the one terminal role output it, alongside typed evidence criteria. If `team.result.synthesis_required` is true, `required_artifacts` must be nonempty and exactly one role with no outgoing local dependency must output every one of them. Normally omit `required_tools`: Runtime derives physical tool bindings from `required_capabilities`; name a tool only when the current callable schema explicitly exposes it. Do not send a template, behavior facet, Agent id, grant ceiling, lease, graph id, `team_display_name`, or `result_fields`: Runtime resolves and binds those physical details.";
 
+/// Execution meaning of a file-level `read` evidence scope. Keep this
+/// separate from the large schema guidance so every model-facing surface can
+/// state the invariant without teaching providers an additional free-form
+/// coverage field.
+pub const EXACT_FILE_EVIDENCE_GUIDANCE: &str = "For a file resource, evidence_scope operation `read` means exact whole-file content through EOF. A bounded read window cannot satisfy it; Runtime executes the governed complete read and accepts only a non-truncated startLine=1, numLines=totalLines receipt with a valid sha256.";
+
 /// Capability identifiers a semantic role may request under an authenticated
 /// permission ceiling. Runtime's compiler and model-facing instruction share
 /// this vocabulary.
@@ -881,5 +887,7 @@ mod tests {
         );
         assert!(SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE.contains("Do not send a template"));
         assert!(SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE.contains("JSON objects tagged by `kind`"));
+        assert!(EXACT_FILE_EVIDENCE_GUIDANCE.contains("whole-file content through EOF"));
+        assert!(EXACT_FILE_EVIDENCE_GUIDANCE.contains("numLines=totalLines"));
     }
 }

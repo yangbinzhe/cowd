@@ -2797,26 +2797,8 @@ fn complete_read_evidence(
     output: &serde_json::Value,
     sequence: u64,
 ) -> Option<harness_contract::context::ObservedEvidence> {
-    let file = output.get("file")?;
-    let complete = output.get("truncated").and_then(serde_json::Value::as_bool) == Some(false)
-        && file.get("startLine").and_then(serde_json::Value::as_u64) == Some(1)
-        && file.get("numLines").and_then(serde_json::Value::as_u64)
-            == file.get("totalLines").and_then(serde_json::Value::as_u64)
-        && file
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .is_some();
-    complete.then_some(())?;
-    let digest = file.get("sha256")?.as_str()?;
-    is_sha256_hex(digest).then_some(())?;
     resolver
-        .observe_trusted_tool_output_file(
-            tool_name,
-            harness_contract::context::WorkspaceAccessMode::Read,
-            file.get("filePath")?.as_str()?,
-            digest,
-            sequence,
-        )
+        .observe_complete_read_tool_output(tool_name, output, sequence)
         .ok()
 }
 

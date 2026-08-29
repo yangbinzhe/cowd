@@ -36,6 +36,24 @@ fn large_scale_collaboration_scenario_enabled() -> bool {
     )
 }
 
+const LARGE_SCALE_SOURCE_PATHS: [&str; 12] = [
+    "crates/runtime/src/orchestration/mod.rs",
+    "crates/runtime/src/orchestration/compiler.rs",
+    "crates/runtime/src/orchestration/intent_compiler.rs",
+    "crates/runtime/src/team/instantiation.rs",
+    "crates/runtime/src/agent/in_process_worker.rs",
+    "crates/runtime/src/agent/result_validator.rs",
+    "crates/gateway/src/runtime_host/task_set.rs",
+    "crates/gateway/src/infrastructure/gateway_health.rs",
+    "crates/runtime/src/conversation/host.rs",
+    "crates/runtime/src/execution_core/graph/executors/verify.rs",
+    "crates/runtime/src/execution_core/services.rs",
+    "crates/runtime/src/recovery/runtime_event_reactor.rs",
+];
+
+const LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE: &str =
+    "最终结论还必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”；只有 Runtime 的完整读取收据确实覆盖全部 12 个目标时才允许输出，否则必须判定任务未完成。";
+
 /// An operator may isolate named production-path scenarios without changing
 /// the default suite. This is useful for a costly, focused provider exercise
 /// whose result must not be obscured by an unrelated scenario's verdict.
@@ -634,10 +652,15 @@ impl LiveScenarioRunner {
         };
         trace.extend(actor.drain_trace());
         let session_id = actor.session_id().to_string();
+        let prompt = if spec.id == "live_qwen38_large_scale_collaboration" {
+            format!("{}{}", spec.prompt, LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE)
+        } else {
+            spec.prompt.to_string()
+        };
         let admission = actor.post_mutation(
             &format!("/api/sessions/{session_id}/messages"),
             json!({
-                "content": spec.prompt,
+                "content": prompt,
                 "idempotency_key": format!("live-eval-{}", uuid::Uuid::new_v4()),
             }),
         );
@@ -1605,11 +1628,27 @@ impl LiveAcceptance {
                 let presentation_satisfied = presentation_checks
                     .iter()
                     .all(|check| check["passed"].as_bool() == Some(true));
+                let complete_source_paths =
+                    complete_exact_source_receipt_paths(timeline, projections);
+                let missing_complete_source_paths =
+                    if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 {
+                        LARGE_SCALE_SOURCE_PATHS
+                            .iter()
+                            .filter(|path| !complete_source_paths.contains(**path))
+                            .copied()
+                            .collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    };
+                let complete_source_coverage = minimum_teams < 6
+                    || minimum_claimed_cross_team_edges < 5
+                    || missing_complete_source_paths.is_empty();
                 let mut checks = vec![
                     json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                     json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
                     json!({"name": "completed_evidence_team", "required": minimum_teams, "passed": team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
                     json!({"name": "claimed_cross_team_edges", "required": minimum_claimed_cross_team_edges, "observed": claimed_cross_team_edges, "passed": edges_satisfied}),
+                    json!({"name": "runtime_attested_complete_source_coverage", "required": if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 { 12 } else { 0 }, "observed": complete_source_paths.len(), "missing": missing_complete_source_paths, "passed": complete_source_coverage}),
                 ];
                 checks.extend(presentation_checks);
                 LiveAcceptanceResult {
@@ -1617,6 +1656,7 @@ impl LiveAcceptance {
                         && quality.score >= quality.required
                         && team_projection
                         && edges_satisfied
+                        && complete_source_coverage
                         && presentation_satisfied,
                     quality: Some(quality.clone()),
                     checks,
@@ -1699,6 +1739,20 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         ]
         .iter()
         .any(|marker| normalized.contains(marker));
+    let source_coverage_contradicted = [
+        "源码完整覆盖维度：未通过",
+        "源码完整覆盖维度:未通过",
+        "不能将本次任务判定为完全通过",
+        "整体任务不能判定为完全通过",
+        "本次任务不能判定为完全通过",
+        "仅有 4 个文件完成",
+        "只有 4 个文件完成",
+        "only 4 files were complete",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(&marker.to_ascii_lowercase()));
+    let source_coverage_declared =
+        !source_coverage_contradicted && normalized.contains("12/12 目标源码已完整读取到 eof");
     let required_concepts = [
         ("verified_facts", &["已验证事实", "verified facts"][..]),
         (
@@ -1722,6 +1776,7 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         json!({"name": "presentation_transport_clean", "passed": transport_clean}),
         json!({"name": "presentation_complete_ending", "passed": complete_ending}),
         json!({"name": "presentation_source_paths", "required": 6, "observed": source_paths.len(), "passed": source_paths.len() >= 6}),
+        json!({"name": "presentation_complete_source_coverage", "passed": source_coverage_declared}),
         json!({"name": "presentation_cross_team_handoff_consumed", "passed": handoff_consumed}),
     ];
     checks.extend(required_concepts.into_iter().map(|(name, markers)| {
@@ -1731,6 +1786,65 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         json!({"name": format!("presentation_{name}"), "passed": passed})
     }));
     checks
+}
+
+fn complete_exact_source_receipt_paths(
+    timeline: &Value,
+    projections: &[Value],
+) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    collect_complete_exact_source_receipt_paths(timeline, &mut paths);
+    for projection in projections {
+        collect_complete_exact_source_receipt_paths(projection, &mut paths);
+    }
+    paths
+}
+
+fn collect_complete_exact_source_receipt_paths(value: &Value, paths: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_complete_exact_source_receipt_paths(value, paths);
+            }
+        }
+        Value::Object(values) => {
+            let sequence = values
+                .get("observed_at_sequence")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let tool_name = values.get("tool_name").and_then(Value::as_str);
+            let scope = values.get("target").and_then(|target| target.get("scope"));
+            let exact_read = sequence > 0
+                && tool_name == Some("read_file")
+                && scope
+                    .and_then(|scope| scope.get("access_mode"))
+                    .and_then(Value::as_str)
+                    == Some("read")
+                && scope
+                    .and_then(|scope| scope.get("coverage"))
+                    .and_then(Value::as_str)
+                    == Some("exact_content");
+            if exact_read {
+                let path = scope
+                    .and_then(|scope| scope.get("path"))
+                    .and_then(|path| path.get("workspace_relative_path"))
+                    .and_then(Value::as_str);
+                let digest = scope
+                    .and_then(|scope| scope.get("path"))
+                    .and_then(|path| path.get("observed_revision_or_digest"))
+                    .and_then(Value::as_str);
+                if let (Some(path), Some(digest)) = (path, digest) {
+                    if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                        paths.insert(path.to_string());
+                    }
+                }
+            }
+            for value in values.values() {
+                collect_complete_exact_source_receipt_paths(value, paths);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 struct LiveAcceptanceResult {
@@ -2703,7 +2817,7 @@ mod tests {
 
     #[test]
     fn large_scale_presentation_gate_accepts_complete_synthesized_terminal() {
-        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\nE/F 结构化交接已完整消费。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
+        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\n12/12 目标源码已完整读取到 EOF。\nE/F 结构化交接已完整消费。\n\n## 源码推断\n边界推断。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
         assert!(large_scale_presentation_checks(response)
             .iter()
             .all(|check| check["passed"] == true));
@@ -2727,6 +2841,60 @@ mod tests {
         assert!(checks.iter().any(|check| {
             check["name"] == "presentation_cross_team_handoff_consumed" && check["passed"] == false
         }));
+    }
+
+    #[test]
+    fn large_scale_presentation_gate_rejects_positive_phrase_with_coverage_failure() {
+        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\n12/12 目标源码已完整读取到 EOF。\nE/F 结构化交接已完整消费。\n源码完整覆盖维度：未通过；不能将本次任务判定为完全通过。\n\n## 源码推断\n推断。\n\n## 未执行的模拟\n未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
+        let checks = large_scale_presentation_checks(response);
+
+        assert!(checks.iter().any(|check| {
+            check["name"] == "presentation_complete_source_coverage" && check["passed"] == false
+        }));
+    }
+
+    #[test]
+    fn complete_source_receipt_gate_requires_attested_exact_content_for_every_target() {
+        fn receipt(path: &str, sequence: u64) -> Value {
+            json!({
+                "observed_at_sequence": sequence,
+                "tool_name": "read_file",
+                "target": {
+                    "kind": "workspace",
+                    "scope": {
+                        "access_mode": "read",
+                        "coverage": "exact_content",
+                        "path": {
+                            "workspace_relative_path": path,
+                            "observed_revision_or_digest": "a".repeat(64),
+                        }
+                    }
+                }
+            })
+        }
+
+        let complete = LARGE_SCALE_SOURCE_PATHS
+            .iter()
+            .enumerate()
+            .map(|(index, path)| receipt(path, index as u64 + 1))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            complete_exact_source_receipt_paths(&json!({"receipts": complete}), &[]).len(),
+            LARGE_SCALE_SOURCE_PATHS.len()
+        );
+
+        let mut incomplete = LARGE_SCALE_SOURCE_PATHS
+            .iter()
+            .take(11)
+            .enumerate()
+            .map(|(index, path)| receipt(path, index as u64 + 1))
+            .collect::<Vec<_>>();
+        let mut bounded = receipt(LARGE_SCALE_SOURCE_PATHS[11], 12);
+        bounded["target"]["scope"]["coverage"] = json!("scoped_content");
+        incomplete.push(bounded);
+        let observed = complete_exact_source_receipt_paths(&json!({"receipts": incomplete}), &[]);
+        assert_eq!(observed.len(), 11);
+        assert!(!observed.contains(LARGE_SCALE_SOURCE_PATHS[11]));
     }
 
     #[test]

@@ -1492,6 +1492,17 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
     }
 }
 
+fn observed_evidence_matches_requested_path(
+    observed: &harness_contract::context::ObservedEvidence,
+    requested_paths: &[String],
+) -> bool {
+    matches!(
+        &observed.target,
+        harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+            if requested_paths.contains(&scope.path.workspace_relative_path)
+    )
+}
+
 impl ScopedRuntimeToolExecutor {
     fn internal_checkpoint_input(
         &self,
@@ -2037,28 +2048,57 @@ impl ScopedRuntimeToolExecutor {
             }
         };
         // Delegated ToolHost adapters must return typed observations together
-        // with a successful receipt. Some compatibility adapters currently
-        // return only the bounded raw output, which leaves a completed exact
-        // read impossible to satisfy at the Agent terminal. The executor
-        // already owns the immutable requested path, actual successful
-        // output, and canonical path resolver, so it can construct the same
-        // Runtime-attested observation before the durable receipt is written.
-        // This bridge is intentionally limited to successful read effects
-        // with no adapter-supplied observations; writes and failed tools are
-        // never inferred from text.
+        // with a successful receipt. Some compatibility adapters return only
+        // raw structured output. In that case Runtime may mint exact-content
+        // evidence solely when the output itself proves start=1, EOF coverage,
+        // no truncation and a valid full-file digest. Requested paths and a
+        // successful status alone are never evidence. Discovery tools must
+        // provide their own typed observations; writes and failures are never
+        // inferred here.
         if outcome.status == RuntimeToolExecutionStatus::Executed
             && outcome.observed_evidence.is_empty()
             && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Read
         {
-            for path in &requested.paths {
-                if let Ok(observed) = self.path_identity_resolver.observe_tool_scope(
-                    tool_name,
-                    &format!("read:{path}"),
-                    outcome.output.as_deref(),
-                    sequence,
-                ) {
+            let parsed = outcome
+                .output
+                .as_deref()
+                .and_then(|output| serde_json::from_str::<serde_json::Value>(output).ok());
+            if tool_name == "read_file" {
+                if let Some(observed) = parsed.as_ref().and_then(|output| {
+                    self.path_identity_resolver
+                        .observe_complete_read_tool_output(tool_name, output, sequence)
+                        .ok()
+                        .filter(|observed| {
+                            observed_evidence_matches_requested_path(observed, &requested.paths)
+                        })
+                }) {
                     outcome.observed_evidence.push(observed);
                 }
+            } else if tool_name == "read_many" {
+                outcome.observed_evidence.extend(
+                    parsed
+                        .as_ref()
+                        .and_then(|output| output.get("results"))
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|item| {
+                            item.get("status").and_then(serde_json::Value::as_str)
+                                == Some("success")
+                        })
+                        .filter_map(|item| item.get("output"))
+                        .filter_map(|output| {
+                            self.path_identity_resolver
+                                .observe_complete_read_tool_output("read_file", output, sequence)
+                                .ok()
+                                .filter(|observed| {
+                                    observed_evidence_matches_requested_path(
+                                        observed,
+                                        &requested.paths,
+                                    )
+                                })
+                        }),
+                );
             }
         }
         if fresh_execution {
@@ -4985,8 +5025,8 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].paths, ["crates/runtime/src/lib.rs"]);
         assert!(
-            !receipts[0].observed_evidence.is_empty(),
-            "a successful delegated read with only raw adapter output must gain a typed Runtime observation"
+            receipts[0].observed_evidence.is_empty(),
+            "a successful delegated read with unstructured adapter output must not be promoted into exact-content evidence"
         );
     }
 
