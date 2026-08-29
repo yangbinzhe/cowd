@@ -346,12 +346,17 @@ fn recursive_files(root: &Path, extension: &str) -> Result<Vec<PathBuf>, String>
 }
 
 fn extract_call_first_strings(source: &str, marker: &str) -> Vec<String> {
-    source
-        .lines()
-        .filter(|line| line.contains(marker))
-        .filter_map(first_quoted)
-        .map(str::to_owned)
-        .collect()
+    let mut values = Vec::new();
+    let mut tail = source;
+    while let Some(index) = tail.find(marker) {
+        let call = &tail[index + marker.len()..];
+        let Some(value) = first_quoted(call) else {
+            break;
+        };
+        values.push(value.to_owned());
+        tail = &call[value.len()..];
+    }
+    values
 }
 
 fn extract_field_strings(source: &str, field: &str) -> Vec<String> {

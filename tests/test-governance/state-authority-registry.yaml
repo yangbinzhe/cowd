@@ -1,59 +1,49 @@
 schema_version: 1
-mode: migration_baseline
+mode: enforced
 legacy_field: RuntimeModuleDescriptor.lifecycle_owner
-legacy_source_digest: d785657e12348082f269b0e127bee6cb80954264d24c34cd231ac035ad68a843
-legacy_candidates:
-  - conversation
-  - host
-  - runtime_control
-  - runtime_harness
-  - execution_core
-  - execution_supervisor
-  - execution_live
-  - orchestration
-  - provider_runtime_client
-  - provider_transport_pool
-  - tool_dispatch
-  - tool_host
-  - tool_orchestrator
-  - tool_execution_plane
-  - mission_control
-  - mission_command_router
-  - mission_runtime
-  - mission_runtime_port
-  - mission_schedule
-  - session_execution
-  - session_input
-  - session_lifecycle
-  - mission_command_interpreter
-  - agent
-  - agent_capability
-  - agent_catalog
-  - definition_registry
-  - managed_agent
-  - agent_process_jsonl_adapter
-  - agent_runtime
-  - team_definition
-  - team_instantiation
-  - team_projection
-  - team_l4_promotion
-  - team_runtime
-  - team_working_state
-  - conflict_arbiter
-  - approval
-  - approval_queue
-  - budget_policy
-  - context_runtime
-  - knowledge_activation
-  - resources
-  - skill
-  - fact_extraction
-  - reality_decision
-  - reality_recall_port
-  - evolution
-  - recovery
-  - runtime_event_store
-  - policy_engine
-  - security
-  - upgrade
-authorities: []
+legacy_source_digest: ""
+legacy_candidates: []
+authorities:
+  - { id: runtime.conversation.turn, owner_crate: runtime, owner_module: conversation, canonical_writer: ConversationRuntime, revision: turn_id, fence: turn_generation, recovery: conversation replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.control, owner_crate: runtime, owner_module: runtime_control, canonical_writer: RuntimeControlState, revision: control_revision, fence: control_generation, recovery: control snapshot, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.execution.graph, owner_crate: runtime, owner_module: execution_core, canonical_writer: ExecutionGraphCommitService, revision: graph_revision, fence: graph_commit_fence, recovery: graph replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.execution.resource, owner_crate: runtime, owner_module: resources, canonical_writer: ExecutionResourceManager, revision: lease_generation, fence: resource_lease, recovery: lease expiry, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.collaboration.program, owner_crate: runtime, owner_module: orchestration, canonical_writer: CollaborationCoordinator, revision: program_revision, fence: program_cas, recovery: program reconcile, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.provider.transport, owner_crate: runtime, owner_module: provider_transport_pool, canonical_writer: ProviderTransportPool, revision: transport_generation, fence: transport_lease, recovery: transport reconnect, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.provider.policy, owner_crate: runtime, owner_module: provider_transport_policy, canonical_writer: ProviderTransportPolicy, revision: policy_revision, fence: policy_epoch, recovery: policy reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.provider.catalog, owner_crate: runtime, owner_module: provider_registry, canonical_writer: ProviderRegistry, revision: provider_generation, fence: registry_generation, recovery: config rebuild, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.tool.effect, owner_crate: runtime, owner_module: tool_host, canonical_writer: ToolHost, revision: effect_id, fence: invocation_id, recovery: effect replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.tool.plan, owner_crate: runtime, owner_module: tool_orchestrator, canonical_writer: ToolOrchestrator, revision: plan_revision, fence: plan_digest, recovery: plan rebuild, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.tool.policy, owner_crate: runtime, owner_module: tool_policy, canonical_writer: ToolPolicy, revision: policy_revision, fence: authorization_epoch, recovery: policy reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.mission.lifecycle, owner_crate: runtime, owner_module: mission_control, canonical_writer: MissionControlRuntime, revision: mission_revision, fence: mission_transition, recovery: mission replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.mission.schedule, owner_crate: runtime, owner_module: mission_schedule, canonical_writer: MissionScheduleStore, revision: schedule_revision, fence: schedule_claim, recovery: schedule tick replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.session.execution, owner_crate: runtime, owner_module: session_execution, canonical_writer: SessionExecutionPolicyControl, revision: policy_revision, fence: transition_id, recovery: policy snapshot, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.session.input, owner_crate: runtime, owner_module: session_input, canonical_writer: SessionInputRouter, revision: input_sequence, fence: input_claim, recovery: input outbox replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.session.lifecycle, owner_crate: runtime, owner_module: session_lifecycle, canonical_writer: SessionLifecycleCoordinator, revision: lifecycle_revision, fence: lifecycle_transition, recovery: lifecycle intent replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.agent.capability, owner_crate: runtime, owner_module: agent_capability, canonical_writer: AgentCapabilityRegistry, revision: capability_revision, fence: capability_digest, recovery: registry rebuild, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.agent.definition, owner_crate: runtime, owner_module: definition_registry, canonical_writer: AgentDefinitionRegistry, revision: definition_revision, fence: definition_digest, recovery: definition reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.agent.execution, owner_crate: runtime, owner_module: agent_runtime, canonical_writer: AgentRuntime, revision: agent_run_id, fence: agent_slot_lease, recovery: run reconcile, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.team.definition, owner_crate: runtime, owner_module: team_definition, canonical_writer: TeamDefinitionStore, revision: team_definition_revision, fence: definition_digest, recovery: definition reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.team.execution, owner_crate: runtime, owner_module: team_runtime, canonical_writer: TeamRuntime, revision: team_run_id, fence: team_slot_lease, recovery: team reconcile, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.approval.decision, owner_crate: runtime, owner_module: approval, canonical_writer: ApprovalCoordinator, revision: approval_revision, fence: approval_id, recovery: approval replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.approval.queue, owner_crate: runtime, owner_module: approval_queue, canonical_writer: ApprovalQueue, revision: queue_revision, fence: request_id, recovery: queue rebuild, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.context.lifecycle, owner_crate: runtime, owner_module: context_runtime, canonical_writer: ContextRuntime, revision: context_revision, fence: context_generation, recovery: context rebuild, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.context.budget, owner_crate: runtime, owner_module: budget_policy, canonical_writer: ContextBudgetPolicy, revision: budget_revision, fence: budget_lease, recovery: budget recompute, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.skill.lifecycle, owner_crate: runtime, owner_module: skill, canonical_writer: SkillRuntime, revision: skill_revision, fence: skill_digest, recovery: skill registry reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.reality.decision, owner_crate: runtime, owner_module: reality_decision, canonical_writer: RealityDecisionService, revision: decision_revision, fence: decision_id, recovery: decision replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.evolution.lifecycle, owner_crate: runtime, owner_module: evolution, canonical_writer: EvolutionRuntime, revision: evolution_revision, fence: proposal_id, recovery: evolution replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.event.store, owner_crate: runtime, owner_module: runtime_event_store, canonical_writer: RuntimeEventStore, revision: stream_revision, fence: append_transaction, recovery: event replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.policy, owner_crate: runtime, owner_module: policy_engine, canonical_writer: PolicyEngine, revision: policy_revision, fence: authorization_epoch, recovery: policy reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.security, owner_crate: runtime, owner_module: security, canonical_writer: RuntimeSecurityPolicy, revision: security_revision, fence: trust_epoch, recovery: security reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.configuration, owner_crate: runtime, owner_module: config, canonical_writer: RuntimeConfig, revision: config_digest, fence: config_generation, recovery: config reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.capability.catalog, owner_crate: runtime, owner_module: capability_manifest, canonical_writer: RuntimeCapabilityManifest, revision: manifest_digest, fence: manifest_generation, recovery: manifest rebuild, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.checkpoint, owner_crate: runtime, owner_module: checkpoint, canonical_writer: RuntimeCheckpointStore, revision: checkpoint_revision, fence: checkpoint_id, recovery: checkpoint restore, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: runtime.upgrade, owner_crate: runtime, owner_module: upgrade, canonical_writer: UpgradeCoordinator, revision: upgrade_revision, fence: upgrade_lease, recovery: upgrade reconcile, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: managed_worker.process, owner_crate: managed-worker-runtime, owner_module: process_jsonl, canonical_writer: ManagedWorkerRuntime, revision: worker_generation, fence: process_lease, recovery: process restart, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: harness.intent.plan, owner_crate: harness-contract, owner_module: intent_planner, canonical_writer: IntentPlan, revision: plan_digest, fence: compilation_id, recovery: deterministic recompile, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: harness.evaluation, owner_crate: harness-eval, owner_module: eval_gate, canonical_writer: EvaluationGate, revision: evaluation_revision, fence: report_digest, recovery: evaluation replay, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: harness.cross_plane.policy, owner_crate: harness-contract, owner_module: cross_plane_policy, canonical_writer: CrossPlanePolicy, revision: policy_revision, fence: decision_id, recovery: deterministic reevaluate, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: mcp.lifecycle, owner_crate: mcp, owner_module: mcp_lifecycle_hardened, canonical_writer: McpLifecycleManager, revision: server_generation, fence: server_lease, recovery: server reconnect, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: memory.recall, owner_crate: memory, owner_module: recall, canonical_writer: MemoryRecallService, revision: memory_revision, fence: recall_snapshot, recovery: recall retry, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: sandbox.policy, owner_crate: sandbox-launcher, owner_module: sandbox, canonical_writer: SandboxPolicy, revision: policy_digest, fence: launch_receipt, recovery: process teardown, evidence: crates/runtime/tests/runtime_capability_authority.rs }
+  - { id: surface.contract, owner_crate: surface, owner_module: contract, canonical_writer: SurfaceContract, revision: schema_digest, fence: contract_revision, recovery: contract reload, evidence: crates/runtime/tests/runtime_capability_authority.rs }

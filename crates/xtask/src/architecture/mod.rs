@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 mod duplicate_authority;
+mod duplicate_capability;
 mod inventory;
 mod source_size;
 mod structural_limits;
@@ -66,18 +67,20 @@ pub(crate) fn run_cli(arguments: &[String]) -> Result<(), String> {
         "source-size" => source_size::run(&roots, &rest),
         "structural-limits" => structural_limits::run(&roots, &rest),
         "duplicate-authority" => duplicate_authority::run(&roots, &rest),
+        "duplicate-capability" => duplicate_capability::run(&roots, &rest),
         "audit" => {
             inventory::run(&roots, &["--check".to_owned()])?;
             source_size::run(&roots, &["--check".to_owned()])?;
             structural_limits::run(&roots, &["--check".to_owned()])?;
-            duplicate_authority::run(&roots, &["--check".to_owned()])
+            duplicate_authority::run(&roots, &["--check".to_owned()])?;
+            duplicate_capability::run(&roots, &["--check".to_owned()])
         }
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: cargo xtask architecture <inventory|source-size|structural-limits|duplicate-authority|audit> [--core PATH] [--edge PATH] [--output PATH] [--check]".to_owned()
+    "usage: cargo xtask architecture <inventory|source-size|structural-limits|duplicate-authority|duplicate-capability|audit> [--core PATH] [--edge PATH] [--output PATH] [--check]".to_owned()
 }
 
 fn option_path(arguments: &[String], name: &str) -> Result<Option<PathBuf>, String> {

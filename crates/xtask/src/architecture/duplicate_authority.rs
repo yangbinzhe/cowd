@@ -2,6 +2,7 @@ use std::{collections::BTreeSet, fs};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use syn::visit::Visit;
 
 use super::{has_flag, Roots};
 
@@ -11,7 +12,19 @@ struct Registry {
     mode: String,
     legacy_source_digest: String,
     legacy_candidates: Vec<String>,
-    authorities: Vec<serde_yaml::Value>,
+    authorities: Vec<Authority>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Authority {
+    id: String,
+    owner_crate: String,
+    owner_module: String,
+    canonical_writer: String,
+    revision: String,
+    fence: String,
+    recovery: String,
+    evidence: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,7 +69,6 @@ pub(super) fn run(roots: &Roots, arguments: &[String]) -> Result<(), String> {
         "enforced" => validate_enforced(&registry, &module_source)?,
         mode => return Err(format!("unknown state authority registry mode: {mode}")),
     }
-    validate_duplicate_policy(roots)?;
     if has_flag(arguments, "--check") {
         println!(
             "duplicate-authority gate passed: mode={} legacy={} authorities={}",
@@ -100,10 +112,37 @@ fn validate_enforced(registry: &Registry, source: &str) -> Result<(), String> {
     if !registry.legacy_candidates.is_empty() || registry.authorities.is_empty() {
         return Err("enforced authority registry must replace every legacy candidate".to_owned());
     }
+    let mut registered = BTreeSet::new();
+    for authority in &registry.authorities {
+        if !registered.insert(authority.id.as_str()) {
+            return Err(format!("duplicate state authority ID: {}", authority.id));
+        }
+        if authority.owner_crate.is_empty()
+            || authority.owner_module.is_empty()
+            || authority.canonical_writer.is_empty()
+            || authority.revision.is_empty()
+            || authority.fence.is_empty()
+            || authority.recovery.is_empty()
+            || authority.evidence.is_empty()
+        {
+            return Err(format!(
+                "state authority {} has incomplete control metadata",
+                authority.id
+            ));
+        }
+    }
+    let referenced = authority_references(source);
+    if referenced != registered {
+        let missing = referenced.difference(&registered).collect::<Vec<_>>();
+        let stale = registered.difference(&referenced).collect::<Vec<_>>();
+        return Err(format!(
+            "authority registry mismatch: missing={missing:?} stale={stale:?}"
+        ));
+    }
     Ok(())
 }
 
-fn validate_duplicate_policy(roots: &Roots) -> Result<(), String> {
+pub(super) fn validate_duplicate_policy(roots: &Roots) -> Result<usize, String> {
     let path = roots
         .core
         .join("tests/test-governance/duplicate-capability-allowlist.yaml");
@@ -115,6 +154,7 @@ fn validate_duplicate_policy(roots: &Roots) -> Result<(), String> {
         return Err("unsupported duplicate capability policy schema".to_owned());
     }
     let mut ids = BTreeSet::new();
+    let count = policy.candidates.len();
     for candidate in policy.candidates {
         if !ids.insert(candidate.id.clone()) {
             return Err(format!(
@@ -137,6 +177,7 @@ fn validate_duplicate_policy(roots: &Roots) -> Result<(), String> {
                 candidate.id
             ));
         }
+        let mut function_sets = Vec::new();
         for source in candidate.sources {
             let absolute = roots.core.join(&source.path);
             let body = fs::read_to_string(&absolute)
@@ -154,9 +195,85 @@ fn validate_duplicate_policy(roots: &Roots) -> Result<(), String> {
                     candidate.id, source.path
                 ));
             }
+            function_sets.push(function_names(&body)?);
+        }
+        if candidate.classification == "adapter_with_duplicated_semantics" {
+            let Some((first, rest)) = function_sets.split_first() else {
+                unreachable!("candidate source count was validated")
+            };
+            let common = first
+                .iter()
+                .filter(|name| rest.iter().all(|functions| functions.contains(*name)))
+                .count();
+            if common == 0 {
+                return Err(format!(
+                    "candidate {} claims duplicated semantics but has no shared operation names",
+                    candidate.id
+                ));
+            }
         }
     }
-    Ok(())
+    Ok(count)
+}
+
+fn function_names(source: &str) -> Result<BTreeSet<String>, String> {
+    #[derive(Default)]
+    struct Functions(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for Functions {
+        fn visit_item_fn(&mut self, function: &'ast syn::ItemFn) {
+            self.0.insert(function.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, function);
+        }
+
+        fn visit_impl_item_fn(&mut self, function: &'ast syn::ImplItemFn) {
+            self.0.insert(function.sig.ident.to_string());
+            syn::visit::visit_impl_item_fn(self, function);
+        }
+    }
+    let syntax =
+        syn::parse_file(source).map_err(|error| format!("parse duplicate source: {error}"))?;
+    let mut functions = Functions::default();
+    functions.visit_file(&syntax);
+    Ok(functions.0)
+}
+
+fn authority_references(source: &str) -> BTreeSet<&str> {
+    let mut references = BTreeSet::new();
+    let source = source
+        .split_once("pub fn runtime_module_map()")
+        .map_or(source, |(_, body)| body);
+    for marker in [
+        "authority(",
+        "coordinator(",
+        "worker(",
+        "projector(",
+        "adapter(",
+        "external(",
+    ] {
+        let mut tail = source;
+        while let Some(index) = tail.find(marker) {
+            let call = &tail[index + marker.len()..];
+            let Some(capability_start) = call.find('"') else {
+                break;
+            };
+            let capability_tail = &call[capability_start + 1..];
+            let Some(capability_end) = capability_tail.find('"') else {
+                break;
+            };
+            let state_source = &capability_tail[capability_end + 1..];
+            let Some(state_start) = state_source.find('"') else {
+                break;
+            };
+            let state_tail = &state_source[state_start + 1..];
+            let Some(state_end) = state_tail.find('"') else {
+                break;
+            };
+            let state = &state_tail[..state_end];
+            references.insert(state);
+            tail = &state_tail[state_end + 1..];
+        }
+    }
+    references
 }
 
 fn first_quoted(line: &str) -> Option<&str> {

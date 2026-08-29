@@ -112,6 +112,7 @@ pub mod mission_runtime;
 pub mod mission_runtime_port;
 #[path = "mission/mission_schedule.rs"]
 pub mod mission_schedule;
+pub mod module_authority;
 pub mod module_map;
 #[path = "context/path_identity.rs"]
 pub mod path_identity;
@@ -607,6 +608,10 @@ pub use mission_runtime_port::MissionRuntimePort;
 pub use mission_schedule::{
     CreateMissionScheduleRequest, MissionScheduleDispatchReport, MissionScheduleStore,
     MissionScheduleTickReport, UpdateMissionScheduleRequest,
+};
+pub use module_authority::{
+    audit_runtime_authorities, AuthorityAudit, AuthorityScope, CapabilityRoleBinding,
+    LifecycleRole, WriterKind,
 };
 pub use module_map::{
     runtime_module_map, runtime_module_names_by_domain, RuntimeDomain, RuntimeModuleDescriptor,

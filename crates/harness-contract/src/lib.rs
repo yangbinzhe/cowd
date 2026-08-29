@@ -25,6 +25,7 @@ pub mod evolution;
 pub mod execution;
 pub mod execution_graph;
 pub mod goal;
+pub mod governance;
 pub mod growth;
 pub mod harness;
 pub mod input_disposition;

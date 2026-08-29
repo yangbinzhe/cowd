@@ -46,6 +46,11 @@ architecture_gates:
       - Oversized hand-written source is phase-owned and generated source has provenance
       - Version-touched Rust code cannot hide mega functions, state carriers, or constructors
       - Duplicate authorities and semantic candidates are classified before release
+  - path: tests/architecture/capability-authority-gate.sh
+    protects:
+      - Every state authority ID resolves to one global owner
+      - External ports cannot claim Runtime authority
+      - Worker, Projector, and Adapter roles cannot write canonical state
   - path: scripts/architecture/check-boundaries.sh
     protects:
       - Gateway has no second AI execution loop

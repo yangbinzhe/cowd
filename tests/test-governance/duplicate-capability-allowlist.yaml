@@ -22,28 +22,28 @@ candidates:
         digest: 440eb492d35e181b326851a666bb1e133163526205736c28c7827a2c2002fb5e
   - id: persistence.session.backend_semantics
     phase: P5
-    classification: adapter_semantic_candidate
+    classification: adapter_with_duplicated_semantics
     owner: session
     sources:
       - { path: crates/session/src/persistence/sqlite.rs, symbol: SqliteSessionStore, digest: 7651d443605b0cc8cb5fa74423016d3f756a3663192c48781212997019e0a31f }
       - { path: crates/session-postgres/src/lib.rs, symbol: PostgresSessionStore, digest: 2c685fccd6649519f44c1929f6869a33492b09f2457bb747452f0a0b053088f0 }
   - id: persistence.runtime_event.backend_semantics
     phase: P5
-    classification: adapter_semantic_candidate
+    classification: adapter_with_duplicated_semantics
     owner: runtime
     sources:
       - { path: crates/runtime/src/recovery/runtime_event_store.rs, symbol: RuntimeEventStore, digest: 852e3f8eada1629f43389ff729383f3119fad8201b99175ad33a09944b2822ce }
       - { path: crates/runtime-postgres/src/lib.rs, symbol: PostgresRuntimeEventStore, digest: c7992da021eb4c72188f1b0595df4d690add016d7eb186a84f3b2d9eb3a2eb9e }
   - id: persistence.matrix.backend_semantics
     phase: P5
-    classification: adapter_semantic_candidate
+    classification: adapter_with_duplicated_semantics
     owner: matrix-repository
     sources:
       - { path: crates/matrix/repository/src/sqlite_repository.rs, symbol: MatrixSqliteRepository, digest: 56ea18ac7f52b8d63e5137374a770463cb38504d6b826db015a25874835cb7d3 }
       - { path: crates/matrix/repository/src/postgres_repository.rs, symbol: PostgresMatrixRepository, digest: ac2590e287e8b91018578eb3b866b683fd9f84646961ae40594898d837ae6c3d }
   - id: persistence.memory.backend_semantics
     phase: P5
-    classification: adapter_semantic_candidate
+    classification: adapter_with_duplicated_semantics
     owner: memory
     sources:
       - { path: crates/memory/src/store/sqlite.rs, symbol: SqliteStore, digest: 83cf075257975b475c0fdf246ec451c4c0ef6b368cb434c3282c2d2a9ea381b5 }

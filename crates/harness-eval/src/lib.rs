@@ -1725,7 +1725,13 @@ pub fn harness_capability_coverage_report() -> HarnessCapabilityCoverageReport {
                 .collect::<Vec<_>>();
             let lifecycle_modules = module_map
                 .iter()
-                .filter(|descriptor| descriptor.domain == domain && descriptor.lifecycle_owner)
+                .filter(|descriptor| {
+                    descriptor.domain == domain
+                        && descriptor.role_bindings.iter().any(|binding| {
+                            binding.role == runtime::LifecycleRole::Authority
+                                && binding.authority_scope == runtime::AuthorityScope::Local
+                        })
+                })
                 .map(|descriptor| descriptor.module.to_string())
                 .collect::<Vec<_>>();
             let requires_lifecycle_owner = lifecycle_required_domains.contains(&domain);
@@ -1733,7 +1739,7 @@ pub fn harness_capability_coverage_report() -> HarnessCapabilityCoverageReport {
                 && (!requires_lifecycle_owner || !lifecycle_modules.is_empty());
             let repair_hint = if requires_lifecycle_owner {
                 format!(
-                    "map runtime {} modules in runtime::module_map and mark at least one lifecycle owner",
+                    "map runtime {} capabilities to a unique local state Authority",
                     domain.as_str()
                 )
             } else {
@@ -2861,7 +2867,7 @@ mod tests {
     }
 
     #[test]
-    fn harness_capability_coverage_requires_runtime_lifecycle_owners() {
+    fn harness_capability_coverage_requires_runtime_state_authorities() {
         let report = harness_capability_coverage_report();
 
         assert_eq!(report.failed, 0);

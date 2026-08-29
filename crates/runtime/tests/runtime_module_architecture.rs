@@ -2,10 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use runtime::{runtime_module_map, RuntimeDomain};
+use runtime::{audit_runtime_authorities, runtime_module_map, LifecycleRole, RuntimeDomain};
 
 #[test]
-fn runtime_module_map_covers_the_harness_lifecycle_once() {
+fn runtime_module_map_covers_the_harness_lifecycle_with_unique_authorities() {
     let map = runtime_module_map();
     assert!(!map.is_empty(), "runtime module map must not be empty");
 
@@ -46,6 +46,10 @@ fn runtime_module_map_covers_the_harness_lifecycle_once() {
         );
     }
 
+    let audit = audit_runtime_authorities(&map).expect("authority bindings must be valid");
+    assert!(!audit.local_authorities.is_empty());
+    assert!(!audit.capabilities.is_empty());
+
     for lifecycle_domain in [
         RuntimeDomain::Conversation,
         RuntimeDomain::Mission,
@@ -57,9 +61,13 @@ fn runtime_module_map_covers_the_harness_lifecycle_once() {
     ] {
         assert!(
             map.iter().any(|descriptor| {
-                descriptor.domain == lifecycle_domain && descriptor.lifecycle_owner
+                descriptor.domain == lifecycle_domain
+                    && descriptor
+                        .role_bindings
+                        .iter()
+                        .any(|binding| binding.role == LifecycleRole::Authority)
             }),
-            "runtime lifecycle domain {lifecycle_domain:?} needs an explicit owner"
+            "runtime lifecycle domain {lifecycle_domain:?} needs an explicit Authority"
         );
     }
 }
