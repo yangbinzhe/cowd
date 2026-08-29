@@ -1664,7 +1664,7 @@ impl LiveAcceptance {
                     json!({"name": "completed_evidence_team", "required": minimum_teams, "passed": team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
                     json!({"name": "claimed_cross_team_edges", "required": minimum_claimed_cross_team_edges, "observed": claimed_cross_team_edges, "passed": edges_satisfied}),
                     json!({"name": "runtime_attested_complete_source_coverage", "required": if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 { 12 } else { 0 }, "observed": complete_source_paths.len(), "missing": missing_complete_source_paths, "passed": complete_source_coverage}),
-                    json!({"name": "runtime_attested_independent_source_review", "required": if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 { 12 } else { 0 }, "observed": independently_reviewed_source_paths.len(), "missing": missing_independently_reviewed_source_paths, "receipt_rule": "distinct exact-content receipts from investigator and reviewer", "passed": independent_source_review}),
+                    json!({"name": "runtime_attested_independent_source_review", "required": if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 { 12 } else { 0 }, "observed": independently_reviewed_source_paths.len(), "missing": missing_independently_reviewed_source_paths, "receipt_rule": "distinct exact-content receipts from two different Agent identities", "passed": independent_source_review}),
                 ];
                 checks.extend(presentation_checks);
                 LiveAcceptanceResult {
@@ -1833,27 +1833,25 @@ fn independently_reviewed_complete_source_receipt_paths(
     timeline: &Value,
     projections: &[Value],
 ) -> BTreeSet<String> {
-    let mut receipt_roles = BTreeMap::<String, BTreeSet<String>>::new();
-    collect_complete_exact_source_receipt_roles(timeline, &mut receipt_roles);
+    let mut receipt_agents = BTreeMap::<String, BTreeSet<String>>::new();
+    collect_complete_exact_source_receipt_agents(timeline, &mut receipt_agents);
     for projection in projections {
-        collect_complete_exact_source_receipt_roles(projection, &mut receipt_roles);
+        collect_complete_exact_source_receipt_agents(projection, &mut receipt_agents);
     }
-    receipt_roles
+    receipt_agents
         .into_iter()
-        .filter_map(|(path, roles)| {
-            (roles.contains("investigator") && roles.contains("reviewer")).then_some(path)
-        })
+        .filter_map(|(path, agents)| (agents.len() >= 2).then_some(path))
         .collect()
 }
 
-fn collect_complete_exact_source_receipt_roles(
+fn collect_complete_exact_source_receipt_agents(
     value: &Value,
-    receipt_roles: &mut BTreeMap<String, BTreeSet<String>>,
+    receipt_agents: &mut BTreeMap<String, BTreeSet<String>>,
 ) {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_complete_exact_source_receipt_roles(value, receipt_roles);
+                collect_complete_exact_source_receipt_agents(value, receipt_agents);
             }
         }
         Value::Object(values) => {
@@ -1886,33 +1884,36 @@ fn collect_complete_exact_source_receipt_roles(
                     .and_then(|reference| reference.get("evidence_ref"))
                     .and_then(|reference| reference.get("id"))
                     .and_then(Value::as_str);
-                if let (Some(path), Some(digest), Some(receipt_id)) = (path, digest, receipt_id) {
+                if let (Some(path), Some(digest), Some(agent_identity)) =
+                    (path, digest, receipt_id.and_then(receipt_agent_identity))
+                {
                     if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                        let roles = receipt_roles.entry(path.to_string()).or_default();
-                        if receipt_id_has_role(receipt_id, "investigator") {
-                            roles.insert("investigator".to_string());
-                        }
-                        if receipt_id_has_role(receipt_id, "reviewer") {
-                            roles.insert("reviewer".to_string());
-                        }
+                        receipt_agents
+                            .entry(path.to_string())
+                            .or_default()
+                            .insert(agent_identity.to_string());
                     }
                 }
             }
             for value in values.values() {
-                collect_complete_exact_source_receipt_roles(value, receipt_roles);
+                collect_complete_exact_source_receipt_agents(value, receipt_agents);
             }
         }
         _ => {}
     }
 }
 
-fn receipt_id_has_role(receipt_id: &str, required_role: &str) -> bool {
-    receipt_id.split(':').any(|segment| {
-        segment == required_role
-            || segment
-                .strip_suffix(required_role)
-                .is_some_and(|prefix| prefix.ends_with('-'))
-    })
+fn receipt_agent_identity(receipt_id: &str) -> Option<&str> {
+    let (execution_prefix, _) = receipt_id.rsplit_once(":read_file:")?;
+    let mut components = execution_prefix.rsplitn(4, ':');
+    let sequence = components.next()?;
+    let attempt = components.next()?;
+    let slot = components.next()?;
+    let identity = components.next()?;
+    sequence.parse::<u64>().ok()?;
+    attempt.parse::<u64>().ok()?;
+    slot.parse::<u64>().ok()?;
+    (!identity.trim().is_empty()).then_some(identity)
 }
 
 fn collect_complete_exact_source_receipt_paths(value: &Value, paths: &mut BTreeSet<String>) {
@@ -3041,7 +3042,7 @@ mod tests {
                 },
                 "evidence_ref": {
                     "evidence_ref": {
-                        "id": format!("agent-tool:team-graph:team-a:{role}:1:read_file:receipt")
+                        "id": format!("agent-tool:team-graph:team-a:{role}:1:1:{sequence}:read_file:digest:read-receipt")
                     }
                 }
             })
@@ -3071,18 +3072,32 @@ mod tests {
             &[],
         )
         .is_empty());
-        assert!(receipt_id_has_role(
-            "agent-tool:graph:team-a-investigator:1:read_file:receipt",
-            "investigator"
-        ));
-        assert!(receipt_id_has_role(
-            "agent-tool:graph:reviewer:1:read_file:receipt",
-            "reviewer"
-        ));
-        assert!(!receipt_id_has_role(
-            "agent-tool:graph:receipt-reviewer-copy:1:read_file:receipt",
-            "reviewer"
-        ));
+        assert_eq!(
+            receipt_agent_identity(
+                "agent-tool:team-graph:program:team-a:0:role-a5684f8888daf18c:1:1:2:read_file:digest:read-receipt"
+            ),
+            Some("agent-tool:team-graph:program:team-a:0:role-a5684f8888daf18c")
+        );
+        assert!(receipt_agent_identity(
+            "agent-tool:graph:role-a5684f8888daf18c:not-a-slot:1:2:read_file:receipt"
+        )
+        .is_none());
+
+        let duplicate_reads_from_one_agent = LARGE_SCALE_SOURCE_PATHS
+            .iter()
+            .enumerate()
+            .flat_map(|(index, path)| {
+                [
+                    receipt(path, index as u64 * 2 + 1, "role-a5684f8888daf18c"),
+                    receipt(path, index as u64 * 2 + 2, "role-a5684f8888daf18c"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert!(independently_reviewed_complete_source_receipt_paths(
+            &json!({"receipts": duplicate_reads_from_one_agent}),
+            &[],
+        )
+        .is_empty());
     }
 
     #[test]

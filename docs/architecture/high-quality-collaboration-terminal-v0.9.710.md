@@ -69,7 +69,7 @@ The live six-Team Qwen scenario independently repeats the presentation checks in
 
 For objectives that require actual structured-handoff consumption, the Runtime and evaluator additionally reject missing-upstream admissions and require a positive conclusion that successor Teams consumed the complete upstream semantics. This turns semantic delivery into a tested acceptance property instead of inferring it from graph topology.
 
-For objectives that require independent source review, the evaluator groups durable exact-content receipts by canonical source path and typed role identity. Every target must have distinct investigator and reviewer receipts with a valid digest. Presentation must agree with those Runtime facts; a positive coverage phrase followed by a caveat that the reviewer did not read the source is rejected.
+For objectives that require independent source review, the evaluator groups durable exact-content receipts by canonical source path and stable Agent execution identity. Every target must have receipts from at least two distinct Agents with a valid digest; repeated reads or duplicated projections from one Agent count once. This is deliberately independent of localized display names and canonical `role-<hash>` identifiers. The typed two-role dependency and Runtime `Verification` contract determine which successor is the reviewer. Presentation must agree with those Runtime facts; a positive coverage phrase followed by a caveat that the reviewer did not read the source is rejected.
 
 ## Resource model
 

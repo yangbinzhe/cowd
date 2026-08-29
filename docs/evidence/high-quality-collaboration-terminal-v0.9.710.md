@@ -65,7 +65,9 @@ The first independent-review run proved the Runtime repair but intentionally rem
 | realized execution | 6/6 Teams and 12/12 Agents completed; 5 edges; 97 tool calls; no failure/recovery |
 | durable exact receipts | 24 distinct role receipts: investigator and reviewer each read all 12 paths to EOF |
 | failed gate | evaluator observed 0/12 independent paths because it matched only a role segment exactly equal to `investigator` or `reviewer`, while canonical role ids were `team-a-investigator`, `team-a-reviewer`, etc. |
-| disposition | evaluator bug fixed with delimiter-aware exact/suffix role-segment matching and a canonical-role-id regression; the failed report is not manually promoted and a fresh immutable-candidate run is required |
+| disposition | the first parser repair handled prefixed English ids but a subsequent candidate used localized role names compiled to opaque `role-<hash>` ids, proving name-based matching was still unsound. The final gate derives stable Agent execution identity from the durable receipt and requires two distinct identities per path; the failed report is not manually promoted |
+
+A subsequent run under `/tmp/cowd-qwen38-quality-v0910-independent-final` was intentionally interrupted after the first four Teams entered: its opaque canonical role ids proved the name-based evaluator repair would inevitably produce another false negative. No completed report from that interrupted run is accepted as evidence.
 
 ## Implemented gates
 
@@ -83,7 +85,7 @@ The first independent-review run proved the Runtime repair but intentionally rem
 - A new semantic-handoff gate rejects topology-only success and requires the final result to confirm complete upstream consumption by E/F.
 - Whole-file source evidence is accepted only from structured `read_file` output proving start line 1, EOF coverage, no truncation and a valid SHA-256 digest.
 - Semantic verifiers with a bounded observable Agent-slot lease retain upstream context but receive their own tools, scoped evidence obligations and an explicit independent-reacquisition constraint.
-- The large-scale gate now requires distinct durable investigator and reviewer exact-content receipts for every one of the twelve target paths; duplicated projections of one receipt do not count twice.
+- The large-scale gate now requires exact-content receipts from two distinct stable Agent execution identities for every one of the twelve target paths; duplicated projections and repeated reads by one Agent do not count twice, and localized/opaque role ids require no special case.
 - The terminal presentation must positively state independent reviewer coverage and is rejected if it also contains a source-visibility or receipt-only caveat.
 
 ## Deterministic verification
