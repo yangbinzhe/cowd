@@ -47,6 +47,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const PROVIDER_PROTOCOL_RECOVERY_BUDGET: u8 = 1;
+/// Presentation-only recovery reuses already verified receipts with tools
+/// disabled. Two local attempts are substantially cheaper than replaying a
+/// whole multi-Team Program when one provider response omits schema labels,
+/// while the small hard bound still prevents an open-ended model loop.
+const STRUCTURED_OUTPUT_RECOVERY_BUDGET: u8 = 2;
 /// A provider can legally return prose despite a named-tool wire constraint.
 /// Permit three bounded root admission repairs before reporting a durable
 /// incomplete result. This budget applies only before any Team Program exists;
@@ -5337,9 +5342,13 @@ where
                                 state.pending_transcript.remove(&ticket.node_id);
                                 state.structured_output_replans =
                                     state.structured_output_replans.saturating_add(1);
-                                if state.structured_output_replans == 1 {
+                                if state.structured_output_replans
+                                    <= STRUCTURED_OUTPUT_RECOVERY_BUDGET
+                                {
                                     let instruction = format!(
-                                        "Runtime terminal-presentation recovery (mandatory): retained evidence satisfies the bounded role, but the terminal answer omits required field(s): {}. Tools are disabled. Give a concise answer with every field [{}], using native structured output, JSON, Markdown headings, or `Field: value` labels. Ground it only in retained receipts; risks or unresolved work must be explicitly stated when applicable.",
+                                        "Runtime terminal-presentation recovery {}/{} (mandatory): retained evidence satisfies the bounded role, but the terminal answer omits required field(s): {}. Tools are disabled. Give a concise answer with every field [{}], using native structured output, JSON, Markdown headings, or `Field: value` labels. Ground it only in retained receipts; risks or unresolved work must be explicitly stated when applicable.",
+                                        state.structured_output_replans,
+                                        STRUCTURED_OUTPUT_RECOVERY_BUDGET,
                                         missing.join(", "),
                                         state.focus_required_output_fields.join(", "),
                                     );
@@ -13687,6 +13696,14 @@ mod tests {
                 .any(|fragment| fragment.contains("Clean terminal synthesis"));
             if clean_terminal {
                 self.saw_clean_terminal_prompt.store(true, Ordering::SeqCst);
+                if attempt == 1 {
+                    return Box::pin(stream::iter(vec![
+                        Ok(AssistantEvent::TextDelta(
+                            "## evidence\nreceipt://runtime-read".to_string(),
+                        )),
+                        Ok(AssistantEvent::MessageStop),
+                    ]));
+                }
                 return Box::pin(stream::iter(vec![
                     Ok(AssistantEvent::TextDelta(
                         "## runtime_findings\nRuntime owns the verified boundary.\n\n## evidence\nreceipt://runtime-read\n\n## summary\nReview complete."
@@ -13699,7 +13716,7 @@ mod tests {
                 // The test harness owns a root presentation and therefore
                 // invokes its narrator after the delegated-style graph. Keep
                 // that unrelated presentation deterministic; the assertion
-                // below still proves attempt 1 used the isolated path.
+                // below still proves attempts 1 and 2 used the isolated path.
                 return Box::pin(stream::iter(vec![
                     Ok(AssistantEvent::TextDelta(
                         "{\"runtime_findings\":\"Runtime owns the verified boundary.\",\"evidence\":\"receipt://runtime-read\",\"summary\":\"Review complete.\"}"
@@ -15235,7 +15252,7 @@ mod tests {
         );
         assert_eq!(output["evidence"], "receipt://runtime-read");
         assert_eq!(output["summary"], "Review complete.");
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
         assert!(
             saw_clean_terminal_prompt.load(Ordering::SeqCst),
             "format recovery must exclude the exploratory transcript"

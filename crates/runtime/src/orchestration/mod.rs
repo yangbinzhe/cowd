@@ -4185,9 +4185,11 @@ mod tests {
     async fn collaboration_coordinator_persists_every_compiled_team_obligation_before_admission() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         ensure_test_mission(&services);
-        let first = parallel_research_team("research", Vec::new());
-        let second = parallel_research_team("review", Vec::new());
-        let mut request = proposal(vec![first, second]);
+        let mut request = proposal(
+            (0..6)
+                .map(|index| parallel_research_team(&format!("workstream-{index}"), Vec::new()))
+                .collect(),
+        );
         request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
             decision_id: "coordinator-obligations".to_string(),
             decision_revision: 1,
@@ -4262,16 +4264,26 @@ mod tests {
             .register_graph(graph)
             .await
             .expect("register Program graph");
-        for node_id in &root_node_ids {
-            collaboration_coordinator::mark_team_admitted(
-                &registered.id,
-                node_id,
-                &format!("team-graph:{node_id}"),
-                services.execution_supervisor().as_ref(),
-                services.graph_state_store(),
-            )
-            .await
-            .expect("mark Team admitted");
+        let graph_id = &registered.id;
+        let supervisor = services.execution_supervisor();
+        let graphs = services.graph_state_store();
+        let admission_results = futures::future::join_all(root_node_ids.iter().map(|node_id| {
+            let child_graph_id = format!("team-graph:{node_id}");
+            let supervisor = std::sync::Arc::clone(&supervisor);
+            async move {
+                collaboration_coordinator::mark_team_admitted(
+                    graph_id,
+                    node_id,
+                    &child_graph_id,
+                    supervisor.as_ref(),
+                    graphs,
+                )
+                .await
+            }
+        }))
+        .await;
+        for result in admission_results {
+            result.expect("concurrent Team admission converges");
         }
         collaboration_coordinator::mark_team_admitted(
             &registered.id,

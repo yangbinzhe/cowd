@@ -20,6 +20,40 @@ use super::{
 };
 
 const MAX_CAS_ATTEMPTS: usize = 3;
+const MIN_PROGRAM_CAS_ATTEMPTS: usize = 8;
+const MAX_PROGRAM_CAS_ATTEMPTS: usize = 128;
+const MAX_PROGRAM_CAS_BACKOFF_MS: u64 = 32;
+
+/// Whole-Program control updates are revision fenced. Multiple independent
+/// Team nodes can therefore finish admission against the same root revision.
+/// A fixed retry count smaller than the active fan-out makes one of those
+/// healthy Teams fail only because its siblings won the CAS first. Scale the
+/// retry budget with the immutable Program topology and de-phase contenders
+/// after every stale revision so bounded parallel admission converges without
+/// weakening the revision fence.
+fn program_cas_attempt_limit(program: &CollaborationProgram) -> usize {
+    program
+        .team_instances
+        .len()
+        .max(program.control.obligations.len())
+        .max(1)
+        .saturating_mul(2)
+        .clamp(MIN_PROGRAM_CAS_ATTEMPTS, MAX_PROGRAM_CAS_ATTEMPTS)
+}
+
+async fn backoff_after_program_cas_conflict(attempt: usize, contention_key: &str) {
+    let exponent = attempt.saturating_sub(1).min(5) as u32;
+    let base_ms = 1_u64
+        .checked_shl(exponent)
+        .unwrap_or(MAX_PROGRAM_CAS_BACKOFF_MS)
+        .min(MAX_PROGRAM_CAS_BACKOFF_MS);
+    let digest = Sha256::digest(contention_key.as_bytes());
+    let jitter_ms = u64::from(digest[0]) % base_ms.saturating_add(1);
+    tokio::time::sleep(std::time::Duration::from_millis(
+        base_ms.saturating_add(jitter_ms),
+    ))
+    .await;
+}
 
 /// the latter carries Runtime-derived retirements into the same graph CAS.
 pub(crate) fn compile_collaboration_intent_patch(
@@ -561,7 +595,8 @@ pub(crate) async fn mark_team_admitted(
     supervisor: &RuntimeExecutionSupervisor,
     graphs: &ExecutionGraphStateStore,
 ) -> Result<(), String> {
-    for _ in 0..MAX_CAS_ATTEMPTS {
+    let mut stale_conflicts = 0usize;
+    loop {
         let graph = graphs
             .load_async(graph_id)
             .await
@@ -573,6 +608,7 @@ pub(crate) async fn mark_team_admitted(
         else {
             return Ok(());
         };
+        let attempt_limit = program_cas_attempt_limit(program);
         if program.control.lifecycle.is_terminal() {
             return Ok(());
         }
@@ -614,11 +650,19 @@ pub(crate) async fn mark_team_admitted(
             Ok(_) => return Ok(()),
             Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
                 crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
-            )) => continue,
+            )) => {
+                stale_conflicts = stale_conflicts.saturating_add(1);
+                if stale_conflicts >= attempt_limit {
+                    return Err(format!(
+                        "program_admission_conflict_exhausted:conflicts={stale_conflicts}:limit={attempt_limit}"
+                    ));
+                }
+                backoff_after_program_cas_conflict(stale_conflicts, node_id).await;
+                continue;
+            }
             Err(error) => return Err(format!("program_admission_commit_failed:{error}")),
         }
     }
-    Err("program_admission_conflict_exhausted".to_string())
 }
 
 /// Persist all incoming cross-Team deliveries before a consumer Team is
@@ -632,7 +676,7 @@ pub(crate) async fn record_incoming_cross_team_deliveries(
     supervisor: &RuntimeExecutionSupervisor,
     graphs: &ExecutionGraphStateStore,
 ) -> Result<(), String> {
-    let mut stale_conflicts = 0;
+    let mut stale_conflicts = 0usize;
     loop {
         let graph = graphs
             .load_async(graph_id)
@@ -645,6 +689,7 @@ pub(crate) async fn record_incoming_cross_team_deliveries(
         else {
             return Ok(());
         };
+        let attempt_limit = program_cas_attempt_limit(program);
         let consumer_instance = instance_id_for_node(program, consumer_node_id)?;
         let pending = program
             .edges
@@ -701,8 +746,14 @@ pub(crate) async fn record_incoming_cross_team_deliveries(
             }
             Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
                 crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
-            )) if stale_conflicts < MAX_CAS_ATTEMPTS => {
+            )) => {
                 stale_conflicts = stale_conflicts.saturating_add(1);
+                if stale_conflicts >= attempt_limit {
+                    return Err(format!(
+                        "cross_team_delivery_conflict_exhausted:conflicts={stale_conflicts}:limit={attempt_limit}"
+                    ));
+                }
+                backoff_after_program_cas_conflict(stale_conflicts, consumer_node_id).await;
                 continue;
             }
             Err(error) => return Err(format!("cross_team_delivery_commit_failed:{error}")),
@@ -720,7 +771,7 @@ pub(crate) async fn claim_incoming_cross_team_deliveries(
     supervisor: &RuntimeExecutionSupervisor,
     graphs: &ExecutionGraphStateStore,
 ) -> Result<(), String> {
-    let mut stale_conflicts = 0;
+    let mut stale_conflicts = 0usize;
     loop {
         let graph = graphs
             .load_async(graph_id)
@@ -733,6 +784,7 @@ pub(crate) async fn claim_incoming_cross_team_deliveries(
         else {
             return Ok(());
         };
+        let attempt_limit = program_cas_attempt_limit(program);
         let consumer_instance = instance_id_for_node(program, consumer_node_id)?;
         let incoming = program
             .edges
@@ -797,8 +849,14 @@ pub(crate) async fn claim_incoming_cross_team_deliveries(
             }
             Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
                 crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
-            )) if stale_conflicts < MAX_CAS_ATTEMPTS => {
+            )) => {
                 stale_conflicts = stale_conflicts.saturating_add(1);
+                if stale_conflicts >= attempt_limit {
+                    return Err(format!(
+                        "cross_team_claim_conflict_exhausted:conflicts={stale_conflicts}:limit={attempt_limit}"
+                    ));
+                }
+                backoff_after_program_cas_conflict(stale_conflicts, consumer_node_id).await;
                 continue;
             }
             Err(error) => return Err(format!("cross_team_claim_commit_failed:{error}")),
@@ -816,7 +874,8 @@ pub(crate) async fn mark_team_admission_rejected(
     supervisor: &RuntimeExecutionSupervisor,
     graphs: &ExecutionGraphStateStore,
 ) -> Result<(), String> {
-    for _ in 0..MAX_CAS_ATTEMPTS {
+    let mut stale_conflicts = 0usize;
+    loop {
         let graph = graphs
             .load_async(graph_id)
             .await
@@ -828,6 +887,7 @@ pub(crate) async fn mark_team_admission_rejected(
         else {
             return Ok(());
         };
+        let attempt_limit = program_cas_attempt_limit(program);
         if program.control.lifecycle.is_terminal() {
             return Ok(());
         }
@@ -867,11 +927,19 @@ pub(crate) async fn mark_team_admission_rejected(
             Ok(_) => return Ok(()),
             Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
                 crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
-            )) => continue,
+            )) => {
+                stale_conflicts = stale_conflicts.saturating_add(1);
+                if stale_conflicts >= attempt_limit {
+                    return Err(format!(
+                        "program_admission_rejection_conflict_exhausted:conflicts={stale_conflicts}:limit={attempt_limit}"
+                    ));
+                }
+                backoff_after_program_cas_conflict(stale_conflicts, node_id).await;
+                continue;
+            }
             Err(error) => return Err(format!("program_admission_rejection_commit_failed:{error}")),
         }
     }
-    Err("program_admission_rejection_conflict_exhausted".to_string())
 }
 
 /// Reconcile a Program after its root graph reaches a terminal state. Required
@@ -1408,7 +1476,8 @@ pub(crate) async fn reconcile_terminal_program_with(
     supervisor: &RuntimeExecutionSupervisor,
     graphs: &ExecutionGraphStateStore,
 ) -> Result<(), String> {
-    for _ in 0..MAX_CAS_ATTEMPTS {
+    let mut stale_conflicts = 0usize;
+    loop {
         let graph = match graphs.load_async(graph_id).await {
             Ok(graph) => graph,
             Err(ExecutionStateStoreError::NotFound(_)) => return Ok(()),
@@ -1421,6 +1490,7 @@ pub(crate) async fn reconcile_terminal_program_with(
         else {
             return Ok(());
         };
+        let attempt_limit = program_cas_attempt_limit(program);
         // `Planning` is the durable quarantine marker for a legacy Program
         // whose frozen Team request cannot be reconstructed safely. It needs
         // an explicit inspect/revise, not a terminal transition that would
@@ -1488,11 +1558,19 @@ pub(crate) async fn reconcile_terminal_program_with(
             Ok(_) => return Ok(()),
             Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
                 crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
-            )) => continue,
+            )) => {
+                stale_conflicts = stale_conflicts.saturating_add(1);
+                if stale_conflicts >= attempt_limit {
+                    return Err(format!(
+                        "program_terminal_conflict_exhausted:conflicts={stale_conflicts}:limit={attempt_limit}"
+                    ));
+                }
+                backoff_after_program_cas_conflict(stale_conflicts, graph_id).await;
+                continue;
+            }
             Err(error) => return Err(format!("program_terminal_commit_failed:{error}")),
         }
     }
-    Err("program_terminal_conflict_exhausted".to_string())
 }
 
 /// Derive one compact Program terminal from the graph's already durable node
@@ -1542,7 +1620,8 @@ pub(crate) async fn reconcile_program_wait_state_with(
     graphs: &ExecutionGraphStateStore,
     teams: &TeamRuntime,
 ) -> Result<(), String> {
-    for _ in 0..MAX_CAS_ATTEMPTS {
+    let mut stale_conflicts = 0usize;
+    loop {
         let graph = match graphs.load_async(graph_id).await {
             Ok(graph) => graph,
             Err(ExecutionStateStoreError::NotFound(_)) => return Ok(()),
@@ -1555,6 +1634,7 @@ pub(crate) async fn reconcile_program_wait_state_with(
         else {
             return Ok(());
         };
+        let attempt_limit = program_cas_attempt_limit(program);
         if program.control.lifecycle.is_terminal() {
             return Ok(());
         }
@@ -1614,7 +1694,16 @@ pub(crate) async fn reconcile_program_wait_state_with(
                                 crate::execution_core::graph::ExecutionCommitError::StaleRevision {
                                     ..
                                 },
-                            )) => continue,
+                            )) => {
+                                stale_conflicts = stale_conflicts.saturating_add(1);
+                                if stale_conflicts >= attempt_limit {
+                                    return Err(format!(
+                                        "program_wait_conflict_exhausted:conflicts={stale_conflicts}:limit={attempt_limit}"
+                                    ));
+                                }
+                                backoff_after_program_cas_conflict(stale_conflicts, graph_id).await;
+                                continue;
+                            }
                             Err(commit_error) => {
                                 return Err(format!(
                                     "program_wait_quarantine_commit_failed:{commit_error}"
@@ -1664,11 +1753,19 @@ pub(crate) async fn reconcile_program_wait_state_with(
             Ok(_) => return Ok(()),
             Err(crate::execution_core::graph::ExecutionRunnerError::Commit(
                 crate::execution_core::graph::ExecutionCommitError::StaleRevision { .. },
-            )) => continue,
+            )) => {
+                stale_conflicts = stale_conflicts.saturating_add(1);
+                if stale_conflicts >= attempt_limit {
+                    return Err(format!(
+                        "program_wait_conflict_exhausted:conflicts={stale_conflicts}:limit={attempt_limit}"
+                    ));
+                }
+                backoff_after_program_cas_conflict(stale_conflicts, graph_id).await;
+                continue;
+            }
             Err(error) => return Err(format!("program_wait_commit_failed:{error}")),
         }
     }
-    Err("program_wait_conflict_exhausted".to_string())
 }
 
 /// Bounded startup reconciliation for Program control truth. This scans

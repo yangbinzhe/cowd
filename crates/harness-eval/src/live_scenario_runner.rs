@@ -27,6 +27,15 @@ fn group_theory_research_scenario_enabled() -> bool {
     )
 }
 
+fn large_scale_collaboration_scenario_enabled() -> bool {
+    matches!(
+        std::env::var("COWD_EVAL_LARGE_SCALE_COLLABORATION")
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
 /// An operator may isolate named production-path scenarios without changing
 /// the default suite. This is useful for a costly, focused provider exercise
 /// whose result must not be obscured by an unrelated scenario's verdict.
@@ -542,6 +551,17 @@ impl LiveScenarioRunner {
                     minimum_claimed_cross_team_edges: 3,
                 },
                 timeout: LiveScenarioTimeout::team(),
+            });
+        }
+        if large_scale_collaboration_scenario_enabled() {
+            scenario_specs.push(LiveScenarioSpec {
+                id: "live_qwen38_large_scale_collaboration",
+                prompt: "这是一次单 Program 大规模协同压力验收，必须由当前 Runtime 实际执行，禁止用根模型文本伪装 Team 或 Agent。必须创建**恰好六个**协作 Team；每个 Team 必须恰好包含两个只读角色：investigator 与 reviewer。investigator 先读取并分析本 Team 的源码范围；reviewer 必须依赖 investigator，独立复核其证据，并作为该 Team 唯一 terminal role。terminal reviewer 必须在 `output_artifacts` 中声明 required result artifacts：`findings`、`source_paths`、`evidence`、`summary`、`unresolved`。不要添加自定义 acceptance，也不要添加无资源绑定的 evidence 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中用实际存在的完整源码路径作为 `evidence_scope`；禁止通配符。Team A（编排与 Program 真相）读取 `crates/runtime/src/orchestration/mod.rs` 和 `crates/runtime/src/orchestration/compiler.rs`；Team B（意图、模板与 Team 实例化）读取 `crates/runtime/src/orchestration/intent_compiler.rs` 和 `crates/runtime/src/team/instantiation.rs`；Team C（Agent 执行与结果验证）读取 `crates/runtime/src/agent/in_process_worker.rs` 和 `crates/runtime/src/agent/result_validator.rs`；Team D（Gateway 背压与语义健康）读取 `crates/gateway/src/runtime_host/task_set.rs` 和 `crates/gateway/src/infrastructure/gateway_health.rs`。A、B、C、D 必须作为第一波并行执行。Team E（对抗性交叉审查）读取 `crates/runtime/src/conversation/host.rs` 和 `crates/runtime/src/execution_core/graph/executors/verify.rs`，必须同时依赖 A 与 B 的结构化交接，审查显式拓扑、证据资格和终态收敛，不能提前开始。Team F（容量、恢复与最终综合）读取 `crates/runtime/src/execution_core/services.rs` 和 `crates/runtime/src/recovery/runtime_event_reactor.rs`，必须同时依赖 C、D、E 的结构化交接，比较正常、过载、取消、恢复和维护追赶路径，最后输出整体结论。Program 必须形成至少五条跨 Team 依赖：A→E、B→E、C→F、D→F、E→F。最终结论必须列出至少六个本次实际读取的完整源码路径，明确区分已验证事实、源码推断与未执行的模拟；给出并发波次、关键瓶颈、失效模式、容量边界和是否适合继续扩大规模的结论。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；禁止 bash 和任何写工具。",
+                acceptance: LiveAcceptance::ArchitectureQuality {
+                    minimum_teams: 6,
+                    minimum_claimed_cross_team_edges: 5,
+                },
+                timeout: LiveScenarioTimeout::large_scale(),
             });
         }
         let selected_scenario_ids = selected_live_scenario_ids();
@@ -1236,6 +1256,11 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
                 }),
         );
     }
+    // Terminal Runtime projections intentionally expose no *currently active*
+    // Agents. Preserve the durable historical Team task population in metrics
+    // so a successfully completed collaboration does not collapse from N
+    // Agents to zero merely because collection happened after closure.
+    let projected_health = projected_team_health(projections);
     let timeline_model_rounds = timeline
         .pointer("/team_session/runtime_run_count")
         .and_then(Value::as_u64)
@@ -1273,8 +1298,8 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
         "model_rounds": model_rounds,
         "effective_models": usage.models.into_iter().collect::<Vec<_>>(),
         "tool_calls": tool_calls,
-        "agent_count": agents.len(),
-        "team_count": teams.len(),
+        "agent_count": agents.len().max(projected_health.agent_count),
+        "team_count": teams.len().max(projected_health.team_count),
         "wall_ms": elapsed_ms,
         "first_token_latency_ms": first_token_latency_ms,
         "wall_tokens_per_second": wall_tokens_per_second.or(output_tokens_per_second),
@@ -1427,6 +1452,14 @@ impl LiveScenarioTimeout {
             initial_wait: Duration::from_secs(240),
             inactivity_wait: Duration::from_secs(300),
             max_wait: Duration::from_secs(900),
+        }
+    }
+
+    const fn large_scale() -> Self {
+        Self {
+            initial_wait: Duration::from_secs(360),
+            inactivity_wait: Duration::from_secs(480),
+            max_wait: Duration::from_secs(1_800),
         }
     }
 
@@ -2868,6 +2901,32 @@ mod tests {
         assert_eq!(metrics["model_rounds"], 2);
         assert_eq!(metrics["token_usage_records"], 3);
         assert_eq!(metrics["effective_models"], json!(["deepseek-v4-flash"]));
+    }
+
+    #[test]
+    fn scenario_metrics_preserve_completed_agent_population_after_terminal_cleanup() {
+        let projection = json!({
+            "agents": [],
+            "teams": [{
+                "id": "team-a",
+                "status": "completed",
+                "detail": {
+                    "tasks": [
+                        {"run_id": "investigator", "status": "completed"},
+                        {"run_id": "reviewer", "status": "completed"}
+                    ]
+                }
+            }]
+        });
+
+        let metrics = scenario_metrics(
+            &json!({"token_speed": {"token_usage": []}}),
+            &[projection],
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(metrics["agent_count"], 2);
+        assert_eq!(metrics["team_count"], 1);
     }
 
     #[test]
