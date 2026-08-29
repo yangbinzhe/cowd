@@ -1,0 +1,5 @@
+{
+  "id": "route-generation",
+  "command": "cargo check -p gateway --all-targets",
+  "env": { "CARGO_INCREMENTAL": "0" }
+}

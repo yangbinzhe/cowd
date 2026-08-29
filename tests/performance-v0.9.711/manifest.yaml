@@ -1,0 +1,26 @@
+schema_version: 1
+version: 0.9.711
+runs: 20
+warmup_runs: 3
+environment:
+  require_clean_worktree: true
+  allowed_dirty_prefixes:
+    - Cargo.lock
+    - crates/xtask/Cargo.toml
+    - crates/xtask/src/main.rs
+    - crates/xtask/src/architecture/
+    - tests/performance-v0.9.711/
+    - tests/test-governance/capability-baseline-v0.9.710.json
+    - tests/test-governance/duplicate-capability-allowlist.yaml
+    - tests/test-governance/source-size-policy.yaml
+    - tests/test-governance/state-authority-registry.yaml
+    - tests/test-governance/test-inventory.yaml
+  cargo_incremental: "0"
+  rust_backtrace: "0"
+workloads:
+  - { id: active-session, file: workloads/active-session.json, direction: lower_is_better, target_percent: 25 }
+  - { id: session-activation, file: workloads/session-activation.json, direction: lower_is_better, target_percent: 15 }
+  - { id: six-team, file: workloads/six-team.json, direction: lower_is_better, target_percent: 10 }
+  - { id: tui-refresh, file: workloads/tui-refresh.json, direction: lower_is_better, target_percent: 15 }
+  - { id: route-generation, file: workloads/route-generation.json, direction: lower_is_better, target_percent: 20 }
+  - { id: backend-page, file: workloads/backend-page.json, direction: lower_is_better, target_percent: 15 }

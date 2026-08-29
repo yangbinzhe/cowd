@@ -1,0 +1,5 @@
+{
+  "id": "session-activation",
+  "command": "cargo test -p gateway session_activation -- --test-threads=1",
+  "env": { "CARGO_INCREMENTAL": "0" }
+}

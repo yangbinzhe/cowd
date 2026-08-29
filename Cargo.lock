@@ -4411,10 +4411,13 @@ version = "0.9.710"
 dependencies = [
  "base64",
  "cowd-app-protocol",
+ "proc-macro2",
  "ring",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
+ "syn 2.0.119",
  "tempfile",
  "toml",
 ]

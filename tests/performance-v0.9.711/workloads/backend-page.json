@@ -1,0 +1,5 @@
+{
+  "id": "backend-page",
+  "command": "cargo test -p session message_persistence_pagination -- --test-threads=1",
+  "env": { "CARGO_INCREMENTAL": "0" }
+}

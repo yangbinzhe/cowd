@@ -9,9 +9,12 @@ publish.workspace = true
 base64 = "0.22"
 cowd-app-protocol = { path = "../app-protocol" }
 ring = "0.17"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml.workspace = true
 sha2 = "0.10"
+syn = { version = "2", features = ["full", "visit"] }
 toml = "0.8"
 
 [dev-dependencies]

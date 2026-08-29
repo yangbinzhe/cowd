@@ -1,0 +1,5 @@
+{
+  "id": "tui-refresh",
+  "command": "cargo test -p tui saturated_projection_stream_is_coalesced_and_bounded --lib -- --test-threads=1",
+  "env": { "CARGO_INCREMENTAL": "0" }
+}

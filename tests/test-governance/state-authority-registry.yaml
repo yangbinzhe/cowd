@@ -1,0 +1,59 @@
+schema_version: 1
+mode: migration_baseline
+legacy_field: RuntimeModuleDescriptor.lifecycle_owner
+legacy_source_digest: d785657e12348082f269b0e127bee6cb80954264d24c34cd231ac035ad68a843
+legacy_candidates:
+  - conversation
+  - host
+  - runtime_control
+  - runtime_harness
+  - execution_core
+  - execution_supervisor
+  - execution_live
+  - orchestration
+  - provider_runtime_client
+  - provider_transport_pool
+  - tool_dispatch
+  - tool_host
+  - tool_orchestrator
+  - tool_execution_plane
+  - mission_control
+  - mission_command_router
+  - mission_runtime
+  - mission_runtime_port
+  - mission_schedule
+  - session_execution
+  - session_input
+  - session_lifecycle
+  - mission_command_interpreter
+  - agent
+  - agent_capability
+  - agent_catalog
+  - definition_registry
+  - managed_agent
+  - agent_process_jsonl_adapter
+  - agent_runtime
+  - team_definition
+  - team_instantiation
+  - team_projection
+  - team_l4_promotion
+  - team_runtime
+  - team_working_state
+  - conflict_arbiter
+  - approval
+  - approval_queue
+  - budget_policy
+  - context_runtime
+  - knowledge_activation
+  - resources
+  - skill
+  - fact_extraction
+  - reality_decision
+  - reality_recall_port
+  - evolution
+  - recovery
+  - runtime_event_store
+  - policy_engine
+  - security
+  - upgrade
+authorities: []

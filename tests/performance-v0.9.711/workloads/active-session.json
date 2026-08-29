@@ -1,0 +1,5 @@
+{
+  "id": "active-session",
+  "command": "cargo test -p gateway gateway::tests -- --test-threads=1",
+  "env": { "CARGO_INCREMENTAL": "0" }
+}

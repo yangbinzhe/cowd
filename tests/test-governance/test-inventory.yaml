@@ -40,6 +40,12 @@ lanes:
     purpose: fail-closed terminal certification over independently observed evidence
 
 architecture_gates:
+  - path: cargo xtask architecture audit --check
+    protects:
+      - Capability inventory remains complete and unique
+      - Oversized hand-written source is phase-owned and generated source has provenance
+      - Version-touched Rust code cannot hide mega functions, state carriers, or constructors
+      - Duplicate authorities and semantic candidates are classified before release
   - path: scripts/architecture/check-boundaries.sh
     protects:
       - Gateway has no second AI execution loop
@@ -116,6 +122,8 @@ surface_gates:
     capability: app.bundle.invoke_stream_tui
 
 manual_suites:
+  - path: tests/performance-v0.9.711/run.sh
+    capability: architecture.performance_comparison
   - path: crates/harness-eval/templates/certification-manifest-v1.json
     capability: harness.terminal-certification
   - path: tests/interactive
