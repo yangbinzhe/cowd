@@ -21,7 +21,7 @@ pub const SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE: &str = "`submit_collaborati
 /// separate from the large schema guidance so every model-facing surface can
 /// state the invariant without teaching providers an additional free-form
 /// coverage field.
-pub const EXACT_FILE_EVIDENCE_GUIDANCE: &str = "For a file resource, evidence_scope operation `read` means exact whole-file content through EOF. A bounded read window cannot satisfy it; Runtime executes the governed complete read and accepts only a non-truncated startLine=1, numLines=totalLines receipt with a valid sha256.";
+pub const EXACT_FILE_EVIDENCE_GUIDANCE: &str = "For a file resource, evidence_scope operation `read` means exact whole-file content through EOF. A bounded read window cannot satisfy it. Runtime executes the governed complete read, must deliver the complete body into that role's Provider context, and accepts only a non-truncated startLine=1, numLines=totalLines observation with a valid sha256. A durable acquisition receipt whose model-facing body was omitted never proves semantic observation; if the complete content cannot fit, Runtime fails closed so orchestration can repartition the assignment.";
 
 /// Typed distinction between delivery-only dependencies and independent
 /// verification. Keep this separate so every model-facing surface can repeat

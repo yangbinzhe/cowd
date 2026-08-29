@@ -3452,6 +3452,10 @@ pub struct ConversationRuntime<C, T> {
     delegated_focus_novelty_target_bp: AtomicU64,
     delegated_focus_acceptance_scopes: std::sync::Mutex<Vec<String>>,
     delegated_focus_required_output_fields: std::sync::Mutex<Vec<String>>,
+    /// A delegated Agent with exact-content obligations must receive the
+    /// complete governed read output in its Provider context. A durable raw
+    /// receipt alone proves acquisition, not semantic observation.
+    exact_evidence_delivery_required: AtomicBool,
     /// Present only for a Gateway-owned durable Session ingress. It fences
     /// provider/tool/terminal side effects against generation and claim loss.
     session_execution_fence: Option<crate::SessionExecutionFence>,
@@ -3946,6 +3950,7 @@ where
             delegated_focus_novelty_target_bp: AtomicU64::new(0),
             delegated_focus_acceptance_scopes: std::sync::Mutex::new(Vec::new()),
             delegated_focus_required_output_fields: std::sync::Mutex::new(Vec::new()),
+            exact_evidence_delivery_required: AtomicBool::new(false),
             session_execution_fence: None,
         }
     }
@@ -4185,6 +4190,18 @@ where
                 .map(|guard| guard.clone())
                 .unwrap_or_default(),
         )
+    }
+
+    /// Require exact file evidence to remain model-visible instead of being
+    /// replaced by the generic oversized-tool receipt summary.
+    pub fn set_exact_evidence_delivery_required(&self, required: bool) {
+        self.exact_evidence_delivery_required
+            .store(required, Ordering::SeqCst);
+    }
+
+    #[must_use]
+    pub fn exact_evidence_delivery_required(&self) -> bool {
+        self.exact_evidence_delivery_required.load(Ordering::SeqCst)
     }
 
     /// Replace runtime-owned context supplied by orchestration layers.
@@ -5725,7 +5742,7 @@ where
                     self.provider_max_output_override,
                 )
             });
-        RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+        self.apply_exact_evidence_delivery_budget(RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window: self.model_context_window,
             model_max_output_tokens: model_max_output,
             subsystem_budget_ratio_bp: self.subsystem_budget_ratio_bp,
@@ -5733,7 +5750,7 @@ where
             autonomy_mode: None,
             expected_parallel_branches: 1,
             expected_verification_passes: 0,
-        })
+        }))
     }
 
     /// A fallback route is only safe when the prepared context fits every
@@ -5761,7 +5778,7 @@ where
         let model_max_output_tokens = outputs
             .next()
             .map_or(0, |first| outputs.fold(first, u32::min));
-        RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+        self.apply_exact_evidence_delivery_budget(RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window,
             model_max_output_tokens,
             subsystem_budget_ratio_bp: self.subsystem_budget_ratio_bp,
@@ -5769,7 +5786,32 @@ where
             autonomy_mode: None,
             expected_parallel_branches: 1,
             expected_verification_passes: 0,
-        })
+        }))
+    }
+
+    fn apply_exact_evidence_delivery_budget(
+        &self,
+        mut plan: RuntimeBudgetPlan,
+    ) -> RuntimeBudgetPlan {
+        if !self.exact_evidence_delivery_required() {
+            return plan;
+        }
+        // Exact evidence is a required Provider input, not an ordinary tool
+        // preview. Keep the subsystem ceiling, output reservation, and a
+        // request-safety reserve intact while allowing the remaining context
+        // to carry complete file bodies. Provider preflight still rejects an
+        // attempt whose fixed inputs plus exact evidence cannot fit.
+        let request_safety_reserve = (plan.model_context_window / 20).max(16_000);
+        let exact_total = plan
+            .subsystem_budget_tokens
+            .saturating_sub(plan.max_output_tokens)
+            .saturating_sub(request_safety_reserve);
+        let exact_total = usize::try_from(exact_total).unwrap_or(usize::MAX);
+        if exact_total > plan.tool_result_budget.max_total_tokens {
+            plan.tool_result_budget.max_total_tokens = exact_total;
+            plan.tool_result_budget.per_tool_max_tokens = exact_total;
+        }
+        plan
     }
 
     fn context_window_resolution_for_model(
@@ -14113,6 +14155,82 @@ mod tests {
         assert!(!receipt.truncated, "{}", receipt.summary);
         assert!(receipt.summary.contains("implemented-auto-strategy-0"));
         assert!(!receipt.summary.contains("omitted; retrieve"));
+    }
+
+    #[test]
+    fn exact_evidence_mode_expands_tool_delivery_without_bypassing_context_ceiling() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let standard = runtime.runtime_budget_plan();
+        runtime.set_exact_evidence_delivery_required(true);
+        let exact = runtime.runtime_budget_plan();
+        runtime
+            .turn_context_ledger
+            .lock()
+            .expect("context ledger")
+            .reset(
+                exact.subsystem_budget_tokens,
+                exact.tool_result_budget.max_total_tokens as u64,
+            );
+
+        assert!(
+            exact.tool_result_budget.max_total_tokens
+                > standard.tool_result_budget.max_total_tokens
+        );
+        assert_eq!(
+            exact.tool_result_budget.per_tool_max_tokens,
+            exact.tool_result_budget.max_total_tokens
+        );
+        assert!(
+            exact.tool_result_budget.max_total_tokens as u64 + exact.max_output_tokens
+                < exact.subsystem_budget_tokens
+        );
+
+        let target_tokens = (standard.tool_result_budget.per_tool_max_tokens
+            + exact.tool_result_budget.per_tool_max_tokens)
+            / 2;
+        let output = serde_json::json!({
+            "type": "text",
+            "path": "src/large.rs",
+            "content": "x".repeat(target_tokens.saturating_mul(3)),
+            "startLine": 1,
+            "numLines": 1,
+            "totalLines": 1,
+            "truncated": false,
+        })
+        .to_string();
+        let receipt = runtime.tool_model_receipt(
+            "read_file",
+            &output,
+            false,
+            &harness_contract::reality::EvidenceRef::observed("tool", "large-exact-read"),
+            Some(&harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::reality::EvidenceRef::observed("tool", "large-exact-read"),
+                "sha256:large-exact-read",
+                output.len() as u64,
+                "application/json",
+                "artifact://art_large_exact_read",
+                "session:test",
+            )),
+        );
+
+        assert!(
+            !receipt.truncated,
+            "raw={} receipt={} omitted={} standard_limit={} exact_limit={}",
+            receipt.raw_tokens,
+            receipt.receipt_tokens,
+            receipt.omitted_tokens,
+            standard.tool_result_budget.per_tool_max_tokens,
+            exact.tool_result_budget.per_tool_max_tokens,
+        );
+        assert_eq!(receipt.omitted_tokens, 0);
+        assert!(receipt.summary.contains(&"x".repeat(256)));
     }
     use fact_kernel::FactLedger;
     use std::sync::atomic::{AtomicUsize, Ordering};

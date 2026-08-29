@@ -1771,9 +1771,19 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         "reviewer 没有独立重读",
         "结构/收据级而非逐行语义级",
         "结构化收据级而非逐行语义级",
+        "仅在收据层级确认",
+        "只在收据层级确认",
+        "收据支持、内容未",
+        "内容级复核未完成",
+        "内容级复核尚未完成",
+        "内容级复核列入未解决",
+        "正文未保留",
         "host.rs 内容未",
         "reviewer did not independently read",
         "reviewer did not see the local file",
+        "content-level review was not completed",
+        "content omitted",
+        "body omitted",
     ]
     .iter()
     .any(|marker| normalized.contains(&marker.to_ascii_lowercase()));
@@ -1855,6 +1865,36 @@ fn collect_complete_exact_source_receipt_agents(
             }
         }
         Value::Object(values) => {
+            // Only the Agent terminal's Runtime-owned observed acceptance is
+            // semantic model-observation evidence. Raw ToolHost receipts also
+            // appear elsewhere in the timeline, but prove acquisition only.
+            if let Some(observed) = values
+                .get("observed_acceptance")
+                .and_then(|acceptance| acceptance.get("observed_evidence"))
+            {
+                collect_exact_source_evidence_agents(observed, receipt_agents);
+            }
+            for (key, value) in values {
+                if key != "observed_acceptance" {
+                    collect_complete_exact_source_receipt_agents(value, receipt_agents);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_exact_source_evidence_agents(
+    value: &Value,
+    receipt_agents: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_exact_source_evidence_agents(value, receipt_agents);
+            }
+        }
+        Value::Object(values) => {
             let sequence = values
                 .get("observed_at_sequence")
                 .and_then(Value::as_u64)
@@ -1896,10 +1936,10 @@ fn collect_complete_exact_source_receipt_agents(
                 }
             }
             for value in values.values() {
-                collect_complete_exact_source_receipt_agents(value, receipt_agents);
+                collect_exact_source_evidence_agents(value, receipt_agents);
             }
         }
-        _ => {}
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -1921,6 +1961,30 @@ fn collect_complete_exact_source_receipt_paths(value: &Value, paths: &mut BTreeS
         Value::Array(values) => {
             for value in values {
                 collect_complete_exact_source_receipt_paths(value, paths);
+            }
+        }
+        Value::Object(values) => {
+            if let Some(observed) = values
+                .get("observed_acceptance")
+                .and_then(|acceptance| acceptance.get("observed_evidence"))
+            {
+                collect_exact_source_evidence_paths(observed, paths);
+            }
+            for (key, value) in values {
+                if key != "observed_acceptance" {
+                    collect_complete_exact_source_receipt_paths(value, paths);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn collect_exact_source_evidence_paths(value: &Value, paths: &mut BTreeSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_exact_source_evidence_paths(value, paths);
             }
         }
         Value::Object(values) => {
@@ -1956,7 +2020,7 @@ fn collect_complete_exact_source_receipt_paths(value: &Value, paths: &mut BTreeS
                 }
             }
             for value in values.values() {
-                collect_complete_exact_source_receipt_paths(value, paths);
+                collect_exact_source_evidence_paths(value, paths);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
@@ -3005,7 +3069,11 @@ mod tests {
             .map(|(index, path)| receipt(path, index as u64 + 1))
             .collect::<Vec<_>>();
         assert_eq!(
-            complete_exact_source_receipt_paths(&json!({"receipts": complete}), &[]).len(),
+            complete_exact_source_receipt_paths(
+                &json!({"observed_acceptance": {"observed_evidence": complete}}),
+                &[],
+            )
+            .len(),
             LARGE_SCALE_SOURCE_PATHS.len()
         );
 
@@ -3018,7 +3086,10 @@ mod tests {
         let mut bounded = receipt(LARGE_SCALE_SOURCE_PATHS[11], 12);
         bounded["target"]["scope"]["coverage"] = json!("scoped_content");
         incomplete.push(bounded);
-        let observed = complete_exact_source_receipt_paths(&json!({"receipts": incomplete}), &[]);
+        let observed = complete_exact_source_receipt_paths(
+            &json!({"observed_acceptance": {"observed_evidence": incomplete}}),
+            &[],
+        );
         assert_eq!(observed.len(), 11);
         assert!(!observed.contains(LARGE_SCALE_SOURCE_PATHS[11]));
     }
@@ -3055,7 +3126,7 @@ mod tests {
         }
         assert_eq!(
             independently_reviewed_complete_source_receipt_paths(
-                &json!({"receipts": receipts}),
+                &json!({"observed_acceptance": {"observed_evidence": receipts}}),
                 &[],
             )
             .len(),
@@ -3068,7 +3139,7 @@ mod tests {
             .map(|(index, path)| receipt(path, index as u64 + 1, "investigator"))
             .collect::<Vec<_>>();
         assert!(independently_reviewed_complete_source_receipt_paths(
-            &json!({"receipts": investigator_only}),
+            &json!({"observed_acceptance": {"observed_evidence": investigator_only}}),
             &[],
         )
         .is_empty());
@@ -3094,10 +3165,50 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(independently_reviewed_complete_source_receipt_paths(
-            &json!({"receipts": duplicate_reads_from_one_agent}),
+            &json!({"observed_acceptance": {"observed_evidence": duplicate_reads_from_one_agent}}),
             &[],
         )
         .is_empty());
+    }
+
+    #[test]
+    fn source_receipt_gate_rejects_acquisition_receipts_not_promoted_to_agent_acceptance() {
+        let raw_receipt = json!({
+            "observed_at_sequence": 1,
+            "tool_name": "read_file",
+            "target": {
+                "kind": "workspace",
+                "scope": {
+                    "access_mode": "read",
+                    "coverage": "exact_content",
+                    "path": {
+                        "workspace_relative_path": LARGE_SCALE_SOURCE_PATHS[0],
+                        "observed_revision_or_digest": "c".repeat(64),
+                    }
+                }
+            },
+            "evidence_ref": {
+                "evidence_ref": {
+                    "id": "agent-tool:team-graph:team-a:reviewer:1:1:1:read_file:digest:read-receipt"
+                }
+            }
+        });
+
+        assert!(complete_exact_source_receipt_paths(
+            &json!({"durable_tool_receipts": [raw_receipt]}),
+            &[],
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn large_scale_presentation_gate_rejects_receipt_only_content_review_caveat() {
+        let response = "## 已验证事实\n`crates/runtime/src/orchestration/mod.rs` `crates/runtime/src/orchestration/compiler.rs` `crates/runtime/src/team/instantiation.rs` `crates/runtime/src/conversation/host.rs` `crates/runtime/src/execution_core/services.rs` `crates/runtime/src/recovery/runtime_event_reactor.rs`\n\n12/12 目标源码已完整读取到 EOF。\n12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF。\nE/F 结构化交接已完整消费。\n\n## 源码推断\nreviewer 仅在收据层级确认，正文未保留，内容级复核未完成。\n\n## 未执行的模拟\n本次未执行模拟。\n\n## 并发波次、关键瓶颈、失效模式、容量边界与扩大规模结论\n结论完整。";
+        let checks = large_scale_presentation_checks(response);
+
+        assert!(checks.iter().any(|check| {
+            check["name"] == "presentation_independent_source_review" && check["passed"] == false
+        }));
     }
 
     #[test]

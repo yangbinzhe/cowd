@@ -12,6 +12,8 @@ The first v0.9.710 real-provider rerun exposed a second, subtler false positive.
 
 The next candidate proved complete semantic handoffs and exact EOF reads, yet exposed a third role-semantics defect. A model-derived reviewer carried both `Verification` and `UpstreamConsumption`, but Team instantiation classified every upstream consumer without an explicit `ReacquireEvidence` facet as a zero-tool reducer. The investigator produced valid whole-file receipts while the reviewer could only inspect the investigator's result and receipt summaries. A machine gate that deduplicated only by source path therefore accepted one producer receipt per file as “reviewed”. v0.9.710 now treats semantic verification over an independently observable bounded resource as an evidence-producing role at the final Agent-slot lease, not as an upstream-only reducer.
 
+The typed-review candidate exposed a fourth and deeper distinction. ToolHost had acquired all 24 whole-file reads and persisted correct exact-content receipts, but the generic model-facing tool budget compacted several large JSON bodies into head/tail summaries. Agent acceptance and the live evaluator still treated the durable acquisition receipt as proof that the role had semantically observed the omitted body. The final design separates **exact acquisition** from **exact model observation**: an exact obligation expands the bounded Provider delivery budget, and only a non-omitting model receipt may enter that Agent's Runtime-owned `observed_acceptance`. If complete delivery still cannot fit, the Agent fails closed and orchestration must repartition it.
+
 ## Invariants
 
 1. Agent semantic results are lossless canonical data. Character limits may apply to raw tool previews, never to the authored result contract.
@@ -23,6 +25,7 @@ The next candidate proved complete semantic handoffs and exact EOF reads, yet ex
 7. Dependency satisfaction has two parts: the predecessor must be terminal and its complete semantic result must be materialized into the successor input. A topology-only wait is not a valid cross-Team handoff.
 8. Semantic verification has two independent inputs: the complete upstream result and fresh Runtime evidence from the verifier's own bounded lease. Reviewing a receipt summary is not equivalent to independently observing its source. Session-only synthesis remains a zero-tool upstream consumer.
 9. Independent review is a typed semantic relation. Model-authored Teams must encode it as `review_of`; `handoff` and `aggregate` deliberately compile to upstream consumption/synthesis and cannot silently acquire verifier authority. An optional `independent_review` acceptance must name the same local predecessor or compilation fails with a repairable diagnostic.
+10. Acquisition and semantic observation are different Runtime facts. Durable ToolHost bytes prove that a read occurred; they satisfy an exact semantic obligation only when the complete body was also delivered to that role's Provider context. Omitted model-facing content is never promoted into Agent acceptance.
 
 ## Canonical chain
 
@@ -70,7 +73,7 @@ The live six-Team Qwen scenario independently repeats the presentation checks in
 
 For objectives that require actual structured-handoff consumption, the Runtime and evaluator additionally reject missing-upstream admissions and require a positive conclusion that successor Teams consumed the complete upstream semantics. This turns semantic delivery into a tested acceptance property instead of inferring it from graph topology.
 
-For objectives that require independent source review, the evaluator groups durable exact-content receipts by canonical source path and stable Agent execution identity. Every target must have receipts from at least two distinct Agents with a valid digest; repeated reads or duplicated projections from one Agent count once. This is deliberately independent of localized display names and canonical `role-<hash>` identifiers. The typed two-role dependency and Runtime `Verification` contract determine which successor is the reviewer. Presentation must agree with those Runtime facts; a positive coverage phrase followed by a caveat that the reviewer did not read the source is rejected.
+For objectives that require independent source review, the evaluator groups exact-content observations from each Agent terminal's Runtime-owned `observed_acceptance` by canonical source path and stable Agent execution identity. Raw ToolHost receipt collections elsewhere in the timeline are intentionally ignored. Every target must have model-observed evidence from at least two distinct Agents with a valid digest; repeated reads or duplicated projections from one Agent count once. This is deliberately independent of localized display names and canonical `role-<hash>` identifiers. The typed two-role dependency and Runtime `Verification` contract determine which successor is the reviewer. Presentation must agree with those Runtime facts; a positive coverage phrase followed by a receipt-only, omitted-body or incomplete-content-review caveat is rejected.
 
 ## Resource model
 
@@ -79,7 +82,8 @@ For objectives that require independent source review, the evaluator groups dura
 - canonical result bytes: complete and durable;
 - provider context capacity: explicitly preflighted;
 - presentation: intelligently synthesized and validated;
-- raw tool bodies: referenced through the artifact/evidence plane.
+- ordinary raw tool bodies: referenced through the artifact/evidence plane;
+- exact-obligation tool bodies: delivered completely within the explicit Provider context ceiling or rejected before semantic acceptance.
 
 When a Program carrier exceeds the single-request routing target, Runtime partitions only between complete Team results and performs evidence-preserving synthesis layers. Every intermediate layer is checked for transport leakage, complete sentence closure and preservation of every concrete source path before it can feed the next layer. An oversized individual Team remains intact and is sent through explicit provider preflight; it is never sliced. The hierarchy is bounded to four merge levels and fails closed if it cannot converge, while the original complete carrier remains in the terminal artifact.
 
@@ -94,5 +98,6 @@ The following old behavior is removed rather than retained behind a flag:
 - large-scale live acceptance based only on topology and non-empty response.
 - semantic `Verification` roles silently downgraded to zero-tool upstream reducers despite owning bounded readable scopes;
 - source-coverage acceptance based on one deduplicated receipt per path when independent review was required.
+- exact semantic acceptance based on durable acquisition receipts whose model-facing body was compacted or omitted.
 
 Single-Team, explicitly validated `TeamSynthesizer` answer candidates remain eligible for direct reuse because they are already user-presentation objects, not multi-Team transport bundles.

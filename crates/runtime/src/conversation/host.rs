@@ -430,6 +430,11 @@ where
         self.runtime_ref().set_context_profile(profile);
     }
 
+    pub fn set_exact_evidence_delivery_required(&self, required: bool) {
+        self.runtime_ref()
+            .set_exact_evidence_delivery_required(required);
+    }
+
     pub fn set_execution_policy(
         &self,
         policy: harness_contract::policy::SessionExecutionPolicy,

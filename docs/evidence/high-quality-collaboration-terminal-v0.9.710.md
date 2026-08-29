@@ -80,6 +80,20 @@ The next full candidate run correctly rejected another semantic variation rather
 | semantic cause | Qwen encoded each local investigator→reviewer dependency as ordinary `handoff`, so Runtime correctly compiled reviewers as zero-tool upstream consumers; 12 investigator reads occurred and the independent gate observed 0/12 |
 | disposition | general model guidance and the live contract now state that independent verification must use `review_of`; optional `independent_review` acceptance is compiler-validated against the same predecessor. `handoff` is not widened implicitly |
 
+The first typed-`review_of` run then exposed a fourth false positive during human audit:
+
+| Observation | Value |
+|---|---|
+| report | `/tmp/cowd-qwen38-quality-v0910-reviewof-final/runs/v0.9.710-1787991759-mission-harness-deep/report.json` |
+| scenario | sibling `live-scenarios/001-live_qwen38_large_scale_collaboration.json` |
+| candidate | `144a80b3` |
+| realized execution | 6/6 Teams, 12/12 Agents, 5 claimed cross-Team edges; 29 model rounds; 97 tool calls |
+| model and usage | only `qwen3.8-max`; 1,269,333 scenario tokens; 1,283,420 ms wall time |
+| durable acquisition | 24 distinct exact read receipts, investigator and reviewer for every target |
+| human semantic audit | rejected: the full terminal simultaneously claimed 12/12 independent review and disclosed that several bodies were not retained, reviewers confirmed only at receipt level, and content-level review remained incomplete |
+| root cause | generic tool-result limits compacted large complete-read JSON before the next Provider request; Agent acceptance and the evaluator counted the durable raw receipt rather than model-visible content |
+| disposition | exact obligations now receive bounded full-delivery budget; omitted exact bodies are filtered from Agent `observed_acceptance`; the evaluator reads only Agent-owned observed acceptance and rejects the newly observed contradiction language |
+
 ## Implemented gates
 
 - Agent semantic results are lossless and retain unknown structured fields.
@@ -99,16 +113,18 @@ The next full candidate run correctly rejected another semantic variation rather
 - Every model-facing collaboration surface now explains the typed `review_of` requirement; `independent_review` criteria with an unknown subject or without a matching `review_of` edge fail compilation with an explicit repair.
 - The large-scale gate now requires exact-content receipts from two distinct stable Agent execution identities for every one of the twelve target paths; duplicated projections and repeated reads by one Agent do not count twice, and localized/opaque role ids require no special case.
 - The terminal presentation must positively state independent reviewer coverage and is rejected if it also contains a source-visibility or receipt-only caveat.
+- Exact-content acquisition and exact model observation are now separate facts. The Agent runtime expands its tool-delivery budget only for an explicit exact obligation, preserves the Provider preflight ceiling, and refuses to promote an omitted body into semantic acceptance.
+- The live source gates consume only Agent terminal `observed_acceptance`; raw durable tool receipts elsewhere in the timeline can prove acquisition but cannot make source coverage pass.
 
 ## Deterministic verification
 
 | Gate | Result |
 |---|---|
 | `cargo check --workspace --all-targets` | passed |
-| `cargo test -p runtime --tests --quiet` | passed: library 1,893; ignored: 2; all integrations passed |
+| `cargo test -p runtime --all-targets --quiet` | passed: library 1,897; ignored: 2; all integrations passed |
 | `cargo test -p tools --all-targets --quiet` | passed: 198 + 4; ignored: 1; failed: 0 |
 | `cargo test -p harness-contract --all-targets --quiet` | passed: 193 + 1; failed: 0 |
-| `cargo test -p harness-eval --all-targets --quiet` | passed on clean rerun: 113 + 2 + 2; failed: 0 |
+| `cargo test -p harness-eval --all-targets --quiet` | passed: 115 + 2 + 2; failed: 0 |
 | `cargo test -p gateway --all-targets --quiet` | passed: 801 + 1 + 1; ignored: 12; failed: 0 |
 | six-Team concurrent Program admission, 20 consecutive executions | passed: 20/20 |
 | adversarial old concatenated/truncated presentation | rejected |
@@ -121,6 +137,9 @@ The next full candidate run correctly rejected another semantic variation rather
 | topology-only semantic-handoff presentation | rejected by Runtime and evaluator gates |
 | investigator-only exact receipts for all twelve paths | rejected by independent-source-review gate |
 | positive independent-review phrase followed by a reviewer visibility contradiction | rejected |
+| raw exact acquisition receipt outside Agent observed acceptance | rejected |
+| exact model receipt with omitted tokens | excluded from Agent acceptance; task fails closed |
+| large exact result above the ordinary per-tool budget | delivered without omission under the exact-obligation budget; Provider ceiling retained |
 | semantic reviewer AgentTask packet | retains upstream input and independently receives `read_file`, scoped evidence and one exact obligation |
 | `cargo fmt --all -- --check` / `git diff --check` | passed |
 

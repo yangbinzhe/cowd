@@ -507,6 +507,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // parent session authority but must not inherit MainTurn's broad,
         // open-ended exploration profile.
         runtime.set_context_profile(ContextProfile::SubAgent);
+        runtime.set_exact_evidence_delivery_required(packet_requires_exact_content(&packet));
         runtime.set_execution_service_class(if binding.evaluation.is_some() {
             harness_contract::execution_graph::ExecutionServiceClass::Maintenance
         } else if packet.managed_invocation.is_some() {
@@ -694,19 +695,27 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             }
         }
         normalize_verified_narrative_terminal(&packet, &tool_executor, &mut summary);
+        let scoped_receipts = tool_executor
+            .receipts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let observed_evidence = model_observed_evidence(
+            packet_requires_exact_content(&packet),
+            &summary.context_turn_report.audit_projections,
+            &scoped_receipts,
+        );
         let evidence_refs = agent_evidence_refs(
             &packet,
             &summary.context_turn_report.audit_projections,
-            &tool_executor
-                .receipts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            &scoped_receipts,
         );
         let (acceptance, runtime_change_receipts) = derive_receipt_backed_satisfied_criteria(
             &packet,
             &summary,
             &evidence_refs,
             &tool_executor,
+            &observed_evidence,
         );
         // `submit_turn` is the delegated child terminal boundary. From this
         // point onward Runtime performs only deterministic presentation
@@ -735,13 +744,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         );
         runtime_write_attempt_paths.sort();
         runtime_write_attempt_paths.dedup();
-        let observed_evidence = tool_executor
-            .receipts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .flat_map(|receipt| receipt.observed_evidence.iter().cloned())
-            .collect::<Vec<_>>();
         let required_acceptance =
             crate::acceptance_evaluator::AcceptanceEvaluator::effective_required(
                 &packet.required_acceptance,
@@ -1073,6 +1075,21 @@ fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
         .map(|assignment| assignment.identity.novelty_target_bp)
         .unwrap_or(0)
         .min(10_000)
+}
+
+fn packet_requires_exact_content(packet: &AgentTaskPacket) -> bool {
+    packet
+        .required_acceptance
+        .evidence_obligations
+        .iter()
+        .any(|obligation| {
+            matches!(
+                &obligation.target,
+                harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                    if scope.coverage
+                        == harness_contract::context::EvidenceCoverageKind::ExactContent
+            )
+        })
 }
 
 fn packet_focus_acceptance_scopes(packet: &AgentTaskPacket) -> Vec<String> {
@@ -2798,6 +2815,43 @@ fn agent_evidence_refs(
     refs
 }
 
+/// Exact acquisition and exact model observation are separate facts. The
+/// ToolHost receipt proves the former; a non-omitting model receipt proves
+/// the latter. Only model-observed exact evidence may satisfy an Agent's
+/// semantic acceptance contract.
+fn model_observed_evidence(
+    exact_delivery_required: bool,
+    audits: &[harness_contract::context::EvidenceAuditProjection],
+    receipts: &[ScopedToolExecutionReceipt],
+) -> Vec<harness_contract::context::ObservedEvidence> {
+    receipts
+        .iter()
+        .flat_map(|receipt| receipt.observed_evidence.iter())
+        .filter(|observed| {
+            let exact_content = exact_delivery_required
+                && matches!(
+                &observed.target,
+                harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                    if scope.coverage
+                        == harness_contract::context::EvidenceCoverageKind::ExactContent
+                );
+            if !exact_content {
+                return true;
+            }
+            let Some(access) = observed.evidence_ref.as_ref() else {
+                return false;
+            };
+            audits.iter().any(|audit| {
+                audit.omitted_tokens == 0
+                    && audit.access.as_ref().is_some_and(|model_access| {
+                        model_access.sha256 == access.sha256 && model_access.bytes == access.bytes
+                    })
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Derive structured-field criteria from the terminal answer and canonical
 /// ToolHost receipts.  Obligation matching itself remains exclusively owned
 /// by `AcceptanceEvaluator::evaluate_required` at the terminal boundary.
@@ -2806,6 +2860,7 @@ fn derive_receipt_backed_satisfied_criteria(
     summary: &crate::TurnSummary,
     evidence_refs: &[harness_contract::context::EvidenceAccessRef],
     tool_executor: &ScopedRuntimeToolExecutor,
+    model_observed_evidence: &[harness_contract::context::ObservedEvidence],
 ) -> (
     Vec<String>,
     Vec<harness_contract::agent::AgentChangeReceipt>,
@@ -2822,14 +2877,6 @@ fn derive_receipt_backed_satisfied_criteria(
     // incorrectly erased reviewer verification from the acceptance result.
     let produced_evidence = produced_runtime_evidence(packet, evidence_refs, &receipts);
     let changes = materialized_change_receipts(&receipts);
-    let observed_evidence = receipts
-        .iter()
-        .flat_map(|receipt| receipt.observed_evidence.iter())
-        .collect::<Vec<_>>();
-    let owned_observed_evidence = observed_evidence
-        .iter()
-        .map(|observed| (*observed).clone())
-        .collect::<Vec<_>>();
     let scope_observed = |scope: &str| {
         let raw = if scope.contains(':') {
             scope.to_string()
@@ -2856,7 +2903,7 @@ fn derive_receipt_backed_satisfied_criteria(
         };
         crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
             &required,
-            &owned_observed_evidence,
+            model_observed_evidence,
         )
     };
     let required_fields = packet_acceptance_contract(packet)
@@ -5645,6 +5692,84 @@ mod tests {
                 .map(|reference| reference.evidence_ref.id)
                 .collect::<Vec<_>>(),
             vec!["tool-1".to_string(), "frame".to_string()]
+        );
+    }
+
+    #[test]
+    fn exact_acceptance_evidence_requires_a_complete_model_receipt() {
+        use harness_contract::context::{
+            EvidenceCoverageKind, EvidenceTargetIdentity, ObservedEvidence,
+            ObservedEvidenceProvenance, WorkspaceAccessMode, WorkspaceObjectKind,
+            WorkspacePathIdentity, WorkspaceScopeIdentity,
+        };
+
+        let access = harness_contract::context::EvidenceAccessRef::durable(
+            harness_contract::context::EvidenceRef::observed("tool", "exact-read"),
+            "sha256:exact-read",
+            42,
+            "application/json",
+            "artifact://art_worker_exact_read",
+            "session:session",
+        );
+        let observed = ObservedEvidence {
+            obligation_id: "read:src/lib.rs".to_string(),
+            target: EvidenceTargetIdentity::Workspace {
+                scope: WorkspaceScopeIdentity {
+                    access_mode: WorkspaceAccessMode::Read,
+                    path: WorkspacePathIdentity {
+                        workspace_id: "workspace".to_string(),
+                        repository_id: "repository".to_string(),
+                        workspace_relative_path: "src/lib.rs".to_string(),
+                        repository_relative_path: "src/lib.rs".to_string(),
+                        object_kind: WorkspaceObjectKind::File,
+                        observed_revision_or_digest: Some("d".repeat(64)),
+                    },
+                    coverage: EvidenceCoverageKind::ExactContent,
+                },
+            },
+            observed_at_sequence: 1,
+            tool_name: "read_file".to_string(),
+            provenance: ObservedEvidenceProvenance::FreshExecution,
+            evidence_ref: Some(access.clone()),
+            workspace_prior_state: None,
+        };
+        let receipt = ScopedToolExecutionReceipt {
+            sequence: 1,
+            tool_name: "read_file".to_string(),
+            effect_kind: harness_contract::tool::ToolEffectKind::Read,
+            resource_scopes: vec!["read:src/lib.rs".to_string()],
+            paths: vec!["src/lib.rs".to_string()],
+            prior_states: BTreeMap::new(),
+            after_digests: BTreeMap::new(),
+            observed_evidence: vec![observed.clone()],
+        };
+        let complete = harness_contract::context::EvidenceAuditProjection {
+            evidence_ref: access.evidence_ref.clone(),
+            content_kind: harness_contract::context::EvidenceContentKind::Json,
+            raw_tokens: 100,
+            receipt_tokens: 112,
+            omitted_tokens: 0,
+            raw_available: true,
+            access: Some(access.clone()),
+        };
+
+        assert_eq!(
+            model_observed_evidence(
+                true,
+                std::slice::from_ref(&complete),
+                std::slice::from_ref(&receipt)
+            ),
+            vec![observed.clone()]
+        );
+
+        let mut omitted = complete;
+        omitted.omitted_tokens = 1;
+        assert!(
+            model_observed_evidence(true, &[omitted], std::slice::from_ref(&receipt)).is_empty()
+        );
+        assert_eq!(
+            model_observed_evidence(false, &[], &[receipt]),
+            vec![observed]
         );
     }
 
