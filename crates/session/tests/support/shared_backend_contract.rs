@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used)]
 
-#[path = "../test-support/backend_contract.rs"]
+#[path = "../../test-support/backend_contract.rs"]
 mod backend_contract;
 
 use backend_contract::BackendContractFixture;

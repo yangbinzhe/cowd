@@ -723,6 +723,12 @@ pub use runtime_event_store::{
     RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput,
     SessionTerminalInput, SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
 };
+#[doc(hidden)]
+pub use runtime_event_store::{
+    runtime_event_request_hash, runtime_event_request_hash_with_terminal,
+    validate_runtime_decision_lease_claims, validate_runtime_event,
+    validate_runtime_event_transaction, validate_runtime_fenced_terminal,
+};
 pub use runtime_memory_summarizer::RuntimeMemorySummarizer;
 pub use sandbox::{
     detect_container_environment, detect_container_environment_from, resolve_sandbox_status,

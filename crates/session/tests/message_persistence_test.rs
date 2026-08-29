@@ -18,6 +18,14 @@
 
 use session::{SessionMessage, SqliteSessionStore};
 
+// Keep all SQLite integration contracts in one process. This preserves every
+// contract case while avoiding repeated crate startup for filtered page and
+// batch workloads in local and CI performance gates.
+#[path = "support/shared_backend_contract.rs"]
+mod shared_backend_contract;
+#[path = "support/sqlite_backend_contract.rs"]
+mod sqlite_backend_contract;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

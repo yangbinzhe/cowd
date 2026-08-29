@@ -1,4 +1,6 @@
 mod backend;
+#[doc(hidden)]
+pub mod domain;
 mod execution_plane;
 mod history;
 mod repository;
