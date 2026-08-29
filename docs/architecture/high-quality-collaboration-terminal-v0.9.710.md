@@ -22,6 +22,7 @@ The next candidate proved complete semantic handoffs and exact EOF reads, yet ex
 6. Runtime resource ceilings remain safety contracts. When a complete evidence packet cannot fit a provider context, preflight rejects the attempt explicitly; no hidden content deletion is permitted.
 7. Dependency satisfaction has two parts: the predecessor must be terminal and its complete semantic result must be materialized into the successor input. A topology-only wait is not a valid cross-Team handoff.
 8. Semantic verification has two independent inputs: the complete upstream result and fresh Runtime evidence from the verifier's own bounded lease. Reviewing a receipt summary is not equivalent to independently observing its source. Session-only synthesis remains a zero-tool upstream consumer.
+9. Independent review is a typed semantic relation. Model-authored Teams must encode it as `review_of`; `handoff` and `aggregate` deliberately compile to upstream consumption/synthesis and cannot silently acquire verifier authority. An optional `independent_review` acceptance must name the same local predecessor or compilation fails with a repairable diagnostic.
 
 ## Canonical chain
 

@@ -23,6 +23,11 @@ pub const SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE: &str = "`submit_collaborati
 /// coverage field.
 pub const EXACT_FILE_EVIDENCE_GUIDANCE: &str = "For a file resource, evidence_scope operation `read` means exact whole-file content through EOF. A bounded read window cannot satisfy it; Runtime executes the governed complete read and accepts only a non-truncated startLine=1, numLines=totalLines receipt with a valid sha256.";
 
+/// Typed distinction between delivery-only dependencies and independent
+/// verification. Keep this separate so every model-facing surface can repeat
+/// it without relying on role names or natural-language responsibility text.
+pub const INDEPENDENT_REVIEW_GUIDANCE: &str = "A successor that must independently verify a predecessor must use a local dependency with kind `review_of`; `handoff` and `aggregate` mean upstream consumption/synthesis and do not authorize independent evidence reacquisition. If an `independent_review` acceptance criterion is supplied, its `subject_role_id` must name the same local `review_of` predecessor.";
+
 /// Capability identifiers a semantic role may request under an authenticated
 /// permission ceiling. Runtime's compiler and model-facing instruction share
 /// this vocabulary.
@@ -889,5 +894,7 @@ mod tests {
         assert!(SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE.contains("JSON objects tagged by `kind`"));
         assert!(EXACT_FILE_EVIDENCE_GUIDANCE.contains("whole-file content through EOF"));
         assert!(EXACT_FILE_EVIDENCE_GUIDANCE.contains("numLines=totalLines"));
+        assert!(INDEPENDENT_REVIEW_GUIDANCE.contains("kind `review_of`"));
+        assert!(INDEPENDENT_REVIEW_GUIDANCE.contains("do not authorize"));
     }
 }

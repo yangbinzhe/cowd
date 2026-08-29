@@ -69,6 +69,17 @@ The first independent-review run proved the Runtime repair but intentionally rem
 
 A subsequent run under `/tmp/cowd-qwen38-quality-v0910-independent-final` was intentionally interrupted after the first four Teams entered: its opaque canonical role ids proved the name-based evaluator repair would inevitably produce another false negative. No completed report from that interrupted run is accepted as evidence.
 
+The next full candidate run correctly rejected another semantic variation rather than producing a false pass:
+
+| Observation | Value |
+|---|---|
+| report | `/tmp/cowd-qwen38-quality-v0910-independent-final2/runs/v0.9.710-1787989226-mission-harness-deep/report.json` |
+| scenario | `/tmp/cowd-qwen38-quality-v0910-independent-final2/runs/v0.9.710-1787989226-mission-harness-deep/live-scenarios/001-live_qwen38_large_scale_collaboration.json` |
+| candidate | `ec488d72` |
+| realized execution | 6/6 Teams and 12/12 Agents completed; 5 cross-Team edges; all presentation concepts except coverage declarations were present |
+| semantic cause | Qwen encoded each local investigator→reviewer dependency as ordinary `handoff`, so Runtime correctly compiled reviewers as zero-tool upstream consumers; 12 investigator reads occurred and the independent gate observed 0/12 |
+| disposition | general model guidance and the live contract now state that independent verification must use `review_of`; optional `independent_review` acceptance is compiler-validated against the same predecessor. `handoff` is not widened implicitly |
+
 ## Implemented gates
 
 - Agent semantic results are lossless and retain unknown structured fields.
@@ -85,6 +96,7 @@ A subsequent run under `/tmp/cowd-qwen38-quality-v0910-independent-final` was in
 - A new semantic-handoff gate rejects topology-only success and requires the final result to confirm complete upstream consumption by E/F.
 - Whole-file source evidence is accepted only from structured `read_file` output proving start line 1, EOF coverage, no truncation and a valid SHA-256 digest.
 - Semantic verifiers with a bounded observable Agent-slot lease retain upstream context but receive their own tools, scoped evidence obligations and an explicit independent-reacquisition constraint.
+- Every model-facing collaboration surface now explains the typed `review_of` requirement; `independent_review` criteria with an unknown subject or without a matching `review_of` edge fail compilation with an explicit repair.
 - The large-scale gate now requires exact-content receipts from two distinct stable Agent execution identities for every one of the twelve target paths; duplicated projections and repeated reads by one Agent do not count twice, and localized/opaque role ids require no special case.
 - The terminal presentation must positively state independent reviewer coverage and is rejected if it also contains a source-visibility or receipt-only caveat.
 

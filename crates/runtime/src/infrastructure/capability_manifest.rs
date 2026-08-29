@@ -512,6 +512,7 @@ pub fn runtime_capability_primer() -> String {
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE.to_string(),
     );
     lines.push(harness_contract::orchestration::EXACT_FILE_EVIDENCE_GUIDANCE.to_string());
+    lines.push(harness_contract::orchestration::INDEPENDENT_REVIEW_GUIDANCE.to_string());
     lines.push("- Before proposing a reusable catalog Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy the exact `template_id` and `roles[]` values. A user-named turn-scoped Team instead goes through `submit_collaboration_decision`; it never publishes a catalog revision.".to_string());
     lines.push(
         "- Preserve the user's requested role name exactly in display_name. role_id is only a machine key; prefer a distinct lowercase ASCII slug when possible. If a provider emits a localized/non-machine role_id, Runtime deterministically normalizes that key while retaining the original display name, dependencies, and dataflow; never replace the requested role with a catalog role."

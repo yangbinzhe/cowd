@@ -113,12 +113,13 @@ fn root_collaboration_decision_instruction(
         )
         .join(", ");
     format!(
-        "Root collaboration admission is pending. Call `{}` exactly once in this provider turn; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team. Give every workstream a distinct `workstream_id`, `objective`, and a nonempty `team.team_key` (a stable lowercase slug). Preserve user-provided Team and role names in `team.display_name` and role `display_name`; use `role_id` only as a distinct machine key. The active permission ceiling is `{}`; each role's `required_capabilities` may contain only [{}]. Express cross-Team ordering only with consumer-workstream `depends_on`. Express local role handoffs only with `team.dependencies`; every dependency names two roles within that one Team and carries artifacts produced by `from` and consumed by `to`. Do not split roles from one requested Team into multiple workstreams. {} {} If the tool returns a retryable structured compile diagnostic, submit one complete corrected semantic decision on the next required provider turn; never retry unchanged. This is not `runtime_orchestrate`.",
+        "Root collaboration admission is pending. Call `{}` exactly once in this provider turn; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team. Give every workstream a distinct `workstream_id`, `objective`, and a nonempty `team.team_key` (a stable lowercase slug). Preserve user-provided Team and role names in `team.display_name` and role `display_name`; use `role_id` only as a distinct machine key. The active permission ceiling is `{}`; each role's `required_capabilities` may contain only [{}]. Express cross-Team ordering only with consumer-workstream `depends_on`. Express local role handoffs only with `team.dependencies`; every dependency names two roles within that one Team and carries artifacts produced by `from` and consumed by `to`. Do not split roles from one requested Team into multiple workstreams. {} {} {} If the tool returns a retryable structured compile diagnostic, submit one complete corrected semantic decision on the next required provider turn; never retry unchanged. This is not `runtime_orchestrate`.",
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
         permission_ceiling.as_str(),
         allowed_capabilities,
         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE,
         harness_contract::orchestration::EXACT_FILE_EVIDENCE_GUIDANCE,
+        harness_contract::orchestration::INDEPENDENT_REVIEW_GUIDANCE,
     )
     + &required_scope_clause
 }

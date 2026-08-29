@@ -52,7 +52,7 @@ const LARGE_SCALE_SOURCE_PATHS: [&str; 12] = [
 ];
 
 const LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE: &str =
-    "最终结论还必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”和独立复核声明“12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF”；只有 Runtime 的完整读取收据确实证明 investigator 与 reviewer 分别覆盖全部 12 个目标时才允许输出，否则必须判定任务未完成。";
+    "每个 Team 的 investigator→reviewer 本地依赖必须显式使用 `kind: review_of`；禁止用 `handoff`、`aggregate` 或普通先后关系替代独立复核语义。最终结论还必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”和独立复核声明“12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF”；只有 Runtime 的完整读取收据确实证明 investigator 与 reviewer 分别覆盖全部 12 个目标时才允许输出，否则必须判定任务未完成。";
 
 /// An operator may isolate named production-path scenarios without changing
 /// the default suite. This is useful for a costly, focused provider exercise

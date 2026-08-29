@@ -447,6 +447,7 @@ fn compile_team(
         validate_cardinality(role, workstream_index, index)?;
     }
     let dependencies = validate_role_dependencies(team, &canonical_ids, workstream_index)?;
+    validate_independent_review_contracts(team, &canonical_ids, &dependencies, workstream_index)?;
     let incoming = incoming_dependencies(&dependencies);
     let outgoing = outgoing_dependencies(&dependencies);
     // Runtime's durable Team contract represents required evidence as an
@@ -665,6 +666,51 @@ fn validate_role_dependencies(
         .into());
     }
     Ok(edges)
+}
+
+fn validate_independent_review_contracts(
+    team: &harness_contract::orchestration::ModelTurnScopedTeamIntent,
+    canonical_ids: &BTreeMap<String, String>,
+    dependencies: &[CanonicalDependency],
+    workstream_index: usize,
+) -> Result<(), IntentCompilerError> {
+    for (role_index, role) in team.roles.iter().enumerate() {
+        let reviewer_id = &canonical_ids[&role.role_id];
+        for (criterion_index, criterion) in role.acceptance.iter().enumerate() {
+            let ModelSemanticAcceptanceCriterion::IndependentReview { subject_role_id } = criterion
+            else {
+                continue;
+            };
+            let path = format!(
+                "workstreams[{workstream_index}].team.roles[{role_index}].acceptance[{criterion_index}]"
+            );
+            let Some(subject_id) = canonical_ids.get(subject_role_id) else {
+                return Err(CollaborationCompileDiagnostic::validation(
+                    "independent_review_subject_unknown",
+                    format!("{path}.subject_role_id"),
+                )
+                .into());
+            };
+            let bound_review = dependencies.iter().any(|dependency| {
+                dependency.from == *subject_id
+                    && dependency.to == *reviewer_id
+                    && dependency.kind == ModelCollaborationDependencyKind::ReviewOf
+            });
+            if !bound_review {
+                let mut diagnostic = CollaborationCompileDiagnostic::validation(
+                    "independent_review_dependency_missing",
+                    path,
+                );
+                diagnostic.semantic_ids = vec![subject_role_id.clone(), role.role_id.clone()];
+                diagnostic.allowed_repairs = vec![
+                    "add_local_review_of_dependency_from_subject_to_reviewer".to_string(),
+                    "remove_independent_review_acceptance_if_only_handoff_is_required".to_string(),
+                ];
+                return Err(diagnostic.into());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_role(
@@ -1278,6 +1324,48 @@ mod tests {
                 },
             ],
         ));
+    }
+
+    #[test]
+    fn independent_review_acceptance_requires_a_typed_review_of_dependency() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut invalid = decision();
+        invalid.workstreams[0].team.roles[1].acceptance.push(
+            ModelSemanticAcceptanceCriterion::IndependentReview {
+                subject_role_id: "任意取证角色".to_string(),
+            },
+        );
+
+        let error = compile_turn_scoped_intent(&request(), &invalid, &services)
+            .expect_err("a handoff cannot masquerade as independent review");
+        let IntentCompilerError::Diagnostic(diagnostic) = error else {
+            panic!("expected semantic diagnostic");
+        };
+        assert_eq!(diagnostic.code, "independent_review_dependency_missing");
+        assert!(diagnostic
+            .allowed_repairs
+            .contains(&"add_local_review_of_dependency_from_subject_to_reviewer".to_string()));
+    }
+
+    #[test]
+    fn independent_review_acceptance_binds_to_review_of_without_role_name_heuristics() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut valid = decision();
+        valid.workstreams[0].team.roles[1].acceptance.push(
+            ModelSemanticAcceptanceCriterion::IndependentReview {
+                subject_role_id: "任意取证角色".to_string(),
+            },
+        );
+        valid.workstreams[0].team.dependencies[0].kind = ModelCollaborationDependencyKind::ReviewOf;
+
+        let compiled = compile_turn_scoped_intent(&request(), &valid, &services)
+            .expect("typed review relation compiles");
+        let reviewer = &compiled.template_proposal["teams"][0]["template"]["roles"][1];
+        assert!(reviewer["behavior"]
+            .as_array()
+            .is_some_and(|facets| facets.iter().any(|facet| facet["kind"] == "verification")));
     }
 
     #[test]
