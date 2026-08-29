@@ -1194,6 +1194,7 @@ mod tests {
                 target: EvidenceTargetIdentity::Network {
                     endpoint: "fixture".to_string(),
                 },
+                observation_requirement: Default::default(),
             }],
         };
         graph.nodes.push(node);

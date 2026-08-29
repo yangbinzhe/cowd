@@ -740,6 +740,7 @@ mod tests {
                 target: harness_contract::context::EvidenceTargetIdentity::Network {
                     endpoint: "fixture".to_string(),
                 },
+                observation_requirement: Default::default(),
             }],
         };
 

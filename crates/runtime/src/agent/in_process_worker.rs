@@ -318,6 +318,16 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .map(|receipt| receipt.sequence)
             .max()
             .unwrap_or(0);
+        let provider_model_obligations = packet
+            .required_acceptance
+            .evidence_obligations
+            .iter()
+            .filter(|obligation| {
+                obligation.observation_requirement
+                    == harness_contract::context::EvidenceObservationRequirement::ProviderModel
+            })
+            .cloned()
+            .collect();
         let tool_executor = Arc::new(ScopedRuntimeToolExecutor {
             host,
             allowed_tools: allowed_tools.clone(),
@@ -337,6 +347,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             managed_invocation: packet.managed_invocation.clone(),
             next_receipt_sequence: AtomicU64::new(recovered_sequence),
             receipts: Mutex::new(durable_receipts),
+            provider_model_obligations,
         });
         if packet.policy_revision != 0 && packet.policy_revision != live_session_policy.revision {
             return Err(format!(
@@ -507,7 +518,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // parent session authority but must not inherit MainTurn's broad,
         // open-ended exploration profile.
         runtime.set_context_profile(ContextProfile::SubAgent);
-        runtime.set_exact_evidence_delivery_required(packet_requires_exact_content(&packet));
         runtime.set_execution_service_class(if binding.evaluation.is_some() {
             harness_contract::execution_graph::ExecutionServiceClass::Maintenance
         } else if packet.managed_invocation.is_some() {
@@ -701,9 +711,8 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let observed_evidence = model_observed_evidence(
-            packet_requires_exact_content(&packet),
-            &summary.context_turn_report.audit_projections,
-            &summary.context_turn_report.observations,
+            &packet.required_acceptance,
+            &summary.model_observations,
             &scoped_receipts,
         );
         let evidence_refs = agent_evidence_refs(
@@ -1078,21 +1087,6 @@ fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
         .min(10_000)
 }
 
-fn packet_requires_exact_content(packet: &AgentTaskPacket) -> bool {
-    packet
-        .required_acceptance
-        .evidence_obligations
-        .iter()
-        .any(|obligation| {
-            matches!(
-                &obligation.target,
-                harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
-                    if scope.coverage
-                        == harness_contract::context::EvidenceCoverageKind::ExactContent
-            )
-        })
-}
-
 fn packet_focus_acceptance_scopes(packet: &AgentTaskPacket) -> Vec<String> {
     let mut scopes = packet
         .required_acceptance
@@ -1228,11 +1222,17 @@ struct ScopedRuntimeToolExecutor {
     managed_invocation: Option<harness_contract::managed_agent::ManagedAgentInvocationFence>,
     next_receipt_sequence: AtomicU64,
     receipts: Mutex<Vec<ScopedToolExecutionReceipt>>,
+    /// Frozen semantic observation policy compiled into the Agent packet.
+    /// This describes required delivery; it never claims delivery occurred.
+    provider_model_obligations: Vec<harness_contract::context::EvidenceObligation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScopedToolExecutionReceipt {
     sequence: u64,
+    /// Provider ToolUse identity for this concrete delivery attempt. Durable
+    /// replay receipts deliberately leave it absent until actual redelivery.
+    provider_invocation_id: Option<String>,
     tool_name: String,
     effect_kind: harness_contract::tool::ToolEffectKind,
     resource_scopes: Vec<String>,
@@ -1266,6 +1266,7 @@ fn scoped_receipt_from_durable(
     paths.sort();
     ScopedToolExecutionReceipt {
         sequence: receipt.sequence,
+        provider_invocation_id: None,
         tool_name: receipt.outcome.tool_name.clone(),
         effect_kind: receipt.effect_kind,
         resource_scopes: receipt.authorized_scopes,
@@ -1348,7 +1349,7 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             self.resource_scopes.as_deref(),
         )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
-        self.execute_scoped(tool_name, &normalized_input, None)
+        self.execute_scoped(tool_name, &normalized_input, None, None)
             .await
             .map(harness_contract::context::ToolOutputDraft::bounded_inline)
     }
@@ -1465,9 +1466,14 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             self.resource_scopes.as_deref(),
         )?;
         self.enforce_resource_ceiling(tool_name, &normalized_input)?;
-        self.execute_scoped(tool_name, &normalized_input, Some(authorization.clone()))
-            .await
-            .map(harness_contract::context::ToolOutputDraft::bounded_inline)
+        self.execute_scoped(
+            tool_name,
+            &normalized_input,
+            Some(authorization.clone()),
+            None,
+        )
+        .await
+        .map(harness_contract::context::ToolOutputDraft::bounded_inline)
     }
 
     fn available_tool_names(&self) -> Vec<String> {
@@ -1483,6 +1489,56 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             .iter()
             .flat_map(|receipt| receipt.observed_evidence.iter().cloned())
             .collect()
+    }
+
+    fn model_delivery_requirement(
+        &self,
+        tool_name: &str,
+        input: &str,
+    ) -> crate::ToolModelDeliveryRequirement {
+        crate::ToolModelDeliveryRequirement::exact(
+            self.provider_model_obligation_ids(tool_name, input),
+        )
+    }
+
+    async fn execute_authorized_invocation_output(
+        &self,
+        provider_invocation_id: &str,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        if tool_name == "checkpoint_create"
+            || matches!(
+                tool_name,
+                "team_board" | "evidence_retrieve" | "request_collaboration_escalation"
+            )
+        {
+            return self
+                .execute_authorized_output(authorization, tool_name, input)
+                .await;
+        }
+        if authorization.tool_id != tool_name || !self.allowed_tools.contains(tool_name) {
+            return Err(ToolError::new(
+                "agent tool authorization does not match the allowed tool request",
+            ));
+        }
+        let normalized_input = normalize_delegated_resource_paths(
+            tool_name,
+            input,
+            &self.workspace_root,
+            &self.path_identity_resolver,
+            self.resource_scopes.as_deref(),
+        )?;
+        self.enforce_resource_ceiling(tool_name, &normalized_input)?;
+        self.execute_scoped(
+            tool_name,
+            &normalized_input,
+            Some(authorization.clone()),
+            Some(provider_invocation_id),
+        )
+        .await
+        .map(harness_contract::context::ToolOutputDraft::bounded_inline)
     }
 
     fn has_tool(&self, tool_name: &str) -> bool {
@@ -1522,6 +1578,75 @@ fn observed_evidence_matches_requested_path(
 }
 
 impl ScopedRuntimeToolExecutor {
+    fn provider_model_obligation_ids(&self, tool_name: &str, input: &str) -> Vec<String> {
+        if self.provider_model_obligations.is_empty()
+            || !matches!(tool_name, "read_file" | "read_many")
+        {
+            return Vec::new();
+        }
+        let Ok(normalized) = normalize_delegated_resource_paths(
+            tool_name,
+            input,
+            &self.workspace_root,
+            &self.path_identity_resolver,
+            self.resource_scopes.as_deref(),
+        ) else {
+            return Vec::new();
+        };
+        let Some(descriptor) = serde_json::from_str::<serde_json::Value>(&normalized)
+            .ok()
+            .and_then(|input| {
+                self.host
+                    .delegated_tool_effect_descriptor(tool_name, &input)
+            })
+        else {
+            return Vec::new();
+        };
+        let requested = crate::governed_tool_plan::resource_scope_from_effect(&descriptor);
+        let requested_identities = requested
+            .paths
+            .iter()
+            .filter_map(|path| self.path_identity_resolver.resolve_planned_file(path).ok())
+            .collect::<Vec<_>>();
+        let mut ids = self
+            .provider_model_obligations
+            .iter()
+            .filter_map(|obligation| {
+                let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
+                    &obligation.target
+                else {
+                    return None;
+                };
+                requested_identities
+                    .iter()
+                    .any(|requested| {
+                        let same_workspace = requested.workspace_id == scope.path.workspace_id
+                            && requested.repository_id == scope.path.repository_id;
+                        let exact_path = requested.workspace_relative_path
+                            == scope.path.workspace_relative_path;
+                        let descendant_verification = obligation.kind
+                            == harness_contract::context::EvidenceObligationKind::VerifyAfterWrite
+                            && (scope.path.workspace_relative_path.is_empty()
+                                || exact_path
+                                || requested
+                                    .workspace_relative_path
+                                    .strip_prefix(&scope.path.workspace_relative_path)
+                                    .is_some_and(|suffix| suffix.starts_with('/')));
+                        same_workspace
+                            && (exact_path || descendant_verification)
+                            && (scope.coverage
+                                == harness_contract::context::EvidenceCoverageKind::ExactContent
+                                || obligation.kind
+                                    == harness_contract::context::EvidenceObligationKind::VerifyAfterWrite)
+                    })
+                .then(|| obligation.obligation_id.clone())
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     fn internal_checkpoint_input(
         &self,
         input: serde_json::Value,
@@ -1826,6 +1951,7 @@ impl ScopedRuntimeToolExecutor {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(ScopedToolExecutionReceipt {
                 sequence,
+                provider_invocation_id: None,
                 tool_name: TOOL.to_string(),
                 effect_kind: descriptor.effect_kind,
                 resource_scopes: vec!["runtime:collaboration_escalation".to_string()],
@@ -1920,6 +2046,7 @@ impl ScopedRuntimeToolExecutor {
         tool_name: &str,
         input: &str,
         authorization: Option<harness_contract::tool::ToolExecutionAuthorization>,
+        provider_invocation_id: Option<&str>,
     ) -> Result<String, ToolError> {
         let parsed_input = serde_json::from_str::<serde_json::Value>(input)
             .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
@@ -2232,6 +2359,7 @@ impl ScopedRuntimeToolExecutor {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(ScopedToolExecutionReceipt {
                         sequence,
+                        provider_invocation_id: provider_invocation_id.map(str::to_string),
                         tool_name: tool_name.to_string(),
                         effect_kind: descriptor.effect_kind,
                         resource_scopes,
@@ -2821,63 +2949,41 @@ fn agent_evidence_refs(
 /// the latter. Only model-observed exact evidence may satisfy an Agent's
 /// semantic acceptance contract.
 fn model_observed_evidence(
-    exact_delivery_required: bool,
-    audits: &[harness_contract::context::EvidenceAuditProjection],
-    observations: &[harness_contract::context::ToolObservation],
+    required: &harness_contract::context::RequiredAcceptance,
+    model_observations: &[harness_contract::context::ProviderModelObservationAttestation],
     receipts: &[ScopedToolExecutionReceipt],
 ) -> Vec<harness_contract::context::ObservedEvidence> {
-    let exact_read_receipt_count = receipts
-        .iter()
-        .flat_map(|receipt| receipt.observed_evidence.iter())
-        .filter(|observed| {
-            matches!(
-                &observed.target,
-                harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
-                    if scope.coverage
-                        == harness_contract::context::EvidenceCoverageKind::ExactContent
-            )
-        })
-        .count();
-    // ToolObservation and EvidenceAuditProjection share the Conversation
-    // Runtime's raw evidence identity. Scoped ToolHost evidence deliberately
-    // has a different durable identity, so correlating by its artifact hash
-    // confuses acquisition with delivery. An exact Agent succeeds only when
-    // every successful read receipt has a matching, non-omitting model-facing
-    // observation. If any read was compacted, promote none of the exact
-    // receipts and let typed acceptance fail closed.
-    let model_read_audits = observations
-        .iter()
-        .filter(|observation| observation.tool_name == "read_file")
-        .filter_map(|observation| {
-            audits
-                .iter()
-                .find(|audit| audit.evidence_ref == observation.raw_ref)
-        })
-        .filter(|audit| audit.content_kind != harness_contract::context::EvidenceContentKind::Error)
-        .collect::<Vec<_>>();
-    let exact_delivery_complete = !exact_delivery_required
-        || (exact_read_receipt_count > 0
-            && model_read_audits.len() >= exact_read_receipt_count
-            && model_read_audits
-                .iter()
-                .all(|audit| audit.omitted_tokens == 0));
     receipts
         .iter()
-        .flat_map(|receipt| receipt.observed_evidence.iter())
-        .filter(|observed| {
-            let exact_content = exact_delivery_required
-                && matches!(
-                &observed.target,
-                harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
-                    if scope.coverage
-                        == harness_contract::context::EvidenceCoverageKind::ExactContent
-                );
-            if !exact_content {
-                return true;
-            }
-            exact_delivery_complete
+        .flat_map(|receipt| {
+            receipt.observed_evidence.iter().cloned().map(|mut observed| {
+                let Some(provider_invocation_id) = receipt.provider_invocation_id.as_deref()
+                else {
+                    return observed;
+                };
+                let matching_attestation = model_observations.iter().find(|attestation| {
+                    attestation.provider_invocation_id == provider_invocation_id
+                        && required.evidence_obligations.iter().any(|obligation| {
+                            obligation.observation_requirement
+                                == harness_contract::context::EvidenceObservationRequirement::ProviderModel
+                                && attestation
+                                    .obligation_ids
+                                    .contains(&obligation.obligation_id)
+                                && crate::path_identity::observed_evidence_satisfies(
+                                    obligation,
+                                    &harness_contract::context::ObservedEvidence {
+                                        model_observation: Some((*attestation).clone()),
+                                        ..observed.clone()
+                                    },
+                                )
+                        })
+                });
+                if let Some(attestation) = matching_attestation {
+                    observed.model_observation = Some(attestation.clone());
+                }
+                observed
+            })
         })
-        .cloned()
         .collect()
 }
 
@@ -3896,6 +4002,7 @@ mod tests {
     ) -> ScopedToolExecutionReceipt {
         ScopedToolExecutionReceipt {
             sequence,
+            provider_invocation_id: None,
             tool_name: "test_tool".to_string(),
             effect_kind,
             resource_scopes: vec![format!(
@@ -4103,6 +4210,7 @@ mod tests {
         };
         let receipt = ScopedToolExecutionReceipt {
             sequence: 1,
+            provider_invocation_id: None,
             tool_name: "read_file".to_string(),
             effect_kind: harness_contract::tool::ToolEffectKind::Read,
             resource_scopes: vec!["read:./fixtures/auto-strategy-write/target.txt".to_string()],
@@ -4365,6 +4473,7 @@ mod tests {
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
         }
     }
 
@@ -4390,10 +4499,12 @@ mod tests {
                 "write_file",
                 r#"{"path":"fixtures/sub/target.txt","content":"one"}"#,
                 None,
+                None,
             ),
             second.execute_scoped(
                 "write_file",
                 r#"{"path":"fixtures/sub/target.txt","content":"two"}"#,
+                None,
                 None,
             )
         );
@@ -4407,10 +4518,12 @@ mod tests {
                 "write_file",
                 r#"{"path":"fixtures/sub","content":"parent"}"#,
                 None,
+                None,
             ),
             second.execute_scoped(
                 "write_file",
                 r#"{"path":"fixtures/sub/target.txt","content":"child"}"#,
+                None,
                 None,
             )
         );
@@ -4424,10 +4537,12 @@ mod tests {
                 "write_file",
                 r#"{"path":"fixtures/left.txt","content":"left"}"#,
                 None,
+                None,
             ),
             second.execute_scoped(
                 "write_file",
                 r#"{"path":"fixtures/right.txt","content":"right"}"#,
+                None,
                 None,
             )
         );
@@ -4524,6 +4639,7 @@ mod tests {
             next_receipt_sequence: AtomicU64::new(1),
             receipts: Mutex::new(vec![ScopedToolExecutionReceipt {
                 sequence: 1,
+                provider_invocation_id: None,
                 tool_name: "read_file".to_string(),
                 effect_kind: harness_contract::tool::ToolEffectKind::Read,
                 resource_scopes: vec!["read:crates/runtime/src/lib.rs".to_string()],
@@ -4532,6 +4648,7 @@ mod tests {
                 after_digests: BTreeMap::new(),
                 observed_evidence: vec![source_evidence],
             }]),
+            provider_model_obligations: Vec::new(),
         };
 
         executor
@@ -4706,6 +4823,62 @@ mod tests {
         assert_eq!(
             packet_focus_acceptance_scopes(&packet),
             ["verify_upstream_change:fixtures/target.txt"]
+        );
+    }
+
+    #[test]
+    fn exact_model_delivery_policy_is_scoped_to_the_matching_invocation() {
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(root.path().join("fixtures")).expect("fixtures");
+        std::fs::write(root.path().join("fixtures/target.txt"), "target").expect("target");
+        std::fs::write(root.path().join("fixtures/other.txt"), "other").expect("other");
+        let resolver = Arc::new(
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+                .expect("path identities"),
+        );
+        let mut required =
+            resolver.compile_required_acceptance(&[], &["read:fixtures/target.txt".to_string()]);
+        crate::path_identity::require_provider_model_observation(&mut required);
+        let obligation_id = required.evidence_obligations[0].obligation_id.clone();
+        let executor = ScopedRuntimeToolExecutor {
+            host: Arc::new(InputSensitiveRuntimeExecutionHost),
+            allowed_tools: BTreeSet::from(["read_file".to_string()]),
+            session_id: "session".to_string(),
+            sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+            policy_revision: 1,
+            memory_context: memory::MemoryTurnContext::new("session", "agent"),
+            model_lease: "model".to_string(),
+            execution_id: "graph".to_string(),
+            node_id: "node".to_string(),
+            attempt: 1,
+            workspace_root: root.path().to_path_buf(),
+            path_identity_resolver: resolver,
+            scope_locks: Arc::new(ScopeLockManager::new()),
+            commit_service: None,
+            resource_scopes: Some(vec!["read:fixtures".to_string()]),
+            managed_invocation: None,
+            next_receipt_sequence: AtomicU64::new(0),
+            receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: required.evidence_obligations,
+        };
+
+        assert_eq!(
+            executor.model_delivery_requirement(
+                "read_file",
+                r#"{"path":"fixtures/target.txt","complete":true}"#,
+            ),
+            crate::ToolModelDeliveryRequirement::exact(vec![obligation_id])
+        );
+        assert_eq!(
+            executor.model_delivery_requirement(
+                "read_file",
+                r#"{"path":"fixtures/other.txt","complete":true}"#,
+            ),
+            crate::ToolModelDeliveryRequirement::Bounded
+        );
+        assert_eq!(
+            executor.model_delivery_requirement("grep_search", r#"{"path":"fixtures"}"#),
+            crate::ToolModelDeliveryRequirement::Bounded
         );
     }
 
@@ -5006,6 +5179,7 @@ mod tests {
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
         };
 
         executor
@@ -5134,6 +5308,7 @@ mod tests {
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
         };
         let absolute_value = serde_json::json!({"path": target});
         let descriptor = executor
@@ -5208,6 +5383,7 @@ mod tests {
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
         };
 
         assert!(executor
@@ -5250,6 +5426,7 @@ mod tests {
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
         };
 
         assert!(executor.has_registered_tools());
@@ -5315,6 +5492,7 @@ mod tests {
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
         };
         let descriptor = executor
             .registered_tool_effect("checkpoint_create", &serde_json::json!({"label": "guard"}))
@@ -5618,6 +5796,7 @@ mod tests {
             managed_invocation: None,
             next_receipt_sequence: AtomicU64::new(0),
             receipts: Mutex::new(Vec::new()),
+            provider_model_obligations: Vec::new(),
         };
         let descriptor = executor
             .registered_tool_effect("read_file", &serde_json::json!({"path": "README.md"}))
@@ -5727,9 +5906,11 @@ mod tests {
     #[test]
     fn exact_acceptance_evidence_requires_a_complete_model_receipt() {
         use harness_contract::context::{
-            EvidenceCoverageKind, EvidenceTargetIdentity, ObservedEvidence,
-            ObservedEvidenceProvenance, WorkspaceAccessMode, WorkspaceObjectKind,
-            WorkspacePathIdentity, WorkspaceScopeIdentity,
+            EvidenceCoverageKind, EvidenceObligation, EvidenceObligationKind,
+            EvidenceObservationRequirement, EvidenceTargetIdentity, ObservedEvidence,
+            ObservedEvidenceProvenance, ProviderModelObservationAttestation, RequiredAcceptance,
+            WorkspaceAccessMode, WorkspaceObjectKind, WorkspacePathIdentity,
+            WorkspaceScopeIdentity,
         };
 
         let access = harness_contract::context::EvidenceAccessRef::durable(
@@ -5760,10 +5941,12 @@ mod tests {
             tool_name: "read_file".to_string(),
             provenance: ObservedEvidenceProvenance::FreshExecution,
             evidence_ref: Some(access.clone()),
+            model_observation: None,
             workspace_prior_state: None,
         };
         let receipt = ScopedToolExecutionReceipt {
             sequence: 1,
+            provider_invocation_id: Some("tool-call-1".to_string()),
             tool_name: "read_file".to_string(),
             effect_kind: harness_contract::tool::ToolEffectKind::Read,
             resource_scopes: vec!["read:src/lib.rs".to_string()],
@@ -5772,45 +5955,54 @@ mod tests {
             after_digests: BTreeMap::new(),
             observed_evidence: vec![observed.clone()],
         };
-        let complete = harness_contract::context::EvidenceAuditProjection {
-            evidence_ref: access.evidence_ref.clone(),
-            content_kind: harness_contract::context::EvidenceContentKind::Json,
-            raw_tokens: 100,
-            receipt_tokens: 112,
-            omitted_tokens: 0,
-            raw_available: true,
-            access: Some(access.clone()),
+        let required = RequiredAcceptance {
+            criteria: Vec::new(),
+            evidence_obligations: vec![EvidenceObligation {
+                obligation_id: "required-read".to_string(),
+                kind: EvidenceObligationKind::ContentRead,
+                target: observed.target.clone(),
+                observation_requirement: EvidenceObservationRequirement::ProviderModel,
+            }],
         };
-        let observation = harness_contract::context::ToolObservation::new(
-            "read_file",
-            "tool-call-1",
-            complete.evidence_ref.clone(),
-            "complete file body",
-        );
+        let complete = ProviderModelObservationAttestation {
+            provider_invocation_id: "tool-call-1".to_string(),
+            obligation_ids: vec!["required-read".to_string()],
+            raw_ref: access.evidence_ref.clone(),
+            model_receipt_sha256: format!("sha256:{}", "a".repeat(64)),
+            raw_tokens: 42,
+            receipt_tokens: 42,
+            omitted_tokens: 0,
+            complete: true,
+            provider_request_sequence: 2,
+            provider_attempt: 1,
+            model: "qwen3.8-max".to_string(),
+        };
 
-        assert_eq!(
-            model_observed_evidence(
-                true,
-                std::slice::from_ref(&complete),
-                std::slice::from_ref(&observation),
-                std::slice::from_ref(&receipt)
-            ),
-            vec![observed.clone()]
+        let promoted = model_observed_evidence(
+            &required,
+            std::slice::from_ref(&complete),
+            std::slice::from_ref(&receipt),
         );
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].model_observation.as_ref(), Some(&complete));
+        assert!(crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
+            &required.evidence_obligations[0],
+            &promoted,
+        ));
 
-        let mut omitted = complete;
+        let mut omitted = complete.clone();
         omitted.omitted_tokens = 1;
-        assert!(model_observed_evidence(
-            true,
-            &[omitted],
-            std::slice::from_ref(&observation),
-            std::slice::from_ref(&receipt)
-        )
-        .is_empty());
-        assert_eq!(
-            model_observed_evidence(false, &[], &[], &[receipt]),
-            vec![observed]
-        );
+        omitted.complete = false;
+        let incomplete = model_observed_evidence(&required, &[omitted], &[receipt.clone()]);
+        assert!(!crate::acceptance_evaluator::AcceptanceEvaluator::evaluate(
+            &required.evidence_obligations[0],
+            &incomplete,
+        ));
+
+        let mut unrelated = complete;
+        unrelated.provider_invocation_id = "tool-call-2".to_string();
+        let uncorrelated = model_observed_evidence(&required, &[unrelated], &[receipt]);
+        assert_eq!(uncorrelated, vec![observed]);
     }
 
     #[test]

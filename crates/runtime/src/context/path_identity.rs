@@ -242,6 +242,7 @@ impl WorkspacePathIdentityResolver {
                 target: EvidenceTargetIdentity::Network {
                     endpoint: "*".to_string(),
                 },
+                observation_requirement: Default::default(),
             });
         }
         let (prefix, path) = raw_scope
@@ -326,6 +327,7 @@ impl WorkspacePathIdentityResolver {
                     coverage,
                 },
             },
+            observation_requirement: Default::default(),
         })
     }
 
@@ -343,6 +345,7 @@ impl WorkspacePathIdentityResolver {
                     display_alias: path,
                     candidates,
                 },
+                observation_requirement: Default::default(),
             },
             Err(error) => EvidenceObligation {
                 obligation_id: obligation_id(raw_scope),
@@ -351,6 +354,7 @@ impl WorkspacePathIdentityResolver {
                     display_alias: raw_scope.to_string(),
                     reason: error.to_string(),
                 },
+                observation_requirement: Default::default(),
             },
         }
     }
@@ -385,6 +389,7 @@ impl WorkspacePathIdentityResolver {
                                     display_alias: scope.clone(),
                                     reason: error.to_string(),
                                 },
+                                observation_requirement: Default::default(),
                             },
                             |obligation| obligation,
                         )
@@ -411,6 +416,7 @@ impl WorkspacePathIdentityResolver {
             tool_name: String::new(),
             provenance: harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
             evidence_ref: None,
+            model_observation: None,
             workspace_prior_state: None,
         })
     }
@@ -686,6 +692,29 @@ impl WorkspacePathIdentityResolver {
     }
 }
 
+/// Mark semantic Agent reads as requiring a complete Provider continuation.
+/// This is applied only while compiling an Agent packet; deterministic
+/// Runtime verification retains acquisition authority.
+pub fn require_provider_model_observation(required: &mut RequiredAcceptance) {
+    for obligation in &mut required.evidence_obligations {
+        let semantic_read = match (&obligation.kind, &obligation.target) {
+            (
+                EvidenceObligationKind::ContentRead | EvidenceObligationKind::VerifyUpstreamChange,
+                EvidenceTargetIdentity::Workspace { scope },
+            ) => scope.coverage == EvidenceCoverageKind::ExactContent,
+            (
+                EvidenceObligationKind::VerifyAfterWrite,
+                EvidenceTargetIdentity::Workspace { .. },
+            ) => true,
+            _ => false,
+        };
+        if semantic_read {
+            obligation.observation_requirement =
+                harness_contract::context::EvidenceObservationRequirement::ProviderModel;
+        }
+    }
+}
+
 fn observed_from_identity(
     tool_name: &str,
     access_mode: WorkspaceAccessMode,
@@ -718,6 +747,7 @@ fn observed_from_identity(
         tool_name: tool_name.to_string(),
         provenance: harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
         evidence_ref: None,
+        model_observation: None,
         workspace_prior_state: None,
     }
 }
@@ -880,6 +910,7 @@ fn observed_verify_after_write_satisfies(
         observed_evidence.iter().any(|read| {
             read.observed_at_sequence > write.observed_at_sequence
                 && observed_write_matches_read(write, read)
+                && observation_requirement_satisfied(obligation, read)
         })
     })
 }
@@ -945,6 +976,9 @@ pub fn observed_evidence_satisfies(
     if observed.observed_at_sequence == 0 || observed.tool_name.trim().is_empty() {
         return false;
     }
+    if !observation_requirement_satisfied(required, observed) {
+        return false;
+    }
     if matches!(
         &observed.target,
         EvidenceTargetIdentity::Workspace { scope }
@@ -966,6 +1000,35 @@ pub fn observed_evidence_satisfies(
         ) => required == "*" || required == observed,
         _ => false,
     }
+}
+
+fn observation_requirement_satisfied(
+    required: &EvidenceObligation,
+    observed: &ObservedEvidence,
+) -> bool {
+    if required.observation_requirement
+        != harness_contract::context::EvidenceObservationRequirement::ProviderModel
+    {
+        return true;
+    }
+    let Some(attestation) = observed.model_observation.as_ref() else {
+        return false;
+    };
+    let digest = attestation
+        .model_receipt_sha256
+        .strip_prefix("sha256:")
+        .unwrap_or_default();
+    attestation.complete
+        && attestation.omitted_tokens == 0
+        && attestation.provider_attempt > 0
+        && !attestation.provider_invocation_id.trim().is_empty()
+        && !attestation.model.trim().is_empty()
+        && attestation.obligation_ids.contains(&required.obligation_id)
+        && !attestation.raw_ref.ref_type.trim().is_empty()
+        && !attestation.raw_ref.id.trim().is_empty()
+        && attestation.raw_ref.boundary == harness_contract::reality::RealityBoundary::Observed
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Directional coverage check for acceptance. It intentionally does not use a
@@ -1116,6 +1179,63 @@ mod tests {
         let file = repository.join(relative);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(file, name).unwrap();
+    }
+
+    #[test]
+    fn provider_model_observation_is_explicit_and_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        repository(root.path(), "cowd", "src/lib.rs");
+        let resolver = WorkspacePathIdentityResolver::discover(root.path()).unwrap();
+        let runtime_requirement = resolver.compile_obligation_or_unresolved("read:cowd/src/lib.rs");
+        let mut observed = resolver
+            .observe_tool_scope(
+                "read_file",
+                "read:cowd/src/lib.rs",
+                Some(&"d".repeat(64)),
+                1,
+            )
+            .unwrap();
+        assert!(observed_evidence_satisfies(&runtime_requirement, &observed));
+
+        let mut required = RequiredAcceptance {
+            criteria: Vec::new(),
+            evidence_obligations: vec![runtime_requirement],
+        };
+        require_provider_model_observation(&mut required);
+        let semantic_requirement = &required.evidence_obligations[0];
+        assert!(!observed_evidence_satisfies(
+            semantic_requirement,
+            &observed
+        ));
+
+        observed.model_observation = Some(
+            harness_contract::context::ProviderModelObservationAttestation {
+                provider_invocation_id: "tool-call-1".to_string(),
+                obligation_ids: vec![semantic_requirement.obligation_id.clone()],
+                raw_ref: harness_contract::context::EvidenceRef::observed(
+                    "tool",
+                    "raw-tool-call-1",
+                ),
+                model_receipt_sha256: format!("sha256:{}", "a".repeat(64)),
+                raw_tokens: 10,
+                receipt_tokens: 10,
+                omitted_tokens: 0,
+                complete: true,
+                provider_request_sequence: 2,
+                provider_attempt: 1,
+                model: "qwen3.8-max".to_string(),
+            },
+        );
+        assert!(observed_evidence_satisfies(semantic_requirement, &observed));
+        observed
+            .model_observation
+            .as_mut()
+            .expect("attestation")
+            .omitted_tokens = 1;
+        assert!(!observed_evidence_satisfies(
+            semantic_requirement,
+            &observed
+        ));
     }
 
     #[test]

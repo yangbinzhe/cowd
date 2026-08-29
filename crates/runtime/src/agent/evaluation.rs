@@ -225,7 +225,9 @@ pub(crate) fn required_acceptance_for_packet(
     }
     scopes.sort();
     scopes.dedup();
-    resolver.compile_required_acceptance(&packet.acceptance, &scopes)
+    let mut required = resolver.compile_required_acceptance(&packet.acceptance, &scopes);
+    crate::path_identity::require_provider_model_observation(&mut required);
+    required
 }
 
 /// Read-only aggregation of immutable terminal evaluations. A definition's

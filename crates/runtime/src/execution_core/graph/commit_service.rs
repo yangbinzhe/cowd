@@ -4053,6 +4053,7 @@ mod tests {
             tool_name: "fixture_tool".to_string(),
             provenance: harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
             evidence_ref: None,
+            model_observation: None,
             workspace_prior_state: Some(harness_contract::context::WorkspacePriorState::Existing {
                 sha256: "before".to_string(),
             }),

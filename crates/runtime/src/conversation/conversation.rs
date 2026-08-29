@@ -2364,6 +2364,57 @@ pub struct ApiClientStream<'a> {
     pub transport_activity: Option<provider::TransportActivity>,
 }
 
+/// Per-invocation model-delivery policy resolved from an immutable execution
+/// binding. This is not proof that delivery occurred; Conversation owns that
+/// proof after a matching Provider request returns a valid response.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ToolModelDeliveryRequirement {
+    #[default]
+    Bounded,
+    Exact {
+        obligation_ids: Vec<String>,
+    },
+}
+
+impl ToolModelDeliveryRequirement {
+    #[must_use]
+    pub fn exact(mut obligation_ids: Vec<String>) -> Self {
+        obligation_ids.sort();
+        obligation_ids.dedup();
+        if obligation_ids.is_empty() {
+            Self::Bounded
+        } else {
+            Self::Exact { obligation_ids }
+        }
+    }
+
+    #[must_use]
+    pub fn obligation_ids(&self) -> &[String] {
+        match self {
+            Self::Bounded => &[],
+            Self::Exact { obligation_ids } => obligation_ids,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_exact(&self) -> bool {
+        matches!(self, Self::Exact { .. })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GeneratedModelReceipt {
+    provider_invocation_id: String,
+    tool_name: String,
+    obligation_ids: Vec<String>,
+    raw_ref: EvidenceRef,
+    model_receipt_sha256: String,
+    raw_tokens: u64,
+    receipt_tokens: u64,
+    omitted_tokens: u64,
+    complete: bool,
+}
+
 /// Object-safe asynchronous contract for model-requested Tool execution.
 ///
 /// Implementors must keep native asynchronous work on the calling Runtime.
@@ -2378,6 +2429,29 @@ pub trait ToolExecutor: Send + Sync + 'static {
         tool_name: &str,
         input: &str,
     ) -> Result<harness_contract::context::ToolOutputDraft, ToolError>;
+
+    /// Execute a Provider-originated invocation while preserving its identity
+    /// into the acquisition receipt. Compatibility executors may ignore the
+    /// identity; production scoped executors override this method.
+    async fn execute_invocation_output(
+        &self,
+        _provider_invocation_id: &str,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        self.execute_output(tool_name, input).await
+    }
+
+    /// Resolve whether this concrete invocation carries a frozen exact
+    /// Provider-model observation obligation. The default preserves ordinary
+    /// bounded tool behavior.
+    fn model_delivery_requirement(
+        &self,
+        _tool_name: &str,
+        _input: &str,
+    ) -> ToolModelDeliveryRequirement {
+        ToolModelDeliveryRequirement::Bounded
+    }
 
     /// Runtime-attested evidence produced by this executor so far.
     ///
@@ -2489,6 +2563,17 @@ pub trait ToolExecutor: Send + Sync + 'static {
         Err(ToolError::new(format!(
             "tool `{tool_name}` has no authorized execution implementation"
         )))
+    }
+
+    async fn execute_authorized_invocation_output(
+        &self,
+        _provider_invocation_id: &str,
+        authorization: &harness_contract::tool::ToolExecutionAuthorization,
+        tool_name: &str,
+        input: &str,
+    ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
+        self.execute_authorized_output(authorization, tool_name, input)
+            .await
     }
 
     fn has_registered_tools(&self) -> bool {
@@ -2821,6 +2906,9 @@ pub struct TurnSummary {
     pub auto_compaction: Option<AutoCompactionEvent>,
     pub ai_kernel_trace: RuntimeAiKernelTrace,
     pub context_turn_report: ContextTurnReport,
+    /// Invocation-level proof that an exact ToolResult survived packing and
+    /// was consumed by a valid Provider continuation in this turn.
+    pub model_observations: Vec<harness_contract::context::ProviderModelObservationAttestation>,
     pub duplicate_tool_calls: u64,
     /// Canonical workspace paths targeted by write-capable tool calls during
     /// this turn, including calls rejected before execution. This is distinct
@@ -3415,6 +3503,13 @@ pub struct ConversationRuntime<C, T> {
     turn_stable_prefix_metrics: std::sync::Mutex<TurnStablePrefixMetrics>,
     /// Stable evidence projections emitted during the active turn.
     turn_evidence_audits: std::sync::Mutex<Vec<EvidenceAuditProjection>>,
+    /// Exact receipts generated in this turn. These contain metadata and
+    /// digests only; canonical bytes remain in Session/artifact storage.
+    turn_generated_model_receipts: std::sync::Mutex<Vec<GeneratedModelReceipt>>,
+    /// Generated receipts promoted only after their byte-identical ToolResult
+    /// appears in a valid, committed Provider continuation.
+    turn_model_observations:
+        std::sync::Mutex<Vec<harness_contract::context::ProviderModelObservationAttestation>>,
     /// Per-turn component accounting and tool-result lease consumption.
     turn_context_ledger: std::sync::Mutex<crate::context_ledger::ContextLedger>,
     /// Latest context governance report emitted by a completed turn.
@@ -3452,10 +3547,6 @@ pub struct ConversationRuntime<C, T> {
     delegated_focus_novelty_target_bp: AtomicU64,
     delegated_focus_acceptance_scopes: std::sync::Mutex<Vec<String>>,
     delegated_focus_required_output_fields: std::sync::Mutex<Vec<String>>,
-    /// A delegated Agent with exact-content obligations must receive the
-    /// complete governed read output in its Provider context. A durable raw
-    /// receipt alone proves acquisition, not semantic observation.
-    exact_evidence_delivery_required: AtomicBool,
     /// Present only for a Gateway-owned durable Session ingress. It fences
     /// provider/tool/terminal side effects against generation and claim loss.
     session_execution_fence: Option<crate::SessionExecutionFence>,
@@ -3874,6 +3965,8 @@ where
             ),
             turn_stable_prefix_metrics: std::sync::Mutex::new(TurnStablePrefixMetrics::default()),
             turn_evidence_audits: std::sync::Mutex::new(Vec::new()),
+            turn_generated_model_receipts: std::sync::Mutex::new(Vec::new()),
+            turn_model_observations: std::sync::Mutex::new(Vec::new()),
             turn_context_ledger: std::sync::Mutex::new(crate::context_ledger::ContextLedger::new(
                 initial_budget_plan.subsystem_budget_tokens,
                 initial_budget_plan.tool_result_budget.max_total_tokens as u64,
@@ -3950,7 +4043,6 @@ where
             delegated_focus_novelty_target_bp: AtomicU64::new(0),
             delegated_focus_acceptance_scopes: std::sync::Mutex::new(Vec::new()),
             delegated_focus_required_output_fields: std::sync::Mutex::new(Vec::new()),
-            exact_evidence_delivery_required: AtomicBool::new(false),
             session_execution_fence: None,
         }
     }
@@ -4192,18 +4284,6 @@ where
         )
     }
 
-    /// Require exact file evidence to remain model-visible instead of being
-    /// replaced by the generic oversized-tool receipt summary.
-    pub fn set_exact_evidence_delivery_required(&self, required: bool) {
-        self.exact_evidence_delivery_required
-            .store(required, Ordering::SeqCst);
-    }
-
-    #[must_use]
-    pub fn exact_evidence_delivery_required(&self) -> bool {
-        self.exact_evidence_delivery_required.load(Ordering::SeqCst)
-    }
-
     /// Replace runtime-owned context supplied by orchestration layers.
     pub fn set_external_context_items(&self, items: Vec<ContextItem>) {
         if let Ok(mut guard) = self.external_context_items.lock() {
@@ -4425,6 +4505,7 @@ where
     /// before it can make a valid typed proposal. Ordinary workspace and
     /// discovery tools remain unavailable, so this is still an admission
     /// barrier rather than a hardcoded Team topology.
+    #[cfg(test)]
     pub(crate) fn require_next_model_orchestration_only(&self) {
         self.require_next_model_tool_action([
             "runtime_capabilities".to_string(),
@@ -4999,6 +5080,12 @@ where
         if let Ok(mut guard) = self.turn_evidence_audits.lock() {
             guard.clear();
         }
+        if let Ok(mut guard) = self.turn_generated_model_receipts.lock() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.turn_model_observations.lock() {
+            guard.clear();
+        }
         if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
             metrics.reset(self.api_client.tool_schema_cache_stats());
         }
@@ -5049,6 +5136,172 @@ where
 
     fn turn_evidence_audits(&self) -> Vec<EvidenceAuditProjection> {
         self.turn_evidence_audits
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_generated_model_receipt(
+        &self,
+        provider_invocation_id: &str,
+        tool_name: &str,
+        requirement: &ToolModelDeliveryRequirement,
+        raw_ref: &EvidenceRef,
+        receipt: &crate::context_evidence::ModelReceipt,
+        is_error: bool,
+    ) -> Result<(), RuntimeError> {
+        if !requirement.is_exact() || is_error {
+            return Ok(());
+        }
+        let generated = GeneratedModelReceipt {
+            provider_invocation_id: provider_invocation_id.to_string(),
+            tool_name: tool_name.to_string(),
+            obligation_ids: requirement.obligation_ids().to_vec(),
+            raw_ref: raw_ref.clone(),
+            model_receipt_sha256: format!(
+                "sha256:{:x}",
+                Sha256::digest(receipt.summary.as_bytes())
+            ),
+            raw_tokens: receipt.raw_tokens,
+            receipt_tokens: receipt.receipt_tokens,
+            omitted_tokens: receipt.omitted_tokens,
+            complete: !receipt.truncated && receipt.omitted_tokens == 0,
+        };
+        let mut receipts = self
+            .turn_generated_model_receipts
+            .lock()
+            .map_err(|_| RuntimeError::new("generated model receipt ledger is poisoned"))?;
+        if let Some(existing) = receipts
+            .iter()
+            .find(|existing| existing.provider_invocation_id == provider_invocation_id)
+        {
+            if existing == &generated {
+                return Ok(());
+            }
+            return Err(RuntimeError::new(format!(
+                "provider invocation `{provider_invocation_id}` produced conflicting exact model receipts"
+            )));
+        }
+        receipts.push(generated);
+        Ok(())
+    }
+
+    fn packed_model_observation_candidates(
+        &self,
+        request: &ApiRequest,
+        request_sequence: usize,
+        provider_attempt: u32,
+    ) -> Result<Vec<harness_contract::context::ProviderModelObservationAttestation>, RuntimeError>
+    {
+        let generated = self
+            .turn_generated_model_receipts
+            .lock()
+            .map_err(|_| RuntimeError::new("generated model receipt ledger is poisoned"))?
+            .clone();
+        if generated.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut packed_results = BTreeMap::<String, (String, String, bool)>::new();
+        for message in request.messages.iter() {
+            for block in &message.blocks {
+                let ContentBlock::ToolResult {
+                    tool_use_id,
+                    tool_name,
+                    output,
+                    is_error,
+                } = block
+                else {
+                    continue;
+                };
+                let packed = (tool_name.clone(), output.clone(), *is_error);
+                if let Some(existing) = packed_results.get(tool_use_id) {
+                    if existing != &packed {
+                        return Err(RuntimeError::new(format!(
+                            "packed provider request contains conflicting ToolResult blocks for invocation `{tool_use_id}`"
+                        )));
+                    }
+                } else {
+                    packed_results.insert(tool_use_id.clone(), packed);
+                }
+            }
+        }
+
+        let mut candidates = Vec::new();
+        for receipt in generated {
+            let Some((tool_name, output, is_error)) =
+                packed_results.get(&receipt.provider_invocation_id)
+            else {
+                // Compaction or request selection may omit an old result. An
+                // omitted result is simply not observed by this attempt.
+                continue;
+            };
+            let packed_digest = format!("sha256:{:x}", Sha256::digest(output.as_bytes()));
+            if tool_name != &receipt.tool_name
+                || *is_error
+                || packed_digest != receipt.model_receipt_sha256
+            {
+                return Err(RuntimeError::new(format!(
+                    "packed ToolResult for exact invocation `{}` no longer matches its generated receipt",
+                    receipt.provider_invocation_id
+                )));
+            }
+            candidates.push(
+                harness_contract::context::ProviderModelObservationAttestation {
+                    provider_invocation_id: receipt.provider_invocation_id,
+                    obligation_ids: receipt.obligation_ids,
+                    raw_ref: receipt.raw_ref,
+                    model_receipt_sha256: receipt.model_receipt_sha256,
+                    raw_tokens: receipt.raw_tokens,
+                    receipt_tokens: receipt.receipt_tokens,
+                    omitted_tokens: receipt.omitted_tokens,
+                    complete: receipt.complete,
+                    provider_request_sequence: u64::try_from(request_sequence).unwrap_or(u64::MAX),
+                    provider_attempt,
+                    model: request.model.clone(),
+                },
+            );
+        }
+        Ok(candidates)
+    }
+
+    fn confirm_model_observations(
+        &self,
+        mut candidates: Vec<harness_contract::context::ProviderModelObservationAttestation>,
+        effective_model: &str,
+    ) -> Result<(), RuntimeError> {
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let mut observations = self
+            .turn_model_observations
+            .lock()
+            .map_err(|_| RuntimeError::new("model observation ledger is poisoned"))?;
+        for candidate in &mut candidates {
+            candidate.model = effective_model.to_string();
+            if let Some(existing) = observations.iter().find(|existing| {
+                existing.provider_invocation_id == candidate.provider_invocation_id
+            }) {
+                if existing.model_receipt_sha256 != candidate.model_receipt_sha256
+                    || existing.raw_ref != candidate.raw_ref
+                    || existing.obligation_ids != candidate.obligation_ids
+                {
+                    return Err(RuntimeError::new(format!(
+                        "provider invocation `{}` has conflicting model observation attestations",
+                        candidate.provider_invocation_id
+                    )));
+                }
+                continue;
+            }
+            observations.push(candidate.clone());
+        }
+        Ok(())
+    }
+
+    fn turn_model_observations(
+        &self,
+    ) -> Vec<harness_contract::context::ProviderModelObservationAttestation> {
+        self.turn_model_observations
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
@@ -5742,7 +5995,7 @@ where
                     self.provider_max_output_override,
                 )
             });
-        self.apply_exact_evidence_delivery_budget(RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+        RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window: self.model_context_window,
             model_max_output_tokens: model_max_output,
             subsystem_budget_ratio_bp: self.subsystem_budget_ratio_bp,
@@ -5750,7 +6003,7 @@ where
             autonomy_mode: None,
             expected_parallel_branches: 1,
             expected_verification_passes: 0,
-        }))
+        })
     }
 
     /// A fallback route is only safe when the prepared context fits every
@@ -5778,7 +6031,7 @@ where
         let model_max_output_tokens = outputs
             .next()
             .map_or(0, |first| outputs.fold(first, u32::min));
-        self.apply_exact_evidence_delivery_budget(RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
+        RuntimeBudgetPlan::derive(RuntimeBudgetInputs {
             model_context_window,
             model_max_output_tokens,
             subsystem_budget_ratio_bp: self.subsystem_budget_ratio_bp,
@@ -5786,16 +6039,10 @@ where
             autonomy_mode: None,
             expected_parallel_branches: 1,
             expected_verification_passes: 0,
-        }))
+        })
     }
 
-    fn apply_exact_evidence_delivery_budget(
-        &self,
-        mut plan: RuntimeBudgetPlan,
-    ) -> RuntimeBudgetPlan {
-        if !self.exact_evidence_delivery_required() {
-            return plan;
-        }
+    fn apply_exact_evidence_delivery_budget(mut plan: RuntimeBudgetPlan) -> RuntimeBudgetPlan {
         // Exact evidence is a required Provider input, not an ordinary tool
         // preview. Keep the subsystem ceiling, output reservation, and a
         // request-safety reserve intact while allowing the remaining context
@@ -7332,6 +7579,14 @@ where
                 budget: request.budget.clone(),
                 attempt: provider_attempt_sequence,
             });
+            // Inspect the immutable, fully packed request immediately before
+            // transport dispatch. Generation alone is not observation; these
+            // candidates are promoted only after a valid response is committed.
+            let packed_model_observations = self.packed_model_observation_candidates(
+                &request,
+                request_sequence,
+                provider_attempt_sequence,
+            )?;
             self.record_provider_context_request(
                 &request,
                 request_sequence,
@@ -7647,6 +7902,7 @@ where
                 if !models_tried.contains(model) {
                     models_tried.push(model.clone());
                 }
+                self.confirm_model_observations(packed_model_observations, model)?;
             }
             self.consume_active_runtime_inputs_for_next_step(
                 TurnInputCheckpoint::AfterProviderResponse,
@@ -8016,6 +8272,7 @@ where
             auto_compaction,
             ai_kernel_trace,
             context_turn_report,
+            model_observations: self.turn_model_observations(),
             duplicate_tool_calls,
             write_attempt_paths,
             max_tool_concurrency_observed,
@@ -8214,6 +8471,9 @@ where
         let effective_input = pre_hook_result
             .updated_input()
             .map_or_else(|| input.to_string(), ToOwned::to_owned);
+        let model_delivery_requirement = self
+            .tool_executor
+            .model_delivery_requirement(tool_name, &effective_input);
         let mut permission_context = PermissionContext::new(
             pre_hook_result.permission_override(),
             pre_hook_result.permission_reason().map(ToOwned::to_owned),
@@ -8297,6 +8557,7 @@ where
                 let tname = tool_name.to_string();
                 let tname_for_err = tname.clone();
                 let tinput = effective_input.clone();
+                let provider_invocation_id = tool_use_id.to_string();
                 let tool_exec = Arc::clone(&self.tool_executor);
                 let evidence_sandbox = self.tool_output_sandbox.clone();
                 let is_evidence_retrieve = tool_name == "evidence_retrieve";
@@ -8405,13 +8666,22 @@ where
                                         tname.as_str(),
                                         "tool_search" | "runtime_capabilities" | "team_board"
                                     ) {
-                                        tool_exec.execute_output(&tname, &tinput).await
+                                        tool_exec
+                                            .execute_invocation_output(
+                                                &provider_invocation_id,
+                                                &tname,
+                                                &tinput,
+                                            )
+                                            .await
                                     } else {
-                                        tool_exec.execute_authorized_output(
-                                            &authorization.authorization,
-                                            &tname,
-                                            &tinput,
-                                        ).await
+                                        tool_exec
+                                            .execute_authorized_invocation_output(
+                                                &provider_invocation_id,
+                                                &authorization.authorization,
+                                                &tname,
+                                                &tinput,
+                                            )
+                                            .await
                                     }
                                 },
                             )
@@ -8596,6 +8866,7 @@ where
                     is_error,
                     &raw_ref,
                     Some(&raw_access),
+                    &model_delivery_requirement,
                 );
                 if let Some(payload) = prepared_vision.as_ref() {
                     model_receipt.summary = vision_tool_model_receipt(payload, &raw_ref);
@@ -8607,6 +8878,14 @@ where
                     model_receipt.truncated =
                         model_receipt.receipt_tokens < model_receipt.raw_tokens;
                 }
+                self.record_generated_model_receipt(
+                    tool_use_id,
+                    tool_name,
+                    &model_delivery_requirement,
+                    &raw_ref,
+                    &model_receipt,
+                    is_error,
+                )?;
                 let audit_projection =
                     crate::context_evidence::audit_projection(&model_receipt, Some(&raw_access));
                 self.push_turn_evidence_audit(audit_projection);
@@ -11013,8 +11292,25 @@ where
             self.record_tool_invocation_event(&terminal, terminal_kind, sequence);
         }
         self.maybe_index_tool_output(raw_ref.id(), tool_name, output, Some(&raw_access));
-        let receipt =
-            self.tool_model_receipt(tool_name, output, is_error, &raw_ref, Some(&raw_access));
+        let delivery_requirement = self
+            .tool_executor
+            .model_delivery_requirement(tool_name, input);
+        let receipt = self.tool_model_receipt(
+            tool_name,
+            output,
+            is_error,
+            &raw_ref,
+            Some(&raw_access),
+            &delivery_requirement,
+        );
+        self.record_generated_model_receipt(
+            tool_use_id,
+            tool_name,
+            &delivery_requirement,
+            &raw_ref,
+            &receipt,
+            is_error,
+        )?;
         self.push_turn_evidence_audit(crate::context_evidence::audit_projection(
             &receipt,
             Some(&raw_access),
@@ -11063,12 +11359,20 @@ where
         is_error: bool,
         raw_ref: &EvidenceRef,
         access: Option<&EvidenceAccessRef>,
+        delivery_requirement: &ToolModelDeliveryRequirement,
     ) -> crate::context_evidence::ModelReceipt {
         let raw_tokens = crate::context_ledger::estimate_text_tokens(output);
-        let per_tool_limit = self
-            .runtime_budget_plan()
-            .tool_result_budget
-            .per_tool_max_tokens as u64;
+        let plan = if delivery_requirement.is_exact() && !is_error {
+            Self::apply_exact_evidence_delivery_budget(self.runtime_budget_plan())
+        } else {
+            self.runtime_budget_plan()
+        };
+        let per_tool_limit = plan.tool_result_budget.per_tool_max_tokens as u64;
+        if delivery_requirement.is_exact() && !is_error {
+            if let Ok(mut ledger) = self.turn_context_ledger.lock() {
+                ledger.expand_tool_result_limit(plan.tool_result_budget.max_total_tokens as u64);
+            }
+        }
         // `build_tool_receipt` spends part of the granted budget on its
         // evidence URI and structured summary prefix. Reserving only the raw
         // body size made even a tiny exact `read_file` JSON lose its `content`
@@ -13899,8 +14203,8 @@ mod tests {
         ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture, EarlyToolDispatchResult,
         EarlyToolDispatcher, EarlyToolExecutionReceipt, ModelStepIntent, ModelStepToolPlan,
         ModelStreamReducer, ModelToolCall, ProviderContextInventory, ProviderTokenReservationSet,
-        RuntimeError, StaticToolExecutor, ToolExposureState, TurnStablePrefixMetrics,
-        TurnToolExposureMetrics,
+        RuntimeError, StaticToolExecutor, ToolExposureState, ToolModelDeliveryRequirement,
+        TurnStablePrefixMetrics, TurnToolExposureMetrics,
     };
     use crate::config::RuntimeFeatureConfig;
     use crate::context_runtime::{
@@ -14150,6 +14454,7 @@ mod tests {
             false,
             &harness_contract::reality::EvidenceRef::observed("tool", "small-exact-read"),
             None,
+            &ToolModelDeliveryRequirement::exact(vec!["small-read".to_string()]),
         );
 
         assert!(!receipt.truncated, "{}", receipt.summary);
@@ -14168,8 +14473,9 @@ mod tests {
         )
         .without_memory();
         let standard = runtime.runtime_budget_plan();
-        runtime.set_exact_evidence_delivery_required(true);
-        let exact = runtime.runtime_budget_plan();
+        let exact = ConversationRuntime::<MockApi, StaticToolExecutor>::apply_exact_evidence_delivery_budget(
+            standard.clone(),
+        );
         runtime
             .turn_context_ledger
             .lock()
@@ -14218,6 +14524,7 @@ mod tests {
                 "artifact://art_large_exact_read",
                 "session:test",
             )),
+            &ToolModelDeliveryRequirement::exact(vec!["large-read".to_string()]),
         );
 
         assert!(
@@ -14231,6 +14538,96 @@ mod tests {
         );
         assert_eq!(receipt.omitted_tokens, 0);
         assert!(receipt.summary.contains(&"x".repeat(256)));
+    }
+
+    #[test]
+    fn model_observation_promotes_only_a_matching_packed_provider_result() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        let raw_ref = harness_contract::reality::EvidenceRef::observed("tool", "raw-1");
+        let access = harness_contract::context::EvidenceAccessRef::durable(
+            raw_ref.clone(),
+            format!("sha256:{}", "b".repeat(64)),
+            16,
+            "application/json",
+            "artifact://raw-1",
+            "session:test",
+        );
+        let requirement = ToolModelDeliveryRequirement::exact(vec!["required-read".to_string()]);
+        let output = r#"{"content":"complete","truncated":false}"#;
+        let receipt = runtime.tool_model_receipt(
+            "read_file",
+            output,
+            false,
+            &raw_ref,
+            Some(&access),
+            &requirement,
+        );
+        runtime
+            .record_generated_model_receipt(
+                "tool-call-1",
+                "read_file",
+                &requirement,
+                &raw_ref,
+                &receipt,
+                false,
+            )
+            .expect("generated receipt");
+        assert!(runtime.turn_model_observations().is_empty());
+
+        let request = ApiRequest {
+            prompt: PromptAssembly::new(vec!["system".to_string()]),
+            messages: vec![ConversationMessage::tool_result(
+                "tool-call-1".to_string(),
+                "read_file".to_string(),
+                receipt.summary.clone(),
+                false,
+            )]
+            .into(),
+            model: "qwen3.8-max".to_string(),
+            reasoning_effort_override: None,
+            request_compiler_cache_hit: false,
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "qwen3.8-max",
+                32_768,
+                4_096,
+                128,
+                256,
+                0,
+            ),
+            provider_evidence_context: None,
+        };
+        let candidates = runtime
+            .packed_model_observation_candidates(&request, 2, 1)
+            .expect("matching packed request");
+        assert_eq!(candidates.len(), 1);
+        assert!(runtime.turn_model_observations().is_empty());
+        runtime
+            .confirm_model_observations(candidates, "qwen3.8-max-effective")
+            .expect("valid response commit promotion");
+        let promoted = runtime.turn_model_observations();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].provider_invocation_id, "tool-call-1");
+        assert_eq!(promoted[0].model, "qwen3.8-max-effective");
+        assert!(promoted[0].complete);
+
+        let mut corrupted = request;
+        corrupted.messages = vec![ConversationMessage::tool_result(
+            "tool-call-1".to_string(),
+            "read_file".to_string(),
+            "different bytes".to_string(),
+            false,
+        )]
+        .into();
+        assert!(runtime
+            .packed_model_observation_candidates(&corrupted, 3, 2)
+            .is_err());
     }
     use fact_kernel::FactLedger;
     use std::sync::atomic::{AtomicUsize, Ordering};

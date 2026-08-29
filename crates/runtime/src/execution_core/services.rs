@@ -8254,6 +8254,34 @@ mod tests {
                         provenance:
                             harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
                         evidence_ref: None,
+                        // This backend is the explicit observation-authority
+                        // test double for a completed in-process Provider
+                        // turn. Semantic obligations therefore carry the same
+                        // typed attestation production would mint after a
+                        // matching request receives a valid response.
+                        model_observation: (obligation.observation_requirement
+                            == harness_contract::context::EvidenceObservationRequirement::ProviderModel)
+                            .then(|| harness_contract::context::ProviderModelObservationAttestation {
+                                provider_invocation_id: format!(
+                                    "test-provider:{}:{}",
+                                    packet.node_id(),
+                                    index + 1
+                                ),
+                                obligation_ids: vec![obligation.obligation_id.clone()],
+                                raw_ref: harness_contract::context::EvidenceRef::observed(
+                                    "tool",
+                                    format!("test-provider-raw:{}:{}", packet.node_id(), index + 1),
+                                ),
+                                model_receipt_sha256: format!("sha256:{}", "c".repeat(64)),
+                                raw_tokens: 1,
+                                receipt_tokens: 1,
+                                omitted_tokens: 0,
+                                complete: true,
+                                provider_request_sequence: u64::try_from(index + 2)
+                                    .unwrap_or(u64::MAX),
+                                provider_attempt: 1,
+                                model: selection.model.clone(),
+                            }),
                         workspace_prior_state: None,
                     }
                 })

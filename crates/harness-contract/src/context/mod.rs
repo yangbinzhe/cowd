@@ -151,6 +151,20 @@ pub enum EvidenceObligationKind {
     NetworkEvidence,
 }
 
+/// Which Runtime authority must have observed evidence before it may satisfy
+/// an obligation. ToolHost acquisition is sufficient for deterministic
+/// mechanical checks. Semantic Agent reads additionally require proof that
+/// the complete receipt entered a successful Provider-model continuation.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceObservationRequirement {
+    #[default]
+    RuntimeAcquisition,
+    ProviderModel,
+}
+
 /// Runtime-compiled evidence requirement. Raw prompt/constraint strings may
 /// be compilation input, but never become acceptance truth after this type is
 /// materialized.
@@ -159,6 +173,8 @@ pub struct EvidenceObligation {
     pub obligation_id: String,
     pub kind: EvidenceObligationKind,
     pub target: EvidenceTargetIdentity,
+    #[serde(default)]
+    pub observation_requirement: EvidenceObservationRequirement,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -186,10 +202,35 @@ pub struct ObservedEvidence {
     pub provenance: ObservedEvidenceProvenance,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<EvidenceAccessRef>,
+    /// Runtime-owned proof that this exact tool result was present in a
+    /// concrete Provider request whose valid response was committed. Raw
+    /// ToolHost acquisition deliberately leaves this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_observation: Option<ProviderModelObservationAttestation>,
     /// Canonical ToolHost-attested pre-image for a workspace write. Runtime
     /// never reconstructs this from the filesystem after execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_prior_state: Option<WorkspacePriorState>,
+}
+
+/// Invocation-level proof of semantic delivery to a Provider model.
+///
+/// The Provider invocation id is the correlation key. Digests are integrity
+/// checks inside that identity and are never used to cross-join independently
+/// owned ToolHost and Conversation evidence namespaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ProviderModelObservationAttestation {
+    pub provider_invocation_id: String,
+    pub obligation_ids: Vec<String>,
+    pub raw_ref: EvidenceRef,
+    pub model_receipt_sha256: String,
+    pub raw_tokens: u64,
+    pub receipt_tokens: u64,
+    pub omitted_tokens: u64,
+    pub complete: bool,
+    pub provider_request_sequence: u64,
+    pub provider_attempt: u32,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

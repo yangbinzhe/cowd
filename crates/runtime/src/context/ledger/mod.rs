@@ -187,6 +187,16 @@ impl ContextLedger {
         *self = Self::new(max_tokens, tool_result_limit);
     }
 
+    /// Monotonically expand the tool-result sub-budget while preserving the
+    /// already frozen subsystem ceiling. Exact semantic delivery uses this
+    /// only for an invocation selected by the immutable execution binding.
+    pub fn expand_tool_result_limit(&mut self, tool_result_limit: u64) {
+        self.tool_result_limit = self
+            .tool_result_limit
+            .max(tool_result_limit.min(self.max_tokens))
+            .max(1);
+    }
+
     pub fn record(
         &mut self,
         component: ContextComponentKind,
@@ -319,6 +329,18 @@ mod tests {
         assert_eq!(ledger.reserve_tool_result(80), 80);
         assert_eq!(ledger.reserve_tool_result(80), 20);
         assert_eq!(ledger.reserve_tool_result(1), 0);
+    }
+
+    #[test]
+    fn exact_delivery_expansion_is_monotonic_and_subsystem_bounded() {
+        let mut ledger = ContextLedger::new(1_000, 100);
+        assert_eq!(ledger.reserve_tool_result(80), 80);
+        ledger.expand_tool_result_limit(800);
+        assert_eq!(ledger.reserve_tool_result(800), 720);
+        ledger.expand_tool_result_limit(50);
+        assert_eq!(ledger.remaining_tool_result_tokens(), 0);
+        ledger.expand_tool_result_limit(2_000);
+        assert_eq!(ledger.reserve_tool_result(500), 200);
     }
 
     #[test]

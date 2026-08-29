@@ -740,6 +740,7 @@ mod tests {
                         provenance:
                             harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
                         evidence_ref: None,
+                        model_observation: None,
                         workspace_prior_state: None,
                     }],
                     unresolved_obligation_ids: Vec::new(),
@@ -791,6 +792,7 @@ mod tests {
                 tool_name: "read_file".to_string(),
                 provenance: harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
                 evidence_ref: None,
+                model_observation: None,
                 workspace_prior_state: None,
             },
         );

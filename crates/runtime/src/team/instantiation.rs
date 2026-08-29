@@ -98,11 +98,13 @@ fn compile_required_acceptance(
     }
     scopes.sort();
     scopes.dedup();
-    resolver.compile_required_acceptance_with_root_alias(
+    let mut required = resolver.compile_required_acceptance_with_root_alias(
         criteria,
         &scopes,
         allow_whole_workspace_root,
-    )
+    );
+    crate::path_identity::require_provider_model_observation(&mut required);
+    required
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3009,6 +3009,7 @@ fn network_evidence(
         tool_name: tool_name.to_string(),
         provenance: harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
         evidence_ref: None,
+        model_observation: None,
         workspace_prior_state: None,
     }
 }

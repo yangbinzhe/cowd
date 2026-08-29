@@ -41,12 +41,10 @@ impl AcceptanceReceiptSnapshot {
         satisfied_criteria.sort();
         satisfied_criteria.dedup();
         observed_evidence.sort_by(|left, right| {
-            crate::path_identity::observed_evidence_fingerprint(left)
-                .cmp(&crate::path_identity::observed_evidence_fingerprint(right))
+            acceptance_evidence_fingerprint(left).cmp(&acceptance_evidence_fingerprint(right))
         });
         observed_evidence.dedup_by(|left, right| {
-            crate::path_identity::observed_evidence_fingerprint(left)
-                == crate::path_identity::observed_evidence_fingerprint(right)
+            acceptance_evidence_fingerprint(left) == acceptance_evidence_fingerprint(right)
         });
         Self {
             required,
@@ -65,7 +63,7 @@ impl AcceptanceEvaluator {
     /// Bump this only when the canonical matching semantics change.  A
     /// consumer may reject an unknown revision, but it must never silently
     /// substitute a locally reimplemented matcher.
-    pub const REVISION: u64 = 1;
+    pub const REVISION: u64 = 2;
 
     /// Preserve the frozen packet's legacy structured criteria only when the
     /// typed requirement carrier is genuinely absent.  This is a terminal
@@ -203,6 +201,14 @@ impl AcceptanceEvaluator {
 fn digest_json<T: serde::Serialize>(value: &T) -> String {
     let bytes = serde_json::to_vec(value).unwrap_or_default();
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn acceptance_evidence_fingerprint(value: &ObservedEvidence) -> String {
+    // Acceptance identity includes authority/provenance and Provider-model
+    // attestation. The target-only novelty fingerprint intentionally serves a
+    // different purpose and must not collapse an attested receipt into an
+    // otherwise identical acquisition-only observation.
+    digest_json(value)
 }
 
 #[cfg(test)]

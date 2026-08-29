@@ -456,6 +456,7 @@ mod tests {
                     provenance:
                         harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
                     evidence_ref: None,
+                    model_observation: None,
                     workspace_prior_state: None,
                 }],
                 unresolved_obligation_ids: Vec::new(),
@@ -493,6 +494,7 @@ mod tests {
                 target: harness_contract::context::EvidenceTargetIdentity::Network {
                     endpoint: "*".to_string(),
                 },
+                observation_requirement: Default::default(),
             }],
         };
         let envelope = serde_json::json!({
