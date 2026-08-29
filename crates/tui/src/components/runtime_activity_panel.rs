@@ -137,17 +137,25 @@ impl RuntimeActivityPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
+        self.sync_execution_projection(app);
+        self.sync_provider_context(app);
+        self.sync_activity_projection(app);
+        self.sync_timeline_activity(app);
+    }
+
+    fn sync_execution_projection(&mut self, app: &App) {
         // ── Context / Ctx info ────────────────────────────────────
-        self.token_count = app.token_count;
-        self.context_window = app.context_window;
-        self.turn_input_tokens = app.turn_input_tokens;
-        self.turn_output_tokens = app.turn_output_tokens;
-        self.execution_policy_preset = app.execution_policy_preset.clone();
+        self.token_count = app.shell.token_count;
+        self.context_window = app.execution.context_window;
+        self.turn_input_tokens = app.execution.turn_input_tokens;
+        self.turn_output_tokens = app.execution.turn_output_tokens;
+        self.execution_policy_preset = app.shell.execution_policy_preset.clone();
         self.execution_policy_transition =
-            canonical_policy_transition(app.execution_policy_snapshot.as_ref());
-        self.session_id = app.session_id.clone();
-        self.model = app.model.clone();
+            canonical_policy_transition(app.shell.execution_policy_snapshot.as_ref());
+        self.session_id = app.shell.session_id.clone();
+        self.model = app.shell.model.clone();
         self.strategy = app
+            .execution
             .latest_execution_projection
             .as_ref()
             .and_then(|projection| projection.strategy.clone());
@@ -165,7 +173,7 @@ impl RuntimeActivityPanel {
         self.execution_work_expected_ms = 0;
         self.execution_work_actual_ms = 0;
         self.execution_work_speedup_bp = None;
-        if let Some(projection) = app.latest_execution_projection.as_ref() {
+        if let Some(projection) = app.execution.latest_execution_projection.as_ref() {
             if let Some(work) = projection.graph.work.as_ref() {
                 self.execution_work_width = work.width;
                 self.execution_work_depth = work.depth;
@@ -216,6 +224,7 @@ impl RuntimeActivityPanel {
             self.projection_evidence_count = projection.evidence.len();
         }
         self.strategy_agent_ids = app
+            .execution
             .latest_execution_projection
             .as_ref()
             .and_then(|projection| {
@@ -240,8 +249,11 @@ impl RuntimeActivityPanel {
         {
             self.focused_backlink_resolution = Some(resolution);
         }
+    }
 
+    fn sync_provider_context(&mut self, app: &App) {
         let mut provider_names = app
+            .gateway
             .gateway_connector_accounts
             .iter()
             .map(|account| account.provider.clone())
@@ -249,7 +261,7 @@ impl RuntimeActivityPanel {
         provider_names.sort();
         provider_names.dedup();
         self.provider_count = provider_names.len();
-        self.provider_model_count = app.available_models.len();
+        self.provider_model_count = app.shell.available_models.len();
         self.provider_names = if provider_names.is_empty() {
             "none".to_string()
         } else {
@@ -267,8 +279,7 @@ impl RuntimeActivityPanel {
             "available".to_string()
         };
 
-        let has_context = app.latest_context_envelope.is_some();
-        if let Some(envelope) = &app.latest_context_envelope {
+        if let Some(envelope) = &app.execution.latest_context_envelope {
             let pressure_bp = envelope
                 .pointer("/diagnostics/pressure_bp")
                 .and_then(serde_json::Value::as_u64)
@@ -292,11 +303,13 @@ impl RuntimeActivityPanel {
                 .map(|values| values.len().to_string())
                 .unwrap_or_else(|| "None".to_string());
             self.policy_action = app
+                .execution
                 .latest_runtime_policy
                 .as_ref()
                 .map(|policy| policy.recommended_profile.clone())
                 .unwrap_or_else(|| "None".to_string());
             self.policy_reason = app
+                .execution
                 .latest_runtime_policy
                 .as_ref()
                 .map(|policy| format!("{} signals", policy.signal_count))
@@ -330,7 +343,7 @@ impl RuntimeActivityPanel {
                     .unwrap_or_default(),
             );
         } else {
-            self.profile = format!("{} session", app.execution_policy_preset);
+            self.profile = format!("{} session", app.shell.execution_policy_preset);
             self.pressure_pct = 0;
             self.pressure_level = "Nominal".to_string();
             self.degradation_path = "None".to_string();
@@ -342,7 +355,7 @@ impl RuntimeActivityPanel {
             self.runtime_hash = "n/a".to_string();
             self.dynamic_hash = "n/a".to_string();
         }
-        if let Some(policy) = &app.latest_runtime_policy {
+        if let Some(policy) = &app.execution.latest_runtime_policy {
             self.runtime_policy_level = policy.level.clone();
             self.runtime_policy_score = policy.score;
             self.runtime_policy_agent = policy.agent_mode.clone();
@@ -355,7 +368,7 @@ impl RuntimeActivityPanel {
             self.runtime_policy_review = false;
             self.runtime_policy_signals = 0;
         }
-        if let Some(summary) = &app.latest_execution_graph_summary {
+        if let Some(summary) = &app.execution.latest_execution_graph_summary {
             self.execution_graph_status = summary.status.clone();
             self.execution_graph_graph_id = summary
                 .graph_id
@@ -385,6 +398,10 @@ impl RuntimeActivityPanel {
             self.execution_graph_conflicts = 0;
             self.execution_graph_completion_pct = "n/a".to_string();
         }
+    }
+
+    fn sync_activity_projection(&mut self, app: &App) {
+        let has_context = app.execution.latest_context_envelope.is_some();
         self.projection_run_count = 0;
         self.projection_tool_count = 0;
         self.projection_skill_count = 0;
@@ -394,6 +411,7 @@ impl RuntimeActivityPanel {
         self.projection_approval_count = 0;
         self.projection_activity_tree.clear();
         self.projection_model_speed = app
+            .execution
             .latest_model_telemetry
             .as_ref()
             .and_then(|telemetry| {
@@ -404,7 +422,7 @@ impl RuntimeActivityPanel {
                     .or_else(|| telemetry.model.clone())
             })
             .unwrap_or_else(|| "n/a".to_string());
-        if let Some(projection) = app.latest_execution_projection.as_ref() {
+        if let Some(projection) = app.execution.latest_execution_projection.as_ref() {
             self.projection_run_count = projection
                 .activities
                 .iter()
@@ -460,9 +478,11 @@ impl RuntimeActivityPanel {
             self.execution_graph_agent_tasks,
             self.provider_status,
             self.execution_policy_preset,
-            canonical_policy_axes(app.execution_policy_snapshot.as_ref())
+            canonical_policy_axes(app.shell.execution_policy_snapshot.as_ref())
         );
+    }
 
+    fn sync_timeline_activity(&mut self, app: &App) {
         // ── Runtime counters and current activity snapshot ──
         let timeline = app.timeline_clone_vec();
         self.event_count = timeline.len();
@@ -1181,6 +1201,7 @@ fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
         return None;
     }
     if let Some(projection) = app
+        .execution
         .latest_execution_projection
         .as_ref()
         .filter(|projection| projection.execution_id == target_id)
@@ -1209,7 +1230,8 @@ fn resolve_runtime_backlink(app: &App, target: &str) -> Option<String> {
             projection.graph.nodes.len()
         ));
     }
-    app.gateway_tasks
+    app.gateway
+        .gateway_tasks
         .iter()
         .find(|task| task.id == target_id)
         .map(|task| {
@@ -1334,9 +1356,9 @@ mod tests {
     #[test]
     fn syncs_runtime_and_context_from_app() {
         let mut app = App::new("m", "session-runtime-123456789");
-        app.execution_policy_preset = "yolo".to_string();
-        app.available_models = vec!["m".to_string(), "m-fast".to_string()];
-        app.gateway_connector_accounts =
+        app.shell.execution_policy_preset = "yolo".to_string();
+        app.shell.available_models = vec!["m".to_string(), "m-fast".to_string()];
+        app.gateway.gateway_connector_accounts =
             vec![crate::runtime_control_store::ConnectorAccountSummary {
                 provider: "anthropic".to_string(),
                 account_id: "account-1".to_string(),
@@ -1345,10 +1367,10 @@ mod tests {
                 reason: None,
                 binding_count: 1,
             }];
-        app.token_count = 42_000;
-        app.context_window = 200_000;
-        app.turn_input_tokens = 12_000;
-        app.turn_output_tokens = 3_000;
+        app.shell.token_count = 42_000;
+        app.execution.context_window = 200_000;
+        app.execution.turn_input_tokens = 12_000;
+        app.execution.turn_output_tokens = 3_000;
         app.add_message("user", "ship the runtime console");
         app.apply_event(CowdEvent::ToolStart {
             id: "tool-1".to_string(),
@@ -1386,11 +1408,11 @@ mod tests {
             },
         });
 
-        app.latest_context_envelope = Some(serde_json::json!({
+        app.execution.latest_context_envelope = Some(serde_json::json!({
             "selected": [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}],
             "omitted": [{"id": 5}]
         }));
-        app.latest_model_telemetry = Some(
+        app.execution.latest_model_telemetry = Some(
             serde_json::from_value(serde_json::json!({
                 "model": "test-model",
                 "wall_tokens_per_second": 21.25,
@@ -1476,7 +1498,7 @@ mod tests {
         let projection: crate::protocol::ExecutionProjection =
             serde_json::from_value(corpus["expected"].clone()).expect("expected projection");
         let mut app = App::new("m", "session-golden");
-        app.latest_execution_projection = Some(projection);
+        app.execution.latest_execution_projection = Some(projection);
 
         let mut panel = RuntimeActivityPanel::new();
         panel.sync_from_app(&app);
@@ -1503,7 +1525,7 @@ mod tests {
     #[test]
     fn strategy_agent_backlink_keyboard_activation_resolves_canonical_focus() {
         let mut app = App::new("m", "session-547");
-        app.latest_execution_projection = Some(strategy_projection());
+        app.execution.latest_execution_projection = Some(strategy_projection());
         let mut panel = RuntimeActivityPanel::new();
         panel.sync_from_app(&app);
         assert_eq!(
@@ -1553,7 +1575,7 @@ mod tests {
             projection.agents[0].id = format!("agent-{secret}");
             projection.agents[0].detail = Some(serde_json::json!({"graph_id": secret}));
             let mut app = App::new("m", "session-safe-links");
-            app.latest_execution_projection = Some(projection);
+            app.execution.latest_execution_projection = Some(projection);
             let mut panel = RuntimeActivityPanel::new();
             panel.sync_from_app(&app);
 

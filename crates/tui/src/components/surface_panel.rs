@@ -51,13 +51,13 @@ impl SurfacePanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
-        self.surfaces = app.gateway_surfaces.clone();
-        self.health = app.gateway_surface_health.clone();
-        self.events = app.gateway_surface_events.clone();
-        self.message_connectors = app.gateway_message_connectors.clone();
-        self.message_endpoints = app.gateway_message_endpoints.clone();
-        self.message_routes = app.gateway_message_routes.clone();
-        self.message_bindings = app.gateway_message_bindings.clone();
+        self.surfaces = app.gateway.gateway_surfaces.clone();
+        self.health = app.gateway.gateway_surface_health.clone();
+        self.events = app.gateway.gateway_surface_events.clone();
+        self.message_connectors = app.gateway.gateway_message_connectors.clone();
+        self.message_endpoints = app.gateway.gateway_message_endpoints.clone();
+        self.message_routes = app.gateway.gateway_message_routes.clone();
+        self.message_bindings = app.gateway.gateway_message_bindings.clone();
         if self.selected >= self.surfaces.len() {
             self.selected = self.surfaces.len().saturating_sub(1);
         }
@@ -645,7 +645,7 @@ mod tests {
     #[test]
     fn renders_surface_registry_without_platform_coupling() {
         let mut app = App::new("model", "session");
-        app.gateway_surface_health = Some(SurfaceHealthSummary {
+        app.gateway.gateway_surface_health = Some(SurfaceHealthSummary {
             status: "ready".to_string(),
             surface_count: 2,
             external_surface_count: 1,
@@ -653,7 +653,7 @@ mod tests {
             resource_count: 1,
             ..Default::default()
         });
-        app.gateway_surfaces = vec![
+        app.gateway.gateway_surfaces = vec![
             SurfaceSummary {
                 id: "tui".to_string(),
                 name: "TUI".to_string(),
@@ -683,7 +683,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        app.gateway_message_connectors =
+        app.gateway.gateway_message_connectors =
             vec![crate::runtime_control_store::MessageConnectorSummary {
                 connector: "webui".to_string(),
                 name: "webui".to_string(),
@@ -697,7 +697,7 @@ mod tests {
                 restart_count: 0,
                 circuit_open: false,
             }];
-        app.gateway_message_endpoints =
+        app.gateway.gateway_message_endpoints =
             vec![crate::runtime_control_store::MessageEndpointSummary {
                 endpoint_id: "message:webui:user".to_string(),
                 connector: "webui".to_string(),
@@ -706,25 +706,27 @@ mod tests {
                 configured: true,
                 capability_count: 1,
             }];
-        app.gateway_message_routes = vec![crate::runtime_control_store::MessageRouteSummary {
-            route_id: "message:webui:default".to_string(),
-            connector: "webui".to_string(),
-            policy: "origin".to_string(),
-            status: "configured".to_string(),
-            configured: true,
-            capability_count: 1,
-            runtime_status: "ready".to_string(),
-        }];
-        app.gateway_message_bindings = vec![crate::runtime_control_store::MessageBindingSummary {
-            binding_id: "message:webui:user:thread".to_string(),
-            connector: "webui".to_string(),
-            endpoint: "user".to_string(),
-            direction: "inbound".to_string(),
-            status: "processed".to_string(),
-            runtime_session_id: Some("session".to_string()),
-            resource_count: 0,
-            last_seen_at_ms: Some(1),
-        }];
+        app.gateway.gateway_message_routes =
+            vec![crate::runtime_control_store::MessageRouteSummary {
+                route_id: "message:webui:default".to_string(),
+                connector: "webui".to_string(),
+                policy: "origin".to_string(),
+                status: "configured".to_string(),
+                configured: true,
+                capability_count: 1,
+                runtime_status: "ready".to_string(),
+            }];
+        app.gateway.gateway_message_bindings =
+            vec![crate::runtime_control_store::MessageBindingSummary {
+                binding_id: "message:webui:user:thread".to_string(),
+                connector: "webui".to_string(),
+                endpoint: "user".to_string(),
+                direction: "inbound".to_string(),
+                status: "processed".to_string(),
+                runtime_session_id: Some("session".to_string()),
+                resource_count: 0,
+                last_seen_at_ms: Some(1),
+            }];
 
         let mut panel = SurfacePanel::new();
         panel.sync_from_app(&app);

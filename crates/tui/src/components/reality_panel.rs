@@ -53,13 +53,13 @@ impl RealityPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
-        self.core = app.gateway_reality_core.clone();
-        self.flow = app.gateway_fact_flow.clone();
-        self.structured = app.gateway_structured_data.clone();
-        self.memory_status = app.memory_status.clone();
-        self.memory_entries = app.memory_entries.len();
-        self.memory_governance = app.memory_governance.clone();
-        self.knowledge_candidates = app.gateway_knowledge_candidates.clone();
+        self.core = app.gateway.gateway_reality_core.clone();
+        self.flow = app.gateway.gateway_fact_flow.clone();
+        self.structured = app.gateway.gateway_structured_data.clone();
+        self.memory_status = app.workbench.memory_status.clone();
+        self.memory_entries = app.workbench.memory_entries.len();
+        self.memory_governance = app.workbench.memory_governance.clone();
+        self.knowledge_candidates = app.workbench.gateway_knowledge_candidates.clone();
     }
 
     pub fn render(&mut self, ctx: &mut RenderContext, area: Rect) {

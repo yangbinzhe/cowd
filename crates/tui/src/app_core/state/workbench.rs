@@ -1,0 +1,25 @@
+use super::SidebarTopicPanel;
+
+pub struct WorkbenchState {
+    pub agent_team_panel: crate::components::agent_team_panel::AgentTeamPanel,
+    pub l4_memory_view: super::L4MemoryView,
+    pub context_panel: crate::components::context_panel::ContextPanel,
+    pub file_changes_panel: crate::components::file_changes_panel::FileChangesPanel,
+    pub todo_panel: crate::components::todo_panel::TodoPanel,
+    pub goal_workbench_panel: crate::components::goal_workbench_panel::GoalWorkbenchPanel,
+    pub approval_cockpit_panel: crate::components::approval_cockpit_panel::ApprovalCockpitPanel,
+    pub file_tree: crate::components::file_tree::FileTree,
+    pub memory_panel: crate::components::memory_panel::MemoryPanel,
+    pub reality_panel: crate::components::reality_panel::RealityPanel,
+    pub skills_panel: crate::components::skills_panel::SkillsPanel,
+    pub config_panel: crate::components::config_panel::ConfigPanel,
+    pub gateway_panel: crate::components::gateway_panel::GatewayPanel,
+    pub surface_panel: crate::components::surface_panel::SurfacePanel,
+    pub runtime_activity_panel: crate::components::runtime_activity_panel::RuntimeActivityPanel,
+    pub tool_ops_panel: crate::components::tool_ops_panel::ToolOpsPanel,
+    pub system_status_bar: crate::components::system_status_bar::SystemStatusBar,
+    pub activity_panel: crate::components::activity_panel::ActivityPanel,
+    pub activity_panel_visible: bool,
+    pub sidebar_active_tab: usize,
+    pub(crate) active_topic_panel: Option<SidebarTopicPanel>,
+}

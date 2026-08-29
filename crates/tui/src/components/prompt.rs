@@ -1209,7 +1209,7 @@ impl Prompt {
     }
 
     /// Render the suggestion dropdown near the input area.
-    /// Public so TuiState can call it after rendering app.input directly.
+    /// Public so TuiState can call it after rendering app.shell.input directly.
     pub fn render_dropdown(&self, ctx: &mut RenderContext, base_area: Rect) {
         if !self.show_suggestions || self.suggestions.is_empty() {
             return;

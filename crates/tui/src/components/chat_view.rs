@@ -242,8 +242,8 @@ impl ChatView {
     /// Uses incremental append: clones only new entries, falls back to
     /// full rebuild on eviction, and patches the streaming tail in-place.
     pub fn sync_from_app(&mut self, app: &crate::App) {
-        if self.last_history_prepend_revision != app.history_prepend_revision {
-            if let Some(anchor_id) = app.history_prepend_anchor_message_id.as_ref() {
+        if self.last_history_prepend_revision != app.history.history_prepend_revision {
+            if let Some(anchor_id) = app.history.history_prepend_anchor_message_id.as_ref() {
                 if let Some(old_index) = self.timeline.iter().position(|entry| {
                     matches!(
                         entry,
@@ -267,15 +267,16 @@ impl ChatView {
                     self.pending_history_anchor = Some((anchor_id.clone(), within_anchor));
                 }
             }
-            self.last_history_prepend_revision = app.history_prepend_revision;
+            self.last_history_prepend_revision = app.history.history_prepend_revision;
         }
         let new_len = app.timeline_len();
         let previous_len = self.timeline.len();
         let previous_last_main = self.last_main_entry_index;
-        let content_changed = app.msg_version != self.msg_version || app.lines_dirty;
-        let session_changed = self.session_id != app.session_id;
-        let full_sync =
-            session_changed || self.last_full_sync_revision != app.timeline_full_sync_revision;
+        let content_changed =
+            app.timeline.msg_version != self.msg_version || app.timeline.lines_dirty;
+        let session_changed = self.session_id != app.shell.session_id;
+        let full_sync = session_changed
+            || self.last_full_sync_revision != app.timeline.timeline_full_sync_revision;
         let mut changed_main_outside_tail = false;
         if full_sync {
             self.timeline = app.timeline_clone_vec();
@@ -283,7 +284,7 @@ impl ChatView {
             self.last_assistant_entry_index = self.timeline.iter().rposition(
                 |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant"),
             );
-            self.last_timeline_mutation_revision = app.timeline_mutation_revision;
+            self.last_timeline_mutation_revision = app.timeline.timeline_mutation_revision;
             self.dirty_patch_indices.clear();
         } else if new_len > self.timeline.len() {
             for i in self.timeline.len()..new_len {
@@ -304,7 +305,7 @@ impl ChatView {
             self.last_assistant_entry_index = self.timeline.iter().rposition(
                 |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant"),
             );
-            self.last_timeline_mutation_revision = app.timeline_mutation_revision;
+            self.last_timeline_mutation_revision = app.timeline.timeline_mutation_revision;
             self.dirty_patch_indices.clear();
         }
         // Pull exact identity-aware mutations. A bounded-log miss is a
@@ -323,7 +324,7 @@ impl ChatView {
                             self.last_assistant_entry_index = self.timeline.iter().rposition(
                                 |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant"),
                             );
-                            self.last_full_sync_revision = app.timeline_full_sync_revision;
+                            self.last_full_sync_revision = app.timeline.timeline_full_sync_revision;
                             self.dirty_patch_indices.clear();
                             break;
                         };
@@ -345,7 +346,7 @@ impl ChatView {
                     self.last_assistant_entry_index = self.timeline.iter().rposition(
                         |entry| matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant"),
                     );
-                    self.last_timeline_mutation_revision = app.timeline_mutation_revision;
+                    self.last_timeline_mutation_revision = app.timeline.timeline_mutation_revision;
                     self.dirty_patch_indices.clear();
                     changed_main_outside_tail = true;
                 }
@@ -365,47 +366,59 @@ impl ChatView {
                 })
             })
             .flatten();
-        self.last_full_sync_revision = app.timeline_full_sync_revision;
-        self.session_id.clone_from(&app.session_id);
-        self.timeline_cursor = app.timeline_cursor;
-        self.scroll_state.offset = app.scroll_offset;
-        self.scroll_state.auto_scroll = app.auto_scroll;
-        self.scroll_state.viewport_height = app.viewport_height;
+        self.last_full_sync_revision = app.timeline.timeline_full_sync_revision;
+        self.session_id.clone_from(&app.shell.session_id);
+        self.timeline_cursor = app.timeline.timeline_cursor;
+        self.scroll_state.offset = app.timeline.scroll_offset;
+        self.scroll_state.auto_scroll = app.timeline.auto_scroll;
+        self.scroll_state.viewport_height = app.timeline.viewport_height;
         self.turn_active = app.turn_is_active();
-        self.turn_input_tokens = app.turn_input_tokens;
-        self.turn_output_tokens = app.turn_output_tokens;
-        self.turn_usage_known = app.turn_usage_known;
-        self.current_turn_tool_count = app.current_turn_tool_count;
-        self.current_turn_thinking_count = app.current_turn_thinking_count;
-        self.session_input_tokens = app.durable_session_input_tokens.max(app.input_tokens);
-        self.session_output_tokens = app.durable_session_output_tokens.max(app.output_tokens);
-        self.context_used_tokens = app.context_used_tokens;
-        self.context_window_tokens = app.context_window_tokens;
-        self.context_remaining_tokens = app.context_remaining_tokens;
-        self.context_usage_percent_bp = app.context_usage_percent_bp;
-        self.execution_status = app.current_execution_status;
-        self.execution_started_at_ms = app.execution_started_at_ms;
-        self.last_progress_at_ms = app.last_progress_at_ms;
-        self.run_metrics = app.current_run_metrics.clone();
-        self.memory_total_entries = app.memory_total_entries.unwrap_or(app.memory_entries.len());
+        self.turn_input_tokens = app.execution.turn_input_tokens;
+        self.turn_output_tokens = app.execution.turn_output_tokens;
+        self.turn_usage_known = app.execution.turn_usage_known;
+        self.current_turn_tool_count = app.execution.current_turn_tool_count;
+        self.current_turn_thinking_count = app.execution.current_turn_thinking_count;
+        self.session_input_tokens = app
+            .history
+            .durable_session_input_tokens
+            .max(app.history.input_tokens);
+        self.session_output_tokens = app
+            .history
+            .durable_session_output_tokens
+            .max(app.history.output_tokens);
+        self.context_used_tokens = app.execution.context_used_tokens;
+        self.context_window_tokens = app.execution.context_window_tokens;
+        self.context_remaining_tokens = app.execution.context_remaining_tokens;
+        self.context_usage_percent_bp = app.execution.context_usage_percent_bp;
+        self.execution_status = app.execution.current_execution_status;
+        self.execution_started_at_ms = app.execution.execution_started_at_ms;
+        self.last_progress_at_ms = app.execution.last_progress_at_ms;
+        self.run_metrics = app.execution.current_run_metrics.clone();
+        self.memory_total_entries = app
+            .workbench
+            .memory_total_entries
+            .unwrap_or(app.workbench.memory_entries.len());
         self.context_selected_count = app
+            .execution
             .latest_context_envelope
             .as_ref()
             .and_then(|value| value.get("selected").and_then(serde_json::Value::as_array))
             .map(Vec::len)
             .unwrap_or_default();
         self.context_omitted_count = app
+            .execution
             .latest_context_envelope
             .as_ref()
             .and_then(|value| value.get("omitted").and_then(serde_json::Value::as_array))
             .map(Vec::len)
             .unwrap_or_default();
         self.memory_candidate_count = app
+            .execution
             .latest_execution_graph_summary
             .as_ref()
             .map(|summary| summary.memory_candidates)
             .unwrap_or_default();
-        if let Some(flow) = &app.gateway_fact_flow {
+        if let Some(flow) = &app.gateway.gateway_fact_flow {
             self.reality_stage_count = flow.stage_count;
             self.reality_event_count = flow.event_count;
             self.reality_promotion_count = flow.promotion_count;
@@ -416,39 +429,43 @@ impl ChatView {
             self.reality_promotion_count = 0;
             self.reality_boundary_count = 0;
         }
-        self.pending_approval_count = app.gateway_pending_approvals.unwrap_or_default();
-        self.surface_count = app.gateway_surfaces.len();
-        self.degraded_count =
-            app.gateway_degraded_reasons.len() + app.gateway_connector_degraded_reasons.len();
-        self.spinner_idx = app.spinner_idx;
-        self.theme = app.theme;
-        self.msg_version = app.msg_version;
-        self.lines_dirty = app.lines_dirty;
-        if self.search_query != app.search_query
-            || self.search_matches != app.search_matches
-            || self.search_current != app.search_current
+        self.pending_approval_count = app.gateway.gateway_pending_approvals.unwrap_or_default();
+        self.surface_count = app.gateway.gateway_surfaces.len();
+        self.degraded_count = app.gateway.gateway_degraded_reasons.len()
+            + app.gateway.gateway_connector_degraded_reasons.len();
+        self.spinner_idx = app.shell.spinner_idx;
+        self.theme = app.shell.theme;
+        self.msg_version = app.timeline.msg_version;
+        self.lines_dirty = app.timeline.lines_dirty;
+        if self.search_query != app.timeline.search_query
+            || self.search_matches != app.timeline.search_matches
+            || self.search_current != app.timeline.search_current
         {
-            self.pending_search_scroll = app.search_matches.get(app.search_current).copied();
+            self.pending_search_scroll = app
+                .timeline
+                .search_matches
+                .get(app.timeline.search_current)
+                .copied();
         }
-        self.search_query = app.search_query.clone();
-        self.search_matches = app.search_matches.clone();
-        self.search_current = app.search_current;
-        self.compact_mode = app.compact_chat;
+        self.search_query = app.timeline.search_query.clone();
+        self.search_matches = app.timeline.search_matches.clone();
+        self.search_current = app.timeline.search_current;
+        self.compact_mode = app.shell.compact_chat;
     }
 
     /// Persist view-model back to the shared App state.
     /// Called after rendering to preserve cursor position and scroll offset.
     pub fn sync_to_app(&self, app: &mut crate::App) {
-        app.scroll_offset = self.scroll_state.offset;
-        app.auto_scroll = self.scroll_state.auto_scroll;
-        app.viewport_height = self.scroll_state.viewport_height;
-        app.cache_hits = self.finalized_cache_hits;
-        app.telemetry.finalized_cache_hits = self.finalized_cache_hits;
-        app.telemetry.finalized_cache_misses = self.finalized_cache_misses;
-        app.telemetry.live_tail_rebuild_count = self
+        app.timeline.scroll_offset = self.scroll_state.offset;
+        app.timeline.auto_scroll = self.scroll_state.auto_scroll;
+        app.timeline.viewport_height = self.scroll_state.viewport_height;
+        app.shell.cache_hits = self.finalized_cache_hits;
+        app.execution.telemetry.finalized_cache_hits = self.finalized_cache_hits;
+        app.execution.telemetry.finalized_cache_misses = self.finalized_cache_misses;
+        app.execution.telemetry.live_tail_rebuild_count = self
             .incremental_rebuild_count
             .saturating_add(self.dynamic_rebuild_count);
-        app.telemetry.full_timeline_rebuild_count = self.full_rebuild_count;
+        app.execution.telemetry.full_timeline_rebuild_count = self.full_rebuild_count;
     }
 
     // ── Navigation ────────────────────────────────────────────────
@@ -2055,30 +2072,31 @@ mod tests {
         let mut app = crate::App::new("requested-model", "compact-real-metrics");
         app.add_message("user", "question");
         app.add_message("assistant", "answer");
-        app.turn_input_tokens = 1_200;
-        app.turn_output_tokens = 340;
-        app.turn_usage_known = true;
-        app.durable_session_input_tokens = 8_000;
-        app.durable_session_output_tokens = 2_000;
-        app.context_used_tokens = Some(12_000);
-        app.context_window_tokens = Some(128_000);
-        app.context_remaining_tokens = Some(116_000);
-        app.context_usage_percent_bp = Some(938);
-        app.current_execution_status =
+        app.execution.turn_input_tokens = 1_200;
+        app.execution.turn_output_tokens = 340;
+        app.execution.turn_usage_known = true;
+        app.history.durable_session_input_tokens = 8_000;
+        app.history.durable_session_output_tokens = 2_000;
+        app.execution.context_used_tokens = Some(12_000);
+        app.execution.context_window_tokens = Some(128_000);
+        app.execution.context_remaining_tokens = Some(116_000);
+        app.execution.context_usage_percent_bp = Some(938);
+        app.execution.current_execution_status =
             Some(harness_contract::projection::ExecutionLiveStatus::CallingTool);
-        app.execution_started_at_ms = Some(current_time_ms().saturating_sub(5_000));
-        app.last_progress_at_ms = Some(current_time_ms().saturating_sub(500));
-        app.current_run_metrics = Some(harness_contract::projection::RunMetricsProjection {
-            tool_calls: 4,
-            memory_recalls: 2,
-            memory_evidence: 1,
-            approvals: 1,
-            files_touched: 3,
-            input_tokens: 1_200,
-            output_tokens: 340,
-            total_tokens: 1_540,
-            ..Default::default()
-        });
+        app.execution.execution_started_at_ms = Some(current_time_ms().saturating_sub(5_000));
+        app.execution.last_progress_at_ms = Some(current_time_ms().saturating_sub(500));
+        app.execution.current_run_metrics =
+            Some(harness_contract::projection::RunMetricsProjection {
+                tool_calls: 4,
+                memory_recalls: 2,
+                memory_evidence: 1,
+                approvals: 1,
+                files_touched: 3,
+                input_tokens: 1_200,
+                output_tokens: 340,
+                total_tokens: 1_540,
+                ..Default::default()
+            });
 
         let mut view = ChatView::new();
         view.sync_from_app(&app);
@@ -2826,9 +2844,9 @@ mod tests {
     #[test]
     fn sync_roundtrip() {
         let mut app = crate::test_utils::app_with_messages(5);
-        app.scroll_offset = 10;
-        app.auto_scroll = false;
-        app.viewport_height = 30;
+        app.timeline.scroll_offset = 10;
+        app.timeline.auto_scroll = false;
+        app.timeline.viewport_height = 30;
 
         let mut view = ChatView::new();
         view.sync_from_app(&app);
@@ -2842,8 +2860,8 @@ mod tests {
         view.scroll_state.auto_scroll = true;
         view.sync_to_app(&mut app);
 
-        assert_eq!(app.scroll_offset, 42);
-        assert!(app.auto_scroll);
+        assert_eq!(app.timeline.scroll_offset, 42);
+        assert!(app.timeline.auto_scroll);
     }
 
     // ── Task 5: Per-message actions menu ────────────────────────────

@@ -443,50 +443,56 @@ impl RuntimeControlSnapshot {
 
     pub fn from_app(app: &App) -> Self {
         Self {
-            gateway_running: app.server_running,
-            active_sessions: app.active_api_sessions,
-            uptime_secs: app.server_uptime_secs,
-            runtime_readiness: app.gateway_runtime_readiness.clone(),
-            runtime_components: app.gateway_runtime_components,
-            task_count: app.gateway_task_count,
-            tasks: app.gateway_tasks.clone(),
-            pending_approvals: app.gateway_pending_approvals,
-            approval_items: app.gateway_approval_items.clone(),
-            approval_grants: app.gateway_approval_grants.clone(),
-            lease_owner: app.gateway_lease_owner.clone(),
-            lease_mode: app.gateway_lease_mode.clone(),
-            memory_status: app.memory_status.clone(),
-            memory_total_entries: app.memory_total_entries,
-            memory_vector_count: app.memory_vector_count,
-            memory_layer_counts: app.memory_layer_counts,
-            memory_context_envelope_status: app.memory_context_envelope_status.clone(),
-            memory_context_envelope_compression: app.memory_context_envelope_compression.clone(),
-            memory_context_envelope_used_ratio: app.memory_context_envelope_used_ratio,
-            memory_context_envelope_checkpoint: app.memory_context_envelope_checkpoint.clone(),
-            memory_governance: app.memory_governance.clone(),
-            knowledge_candidates: app.gateway_knowledge_candidates.clone(),
-            cross_plane_grants_active: app.gateway_cross_plane_grants_active,
-            cross_plane_actions_24h: app.gateway_cross_plane_actions_24h,
-            connector_accounts: app.gateway_connector_accounts.clone(),
-            connector_capabilities: app.gateway_connector_capabilities.clone(),
-            connector_resources: app.gateway_connector_resources.clone(),
-            action_receipts: app.gateway_action_receipts.clone(),
-            surfaces: app.gateway_surfaces.clone(),
-            surface_health: app.gateway_surface_health.clone(),
-            surface_events: app.gateway_surface_events.clone(),
-            message_connectors: app.gateway_message_connectors.clone(),
-            message_endpoints: app.gateway_message_endpoints.clone(),
-            message_routes: app.gateway_message_routes.clone(),
-            message_bindings: app.gateway_message_bindings.clone(),
-            cowd_kernel: app.gateway_cowd_kernel.clone(),
-            gateway_capability_contract: app.gateway_capability_contract.clone(),
-            structured_data: app.gateway_structured_data.clone(),
-            reality_core: app.gateway_reality_core.clone(),
-            fact_flow: app.gateway_fact_flow.clone(),
-            mission_control: app.gateway_mission_control.clone(),
-            mission_materialized: app.gateway_mission_materialized.clone(),
-            connector_degraded_reasons: app.gateway_connector_degraded_reasons.clone(),
-            degraded_reasons: app.gateway_degraded_reasons.clone(),
+            gateway_running: app.gateway.server_running,
+            active_sessions: app.gateway.active_api_sessions,
+            uptime_secs: app.gateway.server_uptime_secs,
+            runtime_readiness: app.gateway.gateway_runtime_readiness.clone(),
+            runtime_components: app.gateway.gateway_runtime_components,
+            task_count: app.gateway.gateway_task_count,
+            tasks: app.gateway.gateway_tasks.clone(),
+            pending_approvals: app.gateway.gateway_pending_approvals,
+            approval_items: app.gateway.gateway_approval_items.clone(),
+            approval_grants: app.gateway.gateway_approval_grants.clone(),
+            lease_owner: app.gateway.gateway_lease_owner.clone(),
+            lease_mode: app.gateway.gateway_lease_mode.clone(),
+            memory_status: app.workbench.memory_status.clone(),
+            memory_total_entries: app.workbench.memory_total_entries,
+            memory_vector_count: app.workbench.memory_vector_count,
+            memory_layer_counts: app.workbench.memory_layer_counts,
+            memory_context_envelope_status: app.workbench.memory_context_envelope_status.clone(),
+            memory_context_envelope_compression: app
+                .workbench
+                .memory_context_envelope_compression
+                .clone(),
+            memory_context_envelope_used_ratio: app.workbench.memory_context_envelope_used_ratio,
+            memory_context_envelope_checkpoint: app
+                .workbench
+                .memory_context_envelope_checkpoint
+                .clone(),
+            memory_governance: app.workbench.memory_governance.clone(),
+            knowledge_candidates: app.workbench.gateway_knowledge_candidates.clone(),
+            cross_plane_grants_active: app.gateway.gateway_cross_plane_grants_active,
+            cross_plane_actions_24h: app.gateway.gateway_cross_plane_actions_24h,
+            connector_accounts: app.gateway.gateway_connector_accounts.clone(),
+            connector_capabilities: app.gateway.gateway_connector_capabilities.clone(),
+            connector_resources: app.gateway.gateway_connector_resources.clone(),
+            action_receipts: app.gateway.gateway_action_receipts.clone(),
+            surfaces: app.gateway.gateway_surfaces.clone(),
+            surface_health: app.gateway.gateway_surface_health.clone(),
+            surface_events: app.gateway.gateway_surface_events.clone(),
+            message_connectors: app.gateway.gateway_message_connectors.clone(),
+            message_endpoints: app.gateway.gateway_message_endpoints.clone(),
+            message_routes: app.gateway.gateway_message_routes.clone(),
+            message_bindings: app.gateway.gateway_message_bindings.clone(),
+            cowd_kernel: app.gateway.gateway_cowd_kernel.clone(),
+            gateway_capability_contract: app.gateway.gateway_capability_contract.clone(),
+            structured_data: app.gateway.gateway_structured_data.clone(),
+            reality_core: app.gateway.gateway_reality_core.clone(),
+            fact_flow: app.gateway.gateway_fact_flow.clone(),
+            mission_control: app.gateway.gateway_mission_control.clone(),
+            mission_materialized: app.gateway.gateway_mission_materialized.clone(),
+            connector_degraded_reasons: app.gateway.gateway_connector_degraded_reasons.clone(),
+            degraded_reasons: app.gateway.gateway_degraded_reasons.clone(),
             ..Self::default()
         }
     }
@@ -503,55 +509,57 @@ impl RuntimeControlSnapshot {
     }
 
     pub fn apply_to_app(&self, app: &mut App) {
-        app.server_running = self.gateway_running;
-        app.server_uptime_secs = self.uptime_secs;
-        app.active_api_sessions = self.active_sessions;
-        app.gateway_runtime_readiness = self.runtime_readiness.clone();
-        app.gateway_runtime_components = self.runtime_components;
-        app.gateway_task_count = self.task_count;
-        app.gateway_tasks = self.tasks.clone();
-        app.gateway_pending_approvals = self.pending_approvals;
-        app.gateway_approval_items = self.approval_items.clone();
-        app.gateway_approval_grants = self.approval_grants.clone();
-        app.memory_status = self.memory_status.clone();
-        app.memory_total_entries = self.memory_total_entries;
-        app.memory_vector_count = self.memory_vector_count;
-        app.memory_layer_counts = self.memory_layer_counts;
-        app.memory_context_envelope_status = self.memory_context_envelope_status.clone();
-        app.memory_context_envelope_compression = self.memory_context_envelope_compression.clone();
-        app.memory_context_envelope_used_ratio = self.memory_context_envelope_used_ratio;
-        app.memory_context_envelope_checkpoint = self.memory_context_envelope_checkpoint.clone();
-        app.memory_governance = self.memory_governance.clone();
-        app.gateway_knowledge_candidates = self.knowledge_candidates.clone();
-        app.gateway_cross_plane_grants_active = self.cross_plane_grants_active;
-        app.gateway_cross_plane_actions_24h = self.cross_plane_actions_24h;
-        app.gateway_connector_accounts = self.connector_accounts.clone();
-        app.gateway_connector_capabilities = self.connector_capabilities.clone();
-        app.gateway_connector_resources = self.connector_resources.clone();
-        app.gateway_action_receipts = self.action_receipts.clone();
-        app.gateway_surfaces = self.surfaces.clone();
-        app.gateway_surface_health = self.surface_health.clone();
-        app.gateway_surface_events = self.surface_events.clone();
-        app.gateway_message_connectors = self.message_connectors.clone();
-        app.gateway_message_endpoints = self.message_endpoints.clone();
-        app.gateway_message_routes = self.message_routes.clone();
-        app.gateway_message_bindings = self.message_bindings.clone();
-        app.gateway_cowd_kernel = self.cowd_kernel.clone();
-        app.gateway_capability_contract = self.gateway_capability_contract.clone();
-        app.gateway_structured_data = self.structured_data.clone();
-        app.gateway_reality_core = self.reality_core.clone();
-        app.gateway_fact_flow = self.fact_flow.clone();
-        app.gateway_mission_control = self.mission_control.clone();
-        app.gateway_mission_materialized = self.mission_materialized.clone();
-        app.gateway_connector_degraded_reasons = self.connector_degraded_reasons.clone();
-        app.gateway_degraded_reasons = self.degraded_reasons.clone();
+        app.gateway.server_running = self.gateway_running;
+        app.gateway.server_uptime_secs = self.uptime_secs;
+        app.gateway.active_api_sessions = self.active_sessions;
+        app.gateway.gateway_runtime_readiness = self.runtime_readiness.clone();
+        app.gateway.gateway_runtime_components = self.runtime_components;
+        app.gateway.gateway_task_count = self.task_count;
+        app.gateway.gateway_tasks = self.tasks.clone();
+        app.gateway.gateway_pending_approvals = self.pending_approvals;
+        app.gateway.gateway_approval_items = self.approval_items.clone();
+        app.gateway.gateway_approval_grants = self.approval_grants.clone();
+        app.workbench.memory_status = self.memory_status.clone();
+        app.workbench.memory_total_entries = self.memory_total_entries;
+        app.workbench.memory_vector_count = self.memory_vector_count;
+        app.workbench.memory_layer_counts = self.memory_layer_counts;
+        app.workbench.memory_context_envelope_status = self.memory_context_envelope_status.clone();
+        app.workbench.memory_context_envelope_compression =
+            self.memory_context_envelope_compression.clone();
+        app.workbench.memory_context_envelope_used_ratio = self.memory_context_envelope_used_ratio;
+        app.workbench.memory_context_envelope_checkpoint =
+            self.memory_context_envelope_checkpoint.clone();
+        app.workbench.memory_governance = self.memory_governance.clone();
+        app.workbench.gateway_knowledge_candidates = self.knowledge_candidates.clone();
+        app.gateway.gateway_cross_plane_grants_active = self.cross_plane_grants_active;
+        app.gateway.gateway_cross_plane_actions_24h = self.cross_plane_actions_24h;
+        app.gateway.gateway_connector_accounts = self.connector_accounts.clone();
+        app.gateway.gateway_connector_capabilities = self.connector_capabilities.clone();
+        app.gateway.gateway_connector_resources = self.connector_resources.clone();
+        app.gateway.gateway_action_receipts = self.action_receipts.clone();
+        app.gateway.gateway_surfaces = self.surfaces.clone();
+        app.gateway.gateway_surface_health = self.surface_health.clone();
+        app.gateway.gateway_surface_events = self.surface_events.clone();
+        app.gateway.gateway_message_connectors = self.message_connectors.clone();
+        app.gateway.gateway_message_endpoints = self.message_endpoints.clone();
+        app.gateway.gateway_message_routes = self.message_routes.clone();
+        app.gateway.gateway_message_bindings = self.message_bindings.clone();
+        app.gateway.gateway_cowd_kernel = self.cowd_kernel.clone();
+        app.gateway.gateway_capability_contract = self.gateway_capability_contract.clone();
+        app.gateway.gateway_structured_data = self.structured_data.clone();
+        app.gateway.gateway_reality_core = self.reality_core.clone();
+        app.gateway.gateway_fact_flow = self.fact_flow.clone();
+        app.gateway.gateway_mission_control = self.mission_control.clone();
+        app.gateway.gateway_mission_materialized = self.mission_materialized.clone();
+        app.gateway.gateway_connector_degraded_reasons = self.connector_degraded_reasons.clone();
+        app.gateway.gateway_degraded_reasons = self.degraded_reasons.clone();
         // The account-wide Runtime snapshot can contain leases belonging to
         // other observers. Once this Surface has an explicit lease outcome,
         // that local admission result is authoritative and must not be
         // overwritten by the first item in the global lease list.
-        if app.gateway_lease_owner.is_none() && app.gateway_lease_mode.is_none() {
-            app.gateway_lease_owner = self.lease_owner.clone();
-            app.gateway_lease_mode = self.lease_mode.clone();
+        if app.gateway.gateway_lease_owner.is_none() && app.gateway.gateway_lease_mode.is_none() {
+            app.gateway.gateway_lease_owner = self.lease_owner.clone();
+            app.gateway.gateway_lease_mode = self.lease_mode.clone();
         }
     }
 
@@ -2589,7 +2597,7 @@ mod tests {
     #[test]
     fn global_snapshot_cannot_overwrite_this_surfaces_read_only_admission() {
         let mut app = App::new("model", "session");
-        app.gateway_lease_mode = Some("read-only".to_string());
+        app.gateway.gateway_lease_mode = Some("read-only".to_string());
         let snapshot = RuntimeControlSnapshot {
             lease_owner: Some("another-surface".to_string()),
             lease_mode: Some("exclusive".to_string()),
@@ -2598,8 +2606,8 @@ mod tests {
 
         snapshot.apply_to_app(&mut app);
 
-        assert_eq!(app.gateway_lease_owner, None);
-        assert_eq!(app.gateway_lease_mode.as_deref(), Some("read-only"));
+        assert_eq!(app.gateway.gateway_lease_owner, None);
+        assert_eq!(app.gateway.gateway_lease_mode.as_deref(), Some("read-only"));
     }
 
     #[test]

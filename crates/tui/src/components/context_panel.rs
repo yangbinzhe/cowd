@@ -52,13 +52,13 @@ impl ContextPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
-        self.token_count = app.token_count;
-        self.context_window = app.context_window;
-        self.turn_input_tokens = app.turn_input_tokens;
-        self.turn_output_tokens = app.turn_output_tokens;
-        self.latest_envelope = app.latest_context_envelope.clone();
-        self.memory_status = app.memory_status.clone();
-        self.memory_entry_count = app.memory_entries.len();
+        self.token_count = app.shell.token_count;
+        self.context_window = app.execution.context_window;
+        self.turn_input_tokens = app.execution.turn_input_tokens;
+        self.turn_output_tokens = app.execution.turn_output_tokens;
+        self.latest_envelope = app.execution.latest_context_envelope.clone();
+        self.memory_status = app.workbench.memory_status.clone();
+        self.memory_entry_count = app.workbench.memory_entries.len();
     }
 
     pub fn from_app(app: &App) -> Self {
@@ -714,12 +714,12 @@ mod tests {
     #[test]
     fn updates_on_sync() {
         let mut app = App::new("m", "s");
-        app.token_count = 10_000;
-        app.context_window = 100_000;
-        app.turn_input_tokens = 500;
-        app.turn_output_tokens = 200;
-        app.memory_status = Some("available".to_string());
-        app.memory_entries = vec![crate::app::MemoryEntry {
+        app.shell.token_count = 10_000;
+        app.execution.context_window = 100_000;
+        app.execution.turn_input_tokens = 500;
+        app.execution.turn_output_tokens = 200;
+        app.workbench.memory_status = Some("available".to_string());
+        app.workbench.memory_entries = vec![crate::app::MemoryEntry {
             id: Some("m1".to_string()),
             layer: "L4".to_string(),
             content: "durable note".to_string(),
@@ -735,7 +735,7 @@ mod tests {
         assert_eq!(panel.memory_entry_count, 1);
 
         // Re-sync with updated values
-        app.token_count = 20_000;
+        app.shell.token_count = 20_000;
         panel.sync_from_app(&app);
         assert_eq!(panel.token_count, 20_000);
     }

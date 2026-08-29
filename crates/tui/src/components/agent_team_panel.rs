@@ -134,6 +134,7 @@ impl AgentTeamPanel {
     pub fn sync_from_app(&mut self, app: &App) {
         let prev_len = self.agents.len();
         self.agents = app
+            .workbench
             .delegate_tasks
             .iter()
             .map(delegate_task_to_agent)
@@ -142,8 +143,8 @@ impl AgentTeamPanel {
             self.detail_idx = None;
         }
         self.sync();
-        self.execution_graph_summary = app.latest_execution_graph_summary.clone();
-        self.delegate_tasks = app.delegate_tasks.clone();
+        self.execution_graph_summary = app.execution.latest_execution_graph_summary.clone();
+        self.delegate_tasks = app.workbench.delegate_tasks.clone();
     }
 
     /// Toggle panel visibility.
@@ -1222,7 +1223,7 @@ mod tests {
     #[test]
     fn sync_from_app_delegates_to_sync() {
         let mut app = App::new("m", "s");
-        app.delegate_tasks = vec![DelegateTask {
+        app.workbench.delegate_tasks = vec![DelegateTask {
             id: "via-app".to_string(),
             description: "plan delegated work".to_string(),
             status: "running".to_string(),
@@ -1248,7 +1249,7 @@ mod tests {
         ));
 
         let mut app = App::new("m", "s");
-        app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
+        app.execution.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
             graph_id: Some("graph-1".to_string()),
             board_id: Some("board-1".to_string()),
             status: "running".to_string(),
@@ -1260,7 +1261,7 @@ mod tests {
             synthesis_lift: Some(1.25),
             complementarity_score: Some(0.82),
         });
-        app.delegate_tasks = vec![DelegateTask {
+        app.workbench.delegate_tasks = vec![DelegateTask {
             id: "delegate-1".to_string(),
             description: "review context-memory integration".to_string(),
             status: "running".to_string(),

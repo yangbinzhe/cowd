@@ -87,15 +87,20 @@ impl PerformanceDashboard {
             return;
         }
         let cache_total = app
+            .execution
             .telemetry
             .finalized_cache_hits
-            .saturating_add(app.telemetry.finalized_cache_misses);
-        let has_reported_data = app.telemetry.history_hydration_duration_ms.is_some()
+            .saturating_add(app.execution.telemetry.finalized_cache_misses);
+        let has_reported_data = app
+            .execution
+            .telemetry
+            .history_hydration_duration_ms
+            .is_some()
             || cache_total > 0
-            || app.telemetry.session_sse_reconnect_count > 0
-            || app.telemetry.projection_sse_reconnect_count > 0
-            || app.telemetry.full_timeline_rebuild_count > 0
-            || app.telemetry.live_tail_rebuild_count > 0;
+            || app.execution.telemetry.session_sse_reconnect_count > 0
+            || app.execution.telemetry.projection_sse_reconnect_count > 0
+            || app.execution.telemetry.full_timeline_rebuild_count > 0
+            || app.execution.telemetry.live_tail_rebuild_count > 0;
         if !has_reported_data {
             self.last_report = None;
             self.last_sync = Instant::now();
@@ -103,13 +108,18 @@ impl PerformanceDashboard {
         }
 
         let cache_hit_rate = (cache_total > 0)
-            .then(|| app.telemetry.finalized_cache_hits as f64 / cache_total as f64);
+            .then(|| app.execution.telemetry.finalized_cache_hits as f64 / cache_total as f64);
         let report = PerformanceReport {
             avg_prepare_context_latency_ms: app
+                .execution
                 .telemetry
                 .history_hydration_duration_ms
                 .unwrap_or_default() as f64,
-            latency_reported: app.telemetry.history_hydration_duration_ms.is_some(),
+            latency_reported: app
+                .execution
+                .telemetry
+                .history_hydration_duration_ms
+                .is_some(),
             cache_hit_rate: cache_hit_rate.unwrap_or_default(),
             cache_hit_rate_reported: cache_hit_rate.is_some(),
             avg_compression_ratio: 0.0,
@@ -119,7 +129,7 @@ impl PerformanceDashboard {
             tuning_applied: false,
             last_tuning: None,
             total_samples: usize::try_from(cache_total).unwrap_or(usize::MAX),
-            window_size: app.telemetry.history_hydrated_messages,
+            window_size: app.execution.telemetry.history_hydrated_messages,
             current_tuning: TuningConfig::default(),
             last_updated: Some(Utc::now()),
         };

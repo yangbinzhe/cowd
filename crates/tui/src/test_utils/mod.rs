@@ -585,8 +585,8 @@ mod tests {
         tui_test_macro_dimensions,
         |terminal: &mut MockTerminal, app: &mut App, _sender: MockEventSender| {
             assert_eq!(terminal.dimensions(), (80, 24));
-            assert_eq!(app.model, "test-model");
-            assert_eq!(app.session_id, "test-session");
+            assert_eq!(app.shell.model, "test-model");
+            assert_eq!(app.shell.session_id, "test-session");
         }
     );
 }

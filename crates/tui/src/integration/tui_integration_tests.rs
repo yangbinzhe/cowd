@@ -40,8 +40,8 @@ fn key_alt(code: KeyCode) -> KeyEvent {
 fn integration_launch_type_stream() {
     let mut state = TuiState::new("test-model", "test-session");
 
-    assert!(!state.should_quit);
-    assert_eq!(state.model, "test-model");
+    assert!(!state.app.shell.should_quit);
+    assert_eq!(state.app.shell.model, "test-model");
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::NONE));
     state.process_raw_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
@@ -52,9 +52,9 @@ fn integration_launch_type_stream() {
     let result = state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert!(matches!(result, ProcessedKey::Submit(text) if text == "Hello"));
 
-    state.add_message("user", "Hello");
+    state.app.add_message("user", "Hello");
     state.apply_event(CowdEvent::TurnStarted);
-    assert!(state.turn_is_active());
+    assert!(state.app.turn_is_active());
 
     let correlation = crate::protocol::GatewayEventCorrelation {
         session_id: "test-session".to_string(),
@@ -86,8 +86,8 @@ fn integration_launch_type_stream() {
         },
     });
 
-    assert!(!state.turn_is_active());
-    assert!(state.timeline_len() >= 2);
+    assert!(!state.app.turn_is_active());
+    assert!(state.app.timeline_len() >= 2);
 }
 
 #[test]
@@ -110,70 +110,71 @@ fn integration_render_chat_view_visible() {
 #[test]
 fn integration_panel_switch() {
     let mut state = TuiState::new("test-model", "test-session");
-    assert!(!state.layout_state.sidebar_visible);
+    assert!(!state.shell.layout_state.sidebar_visible);
 
     state.handle_input(key_ctrl(KeyCode::Char('b')));
-    assert!(state.layout_state.sidebar_visible);
+    assert!(state.shell.layout_state.sidebar_visible);
 
     // Default tab is Chat (index 0)
-    assert_eq!(state.sidebar_active_tab, 0);
+    assert_eq!(state.workbench.sidebar_active_tab, 0);
 
     // Tab cycles through every registered sidebar tab and then wraps.
     for expected in 1..SIDEBAR_TAB_COUNT {
         state.handle_input(key(KeyCode::Tab));
         assert_eq!(
-            state.sidebar_active_tab, expected,
+            state.workbench.sidebar_active_tab, expected,
             "Tab cycle step to tab {expected}"
         );
     }
     // Final Tab wraps back to 0.
     state.handle_input(key(KeyCode::Tab));
-    assert_eq!(state.sidebar_active_tab, 0);
+    assert_eq!(state.workbench.sidebar_active_tab, 0);
 }
 
 #[test]
 fn integration_terminal_display_mode_and_control_shortcuts() {
     let mut state = TuiState::new("test-model", "test-session");
 
-    assert!(!state.app.compact_chat);
+    assert!(!state.app.shell.compact_chat);
     state.process_raw_key(key_alt(KeyCode::Char('v')));
-    assert!(state.app.compact_chat);
+    assert!(state.app.shell.compact_chat);
     state.process_raw_key(key_alt(KeyCode::Char('v')));
-    assert!(!state.app.compact_chat);
+    assert!(!state.app.shell.compact_chat);
 
     state.process_raw_key(key_alt(KeyCode::Char('e')));
-    assert!(state.layout_state.sidebar_visible);
-    assert_eq!(state.sidebar_active_tab, TAB_RUNTIME);
-    assert!(!state.app.compact_chat);
+    assert!(state.shell.layout_state.sidebar_visible);
+    assert_eq!(state.workbench.sidebar_active_tab, TAB_RUNTIME);
+    assert!(!state.app.shell.compact_chat);
 
     state.process_raw_key(key_alt(KeyCode::Char('g')));
-    assert!(state.layout_state.sidebar_visible);
-    assert_eq!(state.sidebar_active_tab, TAB_GATEWAY);
+    assert!(state.shell.layout_state.sidebar_visible);
+    assert_eq!(state.workbench.sidebar_active_tab, TAB_GATEWAY);
 }
 
 #[test]
 fn integration_clean_mode_renders_current_turn_live_stats() {
     let mut terminal = MockTerminal::new(120, 24);
     let mut state = TuiState::new("test-model", "test-session");
-    state.app.compact_chat = true;
+    state.app.shell.compact_chat = true;
     state.app.add_message("user", "Run a diagnostic");
     state.app.add_message("assistant", "Diagnostic complete.");
-    state.app.turn_input_tokens = 1_200;
-    state.app.turn_output_tokens = 340;
-    state.app.turn_usage_known = true;
-    state.app.current_execution_status =
+    state.app.execution.turn_input_tokens = 1_200;
+    state.app.execution.turn_output_tokens = 340;
+    state.app.execution.turn_usage_known = true;
+    state.app.execution.current_execution_status =
         Some(harness_contract::projection::ExecutionLiveStatus::CallingTool);
-    state.app.current_run_metrics = Some(harness_contract::projection::RunMetricsProjection {
-        tool_calls: 4,
-        memory_recalls: 2,
-        memory_evidence: 1,
-        approvals: 1,
-        files_touched: 3,
-        input_tokens: 1_200,
-        output_tokens: 340,
-        total_tokens: 1_540,
-        ..Default::default()
-    });
+    state.app.execution.current_run_metrics =
+        Some(harness_contract::projection::RunMetricsProjection {
+            tool_calls: 4,
+            memory_recalls: 2,
+            memory_evidence: 1,
+            approvals: 1,
+            files_touched: 3,
+            input_tokens: 1_200,
+            output_tokens: 340,
+            total_tokens: 1_540,
+            ..Default::default()
+        });
 
     terminal.draw(|frame| state.render(frame));
     let joined = terminal.buffer_lines().join("\n");
@@ -208,40 +209,41 @@ fn integration_session_picker_lifecycle() {
             message_count: 10,
         },
     ];
-    state.open_session_picker(sessions);
-    assert!(state.picker_active);
-    assert_eq!(state.picker_selected_id(), Some("sess-001"));
+    state.app.open_session_picker(sessions);
+    assert!(state.app.shell.picker_active);
+    assert_eq!(state.app.picker_selected_id(), Some("sess-001"));
 
-    state.picker_down();
-    assert_eq!(state.picker_selected_id(), Some("sess-002"));
+    state.app.picker_down();
+    assert_eq!(state.app.picker_selected_id(), Some("sess-002"));
 
-    state.picker_up();
-    assert_eq!(state.picker_selected_id(), Some("sess-001"));
+    state.app.picker_up();
+    assert_eq!(state.app.picker_selected_id(), Some("sess-001"));
 
-    state.close_session_picker();
-    assert!(!state.picker_active);
+    state.app.close_session_picker();
+    assert!(!state.app.shell.picker_active);
 }
 
 #[test]
 fn integration_approval_dialog_lifecycle() {
     let mut state = TuiState::new("test-model", "test-session");
 
-    state.gateway_approval_items = vec![crate::runtime_control_store::ApprovalSummary {
-        id: "approval-1".into(),
-        tool_name: "bash".into(),
-        input_preview: "rm -rf /".into(),
-        allowed_scopes: vec!["once".into()],
-        ..Default::default()
-    }];
+    state.app.gateway.gateway_approval_items =
+        vec![crate::runtime_control_store::ApprovalSummary {
+            id: "approval-1".into(),
+            tool_name: "bash".into(),
+            input_preview: "rm -rf /".into(),
+            allowed_scopes: vec!["once".into()],
+            ..Default::default()
+        }];
 
     state.open_approval_dialog();
-    assert!(!state.dialog_manager.is_empty());
+    assert!(!state.overlay.dialog_manager.is_empty());
 
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
     let handled = state.handle_input(enter);
     assert!(!handled, "Enter must not approve a side effect");
     assert!(
-        !state.dialog_manager.is_empty(),
+        !state.overlay.dialog_manager.is_empty(),
         "fail-closed Enter must leave the approval dialog open"
     );
 
@@ -249,7 +251,7 @@ fn integration_approval_dialog_lifecycle() {
     let handled = state.handle_input(explicit_yes);
     assert!(handled, "explicit Y must resolve an approvable request");
     assert!(
-        state.dialog_manager.is_empty(),
+        state.overlay.dialog_manager.is_empty(),
         "an explicit verdict must close the approval dialog"
     );
 }
@@ -257,40 +259,40 @@ fn integration_approval_dialog_lifecycle() {
 #[test]
 fn integration_model_switch() {
     let mut state = TuiState::new("claude-sonnet-4-6", "test-session");
-    state.available_models = vec![
+    state.app.shell.available_models = vec![
         "claude-sonnet-4-6".into(),
         "claude-haiku-4-5".into(),
         "deepseek-v4-pro".into(),
     ];
 
-    let new_model = state.next_model();
+    let new_model = state.app.next_model();
     assert_eq!(new_model, Some("claude-haiku-4-5".into()));
-    assert!(state.model_dirty);
+    assert!(state.app.shell.model_dirty);
 
-    let new_model2 = state.next_model();
+    let new_model2 = state.app.next_model();
     assert_eq!(new_model2, Some("deepseek-v4-pro".into()));
 
-    let new_model3 = state.next_model();
+    let new_model3 = state.app.next_model();
     assert_eq!(new_model3, Some("claude-sonnet-4-6".into()));
 }
 
 #[test]
 fn integration_theme_toggle() {
     let mut state = TuiState::new("test-model", "test-session");
-    assert_eq!(state.theme, crate::app::Theme::Dark);
-    assert_eq!(state.theme_engine.theme.name, "dark");
+    assert_eq!(state.app.shell.theme, crate::app::Theme::Dark);
+    assert_eq!(state.shell.theme_engine.theme.name, "dark");
 
     state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     state.handle_input(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
 
-    assert_eq!(state.theme, crate::app::Theme::Light);
-    assert_eq!(state.theme_engine.theme.name, "light");
+    assert_eq!(state.app.shell.theme, crate::app::Theme::Light);
+    assert_eq!(state.shell.theme_engine.theme.name, "light");
 
     state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     state.handle_input(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
 
-    assert_eq!(state.theme, crate::app::Theme::Dark);
-    assert_eq!(state.theme_engine.theme.name, "dark");
+    assert_eq!(state.app.shell.theme, crate::app::Theme::Dark);
+    assert_eq!(state.shell.theme_engine.theme.name, "dark");
 }
 
 #[test]
@@ -300,12 +302,12 @@ fn integration_command_palette() {
     state.handle_input(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     state.handle_input(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
 
-    assert!(state.command_palette.is_open());
-    assert!(state.dialog_manager.is_empty());
+    assert!(state.overlay.command_palette.is_open());
+    assert!(state.overlay.dialog_manager.is_empty());
 
     let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     state.handle_input(esc);
-    assert!(!state.command_palette.is_open());
+    assert!(!state.overlay.command_palette.is_open());
 }
 
 #[test]
@@ -313,8 +315,8 @@ fn integration_slash_keeps_input_control_without_opening_palette() {
     let mut state = TuiState::new("test-model", "test-session");
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-    assert!(!state.command_palette.is_open());
-    assert_eq!(state.app.input.text(), "/");
+    assert!(!state.overlay.command_palette.is_open());
+    assert_eq!(state.app.shell.input.text(), "/");
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
     state.process_raw_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
@@ -322,11 +324,11 @@ fn integration_slash_keeps_input_control_without_opening_palette() {
     state.process_raw_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
     state.process_raw_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
 
-    assert!(!state.command_palette.is_open());
-    assert_eq!(state.app.input.text(), "/statu");
+    assert!(!state.overlay.command_palette.is_open());
+    assert_eq!(state.app.shell.input.text(), "/statu");
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-    assert_eq!(state.app.input.text(), "/status");
+    assert_eq!(state.app.shell.input.text(), "/status");
 }
 
 #[test]
@@ -334,6 +336,7 @@ fn integration_mid_text_slash_completion_replaces_current_token() {
     let mut state = TuiState::new("test-model", "test-session");
     let projection = crate::test_utils::gateway_command_projection_fixture();
     state
+        .shell
         .prompt
         .sync_command_suggestions_from_projection(&projection);
 
@@ -346,7 +349,7 @@ fn integration_mid_text_slash_completion_replaces_current_token() {
 
     state.process_raw_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-    assert_eq!(state.app.input.text(), "please run /status now");
+    assert_eq!(state.app.shell.input.text(), "please run /status now");
 }
 
 #[test]
@@ -357,7 +360,7 @@ fn integration_absolute_path_slash_does_not_open_command_palette() {
         state.process_raw_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
     }
 
-    assert!(!state.command_palette.is_open());
+    assert!(!state.overlay.command_palette.is_open());
 }
 
 #[test]
@@ -366,6 +369,7 @@ fn integration_dialog_focus_trap_multiple() {
 
     use crate::components::dialog::{DialogKind, DialogState};
     state
+        .overlay
         .dialog_manager
         .push(DialogState::new(DialogKind::Alert {
             title: "Error".into(),
@@ -376,7 +380,7 @@ fn integration_dialog_focus_trap_multiple() {
     let handled = state.handle_input(a_key);
     assert!(handled);
 
-    assert!(state.dialog_manager.is_empty());
+    assert!(state.overlay.dialog_manager.is_empty());
 }
 
 #[test]
@@ -384,45 +388,47 @@ fn integration_scroll_offset_updates() {
     let mut state = TuiState::new("test-model", "test-session");
 
     for i in 0..50 {
-        state.add_message("user", &format!("Message number {i}"));
+        state
+            .app
+            .add_message("user", &format!("Message number {i}"));
     }
 
-    assert!(state.timeline_len() >= 50);
+    assert!(state.app.timeline_len() >= 50);
 
-    let initial_scroll = state.scroll_offset;
+    let initial_scroll = state.app.timeline.scroll_offset;
     state.handle_input(key(KeyCode::Char('j')));
-    assert_eq!(state.scroll_offset, initial_scroll + 1);
-    assert!(!state.auto_scroll);
+    assert_eq!(state.app.timeline.scroll_offset, initial_scroll + 1);
+    assert!(!state.app.timeline.auto_scroll);
 
     state.handle_input(key(KeyCode::Char('k')));
-    assert_eq!(state.scroll_offset, initial_scroll);
+    assert_eq!(state.app.timeline.scroll_offset, initial_scroll);
 
     state.handle_input(key(KeyCode::Char('g')));
     state.handle_input(key(KeyCode::Char('g')));
-    assert_eq!(state.scroll_offset, 0);
+    assert_eq!(state.app.timeline.scroll_offset, 0);
 }
 
 #[test]
 fn integration_input_history_navigation() {
     let mut state = TuiState::new("test-model", "test-session");
 
-    state.input_history.push("first command".into());
-    state.input_history.push("second command".into());
-    state.input_history.push("third command".into());
+    state.app.shell.input_history.push("first command".into());
+    state.app.shell.input_history.push("second command".into());
+    state.app.shell.input_history.push("third command".into());
 
-    let text = state.history_prev();
+    let text = state.app.history_prev();
     assert_eq!(text, Some("third command".into()));
 
-    let text = state.history_prev();
+    let text = state.app.history_prev();
     assert_eq!(text, Some("second command".into()));
 
-    let text = state.history_next();
+    let text = state.app.history_next();
     assert_eq!(text, Some("third command".into()));
 
-    let text = state.history_next();
+    let text = state.app.history_next();
     assert_eq!(text, Some(String::new()));
 
-    assert!(state.history_idx.is_none());
+    assert!(state.app.shell.history_idx.is_none());
 }
 
 #[test]
@@ -436,7 +442,7 @@ fn integration_timeline_entry_lifecycle() {
         preview: "ls -la".into(),
     });
 
-    let has_tool = state.timeline_iter().any(
+    let has_tool = state.app.timeline_iter().any(
         |(_, e)| matches!(e, crate::app::TimelineEntry::ToolCall { id, .. } if id == "tool-1"),
     );
     assert!(has_tool);
@@ -448,7 +454,7 @@ fn integration_timeline_entry_lifecycle() {
         exit_code: Some(0),
     });
 
-    let tool = state.timeline_iter().find_map(|(_, e)| {
+    let tool = state.app.timeline_iter().find_map(|(_, e)| {
         if let crate::app::TimelineEntry::ToolCall {
             id, done, expanded, ..
         } = e
@@ -469,27 +475,29 @@ fn integration_timeline_entry_lifecycle() {
 fn integration_notification_lifecycle() {
     let mut state = TuiState::new("test-model", "test-session");
 
-    state.show_notification("Model switched to claude-haiku");
-    assert!(state.notification.is_some());
+    state
+        .app
+        .show_notification("Model switched to claude-haiku");
+    assert!(state.app.shell.notification.is_some());
 
     for _ in 0..30 {
-        state.tick();
+        state.app.tick();
     }
-    assert!(state.notification.is_none());
+    assert!(state.app.shell.notification.is_none());
 }
 
 #[test]
 fn integration_search_flow() {
     let mut state = TuiState::new("test-model", "test-session");
-    state.add_message("user", "Hello world");
-    state.add_message("assistant", "Hi there, world!");
+    state.app.add_message("user", "Hello world");
+    state.app.add_message("assistant", "Hi there, world!");
 
     // Clear input to allow search activation via keybind engine
-    state.input = crate::components::composer::model::ComposerModel::default();
+    state.app.shell.input = crate::components::composer::model::ComposerModel::default();
 
     state.process_raw_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
     assert!(
-        state.search_active,
+        state.app.timeline.search_active,
         "search should be activated by Ctrl+F through the production input path"
     );
 
@@ -499,20 +507,20 @@ fn integration_search_flow() {
     state.process_raw_key(key(KeyCode::Char('r')));
     state.process_raw_key(key(KeyCode::Char('l')));
     state.process_raw_key(key(KeyCode::Char('d')));
-    assert_eq!(state.search_query, "world");
+    assert_eq!(state.app.timeline.search_query, "world");
 
     // Press Enter to execute search
     state.process_raw_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(!state.search_active);
-    assert!(!state.search_matches.is_empty());
+    assert!(!state.app.timeline.search_active);
+    assert!(!state.app.timeline.search_matches.is_empty());
 
-    assert_eq!(state.search_matches.len(), 2);
+    assert_eq!(state.app.timeline.search_matches.len(), 2);
     state.process_raw_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
-    assert_eq!(state.search_current, 1);
+    assert_eq!(state.app.timeline.search_current, 1);
     state.process_raw_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT));
-    assert_eq!(state.search_current, 0);
+    assert_eq!(state.app.timeline.search_current, 0);
 
-    state.cancel_search();
-    assert!(state.search_query.is_empty());
-    assert!(state.search_matches.is_empty());
+    state.app.cancel_search();
+    assert!(state.app.timeline.search_query.is_empty());
+    assert!(state.app.timeline.search_matches.is_empty());
 }

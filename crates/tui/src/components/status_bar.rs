@@ -362,7 +362,7 @@ impl StatusBar {
     /// Only sections with recognized built-in IDs are populated;
     /// custom sections are left unchanged.
     pub fn sync_from_app(&mut self, app: &App) {
-        if let Some(message) = app.notification.as_ref() {
+        if let Some(message) = app.shell.notification.as_ref() {
             let changed = self
                 .notification
                 .as_ref()
@@ -380,6 +380,7 @@ impl StatusBar {
         self.compact_model = compact_model(app);
         self.compact_status = compact_run_status(app);
         self.compact_context = app
+            .execution
             .context_usage_percent_bp
             .map(|value| format!("{:.0}%", f64::from(value) / 100.0))
             .unwrap_or_else(|| "—".to_string());
@@ -387,8 +388,8 @@ impl StatusBar {
             section.content = match section.id.as_str() {
                 "version" => Some(format!("v{}", env!("CARGO_PKG_VERSION"))),
                 "model" => {
-                    let mode = app.execution_policy_preset.to_ascii_uppercase();
-                    section.style = match app.execution_policy_preset.as_str() {
+                    let mode = app.shell.execution_policy_preset.to_ascii_uppercase();
+                    section.style = match app.shell.execution_policy_preset.as_str() {
                         "yolo" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                         "autonomous" => Style::default().fg(Color::Yellow),
                         "cautious" => Style::default().fg(Color::Blue),
@@ -397,8 +398,8 @@ impl StatusBar {
                         _ => Style::default(),
                     };
                     let model = match (
-                        app.requested_model.as_deref(),
-                        app.effective_model.as_deref(),
+                        app.shell.requested_model.as_deref(),
+                        app.shell.effective_model.as_deref(),
                     ) {
                         (Some(requested), Some(effective)) if requested != effective => {
                             section.style = Style::default().fg(Color::Yellow);
@@ -422,11 +423,11 @@ impl StatusBar {
                 "run_status" => Some(format_run_status(app)),
                 "model_telemetry" => {
                     let mut facts = Vec::new();
-                    if let Some(latency) = app.current_execution_latency.as_ref() {
+                    if let Some(latency) = app.execution.current_execution_latency.as_ref() {
                         facts.push(format!("h:{}ms", latency.harness_elapsed_ms));
                         facts.push(format!("p:{}ms", latency.provider_wall_ms));
                     }
-                    if let Some(telemetry) = app.latest_model_telemetry.as_ref() {
+                    if let Some(telemetry) = app.execution.latest_model_telemetry.as_ref() {
                         if let Some(latency) = telemetry.first_token_latency_ms {
                             facts.push(format!("first:{}ms", latency));
                         }
@@ -448,36 +449,40 @@ impl StatusBar {
                             ));
                         }
                     }
-                    if let Some(source) = app.model_source.as_deref() {
+                    if let Some(source) = app.shell.model_source.as_deref() {
                         facts.push(format!("src:{}", preview(source, 18)));
                     }
                     (!facts.is_empty()).then(|| facts.join(" "))
                 }
                 "context" => {
                     let pct = app
+                        .execution
                         .context_usage_percent_bp
                         .map_or(0.0, |value| f64::from(value) / 100.0);
                     section.style = Style::default().fg(context_color(pct));
                     token_bar(app).map(|bar| format!("ctx {bar}"))
                 }
                 "turn_tokens" => {
-                    if !app.turn_usage_known
-                        && (app.turn_is_active() || app.current_run_metrics.is_some())
+                    if !app.execution.turn_usage_known
+                        && (app.turn_is_active() || app.execution.current_run_metrics.is_some())
                     {
                         Some("in:— out:— Σ—".to_string())
                     } else {
-                        app.current_run_metrics.as_ref().map_or_else(
+                        app.execution.current_run_metrics.as_ref().map_or_else(
                             || {
-                                (app.input_tokens > 0 || app.output_tokens > 0).then(|| {
-                                    format!(
-                                        "in:{} out:{} Σ{}",
-                                        fmt_tokens(app.input_tokens),
-                                        fmt_tokens(app.output_tokens),
-                                        fmt_tokens(
-                                            app.input_tokens.saturating_add(app.output_tokens)
+                                (app.history.input_tokens > 0 || app.history.output_tokens > 0)
+                                    .then(|| {
+                                        format!(
+                                            "in:{} out:{} Σ{}",
+                                            fmt_tokens(app.history.input_tokens),
+                                            fmt_tokens(app.history.output_tokens),
+                                            fmt_tokens(
+                                                app.history
+                                                    .input_tokens
+                                                    .saturating_add(app.history.output_tokens)
+                                            )
                                         )
-                                    )
-                                })
+                                    })
                             },
                             |metrics| {
                                 Some(format!(
@@ -491,14 +496,16 @@ impl StatusBar {
                     }
                 }
                 "session_tokens" => {
-                    let authoritative = app.authoritative_session_input_tokens.is_some()
-                        || app.authoritative_session_output_tokens.is_some();
+                    let authoritative = app.history.authoritative_session_input_tokens.is_some()
+                        || app.history.authoritative_session_output_tokens.is_some();
                     let input = app
+                        .history
                         .authoritative_session_input_tokens
-                        .unwrap_or(app.durable_session_input_tokens);
+                        .unwrap_or(app.history.durable_session_input_tokens);
                     let output = app
+                        .history
                         .authoritative_session_output_tokens
-                        .unwrap_or(app.durable_session_output_tokens);
+                        .unwrap_or(app.history.durable_session_output_tokens);
                     (input > 0 || output > 0).then(|| {
                         format!(
                             "{} in:{} out:{} Σ{}",
@@ -509,18 +516,18 @@ impl StatusBar {
                         )
                     })
                 }
-                "memory_stats" => app.current_run_metrics.as_ref().map_or_else(
+                "memory_stats" => app.execution.current_run_metrics.as_ref().map_or_else(
                     || {
-                        app.memory_total_entries.map(|total| {
+                        app.workbench.memory_total_entries.map(|total| {
                             format!(
                                 "mem:{} vec:{} [{},{},{},{},{}]",
                                 total,
-                                app.memory_vector_count.unwrap_or_default(),
-                                app.memory_layer_counts[0],
-                                app.memory_layer_counts[1],
-                                app.memory_layer_counts[2],
-                                app.memory_layer_counts[3],
-                                app.memory_layer_counts[4],
+                                app.workbench.memory_vector_count.unwrap_or_default(),
+                                app.workbench.memory_layer_counts[0],
+                                app.workbench.memory_layer_counts[1],
+                                app.workbench.memory_layer_counts[2],
+                                app.workbench.memory_layer_counts[3],
+                                app.workbench.memory_layer_counts[4],
                             )
                         })
                     },
@@ -536,22 +543,25 @@ impl StatusBar {
                     },
                 ),
                 "search" => {
-                    if app.search_active {
-                        Some(format!("/{}", app.search_query))
-                    } else if !app.search_matches.is_empty() {
+                    if app.timeline.search_active {
+                        Some(format!("/{}", app.timeline.search_query))
+                    } else if !app.timeline.search_matches.is_empty() {
                         Some(format!(
                             "/{} [{}/{}]",
-                            app.search_query,
-                            app.search_current + 1,
-                            app.search_matches.len()
+                            app.timeline.search_query,
+                            app.timeline.search_current + 1,
+                            app.timeline.search_matches.len()
                         ))
                     } else {
                         None
                     }
                 }
-                "history" => app.history_idx.map(|hidx| format!("hist:{}", hidx + 1)),
-                "causal_health" => (app.telemetry.orphan_event_count > 0)
-                    .then(|| format!("⚠ orphan:{}", app.telemetry.orphan_event_count)),
+                "history" => app
+                    .shell
+                    .history_idx
+                    .map(|hidx| format!("hist:{}", hidx + 1)),
+                "causal_health" => (app.execution.telemetry.orphan_event_count > 0)
+                    .then(|| format!("⚠ orphan:{}", app.execution.telemetry.orphan_event_count)),
                 "permission_status" => None,
                 _ => None,
             };
@@ -724,10 +734,11 @@ fn preview(value: &str, max: usize) -> String {
 /// Build a character-based progress bar: "████░░░░ 6.2K/128K (39%)"
 pub fn token_bar(app: &App) -> Option<String> {
     let window = app
+        .execution
         .context_window_tokens
-        .or_else(|| (app.context_window > 0).then_some(app.context_window))?;
-    let used = app.context_used_tokens?;
-    let pct = app.context_usage_percent_bp.map_or_else(
+        .or_else(|| (app.execution.context_window > 0).then_some(app.execution.context_window))?;
+    let used = app.execution.context_used_tokens?;
+    let pct = app.execution.context_usage_percent_bp.map_or_else(
         || used as f64 / window.max(1) as f64 * 100.0,
         |bp| f64::from(bp) / 100.0,
     );
@@ -745,10 +756,12 @@ pub fn token_bar(app: &App) -> Option<String> {
     }
 
     let remaining = app
+        .execution
         .context_remaining_tokens
         .map(|value| format!(" rem:{}", fmt_tokens(value)))
         .unwrap_or_default();
     let source = app
+        .execution
         .context_usage_source
         .as_deref()
         .filter(|source| !source.trim().is_empty())
@@ -765,8 +778,8 @@ pub fn token_bar(app: &App) -> Option<String> {
 
 fn compact_model(app: &App) -> String {
     match (
-        app.requested_model.as_deref(),
-        app.effective_model.as_deref(),
+        app.shell.requested_model.as_deref(),
+        app.shell.effective_model.as_deref(),
     ) {
         (Some(requested), Some(effective)) if requested != effective => {
             // At narrow widths the provider-observed model is the operational
@@ -781,6 +794,7 @@ fn compact_model(app: &App) -> String {
 
 fn compact_run_status(app: &App) -> String {
     let status = app
+        .execution
         .current_execution_status
         .map(execution_status_text)
         .unwrap_or_else(|| {
@@ -790,7 +804,7 @@ fn compact_run_status(app: &App) -> String {
                 "idle"
             }
         });
-    if app.gateway_lease_mode.as_deref() == Some("read-only") {
+    if app.gateway.gateway_lease_mode.as_deref() == Some("read-only") {
         if status == "idle" {
             "read-only".to_string()
         } else {
@@ -803,10 +817,11 @@ fn compact_run_status(app: &App) -> String {
 
 fn format_run_status(app: &App) -> String {
     let mut parts = vec![compact_run_status(app)];
-    if app.turn_interaction.presentation.stale {
+    if app.execution.turn_interaction.presentation.stale {
         parts.push("stale".to_string());
     }
     if let Some(execution_id) = app
+        .execution
         .current_execution_id
         .as_deref()
         .filter(|id| !id.trim().is_empty())
@@ -814,6 +829,7 @@ fn format_run_status(app: &App) -> String {
         parts.push(format!("exec:{}", preview(execution_id, 10)));
     }
     if let Some(turn_id) = app
+        .execution
         .current_turn_id
         .as_deref()
         .filter(|id| !id.trim().is_empty())
@@ -821,6 +837,7 @@ fn format_run_status(app: &App) -> String {
         parts.push(format!("turn:{}", preview(turn_id, 10)));
     }
     if let Some(detail) = app
+        .execution
         .current_execution_status_detail
         .as_deref()
         .filter(|detail| !detail.trim().is_empty())
@@ -828,19 +845,20 @@ fn format_run_status(app: &App) -> String {
         parts.push(preview(detail, 24));
     }
     let now = current_time_ms();
-    if let Some(started) = app.execution_started_at_ms {
+    if let Some(started) = app.execution.execution_started_at_ms {
         let terminal = app
+            .execution
             .current_execution_status
             .is_some_and(harness_contract::projection::ExecutionLiveStatus::is_terminal);
         let end = if terminal {
-            app.last_progress_at_ms.unwrap_or(now)
+            app.execution.last_progress_at_ms.unwrap_or(now)
         } else {
             now
         };
         parts.push(format!("{}s", end.saturating_sub(started) / 1_000));
     }
     if app.turn_is_active() {
-        if let Some(last_progress) = app.last_progress_at_ms {
+        if let Some(last_progress) = app.execution.last_progress_at_ms {
             parts.push(format!(
                 "progress {}s",
                 now.saturating_sub(last_progress) / 1_000
@@ -1002,7 +1020,7 @@ mod tests {
         assert_eq!(model.content.as_deref(), Some("test-model UNAVAILABLE"));
 
         let mut app = app;
-        app.execution_policy_preset = "std".to_string();
+        app.shell.execution_policy_preset = "std".to_string();
         bar.sync_from_app(&app);
         assert_eq!(
             bar.section_mut("model").unwrap().content.as_deref(),
@@ -1013,9 +1031,9 @@ mod tests {
     #[test]
     fn sync_from_app_populates_context_section() {
         let mut app = App::new("claude-sonnet-4", "test-session");
-        app.context_window_tokens = Some(200_000);
-        app.context_used_tokens = Some(50_000);
-        app.context_usage_percent_bp = Some(2_500);
+        app.execution.context_window_tokens = Some(200_000);
+        app.execution.context_used_tokens = Some(50_000);
+        app.execution.context_usage_percent_bp = Some(2_500);
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
@@ -1028,7 +1046,7 @@ mod tests {
     #[test]
     fn sync_from_app_shows_execution_policy() {
         let mut app = App::new("claude-sonnet-4", "test-session");
-        app.execution_policy_preset = "yolo".to_string();
+        app.shell.execution_policy_preset = "yolo".to_string();
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
@@ -1041,7 +1059,7 @@ mod tests {
     #[test]
     fn sync_from_app_keeps_read_only_lease_state_persistently_visible() {
         let mut app = App::new("claude-sonnet-4", "test-session");
-        app.gateway_lease_mode = Some("read-only".to_string());
+        app.gateway.gateway_lease_mode = Some("read-only".to_string());
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
@@ -1053,9 +1071,9 @@ mod tests {
     #[test]
     fn sync_from_app_shows_memory_stats() {
         let mut app = App::new("claude-sonnet-4", "test-session");
-        app.memory_total_entries = Some(12);
-        app.memory_vector_count = Some(7);
-        app.memory_layer_counts = [1, 2, 3, 4, 5];
+        app.workbench.memory_total_entries = Some(12);
+        app.workbench.memory_vector_count = Some(7);
+        app.workbench.memory_layer_counts = [1, 2, 3, 4, 5];
         let mut bar = StatusBar::with_default_sections();
 
         bar.sync_from_app(&app);
@@ -1127,10 +1145,10 @@ mod tests {
     #[test]
     fn forty_columns_keep_model_typed_status_and_context_visible() {
         let mut app = App::new("requested-model", "session-status-40");
-        app.effective_model = Some("effective-model".to_string());
-        app.current_execution_status =
+        app.shell.effective_model = Some("effective-model".to_string());
+        app.execution.current_execution_status =
             Some(harness_contract::projection::ExecutionLiveStatus::CallingTool);
-        app.context_usage_percent_bp = Some(6_250);
+        app.execution.context_usage_percent_bp = Some(6_250);
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
@@ -1153,9 +1171,9 @@ mod tests {
     #[test]
     fn render_default_status_suppresses_low_priority_sections_on_medium_width() {
         let mut app = App::new("deepseek-v4-pro", "session-status-medium");
-        app.context_window_tokens = Some(200_000);
-        app.context_used_tokens = Some(50_000);
-        app.context_usage_percent_bp = Some(2_500);
+        app.execution.context_window_tokens = Some(200_000);
+        app.execution.context_used_tokens = Some(50_000);
+        app.execution.context_usage_percent_bp = Some(2_500);
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
@@ -1242,7 +1260,7 @@ mod tests {
     #[test]
     fn permission_status_is_not_in_footer() {
         let mut app = App::new("test-model", "test-session");
-        app.permission_count = 2;
+        app.workbench.permission_count = 2;
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
@@ -1252,8 +1270,8 @@ mod tests {
     #[test]
     fn session_tokens_show_after_context() {
         let mut app = App::new("test-model", "test-session");
-        app.input_tokens = 1200;
-        app.output_tokens = 3400;
+        app.history.input_tokens = 1200;
+        app.history.output_tokens = 3400;
         let mut bar = StatusBar::with_default_sections();
         bar.sync_from_app(&app);
 
@@ -1306,9 +1324,9 @@ mod tests {
     fn token_bar_returns_some_when_window_nonzero() {
         use crate::app::App;
         let mut app = App::new("test", "test-session");
-        app.context_window_tokens = Some(200_000);
-        app.context_used_tokens = Some(50_000);
-        app.context_usage_percent_bp = Some(2_500);
+        app.execution.context_window_tokens = Some(200_000);
+        app.execution.context_used_tokens = Some(50_000);
+        app.execution.context_usage_percent_bp = Some(2_500);
         let bar = token_bar(&app);
         assert!(
             bar.is_some(),

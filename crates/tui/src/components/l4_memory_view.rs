@@ -28,6 +28,7 @@ impl L4MemoryView {
 
     pub fn sync_from_app(&mut self, app: &App) {
         self.entries = app
+            .workbench
             .memory_entries
             .iter()
             .filter(|entry| entry.layer.eq_ignore_ascii_case("l4"))

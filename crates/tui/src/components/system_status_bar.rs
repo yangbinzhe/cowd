@@ -42,7 +42,7 @@ impl SystemStatusBar {
 
     pub fn sync_from_app(&mut self, app: &App) {
         self.runtime = runtime_health(app).to_string();
-        self.turn = if let Some(status) = app.current_execution_status {
+        self.turn = if let Some(status) = app.execution.current_execution_status {
             execution_status_label(status).to_string()
         } else if app.turn_is_active() {
             match app.timeline_last() {
@@ -55,9 +55,9 @@ impl SystemStatusBar {
         } else {
             "idle".to_string()
         };
-        self.session_id = app.session_id.clone();
+        self.session_id = app.shell.session_id.clone();
         if self.activity_timeline_len != app.timeline_len()
-            || self.activity_full_sync_revision != app.timeline_full_sync_revision
+            || self.activity_full_sync_revision != app.timeline.timeline_full_sync_revision
         {
             let stats = app.session_activity_stats();
             self.thinking_count = stats.thinking_count as u32;
@@ -65,14 +65,16 @@ impl SystemStatusBar {
             self.reply_count = stats.message_count as u32;
             self.event_count = stats.event_count as u32;
             self.activity_timeline_len = app.timeline_len();
-            self.activity_full_sync_revision = app.timeline_full_sync_revision;
+            self.activity_full_sync_revision = app.timeline.timeline_full_sync_revision;
         }
         self.approval_count = app
+            .gateway
             .gateway_pending_approvals
             .unwrap_or_default()
-            .max(app.permission_count as u64);
-        self.permission_count = app.permission_count;
+            .max(app.workbench.permission_count as u64);
+        self.permission_count = app.workbench.permission_count;
         self.last_phase = app
+            .execution
             .current_execution_status_detail
             .clone()
             .unwrap_or_else(|| match app.timeline_last() {
@@ -94,33 +96,36 @@ impl SystemStatusBar {
                 None => "idle".to_string(),
             });
         self.daemon = app
+            .gateway
             .gateway_runtime_readiness
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        self.gateway = if app.server_running {
-            format!("up:{}s", app.server_uptime_secs.unwrap_or_default())
+        self.gateway = if app.gateway.server_running {
+            format!("up:{}s", app.gateway.server_uptime_secs.unwrap_or_default())
         } else {
             "down".to_string()
         };
         self.provider = app
+            .gateway
             .gateway_connector_accounts
             .first()
             .map(|account| account.provider.clone())
             .unwrap_or_else(|| "unresolved".to_string());
         self.connectors = connector_health(app);
         self.memory = app
+            .workbench
             .memory_status
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        self.mode = if app.compact_chat {
+        self.mode = if app.shell.compact_chat {
             "clean".to_string()
         } else {
             "panorama".to_string()
         };
         self.evidence = evidence_health(app);
         self.model = match (
-            app.requested_model.as_deref(),
-            app.effective_model.as_deref(),
+            app.shell.requested_model.as_deref(),
+            app.shell.effective_model.as_deref(),
         ) {
             (Some(requested), Some(effective)) if requested != effective => {
                 format!("{}→{}", preview(requested, 12), preview(effective, 12))
@@ -129,9 +134,11 @@ impl SystemStatusBar {
             (Some(requested), None) => format!("{}…", preview(requested, 24)),
             (None, None) => "unresolved".to_string(),
         };
-        self.transport = match &app.stream_connection_state {
+        self.transport = match &app.execution.stream_connection_state {
             crate::protocol::SessionStreamConnectionState::Connecting => "connecting".to_string(),
-            crate::protocol::SessionStreamConnectionState::Connected if app.history_hydrated => {
+            crate::protocol::SessionStreamConnectionState::Connected
+                if app.history.history_hydrated =>
+            {
                 "live".to_string()
             }
             crate::protocol::SessionStreamConnectionState::Connected => "syncing".to_string(),
@@ -144,10 +151,10 @@ impl SystemStatusBar {
             ),
         };
         if matches!(
-            app.stream_connection_state,
+            app.execution.stream_connection_state,
             crate::protocol::SessionStreamConnectionState::Connected
         ) {
-            if let Some(projection_state) = app.projection_connection_state.as_ref() {
+            if let Some(projection_state) = app.execution.projection_connection_state.as_ref() {
                 self.transport = match projection_state {
                     crate::protocol::SessionStreamConnectionState::Connecting => {
                         "projection:connecting".to_string()
@@ -165,7 +172,7 @@ impl SystemStatusBar {
                 };
             }
         }
-        self.history = app.session_history_index.as_ref().map_or_else(
+        self.history = app.history.session_history_index.as_ref().map_or_else(
             || "history:syncing".to_string(),
             |index| {
                 let indexed = index
@@ -178,9 +185,10 @@ impl SystemStatusBar {
             },
         );
         self.issue = app
+            .gateway
             .gateway_degraded_reasons
             .first()
-            .or_else(|| app.gateway_connector_degraded_reasons.first())
+            .or_else(|| app.gateway.gateway_connector_degraded_reasons.first())
             .map(|reason| preview(reason, 34));
     }
 }
@@ -300,13 +308,13 @@ fn execution_status_label(
 }
 
 fn runtime_health(app: &App) -> &'static str {
-    if !app.gateway_degraded_reasons.is_empty()
-        || !app.gateway_connector_degraded_reasons.is_empty()
+    if !app.gateway.gateway_degraded_reasons.is_empty()
+        || !app.gateway.gateway_connector_degraded_reasons.is_empty()
     {
         "degraded"
-    } else if app.gateway_pending_approvals.unwrap_or(0) > 0 {
+    } else if app.gateway.gateway_pending_approvals.unwrap_or(0) > 0 {
         "blocked"
-    } else if app.gateway_runtime_readiness.is_some() || app.server_running {
+    } else if app.gateway.gateway_runtime_readiness.is_some() || app.gateway.server_running {
         "ready"
     } else {
         "unknown"
@@ -314,11 +322,14 @@ fn runtime_health(app: &App) -> &'static str {
 }
 
 fn connector_health(app: &App) -> String {
-    if !app.gateway_connector_degraded_reasons.is_empty() {
-        return format!("degraded:{}", app.gateway_connector_degraded_reasons.len());
+    if !app.gateway.gateway_connector_degraded_reasons.is_empty() {
+        return format!(
+            "degraded:{}",
+            app.gateway.gateway_connector_degraded_reasons.len()
+        );
     }
-    let accounts = app.gateway_connector_accounts.len();
-    let capabilities = app.gateway_connector_capabilities.len();
+    let accounts = app.gateway.gateway_connector_accounts.len();
+    let capabilities = app.gateway.gateway_connector_capabilities.len();
     if accounts == 0 && capabilities == 0 {
         "none".to_string()
     } else {
@@ -328,17 +339,20 @@ fn connector_health(app: &App) -> String {
 
 fn evidence_health(app: &App) -> String {
     let context_count = app
+        .execution
         .latest_context_envelope
         .as_ref()
         .and_then(|value| value.get("selected").and_then(serde_json::Value::as_array))
         .map(Vec::len)
         .unwrap_or_default();
     let memory_count = app
+        .execution
         .latest_execution_graph_summary
         .as_ref()
         .map(|summary| summary.memory_candidates)
         .unwrap_or_default();
     let reality_count = app
+        .gateway
         .gateway_fact_flow
         .as_ref()
         .map(|flow| {
@@ -412,7 +426,7 @@ mod tests {
     #[test]
     fn runtime_health_blocks_on_pending_approvals() {
         let mut app = App::new("m", "s");
-        app.gateway_pending_approvals = Some(2);
+        app.gateway.gateway_pending_approvals = Some(2);
 
         assert_eq!(runtime_health(&app), "blocked");
     }
@@ -420,7 +434,7 @@ mod tests {
     #[test]
     fn connector_health_summarizes_accounts_and_capabilities() {
         let mut app = App::new("m", "s");
-        app.gateway_connector_accounts.push(
+        app.gateway.gateway_connector_accounts.push(
             crate::runtime_control_store::ConnectorAccountSummary {
                 provider: "mock".into(),
                 account_id: "a1".into(),
@@ -430,7 +444,7 @@ mod tests {
                 binding_count: 1,
             },
         );
-        app.gateway_connector_capabilities.push(
+        app.gateway.gateway_connector_capabilities.push(
             crate::runtime_control_store::ConnectorCapabilitySummary {
                 provider: "mock".into(),
                 capability_id: "read".into(),
@@ -447,12 +461,12 @@ mod tests {
     #[test]
     fn evidence_health_summarizes_current_turn_signals() {
         let mut app = App::new("m", "s");
-        app.compact_chat = true;
-        app.latest_context_envelope = Some(serde_json::json!({
+        app.shell.compact_chat = true;
+        app.execution.latest_context_envelope = Some(serde_json::json!({
             "selected": [{"id": "a"}, {"id": "b"}],
             "omitted": []
         }));
-        app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
+        app.execution.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
             graph_id: None,
             board_id: None,
             status: "ready".into(),
@@ -464,7 +478,7 @@ mod tests {
             synthesis_lift: None,
             complementarity_score: None,
         });
-        app.gateway_fact_flow = Some(crate::runtime_control_store::FactFlowSummary {
+        app.gateway.gateway_fact_flow = Some(crate::runtime_control_store::FactFlowSummary {
             source: "test".into(),
             session_id: Some("s".into()),
             stage_count: 1,
@@ -479,9 +493,10 @@ mod tests {
     #[test]
     fn render_system_status_bar_keeps_top_line_calm() {
         let mut app = App::new("deepseek-v4-pro", "s");
-        app.effective_model = Some("deepseek-v4-flash".into());
-        app.history_hydrated = true;
-        app.stream_connection_state = crate::protocol::SessionStreamConnectionState::Connected;
+        app.shell.effective_model = Some("deepseek-v4-flash".into());
+        app.history.history_hydrated = true;
+        app.execution.stream_connection_state =
+            crate::protocol::SessionStreamConnectionState::Connected;
         let mut bar = SystemStatusBar::new();
         bar.sync_from_app(&app);
 

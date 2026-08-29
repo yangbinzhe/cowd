@@ -114,6 +114,7 @@ impl SkillsPanel {
     /// available Skill and must never be replaced with invented capabilities.
     pub fn sync_from_app(&mut self, app: &App) {
         self.entries = app
+            .workbench
             .skill_list
             .iter()
             .map(|s| SkillDisplayEntry {
@@ -818,7 +819,7 @@ mod tests {
 
     fn app_with_catalog() -> App {
         let mut app = App::new("test-model", "test-session");
-        app.skill_list = vec![
+        app.workbench.skill_list = vec![
             SkillSummary {
                 id: "local:release".to_string(),
                 name: "release".to_string(),
@@ -931,7 +932,7 @@ mod tests {
     #[test]
     fn from_app_constructor() {
         let mut app = App::new("test-model", "test-session");
-        app.skill_list = vec![SkillSummary {
+        app.workbench.skill_list = vec![SkillSummary {
             id: "test:skill".to_string(),
             name: "TestSkill".to_string(),
             description: "A test skill".to_string(),
@@ -951,7 +952,7 @@ mod tests {
     #[test]
     fn governed_application_entries_render_action_hints() {
         let mut app = App::new("test-model", "test-session");
-        app.skill_list = vec![SkillSummary {
+        app.workbench.skill_list = vec![SkillSummary {
             id: "app:supply-risk-analyst".to_string(),
             name: "supply-risk-analyst".to_string(),
             description: "Supply Risk Analyst".to_string(),
@@ -971,7 +972,7 @@ mod tests {
     #[test]
     fn local_entries_report_run_as_supported() {
         let mut app = App::new("test-model", "test-session");
-        app.skill_list = vec![SkillSummary {
+        app.workbench.skill_list = vec![SkillSummary {
             id: "local:release".to_string(),
             name: "release".to_string(),
             description: "Prepare release".to_string(),
@@ -994,7 +995,7 @@ mod tests {
     #[test]
     fn local_entries_key_r_triggers_run() {
         let mut app = App::new("test-model", "test-session");
-        app.skill_list = vec![SkillSummary {
+        app.workbench.skill_list = vec![SkillSummary {
             id: "local:release".to_string(),
             name: "release".to_string(),
             description: "Prepare release".to_string(),

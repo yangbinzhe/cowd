@@ -44,8 +44,8 @@ impl MemoryPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
-        self.entries = app.memory_entries.clone();
-        self.status = app.memory_status.clone();
+        self.entries = app.workbench.memory_entries.clone();
+        self.status = app.workbench.memory_status.clone();
         if self.selected >= self.filtered_entries().len() {
             self.selected = self.filtered_entries().len().saturating_sub(1);
         }

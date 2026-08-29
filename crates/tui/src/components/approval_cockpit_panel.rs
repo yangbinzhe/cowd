@@ -32,16 +32,16 @@ impl ApprovalCockpitPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
-        self.approval_items = app.gateway_approval_items.clone();
-        self.approval_grants = app.gateway_approval_grants.clone();
-        self.permission_count = app.permission_count;
-        self.pending_approvals = app.gateway_pending_approvals;
-        self.cross_plane_grants_active = app.gateway_cross_plane_grants_active;
-        self.cross_plane_actions_24h = app.gateway_cross_plane_actions_24h;
-        self.lease_owner = app.gateway_lease_owner.clone();
-        self.lease_mode = app.gateway_lease_mode.clone();
-        self.degraded_reasons = app.gateway_degraded_reasons.clone();
-        self.gateway_running = app.server_running;
+        self.approval_items = app.gateway.gateway_approval_items.clone();
+        self.approval_grants = app.gateway.gateway_approval_grants.clone();
+        self.permission_count = app.workbench.permission_count;
+        self.pending_approvals = app.gateway.gateway_pending_approvals;
+        self.cross_plane_grants_active = app.gateway.gateway_cross_plane_grants_active;
+        self.cross_plane_actions_24h = app.gateway.gateway_cross_plane_actions_24h;
+        self.lease_owner = app.gateway.gateway_lease_owner.clone();
+        self.lease_mode = app.gateway.gateway_lease_mode.clone();
+        self.degraded_reasons = app.gateway.gateway_degraded_reasons.clone();
+        self.gateway_running = app.gateway.server_running;
     }
 
     pub fn focus_backlink_target(&mut self, target: impl Into<String>) {
@@ -376,10 +376,10 @@ mod tests {
     #[test]
     fn renders_approval_and_cross_plane_summary() {
         let mut app = App::new("model", "session");
-        app.server_running = true;
-        app.permission_count = 2;
-        app.gateway_pending_approvals = Some(1);
-        app.gateway_approval_items = vec![ApprovalSummary {
+        app.gateway.server_running = true;
+        app.workbench.permission_count = 2;
+        app.gateway.gateway_pending_approvals = Some(1);
+        app.gateway.gateway_approval_items = vec![ApprovalSummary {
             id: "approval-123456789".to_string(),
             tool_name: "bash".to_string(),
             risk: Some("high".to_string()),
@@ -390,10 +390,10 @@ mod tests {
             timeout_behavior: Some("execution_waits_for_timeout_resolution".to_string()),
             ..ApprovalSummary::default()
         }];
-        app.gateway_cross_plane_grants_active = Some(3);
-        app.gateway_cross_plane_actions_24h = Some(9);
-        app.gateway_lease_owner = Some("tui:session".to_string());
-        app.gateway_lease_mode = Some("attached".to_string());
+        app.gateway.gateway_cross_plane_grants_active = Some(3);
+        app.gateway.gateway_cross_plane_actions_24h = Some(9);
+        app.gateway.gateway_lease_owner = Some("tui:session".to_string());
+        app.gateway.gateway_lease_mode = Some("attached".to_string());
         let mut panel = ApprovalCockpitPanel::new();
         panel.sync_from_app(&app);
 
@@ -416,9 +416,9 @@ mod tests {
     #[test]
     fn renders_nonblocking_confirmation_as_a_veto_window() {
         let mut app = App::new("model", "session");
-        app.server_running = true;
-        app.gateway_pending_approvals = Some(1);
-        app.gateway_approval_items = vec![ApprovalSummary {
+        app.gateway.server_running = true;
+        app.gateway.gateway_pending_approvals = Some(1);
+        app.gateway.gateway_approval_items = vec![ApprovalSummary {
             id: "confirmation-123456789".to_string(),
             tool_name: "definition.template.publish".to_string(),
             risk: Some("medium".to_string()),
@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn renders_degraded_projection_reasons() {
         let mut app = App::new("model", "session");
-        app.gateway_degraded_reasons = vec!["approval projection unavailable".to_string()];
+        app.gateway.gateway_degraded_reasons = vec!["approval projection unavailable".to_string()];
 
         let mut panel = ApprovalCockpitPanel::new();
         panel.sync_from_app(&app);

@@ -12,7 +12,4 @@ generated:
     path: surfaces/webui/src/generated/gateway-api.ts
     generator: surfaces/webui/scripts/generate-api.mjs
     source: surfaces/webui/scripts/generate-api.mjs
-transitional:
-  - { repository: core, path: crates/tui/src/gateway/gateway_client.rs, phase: P2-P6 }
-  - { repository: core, path: crates/tui/src/app_core/state.rs, phase: P6 }
-  - { repository: core, path: crates/tui/src/app_core/app.rs, phase: P6 }
+transitional: []

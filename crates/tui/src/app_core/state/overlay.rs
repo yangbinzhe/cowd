@@ -1,0 +1,16 @@
+pub struct OverlayState {
+    pub dialog_manager: crate::components::dialog::DialogManager,
+    pub(super) pending_approval_dialog: Option<(String, String, bool)>,
+    pub toast_manager: crate::components::toast::ToastManager,
+    pub agents_overlay: crate::components::agents_overlay::AgentsOverlay,
+    pub thinking_panel: crate::components::thinking_panel::ThinkingPanel,
+    pub command_palette: crate::components::command_palette::CommandPalette,
+    pub question_form: Option<crate::components::question_form::QuestionForm>,
+    pub export_dialog: crate::components::export_dialog::ExportDialog,
+    pub export_dialog_active: bool,
+    pub pending_export_options: Option<crate::components::export_dialog::ExportOptions>,
+    pub revert_dialog: crate::components::revert_dialog::RevertDialog,
+    pub context_suggestions: crate::components::context_suggestions::ContextSuggestions,
+    pub diff_viewer: crate::components::diff_viewer::DiffViewer,
+    pub performance_dashboard: crate::components::performance_dashboard::PerformanceDashboard,
+}

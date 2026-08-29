@@ -213,39 +213,41 @@ impl GatewayPanel {
     /// Derives health_status from server_running: "Healthy" when running,
     /// None when stopped.
     pub fn sync_from_app(&mut self, app: &App) {
-        self.server_running = app.server_running;
-        self.uptime_secs = app.server_uptime_secs;
-        self.active_sessions = app.active_api_sessions;
-        self.runtime_readiness = app.gateway_runtime_readiness.clone();
-        self.runtime_components = app.gateway_runtime_components;
-        self.task_count = app.gateway_task_count;
-        self.pending_approvals = app.gateway_pending_approvals;
-        self.lease_owner = app.gateway_lease_owner.clone();
-        self.lease_mode = app.gateway_lease_mode.clone();
-        self.memory_status = app.memory_status.clone();
-        self.memory_context_envelope_status = app.memory_context_envelope_status.clone();
-        self.memory_context_envelope_compression = app.memory_context_envelope_compression.clone();
-        self.memory_context_envelope_used_ratio = app.memory_context_envelope_used_ratio;
-        self.memory_context_envelope_checkpoint = app.memory_context_envelope_checkpoint.clone();
-        self.connector_accounts = app.gateway_connector_accounts.clone();
-        self.connector_capabilities = app.gateway_connector_capabilities.clone();
-        self.connector_resources = app.gateway_connector_resources.clone();
-        self.execution_receipts = app.gateway_action_receipts.clone();
-        self.surfaces = app.gateway_surfaces.clone();
-        self.surface_health = app.gateway_surface_health.clone();
-        self.message_connectors = app.gateway_message_connectors.clone();
-        self.message_endpoints = app.gateway_message_endpoints.clone();
-        self.message_routes = app.gateway_message_routes.clone();
-        self.message_bindings = app.gateway_message_bindings.clone();
-        self.cowd_kernel = app.gateway_cowd_kernel.clone();
-        self.gateway_capability_contract = app.gateway_capability_contract.clone();
-        self.structured_data = app.gateway_structured_data.clone();
-        self.reality_core = app.gateway_reality_core.clone();
-        self.fact_flow = app.gateway_fact_flow.clone();
-        self.mission_control = app.gateway_mission_control.clone();
-        self.connector_degraded_reasons = app.gateway_connector_degraded_reasons.clone();
-        self.degraded_reasons = app.gateway_degraded_reasons.clone();
-        if app.server_running {
+        self.server_running = app.gateway.server_running;
+        self.uptime_secs = app.gateway.server_uptime_secs;
+        self.active_sessions = app.gateway.active_api_sessions;
+        self.runtime_readiness = app.gateway.gateway_runtime_readiness.clone();
+        self.runtime_components = app.gateway.gateway_runtime_components;
+        self.task_count = app.gateway.gateway_task_count;
+        self.pending_approvals = app.gateway.gateway_pending_approvals;
+        self.lease_owner = app.gateway.gateway_lease_owner.clone();
+        self.lease_mode = app.gateway.gateway_lease_mode.clone();
+        self.memory_status = app.workbench.memory_status.clone();
+        self.memory_context_envelope_status = app.workbench.memory_context_envelope_status.clone();
+        self.memory_context_envelope_compression =
+            app.workbench.memory_context_envelope_compression.clone();
+        self.memory_context_envelope_used_ratio = app.workbench.memory_context_envelope_used_ratio;
+        self.memory_context_envelope_checkpoint =
+            app.workbench.memory_context_envelope_checkpoint.clone();
+        self.connector_accounts = app.gateway.gateway_connector_accounts.clone();
+        self.connector_capabilities = app.gateway.gateway_connector_capabilities.clone();
+        self.connector_resources = app.gateway.gateway_connector_resources.clone();
+        self.execution_receipts = app.gateway.gateway_action_receipts.clone();
+        self.surfaces = app.gateway.gateway_surfaces.clone();
+        self.surface_health = app.gateway.gateway_surface_health.clone();
+        self.message_connectors = app.gateway.gateway_message_connectors.clone();
+        self.message_endpoints = app.gateway.gateway_message_endpoints.clone();
+        self.message_routes = app.gateway.gateway_message_routes.clone();
+        self.message_bindings = app.gateway.gateway_message_bindings.clone();
+        self.cowd_kernel = app.gateway.gateway_cowd_kernel.clone();
+        self.gateway_capability_contract = app.gateway.gateway_capability_contract.clone();
+        self.structured_data = app.gateway.gateway_structured_data.clone();
+        self.reality_core = app.gateway.gateway_reality_core.clone();
+        self.fact_flow = app.gateway.gateway_fact_flow.clone();
+        self.mission_control = app.gateway.gateway_mission_control.clone();
+        self.connector_degraded_reasons = app.gateway.gateway_connector_degraded_reasons.clone();
+        self.degraded_reasons = app.gateway.gateway_degraded_reasons.clone();
+        if app.gateway.server_running {
             self.health_status = Some("Healthy".to_string());
         } else {
             self.health_status = None;

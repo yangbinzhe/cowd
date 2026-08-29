@@ -1,4 +1,10 @@
 #![allow(dead_code)]
+pub use crate::app_model::{
+    ChatMessage, MessageIdentity, MessageSource, PendingInputPreview, PendingResource,
+    SessionActivityStats, SessionSummary, SystemNotice, SystemNoticeKind, Theme, TimelineCausality,
+    TimelineEntry, TimelinePage, ToolCard, TuiTelemetry,
+};
+use crate::app_model::{LiveMessageKey, ToolInstanceIdentity};
 use crate::components::composer::model::ComposerModel;
 use crate::components::turn_interaction::TurnInteractionState;
 use crate::layout::{build_default_layout, LayoutState, LayoutTree};
@@ -21,323 +27,18 @@ const PAGE_SIZE: usize = 500;
 const SOFT_CAP: usize = 50000;
 const HARD_CAP: usize = 50000;
 
-#[derive(Debug, Clone)]
-pub struct TimelinePage {
-    pub entries: Vec<TimelineEntry>,
-    pub start_index: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum TimelineEntry {
-    Message {
-        role: String,
-        content: String,
-        timestamp: String,
-        identity: Option<MessageIdentity>,
-    },
-    Thinking {
-        id: u64,
-        causal_item_id: Option<String>,
-        causality: Option<TimelineCausality>,
-        content: String,
-        complete: bool,
-        expanded: bool,
-    },
-    ToolCall {
-        id: String,
-        name: String,
-        preview: String,
-        output: String,
-        done: bool,
-        expanded: bool,
-        exit_code: Option<i32>,
-        causality: Option<TimelineCausality>,
-    },
-    SlashOutput {
-        command: String,
-        output: String,
-        expanded: bool,
-    },
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TimelineCausality {
-    pub model_step_id: Option<String>,
-    pub item_id: Option<String>,
-    pub segment_id: Option<String>,
-    pub tool_call_id: Option<String>,
-    pub causal_sequence: Option<u64>,
-    pub delta_sequence: Option<u64>,
-    pub causal_parent_ids: Vec<String>,
-    pub wave: usize,
-    pub lane: usize,
-    pub lane_count: usize,
-}
-
-impl TimelineCausality {
-    fn from_correlation(correlation: &crate::protocol::GatewayEventCorrelation) -> Self {
-        Self {
-            model_step_id: correlation.model_step_id.clone(),
-            item_id: correlation.item_id.clone(),
-            segment_id: correlation.segment_id.clone(),
-            tool_call_id: correlation.tool_call_id.clone(),
-            causal_sequence: correlation.causal_sequence,
-            delta_sequence: correlation.delta_sequence,
-            causal_parent_ids: correlation.causal_parent_ids.clone(),
-            wave: 0,
-            lane: 0,
-            lane_count: 1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessageIdentity {
-    pub message_id: Option<String>,
-    pub sequence: Option<usize>,
-    pub execution_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub part_id: Option<String>,
-    pub source: MessageSource,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageSource {
-    Local,
-    DurableHistory,
-    DurableIngress,
-    Live,
-    ReplayedTerminal,
-    DurableTerminal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct LiveMessageKey {
-    execution_id: Option<String>,
-    turn_id: Option<String>,
-    part_id: Option<String>,
-}
-
-/// Canonical identity for one tool invocation.
-///
-/// Provider-local tool ids are not globally unique (`dsml-tool-0` commonly
-/// repeats every turn). All indexing therefore includes the owning
-/// Session/execution/turn/part, or the durable message/block position while
-/// hydrating history.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ToolInstanceIdentity {
-    session_id: String,
-    execution_id: Option<String>,
-    turn_id: Option<String>,
-    part_id: Option<String>,
-    durable_message_id: Option<String>,
-    durable_sequence: Option<usize>,
-    block_index: Option<usize>,
-    provider_tool_id: String,
-}
-
-impl ToolInstanceIdentity {
-    fn stable_key(&self) -> String {
-        fn segment(value: Option<&str>) -> String {
-            value.map_or_else(
-                || "-".to_string(),
-                |value| format!("{}:{value}", value.len()),
-            )
-        }
-        if self.provider_tool_id.contains("#cowd-")
-            && self.execution_id.is_some()
-            && self.turn_id.is_some()
-        {
-            return format!(
-                "tool-instance-v2|{}|{}|{}|{}",
-                segment(Some(&self.session_id)),
-                segment(self.execution_id.as_deref()),
-                segment(self.turn_id.as_deref()),
-                segment(Some(&self.provider_tool_id)),
-            );
-        }
-        format!(
-            "tool-instance|{}|{}|{}|{}|{}|{}|{}|{}",
-            segment(Some(&self.session_id)),
-            segment(self.execution_id.as_deref()),
-            segment(self.turn_id.as_deref()),
-            segment(self.part_id.as_deref()),
-            segment(self.durable_message_id.as_deref()),
-            self.durable_sequence
-                .map_or_else(|| "-".to_string(), |value| value.to_string()),
-            self.block_index
-                .map_or_else(|| "-".to_string(), |value| value.to_string()),
-            segment(Some(&self.provider_tool_id)),
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SessionActivityStats {
-    pub thinking_count: usize,
-    pub tool_count: usize,
-    pub message_count: usize,
-    pub event_count: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TuiTelemetry {
-    pub history_hydration_duration_ms: Option<u64>,
-    pub history_hydrated_messages: usize,
-    pub history_hydration_pages: usize,
-    pub session_sse_reconnect_count: u64,
-    pub session_sse_last_cursor: Option<u64>,
-    pub projection_sse_reconnect_count: u64,
-    pub projection_sse_last_cursor: Option<u64>,
-    pub replay_terminal_dedupe_count: u64,
-    pub text_delta_dedupe_count: u64,
-    pub orphan_event_count: u64,
-    pub finalized_cache_hits: u64,
-    pub finalized_cache_misses: u64,
-    pub live_tail_rebuild_count: u64,
-    pub full_timeline_rebuild_count: u64,
-    pub model_mismatch_count: u64,
-    pub model_mismatch_active: bool,
-}
-
-impl TimelineEntry {
-    pub fn expanded_lines(&self) -> usize {
-        match self {
-            Self::Message { content, .. } => content.lines().count().max(1),
-            Self::Thinking {
-                content, expanded, ..
-            } => {
-                if *expanded {
-                    content.lines().count().max(1) + 2
-                } else {
-                    1
-                }
-            }
-            Self::ToolCall {
-                output, expanded, ..
-            } => {
-                if *expanded && !output.is_empty() {
-                    output.lines().count().max(1) + 2
-                } else {
-                    1
-                }
-            }
-            Self::SlashOutput {
-                output, expanded, ..
-            } => {
-                if *expanded && !output.is_empty() {
-                    output.lines().count().max(1) + 2
-                } else {
-                    1
-                }
-            }
-        }
-    }
-
-    pub fn is_collapsible(&self) -> bool {
-        matches!(
-            self,
-            Self::Thinking { .. } | Self::ToolCall { .. } | Self::SlashOutput { .. }
-        )
-    }
-
-    pub fn is_expanded(&self) -> bool {
-        match self {
-            Self::Thinking { expanded, .. } => *expanded,
-            Self::ToolCall { expanded, .. } => *expanded,
-            Self::SlashOutput { expanded, .. } => *expanded,
-            _ => false,
-        }
-    }
-
-    pub fn toggle(&mut self) {
-        match self {
-            Self::Thinking { expanded, .. } => *expanded = !*expanded,
-            Self::ToolCall { expanded, .. } => *expanded = !*expanded,
-            Self::SlashOutput { expanded, .. } => *expanded = !*expanded,
-            _ => {}
-        }
-    }
-
-    pub fn full_text(&self) -> String {
-        match self {
-            Self::Message { content, .. } => content.clone(),
-            Self::Thinking { content, .. } => content.clone(),
-            Self::ToolCall { output, .. } => output.clone(),
-            Self::SlashOutput { output, .. } => output.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolCard {
-    pub id: String,
-    pub name: String,
-    pub output: String,
-    pub done: bool,
-    pub expanded: bool,
-    pub exit_code: Option<i32>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSummary {
-    pub id: String,
-    pub title: Option<String>,
-    pub path: String,
-    pub updated_at_ms: u64,
-    pub message_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingResource {
-    pub id: String,
-    pub label: String,
-    pub kind: String,
-}
-
-/// Read-only TUI projection of a Runtime-owned SessionIngress record. Edits,
-/// cancellation and routing still address the canonical `input_id` through
-/// Gateway; this struct is never an executable local queue.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingInputPreview {
-    pub input_id: String,
-    pub status: String,
-    pub decision: String,
-    pub content_preview: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SystemNoticeKind {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SystemNotice {
-    pub kind: SystemNoticeKind,
-    pub content: String,
-    pub timestamp: String,
-}
-
-impl SystemNotice {
-    pub fn label(&self) -> String {
-        let prefix = match self.kind {
-            SystemNoticeKind::Info => "notice",
-            SystemNoticeKind::Warning => "warning",
-            SystemNoticeKind::Error => "error",
-        };
-        format!("{prefix}: {}", self.content)
-    }
-}
-
+/// Narrow composition root for terminal read models. Each slice has one
+/// lifecycle and stays below the structural field limit.
 pub struct App {
+    pub shell: AppShellState,
+    pub timeline: TimelineState,
+    pub workbench: WorkbenchViewState,
+    pub gateway: GatewayViewState,
+    pub execution: ExecutionViewState,
+    pub history: HistoryViewState,
+}
+
+pub struct AppShellState {
     pub model: String,
     /// Model requested by the caller/session record. This is not proof that a
     /// provider actually used it.
@@ -360,6 +61,28 @@ pub struct App {
     pub spinner_idx: usize,
     pub should_quit: bool,
 
+    pub token_count: u64,
+    pub compaction_count: u32,
+    pub cache_hits: u64,
+    pub picker_active: bool,
+    pub picker_sessions: Vec<SessionSummary>,
+    pub picker_idx: usize,
+    pub theme: Theme,
+    pub input_history: Vec<String>,
+    pub history_idx: Option<usize>,
+    pub help_visible: bool,
+    pub available_models: Vec<String>,
+    pub model_dirty: bool,
+    pub notification: Option<String>,
+    notification_ttl: u32,
+    pub sessions: Vec<(String, String, String)>,
+    pub active_session_name: String,
+    pub layout_tree: LayoutTree,
+    pub layout_state: LayoutState,
+    pub compact_chat: bool,
+}
+
+pub struct TimelineState {
     pub timeline_pages: VecDeque<TimelinePage>,
     pub total_entries: usize,
     pub timeline_cursor: usize,
@@ -377,13 +100,30 @@ pub struct App {
     non_text_durable_owner: HashMap<String, String>,
     thinking_id_counter: u64,
 
-    pub token_count: u64,
-    pub compaction_count: u32,
-    pub cache_hits: u64,
-    pub picker_active: bool,
-    pub picker_sessions: Vec<SessionSummary>,
-    pub picker_idx: usize,
-    pub theme: Theme,
+    pub scroll_offset: usize,
+    pub auto_scroll: bool,
+    pub msg_version: u64,
+    pub render_version: u64,
+    pub timeline_full_sync_revision: u64,
+    pub timeline_mutation_revision: u64,
+    timeline_dirty_log: VecDeque<(u64, usize, String)>,
+    pub last_drawn_version: u64,
+    pub last_drawn_render_version: u64,
+    pub cached_chat_lines: Vec<ratatui::text::Line<'static>>,
+    pub entry_line_counts: Vec<usize>,
+    pub lines_dirty: bool,
+    last_built_line_count: usize,
+    pub search_query: String,
+    pub search_matches: Vec<usize>,
+    pub search_current: usize,
+    pub search_active: bool,
+    searchable_content_revision: u64,
+    search_index_revision: u64,
+    search_text_index: Vec<String>,
+    pub viewport_height: usize,
+}
+
+pub struct WorkbenchViewState {
     pub gateway_sessions: Vec<GatewaySession>,
     pub gateway_platform: String,
     pub file_entries: Vec<FileEntry>,
@@ -417,7 +157,9 @@ pub struct App {
     pub lsp_available: usize,
     /// Number of pending permission requests.
     pub permission_count: usize,
+}
 
+pub struct GatewayViewState {
     /// Wave execution state for agentic loop tracking.
     pub wave_state: crate::components::status_bar::WaveState,
 
@@ -489,9 +231,9 @@ pub struct App {
     pub gateway_lease_owner: Option<String>,
     /// Current runtime session lease mode for the attached TUI session.
     pub gateway_lease_mode: Option<String>,
-    pub scroll_offset: usize,
-    pub auto_scroll: bool,
+}
 
+pub struct ExecutionViewState {
     /// Canonical TUI transport/execution presentation state.  Timeline text
     /// and legacy stream events may decorate a turn but cannot decide whether
     /// a Runtime execution is active.
@@ -508,19 +250,6 @@ pub struct App {
     /// started even when an intermediate phase envelope was coalesced.
     committed_ingress_correlations: BTreeSet<(String, String)>,
 
-    pub msg_version: u64,
-    /// Non-transcript UI revision (composer, focus, modal/search selection).
-    pub render_version: u64,
-    /// Changes only when consumers must replace their complete timeline
-    /// projection (history reconciliation or front eviction).
-    pub timeline_full_sync_revision: u64,
-    /// Monotonic identity-aware mutation cursor consumed by ChatView. This is
-    /// independent from append length and catches progress updates to entries
-    /// far outside the visible tail.
-    pub timeline_mutation_revision: u64,
-    timeline_dirty_log: VecDeque<(u64, usize, String)>,
-    pub last_drawn_version: u64,
-    pub last_drawn_render_version: u64,
     pub context_window: u64,
     pub latest_context_envelope: Option<Value>,
     pub latest_runtime_policy: Option<crate::RuntimePolicyDecisionSummary>,
@@ -542,6 +271,25 @@ pub struct App {
     pub context_remaining_tokens: Option<u64>,
     pub context_usage_percent_bp: Option<u16>,
     pub context_usage_source: Option<String>,
+    pub telemetry: TuiTelemetry,
+    pub stream_connection_state: crate::protocol::SessionStreamConnectionState,
+    pub projection_connection_state: Option<crate::protocol::SessionStreamConnectionState>,
+    pub live_output_snapshot_gap: bool,
+    live_stream_revisions: HashMap<LiveMessageKey, u64>,
+    seen_terminal_ids: BTreeSet<String>,
+    seen_cancellation_ids: BTreeMap<String, harness_contract::turn::CancellationStatus>,
+    hydrated_non_text_message_ids: BTreeSet<String>,
+    pending_message_admissions: BTreeMap<String, u64>,
+    pub turn_input_tokens: u64,
+    pub turn_output_tokens: u64,
+    pub turn_usage_known: bool,
+    pub current_turn_tool_count: usize,
+    pub current_turn_thinking_count: usize,
+    pre_turn_input: u64,
+    pre_turn_output: u64,
+}
+
+pub struct HistoryViewState {
     pub history_hydrated: bool,
     pub session_history_index: Option<crate::protocol::SessionHistoryIndexProjection>,
     pub history_hydration_error: Option<String>,
@@ -554,18 +302,6 @@ pub struct App {
     pub history_loading_newer: bool,
     pub history_prepend_revision: u64,
     pub history_prepend_anchor_message_id: Option<String>,
-    pub telemetry: TuiTelemetry,
-    pub stream_connection_state: crate::protocol::SessionStreamConnectionState,
-    pub projection_connection_state: Option<crate::protocol::SessionStreamConnectionState>,
-    pub live_output_snapshot_gap: bool,
-    /// Last accepted provider stream revision for each causal assistant part.
-    /// Byte offsets alone cannot reject a replay that carries a conflicting
-    /// payload at the same range after reconnect.
-    live_stream_revisions: HashMap<LiveMessageKey, u64>,
-    seen_terminal_ids: BTreeSet<String>,
-    seen_cancellation_ids: BTreeMap<String, harness_contract::turn::CancellationStatus>,
-    hydrated_non_text_message_ids: BTreeSet<String>,
-    pending_message_admissions: BTreeMap<String, u64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub durable_session_input_tokens: u64,
@@ -575,51 +311,6 @@ pub struct App {
     pub authoritative_session_input_tokens: Option<u64>,
     pub authoritative_session_output_tokens: Option<u64>,
     durable_message_usage: BTreeMap<String, (u64, u64)>,
-
-    pub turn_input_tokens: u64,
-    pub turn_output_tokens: u64,
-    /// Provider usage has been observed for the selected turn. Zero is a valid
-    /// measured value; false means unknown and must render as an em dash.
-    pub turn_usage_known: bool,
-    pub current_turn_tool_count: usize,
-    pub current_turn_thinking_count: usize,
-    pre_turn_input: u64,
-    pre_turn_output: u64,
-
-    pub cached_chat_lines: Vec<ratatui::text::Line<'static>>,
-
-    pub entry_line_counts: Vec<usize>,
-    pub lines_dirty: bool,
-    last_built_line_count: usize,
-
-    pub input_history: Vec<String>,
-    pub history_idx: Option<usize>,
-
-    pub search_query: String,
-    pub search_matches: Vec<usize>,
-    pub search_current: usize,
-    pub search_active: bool,
-    searchable_content_revision: u64,
-    search_index_revision: u64,
-    search_text_index: Vec<String>,
-
-    pub viewport_height: usize,
-
-    pub help_visible: bool,
-
-    pub available_models: Vec<String>,
-    pub model_dirty: bool,
-
-    pub notification: Option<String>,
-    notification_ttl: u32,
-
-    pub sessions: Vec<(String, String, String)>, // (id, name, created)
-    pub active_session_name: String,
-
-    pub layout_tree: LayoutTree,
-    pub layout_state: LayoutState,
-
-    pub compact_chat: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -677,329 +368,247 @@ pub struct CurrentTaskSummary {
     pub blocker_reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Theme {
-    Dark,
-    Light,
-}
-
-impl Theme {
-    pub fn bg(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::Black,
-            Self::Light => ratatui::style::Color::White,
-        }
-    }
-    pub fn fg(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::White,
-            Self::Light => ratatui::style::Color::Black,
-        }
-    }
-    pub fn accent(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::Cyan,
-            Self::Light => ratatui::style::Color::Blue,
-        }
-    }
-    pub fn user_color(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::Green,
-            Self::Light => ratatui::style::Color::DarkGray,
-        }
-    }
-    /// Secondary / dimmed text (used for muted labels, timestamps, truncation notices).
-    /// Higher contrast than DarkGray for readability on dark backgrounds.
-    pub fn muted_color(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::Rgb(150, 150, 150),
-            Self::Light => ratatui::style::Color::Rgb(100, 100, 100),
-        }
-    }
-    /// Warning / attention color.
-    pub fn warn_color(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::Yellow,
-            Self::Light => ratatui::style::Color::Rgb(180, 130, 0),
-        }
-    }
-    /// Success / positive color.
-    pub fn success_color(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::Green,
-            Self::Light => ratatui::style::Color::Rgb(0, 130, 0),
-        }
-    }
-    /// Error / negative color.
-    pub fn error_color(&self) -> ratatui::style::Color {
-        ratatui::style::Color::Red
-    }
-    /// Code block background color.
-    pub fn code_bg_color(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::Rgb(35, 35, 45),
-            Self::Light => ratatui::style::Color::Rgb(235, 235, 240),
-        }
-    }
-    /// Inline code color.
-    pub fn inline_code_color(&self) -> ratatui::style::Color {
-        self.warn_color()
-    }
-    /// Link color.
-    pub fn link_color(&self) -> ratatui::style::Color {
-        match self {
-            Self::Dark => ratatui::style::Color::Cyan,
-            Self::Light => ratatui::style::Color::Blue,
-        }
-    }
-    pub fn toggle(&mut self) {
-        *self = match self {
-            Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
-        };
-    }
-}
-
 impl App {
     pub fn new(model: &str, session_id: &str) -> Self {
         Self {
-            model: model.to_string(),
-            requested_model: (!model.trim().is_empty()
-                && model != "default"
-                && model != "unresolved")
-                .then(|| model.to_string()),
-            effective_model: None,
-            model_source: None,
-            session_id: session_id.to_string(),
-            execution_policy_preset: "unavailable".to_string(),
-            execution_policy_snapshot: None,
-            current_task: None,
-            input: ComposerModel::default(),
-            spinner_idx: 0,
-            should_quit: false,
-
-            timeline_pages: VecDeque::new(),
-            total_entries: 0,
-            timeline_cursor: 0,
-            timeline_base_position: 0,
-            message_timeline_positions: HashMap::new(),
-            live_timeline_positions: HashMap::new(),
-            tool_timeline_positions: HashMap::new(),
-            pending_history_tool_instances: HashMap::new(),
-            non_text_durable_owner: HashMap::new(),
-            thinking_id_counter: 0,
-
-            token_count: 0,
-            compaction_count: 0,
-            cache_hits: 0,
-            picker_active: false,
-            picker_sessions: Vec::new(),
-            picker_idx: 0,
-            theme: Theme::Dark,
-            gateway_sessions: Vec::new(),
-            gateway_platform: String::new(),
-            file_entries: Vec::new(),
-            delegate_tasks: Vec::new(),
-            memory_entries: Vec::new(),
-            skill_list: Vec::new(),
-            pending_resources: Vec::new(),
-            pending_inputs: Vec::new(),
-            system_notices: VecDeque::new(),
-            skin: crate::skin::SkinConfig::default(),
-            memory_status: None,
-            memory_total_entries: None,
-            memory_vector_count: None,
-            memory_layer_counts: [0; 5],
-            memory_context_envelope_status: None,
-            memory_context_envelope_compression: None,
-            memory_context_envelope_used_ratio: None,
-            memory_context_envelope_checkpoint: None,
-            memory_governance: None,
-            gateway_knowledge_candidates: Vec::new(),
-
-            selected_agent_reputation: None,
-            mcp_count: 0,
-            lsp_available: 0,
-            permission_count: 0,
-
-            wave_state: crate::components::status_bar::WaveState::default(),
-            server_running: false,
-            server_uptime_secs: None,
-            active_api_sessions: 0,
-            gateway_runtime_readiness: None,
-            gateway_runtime_components: None,
-            gateway_task_count: None,
-            gateway_tasks: Vec::new(),
-            gateway_pending_approvals: None,
-            gateway_approval_items: Vec::new(),
-            gateway_approval_grants: Vec::new(),
-            gateway_cross_plane_grants_active: None,
-            gateway_cross_plane_actions_24h: None,
-            gateway_connector_accounts: Vec::new(),
-            gateway_connector_capabilities: Vec::new(),
-            gateway_connector_resources: Vec::new(),
-            gateway_action_receipts: Vec::new(),
-            gateway_surfaces: Vec::new(),
-            gateway_surface_health: None,
-            gateway_surface_events: Vec::new(),
-            gateway_message_connectors: Vec::new(),
-            gateway_message_endpoints: Vec::new(),
-            gateway_message_routes: Vec::new(),
-            gateway_message_bindings: Vec::new(),
-            gateway_cowd_kernel: None,
-            gateway_capability_contract: None,
-            gateway_structured_data: None,
-            gateway_reality_core: None,
-            gateway_fact_flow: None,
-            gateway_mission_control: None,
-            gateway_mission_materialized: None,
-            gateway_connector_degraded_reasons: Vec::new(),
-            gateway_degraded_reasons: Vec::new(),
-            gateway_lease_owner: None,
-            gateway_lease_mode: None,
-            scroll_offset: 0,
-            auto_scroll: true,
-
-            turn_interaction: TurnInteractionState::default(),
-            streaming_received: false,
-            terminal_correlations: VecDeque::new(),
-            committed_ingress_correlations: BTreeSet::new(),
-
-            msg_version: 0,
-            render_version: 0,
-            timeline_full_sync_revision: 0,
-            timeline_mutation_revision: 0,
-            timeline_dirty_log: VecDeque::new(),
-            last_drawn_version: u64::MAX,
-            last_drawn_render_version: u64::MAX,
-            context_window: 0,
-            latest_context_envelope: None,
-            latest_runtime_policy: None,
-            latest_execution_graph_summary: None,
-            latest_execution_projection: None,
-            current_execution_status: None,
-            current_execution_status_detail: None,
-            current_execution_id: None,
-            current_turn_id: None,
-            execution_started_at_ms: None,
-            last_progress_at_ms: None,
-            current_run_metrics: None,
-            current_execution_latency: None,
-            latest_model_telemetry: None,
-            context_used_tokens: None,
-            context_window_tokens: None,
-            context_remaining_tokens: None,
-            context_usage_percent_bp: None,
-            context_usage_source: None,
-            history_hydrated: false,
-            session_history_index: None,
-            history_hydration_error: None,
-            history_window_truncated: false,
-            history_oldest_offset: 0,
-            history_window_end_offset: 0,
-            history_total_messages: 0,
-            history_has_older: false,
-            history_loading_older: false,
-            history_loading_newer: false,
-            history_prepend_revision: 0,
-            history_prepend_anchor_message_id: None,
-            telemetry: TuiTelemetry::default(),
-            stream_connection_state: crate::protocol::SessionStreamConnectionState::Connecting,
-            projection_connection_state: None,
-            live_output_snapshot_gap: false,
-            live_stream_revisions: HashMap::new(),
-            seen_terminal_ids: BTreeSet::new(),
-            seen_cancellation_ids: BTreeMap::new(),
-            hydrated_non_text_message_ids: BTreeSet::new(),
-            pending_message_admissions: BTreeMap::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            durable_session_input_tokens: 0,
-            durable_session_output_tokens: 0,
-            authoritative_session_input_tokens: None,
-            authoritative_session_output_tokens: None,
-            durable_message_usage: BTreeMap::new(),
-
-            turn_input_tokens: 0,
-            turn_output_tokens: 0,
-            turn_usage_known: false,
-            current_turn_tool_count: 0,
-            current_turn_thinking_count: 0,
-            pre_turn_input: 0,
-            pre_turn_output: 0,
-
-            cached_chat_lines: Vec::new(),
-
-            entry_line_counts: Vec::new(),
-            lines_dirty: true,
-            last_built_line_count: 0,
-
-            input_history: Vec::new(),
-            history_idx: None,
-
-            search_query: String::new(),
-            search_matches: Vec::new(),
-            search_current: 0,
-            search_active: false,
-            searchable_content_revision: 0,
-            search_index_revision: u64::MAX,
-            search_text_index: Vec::new(),
-
-            viewport_height: 24,
-
-            help_visible: false,
-
-            available_models: vec![model.to_string()],
-            model_dirty: false,
-
-            notification: None,
-            notification_ttl: 0,
-
-            sessions: Vec::new(),
-            active_session_name: String::new(),
-
-            layout_tree: build_default_layout(),
-            layout_state: LayoutState::new(),
-            compact_chat: false,
+            shell: AppShellState {
+                model: model.to_string(),
+                requested_model: (!model.trim().is_empty()
+                    && model != "default"
+                    && model != "unresolved")
+                    .then(|| model.to_string()),
+                effective_model: None,
+                model_source: None,
+                session_id: session_id.to_string(),
+                execution_policy_preset: "unavailable".to_string(),
+                execution_policy_snapshot: None,
+                current_task: None,
+                input: ComposerModel::default(),
+                spinner_idx: 0,
+                should_quit: false,
+                token_count: 0,
+                compaction_count: 0,
+                cache_hits: 0,
+                picker_active: false,
+                picker_sessions: Vec::new(),
+                picker_idx: 0,
+                theme: Theme::Dark,
+                input_history: Vec::new(),
+                history_idx: None,
+                help_visible: false,
+                available_models: vec![model.to_string()],
+                model_dirty: false,
+                notification: None,
+                notification_ttl: 0,
+                sessions: Vec::new(),
+                active_session_name: String::new(),
+                layout_tree: build_default_layout(),
+                layout_state: LayoutState::new(),
+                compact_chat: false,
+            },
+            timeline: TimelineState {
+                timeline_pages: VecDeque::new(),
+                total_entries: 0,
+                timeline_cursor: 0,
+                timeline_base_position: 0,
+                message_timeline_positions: HashMap::new(),
+                live_timeline_positions: HashMap::new(),
+                tool_timeline_positions: HashMap::new(),
+                pending_history_tool_instances: HashMap::new(),
+                non_text_durable_owner: HashMap::new(),
+                thinking_id_counter: 0,
+                scroll_offset: 0,
+                auto_scroll: true,
+                msg_version: 0,
+                render_version: 0,
+                timeline_full_sync_revision: 0,
+                timeline_mutation_revision: 0,
+                timeline_dirty_log: VecDeque::new(),
+                last_drawn_version: u64::MAX,
+                last_drawn_render_version: u64::MAX,
+                cached_chat_lines: Vec::new(),
+                entry_line_counts: Vec::new(),
+                lines_dirty: true,
+                last_built_line_count: 0,
+                search_query: String::new(),
+                search_matches: Vec::new(),
+                search_current: 0,
+                search_active: false,
+                searchable_content_revision: 0,
+                search_index_revision: u64::MAX,
+                search_text_index: Vec::new(),
+                viewport_height: 24,
+            },
+            workbench: WorkbenchViewState {
+                gateway_sessions: Vec::new(),
+                gateway_platform: String::new(),
+                file_entries: Vec::new(),
+                delegate_tasks: Vec::new(),
+                memory_entries: Vec::new(),
+                skill_list: Vec::new(),
+                pending_resources: Vec::new(),
+                pending_inputs: Vec::new(),
+                system_notices: VecDeque::new(),
+                skin: crate::skin::SkinConfig::default(),
+                memory_status: None,
+                memory_total_entries: None,
+                memory_vector_count: None,
+                memory_layer_counts: [0; 5],
+                memory_context_envelope_status: None,
+                memory_context_envelope_compression: None,
+                memory_context_envelope_used_ratio: None,
+                memory_context_envelope_checkpoint: None,
+                memory_governance: None,
+                gateway_knowledge_candidates: Vec::new(),
+                selected_agent_reputation: None,
+                mcp_count: 0,
+                lsp_available: 0,
+                permission_count: 0,
+            },
+            gateway: GatewayViewState {
+                wave_state: crate::components::status_bar::WaveState::default(),
+                server_running: false,
+                server_uptime_secs: None,
+                active_api_sessions: 0,
+                gateway_runtime_readiness: None,
+                gateway_runtime_components: None,
+                gateway_task_count: None,
+                gateway_tasks: Vec::new(),
+                gateway_pending_approvals: None,
+                gateway_approval_items: Vec::new(),
+                gateway_approval_grants: Vec::new(),
+                gateway_cross_plane_grants_active: None,
+                gateway_cross_plane_actions_24h: None,
+                gateway_connector_accounts: Vec::new(),
+                gateway_connector_capabilities: Vec::new(),
+                gateway_connector_resources: Vec::new(),
+                gateway_action_receipts: Vec::new(),
+                gateway_surfaces: Vec::new(),
+                gateway_surface_health: None,
+                gateway_surface_events: Vec::new(),
+                gateway_message_connectors: Vec::new(),
+                gateway_message_endpoints: Vec::new(),
+                gateway_message_routes: Vec::new(),
+                gateway_message_bindings: Vec::new(),
+                gateway_cowd_kernel: None,
+                gateway_capability_contract: None,
+                gateway_structured_data: None,
+                gateway_reality_core: None,
+                gateway_fact_flow: None,
+                gateway_mission_control: None,
+                gateway_mission_materialized: None,
+                gateway_connector_degraded_reasons: Vec::new(),
+                gateway_degraded_reasons: Vec::new(),
+                gateway_lease_owner: None,
+                gateway_lease_mode: None,
+            },
+            execution: ExecutionViewState {
+                turn_interaction: TurnInteractionState::default(),
+                streaming_received: false,
+                terminal_correlations: VecDeque::new(),
+                committed_ingress_correlations: BTreeSet::new(),
+                context_window: 0,
+                latest_context_envelope: None,
+                latest_runtime_policy: None,
+                latest_execution_graph_summary: None,
+                latest_execution_projection: None,
+                current_execution_status: None,
+                current_execution_status_detail: None,
+                current_execution_id: None,
+                current_turn_id: None,
+                execution_started_at_ms: None,
+                last_progress_at_ms: None,
+                current_run_metrics: None,
+                current_execution_latency: None,
+                latest_model_telemetry: None,
+                context_used_tokens: None,
+                context_window_tokens: None,
+                context_remaining_tokens: None,
+                context_usage_percent_bp: None,
+                context_usage_source: None,
+                telemetry: TuiTelemetry::default(),
+                stream_connection_state: crate::protocol::SessionStreamConnectionState::Connecting,
+                projection_connection_state: None,
+                live_output_snapshot_gap: false,
+                live_stream_revisions: HashMap::new(),
+                seen_terminal_ids: BTreeSet::new(),
+                seen_cancellation_ids: BTreeMap::new(),
+                hydrated_non_text_message_ids: BTreeSet::new(),
+                pending_message_admissions: BTreeMap::new(),
+                turn_input_tokens: 0,
+                turn_output_tokens: 0,
+                turn_usage_known: false,
+                current_turn_tool_count: 0,
+                current_turn_thinking_count: 0,
+                pre_turn_input: 0,
+                pre_turn_output: 0,
+            },
+            history: HistoryViewState {
+                history_hydrated: false,
+                session_history_index: None,
+                history_hydration_error: None,
+                history_window_truncated: false,
+                history_oldest_offset: 0,
+                history_window_end_offset: 0,
+                history_total_messages: 0,
+                history_has_older: false,
+                history_loading_older: false,
+                history_loading_newer: false,
+                history_prepend_revision: 0,
+                history_prepend_anchor_message_id: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                durable_session_input_tokens: 0,
+                durable_session_output_tokens: 0,
+                authoritative_session_input_tokens: None,
+                authoritative_session_output_tokens: None,
+                durable_message_usage: BTreeMap::new(),
+            },
         }
     }
 
     pub fn refresh_model_mismatch_telemetry(&mut self) {
         let mismatch = self
+            .shell
             .requested_model
             .as_deref()
-            .zip(self.effective_model.as_deref())
+            .zip(self.shell.effective_model.as_deref())
             .is_some_and(|(requested, effective)| requested != effective);
-        if mismatch && !self.telemetry.model_mismatch_active {
-            self.telemetry.model_mismatch_count =
-                self.telemetry.model_mismatch_count.saturating_add(1);
+        if mismatch && !self.execution.telemetry.model_mismatch_active {
+            self.execution.telemetry.model_mismatch_count = self
+                .execution
+                .telemetry
+                .model_mismatch_count
+                .saturating_add(1);
             tracing::warn!(
-                session_id = %self.session_id,
-                requested_model = self.requested_model.as_deref().unwrap_or("unknown"),
-                effective_model = self.effective_model.as_deref().unwrap_or("unknown"),
-                mismatch_count = self.telemetry.model_mismatch_count,
+                session_id = %self.shell.session_id,
+                requested_model = self.shell.requested_model.as_deref().unwrap_or("unknown"),
+                effective_model = self.shell.effective_model.as_deref().unwrap_or("unknown"),
+                mismatch_count = self.execution.telemetry.model_mismatch_count,
                 "TUI observed a requested/effective model mismatch"
             );
         }
-        self.telemetry.model_mismatch_active = mismatch;
+        self.execution.telemetry.model_mismatch_active = mismatch;
     }
 
     pub fn apply_session_stats(&mut self, stats: Value) {
         if stats
             .get("session_id")
             .and_then(Value::as_str)
-            .is_some_and(|session_id| session_id != self.session_id)
+            .is_some_and(|session_id| session_id != self.shell.session_id)
         {
             return;
         }
         if let Some(tokens) = stats.get("tokens") {
-            self.authoritative_session_input_tokens = tokens.get("input").and_then(Value::as_u64);
-            self.authoritative_session_output_tokens = tokens.get("output").and_then(Value::as_u64);
+            self.history.authoritative_session_input_tokens =
+                tokens.get("input").and_then(Value::as_u64);
+            self.history.authoritative_session_output_tokens =
+                tokens.get("output").and_then(Value::as_u64);
         }
         if let Some(total) = stats.pointer("/tokens/total").and_then(Value::as_u64) {
-            self.token_count = total;
+            self.shell.token_count = total;
         }
-        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
     }
 
     /// Install the canonical execution snapshot if it is not an older replay
@@ -1012,6 +621,7 @@ impl App {
     ) -> bool {
         if self.turn_is_active()
             && self
+                .execution
                 .current_execution_id
                 .as_deref()
                 .is_some_and(|current| current != projection.execution_id.as_str())
@@ -1027,6 +637,7 @@ impl App {
             return false;
         }
         if let Some(current) = self
+            .execution
             .latest_execution_projection
             .as_ref()
             .filter(|current| current.execution_id == projection.execution_id)
@@ -1084,7 +695,7 @@ impl App {
             .as_ref()
             .and_then(|live| live.turn_id.clone())
             .or_else(|| projection.turn_id.clone())
-            .or_else(|| self.current_turn_id.clone());
+            .or_else(|| self.execution.current_turn_id.clone());
         let total_nodes = projection.graph.nodes.len();
         let terminal_nodes = projection
             .graph
@@ -1111,7 +722,7 @@ impl App {
         } else {
             "running"
         };
-        self.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
+        self.execution.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
             graph_id: Some(projection.execution_id.clone()),
             board_id: None,
             status: status.to_string(),
@@ -1128,9 +739,9 @@ impl App {
             synthesis_lift: None,
             complementarity_score: None,
         });
-        let preserved_model_telemetry = (self.current_execution_id.as_deref()
+        let preserved_model_telemetry = (self.execution.current_execution_id.as_deref()
             == Some(projection.execution_id.as_str()))
-        .then(|| self.latest_model_telemetry.clone())
+        .then(|| self.execution.latest_model_telemetry.clone())
         .flatten();
         if let Some(live) = projection.live.as_ref() {
             self.install_execution_live_facts(
@@ -1140,15 +751,16 @@ impl App {
             );
         } else {
             self.reset_live_execution_facts();
-            self.latest_model_telemetry = preserved_model_telemetry;
+            self.execution.latest_model_telemetry = preserved_model_telemetry;
             // The execution identity is canonical even before Runtime has
             // materialized live facts. Every other field remains unknown.
-            self.current_execution_id = Some(projection.execution_id.clone());
+            self.execution.current_execution_id = Some(projection.execution_id.clone());
         }
-        self.latest_execution_projection = Some(projection);
+        self.execution.latest_execution_projection = Some(projection);
         if !snapshot_has_active_root
             && !snapshot_has_durable_winner
             && self
+                .execution
                 .turn_interaction
                 .clear_root_presentation_from_snapshot()
         {
@@ -1165,7 +777,7 @@ impl App {
                 harness_contract::outcome::TerminalPresentationState::Started
                 | harness_contract::outcome::TerminalPresentationState::Streaming
                 | harness_contract::outcome::TerminalPresentationState::Validating => {
-                    self.turn_interaction.begin_root_presentation(
+                    self.execution.turn_interaction.begin_root_presentation(
                         presentation.presentation_id,
                         presentation.attempt_id,
                         presentation.envelope_id,
@@ -1175,7 +787,7 @@ impl App {
                 harness_contract::outcome::TerminalPresentationState::Committed
                 | harness_contract::outcome::TerminalPresentationState::Aborted
                 | harness_contract::outcome::TerminalPresentationState::Superseded => {
-                    self.turn_interaction.end_root_presentation(
+                    self.execution.turn_interaction.end_root_presentation(
                         &presentation.presentation_id,
                         &presentation.attempt_id,
                     );
@@ -1186,7 +798,7 @@ impl App {
             self.apply_cancellation_receipt(receipt);
         }
         self.refresh_model_mismatch_telemetry();
-        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
         true
     }
 
@@ -1206,6 +818,7 @@ impl App {
             return false;
         }
         let Some(current) = self
+            .execution
             .latest_execution_projection
             .as_ref()
             .filter(|projection| projection.execution_id == update.execution_id)
@@ -1219,11 +832,11 @@ impl App {
         {
             return false;
         }
-        let preserved_model_telemetry = (self.current_execution_id.as_deref()
+        let preserved_model_telemetry = (self.execution.current_execution_id.as_deref()
             == Some(update.execution_id.as_str()))
-        .then(|| self.latest_model_telemetry.clone())
+        .then(|| self.execution.latest_model_telemetry.clone())
         .flatten();
-        if let Some(projection) = self.latest_execution_projection.as_mut() {
+        if let Some(projection) = self.execution.latest_execution_projection.as_mut() {
             projection.live = Some(update.live.clone());
         }
         self.install_execution_live_facts(
@@ -1232,7 +845,7 @@ impl App {
             preserved_model_telemetry,
         );
         self.refresh_model_mismatch_telemetry();
-        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
         true
     }
 
@@ -1244,9 +857,9 @@ impl App {
     ) {
         if live.status == harness_contract::projection::ExecutionLiveStatus::Cancelled {
             self.remove_stale_live_assistant_parts(execution_id.into(), live.turn_id.as_deref());
-            self.turn_interaction.terminal_observed();
+            self.execution.turn_interaction.terminal_observed();
             self.record_terminal_correlation(&crate::protocol::GatewayEventCorrelation {
-                session_id: self.session_id.clone(),
+                session_id: self.shell.session_id.clone(),
                 execution_id: Some(execution_id.to_string()),
                 turn_id: live.turn_id.clone(),
                 ..Default::default()
@@ -1260,37 +873,38 @@ impl App {
             );
         }
         self.reset_live_execution_facts();
-        self.latest_model_telemetry = preserved_model_telemetry;
-        self.current_execution_status = Some(live.status);
-        self.current_execution_status_detail = live.status_detail.clone();
-        self.current_execution_id = Some(execution_id.to_string());
-        self.current_turn_id = live.turn_id.clone();
-        self.execution_started_at_ms = Some(live.started_at_ms);
-        self.last_progress_at_ms = Some(live.last_progress_at_ms);
-        self.current_run_metrics = Some(live.metrics.clone());
-        self.current_execution_latency = Some(live.latency.clone());
-        self.turn_input_tokens = live.metrics.input_tokens;
-        self.turn_output_tokens = live.metrics.output_tokens;
-        self.turn_usage_known = live.context_usage.as_ref().is_some_and(|usage| {
+        self.execution.latest_model_telemetry = preserved_model_telemetry;
+        self.execution.current_execution_status = Some(live.status);
+        self.execution.current_execution_status_detail = live.status_detail.clone();
+        self.execution.current_execution_id = Some(execution_id.to_string());
+        self.execution.current_turn_id = live.turn_id.clone();
+        self.execution.execution_started_at_ms = Some(live.started_at_ms);
+        self.execution.last_progress_at_ms = Some(live.last_progress_at_ms);
+        self.execution.current_run_metrics = Some(live.metrics.clone());
+        self.execution.current_execution_latency = Some(live.latency.clone());
+        self.execution.turn_input_tokens = live.metrics.input_tokens;
+        self.execution.turn_output_tokens = live.metrics.output_tokens;
+        self.execution.turn_usage_known = live.context_usage.as_ref().is_some_and(|usage| {
             usage
                 .input_source
                 .as_deref()
                 .is_some_and(|source| source != "runtime_request_budget_estimate")
         });
-        self.input_tokens = live.metrics.input_tokens;
-        self.output_tokens = live.metrics.output_tokens;
-        self.token_count = live.metrics.total_tokens;
+        self.history.input_tokens = live.metrics.input_tokens;
+        self.history.output_tokens = live.metrics.output_tokens;
+        self.shell.token_count = live.metrics.total_tokens;
         if let Some(context) = live.context_usage.as_ref() {
-            self.effective_model = context.model.clone();
-            if self.effective_model.is_some() {
-                self.model_source = Some("runtime.execution_live.context_usage.model".to_string());
+            self.shell.effective_model = context.model.clone();
+            if self.shell.effective_model.is_some() {
+                self.shell.model_source =
+                    Some("runtime.execution_live.context_usage.model".to_string());
             }
-            self.context_used_tokens = context.input_tokens;
-            self.context_window_tokens = context.window_tokens;
-            self.context_remaining_tokens = context.remaining_tokens;
-            self.context_usage_percent_bp = context.usage_percent_bp;
-            self.context_usage_source = context.input_source.clone();
-            self.context_window = context.window_tokens.unwrap_or_default();
+            self.execution.context_used_tokens = context.input_tokens;
+            self.execution.context_window_tokens = context.window_tokens;
+            self.execution.context_remaining_tokens = context.remaining_tokens;
+            self.execution.context_usage_percent_bp = context.usage_percent_bp;
+            self.execution.context_usage_source = context.input_source.clone();
+            self.execution.context_window = context.window_tokens.unwrap_or_default();
         }
     }
 
@@ -1301,7 +915,7 @@ impl App {
         parts: &[harness_contract::projection::ExecutionLiveOutputPart],
         output_bytes: u64,
     ) {
-        self.live_output_snapshot_gap = false;
+        self.execution.live_output_snapshot_gap = false;
         if self
             .timeline_correlated_assistant_index(Some(execution_id), turn_id)
             .is_some_and(|index| {
@@ -1320,7 +934,7 @@ impl App {
             return;
         }
         if parts.is_empty() {
-            self.live_output_snapshot_gap = output_bytes > 0;
+            self.execution.live_output_snapshot_gap = output_bytes > 0;
             return;
         }
         let mut recovered_bytes = 0_u64;
@@ -1329,11 +943,11 @@ impl App {
         for part in ordered {
             recovered_bytes = recovered_bytes.saturating_add(part.bytes);
             let Some(preview) = part.preview.as_deref() else {
-                self.live_output_snapshot_gap |= part.bytes > 0;
+                self.execution.live_output_snapshot_gap |= part.bytes > 0;
                 continue;
             };
             let Ok(preview_start) = usize::try_from(part.preview_start_bytes) else {
-                self.live_output_snapshot_gap = true;
+                self.execution.live_output_snapshot_gap = true;
                 continue;
             };
             let part_id = Some(part.part_id.as_str());
@@ -1351,7 +965,7 @@ impl App {
                 if repaired {
                     self.note_searchable_content_changed();
                 } else {
-                    self.live_output_snapshot_gap = true;
+                    self.execution.live_output_snapshot_gap = true;
                 }
             } else if preview_start == 0 {
                 self.timeline_push(TimelineEntry::Message {
@@ -1368,13 +982,13 @@ impl App {
                     }),
                 });
             } else {
-                self.live_output_snapshot_gap = true;
+                self.execution.live_output_snapshot_gap = true;
             }
         }
         if recovered_bytes != output_bytes {
-            self.live_output_snapshot_gap = true;
+            self.execution.live_output_snapshot_gap = true;
         }
-        if self.live_output_snapshot_gap {
+        if self.execution.live_output_snapshot_gap {
             self.add_system_notice(
                 SystemNoticeKind::Warning,
                 "Canonical live output has an incomplete per-item byte range; preserving verified segments until the durable terminal arrives",
@@ -1383,30 +997,30 @@ impl App {
     }
 
     fn reset_live_execution_facts(&mut self) {
-        self.current_execution_status = None;
-        self.current_execution_status_detail = None;
-        self.current_execution_id = None;
-        self.current_turn_id = None;
-        self.execution_started_at_ms = None;
-        self.last_progress_at_ms = None;
-        self.current_run_metrics = None;
-        self.current_execution_latency = None;
-        self.latest_model_telemetry = None;
-        self.effective_model = None;
-        self.model_source = None;
-        self.context_used_tokens = None;
-        self.context_window_tokens = None;
-        self.context_remaining_tokens = None;
-        self.context_usage_percent_bp = None;
-        self.context_usage_source = None;
-        self.context_window = 0;
-        self.live_stream_revisions.clear();
-        self.turn_input_tokens = 0;
-        self.turn_output_tokens = 0;
-        self.turn_usage_known = false;
-        self.input_tokens = 0;
-        self.output_tokens = 0;
-        self.token_count = 0;
+        self.execution.current_execution_status = None;
+        self.execution.current_execution_status_detail = None;
+        self.execution.current_execution_id = None;
+        self.execution.current_turn_id = None;
+        self.execution.execution_started_at_ms = None;
+        self.execution.last_progress_at_ms = None;
+        self.execution.current_run_metrics = None;
+        self.execution.current_execution_latency = None;
+        self.execution.latest_model_telemetry = None;
+        self.shell.effective_model = None;
+        self.shell.model_source = None;
+        self.execution.context_used_tokens = None;
+        self.execution.context_window_tokens = None;
+        self.execution.context_remaining_tokens = None;
+        self.execution.context_usage_percent_bp = None;
+        self.execution.context_usage_source = None;
+        self.execution.context_window = 0;
+        self.execution.live_stream_revisions.clear();
+        self.execution.turn_input_tokens = 0;
+        self.execution.turn_output_tokens = 0;
+        self.execution.turn_usage_known = false;
+        self.history.input_tokens = 0;
+        self.history.output_tokens = 0;
+        self.shell.token_count = 0;
     }
 
     /// Drop an execution projection as soon as Gateway revokes the caller or
@@ -1415,31 +1029,40 @@ impl App {
     /// produced it has expired.
     pub fn invalidate_execution_projection(&mut self, execution_id: &str) -> bool {
         let matches_projection = self
+            .execution
             .latest_execution_projection
             .as_ref()
             .is_some_and(|projection| projection.execution_id == execution_id);
-        let matches_current_execution = self.current_execution_id.as_deref() == Some(execution_id);
-        let matches_interaction =
-            self.turn_interaction.execution.execution_id.as_deref() == Some(execution_id);
+        let matches_current_execution =
+            self.execution.current_execution_id.as_deref() == Some(execution_id);
+        let matches_interaction = self
+            .execution
+            .turn_interaction
+            .execution
+            .execution_id
+            .as_deref()
+            == Some(execution_id);
         if !matches_projection && !matches_current_execution && !matches_interaction {
             return false;
         }
         if matches_projection {
-            self.latest_execution_projection = None;
+            self.execution.latest_execution_projection = None;
         }
         if matches_projection || matches_current_execution {
             self.reset_live_execution_facts();
         }
         if self
+            .execution
             .latest_execution_graph_summary
             .as_ref()
             .is_some_and(|summary| summary.graph_id.as_deref() == Some(execution_id))
         {
-            self.latest_execution_graph_summary = None;
+            self.execution.latest_execution_graph_summary = None;
         }
-        self.turn_interaction
+        self.execution
+            .turn_interaction
             .clear_execution_if_matches(execution_id);
-        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
         true
     }
 
@@ -1448,17 +1071,17 @@ impl App {
     /// avoided: transcript, evidence, model facts, drafts and cached panels
     /// all belonged to the expired authority.
     pub fn revoke_session_authorization(&mut self, reason: &str) {
-        let session_id = self.session_id.clone();
-        let skin = self.skin.clone();
-        let theme = self.theme;
-        let execution_policy_preset = self.execution_policy_preset.clone();
-        let execution_policy_snapshot = self.execution_policy_snapshot.clone();
+        let session_id = self.shell.session_id.clone();
+        let skin = self.workbench.skin.clone();
+        let theme = self.shell.theme;
+        let execution_policy_preset = self.shell.execution_policy_preset.clone();
+        let execution_policy_snapshot = self.shell.execution_policy_snapshot.clone();
         let mut clean = Self::new("unavailable", &session_id);
-        clean.skin = skin;
-        clean.theme = theme;
-        clean.execution_policy_preset = execution_policy_preset;
-        clean.execution_policy_snapshot = execution_policy_snapshot;
-        clean.history_hydration_error = Some("session authorization revoked".to_string());
+        clean.workbench.skin = skin;
+        clean.shell.theme = theme;
+        clean.shell.execution_policy_preset = execution_policy_preset;
+        clean.shell.execution_policy_snapshot = execution_policy_snapshot;
+        clean.history.history_hydration_error = Some("session authorization revoked".to_string());
         clean.add_system_notice(
             SystemNoticeKind::Error,
             &format!("Session authorization revoked: {reason}"),
@@ -1470,15 +1093,15 @@ impl App {
     }
 
     pub fn mark_dirty(&mut self) {
-        self.lines_dirty = true;
-        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline.lines_dirty = true;
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
     }
 
     /// Request a frame without invalidating the width-aware transcript cache.
     /// Composer edits, focus movement, search selection and modal state do not
     /// change timeline content.
     pub fn request_redraw(&mut self) {
-        self.render_version = self.render_version.wrapping_add(1);
+        self.timeline.render_version = self.timeline.render_version.wrapping_add(1);
     }
 
     fn message_timestamp(created_at_ms: u64) -> String {
@@ -1526,15 +1149,15 @@ impl App {
     }
 
     fn timeline_message_index(&self, message_id: &str) -> Option<usize> {
-        let absolute = *self.message_timeline_positions.get(message_id)?;
+        let absolute = *self.timeline.message_timeline_positions.get(message_id)?;
         self.logical_timeline_index(absolute)
     }
 
     fn logical_timeline_index(&self, absolute: u64) -> Option<usize> {
-        let logical = absolute.checked_sub(self.timeline_base_position)?;
+        let logical = absolute.checked_sub(self.timeline.timeline_base_position)?;
         usize::try_from(logical)
             .ok()
-            .filter(|index| *index < self.total_entries)
+            .filter(|index| *index < self.timeline.total_entries)
     }
 
     fn timeline_message_by_id_mut(&mut self, message_id: &str) -> Option<&mut TimelineEntry> {
@@ -1544,9 +1167,11 @@ impl App {
 
     fn index_message_identity_at(&mut self, index: usize) {
         let absolute = self
+            .timeline
             .timeline_base_position
             .saturating_add(u64::try_from(index).unwrap_or(u64::MAX));
-        self.live_timeline_positions
+        self.timeline
+            .live_timeline_positions
             .retain(|_, position| *position != absolute);
         let Some(TimelineEntry::Message {
             identity: Some(identity),
@@ -1562,17 +1187,21 @@ impl App {
             part_id: identity.part_id.clone(),
         });
         if let Some(message_id) = message_id {
-            self.message_timeline_positions.insert(message_id, absolute);
+            self.timeline
+                .message_timeline_positions
+                .insert(message_id, absolute);
         }
         if let Some(live_key) = live_key {
-            self.live_timeline_positions.insert(live_key, absolute);
+            self.timeline
+                .live_timeline_positions
+                .insert(live_key, absolute);
         }
     }
 
     fn rebuild_timeline_positions(&mut self) {
-        self.message_timeline_positions.clear();
-        self.live_timeline_positions.clear();
-        self.tool_timeline_positions.clear();
+        self.timeline.message_timeline_positions.clear();
+        self.timeline.live_timeline_positions.clear();
+        self.timeline.tool_timeline_positions.clear();
         let indexed = self
             .timeline_iter()
             .filter_map(|(index, entry)| match entry {
@@ -1595,31 +1224,39 @@ impl App {
             .collect::<Vec<_>>();
         for (message_id, live_key, tool_id, index) in indexed {
             let absolute = self
+                .timeline
                 .timeline_base_position
                 .saturating_add(u64::try_from(index).unwrap_or(u64::MAX));
             if let Some(message_id) = message_id {
-                self.message_timeline_positions.insert(message_id, absolute);
+                self.timeline
+                    .message_timeline_positions
+                    .insert(message_id, absolute);
             }
             if let Some(live_key) = live_key {
-                self.live_timeline_positions.insert(live_key, absolute);
+                self.timeline
+                    .live_timeline_positions
+                    .insert(live_key, absolute);
             }
             if let Some(tool_id) = tool_id {
-                self.tool_timeline_positions.insert(tool_id, absolute);
+                self.timeline
+                    .tool_timeline_positions
+                    .insert(tool_id, absolute);
             }
         }
     }
 
     fn note_searchable_content_changed(&mut self) {
-        self.searchable_content_revision = self.searchable_content_revision.wrapping_add(1);
+        self.timeline.searchable_content_revision =
+            self.timeline.searchable_content_revision.wrapping_add(1);
     }
 
     fn ensure_search_text_index(&mut self) {
-        if self.search_index_revision == self.searchable_content_revision
-            && self.search_text_index.len() == self.total_entries
+        if self.timeline.search_index_revision == self.timeline.searchable_content_revision
+            && self.timeline.search_text_index.len() == self.timeline.total_entries
         {
             return;
         }
-        self.search_text_index = self
+        self.timeline.search_text_index = self
             .timeline_iter()
             .map(|(_, entry)| {
                 let visible_in_chat = matches!(
@@ -1634,7 +1271,7 @@ impl App {
                 }
             })
             .collect();
-        self.search_index_revision = self.searchable_content_revision;
+        self.timeline.search_index_revision = self.timeline.searchable_content_revision;
     }
 
     fn timeline_live_message_index(
@@ -1648,7 +1285,8 @@ impl App {
             turn_id: turn_id.map(ToOwned::to_owned),
             part_id: part_id.map(ToOwned::to_owned),
         };
-        self.live_timeline_positions
+        self.timeline
+            .live_timeline_positions
             .get(&key)
             .copied()
             .and_then(|absolute| self.logical_timeline_index(absolute))
@@ -1682,29 +1320,30 @@ impl App {
         turn_id: Option<&str>,
     ) -> Option<usize> {
         let turn_id = turn_id?;
-        let mut matches = self
-            .live_timeline_positions
-            .iter()
-            .filter_map(|(key, absolute)| {
-                (key.turn_id.as_deref() == Some(turn_id)
-                    && execution_id
-                        .is_none_or(|expected| key.execution_id.as_deref() == Some(expected)))
-                .then(|| self.logical_timeline_index(*absolute))
-                .flatten()
-                .filter(|index| {
-                    matches!(
-                        self.timeline_get(*index),
-                        Some(TimelineEntry::Message {
-                            role,
-                            identity: Some(MessageIdentity {
-                                source: MessageSource::Live,
+        let mut matches =
+            self.timeline
+                .live_timeline_positions
+                .iter()
+                .filter_map(|(key, absolute)| {
+                    (key.turn_id.as_deref() == Some(turn_id)
+                        && execution_id
+                            .is_none_or(|expected| key.execution_id.as_deref() == Some(expected)))
+                    .then(|| self.logical_timeline_index(*absolute))
+                    .flatten()
+                    .filter(|index| {
+                        matches!(
+                            self.timeline_get(*index),
+                            Some(TimelineEntry::Message {
+                                role,
+                                identity: Some(MessageIdentity {
+                                    source: MessageSource::Live,
+                                    ..
+                                }),
                                 ..
-                            }),
-                            ..
-                        }) if role == "assistant"
-                    )
-                })
-            });
+                            }) if role == "assistant"
+                        )
+                    })
+                });
         let only = matches.next()?;
         matches.next().is_none().then_some(only)
     }
@@ -1789,11 +1428,11 @@ impl App {
     }
 
     fn apply_history_page(&mut self, page: crate::protocol::SessionMessagesPage) {
-        if page.session_id != self.session_id {
+        if page.session_id != self.shell.session_id {
             return;
         }
-        if page.total > SOFT_CAP && !self.history_window_truncated {
-            self.history_window_truncated = true;
+        if page.total > SOFT_CAP && !self.history.history_window_truncated {
+            self.history.history_window_truncated = true;
             let warning = format!(
                 "Durable history has {} messages; this TUI keeps the newest {} visible. Compact or checkpoint the session to restore a complete interactive window.",
                 page.total, SOFT_CAP
@@ -1868,6 +1507,7 @@ impl App {
                 }
             }
             if self
+                .execution
                 .hydrated_non_text_message_ids
                 .insert(message.id.clone())
             {
@@ -1878,12 +1518,13 @@ impl App {
             self.reorder_messages_by_durable_sequence();
             self.rebuild_timeline_positions();
             self.rebuild_input_history_from_durable_messages();
-            self.history_hydrated = true;
-            self.history_hydration_error = None;
+            self.history.history_hydrated = true;
+            self.history.history_hydration_error = None;
         }
-        self.timeline_full_sync_revision = self.timeline_full_sync_revision.wrapping_add(1);
-        if self.auto_scroll {
-            self.timeline_cursor = self.timeline_len().saturating_sub(1);
+        self.timeline.timeline_full_sync_revision =
+            self.timeline.timeline_full_sync_revision.wrapping_add(1);
+        if self.timeline.auto_scroll {
+            self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
         }
         self.mark_dirty();
     }
@@ -1918,7 +1559,7 @@ impl App {
         if remove.is_empty() {
             return;
         }
-        let non_text_owner = self.non_text_durable_owner.clone();
+        let non_text_owner = self.timeline.non_text_durable_owner.clone();
         let retained = entries
             .into_iter()
             .filter(|entry| match entry {
@@ -1972,7 +1613,7 @@ impl App {
         if remove.is_empty() {
             return;
         }
-        let non_text_owner = self.non_text_durable_owner.clone();
+        let non_text_owner = self.timeline.non_text_durable_owner.clone();
         let retained = entries
             .into_iter()
             .filter(|entry| match entry {
@@ -2003,9 +1644,11 @@ impl App {
             .filter(|entry| {
                 let owned_non_text = match entry {
                     TimelineEntry::ToolCall { id, .. } => self
+                        .timeline
                         .non_text_durable_owner
                         .contains_key(&format!("tool|{id}")),
                     TimelineEntry::Thinking { id, .. } => self
+                        .timeline
                         .non_text_durable_owner
                         .contains_key(&format!("thinking|{id}")),
                     _ => false,
@@ -2023,9 +1666,9 @@ impl App {
                     )
             })
             .collect::<Vec<_>>();
-        self.hydrated_non_text_message_ids.clear();
-        self.pending_history_tool_instances.clear();
-        self.non_text_durable_owner.clear();
+        self.execution.hydrated_non_text_message_ids.clear();
+        self.timeline.pending_history_tool_instances.clear();
+        self.timeline.non_text_durable_owner.clear();
         self.replace_timeline_entries(retained);
     }
 
@@ -2038,29 +1681,32 @@ impl App {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
-        self.non_text_durable_owner
+        self.timeline
+            .non_text_durable_owner
             .retain(|key, _| retained_non_text_keys.contains(key));
-        self.timeline_pages.clear();
-        self.total_entries = 0;
-        self.timeline_base_position = 0;
-        self.message_timeline_positions.clear();
-        self.live_timeline_positions.clear();
-        self.tool_timeline_positions.clear();
+        self.timeline.timeline_pages.clear();
+        self.timeline.total_entries = 0;
+        self.timeline.timeline_base_position = 0;
+        self.timeline.message_timeline_positions.clear();
+        self.timeline.live_timeline_positions.clear();
+        self.timeline.tool_timeline_positions.clear();
         for chunk in entries.chunks(PAGE_SIZE) {
-            let start_index = self.total_entries;
-            self.timeline_pages.push_back(TimelinePage {
+            let start_index = self.timeline.total_entries;
+            self.timeline.timeline_pages.push_back(TimelinePage {
                 entries: chunk.to_vec(),
                 start_index,
             });
-            self.total_entries = self.total_entries.saturating_add(chunk.len());
+            self.timeline.total_entries = self.timeline.total_entries.saturating_add(chunk.len());
         }
-        self.timeline_cursor = self
+        self.timeline.timeline_cursor = self
+            .timeline
             .timeline_cursor
-            .min(self.total_entries.saturating_sub(1));
+            .min(self.timeline.total_entries.saturating_sub(1));
         self.rebuild_timeline_positions();
         self.note_searchable_content_changed();
-        self.timeline_dirty_log.clear();
-        self.timeline_full_sync_revision = self.timeline_full_sync_revision.wrapping_add(1);
+        self.timeline.timeline_dirty_log.clear();
+        self.timeline.timeline_full_sync_revision =
+            self.timeline.timeline_full_sync_revision.wrapping_add(1);
     }
 
     fn hydrate_non_text_blocks(
@@ -2079,9 +1725,11 @@ impl App {
                     else {
                         continue;
                     };
-                    let id = self.thinking_id_counter;
-                    self.thinking_id_counter = self.thinking_id_counter.saturating_add(1);
-                    self.non_text_durable_owner
+                    let id = self.timeline.thinking_id_counter;
+                    self.timeline.thinking_id_counter =
+                        self.timeline.thinking_id_counter.saturating_add(1);
+                    self.timeline
+                        .non_text_durable_owner
                         .insert(format!("thinking|{id}"), durable_message_id.to_string());
                     self.timeline_push(TimelineEntry::Thinking {
                         id,
@@ -2117,7 +1765,7 @@ impl App {
                         .and_then(Value::as_str)
                         .unwrap_or(provider_tool_id);
                     let id = ToolInstanceIdentity {
-                        session_id: self.session_id.clone(),
+                        session_id: self.shell.session_id.clone(),
                         execution_id: block
                             .get("cowd_execution_id")
                             .and_then(Value::as_str)
@@ -2134,6 +1782,7 @@ impl App {
                     }
                     .stable_key();
                     if self
+                        .timeline
                         .tool_timeline_positions
                         .get(&id)
                         .copied()
@@ -2142,11 +1791,13 @@ impl App {
                     {
                         continue;
                     }
-                    self.pending_history_tool_instances
+                    self.timeline
+                        .pending_history_tool_instances
                         .entry(provider_tool_id.to_string())
                         .or_default()
                         .push_back(id.clone());
-                    self.non_text_durable_owner
+                    self.timeline
+                        .non_text_durable_owner
                         .insert(format!("tool|{id}"), durable_message_id.to_string());
                     self.timeline_push(TimelineEntry::ToolCall {
                         id,
@@ -2182,12 +1833,13 @@ impl App {
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     let matched_instance = self
+                        .timeline
                         .pending_history_tool_instances
                         .get_mut(tool_use_id)
                         .and_then(VecDeque::pop_front);
                     let tool_index = matched_instance
                         .as_ref()
-                        .and_then(|id| self.tool_timeline_positions.get(id))
+                        .and_then(|id| self.timeline.tool_timeline_positions.get(id))
                         .copied()
                         .and_then(|absolute| self.logical_timeline_index(absolute));
                     let mut found = false;
@@ -2207,7 +1859,7 @@ impl App {
                     }
                     if !found {
                         let id = ToolInstanceIdentity {
-                            session_id: self.session_id.clone(),
+                            session_id: self.shell.session_id.clone(),
                             execution_id: block
                                 .get("cowd_execution_id")
                                 .and_then(Value::as_str)
@@ -2227,7 +1879,8 @@ impl App {
                                 .to_string(),
                         }
                         .stable_key();
-                        self.non_text_durable_owner
+                        self.timeline
+                            .non_text_durable_owner
                             .insert(format!("tool|{id}"), durable_message_id.to_string());
                         self.timeline_push(TimelineEntry::ToolCall {
                             id,
@@ -2313,19 +1966,27 @@ impl App {
             .and_then(Value::as_u64)
             .unwrap_or_default();
         if let Some((previous_input, previous_output)) = self
+            .history
             .durable_message_usage
             .insert(message_id.to_string(), (input, output))
         {
-            self.durable_session_input_tokens = self
+            self.history.durable_session_input_tokens = self
+                .history
                 .durable_session_input_tokens
                 .saturating_sub(previous_input);
-            self.durable_session_output_tokens = self
+            self.history.durable_session_output_tokens = self
+                .history
                 .durable_session_output_tokens
                 .saturating_sub(previous_output);
         }
-        self.durable_session_input_tokens = self.durable_session_input_tokens.saturating_add(input);
-        self.durable_session_output_tokens =
-            self.durable_session_output_tokens.saturating_add(output);
+        self.history.durable_session_input_tokens = self
+            .history
+            .durable_session_input_tokens
+            .saturating_add(input);
+        self.history.durable_session_output_tokens = self
+            .history
+            .durable_session_output_tokens
+            .saturating_add(output);
     }
 
     fn rebuild_input_history_from_durable_messages(&mut self) {
@@ -2345,49 +2006,53 @@ impl App {
         if history.len() > INPUT_HISTORY_LIMIT {
             history.drain(..history.len() - INPUT_HISTORY_LIMIT);
         }
-        self.input_history = history;
-        self.history_idx = None;
+        self.shell.input_history = history;
+        self.shell.history_idx = None;
     }
 
     pub fn record_input_history(&mut self, input: String) {
         const INPUT_HISTORY_LIMIT: usize = 1_000;
         if input.is_empty()
             || self
+                .shell
                 .input_history
                 .last()
                 .is_some_and(|previous| previous == &input)
         {
-            self.history_idx = None;
+            self.shell.history_idx = None;
             return;
         }
-        self.input_history.push(input);
-        if self.input_history.len() > INPUT_HISTORY_LIMIT {
-            self.input_history.remove(0);
+        self.shell.input_history.push(input);
+        if self.shell.input_history.len() > INPUT_HISTORY_LIMIT {
+            self.shell.input_history.remove(0);
         }
-        self.history_idx = None;
+        self.shell.history_idx = None;
     }
 
     fn correlation_is_current(
         &self,
         correlation: &crate::protocol::GatewayEventCorrelation,
     ) -> bool {
-        if correlation.session_id != self.session_id
+        if correlation.session_id != self.shell.session_id
             || correlation.execution_id.is_none()
             || correlation.turn_id.is_none()
         {
             return false;
         }
-        self.current_execution_id
+        self.execution
+            .current_execution_id
             .as_deref()
             .is_none_or(|current| correlation.execution_id.as_deref() == Some(current))
             && self
+                .execution
                 .current_turn_id
                 .as_deref()
                 .is_none_or(|current| correlation.turn_id.as_deref() == Some(current))
     }
 
     pub(crate) fn execution_is_terminalized(&self, execution_id: &str) -> bool {
-        self.terminal_correlations
+        self.execution
+            .terminal_correlations
             .iter()
             .any(|(terminal_execution_id, _)| terminal_execution_id == execution_id)
     }
@@ -2401,7 +2066,7 @@ impl App {
             .as_deref()
             .zip(correlation.turn_id.as_deref())
             .is_some_and(|(execution_id, turn_id)| {
-                self.terminal_correlations.iter().any(
+                self.execution.terminal_correlations.iter().any(
                     |(terminal_execution_id, terminal_turn_id)| {
                         terminal_execution_id == execution_id && terminal_turn_id == turn_id
                     },
@@ -2422,6 +2087,7 @@ impl App {
             return;
         };
         if self
+            .execution
             .terminal_correlations
             .iter()
             .any(|(known_execution_id, known_turn_id)| {
@@ -2430,10 +2096,11 @@ impl App {
         {
             return;
         }
-        self.terminal_correlations
+        self.execution
+            .terminal_correlations
             .push_back((execution_id.clone(), turn_id.clone()));
-        while self.terminal_correlations.len() > TERMINAL_CORRELATION_CAPACITY {
-            self.terminal_correlations.pop_front();
+        while self.execution.terminal_correlations.len() > TERMINAL_CORRELATION_CAPACITY {
+            self.execution.terminal_correlations.pop_front();
         }
     }
 
@@ -2442,10 +2109,14 @@ impl App {
         correlation: &crate::protocol::GatewayEventCorrelation,
     ) -> bool {
         if !self.correlation_is_current(correlation) {
-            self.telemetry.orphan_event_count = self.telemetry.orphan_event_count.saturating_add(1);
-            let orphan_count = self.telemetry.orphan_event_count;
+            self.execution.telemetry.orphan_event_count = self
+                .execution
+                .telemetry
+                .orphan_event_count
+                .saturating_add(1);
+            let orphan_count = self.execution.telemetry.orphan_event_count;
             tracing::warn!(
-                session_id = %self.session_id,
+                session_id = %self.shell.session_id,
                 event_session_id = %correlation.session_id,
                 execution_id = correlation.execution_id.as_deref().unwrap_or("missing"),
                 turn_id = correlation.turn_id.as_deref().unwrap_or("missing"),
@@ -2456,13 +2127,14 @@ impl App {
             // spaced counts. This makes causal loss visible without allowing a
             // noisy stale stream to flood the transcript.
             if orphan_count == 1 || orphan_count.is_power_of_two() {
-                let warning = format!(
+                let warning =
+                    format!(
                     "Ignored {orphan_count} event(s) outside the active session/execution/turn \
                      (current execution={}, turn={}, status={:?}; incoming execution={}, turn={}); \
                      canonical history and projection remain authoritative",
-                    self.current_execution_id.as_deref().unwrap_or("none"),
-                    self.current_turn_id.as_deref().unwrap_or("none"),
-                    self.current_execution_status,
+                    self.execution.current_execution_id.as_deref().unwrap_or("none"),
+                    self.execution.current_turn_id.as_deref().unwrap_or("none"),
+                    self.execution.current_execution_status,
                     correlation.execution_id.as_deref().unwrap_or("missing"),
                     correlation.turn_id.as_deref().unwrap_or("missing"),
                 );
@@ -2471,8 +2143,8 @@ impl App {
             }
             return false;
         }
-        self.current_execution_id = correlation.execution_id.clone();
-        self.current_turn_id = correlation.turn_id.clone();
+        self.execution.current_execution_id = correlation.execution_id.clone();
+        self.execution.current_turn_id = correlation.turn_id.clone();
         true
     }
 
@@ -2485,19 +2157,19 @@ impl App {
         &mut self,
         correlation: &crate::protocol::GatewayEventCorrelation,
     ) -> bool {
-        if correlation.session_id != self.session_id
+        if correlation.session_id != self.shell.session_id
             || correlation.execution_id.is_none()
             || correlation.turn_id.is_none()
         {
             return self.adopt_live_correlation(correlation);
         }
-        if self.current_execution_id.as_deref() != correlation.execution_id.as_deref()
-            || self.current_turn_id.as_deref() != correlation.turn_id.as_deref()
+        if self.execution.current_execution_id.as_deref() != correlation.execution_id.as_deref()
+            || self.execution.current_turn_id.as_deref() != correlation.turn_id.as_deref()
         {
-            if let Some(previous_execution_id) = self.current_execution_id.clone() {
-                if let Some(previous_turn_id) = self.current_turn_id.clone() {
+            if let Some(previous_execution_id) = self.execution.current_execution_id.clone() {
+                if let Some(previous_turn_id) = self.execution.current_turn_id.clone() {
                     self.record_terminal_correlation(&crate::protocol::GatewayEventCorrelation {
-                        session_id: self.session_id.clone(),
+                        session_id: self.shell.session_id.clone(),
                         execution_id: Some(previous_execution_id.clone()),
                         turn_id: Some(previous_turn_id),
                         ..crate::protocol::GatewayEventCorrelation::default()
@@ -2507,10 +2179,12 @@ impl App {
             } else {
                 self.reset_live_execution_facts();
             }
-            self.current_execution_id = correlation.execution_id.clone();
-            self.current_turn_id = correlation.turn_id.clone();
+            self.execution.current_execution_id = correlation.execution_id.clone();
+            self.execution.current_turn_id = correlation.turn_id.clone();
             if let Some(execution_id) = correlation.execution_id.as_deref() {
-                self.turn_interaction.ingress_accepted(execution_id);
+                self.execution
+                    .turn_interaction
+                    .ingress_accepted(execution_id);
             }
         }
         self.adopt_live_correlation(correlation)
@@ -2525,17 +2199,20 @@ impl App {
             .as_deref()
             .zip(correlation.turn_id.as_deref())
             .is_some_and(|(execution_id, turn_id)| {
-                self.committed_ingress_correlations
+                self.execution
+                    .committed_ingress_correlations
                     .contains(&(execution_id.to_string(), turn_id.to_string()))
             });
-        let incoming_differs = self.current_execution_id.as_deref()
+        let incoming_differs = self.execution.current_execution_id.as_deref()
             != correlation.execution_id.as_deref()
-            || self.current_turn_id.as_deref() != correlation.turn_id.as_deref();
+            || self.execution.current_turn_id.as_deref() != correlation.turn_id.as_deref();
         let current_is_terminal = self
+            .execution
             .current_execution_id
             .as_deref()
             .is_some_and(|execution_id| self.execution_is_terminalized(execution_id))
             || self
+                .execution
                 .current_execution_status
                 .is_some_and(harness_contract::projection::ExecutionLiveStatus::is_terminal);
         let incoming_is_live = !self.correlation_is_terminalized(correlation);
@@ -2605,13 +2282,13 @@ impl App {
                 }
             }
             if found {
-                self.lines_dirty = true;
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.timeline.lines_dirty = true;
+                self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
                 return;
             }
         }
-        let id = self.thinking_id_counter;
-        self.thinking_id_counter = self.thinking_id_counter.saturating_add(1);
+        let id = self.timeline.thinking_id_counter;
+        self.timeline.thinking_id_counter = self.timeline.thinking_id_counter.saturating_add(1);
         self.timeline_push(TimelineEntry::Thinking {
             id,
             causal_item_id,
@@ -2620,9 +2297,10 @@ impl App {
             complete: false,
             expanded: false,
         });
-        self.current_turn_thinking_count = self.current_turn_thinking_count.saturating_add(1);
-        self.msg_version = self.msg_version.wrapping_add(1);
-        self.timeline_cursor = self.timeline_len().saturating_sub(1);
+        self.execution.current_turn_thinking_count =
+            self.execution.current_turn_thinking_count.saturating_add(1);
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
+        self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
     }
 
     fn complete_correlated_thinking(
@@ -2647,7 +2325,7 @@ impl App {
                 if existing.as_deref() == Some(causal_item_id) {
                     *complete = true;
                     *expanded = false;
-                    self.msg_version = self.msg_version.wrapping_add(1);
+                    self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
                     return;
                 }
             }
@@ -2693,7 +2371,12 @@ impl App {
     }
 
     fn annotate_correlated_tool(&mut self, tool_instance_id: &str, causality: TimelineCausality) {
-        let Some(absolute) = self.tool_timeline_positions.get(tool_instance_id).copied() else {
+        let Some(absolute) = self
+            .timeline
+            .tool_timeline_positions
+            .get(tool_instance_id)
+            .copied()
+        else {
             return;
         };
         let Some(index) = self.logical_timeline_index(absolute) else {
@@ -2729,20 +2412,21 @@ impl App {
                 known.lane_count = lane_count;
             }
         }
-        self.lines_dirty = true;
+        self.timeline.lines_dirty = true;
     }
 
     fn current_tool_instance_key(&self, provider_tool_id: &str) -> String {
         if provider_tool_id.starts_with("tool-instance|") {
             return provider_tool_id.to_string();
         }
-        if self.current_execution_id.is_none() && self.current_turn_id.is_none() {
+        if self.execution.current_execution_id.is_none() && self.execution.current_turn_id.is_none()
+        {
             return provider_tool_id.to_string();
         }
         ToolInstanceIdentity {
-            session_id: self.session_id.clone(),
-            execution_id: self.current_execution_id.clone(),
-            turn_id: self.current_turn_id.clone(),
+            session_id: self.shell.session_id.clone(),
+            execution_id: self.execution.current_execution_id.clone(),
+            turn_id: self.execution.current_turn_id.clone(),
             part_id: None,
             durable_message_id: None,
             durable_sequence: None,
@@ -2779,16 +2463,19 @@ impl App {
             // ordinary causal event. Once a root presentation starts, adopt
             // those bytes into its explicit owner instead of showing a second
             // assistant bubble.
-            self.turn_interaction.active_root_owner()
+            self.execution.turn_interaction.active_root_owner()
         });
-        if presentation_owner.is_none() && self.turn_interaction.root_preview_closed() {
-            self.telemetry.text_delta_dedupe_count =
-                self.telemetry.text_delta_dedupe_count.saturating_add(1);
+        if presentation_owner.is_none() && self.execution.turn_interaction.root_preview_closed() {
+            self.execution.telemetry.text_delta_dedupe_count = self
+                .execution
+                .telemetry
+                .text_delta_dedupe_count
+                .saturating_add(1);
             return;
         }
         if let Some((presentation_id, attempt_id)) = presentation_owner {
             use crate::components::turn_interaction::PresentationDeltaAdmission;
-            match self.turn_interaction.admit_root_delta(
+            match self.execution.turn_interaction.admit_root_delta(
                 &presentation_id,
                 &attempt_id,
                 start_bytes as u64,
@@ -2796,12 +2483,15 @@ impl App {
             ) {
                 PresentationDeltaAdmission::Accepted => {}
                 PresentationDeltaAdmission::Duplicate | PresentationDeltaAdmission::NotOwner => {
-                    self.telemetry.text_delta_dedupe_count =
-                        self.telemetry.text_delta_dedupe_count.saturating_add(1);
+                    self.execution.telemetry.text_delta_dedupe_count = self
+                        .execution
+                        .telemetry
+                        .text_delta_dedupe_count
+                        .saturating_add(1);
                     return;
                 }
                 PresentationDeltaAdmission::Gap => {
-                    self.live_output_snapshot_gap = true;
+                    self.execution.live_output_snapshot_gap = true;
                     self.add_system_notice(
                         SystemNoticeKind::Warning,
                         "Root answer stream reported a byte gap; waiting for the durable terminal",
@@ -2834,15 +2524,19 @@ impl App {
             part_id: correlation.part_id.clone(),
         };
         if self
+            .execution
             .live_stream_revisions
             .get(&stream_key)
             .is_some_and(|accepted| stream_revision <= *accepted)
         {
-            self.telemetry.text_delta_dedupe_count =
-                self.telemetry.text_delta_dedupe_count.saturating_add(1);
+            self.execution.telemetry.text_delta_dedupe_count = self
+                .execution
+                .telemetry
+                .text_delta_dedupe_count
+                .saturating_add(1);
             return;
         }
-        self.streaming_received = true;
+        self.execution.streaming_received = true;
         if let Some(TimelineEntry::Message { content, .. }) = self.timeline_live_message_mut(
             correlation.execution_id.as_deref(),
             correlation.turn_id.as_deref(),
@@ -2850,15 +2544,18 @@ impl App {
         ) {
             let accepted = content.len();
             if end_bytes <= accepted {
-                self.telemetry.text_delta_dedupe_count =
-                    self.telemetry.text_delta_dedupe_count.saturating_add(1);
+                self.execution.telemetry.text_delta_dedupe_count = self
+                    .execution
+                    .telemetry
+                    .text_delta_dedupe_count
+                    .saturating_add(1);
             } else if start_bytes <= accepted
                 && text.is_char_boundary(accepted.saturating_sub(start_bytes))
             {
                 content.push_str(&text[accepted.saturating_sub(start_bytes)..]);
                 self.note_searchable_content_changed();
             } else {
-                self.live_output_snapshot_gap = true;
+                self.execution.live_output_snapshot_gap = true;
                 self.add_system_notice(
                     SystemNoticeKind::Warning,
                     "Assistant stream reported a byte gap; waiting for the canonical projection/terminal instead of duplicating or inventing text",
@@ -2872,15 +2569,20 @@ impl App {
                 )
                 .is_some()
             {
-                self.telemetry.text_delta_dedupe_count =
-                    self.telemetry.text_delta_dedupe_count.saturating_add(1);
-                self.live_stream_revisions
+                self.execution.telemetry.text_delta_dedupe_count = self
+                    .execution
+                    .telemetry
+                    .text_delta_dedupe_count
+                    .saturating_add(1);
+                self.execution
+                    .live_stream_revisions
                     .insert(stream_key, stream_revision);
                 return;
             }
             if start_bytes != 0 {
-                self.live_output_snapshot_gap = true;
-                self.live_stream_revisions
+                self.execution.live_output_snapshot_gap = true;
+                self.execution
+                    .live_stream_revisions
                     .insert(stream_key, stream_revision);
                 self.add_system_notice(
                     SystemNoticeKind::Warning,
@@ -2902,17 +2604,19 @@ impl App {
                 }),
             });
         }
-        self.live_stream_revisions
+        self.execution
+            .live_stream_revisions
             .insert(stream_key, stream_revision);
-        self.timeline_cursor = self.timeline_len().saturating_sub(1);
+        self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
         self.mark_dirty();
     }
 
     fn apply_cancellation_receipt(&mut self, receipt: harness_contract::turn::CancellationReceipt) {
-        if receipt.session_id != self.session_id {
+        if receipt.session_id != self.shell.session_id {
             return;
         }
         let previous_status = self
+            .execution
             .seen_cancellation_ids
             .get(&receipt.cancellation_id)
             .copied();
@@ -2923,35 +2627,38 @@ impl App {
             return;
         }
         if previous_status == Some(harness_contract::turn::CancellationStatus::Requested) {
-            self.system_notices
+            self.workbench
+                .system_notices
                 .retain(|notice| !notice.content.contains(&receipt.cancellation_id));
         }
-        self.seen_cancellation_ids
+        self.execution
+            .seen_cancellation_ids
             .insert(receipt.cancellation_id.clone(), receipt.status);
         const CANCELLATION_DEDUPE_CAPACITY: usize = 2_048;
-        while self.seen_cancellation_ids.len() > CANCELLATION_DEDUPE_CAPACITY {
-            let Some(oldest) = self.seen_cancellation_ids.keys().next().cloned() else {
+        while self.execution.seen_cancellation_ids.len() > CANCELLATION_DEDUPE_CAPACITY {
+            let Some(oldest) = self.execution.seen_cancellation_ids.keys().next().cloned() else {
                 break;
             };
-            self.seen_cancellation_ids.remove(&oldest);
+            self.execution.seen_cancellation_ids.remove(&oldest);
         }
 
         let settles_current = receipt.status
             == harness_contract::turn::CancellationStatus::Cancelled
             && (receipt.execution_id.is_empty()
-                || self.current_execution_id.as_deref() == Some(receipt.execution_id.as_str()));
+                || self.execution.current_execution_id.as_deref()
+                    == Some(receipt.execution_id.as_str()));
         if settles_current {
             let execution_id = (!receipt.execution_id.is_empty())
                 .then_some(receipt.execution_id.clone())
-                .or_else(|| self.current_execution_id.clone());
+                .or_else(|| self.execution.current_execution_id.clone());
             let turn_id = (!receipt.turn_id.is_empty())
                 .then_some(receipt.turn_id.clone())
-                .or_else(|| self.current_turn_id.clone());
+                .or_else(|| self.execution.current_turn_id.clone());
             self.remove_stale_live_assistant_parts(execution_id.as_deref(), turn_id.as_deref());
-            self.current_execution_status =
+            self.execution.current_execution_status =
                 Some(harness_contract::projection::ExecutionLiveStatus::Cancelled);
-            self.current_execution_status_detail = receipt.reason.clone();
-            self.turn_interaction.terminal_observed();
+            self.execution.current_execution_status_detail = receipt.reason.clone();
+            self.execution.turn_interaction.terminal_observed();
             self.record_terminal_correlation(&crate::protocol::GatewayEventCorrelation {
                 session_id: receipt.session_id.clone(),
                 execution_id,
@@ -2979,6 +2686,21 @@ impl App {
     }
 
     fn apply_gateway_session_event(&mut self, event: crate::protocol::GatewaySessionEvent) {
+        let event = match self.apply_gateway_session_ingress_event(event) {
+            Ok(()) => return,
+            Err(event) => event,
+        };
+        let event = match self.apply_gateway_session_progress_event(event) {
+            Ok(()) => return,
+            Err(event) => event,
+        };
+        let _ = self.apply_gateway_session_terminal_event(event);
+    }
+
+    fn apply_gateway_session_ingress_event(
+        &mut self,
+        event: crate::protocol::GatewaySessionEvent,
+    ) -> Result<(), crate::protocol::GatewaySessionEvent> {
         use crate::protocol::GatewaySessionEvent;
         match event {
             GatewaySessionEvent::UserMessageCommitted {
@@ -2987,15 +2709,15 @@ impl App {
                 sequence,
                 created_at_ms,
             } => {
-                if correlation.session_id != self.session_id {
-                    return;
+                if correlation.session_id != self.shell.session_id {
+                    return Ok(());
                 }
                 let Some(message_id) = correlation.message_id else {
                     self.add_system_notice(
                         SystemNoticeKind::Warning,
                         "Ignored a committed user message without stable identity",
                     );
-                    return;
+                    return Ok(());
                 };
                 let incoming_execution = correlation.execution_id.clone();
                 let incoming_turn = correlation.turn_id.clone();
@@ -3004,16 +2726,20 @@ impl App {
                     .zip(incoming_turn.as_ref())
                     .map(|(execution_id, turn_id)| (execution_id.clone(), turn_id.clone()))
                 {
-                    self.committed_ingress_correlations.insert(identity);
+                    self.execution
+                        .committed_ingress_correlations
+                        .insert(identity);
                 }
-                let selects_visible_execution = self.current_execution_id.is_none()
-                    || self.current_execution_id.as_deref() == incoming_execution.as_deref()
+                let selects_visible_execution = self.execution.current_execution_id.is_none()
+                    || self.execution.current_execution_id.as_deref()
+                        == incoming_execution.as_deref()
                     || !self.turn_is_active()
-                    || self.current_execution_status.is_some_and(
+                    || self.execution.current_execution_status.is_some_and(
                         harness_contract::projection::ExecutionLiveStatus::is_terminal,
                     );
                 if selects_visible_execution
-                    && self.current_execution_id.as_deref() != incoming_execution.as_deref()
+                    && self.execution.current_execution_id.as_deref()
+                        != incoming_execution.as_deref()
                 {
                     self.reset_live_execution_facts();
                 }
@@ -3026,11 +2752,11 @@ impl App {
                     source: MessageSource::DurableIngress,
                 };
                 if selects_visible_execution {
-                    self.current_execution_id = incoming_execution;
-                    self.current_turn_id = incoming_turn;
-                    self.current_execution_status =
+                    self.execution.current_execution_id = incoming_execution;
+                    self.execution.current_turn_id = incoming_turn;
+                    self.execution.current_execution_status =
                         Some(harness_contract::projection::ExecutionLiveStatus::Queued);
-                    self.current_execution_status_detail =
+                    self.execution.current_execution_status_detail =
                         Some("input durably admitted".to_string());
                 }
                 self.record_input_history(content.clone());
@@ -3066,7 +2792,7 @@ impl App {
                         identity: Some(identity),
                     });
                 }
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.mark_dirty();
             }
             GatewaySessionEvent::TextDelta {
@@ -3102,15 +2828,15 @@ impl App {
                             || !self.adopt_active_execution_correlation(&correlation)
                             || self.correlation_is_terminalized(&correlation)
                         {
-                            return;
+                            return Ok(());
                         }
-                        self.turn_interaction.begin_root_presentation(
+                        self.execution.turn_interaction.begin_root_presentation(
                             presentation_id,
                             attempt_id,
                             envelope_id,
                             envelope_revision,
                         );
-                        self.current_execution_status_detail =
+                        self.execution.current_execution_status_detail =
                             Some("preparing root answer presentation".to_string());
                         self.mark_dirty();
                     }
@@ -3124,8 +2850,8 @@ impl App {
                         let (Ok(start_bytes), Ok(end_bytes)) =
                             (usize::try_from(byte_start), usize::try_from(byte_end))
                         else {
-                            self.live_output_snapshot_gap = true;
-                            return;
+                            self.execution.live_output_snapshot_gap = true;
+                            return Ok(());
                         };
                         self.apply_gateway_text_delta(
                             correlation,
@@ -3147,6 +2873,7 @@ impl App {
                         reason,
                     } => {
                         if self
+                            .execution
                             .turn_interaction
                             .end_root_presentation(&presentation_id, &attempt_id)
                         {
@@ -3156,7 +2883,7 @@ impl App {
                                 execution_id.as_deref(),
                                 turn_id.as_deref(),
                             );
-                            self.current_execution_status_detail = Some(reason);
+                            self.execution.current_execution_status_detail = Some(reason);
                             self.mark_dirty();
                         }
                     }
@@ -3168,7 +2895,8 @@ impl App {
                         // The committed lifecycle fact closes preview writes.
                         // TerminalCommitted/history remains the sole text and
                         // immutable message identity authority.
-                        self.turn_interaction
+                        self.execution
+                            .turn_interaction
                             .end_root_presentation(&presentation_id, &attempt_id);
                     }
                     TerminalDeliveryEvent::CancellationCommitted { receipt } => {
@@ -3176,6 +2904,17 @@ impl App {
                     }
                 }
             }
+            event => return Err(event),
+        }
+        Ok(())
+    }
+
+    fn apply_gateway_session_progress_event(
+        &mut self,
+        event: crate::protocol::GatewaySessionEvent,
+    ) -> Result<(), crate::protocol::GatewaySessionEvent> {
+        use crate::protocol::GatewaySessionEvent;
+        match event {
             GatewaySessionEvent::ReasoningSummaryDelta {
                 correlation,
                 summary,
@@ -3247,7 +2986,7 @@ impl App {
                 detail,
             } => {
                 if self.correlation_is_terminalized(&correlation) && !status.is_terminal() {
-                    return;
+                    return Ok(());
                 }
                 let adopted = if status == harness_contract::projection::ExecutionLiveStatus::Queued
                 {
@@ -3256,10 +2995,10 @@ impl App {
                     self.adopt_started_execution_correlation(&correlation)
                 };
                 if !adopted {
-                    return;
+                    return Ok(());
                 }
-                self.current_execution_status = Some(status);
-                self.current_execution_status_detail = detail;
+                self.execution.current_execution_status = Some(status);
+                self.execution.current_execution_status_detail = detail;
                 self.mark_dirty();
             }
             GatewaySessionEvent::ProviderAttempt {
@@ -3317,6 +3056,17 @@ impl App {
                     self.apply_event(CowdEvent::RunModelTelemetry { telemetry });
                 }
             }
+            event => return Err(event),
+        }
+        Ok(())
+    }
+
+    fn apply_gateway_session_terminal_event(
+        &mut self,
+        event: crate::protocol::GatewaySessionEvent,
+    ) -> Result<(), crate::protocol::GatewaySessionEvent> {
+        use crate::protocol::GatewaySessionEvent;
+        match event {
             GatewaySessionEvent::TerminalCommitted {
                 correlation,
                 assistant_text,
@@ -3324,56 +3074,60 @@ impl App {
                 token_usage,
                 ..
             } => {
-                if correlation.session_id != self.session_id {
-                    return;
+                if correlation.session_id != self.shell.session_id {
+                    return Ok(());
                 }
                 let complete_identity = correlation.execution_id.is_some()
                     && correlation.turn_id.is_some()
                     && correlation.message_id.is_some()
                     && correlation.terminal_id.is_some();
                 if !complete_identity {
-                    self.telemetry.orphan_event_count =
-                        self.telemetry.orphan_event_count.saturating_add(1);
+                    self.execution.telemetry.orphan_event_count = self
+                        .execution
+                        .telemetry
+                        .orphan_event_count
+                        .saturating_add(1);
                     let warning = format!(
                         "Rejected terminal without complete execution/turn/message/terminal identity (orphan #{})",
-                        self.telemetry.orphan_event_count
+                        self.execution.telemetry.orphan_event_count
                     );
                     self.add_system_notice(SystemNoticeKind::Warning, &warning);
                     self.show_notification(&warning);
-                    return;
+                    return Ok(());
                 }
                 if correlation.replayed {
                     // Durable history is the only transcript authority for
                     // replay. A replayed commit is an ordering/cursor fact and
                     // must never append assistant prose on its own.
-                    return;
+                    return Ok(());
                 }
                 let settles_current = self.adopt_live_correlation(&correlation);
                 if !settles_current {
-                    return;
+                    return Ok(());
                 }
-                if self.current_execution_status
+                if self.execution.current_execution_status
                     == Some(harness_contract::projection::ExecutionLiveStatus::Cancelled)
                 {
                     // Cancellation won the execution terminal CAS. A delayed
                     // outbox commit from the same execution cannot resurrect
                     // assistant output or flip the surface back to Complete.
-                    return;
+                    return Ok(());
                 }
                 if settles_current {
                     // Transcript durability does not classify GoalCompletion.
                     // Partial/blocked turns also commit a friendly assistant
                     // answer; lifecycle status remains owned by ExecutionLive.
-                    self.current_execution_id = correlation.execution_id.clone();
-                    self.current_turn_id = correlation.turn_id.clone();
+                    self.execution.current_execution_id = correlation.execution_id.clone();
+                    self.execution.current_turn_id = correlation.turn_id.clone();
                 }
                 if let Some(terminal_id) = correlation.terminal_id.as_ref() {
-                    if !self.seen_terminal_ids.insert(terminal_id.clone()) {
-                        self.telemetry.replay_terminal_dedupe_count = self
+                    if !self.execution.seen_terminal_ids.insert(terminal_id.clone()) {
+                        self.execution.telemetry.replay_terminal_dedupe_count = self
+                            .execution
                             .telemetry
                             .replay_terminal_dedupe_count
                             .saturating_add(1);
-                        return;
+                        return Ok(());
                     }
                 }
                 self.record_terminal_correlation(&correlation);
@@ -3383,7 +3137,9 @@ impl App {
                     .zip(correlation.turn_id.as_ref())
                     .map(|(execution_id, turn_id)| (execution_id.clone(), turn_id.clone()))
                 {
-                    self.committed_ingress_correlations.remove(&identity);
+                    self.execution
+                        .committed_ingress_correlations
+                        .remove(&identity);
                 }
                 if let Some(message_id) = correlation.message_id.as_deref() {
                     if let Some(usage) = token_usage.as_ref() {
@@ -3489,23 +3245,25 @@ impl App {
                     }
                 }
                 if settles_current {
-                    self.turn_interaction.terminal_observed();
+                    self.execution.turn_interaction.terminal_observed();
                 }
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
                 self.mark_dirty();
             }
             GatewaySessionEvent::TurnError { correlation, error } => {
                 if self.adopt_live_correlation(&correlation) {
-                    self.current_execution_status =
+                    self.execution.current_execution_status =
                         Some(harness_contract::projection::ExecutionLiveStatus::Error);
-                    self.current_execution_status_detail = Some(error.clone());
-                    self.current_execution_id = correlation.execution_id;
-                    self.current_turn_id = correlation.turn_id;
-                    self.turn_interaction.terminal_observed();
+                    self.execution.current_execution_status_detail = Some(error.clone());
+                    self.execution.current_execution_id = correlation.execution_id;
+                    self.execution.current_turn_id = correlation.turn_id;
+                    self.execution.turn_interaction.terminal_observed();
                     self.add_system_notice(SystemNoticeKind::Error, &format!("Error: {error}"));
                 }
             }
+            event => return Err(event),
         }
+        Ok(())
     }
 
     pub fn apply_session_input_projection(&mut self, projection: Value) {
@@ -3514,6 +3272,7 @@ impl App {
         // exactly when it first becomes actionable, without creating a local
         // execution queue or repeating notices for the same snapshot.
         let announced_queued_ids = self
+            .workbench
             .pending_inputs
             .iter()
             .filter(|input| input.status == "queued_next")
@@ -3567,7 +3326,7 @@ impl App {
             })
             .map(|input| input.input_id.clone())
             .collect::<Vec<_>>();
-        self.pending_inputs = inputs;
+        self.workbench.pending_inputs = inputs;
         self.mark_dirty();
         for input_id in newly_queued {
             self.add_system_notice(
@@ -3602,7 +3361,8 @@ impl App {
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect::<std::collections::HashSet<_>>();
-            self.pending_inputs
+            self.workbench
+                .pending_inputs
                 .retain(|input| !applied.contains(input.input_id.as_str()));
         }
         let kind = if state == "failed" {
@@ -3616,7 +3376,8 @@ impl App {
 
     #[must_use]
     pub fn queued_follow_up_count(&self) -> usize {
-        self.pending_inputs
+        self.workbench
+            .pending_inputs
             .iter()
             .filter(|input| input.status == "queued_next")
             .count()
@@ -3624,24 +3385,25 @@ impl App {
 
     #[must_use]
     pub fn queued_follow_up_preview(&self) -> Option<&PendingInputPreview> {
-        self.pending_inputs
+        self.workbench
+            .pending_inputs
             .iter()
             .find(|input| input.status == "queued_next")
     }
 
     pub fn timeline_len(&self) -> usize {
-        self.total_entries
+        self.timeline.total_entries
     }
 
     pub fn timeline_is_empty(&self) -> bool {
-        self.total_entries == 0
+        self.timeline.total_entries == 0
     }
 
     pub fn timeline_get(&self, idx: usize) -> Option<&TimelineEntry> {
-        if idx >= self.total_entries {
+        if idx >= self.timeline.total_entries {
             return None;
         }
-        for page in &self.timeline_pages {
+        for page in &self.timeline.timeline_pages {
             if idx >= page.start_index && idx < page.start_index + page.entries.len() {
                 return page.entries.get(idx - page.start_index);
             }
@@ -3654,12 +3416,12 @@ impl App {
     }
 
     pub fn timeline_get_mut(&mut self, idx: usize) -> Option<&mut TimelineEntry> {
-        if idx >= self.total_entries {
+        if idx >= self.timeline.total_entries {
             return None;
         }
         let key = self.timeline_get(idx).map(Self::timeline_entry_key)?;
         self.note_timeline_entry_mutated(idx, key);
-        for page in &mut self.timeline_pages {
+        for page in &mut self.timeline.timeline_pages {
             if idx >= page.start_index && idx < page.start_index + page.entries.len() {
                 return page.entries.get_mut(idx - page.start_index);
             }
@@ -3668,21 +3430,24 @@ impl App {
     }
 
     pub fn timeline_last_mut(&mut self) -> Option<&mut TimelineEntry> {
-        self.total_entries
+        self.timeline
+            .total_entries
             .checked_sub(1)
             .and_then(|index| self.timeline_get_mut(index))
     }
 
     pub fn timeline_last(&self) -> Option<&TimelineEntry> {
-        self.timeline_pages
+        self.timeline
+            .timeline_pages
             .back()
             .and_then(|page| page.entries.last())
     }
 
     pub fn timeline_push(&mut self, entry: TimelineEntry) {
         let absolute_position = self
+            .timeline
             .timeline_base_position
-            .saturating_add(u64::try_from(self.total_entries).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(self.timeline.total_entries).unwrap_or(u64::MAX));
         let (message_id, live_key, tool_id) = match &entry {
             TimelineEntry::Message {
                 identity: Some(identity),
@@ -3699,36 +3464,41 @@ impl App {
             TimelineEntry::ToolCall { id, .. } => (None, None, Some(id.clone())),
             _ => (None, None, None),
         };
-        if self.timeline_pages.is_empty()
+        if self.timeline.timeline_pages.is_empty()
             || self
+                .timeline
                 .timeline_pages
                 .back()
                 .is_none_or(|p| p.entries.len() >= PAGE_SIZE)
         {
             let start = self
+                .timeline
                 .timeline_pages
                 .back()
                 .map_or(0, |p| p.start_index + p.entries.len());
-            self.timeline_pages.push_back(TimelinePage {
+            self.timeline.timeline_pages.push_back(TimelinePage {
                 entries: Vec::with_capacity(PAGE_SIZE),
                 start_index: start,
             });
         }
-        let Some(page) = self.timeline_pages.back_mut() else {
+        let Some(page) = self.timeline.timeline_pages.back_mut() else {
             return;
         };
         page.entries.push(entry);
-        self.total_entries += 1;
+        self.timeline.total_entries += 1;
         if let Some(message_id) = message_id {
-            self.message_timeline_positions
+            self.timeline
+                .message_timeline_positions
                 .insert(message_id, absolute_position);
         }
         if let Some(live_key) = live_key {
-            self.live_timeline_positions
+            self.timeline
+                .live_timeline_positions
                 .insert(live_key, absolute_position);
         }
         if let Some(tool_id) = tool_id {
-            self.tool_timeline_positions
+            self.timeline
+                .tool_timeline_positions
                 .insert(tool_id, absolute_position);
         }
         self.note_searchable_content_changed();
@@ -3737,7 +3507,7 @@ impl App {
     }
 
     pub fn timeline_iter(&self) -> impl Iterator<Item = (usize, &TimelineEntry)> + '_ {
-        self.timeline_pages.iter().flat_map(|page| {
+        self.timeline.timeline_pages.iter().flat_map(|page| {
             let start = page.start_index;
             page.entries
                 .iter()
@@ -3747,16 +3517,18 @@ impl App {
     }
 
     pub fn timeline_iter_mut(&mut self) -> impl Iterator<Item = &mut TimelineEntry> + '_ {
-        self.timeline_full_sync_revision = self.timeline_full_sync_revision.wrapping_add(1);
-        self.timeline_dirty_log.clear();
-        self.timeline_pages
+        self.timeline.timeline_full_sync_revision =
+            self.timeline.timeline_full_sync_revision.wrapping_add(1);
+        self.timeline.timeline_dirty_log.clear();
+        self.timeline
+            .timeline_pages
             .iter_mut()
             .flat_map(|page| page.entries.iter_mut())
     }
 
     pub fn timeline_clone_vec(&self) -> Vec<TimelineEntry> {
-        let mut v = Vec::with_capacity(self.total_entries);
-        for page in &self.timeline_pages {
+        let mut v = Vec::with_capacity(self.timeline.total_entries);
+        for page in &self.timeline.timeline_pages {
             v.extend(page.entries.iter().cloned());
         }
         v
@@ -3787,12 +3559,17 @@ impl App {
 
     fn note_timeline_entry_mutated(&mut self, index: usize, key: String) {
         const DIRTY_LOG_CAP: usize = 8_192;
-        self.timeline_mutation_revision = self.timeline_mutation_revision.wrapping_add(1);
-        self.timeline_dirty_log
-            .push_back((self.timeline_mutation_revision, index, key));
-        if self.timeline_dirty_log.len() > DIRTY_LOG_CAP {
-            self.timeline_dirty_log.clear();
-            self.timeline_full_sync_revision = self.timeline_full_sync_revision.wrapping_add(1);
+        self.timeline.timeline_mutation_revision =
+            self.timeline.timeline_mutation_revision.wrapping_add(1);
+        self.timeline.timeline_dirty_log.push_back((
+            self.timeline.timeline_mutation_revision,
+            index,
+            key,
+        ));
+        if self.timeline.timeline_dirty_log.len() > DIRTY_LOG_CAP {
+            self.timeline.timeline_dirty_log.clear();
+            self.timeline.timeline_full_sync_revision =
+                self.timeline.timeline_full_sync_revision.wrapping_add(1);
         }
     }
 
@@ -3802,10 +3579,11 @@ impl App {
         &self,
         revision: u64,
     ) -> Option<(u64, Vec<(usize, TimelineEntry)>)> {
-        if revision == self.timeline_mutation_revision {
+        if revision == self.timeline.timeline_mutation_revision {
             return Some((revision, Vec::new()));
         }
         let first_revision = self
+            .timeline
             .timeline_dirty_log
             .front()
             .map(|(revision, _, _)| *revision)?;
@@ -3814,6 +3592,7 @@ impl App {
         }
         let mut dirty = BTreeMap::<usize, (&str, u64)>::new();
         for (mutation_revision, index, key) in self
+            .timeline
             .timeline_dirty_log
             .iter()
             .filter(|(mutation_revision, _, _)| *mutation_revision > revision)
@@ -3828,12 +3607,12 @@ impl App {
             }
             entries.push((index, entry.clone()));
         }
-        Some((self.timeline_mutation_revision, entries))
+        Some((self.timeline.timeline_mutation_revision, entries))
     }
 
     fn soft_evict(&mut self) {
-        while self.total_entries > SOFT_CAP {
-            let Some(front) = self.timeline_pages.front() else {
+        while self.timeline.total_entries > SOFT_CAP {
+            let Some(front) = self.timeline.timeline_pages.front() else {
                 break;
             };
             let evict_count = front.entries.len();
@@ -3853,9 +3632,10 @@ impl App {
                 })
                 .collect::<Vec<_>>();
 
-            let evicted_lines: usize = if !self.entry_line_counts.is_empty() {
-                let count = evict_count.min(self.entry_line_counts.len());
-                self.entry_line_counts
+            let evicted_lines: usize = if !self.timeline.entry_line_counts.is_empty() {
+                let count = evict_count.min(self.timeline.entry_line_counts.len());
+                self.timeline
+                    .entry_line_counts
                     .iter()
                     .take(count)
                     .map(|&c| c + 1)
@@ -3864,32 +3644,38 @@ impl App {
                 0
             };
 
-            let drain_count = evict_count.min(self.entry_line_counts.len());
-            self.entry_line_counts.drain(0..drain_count);
-            self.scroll_offset = self.scroll_offset.saturating_sub(evicted_lines);
-            self.timeline_cursor = self.timeline_cursor.saturating_sub(evict_count);
-            self.search_matches.retain(|&m| m >= evict_count);
-            self.search_matches
+            let drain_count = evict_count.min(self.timeline.entry_line_counts.len());
+            self.timeline.entry_line_counts.drain(0..drain_count);
+            self.timeline.scroll_offset = self.timeline.scroll_offset.saturating_sub(evicted_lines);
+            self.timeline.timeline_cursor =
+                self.timeline.timeline_cursor.saturating_sub(evict_count);
+            self.timeline.search_matches.retain(|&m| m >= evict_count);
+            self.timeline
+                .search_matches
                 .iter_mut()
                 .for_each(|m| *m -= evict_count);
 
-            self.timeline_pages.pop_front();
-            self.total_entries -= evict_count;
-            self.timeline_base_position = self
+            self.timeline.timeline_pages.pop_front();
+            self.timeline.total_entries -= evict_count;
+            self.timeline.timeline_base_position = self
+                .timeline
                 .timeline_base_position
                 .saturating_add(u64::try_from(evict_count).unwrap_or(u64::MAX));
             for message_id in evicted_message_ids {
-                self.message_timeline_positions.remove(&message_id);
+                self.timeline.message_timeline_positions.remove(&message_id);
             }
-            self.live_timeline_positions
-                .retain(|_, position| *position >= self.timeline_base_position);
-            self.tool_timeline_positions
-                .retain(|_, position| *position >= self.timeline_base_position);
+            self.timeline
+                .live_timeline_positions
+                .retain(|_, position| *position >= self.timeline.timeline_base_position);
+            self.timeline
+                .tool_timeline_positions
+                .retain(|_, position| *position >= self.timeline.timeline_base_position);
             self.note_searchable_content_changed();
-            self.timeline_full_sync_revision = self.timeline_full_sync_revision.wrapping_add(1);
+            self.timeline.timeline_full_sync_revision =
+                self.timeline.timeline_full_sync_revision.wrapping_add(1);
 
             let mut next_start = 0usize;
-            for page in &mut self.timeline_pages {
+            for page in &mut self.timeline.timeline_pages {
                 page.start_index = next_start;
                 next_start += page.entries.len();
             }
@@ -3897,8 +3683,8 @@ impl App {
     }
 
     fn hard_evict(&mut self) {
-        while self.total_entries > HARD_CAP {
-            let Some(front) = self.timeline_pages.front() else {
+        while self.timeline.total_entries > HARD_CAP {
+            let Some(front) = self.timeline.timeline_pages.front() else {
                 break;
             };
             let evict_count = front.entries.len();
@@ -3918,9 +3704,10 @@ impl App {
                 })
                 .collect::<Vec<_>>();
 
-            let evicted_lines: usize = if !self.entry_line_counts.is_empty() {
-                let count = evict_count.min(self.entry_line_counts.len());
-                self.entry_line_counts
+            let evicted_lines: usize = if !self.timeline.entry_line_counts.is_empty() {
+                let count = evict_count.min(self.timeline.entry_line_counts.len());
+                self.timeline
+                    .entry_line_counts
                     .iter()
                     .take(count)
                     .map(|&c| c + 1)
@@ -3929,32 +3716,38 @@ impl App {
                 0
             };
 
-            let drain_count = evict_count.min(self.entry_line_counts.len());
-            self.entry_line_counts.drain(0..drain_count);
-            self.scroll_offset = self.scroll_offset.saturating_sub(evicted_lines);
-            self.timeline_cursor = self.timeline_cursor.saturating_sub(evict_count);
-            self.search_matches.retain(|&m| m >= evict_count);
-            self.search_matches
+            let drain_count = evict_count.min(self.timeline.entry_line_counts.len());
+            self.timeline.entry_line_counts.drain(0..drain_count);
+            self.timeline.scroll_offset = self.timeline.scroll_offset.saturating_sub(evicted_lines);
+            self.timeline.timeline_cursor =
+                self.timeline.timeline_cursor.saturating_sub(evict_count);
+            self.timeline.search_matches.retain(|&m| m >= evict_count);
+            self.timeline
+                .search_matches
                 .iter_mut()
                 .for_each(|m| *m -= evict_count);
 
-            self.timeline_pages.pop_front();
-            self.total_entries -= evict_count;
-            self.timeline_base_position = self
+            self.timeline.timeline_pages.pop_front();
+            self.timeline.total_entries -= evict_count;
+            self.timeline.timeline_base_position = self
+                .timeline
                 .timeline_base_position
                 .saturating_add(u64::try_from(evict_count).unwrap_or(u64::MAX));
             for message_id in evicted_message_ids {
-                self.message_timeline_positions.remove(&message_id);
+                self.timeline.message_timeline_positions.remove(&message_id);
             }
-            self.live_timeline_positions
-                .retain(|_, position| *position >= self.timeline_base_position);
-            self.tool_timeline_positions
-                .retain(|_, position| *position >= self.timeline_base_position);
+            self.timeline
+                .live_timeline_positions
+                .retain(|_, position| *position >= self.timeline.timeline_base_position);
+            self.timeline
+                .tool_timeline_positions
+                .retain(|_, position| *position >= self.timeline.timeline_base_position);
             self.note_searchable_content_changed();
-            self.timeline_full_sync_revision = self.timeline_full_sync_revision.wrapping_add(1);
+            self.timeline.timeline_full_sync_revision =
+                self.timeline.timeline_full_sync_revision.wrapping_add(1);
 
             let mut next_start = 0usize;
-            for page in &mut self.timeline_pages {
+            for page in &mut self.timeline.timeline_pages {
                 page.start_index = next_start;
                 next_start += page.entries.len();
             }
@@ -3963,43 +3756,48 @@ impl App {
 
     pub fn spinner_char(&self) -> &'static str {
         const F: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        F[self.spinner_idx % F.len()]
+        F[self.shell.spinner_idx % F.len()]
     }
 
     pub fn tick(&mut self) {
-        self.spinner_idx = self.spinner_idx.wrapping_add(1);
-        if self.notification_ttl > 0 {
-            self.notification_ttl -= 1;
-            if self.notification_ttl == 0 {
-                self.notification = None;
+        self.shell.spinner_idx = self.shell.spinner_idx.wrapping_add(1);
+        if self.shell.notification_ttl > 0 {
+            self.shell.notification_ttl -= 1;
+            if self.shell.notification_ttl == 0 {
+                self.shell.notification = None;
             }
         }
     }
 
     #[must_use]
     pub fn turn_is_active(&self) -> bool {
-        self.turn_interaction.is_active()
+        self.execution.turn_interaction.is_active()
     }
 
     pub fn next_model(&mut self) -> Option<String> {
-        if self.available_models.len() <= 1 {
+        if self.shell.available_models.len() <= 1 {
             return None;
         }
-        if let Some(pos) = self.available_models.iter().position(|m| m == &self.model) {
-            let idx = (pos + 1) % self.available_models.len();
-            self.model = self.available_models[idx].clone();
-            self.model_dirty = true;
-            Some(self.model.clone())
+        if let Some(pos) = self
+            .shell
+            .available_models
+            .iter()
+            .position(|m| m == &self.shell.model)
+        {
+            let idx = (pos + 1) % self.shell.available_models.len();
+            self.shell.model = self.shell.available_models[idx].clone();
+            self.shell.model_dirty = true;
+            Some(self.shell.model.clone())
         } else {
-            self.model = self.available_models[0].clone();
-            self.model_dirty = true;
-            Some(self.model.clone())
+            self.shell.model = self.shell.available_models[0].clone();
+            self.shell.model_dirty = true;
+            Some(self.shell.model.clone())
         }
     }
 
     pub fn show_notification(&mut self, msg: &str) {
-        self.notification = Some(msg.to_string());
-        self.notification_ttl = 30;
+        self.shell.notification = Some(msg.to_string());
+        self.shell.notification_ttl = 30;
     }
 
     pub fn format_timestamp() -> String {
@@ -4014,32 +3812,33 @@ impl App {
     }
 
     pub fn open_session_picker(&mut self, sessions: Vec<SessionSummary>) {
-        self.picker_sessions = sessions;
-        self.picker_idx = 0;
-        self.picker_active = true;
+        self.shell.picker_sessions = sessions;
+        self.shell.picker_idx = 0;
+        self.shell.picker_active = true;
     }
 
     pub fn close_session_picker(&mut self) {
-        self.picker_active = false;
-        self.picker_sessions.clear();
-        self.picker_idx = 0;
+        self.shell.picker_active = false;
+        self.shell.picker_sessions.clear();
+        self.shell.picker_idx = 0;
     }
 
     pub fn picker_up(&mut self) {
-        if self.picker_idx > 0 {
-            self.picker_idx -= 1;
+        if self.shell.picker_idx > 0 {
+            self.shell.picker_idx -= 1;
         }
     }
 
     pub fn picker_down(&mut self) {
-        if self.picker_idx + 1 < self.picker_sessions.len() {
-            self.picker_idx += 1;
+        if self.shell.picker_idx + 1 < self.shell.picker_sessions.len() {
+            self.shell.picker_idx += 1;
         }
     }
 
     pub fn picker_selected_id(&self) -> Option<&str> {
-        self.picker_sessions
-            .get(self.picker_idx)
+        self.shell
+            .picker_sessions
+            .get(self.shell.picker_idx)
             .map(|s| s.id.as_str())
     }
 
@@ -4047,15 +3846,15 @@ impl App {
         if self.timeline_is_empty() {
             return false;
         }
-        let mut idx = self.timeline_cursor;
+        let mut idx = self.timeline.timeline_cursor;
         loop {
             if idx == 0 {
                 break;
             }
             idx -= 1;
             if self.timeline_get(idx).is_some_and(|e| e.is_collapsible()) {
-                self.timeline_cursor = idx;
-                self.auto_scroll = false;
+                self.timeline.timeline_cursor = idx;
+                self.timeline.auto_scroll = false;
                 return true;
             }
         }
@@ -4066,12 +3865,12 @@ impl App {
         if self.timeline_is_empty() {
             return false;
         }
-        let mut idx = self.timeline_cursor;
+        let mut idx = self.timeline.timeline_cursor;
         while idx + 1 < self.timeline_len() {
             idx += 1;
             if self.timeline_get(idx).is_some_and(|e| e.is_collapsible()) {
-                self.timeline_cursor = idx;
-                self.auto_scroll = true;
+                self.timeline.timeline_cursor = idx;
+                self.timeline.auto_scroll = true;
                 return true;
             }
         }
@@ -4079,9 +3878,9 @@ impl App {
     }
 
     pub fn toggle_expand_current(&mut self) {
-        if let Some(entry) = self.timeline_get_mut(self.timeline_cursor) {
+        if let Some(entry) = self.timeline_get_mut(self.timeline.timeline_cursor) {
             entry.toggle();
-            self.msg_version = self.msg_version.wrapping_add(1);
+            self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
         }
     }
 
@@ -4119,8 +3918,8 @@ impl App {
                 source: MessageSource::Local,
             }),
         });
-        self.timeline_cursor = self.timeline_len().saturating_sub(1);
-        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
     }
 
     pub fn begin_message_admission(
@@ -4130,7 +3929,8 @@ impl App {
         submission_generation: u64,
         starts_new_turn: bool,
     ) {
-        self.pending_message_admissions
+        self.execution
+            .pending_message_admissions
             .insert(client_message_id.clone(), submission_generation);
         self.add_message_with_id("user", content, Some(client_message_id));
         if starts_new_turn {
@@ -4143,20 +3943,21 @@ impl App {
         if trimmed.is_empty() {
             return;
         }
-        self.system_notices.push_back(SystemNotice {
+        self.workbench.system_notices.push_back(SystemNotice {
             kind,
             content: trimmed.to_string(),
             timestamp: App::format_timestamp(),
         });
         const SYSTEM_NOTICE_CAP: usize = 500;
-        while self.system_notices.len() > SYSTEM_NOTICE_CAP {
-            self.system_notices.pop_front();
+        while self.workbench.system_notices.len() > SYSTEM_NOTICE_CAP {
+            self.workbench.system_notices.pop_front();
         }
-        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
     }
 
     pub fn recent_system_notice_labels(&self, limit: usize) -> Vec<String> {
-        self.system_notices
+        self.workbench
+            .system_notices
             .iter()
             .rev()
             .take(limit)
@@ -4174,12 +3975,12 @@ impl App {
             output: trimmed.to_string(),
             expanded: trimmed.lines().count() <= 3,
         });
-        self.timeline_cursor = self.timeline_len().saturating_sub(1);
-        self.msg_version = self.msg_version.wrapping_add(1);
+        self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
+        self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
     }
 
     pub fn copy_focused_content(&self) -> bool {
-        let Some(entry) = self.timeline_get(self.timeline_cursor) else {
+        let Some(entry) = self.timeline_get(self.timeline.timeline_cursor) else {
             return false;
         };
         let text = entry.full_text();
@@ -4208,13 +4009,14 @@ impl App {
     }
 
     pub fn execute_search(&mut self, query: &str) {
-        self.search_query = query.to_string();
-        self.search_matches.clear();
-        self.search_current = 0;
+        self.timeline.search_query = query.to_string();
+        self.timeline.search_matches.clear();
+        self.timeline.search_current = 0;
 
         let lower = query.to_lowercase();
         self.ensure_search_text_index();
-        self.search_matches = self
+        self.timeline.search_matches = self
+            .timeline
             .search_text_index
             .iter()
             .enumerate()
@@ -4227,11 +4029,11 @@ impl App {
     }
 
     pub fn search_next(&mut self) {
-        if self.search_matches.is_empty() {
+        if self.timeline.search_matches.is_empty() {
             return;
         }
-        let idx = if self.search_current + 1 < self.search_matches.len() {
-            self.search_current + 1
+        let idx = if self.timeline.search_current + 1 < self.timeline.search_matches.len() {
+            self.timeline.search_current + 1
         } else {
             0
         };
@@ -4239,22 +4041,22 @@ impl App {
     }
 
     pub fn search_prev(&mut self) {
-        if self.search_matches.is_empty() {
+        if self.timeline.search_matches.is_empty() {
             return;
         }
-        let idx = if self.search_current > 0 {
-            self.search_current - 1
+        let idx = if self.timeline.search_current > 0 {
+            self.timeline.search_current - 1
         } else {
-            self.search_matches.len() - 1
+            self.timeline.search_matches.len() - 1
         };
         self.go_search_match(idx);
     }
 
     fn go_search_match(&mut self, match_idx: usize) {
-        if let Some(&entry_idx) = self.search_matches.get(match_idx) {
-            self.search_current = match_idx;
-            self.timeline_cursor = entry_idx;
-            self.auto_scroll = false;
+        if let Some(&entry_idx) = self.timeline.search_matches.get(match_idx) {
+            self.timeline.search_current = match_idx;
+            self.timeline.timeline_cursor = entry_idx;
+            self.timeline.auto_scroll = false;
             // ChatView owns the wrapped visual-row index and performs the
             // actual scroll after width-aware cache reconciliation.
             self.request_redraw();
@@ -4262,69 +4064,90 @@ impl App {
     }
 
     pub fn cancel_search(&mut self) {
-        self.search_query.clear();
-        self.search_matches.clear();
-        self.search_current = 0;
-        self.search_active = false;
+        self.timeline.search_query.clear();
+        self.timeline.search_matches.clear();
+        self.timeline.search_current = 0;
+        self.timeline.search_active = false;
     }
 
     pub fn scroll_to_entry(&mut self, entry_idx: usize) {
-        let vh = self.viewport_height.max(1);
+        let vh = self.timeline.viewport_height.max(1);
         let mut offset: usize = 0;
-        for i in 0..entry_idx.min(self.entry_line_counts.len()) {
-            offset += self.entry_line_counts[i] + 1;
+        for i in 0..entry_idx.min(self.timeline.entry_line_counts.len()) {
+            offset += self.timeline.entry_line_counts[i] + 1;
         }
-        let entry_h = self.entry_line_counts.get(entry_idx).copied().unwrap_or(1);
+        let entry_h = self
+            .timeline
+            .entry_line_counts
+            .get(entry_idx)
+            .copied()
+            .unwrap_or(1);
 
-        let scroll = self.scroll_offset;
+        let scroll = self.timeline.scroll_offset;
         if offset < scroll {
-            self.scroll_offset = offset;
+            self.timeline.scroll_offset = offset;
         } else if offset + entry_h > scroll + vh {
-            self.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h));
+            self.timeline.scroll_offset = offset.saturating_sub(vh.saturating_sub(entry_h));
         }
     }
 
     pub fn scroll_page_up(&mut self) {
-        let amount = self.viewport_height.max(1).saturating_sub(1);
-        self.scroll_offset = self.scroll_offset.saturating_sub(amount);
+        let amount = self.timeline.viewport_height.max(1).saturating_sub(1);
+        self.timeline.scroll_offset = self.timeline.scroll_offset.saturating_sub(amount);
     }
 
     pub fn scroll_page_down(&mut self) {
-        let amount = self.viewport_height.max(1).saturating_sub(1);
-        self.scroll_offset = self.scroll_offset.saturating_add(amount);
+        let amount = self.timeline.viewport_height.max(1).saturating_sub(1);
+        self.timeline.scroll_offset = self.timeline.scroll_offset.saturating_add(amount);
     }
 
     pub fn history_prev(&mut self) -> Option<String> {
-        if self.input_history.is_empty() {
+        if self.shell.input_history.is_empty() {
             return None;
         }
-        let idx = match self.history_idx {
+        let idx = match self.shell.history_idx {
             Some(0) => return None,
             Some(i) => i - 1,
-            None => self.input_history.len().saturating_sub(1),
+            None => self.shell.input_history.len().saturating_sub(1),
         };
-        self.history_idx = Some(idx);
-        self.input_history.get(idx).cloned()
+        self.shell.history_idx = Some(idx);
+        self.shell.input_history.get(idx).cloned()
     }
 
     pub fn history_next(&mut self) -> Option<String> {
-        let idx = match self.history_idx {
-            Some(i) if i + 1 < self.input_history.len() => i + 1,
+        let idx = match self.shell.history_idx {
+            Some(i) if i + 1 < self.shell.input_history.len() => i + 1,
             _ => {
-                self.history_idx = None;
+                self.shell.history_idx = None;
                 return Some(String::new());
             }
         };
-        self.history_idx = Some(idx);
-        self.input_history.get(idx).cloned()
+        self.shell.history_idx = Some(idx);
+        self.shell.input_history.get(idx).cloned()
     }
 
     pub fn apply_event(&mut self, event: CowdEvent) {
+        let event = match self.apply_session_history_event(event) {
+            Ok(()) => return,
+            Err(event) => event,
+        };
+        let event = match self.apply_session_control_event(event) {
+            Ok(()) => return,
+            Err(event) => event,
+        };
+        let event = match self.apply_turn_activity_event(event) {
+            Ok(()) => return,
+            Err(event) => event,
+        };
+        let _ = self.apply_shell_projection_event(event);
+    }
+
+    fn apply_session_history_event(&mut self, event: CowdEvent) -> Result<(), CowdEvent> {
         match event {
             CowdEvent::SessionScoped {
                 session_id, event, ..
             } => {
-                if session_id == self.session_id {
+                if session_id == self.shell.session_id {
                     self.apply_event(*event);
                 }
             }
@@ -4335,9 +4158,9 @@ impl App {
                 self.apply_history_page(page);
             }
             CowdEvent::SessionHistoryIndexLoaded { projection } => {
-                if projection.session_id == self.session_id {
-                    self.history_total_messages = projection.total_messages as usize;
-                    self.history_has_older =
+                if projection.session_id == self.shell.session_id {
+                    self.history.history_total_messages = projection.total_messages as usize;
+                    self.history.history_has_older =
                         projection.total_messages as usize > self.timeline_len();
                     if !matches!(
                         projection.recovery_state,
@@ -4352,12 +4175,13 @@ impl App {
                             ),
                         );
                     }
-                    self.session_history_index = Some(projection);
-                    self.msg_version = self.msg_version.wrapping_add(1);
+                    self.history.session_history_index = Some(projection);
+                    self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
                 }
             }
             CowdEvent::SessionHistoryCatchupPage { page } => {
-                let visible_at_tail = self.history_window_end_offset >= self.history_total_messages;
+                let visible_at_tail =
+                    self.history.history_window_end_offset >= self.history.history_total_messages;
                 if visible_at_tail {
                     self.apply_history_page(page);
                 }
@@ -4373,47 +4197,55 @@ impl App {
                 next_sequence: _,
                 has_older,
             } => {
-                if session_id == self.session_id {
-                    self.history_hydrated = true;
-                    self.history_hydration_error = None;
+                if session_id == self.shell.session_id {
+                    self.history.history_hydrated = true;
+                    self.history.history_hydration_error = None;
                     match kind {
                         crate::protocol::SessionHistoryHydrationKind::InitialWindow => {
-                            self.history_oldest_offset = oldest_offset;
-                            self.history_window_end_offset =
+                            self.history.history_oldest_offset = oldest_offset;
+                            self.history.history_window_end_offset =
                                 oldest_offset.saturating_add(message_count);
-                            self.history_total_messages =
-                                total_messages.max(self.history_window_end_offset);
-                            self.history_has_older = has_older;
+                            self.history.history_total_messages =
+                                total_messages.max(self.history.history_window_end_offset);
+                            self.history.history_has_older = has_older;
                         }
                         crate::protocol::SessionHistoryHydrationKind::IncrementalCatchup => {
-                            let previous_total = self.history_total_messages;
-                            let was_at_tail = self.history_window_end_offset >= previous_total;
-                            self.history_total_messages =
-                                self.history_total_messages.max(total_messages);
+                            let previous_total = self.history.history_total_messages;
+                            let was_at_tail =
+                                self.history.history_window_end_offset >= previous_total;
+                            self.history.history_total_messages =
+                                self.history.history_total_messages.max(total_messages);
                             if was_at_tail {
-                                self.history_window_end_offset = self.history_total_messages;
+                                self.history.history_window_end_offset =
+                                    self.history.history_total_messages;
                                 let visible_span = self
+                                    .history
                                     .history_window_end_offset
-                                    .saturating_sub(self.history_oldest_offset);
+                                    .saturating_sub(self.history.history_oldest_offset);
                                 if visible_span > SOFT_CAP {
-                                    self.history_oldest_offset =
-                                        self.history_window_end_offset.saturating_sub(SOFT_CAP);
+                                    self.history.history_oldest_offset = self
+                                        .history
+                                        .history_window_end_offset
+                                        .saturating_sub(SOFT_CAP);
                                 }
-                                self.history_has_older = self.history_oldest_offset > 0;
+                                self.history.history_has_older =
+                                    self.history.history_oldest_offset > 0;
                             }
                         }
                     }
-                    self.history_window_truncated = self.history_has_older;
-                    self.telemetry.history_hydration_duration_ms = Some(duration_ms);
-                    self.telemetry.history_hydrated_messages = self
+                    self.history.history_window_truncated = self.history.history_has_older;
+                    self.execution.telemetry.history_hydration_duration_ms = Some(duration_ms);
+                    self.execution.telemetry.history_hydrated_messages = self
+                        .execution
                         .telemetry
                         .history_hydrated_messages
                         .saturating_add(message_count);
-                    self.telemetry.history_hydration_pages = self
+                    self.execution.telemetry.history_hydration_pages = self
+                        .execution
                         .telemetry
                         .history_hydration_pages
                         .saturating_add(page_count);
-                    if self.history_has_older {
+                    if self.history.history_has_older {
                         self.add_system_notice(
                             SystemNoticeKind::Info,
                             "Older durable history remains available; use /history older to load the preceding page without blocking live events.",
@@ -4427,17 +4259,17 @@ impl App {
                 oldest_offset,
                 has_older,
             } => {
-                if page.session_id == self.session_id {
+                if page.session_id == self.shell.session_id {
                     if self.turn_is_active() {
-                        self.history_loading_older = false;
+                        self.history.history_loading_older = false;
                         self.add_system_notice(
                             SystemNoticeKind::Warning,
                             "Older history was not installed because a live turn started while the page was loading",
                         );
-                        return;
+                        return Ok(());
                     }
-                    self.history_prepend_anchor_message_id = self
-                        .timeline_get(self.timeline_cursor)
+                    self.history.history_prepend_anchor_message_id = self
+                        .timeline_get(self.timeline.timeline_cursor)
                         .and_then(|entry| match entry {
                             TimelineEntry::Message {
                                 identity:
@@ -4463,24 +4295,28 @@ impl App {
                             })
                         });
                     self.make_room_for_older_history(page.messages.len());
-                    self.history_loading_older = false;
-                    self.history_oldest_offset = oldest_offset;
-                    self.history_window_end_offset = self
+                    self.history.history_loading_older = false;
+                    self.history.history_oldest_offset = oldest_offset;
+                    self.history.history_window_end_offset = self
+                        .history
                         .history_window_end_offset
                         .saturating_sub(page.messages.len());
-                    self.history_total_messages = self.history_total_messages.max(page.total);
-                    self.history_has_older = has_older;
+                    self.history.history_total_messages =
+                        self.history.history_total_messages.max(page.total);
+                    self.history.history_has_older = has_older;
                     // API `has_more` points toward newer messages. This page
                     // is nevertheless complete for the older-window action.
                     page.has_more = false;
                     self.apply_history_page(page);
-                    if let Some(anchor) = self.history_prepend_anchor_message_id.as_deref() {
+                    if let Some(anchor) = self.history.history_prepend_anchor_message_id.as_deref()
+                    {
                         if let Some(index) = self.timeline_message_index(anchor) {
-                            self.timeline_cursor = index;
-                            self.auto_scroll = false;
+                            self.timeline.timeline_cursor = index;
+                            self.timeline.auto_scroll = false;
                         }
                     }
-                    self.history_prepend_revision = self.history_prepend_revision.wrapping_add(1);
+                    self.history.history_prepend_revision =
+                        self.history.history_prepend_revision.wrapping_add(1);
                 }
             }
             CowdEvent::SessionHistoryNewerPage {
@@ -4488,26 +4324,28 @@ impl App {
                 window_end_offset,
                 has_newer,
             } => {
-                if page.session_id == self.session_id {
-                    self.history_loading_newer = false;
+                if page.session_id == self.shell.session_id {
+                    self.history.history_loading_newer = false;
                     if self.turn_is_active() {
                         self.add_system_notice(
                             SystemNoticeKind::Warning,
                             "Newer history was not installed because a live turn started while the page was loading",
                         );
-                        return;
+                        return Ok(());
                     }
                     let loaded = page.messages.len();
                     self.make_room_for_newer_history(loaded);
-                    self.history_oldest_offset = self.history_oldest_offset.saturating_add(loaded);
-                    self.history_window_end_offset = window_end_offset;
-                    self.history_total_messages = self.history_total_messages.max(page.total);
-                    self.history_has_older = self.history_oldest_offset > 0;
+                    self.history.history_oldest_offset =
+                        self.history.history_oldest_offset.saturating_add(loaded);
+                    self.history.history_window_end_offset = window_end_offset;
+                    self.history.history_total_messages =
+                        self.history.history_total_messages.max(page.total);
+                    self.history.history_has_older = self.history.history_oldest_offset > 0;
                     page.has_more = false;
                     self.apply_history_page(page);
-                    self.auto_scroll = !has_newer;
-                    if self.auto_scroll {
-                        self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                    self.timeline.auto_scroll = !has_newer;
+                    if self.timeline.auto_scroll {
+                        self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
                     }
                 }
             }
@@ -4515,31 +4353,38 @@ impl App {
                 mut page,
                 oldest_offset,
             } => {
-                if page.session_id == self.session_id {
-                    self.history_loading_newer = false;
+                if page.session_id == self.shell.session_id {
+                    self.history.history_loading_newer = false;
                     if self.turn_is_active() {
                         self.add_system_notice(
                             SystemNoticeKind::Warning,
                             "Latest history was not installed because a live turn started while the page was loading",
                         );
-                        return;
+                        return Ok(());
                     }
                     self.clear_durable_history_window();
-                    self.history_oldest_offset = oldest_offset;
-                    self.history_window_end_offset =
+                    self.history.history_oldest_offset = oldest_offset;
+                    self.history.history_window_end_offset =
                         oldest_offset.saturating_add(page.messages.len());
-                    self.history_total_messages = page.total;
-                    self.history_has_older = oldest_offset > 0;
+                    self.history.history_total_messages = page.total;
+                    self.history.history_has_older = oldest_offset > 0;
                     page.has_more = false;
                     self.apply_history_page(page);
-                    self.auto_scroll = true;
-                    self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                    self.timeline.auto_scroll = true;
+                    self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
                 }
             }
+            event => return Err(event),
+        }
+        Ok(())
+    }
+
+    fn apply_session_control_event(&mut self, event: CowdEvent) -> Result<(), CowdEvent> {
+        match event {
             CowdEvent::SessionHistoryOlderFailed { session_id, error } => {
-                if session_id == self.session_id {
-                    self.history_loading_older = false;
-                    self.history_loading_newer = false;
+                if session_id == self.shell.session_id {
+                    self.history.history_loading_older = false;
+                    self.history.history_loading_newer = false;
                     self.add_system_notice(
                         SystemNoticeKind::Error,
                         &format!("Loading older durable history failed: {error}"),
@@ -4547,9 +4392,9 @@ impl App {
                 }
             }
             CowdEvent::SessionHistoryHydrationFailed { session_id, error } => {
-                if session_id == self.session_id {
-                    self.history_hydrated = false;
-                    self.history_hydration_error = Some(error.clone());
+                if session_id == self.shell.session_id {
+                    self.history.history_hydrated = false;
+                    self.history.history_hydration_error = Some(error.clone());
                     self.add_system_notice(
                         SystemNoticeKind::Error,
                         &format!("Session history unavailable: {error}"),
@@ -4561,13 +4406,16 @@ impl App {
                 client_message_id,
                 submission_generation,
             } => {
-                if session_id == self.session_id
+                if session_id == self.shell.session_id
                     && self
+                        .execution
                         .pending_message_admissions
                         .get(&client_message_id)
                         .is_some_and(|generation| *generation == submission_generation)
                 {
-                    self.pending_message_admissions.remove(&client_message_id);
+                    self.execution
+                        .pending_message_admissions
+                        .remove(&client_message_id);
                 }
             }
             CowdEvent::MessageAdmissionFailed {
@@ -4578,15 +4426,18 @@ impl App {
                 started_new_turn,
                 error,
             } => {
-                if session_id != self.session_id
+                if session_id != self.shell.session_id
                     || self
+                        .execution
                         .pending_message_admissions
                         .get(&client_message_id)
                         .is_none_or(|generation| *generation != submission_generation)
                 {
-                    return;
+                    return Ok(());
                 }
-                self.pending_message_admissions.remove(&client_message_id);
+                self.execution
+                    .pending_message_admissions
+                    .remove(&client_message_id);
                 let retained = self
                     .timeline_clone_vec()
                     .into_iter()
@@ -4604,17 +4455,18 @@ impl App {
                     })
                     .collect();
                 self.replace_timeline_entries(retained);
-                if self.input.text().is_empty() {
-                    self.input.set_text(&original_text);
+                if self.shell.input.text().is_empty() {
+                    self.shell.input.set_text(&original_text);
                 }
                 if started_new_turn
-                    && self.pending_message_admissions.is_empty()
+                    && self.execution.pending_message_admissions.is_empty()
                     && matches!(
-                        self.turn_interaction.transport,
+                        self.execution.turn_interaction.transport,
                         crate::components::turn_interaction::TransportState::Submitting
                     )
                 {
-                    self.turn_interaction
+                    self.execution
+                        .turn_interaction
                         .reduce(crate::components::turn_interaction::TurnInteractionAction::Reset);
                 }
                 self.add_system_notice(
@@ -4626,47 +4478,51 @@ impl App {
                 self.mark_dirty();
             }
             CowdEvent::SessionAuthorizationRevoked { session_id, reason } => {
-                if session_id == self.session_id {
+                if session_id == self.shell.session_id {
                     self.revoke_session_authorization(&reason);
                 }
             }
             CowdEvent::SessionStreamConnection { session_id, state } => {
-                if session_id == self.session_id {
-                    self.stream_connection_state = state.clone();
+                if session_id == self.shell.session_id {
+                    self.execution.stream_connection_state = state.clone();
                     match state {
                         crate::protocol::SessionStreamConnectionState::Connecting => {
-                            self.turn_interaction.reconnecting();
+                            self.execution.turn_interaction.reconnecting();
                         }
                         crate::protocol::SessionStreamConnectionState::Connected => {}
                         crate::protocol::SessionStreamConnectionState::Reconnecting {
                             after_cursor,
                             ..
                         } => {
-                            self.telemetry.session_sse_reconnect_count =
-                                self.telemetry.session_sse_reconnect_count.saturating_add(1);
-                            self.telemetry.session_sse_last_cursor = after_cursor;
-                            self.turn_interaction.reconnecting();
+                            self.execution.telemetry.session_sse_reconnect_count = self
+                                .execution
+                                .telemetry
+                                .session_sse_reconnect_count
+                                .saturating_add(1);
+                            self.execution.telemetry.session_sse_last_cursor = after_cursor;
+                            self.execution.turn_interaction.reconnecting();
                         }
                     }
                     self.mark_dirty();
                 }
             }
             CowdEvent::ExecutionProjectionConnection { state, .. } => {
-                self.projection_connection_state = Some(state.clone());
+                self.execution.projection_connection_state = Some(state.clone());
                 match state {
                     crate::protocol::SessionStreamConnectionState::Connecting => {
-                        self.turn_interaction.reconnecting();
+                        self.execution.turn_interaction.reconnecting();
                     }
                     crate::protocol::SessionStreamConnectionState::Reconnecting {
                         after_cursor,
                         ..
                     } => {
-                        self.telemetry.projection_sse_reconnect_count = self
+                        self.execution.telemetry.projection_sse_reconnect_count = self
+                            .execution
                             .telemetry
                             .projection_sse_reconnect_count
                             .saturating_add(1);
-                        self.telemetry.projection_sse_last_cursor = after_cursor;
-                        self.turn_interaction.reconnecting();
+                        self.execution.telemetry.projection_sse_last_cursor = after_cursor;
+                        self.execution.turn_interaction.reconnecting();
                     }
                     crate::protocol::SessionStreamConnectionState::Connected => {
                         // A transport handshake alone does not make metrics
@@ -4697,6 +4553,13 @@ impl App {
                 snapshot.apply_to_app(self);
                 self.mark_dirty();
             }
+            event => return Err(event),
+        }
+        Ok(())
+    }
+
+    fn apply_turn_activity_event(&mut self, event: CowdEvent) -> Result<(), CowdEvent> {
+        match event {
             CowdEvent::ReasoningSummaryDelta { summary } => {
                 let mut found = false;
                 if let Some(TimelineEntry::Thinking {
@@ -4714,8 +4577,8 @@ impl App {
                     }
                 }
                 if !found {
-                    let id = self.thinking_id_counter;
-                    self.thinking_id_counter += 1;
+                    let id = self.timeline.thinking_id_counter;
+                    self.timeline.thinking_id_counter += 1;
                     self.timeline_push(TimelineEntry::Thinking {
                         id,
                         causal_item_id: None,
@@ -4724,25 +4587,26 @@ impl App {
                         complete: false,
                         expanded: false,
                     });
-                    self.current_turn_thinking_count =
-                        self.current_turn_thinking_count.saturating_add(1);
-                    self.msg_version = self.msg_version.wrapping_add(1);
+                    self.execution.current_turn_thinking_count =
+                        self.execution.current_turn_thinking_count.saturating_add(1);
+                    self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
                 } else {
-                    self.lines_dirty = true;
+                    self.timeline.lines_dirty = true;
                 }
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
             }
 
             CowdEvent::ToolStart { id, name, preview } => {
                 let id = self.current_tool_instance_key(&id);
                 if self
+                    .timeline
                     .tool_timeline_positions
                     .get(&id)
                     .copied()
                     .and_then(|position| self.logical_timeline_index(position))
                     .is_some()
                 {
-                    return;
+                    return Ok(());
                 }
                 self.timeline_push(TimelineEntry::ToolCall {
                     id,
@@ -4754,9 +4618,10 @@ impl App {
                     exit_code: None,
                     causality: None,
                 });
-                self.current_turn_tool_count = self.current_turn_tool_count.saturating_add(1);
-                self.timeline_cursor = self.timeline_len().saturating_sub(1);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.execution.current_turn_tool_count =
+                    self.execution.current_turn_tool_count.saturating_add(1);
+                self.timeline.timeline_cursor = self.timeline_len().saturating_sub(1);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::ToolProgress {
@@ -4766,6 +4631,7 @@ impl App {
             } => {
                 let id = self.current_tool_instance_key(&id);
                 let tool_index = self
+                    .timeline
                     .tool_timeline_positions
                     .get(&id)
                     .copied()
@@ -4784,7 +4650,7 @@ impl App {
                         }
                         output.drain(..keep_from);
                     }
-                    self.lines_dirty = true;
+                    self.timeline.lines_dirty = true;
                 }
             }
 
@@ -4796,6 +4662,7 @@ impl App {
             } => {
                 let id = self.current_tool_instance_key(&id);
                 let tool_index = self
+                    .timeline
                     .tool_timeline_positions
                     .get(&id)
                     .copied()
@@ -4816,7 +4683,7 @@ impl App {
                     *expanded = false;
                     *ec = exit_code;
                 }
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::TokenUsage {
@@ -4825,12 +4692,14 @@ impl App {
                 cache_create,
                 cache_read,
             } => {
-                self.input_tokens = input;
-                self.output_tokens = output;
-                self.token_count = input + output + cache_create + cache_read;
-                self.turn_input_tokens = input.saturating_sub(self.pre_turn_input);
-                self.turn_output_tokens = output.saturating_sub(self.pre_turn_output);
-                self.turn_usage_known = true;
+                self.history.input_tokens = input;
+                self.history.output_tokens = output;
+                self.shell.token_count = input + output + cache_create + cache_read;
+                self.execution.turn_input_tokens =
+                    input.saturating_sub(self.execution.pre_turn_input);
+                self.execution.turn_output_tokens =
+                    output.saturating_sub(self.execution.pre_turn_output);
+                self.execution.turn_usage_known = true;
             }
             CowdEvent::RunModelTelemetry { telemetry } => {
                 if let Some(model) = telemetry
@@ -4838,34 +4707,42 @@ impl App {
                     .as_ref()
                     .filter(|model| !model.trim().is_empty())
                 {
-                    self.effective_model = Some(model.clone());
-                    self.model = model.clone();
-                    self.model_source = Some("runtime.run_model_telemetry".to_string());
+                    self.shell.effective_model = Some(model.clone());
+                    self.shell.model = model.clone();
+                    self.shell.model_source = Some("runtime.run_model_telemetry".to_string());
                 }
-                self.input_tokens = telemetry.input_tokens;
-                self.output_tokens = telemetry.output_tokens;
-                self.token_count = telemetry.total_tokens;
-                self.turn_input_tokens = telemetry.input_tokens;
-                self.turn_output_tokens = telemetry.output_tokens;
-                self.turn_usage_known = !matches!(
+                self.history.input_tokens = telemetry.input_tokens;
+                self.history.output_tokens = telemetry.output_tokens;
+                self.shell.token_count = telemetry.total_tokens;
+                self.execution.turn_input_tokens = telemetry.input_tokens;
+                self.execution.turn_output_tokens = telemetry.output_tokens;
+                self.execution.turn_usage_known = !matches!(
                     telemetry.usage_source.as_str(),
                     "" | "unknown" | "pending" | "runtime_request_budget_estimate"
                 );
                 let metrics = self
+                    .execution
                     .current_run_metrics
                     .get_or_insert_with(Default::default);
                 metrics.input_tokens = telemetry.input_tokens;
                 metrics.output_tokens = telemetry.output_tokens;
                 metrics.total_tokens = telemetry.total_tokens;
-                self.latest_model_telemetry = Some(telemetry);
+                self.execution.latest_model_telemetry = Some(telemetry);
                 self.refresh_model_mismatch_telemetry();
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
+            event => return Err(event),
+        }
+        Ok(())
+    }
+
+    fn apply_shell_projection_event(&mut self, event: CowdEvent) -> Result<(), CowdEvent> {
+        match event {
             CowdEvent::ContextWindow(ctx) => {
-                self.context_window = ctx;
-                self.context_window_tokens = Some(ctx);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.execution.context_window = ctx;
+                self.execution.context_window_tokens = Some(ctx);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
             CowdEvent::ProviderAttempt {
                 model,
@@ -4874,67 +4751,69 @@ impl App {
                 packed_input_tokens,
                 ..
             } => {
-                self.effective_model = Some(model);
-                self.model_source = Some("runtime.provider_attempt.model".to_string());
+                self.shell.effective_model = Some(model);
+                self.shell.model_source = Some("runtime.provider_attempt.model".to_string());
                 // ProviderAttempt is a pre-request estimate delivered on a
                 // separate event stream. It may arrive after the canonical
                 // terminal projection, so it must never replace observed
                 // provider usage for the same turn. TurnStarted resets these
                 // fields before the next request can install a new estimate.
-                if self.context_usage_source.as_deref() != Some("provider_actual") {
-                    self.context_used_tokens = Some(packed_input_tokens);
-                    self.context_window_tokens = Some(context_window_tokens);
-                    self.context_remaining_tokens =
+                if self.execution.context_usage_source.as_deref() != Some("provider_actual") {
+                    self.execution.context_used_tokens = Some(packed_input_tokens);
+                    self.execution.context_window_tokens = Some(context_window_tokens);
+                    self.execution.context_remaining_tokens =
                         Some(context_window_tokens.saturating_sub(packed_input_tokens));
-                    self.context_usage_percent_bp = (context_window_tokens > 0).then(|| {
-                        packed_input_tokens
-                            .saturating_mul(10_000)
-                            .saturating_div(context_window_tokens)
-                            .min(10_000) as u16
-                    });
-                    self.context_usage_source = Some(format!(
+                    self.execution.context_usage_percent_bp =
+                        (context_window_tokens > 0).then(|| {
+                            packed_input_tokens
+                                .saturating_mul(10_000)
+                                .saturating_div(context_window_tokens)
+                                .min(10_000) as u16
+                        });
+                    self.execution.context_usage_source = Some(format!(
                         "runtime.provider_attempt.request_budget:{context_window_source}"
                     ));
-                    self.context_window = context_window_tokens;
+                    self.execution.context_window = context_window_tokens;
                 }
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
             CowdEvent::ContextEnvelope { envelope } => {
-                self.latest_context_envelope = Some(envelope);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.execution.latest_context_envelope = Some(envelope);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
             CowdEvent::RuntimePolicyDecision { summary } => {
-                self.latest_runtime_policy = Some(summary);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.execution.latest_runtime_policy = Some(summary);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
             CowdEvent::ExecutionGraphSummary { summary } => {
-                self.latest_execution_graph_summary = Some(summary);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.execution.latest_execution_graph_summary = Some(summary);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::TurnStarted => {
-                self.turn_interaction.submit_started();
+                self.execution.turn_interaction.submit_started();
                 self.reset_live_execution_facts();
-                self.streaming_received = false;
-                self.latest_context_envelope = None;
-                self.latest_runtime_policy = None;
-                self.latest_execution_graph_summary = None;
-                self.latest_execution_projection = None;
-                self.thinking_id_counter = 0;
-                self.pre_turn_input = self.input_tokens;
-                self.pre_turn_output = self.output_tokens;
-                self.turn_input_tokens = 0;
-                self.turn_output_tokens = 0;
-                self.turn_usage_known = false;
-                self.current_turn_tool_count = 0;
-                self.current_turn_thinking_count = 0;
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.execution.streaming_received = false;
+                self.execution.latest_context_envelope = None;
+                self.execution.latest_runtime_policy = None;
+                self.execution.latest_execution_graph_summary = None;
+                self.execution.latest_execution_projection = None;
+                self.timeline.thinking_id_counter = 0;
+                self.execution.pre_turn_input = self.history.input_tokens;
+                self.execution.pre_turn_output = self.history.output_tokens;
+                self.execution.turn_input_tokens = 0;
+                self.execution.turn_output_tokens = 0;
+                self.execution.turn_usage_known = false;
+                self.execution.current_turn_tool_count = 0;
+                self.execution.current_turn_thinking_count = 0;
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::ResourcesCommitted { ids } => {
-                self.pending_resources
+                self.workbench
+                    .pending_resources
                     .retain(|resource| !ids.contains(&resource.id));
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::SessionInputProjection { projection } => {
@@ -4945,11 +4824,12 @@ impl App {
             }
             CowdEvent::ResourceUploaded { id, label, kind } => {
                 if !self
+                    .workbench
                     .pending_resources
                     .iter()
                     .any(|resource| resource.id == id)
                 {
-                    self.pending_resources.push(PendingResource {
+                    self.workbench.pending_resources.push(PendingResource {
                         id: id.clone(),
                         label: label.clone(),
                         kind: kind.clone(),
@@ -4972,7 +4852,7 @@ impl App {
             }
 
             CowdEvent::CompactionNotice { removed_count } => {
-                self.compaction_count += 1;
+                self.shell.compaction_count += 1;
                 self.add_system_notice(
                     SystemNoticeKind::Info,
                     &format!("Compacted {removed_count} earlier messages to save context."),
@@ -4980,11 +4860,11 @@ impl App {
             }
 
             CowdEvent::MemoryEntry { .. } => {
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::MemoryUpdate { .. } => {
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::MemoryStats {
@@ -4992,37 +4872,39 @@ impl App {
                 vector_count,
                 layers,
             } => {
-                self.memory_total_entries = Some(total_entries);
-                self.memory_vector_count = Some(vector_count);
-                self.memory_layer_counts = memory_layer_counts_from_strings(&layers);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.workbench.memory_total_entries = Some(total_entries);
+                self.workbench.memory_vector_count = Some(vector_count);
+                self.workbench.memory_layer_counts = memory_layer_counts_from_strings(&layers);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::SessionList { sessions } => {
-                self.sessions = sessions;
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.shell.sessions = sessions;
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::SessionCreated { id, name } => {
-                self.sessions.push((id, name, App::format_timestamp()));
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.shell
+                    .sessions
+                    .push((id, name, App::format_timestamp()));
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::SessionDeleted { id } => {
-                self.sessions.retain(|(sid, _, _)| sid != &id);
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.shell.sessions.retain(|(sid, _, _)| sid != &id);
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
             CowdEvent::SessionSwitched { id: _, name } => {
-                self.active_session_name = name;
-                self.msg_version = self.msg_version.wrapping_add(1);
+                self.shell.active_session_name = name;
+                self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
             CowdEvent::Warning { message } => {
                 self.show_notification(&message);
             }
-            // New CowdEvent variants not yet consumed by TUI
-            _ => {}
+            event => return Err(event),
         }
+        Ok(())
     }
 }
 
@@ -5066,2426 +4948,5 @@ pub trait ToolRegistry: Send + Sync {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_msg(content: &str) -> TimelineEntry {
-        TimelineEntry::Message {
-            role: "user".into(),
-            content: content.into(),
-            timestamp: "12:00".into(),
-            identity: None,
-        }
-    }
-
-    #[test]
-    fn timeline_no_trim_at_3000() {
-        let mut app = App::new("test", "sess");
-        for i in 0..3500 {
-            app.add_message("user", &format!("msg {i}"));
-        }
-        assert_eq!(app.timeline_len(), 3500);
-        let first = app.timeline_get(0).unwrap();
-        assert!(first.full_text().contains("msg 0"));
-        let last = app.timeline_get(3499).unwrap();
-        assert!(last.full_text().contains("msg 3499"));
-    }
-
-    #[test]
-    fn scroll_up_loads_page() {
-        let mut app = App::new("test", "sess");
-        for i in 0..600 {
-            app.add_message("user", &format!("msg {i}"));
-        }
-        assert_eq!(app.timeline_len(), 600);
-        assert_eq!(app.timeline_pages.len(), 2);
-        let at_500 = app.timeline_get(500).unwrap();
-        assert!(at_500.full_text().contains("msg 500"));
-        let at_0 = app.timeline_get(0).unwrap();
-        assert!(at_0.full_text().contains("msg 0"));
-    }
-
-    #[test]
-    fn context_envelope_event_updates_app_state() {
-        let envelope = crate::test_utils::context_envelope_fixture();
-        let expected_id = envelope
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap()
-            .to_string();
-        let mut app = App::new("test", "sess");
-
-        app.apply_event(CowdEvent::ContextEnvelope { envelope });
-
-        assert_eq!(
-            app.latest_context_envelope
-                .as_ref()
-                .and_then(|env| env.get("id"))
-                .and_then(serde_json::Value::as_str),
-            Some(expected_id.as_str())
-        );
-    }
-
-    #[test]
-    fn turn_started_clears_previous_turn_runtime_evidence() {
-        let mut app = App::new("test", "sess");
-        app.latest_context_envelope = Some(serde_json::json!({"selected": [{"id": "old"}]}));
-        app.latest_runtime_policy = Some(crate::RuntimePolicyDecisionSummary {
-            level: "complex".into(),
-            score: 80,
-            recommended_profile: "deep".into(),
-            agent_mode: "team".into(),
-            requires_review: true,
-            signal_count: 3,
-        });
-        app.latest_execution_graph_summary = Some(crate::RuntimeExecutionGraphSummary {
-            graph_id: Some("g".into()),
-            board_id: Some("b".into()),
-            status: "done".into(),
-            agent_tasks: 1,
-            child_executions: 0,
-            memory_candidates: 2,
-            conflicts: 0,
-            completion_rate: Some(1.0),
-            synthesis_lift: None,
-            complementarity_score: None,
-        });
-        app.current_execution_status =
-            Some(harness_contract::projection::ExecutionLiveStatus::Complete);
-        app.effective_model = Some("old-effective-model".to_string());
-        app.context_used_tokens = Some(8_000);
-        app.context_window_tokens = Some(128_000);
-        app.current_run_metrics = Some(Default::default());
-
-        app.apply_event(CowdEvent::TurnStarted);
-
-        assert!(app.latest_context_envelope.is_none());
-        assert!(app.latest_runtime_policy.is_none());
-        assert!(app.latest_execution_graph_summary.is_none());
-        assert!(app.current_execution_status.is_none());
-        assert!(app.effective_model.is_none());
-        assert!(app.context_used_tokens.is_none());
-        assert!(app.context_window_tokens.is_none());
-        assert!(app.current_run_metrics.is_none());
-        assert!(app.turn_is_active());
-    }
-
-    #[test]
-    fn app_applies_gateway_session_stats() {
-        let mut app = App::new("test", "sess");
-        app.apply_session_stats(serde_json::json!({
-            "session_id": "sess",
-            "tokens": {
-                "input": 500,
-                "output": 12,
-                "total": 512
-            }
-        }));
-
-        assert_eq!(app.token_count, 512);
-        assert_eq!(app.authoritative_session_input_tokens, Some(500));
-        assert_eq!(app.authoritative_session_output_tokens, Some(12));
-    }
-
-    #[test]
-    fn session_stats_own_full_session_tokens_separately_from_the_visible_window() {
-        let mut app = App::new("test", "sess");
-        app.apply_session_stats(serde_json::json!({
-            "session_id": "sess",
-            "tokens": {
-                "input": 45_000,
-                "output": 5_000,
-                "total": 50_000
-            }
-        }));
-        app.record_durable_message_usage(
-            "visible-message",
-            &serde_json::json!({"input_tokens": 40, "output_tokens": 5}),
-        );
-
-        assert_eq!(app.authoritative_session_input_tokens, Some(45_000));
-        assert_eq!(app.authoritative_session_output_tokens, Some(5_000));
-        assert_eq!(app.durable_session_input_tokens, 40);
-        assert_eq!(app.durable_session_output_tokens, 5);
-    }
-
-    #[test]
-    fn execution_projection_owner_rejects_lower_revision_for_same_execution() {
-        use harness_contract::execution_graph::ExecutionGraph;
-        use harness_contract::projection::{ExecutionProjection, ProjectionCommandAvailability};
-
-        let projection = |revision: u64, objective: &str| ExecutionProjection {
-            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
-            execution_id: "execution-monotonic".to_string(),
-            revision,
-            cursor: revision,
-            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
-            authorization_revision: 1,
-            redaction_revision: "redaction-1".to_string(),
-            session_id: Some("session-monotonic".to_string()),
-            mission_id: None,
-            task_id: None,
-            turn_id: None,
-            strategy: None,
-            graph: harness_contract::execution_graph::project_execution_graph(
-                &ExecutionGraph::new(objective),
-            ),
-            child_executions: Vec::new(),
-            activities: Vec::new(),
-            activity_relations: Vec::new(),
-            goals: Vec::new(),
-            agents: Vec::new(),
-            teams: Vec::new(),
-            relations: Vec::new(),
-            approvals: Vec::new(),
-            admissions: Vec::new(),
-            outcomes: Vec::new(),
-            interventions: Vec::new(),
-            usage: Vec::new(),
-            context: Vec::new(),
-            evidence: Vec::new(),
-            health: Vec::new(),
-            recovery: Vec::new(),
-            live: None,
-            delivery_envelope: None,
-            terminal_presentation: None,
-            cancellation_receipt: None,
-            available_commands: Vec::<ProjectionCommandAvailability>::new(),
-        };
-
-        let mut app = App::new("test", "session-monotonic");
-        assert!(app.apply_execution_projection(projection(5, "revision five")));
-        let graph_summary_id = app
-            .latest_execution_graph_summary
-            .as_ref()
-            .and_then(|summary| summary.graph_id.clone());
-        assert!(!app.apply_execution_projection(projection(4, "stale revision four")));
-
-        assert_eq!(
-            app.latest_execution_projection
-                .as_ref()
-                .map(|current| current.revision),
-            Some(5)
-        );
-        assert_eq!(
-            app.latest_execution_graph_summary
-                .as_ref()
-                .and_then(|summary| summary.graph_id.clone()),
-            graph_summary_id
-        );
-        assert!(app
-            .latest_execution_projection
-            .as_ref()
-            .is_some_and(|current| current.graph.objective == "revision five"));
-    }
-
-    #[test]
-    fn execution_projection_without_live_facts_cannot_reuse_previous_execution_values() {
-        use harness_contract::execution_graph::ExecutionGraph;
-        use harness_contract::projection::{ExecutionProjection, ProjectionCommandAvailability};
-
-        let mut app = App::new("requested-model", "session-live-missing");
-        app.current_execution_status =
-            Some(harness_contract::projection::ExecutionLiveStatus::Complete);
-        app.current_execution_id = Some("execution-old".to_string());
-        app.current_turn_id = Some("turn-old".to_string());
-        app.effective_model = Some("old-effective-model".to_string());
-        app.context_used_tokens = Some(64_000);
-        app.context_window_tokens = Some(128_000);
-        app.context_remaining_tokens = Some(64_000);
-        app.context_usage_percent_bp = Some(5_000);
-        app.current_run_metrics = Some(Default::default());
-        app.input_tokens = 64_000;
-        app.output_tokens = 2_000;
-        app.token_count = 66_000;
-
-        assert!(app.apply_execution_projection(ExecutionProjection {
-            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
-            execution_id: "execution-new".to_string(),
-            revision: 1,
-            cursor: 1,
-            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
-            authorization_revision: 1,
-            redaction_revision: "redaction-1".to_string(),
-            session_id: Some("session-live-missing".to_string()),
-            mission_id: None,
-            task_id: None,
-            turn_id: None,
-            strategy: None,
-            graph: harness_contract::execution_graph::project_execution_graph(
-                &ExecutionGraph::new("new execution"),
-            ),
-            child_executions: Vec::new(),
-            activities: Vec::new(),
-            activity_relations: Vec::new(),
-            goals: Vec::new(),
-            agents: Vec::new(),
-            teams: Vec::new(),
-            relations: Vec::new(),
-            approvals: Vec::new(),
-            admissions: Vec::new(),
-            outcomes: Vec::new(),
-            interventions: Vec::new(),
-            usage: Vec::new(),
-            context: Vec::new(),
-            evidence: Vec::new(),
-            health: Vec::new(),
-            recovery: Vec::new(),
-            live: None,
-            delivery_envelope: None,
-            terminal_presentation: None,
-            cancellation_receipt: None,
-            available_commands: Vec::<ProjectionCommandAvailability>::new(),
-        }));
-
-        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
-        assert!(app.current_execution_status.is_none());
-        assert!(app.current_turn_id.is_none());
-        assert!(app.effective_model.is_none());
-        assert!(app.context_used_tokens.is_none());
-        assert!(app.context_window_tokens.is_none());
-        assert!(app.current_run_metrics.is_none());
-        assert_eq!(app.token_count, 0);
-    }
-
-    #[test]
-    fn delayed_provider_attempt_cannot_replace_observed_projection_context_usage() {
-        use harness_contract::projection::{
-            ContextUsageProjection, ExecutionLiveState, ExecutionLiveStatus,
-        };
-
-        let mut app = App::new("requested-model", "session-context-authority");
-        app.install_execution_live_facts(
-            "execution-context-authority",
-            &ExecutionLiveState {
-                revision: 8,
-                status: ExecutionLiveStatus::Complete,
-                status_detail: None,
-                turn_id: Some("turn-context-authority".to_string()),
-                started_at_ms: 1,
-                updated_at_ms: 2,
-                last_progress_at_ms: 2,
-                context_usage: Some(ContextUsageProjection {
-                    model: Some("observed-model".to_string()),
-                    window_tokens: Some(16_384),
-                    window_source: Some("configured".to_string()),
-                    input_tokens: Some(188),
-                    input_source: Some("provider_actual".to_string()),
-                    remaining_tokens: Some(16_196),
-                    usage_percent_bp: Some(114),
-                    request_sequence: Some(5),
-                    components: Vec::new(),
-                }),
-                metrics: harness_contract::projection::RunMetricsProjection {
-                    input_tokens: 188,
-                    output_tokens: 19,
-                    total_tokens: 207,
-                    ..Default::default()
-                },
-                latency: Default::default(),
-                output_preview: None,
-                output_preview_start_bytes: 0,
-                output_bytes: 0,
-                output_parts: Vec::new(),
-                terminal_ref: Some("terminal-context-authority".to_string()),
-                error: None,
-            },
-            None,
-        );
-
-        app.apply_event(CowdEvent::ProviderAttempt {
-            model: "observed-model".to_string(),
-            models_tried: vec!["observed-model".to_string()],
-            context_window_tokens: 16_384,
-            context_window_source: "configured".to_string(),
-            packed_input_tokens: 5_536,
-        });
-
-        assert_eq!(app.context_used_tokens, Some(188));
-        assert_eq!(app.context_remaining_tokens, Some(16_196));
-        assert_eq!(app.context_usage_percent_bp, Some(114));
-        assert_eq!(app.context_usage_source.as_deref(), Some("provider_actual"));
-        assert_eq!(app.current_run_metrics.as_ref().unwrap().total_tokens, 207);
-    }
-
-    #[test]
-    fn invalidating_selected_execution_clears_identity_without_materialized_projection() {
-        let mut app = App::new("requested-model", "session-selection");
-        app.current_execution_id = Some("execution-old".to_string());
-        app.current_turn_id = Some("turn-old".to_string());
-        app.current_execution_status =
-            Some(harness_contract::projection::ExecutionLiveStatus::Finalizing);
-        app.effective_model = Some("stale-model".to_string());
-        assert!(app.latest_execution_projection.is_none());
-
-        assert!(app.invalidate_execution_projection("execution-old"));
-        assert!(app.current_execution_id.is_none());
-        assert!(app.current_turn_id.is_none());
-        assert!(app.current_execution_status.is_none());
-        assert!(app.effective_model.is_none());
-    }
-
-    #[test]
-    fn page_boundary_seamless() {
-        let mut app = App::new("test", "sess");
-        for i in 0..PAGE_SIZE {
-            app.add_message("user", &format!("msg {i}"));
-        }
-        assert_eq!(app.timeline_len(), PAGE_SIZE);
-        assert_eq!(app.timeline_pages.len(), 1);
-
-        app.add_message("user", "overflow");
-        assert_eq!(app.timeline_len(), PAGE_SIZE + 1);
-        assert_eq!(app.timeline_pages.len(), 2);
-
-        assert!(app.timeline_get(0).unwrap().full_text().contains("msg 0"));
-        assert!(app
-            .timeline_get(PAGE_SIZE - 1)
-            .unwrap()
-            .full_text()
-            .contains(&format!("msg {}", PAGE_SIZE - 1)));
-        assert!(app
-            .timeline_get(PAGE_SIZE)
-            .unwrap()
-            .full_text()
-            .contains("overflow"));
-
-        let count = app.timeline_iter().count();
-        assert_eq!(count, PAGE_SIZE + 1);
-    }
-
-    #[test]
-    fn memory_soft_cap() {
-        let mut app = App::new("test", "sess");
-        for i in 0..(SOFT_CAP + 500) {
-            app.add_message("user", &format!("msg {i}"));
-        }
-        assert!(app.timeline_len() <= SOFT_CAP);
-        let first_entry = app.timeline_get(0).unwrap();
-        assert!(!first_entry.full_text().contains("msg 0"));
-    }
-
-    #[test]
-    fn empty_timeline_handled() {
-        let app = App::new("test", "sess");
-        assert!(app.timeline_is_empty());
-        assert_eq!(app.timeline_len(), 0);
-        assert!(app.timeline_get(0).is_none());
-        assert_eq!(app.timeline_iter().count(), 0);
-    }
-
-    #[test]
-    fn unresolved_startup_model_is_not_claimed_as_requested_model() {
-        let app = App::new("unresolved", "sess");
-        assert_eq!(app.model, "unresolved");
-        assert_eq!(app.requested_model, None);
-        assert_eq!(app.effective_model, None);
-    }
-
-    #[test]
-    fn oversized_durable_history_exposes_the_visible_window_limit() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: Vec::new(),
-                total: SOFT_CAP + 1,
-                offset: 0,
-                from_seq: Some(0),
-                next_seq: None,
-                limit: PAGE_SIZE,
-                has_more: false,
-            },
-        });
-
-        assert!(app.history_window_truncated);
-        assert!(app.system_notices.iter().any(|notice| {
-            notice.kind == SystemNoticeKind::Warning
-                && notice.content.contains("Compact or checkpoint")
-                && notice.content.contains(&SOFT_CAP.to_string())
-        }));
-        assert!(app
-            .notification
-            .as_deref()
-            .is_some_and(|notice| notice.contains("Durable history")));
-    }
-
-    #[test]
-    fn body_free_history_index_drives_session_coverage_without_materializing_messages() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::SessionHistoryIndexLoaded {
-            projection: crate::protocol::SessionHistoryIndexProjection {
-                schema_version: 1,
-                session_id: "sess".to_string(),
-                projection_generation: 9,
-                durable_cursor: 42,
-                event_cursor: 41,
-                history_revision: 7,
-                total_messages: 100_000,
-                total_bytes: 8_000_000,
-                latest_checkpoint_sequence: Some(90_000),
-                latest_checkpoint_event_id: Some("checkpoint-1".to_string()),
-                index_generation: 4,
-                indexed_through_sequence: Some(99_999),
-                index_card_count: 250,
-                index_complete: true,
-                recovery_state: crate::protocol::SessionHistoryRecoveryState::Ready,
-                recent_metadata: Vec::new(),
-                cards: Vec::new(),
-            },
-        });
-
-        assert_eq!(app.history_total_messages, 100_000);
-        assert!(app.history_has_older);
-        assert_eq!(
-            app.session_history_index
-                .as_ref()
-                .map(|index| (index.projection_generation, index.durable_cursor)),
-            Some((9, 42))
-        );
-        assert!(app.timeline_is_empty());
-    }
-
-    #[test]
-    fn session_input_projection_is_a_bounded_runtime_owned_queue_view() {
-        let mut app = App::new("test", "sess");
-        app.apply_session_input_projection(serde_json::json!({
-            "inputs": [
-                {
-                    "input_id": "queued-a",
-                    "status": "queued_next",
-                    "decision": "enqueue_next_step",
-                    "content_preview": "follow up with tests"
-                },
-                {
-                    "input_id": "done-b",
-                    "status": "consumed",
-                    "decision": "start_new_turn",
-                    "content_preview": "already consumed"
-                }
-            ]
-        }));
-
-        assert_eq!(app.queued_follow_up_count(), 1);
-        let preview = app.queued_follow_up_preview().expect("queued preview");
-        assert_eq!(preview.input_id, "queued-a");
-        assert_eq!(preview.content_preview, "follow up with tests");
-        assert!(app.system_notices.iter().any(|notice| {
-            notice.content.contains("/queue edit queued-a")
-                && notice.content.contains("/queue cancel queued-a")
-        }));
-        assert!(app
-            .pending_inputs
-            .iter()
-            .all(|input| input.input_id != "done-b"));
-
-        app.apply_session_input_projection(serde_json::json!({
-            "pending_count": 0,
-            "inputs": [
-                {
-                    "input_id": "queued-a",
-                    "status": "consumed",
-                    "decision": "start_new_turn",
-                    "content_preview": "follow up with tests"
-                }
-            ]
-        }));
-        assert_eq!(
-            app.queued_follow_up_count(),
-            0,
-            "a consumed canonical projection must clear the composer queue"
-        );
-        assert!(app.queued_follow_up_preview().is_none());
-    }
-
-    #[test]
-    fn incremental_history_hydration_preserves_and_advances_the_existing_window() {
-        use crate::protocol::SessionHistoryHydrationKind;
-
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::SessionHistoryHydrated {
-            session_id: "sess".to_string(),
-            kind: SessionHistoryHydrationKind::InitialWindow,
-            duration_ms: 4,
-            message_count: 26,
-            page_count: 1,
-            oldest_offset: 0,
-            total_messages: 26,
-            next_sequence: 26,
-            has_older: false,
-        });
-        app.apply_event(CowdEvent::SessionHistoryHydrated {
-            session_id: "sess".to_string(),
-            kind: SessionHistoryHydrationKind::IncrementalCatchup,
-            duration_ms: 2,
-            message_count: 2,
-            page_count: 1,
-            oldest_offset: 0,
-            total_messages: 28,
-            next_sequence: 28,
-            has_older: false,
-        });
-
-        assert_eq!(app.history_oldest_offset, 0);
-        assert_eq!(app.history_window_end_offset, 28);
-        assert_eq!(app.history_total_messages, 28);
-        assert!(!app.history_has_older);
-
-        app.history_oldest_offset = 5;
-        app.history_window_end_offset = 15;
-        app.history_total_messages = 28;
-        app.apply_event(CowdEvent::SessionHistoryHydrated {
-            session_id: "sess".to_string(),
-            kind: SessionHistoryHydrationKind::IncrementalCatchup,
-            duration_ms: 1,
-            message_count: 2,
-            page_count: 1,
-            oldest_offset: 0,
-            total_messages: 30,
-            next_sequence: 30,
-            has_older: false,
-        });
-
-        assert_eq!(
-            (app.history_oldest_offset, app.history_window_end_offset),
-            (5, 15),
-            "catch-up while browsing a middle window must not invent a new pagination offset"
-        );
-        assert_eq!(app.history_total_messages, 30);
-
-        app.history_oldest_offset = 10;
-        app.history_window_end_offset = SOFT_CAP + 10;
-        app.history_total_messages = SOFT_CAP + 10;
-        app.history_has_older = true;
-        app.apply_event(CowdEvent::SessionHistoryHydrated {
-            session_id: "sess".to_string(),
-            kind: SessionHistoryHydrationKind::IncrementalCatchup,
-            duration_ms: 1,
-            message_count: 2,
-            page_count: 1,
-            oldest_offset: 0,
-            total_messages: SOFT_CAP + 12,
-            next_sequence: SOFT_CAP + 12,
-            has_older: false,
-        });
-
-        assert_eq!(app.history_oldest_offset, 12);
-        assert_eq!(app.history_window_end_offset, SOFT_CAP + 12);
-        assert!(app.history_has_older);
-    }
-
-    #[test]
-    fn fifty_thousand_message_catchup_does_not_contaminate_a_middle_history_window() {
-        let page = crate::protocol::SessionMessagesPage {
-            session_id: "sess".to_string(),
-            messages: vec![crate::protocol::SessionMessageProjection {
-                id: "new-message-50000".to_string(),
-                session_id: "sess".to_string(),
-                sequence: 50_000,
-                role: "assistant".to_string(),
-                blocks: vec![serde_json::json!({
-                    "type": "text",
-                    "text": "new tail answer"
-                })],
-                created_at_ms: 50_000,
-                token_usage: None,
-                tool_use_id: None,
-                tool_name: None,
-            }],
-            total: 50_001,
-            offset: 50_000,
-            from_seq: Some(50_000),
-            next_seq: Some(50_001),
-            limit: 500,
-            has_more: false,
-        };
-        let mut app = App::new("test", "sess");
-        app.history_oldest_offset = 24_000;
-        app.history_window_end_offset = 25_000;
-        app.history_total_messages = 50_000;
-
-        app.apply_event(CowdEvent::SessionHistoryCatchupPage { page: page.clone() });
-        app.apply_event(CowdEvent::SessionHistoryHydrated {
-            session_id: "sess".to_string(),
-            kind: crate::protocol::SessionHistoryHydrationKind::IncrementalCatchup,
-            duration_ms: 1,
-            message_count: 1,
-            page_count: 1,
-            oldest_offset: 50_000,
-            total_messages: 50_001,
-            next_sequence: 50_001,
-            has_older: true,
-        });
-
-        assert!(
-            app.timeline_iter()
-                .all(|(_, entry)| !entry.full_text().contains("new tail answer")),
-            "a reconnect catch-up must not splice the newest message into a browsed middle window"
-        );
-        assert_eq!(app.history_oldest_offset, 24_000);
-        assert_eq!(app.history_window_end_offset, 25_000);
-        assert_eq!(app.history_total_messages, 50_001);
-
-        app.history_oldest_offset = 49_000;
-        app.history_window_end_offset = 50_000;
-        app.history_total_messages = 50_000;
-        app.apply_event(CowdEvent::SessionHistoryCatchupPage { page });
-        assert!(app
-            .timeline_iter()
-            .any(|(_, entry)| entry.full_text().contains("new tail answer")));
-    }
-
-    #[test]
-    fn terminal_without_complete_causal_identity_is_visible_and_fail_closed() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: correlation("execution-live", "turn-live"),
-                text: "partial".to_string(),
-                start_bytes: 0,
-                end_bytes: 7,
-                stream_revision: 7,
-            },
-        });
-        let mut incomplete = correlation("execution-live", "turn-live");
-        incomplete.message_id = Some("assistant-live".to_string());
-        incomplete.terminal_id = None;
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
-                correlation: incomplete,
-                assistant_text: "must not commit".to_string(),
-                sequence: Some(1),
-                iterations: 1,
-                token_usage: None,
-            },
-        });
-
-        assert_eq!(app.telemetry.orphan_event_count, 1);
-        assert!(app
-            .notification
-            .as_deref()
-            .is_some_and(|value| value.contains("Rejected terminal")));
-        assert!(app
-            .timeline_iter()
-            .all(|(_, entry)| !entry.full_text().contains("must not commit")));
-    }
-
-    #[test]
-    fn e10_history_failure_is_visible_without_polluting_the_transcript() {
-        let mut app = App::new("test", "sess");
-        app.add_message("assistant", "durable answer");
-        let timeline_before = app.timeline_clone_vec();
-
-        app.apply_event(CowdEvent::SessionHistoryHydrationFailed {
-            session_id: "sess".to_string(),
-            error: "HTTP 500 malformed stored message".to_string(),
-        });
-
-        assert!(!app.history_hydrated);
-        assert_eq!(
-            app.history_hydration_error.as_deref(),
-            Some("HTTP 500 malformed stored message")
-        );
-        assert_eq!(app.timeline_clone_vec(), timeline_before);
-        assert!(app.system_notices.iter().any(|notice| {
-            notice.kind == SystemNoticeKind::Error
-                && notice.content.contains("Session history unavailable")
-                && notice.content.contains("malformed stored message")
-        }));
-    }
-
-    #[test]
-    fn e10_closed_session_admission_restores_the_draft_without_ghost_messages() {
-        let mut app = App::new("test", "sess");
-        let message_id = "tui:e10-message".to_string();
-        app.begin_message_admission("must remain editable", message_id.clone(), 11, true);
-        assert!(app
-            .timeline_iter()
-            .any(|(_, entry)| entry.full_text().contains("must remain editable")));
-
-        app.apply_event(CowdEvent::MessageAdmissionFailed {
-            session_id: "sess".to_string(),
-            client_message_id: message_id,
-            submission_generation: 11,
-            original_text: "must remain editable".to_string(),
-            started_new_turn: true,
-            error: "session is closed".to_string(),
-        });
-
-        assert_eq!(app.input.text(), "must remain editable");
-        assert!(app.pending_message_admissions.is_empty());
-        assert!(app
-            .timeline_iter()
-            .all(|(_, entry)| !entry.full_text().contains("must remain editable")));
-        assert!(app.system_notices.iter().any(|notice| {
-            notice.kind == SystemNoticeKind::Error
-                && notice.content.contains("draft was restored")
-                && notice.content.contains("session is closed")
-        }));
-    }
-
-    #[test]
-    fn e10_session_authorization_revocation_clears_all_session_derived_state() {
-        let mut app = App::new("private-model", "sess");
-        app.add_message("assistant", "private transcript");
-        app.input.set_text("private draft");
-        app.effective_model = Some("private-effective-model".to_string());
-        app.latest_context_envelope = Some(serde_json::json!({"secret": true}));
-
-        app.apply_event(CowdEvent::SessionAuthorizationRevoked {
-            session_id: "sess".to_string(),
-            reason: "credential epoch changed".to_string(),
-        });
-
-        assert!(app.timeline_is_empty());
-        assert!(app.input.text().is_empty());
-        assert!(app.effective_model.is_none());
-        assert!(app.latest_context_envelope.is_none());
-        assert_eq!(app.model, "unavailable");
-        assert!(app.system_notices.iter().any(|notice| {
-            notice.kind == SystemNoticeKind::Error
-                && notice.content.contains("Session authorization revoked")
-        }));
-    }
-
-    #[test]
-    fn execution_policy_is_unavailable_until_gateway_truth_is_loaded() {
-        let app = App::new("test", "sess");
-
-        assert_eq!(app.execution_policy_preset, "unavailable");
-    }
-
-    #[test]
-    fn session_activity_stats_cover_current_conversation() {
-        let mut app = App::new("test", "sess");
-        app.add_message("user", "hi");
-        app.add_message("system", "memory update");
-        app.timeline_push(TimelineEntry::Thinking {
-            id: 1,
-            causal_item_id: None,
-            causality: None,
-            content: "reasoning".to_string(),
-            complete: true,
-            expanded: false,
-        });
-        app.timeline_push(TimelineEntry::ToolCall {
-            id: "tool-1".to_string(),
-            name: "bash".to_string(),
-            preview: "echo ok".to_string(),
-            output: "ok".to_string(),
-            done: true,
-            expanded: false,
-            exit_code: Some(0),
-            causality: None,
-        });
-        app.add_message("assistant", "done");
-
-        let stats = app.session_activity_stats();
-        assert_eq!(stats.thinking_count, 1);
-        assert_eq!(stats.tool_count, 1);
-        assert_eq!(stats.message_count, 2);
-        assert_eq!(stats.event_count, 4);
-    }
-
-    #[test]
-    fn add_entry_appends_to_last_page() {
-        let mut app = App::new("test", "sess");
-        for i in 0..300 {
-            app.timeline_push(make_msg(&format!("entry {i}")));
-        }
-        assert_eq!(app.timeline_len(), 300);
-        assert_eq!(app.timeline_pages.len(), 1);
-        assert_eq!(app.timeline_pages[0].entries.len(), 300);
-        assert_eq!(app.timeline_pages[0].start_index, 0);
-    }
-
-    #[test]
-    fn get_entry_cross_page() {
-        let mut app = App::new("test", "sess");
-        for i in 0..(PAGE_SIZE * 3 + 200) {
-            app.timeline_push(make_msg(&format!("entry {i}")));
-        }
-        assert_eq!(app.timeline_len(), PAGE_SIZE * 3 + 200);
-        assert!(app.timeline_get(0).unwrap().full_text().contains("entry 0"));
-        assert!(app
-            .timeline_get(PAGE_SIZE)
-            .unwrap()
-            .full_text()
-            .contains(&format!("entry {}", PAGE_SIZE)));
-        assert!(app
-            .timeline_get(PAGE_SIZE * 2 + 50)
-            .unwrap()
-            .full_text()
-            .contains(&format!("entry {}", PAGE_SIZE * 2 + 50)));
-    }
-
-    #[test]
-    fn cursor_up_down_works_across_pages() {
-        let mut app = App::new("test", "sess");
-        for i in 0..600 {
-            app.timeline_push(TimelineEntry::Thinking {
-                id: i,
-                causal_item_id: None,
-                causality: None,
-                content: format!("think {i}"),
-                complete: true,
-                expanded: false,
-            });
-        }
-        app.timeline_cursor = 599;
-        let moved = app.cursor_up();
-        assert!(moved);
-        assert!(app.timeline_cursor < 599);
-    }
-
-    fn correlation(execution_id: &str, turn_id: &str) -> crate::protocol::GatewayEventCorrelation {
-        crate::protocol::GatewayEventCorrelation {
-            session_id: "sess".to_string(),
-            execution_id: Some(execution_id.to_string()),
-            turn_id: Some(turn_id.to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn root_presentation_has_one_preview_owner_and_durable_commit_replaces_it() {
-        use harness_contract::live::TerminalDeliveryEvent;
-
-        let mut app = App::new("test", "sess");
-        app.current_execution_id = Some("execution-root".to_string());
-        app.current_turn_id = Some("turn-root".to_string());
-        let correlation = correlation("execution-root", "turn-root");
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
-            correlation: correlation.clone(),
-            delivery: TerminalDeliveryEvent::TerminalPresentationStarted {
-                presentation_id: "presentation-root".to_string(),
-                attempt_id: "attempt-1".to_string(),
-                envelope_id: "envelope-1".to_string(),
-                envelope_revision: 1,
-                objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
-            },
-        });
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
-            correlation: correlation.clone(),
-            delivery: TerminalDeliveryEvent::TextDelta {
-                presentation_id: "presentation-root".to_string(),
-                attempt_id: "attempt-1".to_string(),
-                byte_start: 0,
-                byte_end: 7,
-                delta: "preview".to_string(),
-            },
-        });
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
-            correlation: correlation.clone(),
-            delivery: TerminalDeliveryEvent::TerminalPresentationCommitted {
-                presentation_id: "presentation-root".to_string(),
-                attempt_id: "attempt-1".to_string(),
-                answer_origin: harness_contract::outcome::AnswerOrigin::TerminalNarrator,
-                terminal_id: "terminal-root".to_string(),
-            },
-        });
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
-            correlation: correlation.clone(),
-            delivery: TerminalDeliveryEvent::TextDelta {
-                presentation_id: "presentation-root".to_string(),
-                attempt_id: "attempt-1".to_string(),
-                byte_start: 7,
-                byte_end: 12,
-                delta: " late".to_string(),
-            },
-        });
-
-        let mut committed = correlation;
-        committed.message_id = Some("assistant-root".to_string());
-        committed.terminal_id = Some("terminal-root".to_string());
-        committed.part_id = Some("terminal-message:assistant-root".to_string());
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalCommitted {
-            correlation: committed,
-            assistant_text: "authoritative final".to_string(),
-            sequence: Some(2),
-            iterations: 1,
-            token_usage: None,
-        });
-
-        let assistant = app
-            .timeline_iter()
-            .filter_map(|(_, entry)| match entry {
-                TimelineEntry::Message { role, content, .. } if role == "assistant" => {
-                    Some(content.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(assistant, vec!["authoritative final"]);
-        assert!(app.turn_interaction.presentation.active_root.is_none());
-    }
-
-    #[test]
-    fn dropped_abort_then_projection_resync_clears_orphaned_root_preview() {
-        use harness_contract::execution_graph::ExecutionGraph;
-        use harness_contract::live::TerminalDeliveryEvent;
-        use harness_contract::projection::{ExecutionProjection, ProjectionCommandAvailability};
-
-        let mut app = App::new("test", "sess");
-        app.current_execution_id = Some("execution-root".to_string());
-        app.current_turn_id = Some("turn-root".to_string());
-        let correlation = correlation("execution-root", "turn-root");
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
-            correlation: correlation.clone(),
-            delivery: TerminalDeliveryEvent::TerminalPresentationStarted {
-                presentation_id: "presentation-root".to_string(),
-                attempt_id: "attempt-1".to_string(),
-                envelope_id: "envelope-1".to_string(),
-                envelope_revision: 1,
-                objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
-            },
-        });
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
-            correlation: correlation.clone(),
-            delivery: TerminalDeliveryEvent::TextDelta {
-                presentation_id: "presentation-root".to_string(),
-                attempt_id: "attempt-1".to_string(),
-                byte_start: 0,
-                byte_end: 7,
-                delta: "preview".to_string(),
-            },
-        });
-        assert!(app.turn_interaction.presentation.active_root.is_some());
-
-        // The reconstructible Abort is intentionally absent. The canonical
-        // snapshot carries neither an active presentation nor a durable
-        // terminal/cancellation winner and must therefore close the orphan.
-        assert!(app.apply_execution_projection(ExecutionProjection {
-            schema_version: harness_contract::projection::EXECUTION_PROJECTION_SCHEMA_VERSION,
-            execution_id: "execution-root".to_string(),
-            revision: 1,
-            cursor: 1,
-            detail_scope: harness_contract::projection::ProjectionDetailScope::Summary,
-            authorization_revision: 1,
-            redaction_revision: "redaction-1".to_string(),
-            session_id: Some("sess".to_string()),
-            mission_id: None,
-            task_id: None,
-            turn_id: Some("turn-root".to_string()),
-            strategy: None,
-            graph: harness_contract::execution_graph::project_execution_graph(
-                &ExecutionGraph::new("recover dropped abort"),
-            ),
-            child_executions: Vec::new(),
-            activities: Vec::new(),
-            activity_relations: Vec::new(),
-            goals: Vec::new(),
-            agents: Vec::new(),
-            teams: Vec::new(),
-            relations: Vec::new(),
-            approvals: Vec::new(),
-            admissions: Vec::new(),
-            outcomes: Vec::new(),
-            interventions: Vec::new(),
-            usage: Vec::new(),
-            context: Vec::new(),
-            evidence: Vec::new(),
-            health: Vec::new(),
-            recovery: Vec::new(),
-            live: None,
-            delivery_envelope: None,
-            terminal_presentation: None,
-            cancellation_receipt: None,
-            available_commands: Vec::<ProjectionCommandAvailability>::new(),
-        }));
-        assert!(app.turn_interaction.presentation.active_root.is_none());
-        assert!(app.turn_interaction.root_preview_closed());
-
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
-            correlation,
-            delivery: TerminalDeliveryEvent::TextDelta {
-                presentation_id: "presentation-root".to_string(),
-                attempt_id: "attempt-1".to_string(),
-                byte_start: 7,
-                byte_end: 12,
-                delta: " late".to_string(),
-            },
-        });
-        assert!(app.timeline_iter().all(|(_, entry)| {
-            !matches!(
-                entry,
-                TimelineEntry::Message { role, .. } if role == "assistant"
-            )
-        }));
-    }
-
-    #[test]
-    fn http_and_sse_cancellation_receipts_dedupe_to_activity_without_assistant_text() {
-        let mut app = App::new("test", "sess");
-        app.current_execution_id = Some("execution-cancel".to_string());
-        app.current_turn_id = Some("turn-cancel".to_string());
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TextDelta {
-            correlation: correlation("execution-cancel", "turn-cancel"),
-            text: "transient".to_string(),
-            start_bytes: 0,
-            end_bytes: 9,
-            stream_revision: 9,
-        });
-        let mut receipt = harness_contract::turn::CancellationReceipt {
-            cancellation_id: "cancel-once".to_string(),
-            session_id: "sess".to_string(),
-            turn_id: "turn-cancel".to_string(),
-            execution_id: "execution-cancel".to_string(),
-            actor_id: "principal:user".to_string(),
-            cause: harness_contract::turn::CancellationCause::UserRequested,
-            reason: Some("user requested".to_string()),
-            requested_at_ms: 100,
-            effective_at_ms: None,
-            status: harness_contract::turn::CancellationStatus::Requested,
-            journal_sequence: 4,
-            projection_revision: 1,
-        };
-        app.apply_cancellation_receipt(receipt.clone());
-        assert_ne!(
-            app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::Cancelled)
-        );
-        receipt.effective_at_ms = Some(120);
-        receipt.status = harness_contract::turn::CancellationStatus::Cancelled;
-        for _ in 0..2 {
-            app.apply_gateway_session_event(
-                crate::protocol::GatewaySessionEvent::TerminalDelivery {
-                    correlation: correlation("execution-cancel", "turn-cancel"),
-                    delivery:
-                        harness_contract::live::TerminalDeliveryEvent::CancellationCommitted {
-                            receipt: receipt.clone(),
-                        },
-                },
-            );
-        }
-
-        assert!(!app.timeline_iter().any(|(_, entry)| matches!(
-            entry,
-            TimelineEntry::Message { role, .. } if role == "assistant"
-        )));
-        assert_eq!(
-            app.system_notices
-                .iter()
-                .filter(|notice| notice.content.contains("cancel-once"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::Cancelled)
-        );
-
-        app.install_execution_live_facts(
-            "execution-cancel",
-            &harness_contract::projection::ExecutionLiveState {
-                revision: 10,
-                status: harness_contract::projection::ExecutionLiveStatus::Cancelled,
-                status_detail: Some("user requested".to_string()),
-                turn_id: Some("turn-cancel".to_string()),
-                started_at_ms: 1,
-                updated_at_ms: 120,
-                last_progress_at_ms: 120,
-                context_usage: None,
-                metrics: Default::default(),
-                latency: Default::default(),
-                output_preview: Some("must stay hidden".to_string()),
-                output_preview_start_bytes: 0,
-                output_bytes: 16,
-                output_parts: vec![harness_contract::projection::ExecutionLiveOutputPart {
-                    model_step_id: "step-cancelled".to_string(),
-                    item_id: "item-cancelled".to_string(),
-                    part_id: "part-cancelled".to_string(),
-                    causal_sequence: 1,
-                    completed: false,
-                    preview: Some("must stay hidden".to_string()),
-                    preview_start_bytes: 0,
-                    bytes: 16,
-                }],
-                terminal_ref: None,
-                error: None,
-            },
-            None,
-        );
-        assert!(!app.timeline_iter().any(|(_, entry)| matches!(
-            entry,
-            TimelineEntry::Message { role, content, .. }
-                if role == "assistant" && content.contains("stay hidden")
-        )));
-
-        let mut late_terminal = correlation("execution-cancel", "turn-cancel");
-        late_terminal.message_id = Some("assistant-late".to_string());
-        late_terminal.terminal_id = Some("terminal-late".to_string());
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalCommitted {
-            correlation: late_terminal,
-            assistant_text: "must not resurrect cancelled output".to_string(),
-            sequence: Some(5),
-            iterations: 1,
-            token_usage: None,
-        });
-        assert_eq!(
-            app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::Cancelled)
-        );
-        assert!(!app.timeline_iter().any(|(_, entry)| matches!(
-            entry,
-            TimelineEntry::Message { role, content, .. }
-                if role == "assistant" && content.contains("resurrect")
-        )));
-
-        app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::TerminalDelivery {
-            correlation: correlation("execution-cancel", "turn-cancel"),
-            delivery: harness_contract::live::TerminalDeliveryEvent::TerminalPresentationStarted {
-                presentation_id: "late-presentation".to_string(),
-                attempt_id: "late-attempt".to_string(),
-                envelope_id: "late-envelope".to_string(),
-                envelope_revision: 1,
-                objective_scope: harness_contract::outcome::AnswerObjectiveScope::Root,
-            },
-        });
-        assert!(app.turn_interaction.presentation.active_root.is_none());
-    }
-
-    #[test]
-    fn causal_reasoning_items_remain_distinct_in_the_tui_timeline() {
-        let mut app = App::new("test", "sess");
-        app.current_execution_id = Some("execution-causal".to_string());
-        app.current_turn_id = Some("turn-causal".to_string());
-        for (item_id, text) in [("reasoning-a", "inspect"), ("reasoning-b", "decide")] {
-            let mut item = correlation("execution-causal", "turn-causal");
-            item.model_step_id = Some("step-causal".to_string());
-            item.item_id = Some(item_id.to_string());
-            item.segment_id = Some(format!("{item_id}:reasoning-summary:0"));
-            app.apply_gateway_session_event(
-                crate::protocol::GatewaySessionEvent::ReasoningSummaryDelta {
-                    correlation: item.clone(),
-                    summary: text.to_string(),
-                },
-            );
-            app.apply_gateway_session_event(crate::protocol::GatewaySessionEvent::ItemCompleted {
-                correlation: item,
-                kind: "public_reasoning".to_string(),
-            });
-        }
-        let items = app
-            .timeline_clone_vec()
-            .into_iter()
-            .filter_map(|entry| match entry {
-                TimelineEntry::Thinking {
-                    causal_item_id,
-                    content,
-                    complete,
-                    ..
-                } => Some((causal_item_id, content, complete)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(items.len(), 2);
-        assert_eq!(
-            items[0],
-            (
-                Some("reasoning-a:reasoning-summary:0".to_string()),
-                "inspect".to_string(),
-                true
-            )
-        );
-        assert_eq!(
-            items[1],
-            (
-                Some("reasoning-b:reasoning-summary:0".to_string()),
-                "decide".to_string(),
-                true
-            )
-        );
-    }
-
-    #[test]
-    fn canonical_cross_surface_fixture_keeps_causal_order_and_parallel_tool_waves() {
-        let fixture: serde_json::Value =
-            serde_json::from_str(harness_contract::live::CAUSAL_SURFACE_TIMELINE_V1_FIXTURE_JSON)
-                .expect("canonical causal fixture");
-        let session_id = fixture["session_id"].as_str().expect("fixture session");
-        let mut app = App::new("fixture-model", session_id);
-
-        for payload in fixture["events"].as_array().expect("fixture events") {
-            let event = crate::gateway_client::gateway_sse_json_to_cowd_event_for_session(
-                payload,
-                Some(session_id),
-            )
-            .expect("fixture event must map to the TUI protocol");
-            app.apply_event(event);
-        }
-
-        let rows = app
-            .timeline_iter()
-            .filter_map(|(_, entry)| match entry {
-                TimelineEntry::Thinking {
-                    causality: Some(causality),
-                    ..
-                } => causality.item_id.clone(),
-                TimelineEntry::ToolCall {
-                    causality: Some(causality),
-                    ..
-                } => causality.tool_call_id.clone(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let expected = fixture["expected_activity"]
-            .as_array()
-            .expect("expected activity")
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(ToOwned::to_owned)
-            .collect::<Vec<_>>();
-        assert_eq!(rows, expected);
-
-        let tools = app
-            .timeline_iter()
-            .filter_map(|(_, entry)| match entry {
-                TimelineEntry::ToolCall {
-                    causality: Some(causality),
-                    ..
-                } => Some((
-                    causality.tool_call_id.clone().unwrap_or_default(),
-                    causality.wave,
-                    causality.lane,
-                    causality.lane_count,
-                )),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            tools,
-            vec![
-                ("tool-a".to_string(), 0, 0, 2),
-                ("tool-b".to_string(), 0, 1, 2),
-                ("tool-c".to_string(), 1, 0, 1),
-            ]
-        );
-        assert!(app.timeline_iter().any(|(_, entry)| matches!(
-            entry,
-            TimelineEntry::Message {
-                role,
-                content,
-                ..
-            } if role == "assistant" && content == "完成"
-        )));
-    }
-
-    #[test]
-    fn durable_history_hydrates_full_transcript_and_deduplicates_replayed_terminal() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: vec![
-                    crate::protocol::SessionMessageProjection {
-                        id: "user-1".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 0,
-                        role: "user".to_string(),
-                        blocks: vec![serde_json::json!({
-                            "type": "text",
-                            "text": "historical question"
-                        })],
-                        created_at_ms: 1_000,
-                        token_usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                    crate::protocol::SessionMessageProjection {
-                        id: "assistant-1".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 1,
-                        role: "assistant".to_string(),
-                        blocks: vec![serde_json::json!({
-                            "type": "text",
-                            "text": "historical answer"
-                        })],
-                        created_at_ms: 2_000,
-                        token_usage: Some(serde_json::json!({
-                            "input_tokens": 12,
-                            "output_tokens": 3
-                        })),
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                ],
-                total: 2,
-                offset: 0,
-                from_seq: Some(0),
-                next_seq: Some(2),
-                limit: 500,
-                has_more: false,
-            },
-        });
-
-        let mut terminal = correlation("execution-old", "turn-old");
-        terminal.message_id = Some("assistant-1".to_string());
-        terminal.terminal_id = Some("terminal-old".to_string());
-        terminal.replayed = true;
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
-                correlation: terminal,
-                assistant_text: "historical answer".to_string(),
-                sequence: Some(1),
-                iterations: 1,
-                token_usage: None,
-            },
-        });
-
-        assert!(app.history_hydrated);
-        assert_eq!(app.timeline_len(), 2);
-        assert_eq!(app.durable_session_input_tokens, 12);
-        assert_eq!(app.durable_session_output_tokens, 3);
-        assert_eq!(
-            app.timeline_get(0).unwrap().full_text(),
-            "historical question"
-        );
-        assert_eq!(
-            app.timeline_get(1).unwrap().full_text(),
-            "historical answer"
-        );
-        assert_eq!(app.input_history, vec!["historical question".to_string()]);
-    }
-
-    #[test]
-    fn durable_history_keeps_provider_transcript_evidence_without_duplicate_answer() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: vec![
-                    crate::protocol::SessionMessageProjection {
-                        id: "assistant:turn-1:transcript:0".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 1,
-                        role: "assistant".to_string(),
-                        blocks: vec![serde_json::json!({
-                            "type": "text",
-                            "text": "premature answer"
-                        })],
-                        created_at_ms: 1_000,
-                        token_usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                    crate::protocol::SessionMessageProjection {
-                        id: "assistant:turn-1".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 2,
-                        role: "assistant".to_string(),
-                        blocks: vec![serde_json::json!({
-                            "type": "text",
-                            "text": "verified final answer"
-                        })],
-                        created_at_ms: 2_000,
-                        token_usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                ],
-                total: 2,
-                offset: 0,
-                from_seq: Some(1),
-                next_seq: Some(3),
-                limit: 500,
-                has_more: false,
-            },
-        });
-
-        let messages = app
-            .timeline_iter()
-            .filter_map(|(_, entry)| match entry {
-                TimelineEntry::Message { content, .. } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(messages, vec!["verified final answer"]);
-    }
-
-    #[test]
-    fn durable_history_restores_tool_use_and_result_as_one_deduplicated_card() {
-        let page = crate::protocol::SessionMessagesPage {
-            session_id: "sess".to_string(),
-            messages: vec![
-                crate::protocol::SessionMessageProjection {
-                    id: "assistant-tool-use".to_string(),
-                    session_id: "sess".to_string(),
-                    sequence: 0,
-                    role: "assistant".to_string(),
-                    blocks: vec![serde_json::json!({
-                        "type": "tool_use",
-                        "id": "tool-1",
-                        "name": "read_file",
-                        "input": "{\"path\":\"Cargo.toml\"}"
-                    })],
-                    created_at_ms: 1_000,
-                    token_usage: None,
-                    tool_use_id: Some("tool-1".to_string()),
-                    tool_name: Some("read_file".to_string()),
-                },
-                crate::protocol::SessionMessageProjection {
-                    id: "tool-result".to_string(),
-                    session_id: "sess".to_string(),
-                    sequence: 1,
-                    role: "tool".to_string(),
-                    blocks: vec![serde_json::json!({
-                        "type": "tool_result",
-                        "tool_use_id": "tool-1",
-                        "tool_name": "read_file",
-                        "output": "workspace manifest",
-                        "is_error": false
-                    })],
-                    created_at_ms: 2_000,
-                    token_usage: None,
-                    tool_use_id: Some("tool-1".to_string()),
-                    tool_name: Some("read_file".to_string()),
-                },
-            ],
-            total: 2,
-            offset: 0,
-            from_seq: Some(0),
-            next_seq: Some(2),
-            limit: 500,
-            has_more: false,
-        };
-        let mut app = App::new("test", "sess");
-
-        app.apply_event(CowdEvent::SessionHistoryPage { page: page.clone() });
-        app.apply_event(CowdEvent::SessionHistoryPage { page });
-
-        let tools = app
-            .timeline_iter()
-            .filter_map(|(_, entry)| match entry {
-                TimelineEntry::ToolCall {
-                    id,
-                    name,
-                    output,
-                    done,
-                    exit_code,
-                    ..
-                } => Some((id, name, output, done, exit_code)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(tools.len(), 1);
-        assert!(
-            tools[0].0.starts_with("tool-instance|"),
-            "history tool cards must use their collision-safe canonical instance identity"
-        );
-        assert_eq!(tools[0].1, "read_file");
-        assert_eq!(tools[0].2, "workspace manifest");
-        assert!(*tools[0].3);
-        assert_eq!(*tools[0].4, Some(0));
-        assert!(
-            app.timeline_iter()
-                .all(|(_, entry)| !matches!(entry, TimelineEntry::Message { content, .. } if content.is_empty())),
-            "tool-only assistant messages must not become empty chat bubbles"
-        );
-    }
-
-    #[test]
-    fn stable_turn_identity_prevents_cross_turn_delta_and_terminal_corruption() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: correlation("execution-1", "turn-1"),
-                text: "same prefix first".to_string(),
-                start_bytes: 0,
-                end_bytes: 17,
-                stream_revision: 17,
-            },
-        });
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::UserMessageCommitted {
-                correlation: {
-                    let mut correlation = correlation("execution-2", "turn-2");
-                    correlation.message_id = Some("user-second".to_string());
-                    correlation
-                },
-                content: "second question".to_string(),
-                sequence: 1,
-                created_at_ms: 2_000,
-            },
-        });
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: correlation("execution-2", "turn-2"),
-                text: "same prefix second".to_string(),
-                start_bytes: 0,
-                end_bytes: 18,
-                stream_revision: 18,
-            },
-        });
-        let mut first_terminal = correlation("execution-1", "turn-1");
-        first_terminal.message_id = Some("assistant-first".to_string());
-        first_terminal.terminal_id = Some("terminal-first".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
-                correlation: first_terminal,
-                assistant_text: "first terminal".to_string(),
-                sequence: Some(2),
-                iterations: 1,
-                token_usage: None,
-            },
-        });
-
-        let messages = app
-            .timeline_iter()
-            .filter_map(|(_, entry)| match entry {
-                TimelineEntry::Message {
-                    content, identity, ..
-                } => Some((content.as_str(), identity.as_ref())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(messages.len(), 3);
-        assert!(
-            messages
-                .iter()
-                .all(|(content, _)| *content != "first terminal"),
-            "a stale terminal must not materialize prose into the active turn"
-        );
-        assert!(messages
-            .iter()
-            .any(|(content, _)| *content == "same prefix second"));
-        assert_eq!(
-            app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::Queued)
-        );
-        assert_eq!(app.current_execution_id.as_deref(), Some("execution-2"));
-        assert_eq!(app.telemetry.orphan_event_count, 1);
-    }
-
-    #[test]
-    fn durable_history_race_reconciles_live_reply_before_terminal_commit() {
-        let mut app = App::new("test", "sess");
-        let mut live = correlation("execution-race", "turn-race");
-        live.part_id = Some("item-text-1:text:0".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: live,
-                text: "streamed answer".to_string(),
-                start_bytes: 0,
-                end_bytes: 15,
-                stream_revision: 15,
-            },
-        });
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: vec![crate::protocol::SessionMessageProjection {
-                    id: "assistant-race".to_string(),
-                    session_id: "sess".to_string(),
-                    sequence: 1,
-                    role: "assistant".to_string(),
-                    blocks: vec![serde_json::json!({
-                        "type": "text",
-                        "text": "streamed answer",
-                        "cowd_turn_id": "turn-race"
-                    })],
-                    created_at_ms: 2_000,
-                    token_usage: None,
-                    tool_use_id: None,
-                    tool_name: None,
-                }],
-                total: 2,
-                offset: 0,
-                from_seq: Some(0),
-                next_seq: Some(2),
-                limit: 500,
-                has_more: false,
-            },
-        });
-
-        let mut terminal = correlation("execution-race", "turn-race");
-        terminal.part_id = Some("item-text-1:text:0".to_string());
-        terminal.message_id = Some("assistant-race".to_string());
-        terminal.terminal_id = Some("terminal-race".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
-                correlation: terminal,
-                assistant_text: "streamed answer".to_string(),
-                sequence: Some(1),
-                iterations: 1,
-                token_usage: None,
-            },
-        });
-
-        let assistant = app
-            .timeline_iter()
-            .filter(|(_, entry)| {
-                matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            assistant.len(),
-            1,
-            "history hydration and terminal delivery must reconcile the live bubble"
-        );
-        assert!(matches!(
-            assistant[0].1,
-            TimelineEntry::Message {
-                content,
-                identity: Some(MessageIdentity {
-                    message_id: Some(message_id),
-                    source: MessageSource::DurableHistory,
-                    ..
-                }),
-                ..
-            } if content == "streamed answer" && message_id == "assistant-race"
-        ));
-    }
-
-    #[test]
-    fn late_live_snapshot_cannot_recreate_a_committed_assistant_bubble() {
-        let mut app = App::new("test", "sess");
-        let mut live = correlation("execution-late", "turn-late");
-        live.part_id = Some("item-text-1:text:0".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: live,
-                text: "one answer".to_string(),
-                start_bytes: 0,
-                end_bytes: 10,
-                stream_revision: 10,
-            },
-        });
-
-        let mut terminal = correlation("execution-late", "turn-late");
-        terminal.part_id = Some("item-text-1:text:0".to_string());
-        terminal.message_id = Some("assistant-late".to_string());
-        terminal.terminal_id = Some("terminal-late".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
-                correlation: terminal,
-                assistant_text: "one answer".to_string(),
-                sequence: Some(1),
-                iterations: 1,
-                token_usage: None,
-            },
-        });
-
-        app.reconcile_live_output_parts(
-            "execution-late",
-            Some("turn-late"),
-            &[harness_contract::projection::ExecutionLiveOutputPart {
-                model_step_id: "step-late".to_string(),
-                item_id: "item-late".to_string(),
-                part_id: "item-text-1:text:0".to_string(),
-                causal_sequence: 1,
-                completed: true,
-                preview: Some("one answer".to_string()),
-                preview_start_bytes: 0,
-                bytes: 10,
-            }],
-            10,
-        );
-
-        let assistant_count = app
-            .timeline_iter()
-            .filter(|(_, entry)| {
-                matches!(entry, TimelineEntry::Message { role, .. } if role == "assistant")
-            })
-            .count();
-        assert_eq!(
-            assistant_count, 1,
-            "a delayed canonical preview must not duplicate its committed terminal"
-        );
-    }
-
-    #[test]
-    fn identical_typed_text_deltas_are_appended_without_snapshot_guessing() {
-        let mut app = App::new("test", "sess");
-        for (start_bytes, text) in [(0, "ha"), (2, "ha")] {
-            app.apply_event(CowdEvent::GatewaySession {
-                event: crate::protocol::GatewaySessionEvent::TextDelta {
-                    correlation: correlation("execution-repeat", "turn-repeat"),
-                    text: text.to_string(),
-                    start_bytes,
-                    end_bytes: start_bytes + text.len(),
-                    stream_revision: (start_bytes + text.len()) as u64,
-                },
-            });
-        }
-
-        assert!(matches!(
-            app.timeline_get(0),
-            Some(TimelineEntry::Message { content, .. }) if content == "haha"
-        ));
-    }
-
-    #[test]
-    fn text_delta_revision_is_monotonic_within_one_causal_part() {
-        let mut app = App::new("test", "sess");
-        let apply = |app: &mut App, text: &str, start_bytes, end_bytes, stream_revision| {
-            app.apply_event(CowdEvent::GatewaySession {
-                event: crate::protocol::GatewaySessionEvent::TextDelta {
-                    correlation: correlation("execution-revision", "turn-revision"),
-                    text: text.to_string(),
-                    start_bytes,
-                    end_bytes,
-                    stream_revision,
-                },
-            });
-        };
-
-        apply(&mut app, "first", 0, 5, 10);
-        apply(&mut app, "stale-conflict", 0, 14, 9);
-        apply(&mut app, "replayed-conflict", 0, 17, 10);
-        apply(&mut app, " tail", 5, 10, 11);
-
-        assert!(matches!(
-            app.timeline_get(0),
-            Some(TimelineEntry::Message { content, .. }) if content == "first tail"
-        ));
-        assert_eq!(
-            app.telemetry.text_delta_dedupe_count, 2,
-            "older and equal revisions must not mutate visible text"
-        );
-    }
-
-    #[test]
-    fn durable_terminal_rejects_late_non_terminal_phase_for_the_same_execution() {
-        let mut app = App::new("test", "sess");
-        app.current_execution_id = Some("execution-terminal".to_string());
-        app.current_turn_id = Some("turn-terminal".to_string());
-        app.current_execution_status =
-            Some(harness_contract::projection::ExecutionLiveStatus::Error);
-        app.current_execution_status_detail = Some("partial result".to_string());
-        let mut terminal = correlation("execution-terminal", "turn-terminal");
-        terminal.message_id = Some("assistant-terminal".to_string());
-        terminal.terminal_id = Some("terminal-1".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TerminalCommitted {
-                correlation: terminal.clone(),
-                assistant_text: "done".to_string(),
-                sequence: Some(1),
-                iterations: 1,
-                token_usage: None,
-            },
-        });
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::ExecutionPhase {
-                correlation: terminal,
-                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
-                detail: Some("late projection".to_string()),
-            },
-        });
-
-        assert_eq!(
-            app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::Error)
-        );
-        assert_eq!(
-            app.current_execution_status_detail.as_deref(),
-            Some("partial result")
-        );
-        assert!(app.execution_is_terminalized("execution-terminal"));
-        assert_eq!(
-            app.telemetry.orphan_event_count, 0,
-            "a known late phase is discarded as an ordering fact, not misreported as a causal orphan"
-        );
-    }
-
-    #[test]
-    fn queued_followup_does_not_replace_the_running_execution_status() {
-        let mut app = App::new("test", "sess");
-        app.turn_interaction.ingress_accepted("execution-running");
-        app.current_execution_id = Some("execution-running".to_string());
-        app.current_turn_id = Some("turn-running".to_string());
-        app.current_execution_status =
-            Some(harness_contract::projection::ExecutionLiveStatus::CallingModel);
-
-        let mut queued = correlation("execution-queued", "turn-queued");
-        queued.message_id = Some("message-queued".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::UserMessageCommitted {
-                correlation: queued,
-                content: "follow up".to_string(),
-                sequence: 4,
-                created_at_ms: 5,
-            },
-        });
-
-        assert_eq!(
-            app.current_execution_id.as_deref(),
-            Some("execution-running")
-        );
-        assert_eq!(
-            app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::CallingModel)
-        );
-        assert!(app.timeline_iter().any(|(_, entry)| matches!(
-            entry,
-            TimelineEntry::Message {
-                identity: Some(MessageIdentity {
-                    message_id: Some(message_id),
-                    ..
-                }),
-                ..
-            } if message_id == "message-queued"
-        )));
-    }
-
-    #[test]
-    fn started_followup_replaces_stale_finalizing_correlation_for_observers() {
-        let mut app = App::new("test", "sess");
-        app.turn_interaction.ingress_accepted("execution-old");
-        app.current_execution_id = Some("execution-old".to_string());
-        app.current_turn_id = Some("turn-old".to_string());
-        app.current_execution_status =
-            Some(harness_contract::projection::ExecutionLiveStatus::Finalizing);
-
-        let mut admitted = correlation("execution-new", "turn-new");
-        admitted.message_id = Some("message-new".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::UserMessageCommitted {
-                correlation: admitted,
-                content: "new observer turn".to_string(),
-                sequence: 8,
-                created_at_ms: 9,
-            },
-        });
-        assert_eq!(
-            app.current_execution_id.as_deref(),
-            Some("execution-old"),
-            "durable admission alone may still be queued and cannot steal an active turn"
-        );
-
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::ExecutionPhase {
-                correlation: correlation("execution-new", "turn-new"),
-                status: harness_contract::projection::ExecutionLiveStatus::PreparingContext,
-                detail: Some("started by Runtime".to_string()),
-            },
-        });
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: correlation("execution-new", "turn-new"),
-                text: "first live delta".to_string(),
-                start_bytes: 0,
-                end_bytes: 16,
-                stream_revision: 16,
-            },
-        });
-
-        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
-        assert_eq!(app.current_turn_id.as_deref(), Some("turn-new"));
-        assert_eq!(
-            app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::PreparingContext)
-        );
-        assert_eq!(app.telemetry.orphan_event_count, 0);
-        assert!(app.timeline_iter().any(|(_, entry)| matches!(
-            entry,
-            TimelineEntry::Message {
-                role,
-                content,
-                identity: Some(MessageIdentity {
-                    source: MessageSource::Live,
-                    execution_id: Some(execution_id),
-                    turn_id: Some(turn_id),
-                    ..
-                }),
-                ..
-            } if role == "assistant"
-                && content == "first live delta"
-                && execution_id == "execution-new"
-                && turn_id == "turn-new"
-        )));
-
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::ExecutionPhase {
-                correlation: correlation("execution-old", "turn-old"),
-                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
-                detail: Some("delayed old phase".to_string()),
-            },
-        });
-        assert_eq!(
-            app.current_execution_id.as_deref(),
-            Some("execution-new"),
-            "a superseded execution cannot reclaim the observer after the new Runtime phase"
-        );
-    }
-
-    #[test]
-    fn first_live_delta_activates_a_committed_followup_when_phase_was_coalesced() {
-        let mut app = App::new("test", "sess");
-        app.turn_interaction.ingress_accepted("execution-old");
-        app.current_execution_id = Some("execution-old".to_string());
-        app.current_turn_id = Some("turn-old".to_string());
-        app.current_execution_status =
-            Some(harness_contract::projection::ExecutionLiveStatus::Finalizing);
-
-        let mut admitted = correlation("execution-new", "turn-new");
-        admitted.message_id = Some("message-new".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::UserMessageCommitted {
-                correlation: admitted,
-                content: "queued until Runtime starts it".to_string(),
-                sequence: 8,
-                created_at_ms: 9,
-            },
-        });
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: correlation("execution-new", "turn-new"),
-                text: "visible before terminal".to_string(),
-                start_bytes: 0,
-                end_bytes: 23,
-                stream_revision: 23,
-            },
-        });
-
-        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
-        assert_eq!(app.current_turn_id.as_deref(), Some("turn-new"));
-        assert_eq!(app.telemetry.orphan_event_count, 0);
-        assert!(app.timeline_iter().any(|(_, entry)| matches!(
-            entry,
-            TimelineEntry::Message {
-                role,
-                content,
-                identity: Some(MessageIdentity {
-                    source: MessageSource::Live,
-                    execution_id: Some(execution_id),
-                    ..
-                }),
-                ..
-            } if role == "assistant"
-                && content == "visible before terminal"
-                && execution_id == "execution-new"
-        )));
-
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: correlation("execution-old", "turn-old"),
-                text: "late old output".to_string(),
-                start_bytes: 0,
-                end_bytes: 15,
-                stream_revision: 15,
-            },
-        });
-        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
-        assert_eq!(
-            app.telemetry.orphan_event_count, 1,
-            "the causal tombstone must reject delayed output from the superseded execution"
-        );
-    }
-
-    #[test]
-    fn first_live_delta_activates_new_turn_after_terminal_when_admission_was_missed() {
-        let mut app = App::new("test", "sess");
-        app.current_execution_id = Some("execution-old".to_string());
-        app.current_turn_id = Some("turn-old".to_string());
-        app.current_execution_status =
-            Some(harness_contract::projection::ExecutionLiveStatus::Complete);
-        app.terminal_correlations
-            .push_back(("execution-old".to_string(), "turn-old".to_string()));
-        app.turn_interaction.terminal_observed();
-
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: correlation("execution-new", "turn-new"),
-                text: "visible before terminal".to_string(),
-                start_bytes: 0,
-                end_bytes: 23,
-                stream_revision: 23,
-            },
-        });
-
-        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
-        assert_eq!(app.current_turn_id.as_deref(), Some("turn-new"));
-        assert_eq!(app.telemetry.orphan_event_count, 0);
-        assert_eq!(
-            app.telemetry.text_delta_dedupe_count, 0,
-            "the new execution's first delta must not inherit the terminal preview tombstone"
-        );
-        assert_eq!(
-            app.turn_interaction.execution.execution_id.as_deref(),
-            Some("execution-new"),
-            "presentation state must be rebound to the new causal execution"
-        );
-        assert!(app.timeline_iter().any(|(_, entry)| matches!(
-            entry,
-            TimelineEntry::Message {
-                role,
-                content,
-                identity: Some(MessageIdentity {
-                    source: MessageSource::Live,
-                    execution_id: Some(execution_id),
-                    ..
-                }),
-                ..
-            } if role == "assistant"
-                && content == "visible before terminal"
-                && execution_id == "execution-new"
-        )));
-
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TextDelta {
-                correlation: correlation("execution-old", "turn-old"),
-                text: "late old output".to_string(),
-                start_bytes: 0,
-                end_bytes: 15,
-                stream_revision: 15,
-            },
-        });
-        assert_eq!(app.current_execution_id.as_deref(), Some("execution-new"));
-        assert_eq!(app.telemetry.orphan_event_count, 1);
-    }
-
-    #[test]
-    fn committed_cross_surface_user_message_reconciles_optimistic_identity() {
-        let mut app = App::new("test", "sess");
-        app.add_message_with_id(
-            "user",
-            "cross-surface prompt",
-            Some("client-message-1".to_string()),
-        );
-        let mut committed = correlation("execution-1", "turn-1");
-        committed.message_id = Some("client-message-1".to_string());
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::UserMessageCommitted {
-                correlation: committed,
-                content: "cross-surface prompt".to_string(),
-                sequence: 7,
-                created_at_ms: 9_000,
-            },
-        });
-
-        assert_eq!(app.timeline_len(), 1);
-        assert!(matches!(
-            app.timeline_get(0),
-            Some(TimelineEntry::Message {
-                identity: Some(MessageIdentity {
-                    sequence: Some(7),
-                    source: MessageSource::DurableIngress,
-                    ..
-                }),
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn reconnect_history_repairs_cross_surface_message_order_by_durable_sequence() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: vec![
-                    crate::protocol::SessionMessageProjection {
-                        id: "user-0".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 0,
-                        role: "user".to_string(),
-                        blocks: vec![serde_json::json!({"type": "text", "text": "zero"})],
-                        created_at_ms: 1,
-                        token_usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                    crate::protocol::SessionMessageProjection {
-                        id: "assistant-2".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 2,
-                        role: "assistant".to_string(),
-                        blocks: vec![serde_json::json!({"type": "text", "text": "two"})],
-                        created_at_ms: 3,
-                        token_usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                ],
-                total: 2,
-                offset: 0,
-                from_seq: Some(0),
-                next_seq: Some(3),
-                limit: 500,
-                has_more: false,
-            },
-        });
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: vec![
-                    crate::protocol::SessionMessageProjection {
-                        id: "user-0".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 0,
-                        role: "user".to_string(),
-                        blocks: vec![serde_json::json!({"type": "text", "text": "zero"})],
-                        created_at_ms: 1,
-                        token_usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                    crate::protocol::SessionMessageProjection {
-                        id: "user-1".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 1,
-                        role: "user".to_string(),
-                        blocks: vec![serde_json::json!({"type": "text", "text": "one"})],
-                        created_at_ms: 2,
-                        token_usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                    crate::protocol::SessionMessageProjection {
-                        id: "assistant-2".to_string(),
-                        session_id: "sess".to_string(),
-                        sequence: 2,
-                        role: "assistant".to_string(),
-                        blocks: vec![serde_json::json!({"type": "text", "text": "two"})],
-                        created_at_ms: 3,
-                        token_usage: None,
-                        tool_use_id: None,
-                        tool_name: None,
-                    },
-                ],
-                total: 3,
-                offset: 0,
-                from_seq: Some(0),
-                next_seq: Some(3),
-                limit: 500,
-                has_more: false,
-            },
-        });
-
-        assert_eq!(
-            app.timeline_iter()
-                .map(|(_, entry)| entry.full_text())
-                .collect::<Vec<_>>(),
-            vec!["zero", "one", "two"]
-        );
-    }
-
-    #[test]
-    fn correlated_turn_error_stops_activity_and_exposes_terminal_status() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::TurnStarted);
-        app.apply_event(CowdEvent::GatewaySession {
-            event: crate::protocol::GatewaySessionEvent::TurnError {
-                correlation: correlation("execution-failed", "turn-failed"),
-                error: "provider unavailable".to_string(),
-            },
-        });
-
-        assert!(!app.turn_is_active());
-        assert_eq!(
-            app.current_execution_status,
-            Some(harness_contract::projection::ExecutionLiveStatus::Error)
-        );
-        assert_eq!(
-            app.current_execution_status_detail.as_deref(),
-            Some("provider unavailable")
-        );
-        assert_eq!(
-            app.current_execution_id.as_deref(),
-            Some("execution-failed")
-        );
-    }
-
-    #[test]
-    fn causal_history_places_late_terminal_before_the_next_ingress() {
-        let mut app = App::new("test", "sess");
-        let projection =
-            |id: &str, sequence: usize, role: &str, text: &str, turn_id: &str, ingress_id: &str| {
-                crate::protocol::SessionMessageProjection {
-                    id: id.to_string(),
-                    session_id: "sess".to_string(),
-                    sequence,
-                    role: role.to_string(),
-                    blocks: vec![serde_json::json!({
-                        "type": "text",
-                        "text": text,
-                        "cowd_turn_id": turn_id,
-                        "cowd_turn_ingress_message_id": ingress_id,
-                    })],
-                    created_at_ms: sequence as u64 + 1,
-                    token_usage: None,
-                    tool_use_id: None,
-                    tool_name: None,
-                }
-            };
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: vec![
-                    projection("user-1", 0, "user", "first", "turn-1", "user-1"),
-                    projection("user-2", 1, "user", "second", "turn-2", "user-2"),
-                    projection(
-                        "assistant-1",
-                        2,
-                        "assistant",
-                        "first answer",
-                        "turn-1",
-                        "user-1",
-                    ),
-                ],
-                total: 3,
-                offset: 0,
-                from_seq: Some(0),
-                next_seq: Some(3),
-                limit: 500,
-                has_more: false,
-            },
-        });
-
-        assert_eq!(
-            app.timeline_iter()
-                .map(|(_, entry)| entry.full_text())
-                .collect::<Vec<_>>(),
-            vec!["first", "first answer", "second"]
-        );
-        assert_eq!(
-            app.timeline_iter()
-                .filter_map(|(_, entry)| match entry {
-                    TimelineEntry::Message {
-                        identity: Some(identity),
-                        ..
-                    } => identity.sequence,
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec![0, 2, 1],
-            "logical presentation order must not rewrite the immutable physical cursor"
-        );
-    }
-
-    #[test]
-    fn repeated_provider_tool_ids_pair_history_results_fifo() {
-        let tool_use = |message_id: &str, sequence: usize, name: &str| {
-            crate::protocol::SessionMessageProjection {
-                id: message_id.to_string(),
-                session_id: "sess".to_string(),
-                sequence,
-                role: "assistant".to_string(),
-                blocks: vec![serde_json::json!({
-                    "type": "tool_use",
-                    "id": "provider-reused-id",
-                    "name": name,
-                    "input": "{}"
-                })],
-                created_at_ms: sequence as u64,
-                token_usage: None,
-                tool_use_id: Some("provider-reused-id".to_string()),
-                tool_name: Some(name.to_string()),
-            }
-        };
-        let tool_result = |message_id: &str, sequence: usize, output: &str| {
-            crate::protocol::SessionMessageProjection {
-                id: message_id.to_string(),
-                session_id: "sess".to_string(),
-                sequence,
-                role: "tool".to_string(),
-                blocks: vec![serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": "provider-reused-id",
-                    "tool_name": "tool",
-                    "output": output,
-                    "is_error": false
-                })],
-                created_at_ms: sequence as u64,
-                token_usage: None,
-                tool_use_id: Some("provider-reused-id".to_string()),
-                tool_name: Some("tool".to_string()),
-            }
-        };
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: vec![
-                    tool_use("use-1", 0, "first-tool"),
-                    tool_use("use-2", 1, "second-tool"),
-                    tool_result("result-1", 2, "first-output"),
-                    tool_result("result-2", 3, "second-output"),
-                ],
-                total: 4,
-                offset: 0,
-                from_seq: Some(0),
-                next_seq: Some(4),
-                limit: 500,
-                has_more: false,
-            },
-        });
-        assert_eq!(
-            app.timeline_iter()
-                .filter_map(|(_, entry)| match entry {
-                    TimelineEntry::ToolCall { name, output, .. } =>
-                        Some((name.as_str(), output.as_str())),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
-            vec![
-                ("first-tool", "first-output"),
-                ("second-tool", "second-output")
-            ]
-        );
-    }
-
-    #[test]
-    fn current_turn_thinking_counter_ignores_history_and_counts_one_live_stream() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::SessionHistoryPage {
-            page: crate::protocol::SessionMessagesPage {
-                session_id: "sess".to_string(),
-                messages: vec![crate::protocol::SessionMessageProjection {
-                    id: "historical-thinking".to_string(),
-                    session_id: "sess".to_string(),
-                    sequence: 0,
-                    role: "assistant".to_string(),
-                    blocks: vec![serde_json::json!({
-                        "type": "thinking",
-                        "thinking": "old reasoning"
-                    })],
-                    created_at_ms: 1,
-                    token_usage: None,
-                    tool_use_id: None,
-                    tool_name: None,
-                }],
-                total: 1,
-                offset: 0,
-                from_seq: Some(0),
-                next_seq: Some(1),
-                limit: 500,
-                has_more: false,
-            },
-        });
-        assert_eq!(app.current_turn_thinking_count, 0);
-        app.apply_event(CowdEvent::TurnStarted);
-        app.apply_event(CowdEvent::ReasoningSummaryDelta {
-            summary: "new".to_string(),
-        });
-        app.apply_event(CowdEvent::ReasoningSummaryDelta {
-            summary: " reasoning".to_string(),
-        });
-        assert_eq!(app.current_turn_thinking_count, 1);
-    }
-
-    #[test]
-    fn unicode_tool_progress_is_bounded_without_splitting_utf8() {
-        let mut app = App::new("test", "sess");
-        app.apply_event(CowdEvent::ToolStart {
-            id: "tool-unicode".to_string(),
-            name: "logger".to_string(),
-            preview: String::new(),
-        });
-        app.apply_event(CowdEvent::ToolProgress {
-            id: "tool-unicode".to_string(),
-            name: "logger".to_string(),
-            progress: "你好🙂".repeat(1200),
-        });
-        let output = app
-            .timeline_iter()
-            .find_map(|(_, entry)| match entry {
-                TimelineEntry::ToolCall { output, .. } => Some(output),
-                _ => None,
-            })
-            .expect("tool output");
-        assert!(output.len() <= 4096);
-        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
-    }
-}
+#[path = "tests/reducer.rs"]
+mod tests;

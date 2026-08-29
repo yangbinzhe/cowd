@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn sync_from_app_turn_complete_hides() {
         let mut app = App::new("m", "s");
-        app.turn_interaction.terminal_observed();
+        app.execution.turn_interaction.terminal_observed();
 
         let mut panel = ThinkingPanel::new();
         panel.visible = true;

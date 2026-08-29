@@ -27,10 +27,10 @@ impl GoalWorkbenchPanel {
     }
 
     pub fn sync_from_app(&mut self, app: &App) {
-        self.current_task = app.current_task.clone();
-        self.gateway_tasks = app.gateway_tasks.clone();
-        self.gateway_task_count = app.gateway_task_count;
-        self.pending_approvals = app.gateway_pending_approvals;
+        self.current_task = app.shell.current_task.clone();
+        self.gateway_tasks = app.gateway.gateway_tasks.clone();
+        self.gateway_task_count = app.gateway.gateway_task_count;
+        self.pending_approvals = app.gateway.gateway_pending_approvals;
     }
 
     fn render_empty(&self) -> Text<'static> {
@@ -261,8 +261,8 @@ mod tests {
     fn renders_gateway_task_summary() {
         let mut panel = GoalWorkbenchPanel::new();
         let mut app = App::new("model", "session");
-        app.gateway_task_count = Some(1);
-        app.gateway_tasks = vec![TaskSummary {
+        app.gateway.gateway_task_count = Some(1);
+        app.gateway.gateway_tasks = vec![TaskSummary {
             id: "task-1234567890".to_string(),
             mission_id: "mission-default".to_string(),
             kind: "root".to_string(),
@@ -300,7 +300,7 @@ mod tests {
     fn renders_gateway_task_blocker_reason() {
         let mut panel = GoalWorkbenchPanel::new();
         let mut app = App::new("model", "session");
-        app.gateway_tasks = vec![TaskSummary {
+        app.gateway.gateway_tasks = vec![TaskSummary {
             id: "task-blocked".to_string(),
             mission_id: "mission-default".to_string(),
             kind: "root".to_string(),

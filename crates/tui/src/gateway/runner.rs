@@ -28,6 +28,9 @@ use crate::state::{
 };
 use crate::{config_migration, cowd_event_channel, error_recovery, CowdEvent, FileEntry};
 
+#[path = "input.rs"]
+mod input;
+
 static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 // APP panels own recovery policy and choose when to issue a fresh request. The
@@ -436,8 +439,12 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
         .clone()
         .unwrap_or_else(|| "unresolved".to_string());
     let mut state = TuiState::new(&display_model, &session_id);
-    state.add_system_notice(SystemNoticeKind::Info, &config.startup_banner);
-    state.add_system_notice(SystemNoticeKind::Info, &config.connected_line);
+    state
+        .app
+        .add_system_notice(SystemNoticeKind::Info, &config.startup_banner);
+    state
+        .app
+        .add_system_notice(SystemNoticeKind::Info, &config.connected_line);
 
     let mut gateway_lease_owner: Option<String> = None;
     let mut session_authorities = SessionAuthorityRegistry::default();
@@ -461,14 +468,14 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     match runtime.block_on(gateway_client.app_catalog()) {
         Ok(catalog) => {
             if let Err(error) = state.set_gateway_app_catalog(catalog) {
-                state.add_system_notice(
+                state.app.add_system_notice(
                     SystemNoticeKind::Warning,
                     &format!("Application catalog was rejected: {error}"),
                 );
             }
         }
         Err(error) => {
-            state.add_system_notice(
+            state.app.add_system_notice(
                 SystemNoticeKind::Warning,
                 &format!(
                     "Application catalog is unavailable; Core TUI remains operational: {error}"
@@ -492,6 +499,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     let mut presence_heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
     let mission_live_task = state
         .app
+        .gateway
         .gateway_mission_control
         .as_ref()
         .and_then(|mission| mission.mission_id.as_deref())
@@ -518,24 +526,26 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     state.set_memory_projection_available(true);
     state.set_active_sessions_count(1);
     if accessibility_enabled {
-        state.accessibility = crate::accessibility::AccessibilityMode::full();
+        state.shell.accessibility = crate::accessibility::AccessibilityMode::full();
         let high_contrast_theme = crate::accessibility::high_contrast_theme(true);
-        state.theme_engine = crate::theme::ThemeEngine::new(high_contrast_theme);
+        state.shell.theme_engine = crate::theme::ThemeEngine::new(high_contrast_theme);
     }
     if !migration_report.contains("nothing to migrate") {
-        state.add_system_notice(SystemNoticeKind::Info, &migration_report);
+        state
+            .app
+            .add_system_notice(SystemNoticeKind::Info, &migration_report);
     }
     match list_workspace_files(runtime, &gateway_client) {
         Ok(files) => {
-            state.prompt.set_workspace_entries(
+            state.shell.prompt.set_workspace_entries(
                 files
                     .iter()
                     .map(|entry| ContextWorkspaceEntry::new(entry.name.clone(), entry.is_dir)),
             );
-            state.app.file_entries = files;
+            state.app.workbench.file_entries = files;
         }
         Err(error) => {
-            state.add_system_notice(
+            state.app.add_system_notice(
                 SystemNoticeKind::Warning,
                 &format!("Gateway workspace projection unavailable: {error}"),
             );
@@ -545,8 +555,10 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     state.queue_gateway_api(
         |client| async move { client.list_sessions().await },
         |state, result| match result {
-            Ok(catalog) => state.apply_gateway_session_catalog(&catalog),
-            Err(error) => state.add_system_notice(
+            Ok(catalog) => {
+                state.apply_gateway_session_catalog(&catalog);
+            }
+            Err(error) => state.app.add_system_notice(
                 SystemNoticeKind::Warning,
                 &format!("Session catalogue refresh failed: {error}"),
             ),
@@ -586,353 +598,27 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                             &observer_id,
                             &mut session_authorities,
                         ),
-                        Err(error) => state.add_system_notice(
+                        Err(error) => state.app.add_system_notice(
                             SystemNoticeKind::Error,
                             &format!("Session switch failed without changing the active view: {error}"),
                         ),
                     }
                 }
                 Some(Ok(event)) = reader.next() => {
-                    if matches!(event, Event::Resize(_, _)) {
-                        // The terminal backend already exposes the new area on
-                        // the next draw.  Resize does not mutate conversation
-                        // state, so it must explicitly advance the render
-                        // version or an otherwise idle TUI would retain the
-                        // old-width framebuffer until another interaction.
-                        state.app.request_redraw();
-                    }
-                    if let Event::Mouse(mouse) = &event {
-                        if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollDown) {
-                            state.handle_mouse_scroll_at(true, mouse.column, mouse.row);
-                            state.app.request_redraw();
-                            continue;
-                        }
-                        if matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp) {
-                            state.handle_mouse_scroll_at(false, mouse.column, mouse.row);
-                            state.app.request_redraw();
-                            continue;
-                        }
-                    }
-                    if let Event::Paste(text) = event {
-                        // Bracketed paste is one canonical composer edit. Do
-                        // not replay it as individual key events, which would
-                        // break undo and can split IME/Unicode transactions.
-                        state.process_paste(&text);
-                        continue;
-                    }
-                    if let Event::Key(key) = event {
-                        if key.kind == KeyEventKind::Press {
-                            let active_session_id = state.app.session_id.clone();
-                            let active_authority_generation = session_authorities
-                                .current(&active_session_id)
-                                .unwrap_or_default();
-                            // Keyboard input is a render cause even when it
-                            // only changes the composer buffer (which is not
-                            // part of the timeline version counter).
-                            state.app.request_redraw();
-                            if state.picker_active {
-                                state.open_session_picker_dialog();
-                            }
-                            match state.process_raw_key(key) {
-                                ProcessedKey::Submit(text) => {
-                                    if text.is_empty() {
-                                        continue;
-                                    }
-                                    if matches!(text.as_str(), "/exit" | "/quit") {
-                                        break;
-                                    }
-                                    if let Some(path) = attach_path_from_command(&text) {
-                                        if gateway_lease_owner.is_none() {
-                                            state.app.input.set_text(&text);
-                                            state.add_system_notice(
-                                                SystemNoticeKind::Error,
-                                                "This session is attached read-only. Resource upload was not sent and the command was restored.",
-                                            );
-                                            continue;
-                                        }
-                                        state.add_system_notice(
-                                            SystemNoticeKind::Info,
-                                            &format!("Uploading {} in the background", path.display()),
-                                        );
-                                        dispatch_gateway_resource_upload(
-                                            &gateway_client,
-                                            &tui_tx,
-                                            &active_session_id,
-                                            active_authority_generation,
-                                            path.to_path_buf(),
-                                        );
-                                        continue;
-                                    }
-                                    if let Some(command) = execution_command_from_input(&text) {
-                                        if gateway_lease_owner.is_none() {
-                                            state.app.input.set_text(&text);
-                                            state.add_system_notice(
-                                                SystemNoticeKind::Error,
-                                                "This session is attached read-only. The execution command was not sent and was restored.",
-                                            );
-                                            continue;
-                                        }
-                                        dispatch_execution_projection_command(
-                                            &gateway_client,
-                                            &tui_tx,
-                                            &state,
-                                            &active_session_id,
-                                            active_authority_generation,
-                                            command,
-                                        );
-                                        continue;
-                                    }
-                                    if text.starts_with('/') {
-                                        if text.trim() == "/history older" {
-                                            if state.app.turn_is_active() {
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Warning,
-                                                    "History window navigation is paused during an active turn so live entries cannot be evicted.",
-                                                );
-                                            } else
-                                            if state.app.history_loading_older {
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Info,
-                                                    "An older history page is already loading in the background.",
-                                                );
-                                            } else if !state.app.history_has_older {
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Info,
-                                                    "This history window is already at the oldest durable message.",
-                                                );
-                                            } else {
-                                                state.app.history_loading_older = true;
-                                                dispatch_older_history_page(
-                                                    &gateway_client,
-                                                    &tui_tx,
-                                                    &active_session_id,
-                                                    active_authority_generation,
-                                                    state.app.history_oldest_offset,
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                        if text.trim() == "/history newer" {
-                                            if state.app.turn_is_active() {
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Warning,
-                                                    "History window navigation is paused during an active turn.",
-                                                );
-                                            } else if state.app.history_loading_newer {
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Info,
-                                                    "A newer history page is already loading.",
-                                                );
-                                            } else if state.app.history_window_end_offset
-                                                >= state.app.history_total_messages
-                                            {
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Info,
-                                                    "This window already contains the latest durable history.",
-                                                );
-                                            } else {
-                                                state.app.history_loading_newer = true;
-                                                dispatch_newer_history_page(
-                                                    &gateway_client,
-                                                    &tui_tx,
-                                                    &active_session_id,
-                                                    active_authority_generation,
-                                                    state.app.history_window_end_offset,
-                                                    state.app.history_total_messages,
-                                                    false,
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                        if text.trim() == "/history latest" {
-                                            if state.app.turn_is_active() {
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Warning,
-                                                    "History window navigation is paused during an active turn.",
-                                                );
-                                            } else {
-                                                state.app.history_loading_newer = true;
-                                                dispatch_newer_history_page(
-                                                    &gateway_client,
-                                                    &tui_tx,
-                                                    &active_session_id,
-                                                    active_authority_generation,
-                                                    state.app.history_window_end_offset,
-                                                    state.app.history_total_messages,
-                                                    true,
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                        if let Some(input_id) = queue_cancel_command(&text) {
-                                            if gateway_lease_owner.is_none() {
-                                                state.app.input.set_text(&text);
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Error,
-                                                    "This session is attached read-only. Queued input was not changed.",
-                                                );
-                                                continue;
-                                            }
-                                            dispatch_pending_input_cancel(
-                                                &gateway_client,
-                                                &tui_tx,
-                                                &active_session_id,
-                                                active_authority_generation,
-                                                input_id,
-                                            );
-                                            continue;
-                                        }
-                                        if let Some(input_id) = queue_edit_command(&text) {
-                                            if gateway_lease_owner.is_none() {
-                                                state.app.input.set_text(&text);
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Error,
-                                                    "This session is attached read-only. Queued input was not changed.",
-                                                );
-                                                continue;
-                                            }
-                                            if let Some(input) = state
-                                                .app
-                                                .pending_inputs
-                                                .iter()
-                                                .find(|input| input.input_id == input_id)
-                                            {
-                                                state.app.input.set_text(&input.content_preview);
-                                                dispatch_pending_input_cancel(
-                                                    &gateway_client,
-                                                    &tui_tx,
-                                                    &active_session_id,
-                                                    active_authority_generation,
-                                                    input_id,
-                                                );
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Info,
-                                                    "Queued follow-up restored to composer; edit it and submit to replace the canonical input.",
-                                                );
-                                            } else {
-                                                state.add_system_notice(
-                                                    SystemNoticeKind::Warning,
-                                                    "Queued input was not found locally; refresh or use its full input id.",
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                        if gateway_lease_owner.is_none()
-                                            && !read_only_slash_command(&text)
-                                        {
-                                            state.app.input.set_text(&text);
-                                            state.add_system_notice(
-                                                SystemNoticeKind::Error,
-                                                "This session is attached read-only. Only read-only inspection commands are available; the command was restored.",
-                                            );
-                                            continue;
-                                        }
-                                        dispatch_gateway_slash(
-                                            &gateway_client,
-                                            &tui_tx,
-                                            &mut state,
-                                            &active_session_id,
-                                            active_authority_generation,
-                                            &text,
-                                        );
-                                        continue;
-                                    }
-                                    if gateway_lease_owner.is_none() {
-                                        state.app.input.set_text(&text);
-                                        state.add_system_notice(
-                                            SystemNoticeKind::Error,
-                                            "This session is read-only because its writer lease was not acquired. The draft was restored; switch sessions or retry after the conflicting writer releases its lease.",
-                                        );
-                                        continue;
-                                    }
-                                    let client_message_id =
-                                        format!("tui:{}", uuid::Uuid::new_v4());
-                                    let execution_was_active = state.app.turn_is_active();
-                                    message_submission_generation =
-                                        message_submission_generation.wrapping_add(1);
-                                    let submission_generation = message_submission_generation;
-                                    state.app.begin_message_admission(
-                                        &text,
-                                        client_message_id.clone(),
-                                        submission_generation,
-                                        !execution_was_active,
-                                    );
-                                    let resource_ids = state
-                                        .app
-                                        .pending_resources
-                                        .iter()
-                                        .map(|resource| resource.id.clone())
-                                        .collect::<Vec<_>>();
-                                    dispatch_gateway_message(
-                                        &gateway_client,
-                                        &tui_tx,
-                                        &active_session_id,
-                                        active_authority_generation,
-                                        text,
-                                        resource_ids,
-                                        client_message_id,
-                                        submission_generation,
-                                        !execution_was_active,
-                                    );
-                                    continue;
-                                }
-                                ProcessedKey::Exit => break,
-                                ProcessedKey::Cancel => {
-                                    if gateway_lease_owner.is_some() {
-                                        dispatch_gateway_cancel(
-                                            &gateway_client,
-                                            &tui_tx,
-                                            &active_session_id,
-                                            state.app.current_execution_id.as_deref(),
-                                            state.app.current_turn_id.as_deref(),
-                                            active_authority_generation,
-                                        );
-                                    } else {
-                                        state.add_system_notice(
-                                            SystemNoticeKind::Error,
-                                            "This session is attached read-only; no cancellation was sent.",
-                                        );
-                                    }
-                                }
-                                ProcessedKey::Nothing => {}
-                            }
-                            if let Some(target_session_id) =
-                                take_pending_session_switch(&mut state)
-                            {
-                                if target_session_id == state.app.session_id {
-                                    state.session_sidebar.set_current_session(&target_session_id);
-                                    continue;
-                                }
-                                if let Some(inflight) =
-                                    session_switch_inflight_target.as_deref()
-                                {
-                                    state.add_system_notice(
-                                        SystemNoticeKind::Info,
-                                        &format!(
-                                            "Session switch to {inflight} is still being prepared; finish or fail that atomic switch before selecting another session"
-                                        ),
-                                    );
-                                    continue;
-                                }
-                                session_switch_generation =
-                                    session_switch_generation.wrapping_add(1).max(1);
-                                session_switch_inflight_target =
-                                    Some(target_session_id.clone());
-                                state.add_system_notice(
-                                    SystemNoticeKind::Info,
-                                    &format!("Preparing session switch to {target_session_id}; the current view remains interactive"),
-                                );
-                                dispatch_gateway_session_switch(
-                                    gateway_client.clone(),
-                                    session_switch_tx.clone(),
-                                    session_switch_generation,
-                                    target_session_id,
-                                    observer_id.clone(),
-                                );
-                            }
-                            consume_pending_session_sidebar_actions(&mut state);
-                            consume_pending_session_export(&mut state);
-                        }
+                    if input::handle_terminal_event(
+                        event,
+                        &gateway_client,
+                        &tui_tx,
+                        &mut state,
+                        &gateway_lease_owner,
+                        &session_authorities,
+                        &mut message_submission_generation,
+                        &mut session_switch_generation,
+                        &mut session_switch_inflight_target,
+                        &session_switch_tx,
+                        &observer_id,
+                    ) {
+                        break;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(50)) => {
@@ -958,7 +644,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                     app_transport_controller.reap_finished();
                     state.update_startup_phase(startup_ready);
                     if state.app.turn_is_active() {
-                        state.tick();
+                        state.app.tick();
                     }
                     if last_presence_heartbeat.elapsed() >= presence_heartbeat_interval
                         && presence_heartbeat_task
@@ -966,7 +652,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
                             .is_none_or(tokio::task::JoinHandle::is_finished)
                     {
                         presence_heartbeat_task.take();
-                        let active_session_id = state.app.session_id.clone();
+                        let active_session_id = state.app.shell.session_id.clone();
                         let active_is_writer = gateway_lease_owner.is_some();
                         let targets = session_source_bridges
                             .keys()
@@ -1007,11 +693,11 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
             // state changes advance `msg_version` above.
             let transient_redraw_due = transient_ui_redraw_due(
                 state.app.turn_is_active(),
-                !state.toast_manager.is_empty(),
+                !state.overlay.toast_manager.is_empty(),
                 last_animation_draw.elapsed(),
             );
-            if state.app.last_drawn_version != state.app.msg_version
-                || state.app.last_drawn_render_version != state.app.render_version
+            if state.app.timeline.last_drawn_version != state.app.timeline.msg_version
+                || state.app.timeline.last_drawn_render_version != state.app.timeline.render_version
                 || transient_redraw_due
             {
                 terminal.draw(|frame| state.render(frame))?;
@@ -1032,7 +718,7 @@ pub fn run_gateway_tui(config: GatewayTuiConfig) -> Result<(), Box<dyn std::erro
     for (_, task) in std::mem::take(&mut session_source_bridges) {
         task.abort();
     }
-    let active_session_id = state.app.session_id.clone();
+    let active_session_id = state.app.shell.session_id.clone();
     if gateway_lease_owner.is_some() {
         let _ = runtime.block_on(gateway_client.release_runtime_session_lease(&active_session_id));
     }
@@ -1096,22 +782,72 @@ fn attach_gateway_session(
     _observer_id: &str,
     authority_generation: u64,
 ) -> Result<(Vec<String>, Duration), Box<dyn std::error::Error>> {
+    let ensured_session_id =
+        attach_gateway_session_identity(runtime, gateway_client, state, config)?;
+    let (writer_attached, mut presence_heartbeat_interval) =
+        attach_gateway_lifecycle(runtime, gateway_client, state, &ensured_session_id);
+    ensure_session_source_bridge(
+        runtime,
+        gateway_client,
+        event_tx,
+        session_source_bridges,
+        &ensured_session_id,
+        authority_generation,
+    );
+    restore_attached_execution_projection(
+        runtime,
+        gateway_client,
+        event_tx,
+        state,
+        execution_projection_source,
+        &ensured_session_id,
+    );
+    acquire_gateway_writer_lease(
+        runtime,
+        gateway_client,
+        state,
+        &ensured_session_id,
+        writer_attached,
+        gateway_lease_owner,
+        &mut presence_heartbeat_interval,
+    );
+    let gateway_session_ids = hydrate_gateway_runtime_state(
+        runtime,
+        gateway_client,
+        state,
+        config,
+        &ensured_session_id,
+        writer_attached && gateway_lease_owner.is_some(),
+    )?;
+    state.app.add_system_notice(
+        SystemNoticeKind::Info,
+        "Gateway event stream subscribed for this session",
+    );
+    Ok((gateway_session_ids, presence_heartbeat_interval))
+}
+
+fn attach_gateway_session_identity(
+    runtime: &tokio::runtime::Runtime,
+    gateway_client: &GatewayApiClient,
+    state: &mut TuiState,
+    config: &GatewayTuiConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
     let status = runtime
         .block_on(gateway_client.status())
         .map_err(|err| format!("Gateway API is required for TUI: {err}"))?;
-    state.app.server_running = true;
-    state.app.active_api_sessions = status
+    state.app.gateway.server_running = true;
+    state.app.gateway.active_api_sessions = status
         .get("active_sessions")
         .and_then(serde_json::Value::as_u64)
         .map(|value| value as usize)
         .unwrap_or_default();
-    state.app.server_uptime_secs = status
+    state.app.gateway.server_uptime_secs = status
         .get("uptime_secs")
         .and_then(serde_json::Value::as_u64);
 
-    let active_api_sessions = state.app.active_api_sessions;
-    let server_uptime_secs = state.app.server_uptime_secs.unwrap_or_default();
-    state.add_system_notice(
+    let active_api_sessions = state.app.gateway.active_api_sessions;
+    let server_uptime_secs = state.app.gateway.server_uptime_secs.unwrap_or_default();
+    state.app.add_system_notice(
         SystemNoticeKind::Info,
         &format!("Gateway API connected: {active_api_sessions} active sessions, uptime {server_uptime_secs}s"),
     );
@@ -1122,24 +858,24 @@ fn attach_gateway_session(
                 .ensure_session(&config.session_id, config.model.as_deref().unwrap_or("")),
         )
         .map_err(|err| format!("Gateway session attach failed: {err}"))?;
-    state.app.active_api_sessions = ensured
+    state.app.gateway.active_api_sessions = ensured
         .get("active_sessions")
         .and_then(serde_json::Value::as_u64)
         .map(|value| value as usize)
-        .unwrap_or(state.app.active_api_sessions);
+        .unwrap_or(state.app.gateway.active_api_sessions);
     let ensured_session_id = ensured
         .get("session_id")
         .and_then(serde_json::Value::as_str)
         .unwrap_or(&config.session_id)
         .to_string();
-    state.app.requested_model = ensured
+    state.app.shell.requested_model = ensured
         .get("model")
         .and_then(serde_json::Value::as_str)
         .filter(|model| !model.trim().is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| config.model.clone());
-    if let Some(model) = state.app.requested_model.clone() {
-        state.app.model = model;
+    if let Some(model) = state.app.shell.requested_model.clone() {
+        state.app.shell.model = model;
     }
     let action = if ensured
         .get("created")
@@ -1150,20 +886,28 @@ fn attach_gateway_session(
     } else {
         "attached"
     };
-    state.add_system_notice(
+    state.app.add_system_notice(
         SystemNoticeKind::Info,
         &format!("Gateway session {action}: {ensured_session_id}"),
     );
+    Ok(ensured_session_id)
+}
 
+fn attach_gateway_lifecycle(
+    runtime: &tokio::runtime::Runtime,
+    gateway_client: &GatewayApiClient,
+    state: &mut TuiState,
+    ensured_session_id: &str,
+) -> (bool, Duration) {
     let mut presence_heartbeat_interval = DEFAULT_PRESENCE_HEARTBEAT_INTERVAL;
     let writer_attached = match runtime.block_on(gateway_client.attach_session(
-        &ensured_session_id,
+        ensured_session_id,
         "tui",
         Some("writer"),
     )) {
         Ok(attached) => {
             presence_heartbeat_interval = presence_heartbeat_interval_from_attachment(&attached);
-            state.add_system_notice(
+            state.app.add_system_notice(
                 SystemNoticeKind::Info,
                 &format!(
                     "Gateway lifecycle attached: state={}, seq={}",
@@ -1177,8 +921,8 @@ fn attach_gateway_session(
                         .unwrap_or_default()
                 ),
             );
-            match runtime.block_on(gateway_client.replay_session(&ensured_session_id, 0, 100)) {
-                Ok(replay) => state.add_system_notice(
+            match runtime.block_on(gateway_client.replay_session(ensured_session_id, 0, 100)) {
+                Ok(replay) => state.app.add_system_notice(
                     SystemNoticeKind::Info,
                     &format!(
                         "Gateway replay ready: total={}, next_seq={}",
@@ -1192,7 +936,7 @@ fn attach_gateway_session(
                             .unwrap_or_default()
                     ),
                 ),
-                Err(err) => state.add_system_notice(
+                Err(err) => state.app.add_system_notice(
                     SystemNoticeKind::Error,
                     &format!("Gateway replay unavailable: {err}"),
                 ),
@@ -1200,26 +944,26 @@ fn attach_gateway_session(
             true
         }
         Err(err) => {
-            state.add_system_notice(
+            state.app.add_system_notice(
                 SystemNoticeKind::Error,
                 &format!(
                     "Gateway lifecycle writer attach unavailable; this TUI remains read-only: {err}"
                 ),
             );
             match runtime.block_on(gateway_client.attach_session(
-                &ensured_session_id,
+                ensured_session_id,
                 "tui",
                 Some("reader"),
             )) {
                 Ok(attached) => {
                     presence_heartbeat_interval =
                         presence_heartbeat_interval_from_attachment(&attached);
-                    state.add_system_notice(
+                    state.app.add_system_notice(
                         SystemNoticeKind::Info,
                         "Gateway lifecycle reader attached",
                     );
                 }
-                Err(reader_error) => state.add_system_notice(
+                Err(reader_error) => state.app.add_system_notice(
                     SystemNoticeKind::Error,
                     &format!("Gateway lifecycle reader attach is also unavailable: {reader_error}"),
                 ),
@@ -1227,26 +971,45 @@ fn attach_gateway_session(
             false
         }
     };
+    (writer_attached, presence_heartbeat_interval)
+}
 
+fn ensure_session_source_bridge(
+    runtime: &tokio::runtime::Runtime,
+    gateway_client: &GatewayApiClient,
+    event_tx: &crate::events::CowdEventSender,
+    session_source_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
+    ensured_session_id: &str,
+    authority_generation: u64,
+) {
     // The bridge establishes the server-side live subscription first, then
     // consumes durable history and live bytes concurrently. Stable message
     // identities reconcile either arrival order without holding live progress
     // behind a slow history page.
     session_source_bridges.retain(|_, task| !task.is_finished());
-    if !session_source_bridges.contains_key(&ensured_session_id) {
+    if !session_source_bridges.contains_key(ensured_session_id) {
         session_source_bridges.insert(
-            ensured_session_id.clone(),
+            ensured_session_id.to_string(),
             spawn_session_source_bridge(
                 runtime,
                 gateway_client.clone(),
                 event_tx.clone(),
-                ensured_session_id.clone(),
+                ensured_session_id.to_string(),
                 authority_generation,
             ),
         );
     }
+}
 
-    match runtime.block_on(gateway_client.session_execution_index(&ensured_session_id)) {
+fn restore_attached_execution_projection(
+    runtime: &tokio::runtime::Runtime,
+    gateway_client: &GatewayApiClient,
+    event_tx: &crate::events::CowdEventSender,
+    state: &mut TuiState,
+    execution_projection_source: &mut ExecutionProjectionReducerController,
+    ensured_session_id: &str,
+) {
+    match runtime.block_on(gateway_client.session_execution_index(ensured_session_id)) {
         Ok(index) => {
             if let Some(execution_id) = session_index_visible_execution_id(&index) {
                 if let Some(generation) = execution_projection_source.begin_selection(&execution_id)
@@ -1267,7 +1030,7 @@ fn attach_gateway_session(
                             );
                         }
                         Err(error) => {
-                            state.add_system_notice(
+                            state.app.add_system_notice(
                                 SystemNoticeKind::Warning,
                                 &format!(
                                     "Latest execution projection is still materializing during attach: {error}"
@@ -1288,15 +1051,26 @@ fn attach_gateway_session(
                 }
             }
         }
-        Err(error) => state.add_system_notice(
+        Err(error) => state.app.add_system_notice(
             SystemNoticeKind::Warning,
             &format!("Session execution index could not be restored during attach: {error}"),
         ),
     }
+}
 
+#[allow(clippy::too_many_arguments)]
+fn acquire_gateway_writer_lease(
+    runtime: &tokio::runtime::Runtime,
+    gateway_client: &GatewayApiClient,
+    state: &mut TuiState,
+    ensured_session_id: &str,
+    writer_attached: bool,
+    gateway_lease_owner: &mut Option<String>,
+    presence_heartbeat_interval: &mut Duration,
+) {
     let lease_result = writer_attached.then(|| {
         runtime.block_on(
-            gateway_client.acquire_runtime_session_lease(&ensured_session_id, "collaborative"),
+            gateway_client.acquire_runtime_session_lease(ensured_session_id, "collaborative"),
         )
     });
     match lease_result {
@@ -1305,12 +1079,12 @@ fn attach_gateway_session(
                 .get("owner")
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned);
-            state.app.gateway_lease_owner = gateway_lease_owner.clone();
-            state.app.gateway_lease_mode = lease
+            state.app.gateway.gateway_lease_owner = gateway_lease_owner.clone();
+            state.app.gateway.gateway_lease_mode = lease
                 .get("mode")
                 .and_then(serde_json::Value::as_str)
                 .map(ToOwned::to_owned);
-            state.add_system_notice(
+            state.app.add_system_notice(
                 SystemNoticeKind::Info,
                 &format!(
                     "Gateway session lease acquired: owner={}, mode={}",
@@ -1327,49 +1101,58 @@ fn attach_gateway_session(
         }
         Some(Err(err)) => {
             *gateway_lease_owner = None;
-            state.app.gateway_lease_owner = None;
-            state.app.gateway_lease_mode = Some("read-only".to_string());
-            let _ = runtime.block_on(gateway_client.detach_session(&ensured_session_id, "tui"));
+            state.app.gateway.gateway_lease_owner = None;
+            state.app.gateway.gateway_lease_mode = Some("read-only".to_string());
+            let _ = runtime.block_on(gateway_client.detach_session(ensured_session_id, "tui"));
             match runtime.block_on(gateway_client.attach_session(
-                &ensured_session_id,
+                ensured_session_id,
                 "tui",
                 Some("reader"),
             )) {
                 Ok(attached) => {
-                    presence_heartbeat_interval =
+                    *presence_heartbeat_interval =
                         presence_heartbeat_interval_from_attachment(&attached);
-                    state.add_system_notice(
+                    state.app.add_system_notice(
                         SystemNoticeKind::Info,
                         "Gateway lifecycle downgraded to reader after writer lease rejection",
                     );
                 }
-                Err(reader_error) => state.add_system_notice(
+                Err(reader_error) => state.app.add_system_notice(
                     SystemNoticeKind::Error,
                     &format!("Gateway lifecycle reader fallback unavailable: {reader_error}"),
                 ),
             }
-            state.add_system_notice(
+            state.app.add_system_notice(
                 SystemNoticeKind::Error,
                 &format!("Gateway session lease unavailable: {err}"),
             );
         }
         None => {
             *gateway_lease_owner = None;
-            state.app.gateway_lease_owner = None;
-            state.app.gateway_lease_mode = Some("read-only".to_string());
+            state.app.gateway.gateway_lease_owner = None;
+            state.app.gateway.gateway_lease_mode = Some("read-only".to_string());
         }
     }
+}
 
+fn hydrate_gateway_runtime_state(
+    runtime: &tokio::runtime::Runtime,
+    gateway_client: &GatewayApiClient,
+    state: &mut TuiState,
+    config: &GatewayTuiConfig,
+    ensured_session_id: &str,
+    writable: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let execution_policy = runtime
         .block_on(resolve_tui_session_execution_policy(
             gateway_client,
-            &ensured_session_id,
+            ensured_session_id,
             config.startup_execution_policy.as_deref(),
-            writer_attached && gateway_lease_owner.is_some(),
+            writable,
         ))
         .map_err(|error| format!("Session execution policy unavailable: {error}"))?;
-    state.app.execution_policy_preset = execution_policy_preset(&execution_policy);
-    state.app.execution_policy_snapshot = Some(execution_policy.clone());
+    state.app.shell.execution_policy_preset = execution_policy_preset(&execution_policy);
+    state.app.shell.execution_policy_snapshot = Some(execution_policy.clone());
 
     let snapshot = runtime.block_on(
         crate::runtime_control_store::refresh_runtime_control_snapshot(
@@ -1385,38 +1168,36 @@ fn attach_gateway_session(
     match runtime.block_on(gateway_client.session_stats(&config.session_id)) {
         Ok(stats) => {
             state.app.apply_session_stats(stats);
-            state.add_system_notice(SystemNoticeKind::Info, "Gateway session statistics loaded");
+            state
+                .app
+                .add_system_notice(SystemNoticeKind::Info, "Gateway session statistics loaded");
         }
-        Err(err) => state.add_system_notice(
+        Err(err) => state.app.add_system_notice(
             SystemNoticeKind::Error,
             &format!("Gateway session statistics unavailable: {err}"),
         ),
     }
     match runtime.block_on(gateway_client.session_input_projection(&config.session_id)) {
         Ok(projection) => state.app.apply_session_input_projection(projection),
-        Err(err) => state.add_system_notice(
+        Err(err) => state.app.add_system_notice(
             SystemNoticeKind::Warning,
             &format!("Gateway queued-input projection unavailable: {err}"),
         ),
     }
     if let Some(readiness) = readiness {
-        state.add_system_notice(
+        state.app.add_system_notice(
             SystemNoticeKind::Info,
             &format!("Gateway runtime projection connected: readiness={readiness}, components={components}"),
         );
     }
     for reason in degraded_reasons.into_iter().take(3) {
-        state.add_system_notice(
+        state.app.add_system_notice(
             SystemNoticeKind::Warning,
             &format!("Gateway projection degraded: {reason}"),
         );
     }
 
-    state.add_system_notice(
-        SystemNoticeKind::Info,
-        "Gateway event stream subscribed for this session",
-    );
-    Ok((gateway_session_ids, presence_heartbeat_interval))
+    Ok(gateway_session_ids)
 }
 
 fn presence_heartbeat_interval_from_attachment(attachment: &serde_json::Value) -> Duration {
@@ -1630,8 +1411,9 @@ fn send_session_list(
 }
 
 fn take_pending_session_switch(state: &mut TuiState) -> Option<String> {
-    let index = state.session_sidebar.pending_switch_idx.take()?;
+    let index = state.session.session_sidebar.pending_switch_idx.take()?;
     state
+        .session
         .session_sidebar
         .sessions()
         .get(index)
@@ -1639,9 +1421,9 @@ fn take_pending_session_switch(state: &mut TuiState) -> Option<String> {
 }
 
 fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
-    if std::mem::take(&mut state.session_sidebar.pending_new_session) {
-        let model = state.app.requested_model.clone();
-        let preset = state.app.execution_policy_preset.clone();
+    if std::mem::take(&mut state.session.session_sidebar.pending_new_session) {
+        let model = state.app.shell.requested_model.clone();
+        let preset = state.app.shell.execution_policy_preset.clone();
         let preset = (!matches!(preset.as_str(), "unavailable" | "unresolved")
             && !preset.trim().is_empty())
         .then_some(preset);
@@ -1662,12 +1444,12 @@ fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
                         .pointer("/created/id")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown");
-                    state.add_system_notice(
+                    state.app.add_system_notice(
                         SystemNoticeKind::Info,
                         &format!("Session created: {id}. Select it and press Enter to switch."),
                     );
                 }
-                Err(error) => state.add_system_notice(
+                Err(error) => state.app.add_system_notice(
                     SystemNoticeKind::Error,
                     &format!("Session creation failed: {error}"),
                 ),
@@ -1675,8 +1457,9 @@ fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
         );
     }
 
-    if let Some((index, title)) = state.session_sidebar.pending_rename.take() {
+    if let Some((index, title)) = state.session.session_sidebar.pending_rename.take() {
         if let Some(session_id) = state
+            .session
             .session_sidebar
             .sessions()
             .get(index)
@@ -1690,9 +1473,11 @@ fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
                 |state, result| match result {
                     Ok(catalog) => {
                         state.apply_gateway_session_catalog(&catalog);
-                        state.add_system_notice(SystemNoticeKind::Info, "Session renamed");
+                        state
+                            .app
+                            .add_system_notice(SystemNoticeKind::Info, "Session renamed");
                     }
-                    Err(error) => state.add_system_notice(
+                    Err(error) => state.app.add_system_notice(
                         SystemNoticeKind::Error,
                         &format!("Session rename failed: {error}"),
                     ),
@@ -1701,15 +1486,16 @@ fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
         }
     }
 
-    if let Some(index) = state.session_sidebar.pending_delete_idx.take() {
+    if let Some(index) = state.session.session_sidebar.pending_delete_idx.take() {
         if let Some(session_id) = state
+            .session
             .session_sidebar
             .sessions()
             .get(index)
             .map(|session| session.id.clone())
         {
-            if session_id == state.app.session_id {
-                state.add_system_notice(
+            if session_id == state.app.shell.session_id {
+                state.app.add_system_notice(
                     SystemNoticeKind::Error,
                     "The active session cannot be deleted. Switch to another session first.",
                 );
@@ -1722,9 +1508,11 @@ fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
                     |state, result| match result {
                         Ok(catalog) => {
                             state.apply_gateway_session_catalog(&catalog);
-                            state.add_system_notice(SystemNoticeKind::Info, "Session deleted");
+                            state
+                                .app
+                                .add_system_notice(SystemNoticeKind::Info, "Session deleted");
                         }
-                        Err(error) => state.add_system_notice(
+                        Err(error) => state.app.add_system_notice(
                             SystemNoticeKind::Error,
                             &format!("Session deletion failed: {error}"),
                         ),
@@ -1734,10 +1522,11 @@ fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
         }
     }
 
-    if std::mem::take(&mut state.session_sidebar.pending_fork) {
-        state.session_sidebar.pending_fork_at = None;
-        let index = state.session_sidebar.selected_idx();
+    if std::mem::take(&mut state.session.session_sidebar.pending_fork) {
+        state.session.session_sidebar.pending_fork_at = None;
+        let index = state.session.session_sidebar.selected_idx();
         if let Some(session_id) = state
+            .session
             .session_sidebar
             .sessions()
             .get(index)
@@ -1758,12 +1547,12 @@ fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
                             .pointer("/branch/id")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("unknown");
-                        state.add_system_notice(
+                        state.app.add_system_notice(
                             SystemNoticeKind::Info,
                             &format!("Session branch created: {id}"),
                         );
                     }
-                    Err(error) => state.add_system_notice(
+                    Err(error) => state.app.add_system_notice(
                         SystemNoticeKind::Error,
                         &format!("Session branch failed: {error}"),
                     ),
@@ -1772,18 +1561,18 @@ fn consume_pending_session_sidebar_actions(state: &mut TuiState) {
         }
     }
 
-    if std::mem::take(&mut state.session_sidebar.pending_export) {
-        state.export_dialog.reset();
-        state.export_dialog_active = true;
+    if std::mem::take(&mut state.session.session_sidebar.pending_export) {
+        state.overlay.export_dialog.reset();
+        state.overlay.export_dialog_active = true;
         state.app.request_redraw();
     }
 }
 
 fn consume_pending_session_export(state: &mut TuiState) {
-    let Some(options) = state.pending_export_options.take() else {
+    let Some(options) = state.overlay.pending_export_options.take() else {
         return;
     };
-    let session_id = state.app.session_id.clone();
+    let session_id = state.app.shell.session_id.clone();
     let leaf = Path::new(&options.filename)
         .file_name()
         .and_then(|name| name.to_str())
@@ -1854,7 +1643,7 @@ fn consume_pending_session_export(state: &mut TuiState) {
             }))
         },
         move |state, result| match result {
-            Ok(receipt) => state.add_system_notice(
+            Ok(receipt) => state.app.add_system_notice(
                 SystemNoticeKind::Info,
                 &format!(
                     "Session exported to {} ({} messages)",
@@ -1868,7 +1657,7 @@ fn consume_pending_session_export(state: &mut TuiState) {
                         .unwrap_or_default()
                 ),
             ),
-            Err(error) => state.add_system_notice(
+            Err(error) => state.app.add_system_notice(
                 SystemNoticeKind::Error,
                 &format!("Session export failed: {error}"),
             ),
@@ -2207,7 +1996,7 @@ fn commit_prepared_session_switch(
         execution_policy,
         warnings,
     } = prepared;
-    let previous_session_id = state.app.session_id.clone();
+    let previous_session_id = state.app.shell.session_id.clone();
     if target_session_id == previous_session_id {
         return;
     }
@@ -2221,20 +2010,21 @@ fn commit_prepared_session_switch(
     let mut target_app = session_apps
         .remove(&target_session_id)
         .unwrap_or_else(|| App::new(&target_model, &target_session_id));
-    target_app.execution_policy_preset = execution_policy_preset(&execution_policy);
-    target_app.execution_policy_snapshot = Some(execution_policy.clone());
-    target_app.requested_model = (target_model != "unresolved").then(|| target_model.clone());
-    if target_app.model == "unresolved" && target_model != "unresolved" {
-        target_app.model = target_model;
+    target_app.shell.execution_policy_preset = execution_policy_preset(&execution_policy);
+    target_app.shell.execution_policy_snapshot = Some(execution_policy.clone());
+    target_app.shell.requested_model = (target_model != "unresolved").then(|| target_model.clone());
+    if target_app.shell.model == "unresolved" && target_model != "unresolved" {
+        target_app.shell.model = target_model;
     }
-    if target_app.file_entries.is_empty() {
-        target_app.file_entries = state.app.file_entries.clone();
+    if target_app.workbench.file_entries.is_empty() {
+        target_app.workbench.file_entries = state.app.workbench.file_entries.clone();
     }
     let previous_app = std::mem::replace(&mut state.app, target_app);
     let authority_generation = session_authorities.begin(&target_session_id);
     state.install_session_authority(authority_generation);
     session_apps.insert(previous_session_id.clone(), previous_app);
     state
+        .session
         .session_sidebar
         .set_current_session(&target_session_id);
     *gateway_lease_owner = lease
@@ -2242,8 +2032,8 @@ fn commit_prepared_session_switch(
         .and_then(|lease| lease.get("owner"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
-    state.app.gateway_lease_owner = gateway_lease_owner.clone();
-    state.app.gateway_lease_mode = lease
+    state.app.gateway.gateway_lease_owner = gateway_lease_owner.clone();
+    state.app.gateway.gateway_lease_mode = lease
         .as_ref()
         .and_then(|lease| lease.get("mode"))
         .and_then(serde_json::Value::as_str)
@@ -2283,7 +2073,7 @@ fn commit_prepared_session_switch(
             }
         }
     }
-    state.add_system_notice(
+    state.app.add_system_notice(
         SystemNoticeKind::Info,
         &format!(
             "Switched session {previous_session_id} → {target_session_id}; target lifecycle={}, seq={}",
@@ -2298,7 +2088,9 @@ fn commit_prepared_session_switch(
         ),
     );
     for warning in warnings {
-        state.add_system_notice(SystemNoticeKind::Warning, &warning);
+        state
+            .app
+            .add_system_notice(SystemNoticeKind::Warning, &warning);
     }
     session_source_bridges.retain(|_, task| !task.is_finished());
     if let Some(stale_bridge) = session_source_bridges.remove(&target_session_id) {
@@ -2416,7 +2208,9 @@ fn dispatch_gateway_slash(
             }
         }
     });
-    state.add_slash_output(&cmd_name, "Slash dispatched to Gateway");
+    state
+        .app
+        .add_slash_output(&cmd_name, "Slash dispatched to Gateway");
     state.open_surface_for_slash_result(&cmd_name);
 }
 
@@ -2801,7 +2595,7 @@ fn dispatch_execution_projection_command(
     authority_generation: u64,
     command: ExecutionCommandKind,
 ) {
-    let Some(projection) = state.app.latest_execution_projection.as_ref() else {
+    let Some(projection) = state.app.execution.latest_execution_projection.as_ref() else {
         let _ = tx.send(CowdEvent::Warning {
             message: "No active execution projection is available for this command".to_string(),
         });
@@ -3130,6 +2924,91 @@ fn is_transient_app_transport_failure(failure: &AppTransportFailure) -> bool {
             }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn route_cowd_event_scope(
+    event: CowdEvent,
+    state: &mut TuiState,
+    execution_projection_source: &mut ExecutionProjectionReducerController,
+    session_apps: &mut BTreeMap<String, App>,
+    session_authorities: &mut SessionAuthorityRegistry,
+    gateway_lease_owner: &mut Option<String>,
+    app_transport_controller: &mut AppTransportController,
+    session_source_bridges: &mut BTreeMap<String, tokio::task::JoinHandle<()>>,
+) -> Option<CowdEvent> {
+    let event = match event {
+        CowdEvent::SessionScoped {
+            session_id,
+            authority_generation,
+            event: scoped,
+        } => {
+            if let CowdEvent::SessionAuthorizationRevoked { reason, .. } = scoped.as_ref() {
+                let reason = reason.clone();
+                if session_authorities.revoke(&session_id, authority_generation) {
+                    if let Some(bridge) = session_source_bridges.remove(&session_id) {
+                        bridge.abort();
+                    }
+                    if session_id == state.app.shell.session_id {
+                        execution_projection_source.revoke_session_authorization();
+                        app_transport_controller.stop_all();
+                        *gateway_lease_owner = None;
+                        state.app.gateway.gateway_lease_owner = None;
+                        state.app.gateway.gateway_lease_mode =
+                            Some("authorization-revoked".to_string());
+                        state.revoke_session_authority(&reason);
+                    } else if let Some(app) = session_apps.get_mut(&session_id) {
+                        app.revoke_session_authorization(&reason);
+                    }
+                }
+                return None;
+            }
+            if !session_authorities.accepts(&session_id, authority_generation) {
+                return None;
+            }
+            if session_id != state.app.shell.session_id {
+                if let Some(app) = session_apps.get_mut(&session_id) {
+                    app.apply_event(*scoped);
+                }
+                return None;
+            }
+            *scoped
+        }
+        event => {
+            if let Some(session_id) = cowd_event_session_id(&event) {
+                if session_authorities.current(session_id).is_none() {
+                    return None;
+                }
+                if session_id != state.app.shell.session_id {
+                    if let Some(app) = session_apps.get_mut(session_id) {
+                        app.apply_event(event);
+                    }
+                    return None;
+                }
+            }
+            event
+        }
+    };
+    if let CowdEvent::SessionAuthorizationRevoked { session_id, reason } = &event {
+        let current_generation = session_authorities.current(session_id);
+        if current_generation
+            .is_some_and(|generation| session_authorities.revoke(session_id, generation))
+        {
+            if let Some(bridge) = session_source_bridges.remove(session_id) {
+                bridge.abort();
+            }
+            if session_id == &state.app.shell.session_id {
+                app_transport_controller.stop_all();
+                *gateway_lease_owner = None;
+                state.revoke_session_authority(reason);
+            } else if let Some(app) = session_apps.get_mut(session_id) {
+                app.revoke_session_authorization(reason);
+            }
+        }
+        execution_projection_source.revoke_session_authorization();
+        return None;
+    }
+    Some(event)
+}
+
 async fn drain_cowd_events_state(
     rx: &mut crate::CowdEventReceiver,
     state: &mut TuiState,
@@ -3144,96 +3023,23 @@ async fn drain_cowd_events_state(
 ) {
     let mut count = 0;
     let limit = if state.app.turn_is_active() { 64 } else { 256 };
-    while let Ok(mut event) = rx.try_recv() {
-        if let CowdEvent::SessionScoped {
-            session_id,
-            authority_generation,
-            event: scoped,
-        } = event
-        {
-            if let CowdEvent::SessionAuthorizationRevoked { reason, .. } = scoped.as_ref() {
-                let reason = reason.clone();
-                if session_authorities.revoke(&session_id, authority_generation) {
-                    if let Some(bridge) = session_source_bridges.remove(&session_id) {
-                        bridge.abort();
-                    }
-                    if session_id == state.app.session_id {
-                        execution_projection_source.revoke_session_authorization();
-                        app_transport_controller.stop_all();
-                        *gateway_lease_owner = None;
-                        state.app.gateway_lease_owner = None;
-                        state.app.gateway_lease_mode = Some("authorization-revoked".to_string());
-                        state.revoke_session_authority(&reason);
-                    } else if let Some(app) = session_apps.get_mut(&session_id) {
-                        app.revoke_session_authorization(&reason);
-                    }
-                }
-                count += 1;
-                if count >= limit {
-                    break;
-                }
-                continue;
-            }
-            if !session_authorities.accepts(&session_id, authority_generation) {
-                count += 1;
-                if count >= limit {
-                    break;
-                }
-                continue;
-            }
-            if session_id != state.app.session_id {
-                if let Some(app) = session_apps.get_mut(&session_id) {
-                    app.apply_event(*scoped);
-                }
-                count += 1;
-                if count >= limit {
-                    break;
-                }
-                continue;
-            }
-            event = *scoped;
-        } else if let Some(session_id) = cowd_event_session_id(&event) {
-            if session_authorities.current(session_id).is_none() {
-                count += 1;
-                if count >= limit {
-                    break;
-                }
-                continue;
-            }
-            if session_id != state.app.session_id {
-                if let Some(app) = session_apps.get_mut(session_id) {
-                    app.apply_event(event);
-                }
-                count += 1;
-                if count >= limit {
-                    break;
-                }
-                continue;
-            }
-        }
-        if let CowdEvent::SessionAuthorizationRevoked { session_id, reason } = &event {
-            let current_generation = session_authorities.current(session_id);
-            if current_generation
-                .is_some_and(|generation| session_authorities.revoke(session_id, generation))
-            {
-                if let Some(bridge) = session_source_bridges.remove(session_id) {
-                    bridge.abort();
-                }
-                if session_id == &state.app.session_id {
-                    app_transport_controller.stop_all();
-                    *gateway_lease_owner = None;
-                    state.revoke_session_authority(reason);
-                } else if let Some(app) = session_apps.get_mut(session_id) {
-                    app.revoke_session_authorization(reason);
-                }
-            }
-            execution_projection_source.revoke_session_authorization();
+    while let Ok(event) = rx.try_recv() {
+        let Some(event) = route_cowd_event_scope(
+            event,
+            state,
+            execution_projection_source,
+            session_apps,
+            session_authorities,
+            gateway_lease_owner,
+            app_transport_controller,
+            session_source_bridges,
+        ) else {
             count += 1;
             if count >= limit {
                 break;
             }
             continue;
-        }
+        };
         let execution_id = event_selected_execution_id(&event, &state.app);
         if let CowdEvent::ExecutionProjectionDelta { generation, delta } = &event {
             if execution_projection_source.accepts(*generation, &delta.execution_id) {
@@ -3328,7 +3134,9 @@ async fn drain_cowd_events_state(
         {
             if execution_projection_source.accepts(*generation, execution_id) {
                 execution_projection_source.finish_snapshot_request(*generation, execution_id);
-                state.add_system_notice(SystemNoticeKind::Warning, message);
+                state
+                    .app
+                    .add_system_notice(SystemNoticeKind::Warning, message);
             }
             count += 1;
             if count >= limit {
@@ -3362,7 +3170,7 @@ async fn drain_cowd_events_state(
                     install,
                     crate::protocol::ProjectionDeltaApply::ResyncRequired
                 ) {
-                    state.add_system_notice(
+                    state.app.add_system_notice(
                         SystemNoticeKind::Warning,
                         "Execution projection snapshot failed the local cursor/schema guard",
                     );
@@ -3401,6 +3209,7 @@ async fn drain_cowd_events_state(
                 .or_else(|| {
                     state
                         .app
+                        .execution
                         .latest_execution_projection
                         .as_ref()
                         .map(|projection| projection.execution_id.clone())
@@ -3412,7 +3221,7 @@ async fn drain_cowd_events_state(
                     execution_id = %next_execution_id,
                     "TUI selected canonical execution projection"
                 );
-                state.app.projection_connection_state =
+                state.app.execution.projection_connection_state =
                     Some(crate::protocol::SessionStreamConnectionState::Connecting);
                 if let Some(previous_execution_id) = previous_execution_id
                     .filter(|previous_execution_id| previous_execution_id != next_execution_id)
@@ -3503,10 +3312,10 @@ fn event_selected_execution_id(event: &CowdEvent, app: &crate::App) -> Option<St
         CowdEvent::ExecutionGraphSummary { summary } => {
             let incoming = summary.graph_id.as_deref()?;
             (!app.execution_is_terminalized(incoming)
-                && (app.current_execution_id.is_none()
-                    || app.current_execution_id.as_deref() == Some(incoming)
+                && (app.execution.current_execution_id.is_none()
+                    || app.execution.current_execution_id.as_deref() == Some(incoming)
                     || !app.turn_is_active()
-                    || app.current_execution_status.is_some_and(
+                    || app.execution.current_execution_status.is_some_and(
                         harness_contract::projection::ExecutionLiveStatus::is_terminal,
                     )))
             .then(|| incoming.to_string())
@@ -3515,10 +3324,11 @@ fn event_selected_execution_id(event: &CowdEvent, app: &crate::App) -> Option<St
             event: crate::protocol::GatewaySessionEvent::UserMessageCommitted { correlation, .. },
         } => {
             let incoming = correlation.execution_id.as_deref()?;
-            (app.current_execution_id.is_none()
-                || app.current_execution_id.as_deref() == Some(incoming)
+            (app.execution.current_execution_id.is_none()
+                || app.execution.current_execution_id.as_deref() == Some(incoming)
                 || !app.turn_is_active()
                 || app
+                    .execution
                     .current_execution_status
                     .is_some_and(harness_contract::projection::ExecutionLiveStatus::is_terminal))
             .then(|| incoming.to_string())
@@ -4119,7 +3929,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(state.app.session_id, "session-b");
+        assert_eq!(state.app.shell.session_id, "session-b");
         assert!(state.app.timeline_iter().all(|(_, entry)| !matches!(
             entry,
             crate::app::TimelineEntry::Message { content, .. }
@@ -4182,10 +3992,11 @@ mod tests {
 
         let mut running_app = crate::App::new("model", "session-1");
         running_app
+            .execution
             .turn_interaction
             .ingress_accepted("execution-running");
-        running_app.current_execution_id = Some("execution-running".to_string());
-        running_app.current_execution_status =
+        running_app.execution.current_execution_id = Some("execution-running".to_string());
+        running_app.execution.current_execution_status =
             Some(harness_contract::projection::ExecutionLiveStatus::CallingModel);
         assert!(
             event_selected_execution_id(&event, &running_app).is_none(),
@@ -4402,7 +4213,7 @@ mod tests {
             controller.selected_execution_id().as_deref(),
             Some("execution-new")
         );
-        assert!(state.app.latest_execution_projection.is_none());
+        assert!(state.app.execution.latest_execution_projection.is_none());
         let pending = controller
             .snapshot_request
             .as_ref()
@@ -4469,8 +4280,8 @@ mod tests {
     async fn e10_revoked_authority_rejects_late_history_session_resource_and_app_results() {
         let (tx, mut rx) = crate::cowd_event_channel();
         let mut state = TuiState::new("model-sensitive", "session-sensitive");
-        state.app.gateway_lease_owner = Some("writer-a".to_string());
-        state.app.gateway_lease_mode = Some("collaborative".to_string());
+        state.app.gateway.gateway_lease_owner = Some("writer-a".to_string());
+        state.app.gateway.gateway_lease_mode = Some("collaborative".to_string());
         let mut gateway_lease_owner = Some("writer-a".to_string());
         let mut session_apps = BTreeMap::new();
         let mut authorities = SessionAuthorityRegistry::default();
@@ -4514,7 +4325,7 @@ mod tests {
             &mut bridges,
         )
         .await;
-        let render_version_after_revoke = state.app.render_version;
+        let render_version_after_revoke = state.app.timeline.render_version;
 
         tx.send(CowdEvent::SessionScoped {
             session_id: "session-sensitive".to_string(),
@@ -4614,11 +4425,11 @@ mod tests {
         assert!(projection_abort.is_finished());
         assert!(bridge_abort.is_finished());
         assert!(gateway_lease_owner.is_none());
-        assert!(state.app.gateway_lease_owner.is_none());
+        assert!(state.app.gateway.gateway_lease_owner.is_none());
         assert!(authorities.current("session-sensitive").is_none());
-        assert!(state.app.pending_resources.is_empty());
+        assert!(state.app.workbench.pending_resources.is_empty());
         assert_eq!(
-            state.app.render_version, render_version_after_revoke,
+            state.app.timeline.render_version, render_version_after_revoke,
             "late history/session/resource/APP results must not dirty the revoked surface"
         );
         assert!(state.app.timeline_iter().all(|(_, entry)| !matches!(

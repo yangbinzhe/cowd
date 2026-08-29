@@ -10,11 +10,15 @@
 
 #[path = "rendering/accessibility.rs"]
 pub mod accessibility;
+#[path = "app_core/action.rs"]
+pub(crate) mod action;
 #[path = "rendering/animation.rs"]
 pub mod animation;
 #[path = "app_core/app.rs"]
 pub mod app;
 pub mod app_core;
+#[path = "app_core/app_model.rs"]
+pub(crate) mod app_model;
 #[path = "app_core/app_surface_host.rs"]
 pub mod app_surface_host;
 #[path = "app_core/boundary_policy.rs"]
@@ -26,6 +30,8 @@ pub mod components;
 pub mod config_migration;
 #[path = "platform/context_tokens.rs"]
 pub mod context_tokens;
+#[path = "app_core/effect.rs"]
+pub(crate) mod effect;
 #[path = "platform/error_recovery.rs"]
 pub mod error_recovery;
 pub mod event;
@@ -47,6 +53,8 @@ pub mod performance;
 pub mod profiler;
 #[path = "app_core/protocol.rs"]
 pub mod protocol;
+#[path = "app_core/reducer.rs"]
+pub(crate) mod reducer;
 #[path = "rendering/render.rs"]
 pub mod render;
 #[path = "gateway/runner.rs"]
@@ -55,6 +63,8 @@ pub mod runner;
 pub mod runtime_control_store;
 #[path = "rendering/scroll_state.rs"]
 pub mod scroll_state;
+#[path = "app_core/selectors.rs"]
+pub(crate) mod selectors;
 #[path = "rendering/skin.rs"]
 pub mod skin;
 #[path = "app_core/state.rs"]
