@@ -94,6 +94,18 @@ The first typed-`review_of` run then exposed a fourth false positive during huma
 | root cause | generic tool-result limits compacted large complete-read JSON before the next Provider request; Agent acceptance and the evaluator counted the durable raw receipt rather than model-visible content |
 | disposition | exact obligations now receive bounded full-delivery budget; omitted exact bodies are filtered from Agent `observed_acceptance`; the evaluator reads only Agent-owned observed acceptance and rejects the newly observed contradiction language |
 
+The first fail-closed candidate correctly stopped the false pass, but exposed an invalid evidence join and therefore remains rejected:
+
+| Observation | Value |
+|---|---|
+| report | `/tmp/cowd-qwen38-quality-v0910-model-observed-final/runs/v0.9.710-1787994705-mission-harness-deep/report.json` |
+| isolated Gateway | `/tmp/cowd-real-qwen-gateway.Mahx7D` |
+| candidate / binary | `b7e2c6d4`; SHA-256 `f0a631983e15c54a90a0c4016245f4d0264553cf6418921fbec13c68bd06ffdd` |
+| result | failed as designed instead of falsely passing; exact observations were not promoted, first-wave investigators failed and downstream Teams were blocked |
+| forensic evidence | Provider trace contained no omission marker and the artifact store held both ToolHost and Conversation copies of complete outputs; the failure was not a read or context-budget failure |
+| association defect | the filter joined ToolHost semantic evidence access to Conversation delivery audit by content access metadata. These are independently owned evidence namespaces and must not rely on incidental digest/byte equality |
+| final repair | correlate each model delivery through the Conversation-owned stable join `ToolObservation.raw_ref == EvidenceAuditProjection.evidence_ref`; require a non-error, zero-omission delivery audit for every exact read receipt in the Agent |
+
 ## Implemented gates
 
 - Agent semantic results are lossless and retain unknown structured fields.
@@ -114,6 +126,7 @@ The first typed-`review_of` run then exposed a fourth false positive during huma
 - The large-scale gate now requires exact-content receipts from two distinct stable Agent execution identities for every one of the twelve target paths; duplicated projections and repeated reads by one Agent do not count twice, and localized/opaque role ids require no special case.
 - The terminal presentation must positively state independent reviewer coverage and is rejected if it also contains a source-visibility or receipt-only caveat.
 - Exact-content acquisition and exact model observation are now separate facts. The Agent runtime expands its tool-delivery budget only for an explicit exact obligation, preserves the Provider preflight ceiling, and refuses to promote an omitted body into semantic acceptance.
+- Model-delivery proof is joined inside the Conversation evidence namespace through the raw evidence identity; ToolHost and Conversation artifacts are never cross-joined by coincidental hashes.
 - The live source gates consume only Agent terminal `observed_acceptance`; raw durable tool receipts elsewhere in the timeline can prove acquisition but cannot make source coverage pass.
 
 ## Deterministic verification

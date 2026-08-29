@@ -703,6 +703,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let observed_evidence = model_observed_evidence(
             packet_requires_exact_content(&packet),
             &summary.context_turn_report.audit_projections,
+            &summary.context_turn_report.observations,
             &scoped_receipts,
         );
         let evidence_refs = agent_evidence_refs(
@@ -2822,8 +2823,44 @@ fn agent_evidence_refs(
 fn model_observed_evidence(
     exact_delivery_required: bool,
     audits: &[harness_contract::context::EvidenceAuditProjection],
+    observations: &[harness_contract::context::ToolObservation],
     receipts: &[ScopedToolExecutionReceipt],
 ) -> Vec<harness_contract::context::ObservedEvidence> {
+    let exact_read_receipt_count = receipts
+        .iter()
+        .flat_map(|receipt| receipt.observed_evidence.iter())
+        .filter(|observed| {
+            matches!(
+                &observed.target,
+                harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                    if scope.coverage
+                        == harness_contract::context::EvidenceCoverageKind::ExactContent
+            )
+        })
+        .count();
+    // ToolObservation and EvidenceAuditProjection share the Conversation
+    // Runtime's raw evidence identity. Scoped ToolHost evidence deliberately
+    // has a different durable identity, so correlating by its artifact hash
+    // confuses acquisition with delivery. An exact Agent succeeds only when
+    // every successful read receipt has a matching, non-omitting model-facing
+    // observation. If any read was compacted, promote none of the exact
+    // receipts and let typed acceptance fail closed.
+    let model_read_audits = observations
+        .iter()
+        .filter(|observation| observation.tool_name == "read_file")
+        .filter_map(|observation| {
+            audits
+                .iter()
+                .find(|audit| audit.evidence_ref == observation.raw_ref)
+        })
+        .filter(|audit| audit.content_kind != harness_contract::context::EvidenceContentKind::Error)
+        .collect::<Vec<_>>();
+    let exact_delivery_complete = !exact_delivery_required
+        || (exact_read_receipt_count > 0
+            && model_read_audits.len() >= exact_read_receipt_count
+            && model_read_audits
+                .iter()
+                .all(|audit| audit.omitted_tokens == 0));
     receipts
         .iter()
         .flat_map(|receipt| receipt.observed_evidence.iter())
@@ -2838,15 +2875,7 @@ fn model_observed_evidence(
             if !exact_content {
                 return true;
             }
-            let Some(access) = observed.evidence_ref.as_ref() else {
-                return false;
-            };
-            audits.iter().any(|audit| {
-                audit.omitted_tokens == 0
-                    && audit.access.as_ref().is_some_and(|model_access| {
-                        model_access.sha256 == access.sha256 && model_access.bytes == access.bytes
-                    })
-            })
+            exact_delivery_complete
         })
         .cloned()
         .collect()
@@ -5752,11 +5781,18 @@ mod tests {
             raw_available: true,
             access: Some(access.clone()),
         };
+        let observation = harness_contract::context::ToolObservation::new(
+            "read_file",
+            "tool-call-1",
+            complete.evidence_ref.clone(),
+            "complete file body",
+        );
 
         assert_eq!(
             model_observed_evidence(
                 true,
                 std::slice::from_ref(&complete),
+                std::slice::from_ref(&observation),
                 std::slice::from_ref(&receipt)
             ),
             vec![observed.clone()]
@@ -5764,11 +5800,15 @@ mod tests {
 
         let mut omitted = complete;
         omitted.omitted_tokens = 1;
-        assert!(
-            model_observed_evidence(true, &[omitted], std::slice::from_ref(&receipt)).is_empty()
-        );
+        assert!(model_observed_evidence(
+            true,
+            &[omitted],
+            std::slice::from_ref(&observation),
+            std::slice::from_ref(&receipt)
+        )
+        .is_empty());
         assert_eq!(
-            model_observed_evidence(false, &[], &[receipt]),
+            model_observed_evidence(false, &[], &[], &[receipt]),
             vec![observed]
         );
     }
