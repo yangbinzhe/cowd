@@ -715,7 +715,7 @@ pub use runtime_event_store::{
     RuntimeProjectionEventInterest, RuntimeProjectionInterest, RuntimeProjectionScanPage,
     RuntimeProjectionWorkClass, RuntimeSessionOutboxFailureClass, RuntimeSessionOutboxHealth,
     RuntimeSessionOutboxRecord, RuntimeSessionTerminalFenceAdoption, RuntimeTransactionEventInput,
-    SessionTerminalInput,
+    SessionTerminalInput, SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
 };
 pub use runtime_memory_summarizer::RuntimeMemorySummarizer;
 pub use sandbox::{

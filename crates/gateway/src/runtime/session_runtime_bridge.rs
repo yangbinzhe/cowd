@@ -2972,10 +2972,15 @@ pub(crate) fn decode_terminal_payload(
     let schema_version = payload
         .get("schema_version")
         .and_then(serde_json::Value::as_u64);
-    if !matches!(schema_version, Some(1 | 2)) {
+    if !schema_version.is_some_and(|version| {
+        (1..=runtime::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION).contains(&version)
+    }) {
         return Err((
             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-            "terminal artifact schema_version must be 1 or 2".to_string(),
+            format!(
+                "terminal artifact schema_version must be in 1..={}",
+                runtime::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION
+            ),
         ));
     }
     let text = payload
@@ -3038,16 +3043,35 @@ pub(crate) fn decode_terminal_payload(
             )
         })?
         .unwrap_or(harness_contract::goal::GoalCompletion::Satisfied);
-    if schema_version == Some(2)
+    if schema_version.is_some_and(|version| version >= 2)
         && !terminal_presentation.as_ref().is_some_and(|presentation| {
             presentation.state == harness_contract::outcome::TerminalPresentationState::Committed
         })
     {
         return Err((
             runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
-            "terminal artifact schema_version 2 requires a committed terminal_presentation"
+            "terminal artifact schema_version 2+ requires a committed terminal_presentation"
                 .to_string(),
         ));
+    }
+    if schema_version == Some(3) {
+        let collaboration_evidence = payload.get("collaboration_evidence").ok_or_else(|| {
+            (
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                "terminal artifact schema_version 3 requires collaboration_evidence".to_string(),
+            )
+        })?;
+        if !collaboration_evidence.is_null()
+            && !collaboration_evidence
+                .as_str()
+                .is_some_and(|evidence| !evidence.trim().is_empty())
+        {
+            return Err((
+                runtime::RuntimeSessionOutboxFailureClass::CorruptPayload,
+                "terminal artifact collaboration_evidence must be null or a non-empty string"
+                    .to_string(),
+            ));
+        }
     }
     let messages = payload
         .get("transcript")
@@ -3664,6 +3688,80 @@ mod tests {
         )
         .is_err());
         assert!(decode_terminal_payload(b"not-json").is_err());
+    }
+
+    #[test]
+    fn terminal_payload_schema_three_round_trips_collaboration_terminal() {
+        let terminal_presentation = serde_json::json!({
+            "presentation_id": "presentation-1",
+            "attempt_id": "attempt-1",
+            "envelope_id": "envelope-1",
+            "envelope_revision": 3,
+            "state": "committed",
+            "answer_origin": "terminal_narrator",
+            "models_attempted": [],
+            "validation": {"status": "valid", "findings": []},
+            "generated_at_ms": 10,
+            "committed_at_ms": 11
+        });
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "schema_version": runtime::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
+            "text": "complete collaboration answer.",
+            "collaboration_evidence": "{\"kind\":\"cowd.runtime.collaboration_evidence.v1\"}",
+            "terminal_presentation": terminal_presentation,
+            "ingress_message_id": "ingress-1",
+            "consumed_input_sequence": 0,
+            "token_usage": {"input_tokens": 12, "output_tokens": 3},
+            "transcript": [{
+                "role": "assistant",
+                "blocks": [{"type": "text", "text": "complete collaboration answer."}]
+            }]
+        }))
+        .unwrap();
+
+        let decoded = decode_terminal_payload(&payload).unwrap();
+        assert_eq!(decoded.text, "complete collaboration answer.");
+        assert_eq!(
+            decoded
+                .terminal_presentation
+                .as_ref()
+                .map(|presentation| presentation.state),
+            Some(harness_contract::outcome::TerminalPresentationState::Committed)
+        );
+    }
+
+    #[test]
+    fn terminal_payload_schema_three_fails_closed_on_partial_migration() {
+        let common = serde_json::json!({
+            "text": "done.",
+            "ingress_message_id": "ingress-1",
+            "consumed_input_sequence": 0,
+            "token_usage": {"input_tokens": 1, "output_tokens": 1},
+            "transcript": [{
+                "role": "assistant",
+                "blocks": [{"type": "text", "text": "done."}]
+            }],
+            "terminal_presentation": {
+                "presentation_id": "presentation-1",
+                "attempt_id": "attempt-1",
+                "envelope_id": "envelope-1",
+                "envelope_revision": 3,
+                "state": "committed",
+                "answer_origin": "terminal_narrator",
+                "models_attempted": [],
+                "validation": {"status": "valid", "findings": []},
+                "generated_at_ms": 10,
+                "committed_at_ms": 11
+            }
+        });
+        let mut missing_evidence = common.clone();
+        missing_evidence["schema_version"] = serde_json::json!(3);
+        assert!(decode_terminal_payload(&serde_json::to_vec(&missing_evidence).unwrap()).is_err());
+
+        let mut future_schema = common;
+        future_schema["schema_version"] = serde_json::json!(4);
+        future_schema["collaboration_evidence"] = serde_json::Value::Null;
+        assert!(decode_terminal_payload(&serde_json::to_vec(&future_schema).unwrap()).is_err());
     }
 
     #[tokio::test]

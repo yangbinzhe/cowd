@@ -10303,7 +10303,7 @@ where
                 .map(|(_, value)| value.as_str())
                 .filter(|value| is_collaboration_evidence_carrier(value));
             let terminal_payload = serde_json::to_vec(&serde_json::json!({
-                "schema_version": 3,
+                "schema_version": crate::SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION,
                 "text": final_answer,
                 // The user-facing synthesis and its complete source carrier
                 // are committed atomically. Presentation limits can therefore

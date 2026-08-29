@@ -25,6 +25,11 @@ const EVENT_SCHEMA_VERSION: u32 = 1;
 const MAX_TRANSACTION_EVENTS: usize = 10_000;
 const MAX_TRANSACTION_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_TERMINAL_ARTIFACT_REF_PREFIX: &str = "terminal_artifact_v1:";
+/// Latest Session terminal artifact payload schema emitted by Runtime.
+///
+/// Gateway consumers accept every positive version through this value so a
+/// writer/reader rollout cannot drift through duplicated numeric literals.
+pub const SESSION_TERMINAL_ARTIFACT_SCHEMA_VERSION: u64 = 3;
 /// Projection lanes share SQLite's single writer with foreground lifecycle
 /// commits.  They must yield quickly under a sustained write load, but an
 /// immediate (0ms) failure turns ordinary writer hand-off into noisy failed
