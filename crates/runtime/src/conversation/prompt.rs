@@ -271,7 +271,11 @@ impl SystemPromptBuilder {
         sections.push(get_simple_system_section());
         sections.push(get_simple_doing_tasks_section());
         sections.push(get_actions_section());
-        sections.push(crate::capability_manifest::runtime_capability_primer());
+        sections.push(if self.uses_compact_capability_primer() {
+            crate::capability_manifest::compact_runtime_capability_primer()
+        } else {
+            crate::capability_manifest::runtime_capability_primer()
+        });
         sections.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
         sections.push(self.environment_section());
         if let Some(config) = &self.config {
@@ -284,6 +288,18 @@ impl SystemPromptBuilder {
     #[must_use]
     pub fn render(&self) -> String {
         self.build().join("\n\n")
+    }
+
+    fn uses_compact_capability_primer(&self) -> bool {
+        const COMPACT_PRIMER_MAX_CONTEXT_TOKENS: u32 = 32_768;
+        let Some(config) = self.config.as_ref() else {
+            return false;
+        };
+        let Some(model) = config.resolved_model() else {
+            return false;
+        };
+        provider::model_context_window_with_overrides(&model, Some(config.model_context_windows()))
+            <= COMPACT_PRIMER_MAX_CONTEXT_TOKENS
     }
 
     fn environment_section(&self) -> String {
@@ -949,6 +965,57 @@ mod tests {
         assert!(rendered.contains("subagent, team"));
         assert!(rendered.contains("runtime-owned"));
         assert!(rendered.contains("runtime_capabilities"));
+    }
+
+    #[test]
+    fn explicit_small_context_uses_capacity_safe_capability_primer() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".cowd")).expect("config directory");
+        fs::write(
+            root.join(".cowd/config.yaml"),
+            "model: compact-fixture\nmodel_context_windows:\n  compact-fixture: 16384\n",
+        )
+        .expect("write compact model config");
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("load compact model config");
+
+        let rendered = SystemPromptBuilder::new()
+            .with_runtime_config(config)
+            .render();
+
+        assert!(rendered.contains("Collaboration invariants:"));
+        assert!(rendered.contains("submit_collaboration_decision"));
+        assert!(rendered.contains("Exact-file evidence"));
+        assert!(!rendered
+            .contains("Each declared result artifact is a required terminal structured field"));
+        assert!(
+            crate::context_ledger::estimate_text_tokens(&rendered) < 8_000,
+            "capacity-safe stable prompt must leave room for history, tools and output"
+        );
+        fs::remove_dir_all(root).expect("cleanup compact model config");
+    }
+
+    #[test]
+    fn large_context_keeps_full_collaboration_contract() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".cowd")).expect("config directory");
+        fs::write(
+            root.join(".cowd/config.yaml"),
+            "model: large-fixture\nmodel_context_windows:\n  large-fixture: 1000000\n",
+        )
+        .expect("write large model config");
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("load large model config");
+
+        let rendered = SystemPromptBuilder::new()
+            .with_runtime_config(config)
+            .render();
+
+        assert!(rendered
+            .contains("Each declared result artifact is a required terminal structured field"));
+        fs::remove_dir_all(root).expect("cleanup large model config");
     }
 
     #[test]

@@ -562,6 +562,55 @@ pub fn runtime_capability_primer() -> String {
     lines.join("\n")
 }
 
+/// Capacity-safe primer for explicitly configured small-context models.
+///
+/// The full catalog remains available through `runtime_capabilities` and the
+/// active native tool schemas. This projection keeps every routing invariant
+/// while avoiding the self-defeating case where catalog prose consumes the
+/// complete provider window before durable conversation history can be sent.
+#[must_use]
+pub fn compact_runtime_capability_primer() -> String {
+    let manifest = RuntimeCapabilityManifest::current();
+    let catalog = RuntimeCapabilityCatalog::current();
+    let mut lines = vec![
+        "# Runtime capability awareness".to_string(),
+        "You run inside Cowd AI Harness. Choose the most efficient available runtime capability; catalog names are callable only when their native schemas are supplied for this request.".to_string(),
+        "The complete versioned catalog and templates are available through `runtime_capabilities`; inspect them instead of guessing omitted physical details.".to_string(),
+        String::new(),
+        "Core capabilities:".to_string(),
+    ];
+    for capability in &manifest.capabilities {
+        lines.push(format!("- `{}`: {}", capability.id, capability.summary));
+    }
+    lines.push(String::new());
+    lines.push("Runtime action routing:".to_string());
+    for action in &catalog.action_contracts {
+        lines.push(format!(
+            "- `{}` -> `runtime_orchestrate({})`: {}",
+            action.runtime_action, action.tool_action, action.when_to_use
+        ));
+    }
+    lines.extend([
+        String::new(),
+        "Collaboration invariants:".to_string(),
+        "- If the user explicitly names Teams, roles, responsibilities, or organization, use the active `submit_collaboration_decision` schema with semantic workstreams; do not substitute a catalog template.".to_string(),
+        "- For a reusable published Team, call `runtime_capabilities(detail=team_templates)` in the same turn and copy exact template and role IDs.".to_string(),
+        "- Preserve requested role display names. Runtime resolves Agents, leases, grants, tools and graph IDs; never invent those physical bindings.".to_string(),
+        "- Declare typed dependencies and result artifacts. A synthesis Team needs one terminal role producing every required artifact; evidence-required results must include evidence, and empty unresolved lists remain explicit.".to_string(),
+        "- Independent verification uses `review_of`; handoff/aggregate dependencies do not authorize independent evidence reacquisition.".to_string(),
+        "- Exact-file evidence requires the complete file from line 1 through EOF with a valid digest. If it cannot fit, fail closed and repartition the assignment.".to_string(),
+        "- Read validation findings and repair rejected proposals; never retry an unchanged recipe or invent unsupported operations/role IDs.".to_string(),
+        String::new(),
+        "Operational invariants:".to_string(),
+        "- Batch or parallelize independent read-only evidence; keep required writes and synthesis required and ordered.".to_string(),
+        "- Treat current explicit user instructions as authoritative over conflicting recalled memory.".to_string(),
+        "- Use `context_retrieve` for missing authorized context and `runtime_capabilities` before choosing higher-order execution.".to_string(),
+        "- Use `runtime_orchestrate(inspect)` for read-only state and propose/revise/control only for intended state changes.".to_string(),
+        format!("- {}", runtime_orchestration_action_guidance()),
+    ]);
+    lines.join("\n")
+}
+
 #[must_use]
 pub fn runtime_capabilities_response(
     intent: &str,
