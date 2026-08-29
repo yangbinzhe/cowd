@@ -1,7 +1,7 @@
 version: 2
-release_version: 0.9.708
-release_authority: docs/architecture/framework-core-hardening-v0.9.708.md
-release_evidence: docs/evidence/framework-core-hardening-v0.9.708.md
+release_version: 0.9.710
+release_authority: docs/architecture/model-observation-attestation-v0.9.710.md
+release_evidence: docs/evidence/high-quality-collaboration-terminal-v0.9.710.md
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh

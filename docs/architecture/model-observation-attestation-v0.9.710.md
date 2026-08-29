@@ -1,7 +1,7 @@
 # Provider model-observation attestation hardening (v0.9.710)
 
-Status: design frozen after strict audit; implementation complete; unified
-verification in progress.
+Status: implementation, deterministic verification and immutable
+`qwen3.8-max` release verification complete.
 
 This amendment closes the remaining evidence-truth defect discovered by the
 real `qwen3.8-max` six-Team evaluation. It is subordinate to
@@ -573,7 +573,7 @@ their terminal evidence is audited.
 
 ## 16. Cross-Team synthesis contract amendment (2026-08-29)
 
-Status: **implemented; deterministic gates passed; immutable live rerun pending**.
+Status: **implemented; deterministic and immutable live gates passed**.
 This amendment was produced only after candidate
 `290da57c2319ff4980ec6fb1d707eab904ee311b` completed both isolated live
 scenarios. It supersedes any scenario-local workaround.
@@ -776,7 +776,7 @@ or test defect.
 
 ## 17. Live acceptance and lifecycle authority amendment (2026-08-29)
 
-Status: **plan frozen and architecture-audited before source changes**. This
+Status: **implemented; deterministic and immutable live gates passed**. This
 amendment follows the first immutable paid-route rerun of candidate
 `ecaf4bc4dd1e0a3860c91d2d9c27537e41afdf42`, release binary SHA-256
 `467ca9d5b765d3774abe497ed04adcc3273b642253314374e728b44e8f53d1b7`.
@@ -918,3 +918,46 @@ Deterministic evidence on the unchanged implementation candidate:
 The candidate may now be committed and built once for Q5. Release authority
 and version evidence remain deliberately unchanged until both immutable live
 scenarios pass and the Gateway log contains no lifecycle-authority warning.
+
+### 17.7 Immutable Qwen closure
+
+The clean source candidate was committed once as
+`b4e40454576e5e2ec92e21428e372b5073d28d6c` and built as the release Cowd
+binary before either scenario started:
+
+- source archive SHA-256:
+  `66b7346b81bf702f7ec86ee7d3d4abe28b8b5325361f1806578261268b3bec94`;
+- Gateway binary SHA-256:
+  `bd1b6f0bad0ed60c59e79e14cb6873ac57b9206bf2944990f42f676abed09540`;
+- binary size: 122,149,752 bytes;
+- report:
+  `/tmp/cowd-qwen38-v0910-lifecycle-authority-final/runs/v0.9.710-1788014810-mission-harness-deep/report.json`;
+- isolated Gateway: `/tmp/cowd-real-qwen-gateway.5oUqXW`.
+
+The unchanged paid DashScope route executed only `qwen3.8-max`, with no model
+fallback. Both required scenarios passed:
+
+| Scenario | Runtime result | Work | Acceptance |
+| --- | --- | --- | --- |
+| group-theory research/evaluation/simulation | 4/4 Teams, 4/4 Agents, 3/3 cross-Team claims | 9 model rounds, 14 tool calls, 871,976 tokens | canonical Program, lineage, source receipts, C4/method/application/evaluation synthesis all passed |
+| six-Team collaboration pressure | 6/6 Teams, 12/12 Agents, 5/5 cross-Team claims | 27 model rounds, 97 tool calls, 8,420,052 tokens | 12/12 exact paths independently observed by two Agent identities; every presentation and architecture check passed |
+
+Aggregate live evidence is 36 model rounds, 111 tool calls and 9,292,028
+tokens. The report is `passed`, its live suite is 2/2, and all 19 required
+report gates passed. The six-Team terminal is transport-clean and complete; it
+separates verified facts, source-grounded inference and unexecuted simulation,
+corrects three inherited path-label mistakes, and provides an actionable
+conditional scale recommendation in the same semantic block as its scale
+subject.
+
+The retained Gateway log has SHA-256
+`8a086bbb3257fd010b2629668ab677a101de40244a6867dbce2dcfa3e0180fd8`.
+It contains zero warning/error lines and zero matches for invalid live status
+transition, `Complete -> Finalizing`, fallback, 429 or quota failure. Mission
+projection reached every expected terminal without approval or recovery work.
+The earlier display lag is therefore closed as a consequence of lifecycle
+authority pollution; no cache timer or refresh workaround was needed.
+
+Q5 is complete and Q6 release closure is authorized. The subsequent release
+evidence/governance commit is documentation-only and must remain a descendant
+of this tested source candidate; it does not alter the verified binary.

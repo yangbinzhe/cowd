@@ -1,6 +1,11 @@
 # High-quality collaboration terminal evidence (v0.9.710)
 
+Release status: passed
+
 Date: 2026-08-29 (Asia/Shanghai)
+
+Release authority:
+`docs/architecture/model-observation-attestation-v0.9.710.md`.
 
 ## Candidate and scope
 
@@ -134,11 +139,12 @@ The first fail-closed candidate correctly stopped the false pass, but exposed an
 | Gate | Result |
 |---|---|
 | `cargo check --workspace --all-targets` | passed |
-| `cargo test -p runtime --all-targets --quiet` | passed: library 1,897; ignored: 2; all integrations passed |
-| `cargo test -p tools --all-targets --quiet` | passed: 198 + 4; ignored: 1; failed: 0 |
-| `cargo test -p harness-contract --all-targets --quiet` | passed: 193 + 1; failed: 0 |
-| `cargo test -p harness-eval --all-targets --quiet` | passed: 115 + 2 + 2; failed: 0 |
-| `cargo test -p gateway --all-targets --quiet` | passed: 801 + 1 + 1; ignored: 12; failed: 0 |
+| Runtime library | 1,910 passed; 0 failed; 2 ignored |
+| Harness Eval library | 117 passed; 0 failed |
+| architecture boundary gate | passed |
+| full workspace all-target regression | passed |
+| isolated process-global Gateway suite | 10/10 passed |
+| reference Bundle / signing / tamper / worker / Gateway proxy | passed |
 | six-Team concurrent Program admission, 20 consecutive executions | passed: 20/20 |
 | adversarial old concatenated/truncated presentation | rejected |
 | complete synthesized presentation fixture with independent-review declaration | accepted |
@@ -158,4 +164,66 @@ The first fail-closed candidate correctly stopped the false pass, but exposed an
 
 ## Real-provider verification
 
-Pending immutable-candidate execution after the semantic-handoff repair. The final evidence revision must record the clean candidate commit, Gateway binary digest, report path, exact model provenance, Program/Team/Agent/edge counts, the new semantic-consumption gate, final-answer audit and any hierarchical synthesis rounds before release tagging.
+### Immutable candidate
+
+| Evidence | Value |
+|---|---|
+| clean source candidate | `b4e40454576e5e2ec92e21428e372b5073d28d6c` |
+| source archive SHA-256 | `66b7346b81bf702f7ec86ee7d3d4abe28b8b5325361f1806578261268b3bec94` |
+| release Gateway SHA-256 | `bd1b6f0bad0ed60c59e79e14cb6873ac57b9206bf2944990f42f676abed09540` |
+| binary size | 122,149,752 bytes |
+| model | only `qwen3.8-max`; no fallback |
+| route | isolated paid DashScope-compatible route; credential remained an environment reference |
+| report | `/tmp/cowd-qwen38-v0910-lifecycle-authority-final/runs/v0.9.710-1788014810-mission-harness-deep/report.json` |
+| report SHA-256 | `d6e1dd7b761f794398ab0d1ce787662fc75703cb1c9aa907d8b8dcba8d32cba5` |
+| Gateway artifacts | `/tmp/cowd-real-qwen-gateway.5oUqXW` |
+| Gateway log SHA-256 | `8a086bbb3257fd010b2629668ab677a101de40244a6867dbce2dcfa3e0180fd8` |
+
+The report passed, the live suite passed 2/2 and all 19 required report gates
+passed. Aggregate real work was 36 model rounds, 111 tool calls and 9,292,028
+tokens.
+
+### Group-theory research/evaluation scenario
+
+- 4/4 Teams and 4/4 Agents completed;
+- A/B/C ran independently and D consumed all three authenticated cross-Team
+  deliveries; 3/3 claimed edges;
+- 9 model rounds, 14 tool calls and 871,976 tokens;
+- only `qwen3.8-max`; canonical Program, lineage, checked source receipts and
+  the requested C4/method/application/evaluation/simulation synthesis passed;
+- scenario artifact SHA-256:
+  `e6743e5100667e1259271efe4f5214be1e0496813ac7aa210cfc5f13b96733a2`.
+
+### Six-Team pressure scenario
+
+- 6/6 Teams and 12/12 Agents completed with zero failed work;
+- A/B/C/D formed the four-Team first wave, E waited for and consumed A/B, and
+  F waited for and consumed C/D/E; 5/5 claimed edges;
+- 27 model rounds, 97 tool calls and 8,420,052 tokens;
+- 12/12 target paths had complete exact observations from two distinct Agent
+  identities; no raw receipt or role-name shortcut was used;
+- every architecture and presentation check passed, including complete source
+  coverage, independent review, semantic handoff, facts/inference/simulation
+  separation, concurrency, bottleneck, failure mode, capacity and the new
+  co-located scale-recommendation predicate;
+- scenario artifact SHA-256:
+  `89e34eab0b1dcee37201fc2ae1ba9ab7961ddc469ce357b1078cb16a705835d9`.
+
+### Independent terminal and lifecycle audit
+
+The final six-Team answer is coherent rather than a transport concatenation.
+It lists all 12 paths, explicitly corrects three inherited path-label errors,
+distinguishes verified facts from source-grounded inference and unexecuted
+simulation, explains the three execution waves and gives a conditional,
+actionable expansion recommendation. It has no truncation sentinel, Runtime
+carrier, internal Team identifier, unfinished fence or contradictory caveat.
+
+The retained Gateway log contains zero warning/error lines and no match for an
+invalid Runtime live transition, `Complete -> Finalizing`, fallback, HTTP 429
+or quota exhaustion. Both Mission projections ended with zero approval and
+zero recovery-required work. The generic durable-status lifecycle pollution
+and the derived stale-display symptom are therefore closed without a polling,
+cache or state-machine-reversal workaround.
+
+The release evidence/governance closure commit is documentation-only and may
+follow the tested source candidate. It does not alter the verified binary.

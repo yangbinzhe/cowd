@@ -1,6 +1,8 @@
 # Framework Core Hardening v0.9.708
 
-Status: implementation authority for `v0.9.708`.
+Status: historical implementation authority for `v0.9.708`; superseded as the
+current release authority by
+`docs/architecture/model-observation-attestation-v0.9.710.md`.
 
 This version closes five high-impact framework defects in one release. It supersedes the
 execution status in `collaboration-program-handoff-2026-08-27.md`; that document remains a
