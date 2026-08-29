@@ -3960,6 +3960,15 @@ pub(crate) fn gateway_sse_json_to_cowd_event_for_session(
         .or_else(|| value.get("event"))
         .or_else(|| value.get("event_type"))
         .and_then(serde_json::Value::as_str)?;
+    gateway_sse_json_to_conversation_event(value, session_id, event_type)
+        .or_else(|| gateway_sse_json_to_session_control_event(value, session_id, event_type))
+}
+
+fn gateway_sse_json_to_conversation_event(
+    value: &serde_json::Value,
+    session_id: Option<&str>,
+    event_type: &str,
+) -> Option<CowdEvent> {
     match event_type {
         "UserMessageCommitted" | "user_message_committed" => {
             let correlation = gateway_event_correlation(value, session_id, None);
@@ -4159,6 +4168,16 @@ pub(crate) fn gateway_sse_json_to_cowd_event_for_session(
                 },
             })
         }
+        _ => None,
+    }
+}
+
+fn gateway_sse_json_to_session_control_event(
+    value: &serde_json::Value,
+    session_id: Option<&str>,
+    event_type: &str,
+) -> Option<CowdEvent> {
+    match event_type {
         // A model loop completion is only rendering progress. The durable
         // SessionRuntimeBridge emits TerminalCommitted after the transcript
         // write succeeds; only that event is allowed to settle TUI state.
@@ -4213,6 +4232,18 @@ pub(crate) fn gateway_sse_json_to_cowd_event_for_session(
                     status,
                     detail,
                 },
+            })
+        }
+        "PermissionRevisionChanged" | "permission_revision_changed" => {
+            Some(CowdEvent::PermissionRevisionChanged {
+                permission_mode: value
+                    .get("permission_mode")
+                    .and_then(serde_json::Value::as_str)?
+                    .to_string(),
+                revision: value.get("revision").and_then(serde_json::Value::as_u64)?,
+                applies_to_active_turn: value
+                    .get("applies_to_active_turn")
+                    .and_then(serde_json::Value::as_bool)?,
             })
         }
         "SessionInputReceived" | "session_input_received" => {
@@ -4474,6 +4505,8 @@ fn strict_gateway_sse_frame_to_cowd_event_for_session(
             | "compaction_notice"
             | "RuntimePolicyDecision"
             | "runtime_policy_decision"
+            | "PermissionRevisionChanged"
+            | "permission_revision_changed"
             | "ExecutionGraphSummary"
             | "execution_graph_summary"
     ) {
@@ -4719,6 +4752,9 @@ fn validate_gateway_session_event_contract(
             Ok(())
         }
         "ExecutionPhase" | "execution_phase" | "TurnError" | "turn_error" => require_execution(),
+        "PermissionRevisionChanged" | "permission_revision_changed" => {
+            validate_permission_revision_event(value, event_type, &require_text)
+        }
         "ProviderAttempt"
         | "provider_attempt"
         | "ContextEnvelope"
@@ -4731,6 +4767,23 @@ fn validate_gateway_session_event_contract(
         | "run_model_telemetry" => require_execution(),
         _ => Ok(()),
     }
+}
+
+fn validate_permission_revision_event(
+    value: &serde_json::Value,
+    event_type: &str,
+    require_text: &impl Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    require_text("permission_mode")?;
+    value
+        .get("revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("`{event_type}` requires integer `revision`"))?;
+    value
+        .get("applies_to_active_turn")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| format!("`{event_type}` requires boolean `applies_to_active_turn`"))?;
+    Ok(())
 }
 
 fn gateway_sse_frame_commit_cursor(frame: &str) -> Option<u64> {

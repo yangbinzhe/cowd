@@ -1086,6 +1086,27 @@ fn gateway_sse_frame_maps_data_json() {
     );
 }
 
+#[test]
+fn permission_revision_event_is_typed_instead_of_becoming_an_unsupported_warning() {
+    let value = serde_json::json!({
+        "type": "PermissionRevisionChanged",
+        "permission_mode": "workspace_write",
+        "revision": 12,
+        "applies_to_active_turn": true
+    });
+
+    let event = gateway_sse_json_to_cowd_event_for_session(&value, Some("session-a"))
+        .expect("permission revision should remain a typed Runtime event");
+    assert!(matches!(
+        event,
+        CowdEvent::PermissionRevisionChanged {
+            permission_mode,
+            revision: 12,
+            applies_to_active_turn: true,
+        } if permission_mode == "workspace_write"
+    ));
+}
+
 #[tokio::test]
 async fn typed_evolution_and_managed_agent_controls_use_gateway_owned_routes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

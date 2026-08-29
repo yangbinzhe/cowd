@@ -522,6 +522,14 @@ pub enum CowdEvent {
         name: String,
         duration_ms: u64,
     },
+    /// Runtime-owned permission revision observation. The TUI does not infer
+    /// the complete policy from this delta; it only invalidates presentation
+    /// caches until the canonical execution-policy projection is refreshed.
+    PermissionRevisionChanged {
+        permission_mode: String,
+        revision: u64,
+        applies_to_active_turn: bool,
+    },
     TurnStarted,
     ResourcesCommitted {
         ids: Vec<String>,

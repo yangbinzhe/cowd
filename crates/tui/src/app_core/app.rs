@@ -4790,6 +4790,13 @@ impl App {
                 self.timeline.msg_version = self.timeline.msg_version.wrapping_add(1);
             }
 
+            CowdEvent::PermissionRevisionChanged { .. } => {
+                // This event is intentionally not a second policy authority.
+                // Gateway's typed execution-policy projection owns the full
+                // state; the revision only causes presentation invalidation.
+                self.timeline.render_version = self.timeline.render_version.wrapping_add(1);
+            }
+
             CowdEvent::TurnStarted => {
                 self.execution.turn_interaction.submit_started();
                 self.reset_live_execution_facts();
