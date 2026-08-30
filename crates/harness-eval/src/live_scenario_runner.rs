@@ -91,7 +91,10 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) 
     let control = json!({
         "corpus_id": "live-scenarios-v1",
         "workspace_fixture": "none",
-        "provider_constraint": "configured_single_route",
+        // The disposable Gateway config is the single-route authority. This
+        // field belongs to Runtime's execution-resource contract, where the
+        // canonical no-override value is `normal`.
+        "provider_constraint": "normal",
         "temperature_milli": 0,
         "resource_scopes": ["provider", "provider_account", "provider_token_pool"],
         "budget_lease_id": format!("live-scenario:{spec_id}:{}", uuid::Uuid::new_v4()),
@@ -3141,6 +3144,11 @@ mod tests {
             .expect("typed evaluation prefix");
         let control: Value = serde_json::from_str(encoded).expect("control JSON");
         assert_eq!(control["corpus_id"], "live-scenarios-v1");
+        assert_eq!(control["provider_constraint"], "normal");
+        assert_eq!(
+            control["resource_scopes"],
+            json!(["provider", "provider_account", "provider_token_pool"])
+        );
         assert_eq!(control["max_total_tokens"], 5_000_000);
         assert!(control["budget_lease_id"]
             .as_str()
