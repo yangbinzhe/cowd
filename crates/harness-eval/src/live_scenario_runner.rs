@@ -2071,23 +2071,35 @@ fn has_scale_recommendation(response: &str) -> bool {
     ];
 
     let normalized_newlines = response.replace("\r\n", "\n").replace('\r', "\n");
-    normalized_newlines
+    let mut section_has_scale_subject = false;
+    for block in normalized_newlines
         .split("\n\n")
         .map(str::trim)
         .filter(|block| !block.is_empty())
-        .map(|block| {
-            block
-                .lines()
-                .filter(|line| !line.trim_start().starts_with('#'))
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_ascii_lowercase()
-        })
-        .filter(|block| !block.is_empty())
-        .any(|block| {
-            SCALE_SUBJECTS.iter().any(|marker| block.contains(marker))
-                && SCALE_DECISIONS.iter().any(|marker| block.contains(marker))
-        })
+    {
+        let mut body = Vec::new();
+        for line in block.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                let heading = trimmed.to_ascii_lowercase();
+                section_has_scale_subject =
+                    SCALE_SUBJECTS.iter().any(|marker| heading.contains(marker));
+            } else {
+                body.push(line);
+            }
+        }
+        let body = body.join(" ").to_ascii_lowercase();
+        if body.is_empty() {
+            continue;
+        }
+        let has_subject =
+            section_has_scale_subject || SCALE_SUBJECTS.iter().any(|marker| body.contains(marker));
+        let has_decision = SCALE_DECISIONS.iter().any(|marker| body.contains(marker));
+        if has_subject && has_decision {
+            return true;
+        }
+    }
+    false
 }
 
 fn complete_exact_source_receipt_paths(
@@ -3390,11 +3402,20 @@ mod tests {
         assert!(has_scale_recommendation(
             "The system is suitable to scale out, but must shard the event store first."
         ));
+        assert!(!has_scale_recommendation(
+            "## 扩大规模\n结论待定。\n\n## 其他事项\n系统适合当前工作。"
+        ));
     }
 
     #[test]
     fn observed_qwen_scale_conclusion_is_semantically_complete() {
         let observed = "判定：适合在当前单节点边界内继续扩大协作规模，但横向扩展存在明确架构前提。\n\n- 扩容建议：在单节点内可继续增加 Team/角色规模；若需跨节点横向扩展，应先行引入事件存储分片或 Postgres 后端。";
+        assert!(has_scale_recommendation(observed));
+    }
+
+    #[test]
+    fn observed_deepseek_scale_section_is_semantically_complete() {
+        let observed = "## 9. 是否适合继续扩大规模\n\n**结论：适合，以中等规模为当前安全边界。** 各层容量独立成闸；但在进一步扩大前应处理四项结构性项。";
         assert!(has_scale_recommendation(observed));
     }
 
