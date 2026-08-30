@@ -138,6 +138,13 @@ fn live_provider_token_limit() -> Result<u64, String> {
 }
 
 fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) -> String {
+    let mut resource_scopes = vec!["provider", "provider_account", "provider_token_pool"];
+    // Scenario admission is a capability lease, not a hint. The tool-evidence
+    // fixture asks the root execution to read this exact file, so grant only
+    // that read rather than weakening Runtime's fail-closed scope ceiling.
+    if spec_id == "live_tool_evidence" {
+        resource_scopes.push("read:Cargo.toml");
+    }
     let control = json!({
         "corpus_id": "live-scenarios-v1",
         "workspace_fixture": "none",
@@ -146,7 +153,7 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) 
         // canonical no-override value is `normal`.
         "provider_constraint": "normal",
         "temperature_milli": 0,
-        "resource_scopes": ["provider", "provider_account", "provider_token_pool"],
+        "resource_scopes": resource_scopes,
         "budget_lease_id": format!("live-scenario:{spec_id}:{}", uuid::Uuid::new_v4()),
         "max_total_tokens": max_total_tokens,
         "prompt": prompt,
@@ -1319,7 +1326,8 @@ impl LiveScenarioRunner {
             // descendants, so reporting only the root would incorrectly claim
             // zero model rounds and zero token/tool usage for a real execution.
             let projections = self.execution_lineage_projections(root_execution_id, trace);
-            let mut result = acceptance.evaluate(response_text, &timeline, &projections);
+            let mut result =
+                acceptance.evaluate(response_text, &timeline, &projections, root_execution_id);
             observations = observations.saturating_add(1);
 
             if let Some(error) = timeline_error {
@@ -1900,9 +1908,9 @@ impl LiveAcceptance {
         response: &str,
         timeline: &Value,
         projections: &[Value],
+        root_execution_id: &str,
     ) -> LiveAcceptanceResult {
-        let projection = projections.first().unwrap_or(&Value::Null);
-        match self {
+        let mut result = match self {
             Self::Contains(expected) => LiveAcceptanceResult {
                 passed: response.contains(expected),
                 quality: None,
@@ -1911,13 +1919,7 @@ impl LiveAcceptance {
                 ],
             },
             Self::RequiresToolEvidence => {
-                let tool_evidence = contains_key_with_nonempty_value(
-                    timeline,
-                    &["tool_name", "tool_call_id", "tool_calls"],
-                ) || contains_key_with_nonempty_value(
-                    projection,
-                    &["tool_name", "tool_call_id", "tool_calls"],
-                );
+                let tool_evidence = has_successful_runtime_tool_completion(timeline);
                 LiveAcceptanceResult {
                     passed: !response.trim().is_empty() && tool_evidence,
                     quality: None,
@@ -2059,7 +2061,17 @@ impl LiveAcceptance {
                     ],
                 }
             }
-        }
+        };
+        let outcome = root_business_outcome(timeline, root_execution_id);
+        result.checks.push(json!({
+            "name": "root_business_outcome_succeeded",
+            "execution_graph_ref": root_execution_id,
+            "observed_event_status": outcome.event_status,
+            "observed_terminal_class": outcome.terminal_class,
+            "passed": outcome.passed,
+        }));
+        result.passed &= outcome.passed;
+        result
     }
 }
 
@@ -3200,37 +3212,72 @@ fn find_u64_by_key(value: &Value, keys: &[&str]) -> Option<u64> {
     }
 }
 
-fn contains_key_with_nonempty_value(value: &Value, keys: &[&str]) -> bool {
-    match value {
-        Value::Object(map) => map.iter().any(|(key, value)| {
-            (keys.contains(&key.as_str()) && is_material_evidence_value(value))
-                || contains_key_with_nonempty_value(value, keys)
-        }),
-        Value::Array(values) => values
-            .iter()
-            .any(|value| contains_key_with_nonempty_value(value, keys)),
-        _ => false,
+#[derive(Debug, Default)]
+struct RootBusinessOutcome {
+    passed: bool,
+    event_status: Option<String>,
+    terminal_class: Option<String>,
+}
+
+/// Bind acceptance to the canonical Runtime outcome for the root execution
+/// graph. A completed execution graph only proves lifecycle closure: the
+/// business outcome may still be partial or failed.
+fn root_business_outcome(timeline: &Value, root_execution_id: &str) -> RootBusinessOutcome {
+    let outcome = timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .rev()
+        .find(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("runtime.outcome.recorded.v1")
+                && event
+                    .pointer("/payload/identity/execution_graph_ref")
+                    .and_then(Value::as_str)
+                    == Some(root_execution_id)
+        });
+    let Some(outcome) = outcome else {
+        return RootBusinessOutcome::default();
+    };
+    let event_status = outcome
+        .get("status")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let terminal_class = outcome
+        .pointer("/payload/terminal/class")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    RootBusinessOutcome {
+        passed: event_status.as_deref() == Some("succeeded")
+            && terminal_class.as_deref() == Some("succeeded"),
+        event_status,
+        terminal_class,
     }
 }
 
-/// A schema field being present is not evidence of a tool call. In
-/// particular, Gateway projections commonly contain `tool_calls: 0`; treating
-/// that as non-empty makes a model's unsupported prose claim pass a live
-/// evaluation. Only concrete identifiers, non-empty collections, positive
-/// counts, or explicit `true` values satisfy an evidence check.
-fn is_material_evidence_value(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(value) => *value,
-        Value::Number(value) => {
-            value.as_u64().is_some_and(|count| count > 0)
-                || value.as_i64().is_some_and(|count| count > 0)
-                || value.as_f64().is_some_and(|count| count > 0.0)
-        }
-        Value::String(value) => !value.trim().is_empty(),
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(values) => !values.is_empty(),
-    }
+/// Successful tool evidence is a canonical Runtime completion receipt. It is
+/// deliberately not a recursive key search: provider capability metadata and
+/// zero-valued usage summaries are declarations, not executed effects.
+fn has_successful_runtime_tool_completion(timeline: &Value) -> bool {
+    timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("tool.invocation.completed")
+                && event.get("status").and_then(Value::as_str) == Some("completed")
+                && event.pointer("/payload/status").and_then(Value::as_str) == Some("completed")
+                && ["invocation_id", "tool_call_id", "tool_name"]
+                    .iter()
+                    .all(|key| {
+                        event
+                            .get("payload")
+                            .and_then(|payload| payload.get(*key))
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| !value.trim().is_empty())
+                    })
+        })
 }
 
 fn summarize_json(value: &Value) -> String {
@@ -3265,6 +3312,40 @@ fn env_duration_millis(key: &str, default: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn successful_root_outcome_timeline(mut timeline: Value) -> Value {
+        let event = json!({
+            "kind": "runtime.outcome.recorded.v1",
+            "status": "succeeded",
+            "payload": {
+                "identity": {"execution_graph_ref": "root"},
+                "terminal": {"class": "succeeded"}
+            }
+        });
+        let object = timeline
+            .as_object_mut()
+            .expect("acceptance timeline fixture must be an object");
+        object
+            .entry("events")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("timeline events must be an array")
+            .push(event);
+        timeline
+    }
+
+    fn completed_tool_event() -> Value {
+        json!({
+            "kind": "tool.invocation.completed",
+            "status": "completed",
+            "payload": {
+                "status": "completed",
+                "invocation_id": "tool-invocation-1",
+                "tool_call_id": "tool-call-1",
+                "tool_name": "read_file"
+            }
+        })
+    }
 
     #[test]
     fn explicit_live_scenario_selection_is_the_activation_authority() {
@@ -3326,6 +3407,30 @@ mod tests {
             .as_str()
             .is_some_and(|id| id.starts_with("live-scenario:live_group_theory")));
         assert_eq!(prompt, "complete the research");
+
+        let tool_controlled = controlled_live_prompt(
+            "live_tool_evidence",
+            "read the manifest".to_string(),
+            10_000,
+        );
+        let (tool_header, _) = tool_controlled
+            .split_once('\n')
+            .expect("tool control header");
+        let tool_control: Value = serde_json::from_str(
+            tool_header
+                .strip_prefix("COWD_EVAL_CONTROL ")
+                .expect("typed evaluation prefix"),
+        )
+        .expect("tool control JSON");
+        assert_eq!(
+            tool_control["resource_scopes"],
+            json!([
+                "provider",
+                "provider_account",
+                "provider_token_pool",
+                "read:Cargo.toml"
+            ])
+        );
     }
 
     #[test]
@@ -3512,7 +3617,12 @@ mod tests {
             minimum_claimed_cross_team_edges: 0,
             evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
-        .evaluate(answer, &receipts, &[json!({"agents": [], "teams": []})]);
+        .evaluate(
+            answer,
+            &receipts,
+            &[json!({"agents": [], "teams": []})],
+            "root",
+        );
         assert!(!result.passed);
         let result = LiveAcceptance::ArchitectureQuality {
             minimum_teams: 1,
@@ -3521,7 +3631,7 @@ mod tests {
         }
         .evaluate(
             answer,
-            &receipts,
+            &successful_root_outcome_timeline(receipts.clone()),
             &[json!({
                 "revision": 1,
                 "agents": [
@@ -3535,6 +3645,7 @@ mod tests {
                     "orchestration": {"collaboration_program": {"edges": []}}
                 }
             })],
+            "root",
         );
         assert!(result.passed);
     }
@@ -3566,6 +3677,7 @@ mod tests {
                     "orchestration": {"collaboration_program": {"edges": []}}
                 }
             })],
+            "root",
         );
         assert!(!result.passed);
     }
@@ -3891,14 +4003,16 @@ mod tests {
             evidence_profile: ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis,
         };
 
-        let predecessor_only = acceptance.evaluate(&response, &json!({}), &[projection("team-a")]);
+        let predecessor_only =
+            acceptance.evaluate(&response, &json!({}), &[projection("team-a")], "root");
         assert!(predecessor_only.checks.iter().any(|check| {
             check["name"] == "runtime_attested_terminal_team_source_review"
                 && check["passed"] == false
                 && check["observed"] == 0
         }));
 
-        let sink_review = acceptance.evaluate(&response, &json!({}), &[projection("team-d")]);
+        let sink_review =
+            acceptance.evaluate(&response, &json!({}), &[projection("team-d")], "root");
         assert!(sink_review.checks.iter().any(|check| {
             check["name"] == "runtime_attested_terminal_team_source_review"
                 && check["passed"] == true
@@ -4063,7 +4177,12 @@ mod tests {
             minimum_claimed_cross_team_edges: 2,
             evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
-        .evaluate(answer, &receipts, &[projection]);
+        .evaluate(
+            answer,
+            &successful_root_outcome_timeline(receipts),
+            &[projection],
+            "root",
+        );
 
         assert!(result.passed);
     }
@@ -4096,8 +4215,9 @@ mod tests {
         }
         .evaluate(
             "completed with durable evidence",
-            &Value::Null,
+            &successful_root_outcome_timeline(json!({})),
             &[projection],
+            "root",
         );
 
         assert!(result.passed);
@@ -4132,6 +4252,7 @@ mod tests {
             "completed with durable evidence",
             &Value::Null,
             &[projection],
+            "root",
         );
 
         assert!(!result.passed);
@@ -4147,10 +4268,10 @@ mod tests {
         }
         .evaluate(
             answer,
-            &json!({"evidence": [
+            &successful_root_outcome_timeline(json!({"evidence": [
                 {"tool_name": "read_file", "is_error": false, "evidence_id": "read-1"},
                 {"tool_name": "grep_search", "is_error": false, "evidence_id": "read-2"}
-            ]}),
+            ]})),
             &[json!({
                 "revision": 1,
                 "agents": [],
@@ -4160,6 +4281,7 @@ mod tests {
                     "orchestration": {"collaboration_program": {"edges": []}}
                 }
             })],
+            "root",
         );
         assert!(result.passed);
     }
@@ -4184,27 +4306,82 @@ mod tests {
             "Cargo.toml",
             &json!({"events": []}),
             &[],
+            "root",
         );
         assert!(!result.passed);
-        let result = LiveAcceptance::RequiresToolEvidence.evaluate(
-            "Cargo.toml",
-            &json!({"events": [{"tool_name": "workspace.read"}]}),
-            &[],
-        );
-        assert!(result.passed);
     }
 
     #[test]
-    fn zero_tool_count_is_not_live_tool_evidence() {
+    fn tool_acceptance_requires_completed_runtime_receipt_and_succeeded_outcome() {
+        let result = LiveAcceptance::RequiresToolEvidence.evaluate(
+            "Cargo.toml version 0.9.712",
+            &successful_root_outcome_timeline(json!({"events": [completed_tool_event()]})),
+            &[],
+            "root",
+        );
+        assert!(result.passed);
+
+        let result = LiveAcceptance::RequiresToolEvidence.evaluate(
+            "Cargo.toml",
+            &successful_root_outcome_timeline(json!({"events": [{
+                "kind": "tool.invocation.failed",
+                "status": "failed",
+                "payload": {
+                    "status": "failed",
+                    "invocation_id": "tool-invocation-1",
+                    "tool_call_id": "tool-call-1",
+                    "tool_name": "read_file"
+                }
+            }]})),
+            &[],
+            "root",
+        );
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn provider_metadata_and_zero_tool_count_are_not_live_tool_evidence() {
         let result = LiveAcceptance::RequiresToolEvidence.evaluate(
             "I read Cargo.toml",
-            &json!({"events": [{"tool_calls": 0}]}),
+            &successful_root_outcome_timeline(json!({"events": [{
+                "kind": "provider.request.packed",
+                "payload": {"capabilities": {"tool_calls": "supported/configured"}}
+            }, {"tool_calls": 0}]})),
             &[json!({"usage": [{"detail": {"tool_calls": 0}}]})],
+            "root",
         );
         assert!(
             !result.passed,
-            "a declared but zero tool count must never validate a claimed tool run"
+            "metadata and a declared zero count must never validate a claimed tool run"
         );
+    }
+
+    #[test]
+    fn partial_failed_or_missing_root_outcome_fails_closed() {
+        for (status, class) in [("failed", "failed"), ("partial", "partial")] {
+            let timeline = json!({"events": [
+                completed_tool_event(),
+                {
+                    "kind": "runtime.outcome.recorded.v1",
+                    "status": status,
+                    "payload": {
+                        "identity": {"execution_graph_ref": "root"},
+                        "terminal": {"class": class}
+                    }
+                }
+            ]});
+            let result =
+                LiveAcceptance::RequiresToolEvidence.evaluate("Cargo.toml", &timeline, &[], "root");
+            assert!(!result.passed, "{status}/{class} must fail closed");
+        }
+
+        let missing = LiveAcceptance::RequiresToolEvidence.evaluate(
+            "Cargo.toml",
+            &json!({"events": [completed_tool_event()]}),
+            &[],
+            "root",
+        );
+        assert!(!missing.passed);
     }
 
     #[test]

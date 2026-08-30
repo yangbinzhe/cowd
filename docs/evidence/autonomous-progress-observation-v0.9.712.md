@@ -5,7 +5,7 @@ Status: deterministic implementation closure passed
 Date: 2026-08-31
 
 Approved plan SHA-256:
-`33e5709c029c5cec06ec02aefd5dee6da26af86eaad988e56ef97fa3cc13295b`.
+`12e933ce512a09da86fc2bab2f1a1eef351fdb87a53464986d3cb599ebb0dc5a`.
 
 ## Root cause
 
@@ -31,6 +31,14 @@ The waste and observability gap were in Harness Eval:
 
 The framework's execution authority was sound; the evaluator's observation
 protocol was incomplete and needlessly expensive.
+
+A first real-provider smoke then exposed a separate semantic-verdict defect.
+Runtime correctly rejected an out-of-scope `Cargo.toml` read and durably
+recorded a failed/partial business outcome with zero tool calls. Harness still
+reported success because it treated graph lifecycle closure as business
+success and recursively matched provider capability metadata
+`tool_calls=supported/configured` as executed tool evidence. That run is
+retained as a negative regression artifact, not accepted as proof.
 
 ## Implemented contract
 
@@ -59,13 +67,23 @@ business-state owners.
   cursors.
 - Deep live report gates require monotonic cursors, fully drained messages and
   Timeline, zero omitted changes and no detected stall.
+- Every live scenario verdict is bound to the root
+  `runtime.outcome.recorded.v1` event. Both its event status and terminal class
+  must be `succeeded`; failed, partial and missing outcomes fail closed.
+- A tool scenario passes only with a complete successful
+  `tool.invocation.completed` Runtime receipt. Provider capability metadata,
+  prose claims and usage counters cannot substitute for an executed effect.
+- The tool fixture receives the exact `read:Cargo.toml` resource lease it
+  requires; no workspace-wide read or weakened Runtime policy was introduced.
 
 No Runtime scheduling, Provider routing, Session persistence, Gateway API or
 Edge production authority changed.
 
 ## Deterministic acceptance
 
-- Harness Eval: 141 tests passed, including 10 observer adversarial/replay tests.
+- Harness Eval: 143 tests passed, including 10 observer adversarial/replay tests
+  and semantic-verdict cases for success, failure, partial outcome, missing
+  outcome, failed tool, zero count and provider-metadata false evidence.
 - Runtime: 1,932 passed, zero failed, two existing ignored tests.
 - Provider: 172 passed, zero failed.
 - Gateway message pagination and composite Timeline cursor contract tests passed.
