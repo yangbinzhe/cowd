@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_TRANSPORTS: usize = 8;
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_ACCOUNT_FAILURE_FENCE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TransportProfileFingerprint(pub u64);
@@ -40,6 +41,8 @@ pub struct ProviderTransportPoolStats {
     pub in_flight: i64,
     /// Highest observed in-flight count (peak concurrency).
     pub peak_in_flight: u64,
+    /// Account-scoped failures currently suppressing sibling dispatches.
+    pub account_failure_fences: usize,
 }
 
 #[derive(Clone)]
@@ -65,6 +68,8 @@ pub struct ProviderTransportPool {
     evictions: AtomicU64,
     in_flight: std::sync::atomic::AtomicI64,
     peak_in_flight: AtomicU64,
+    account_failure_fences: Mutex<HashMap<(u64, String), Instant>>,
+    account_failure_fence_ttl: Duration,
 }
 
 impl Default for ProviderTransportPool {
@@ -81,6 +86,15 @@ impl ProviderTransportPool {
 
     #[must_use]
     pub fn new_with_idle_ttl(max_entries: usize, idle_ttl: Duration) -> Self {
+        Self::new_with_ttls(max_entries, idle_ttl, DEFAULT_ACCOUNT_FAILURE_FENCE_TTL)
+    }
+
+    #[must_use]
+    fn new_with_ttls(
+        max_entries: usize,
+        idle_ttl: Duration,
+        account_failure_fence_ttl: Duration,
+    ) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             max_entries: max_entries.max(1),
@@ -92,7 +106,47 @@ impl ProviderTransportPool {
             evictions: AtomicU64::new(0),
             in_flight: std::sync::atomic::AtomicI64::new(0),
             peak_in_flight: AtomicU64::new(0),
+            account_failure_fences: Mutex::new(HashMap::new()),
+            account_failure_fence_ttl,
         }
+    }
+
+    /// Return whether a sibling Runtime consumer must avoid a known-unusable
+    /// provider account before performing network I/O.
+    pub(crate) fn provider_account_is_fenced(
+        &self,
+        registry_revision: u64,
+        provider_account: &str,
+    ) -> bool {
+        let mut fences = self
+            .account_failure_fences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fences.retain(|_, observed_at| observed_at.elapsed() < self.account_failure_fence_ttl);
+        fences.contains_key(&(registry_revision, provider_account.to_string()))
+    }
+
+    /// Publish an account-scoped Provider fact for a short burst window.
+    /// Request-scoped failures must never enter this shared fence.
+    pub(crate) fn record_provider_failure(
+        &self,
+        registry_revision: u64,
+        provider_account: &str,
+        scope: model_protocol::provider_failure::ProviderFailureScope,
+    ) -> bool {
+        if scope != model_protocol::provider_failure::ProviderFailureScope::Account {
+            return false;
+        }
+        let mut fences = self
+            .account_failure_fences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fences.retain(|_, observed_at| observed_at.elapsed() < self.account_failure_fence_ttl);
+        fences.insert(
+            (registry_revision, provider_account.to_string()),
+            Instant::now(),
+        );
+        true
     }
 
     /// Mark one model request as in flight. The returned guard MUST be held
@@ -169,6 +223,14 @@ impl ProviderTransportPool {
 
     #[must_use]
     pub fn stats(&self) -> ProviderTransportPoolStats {
+        let account_failure_fences = {
+            let mut fences = self
+                .account_failure_fences
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            fences.retain(|_, observed_at| observed_at.elapsed() < self.account_failure_fence_ttl);
+            fences.len()
+        };
         ProviderTransportPoolStats {
             entries: self
                 .entries
@@ -181,6 +243,7 @@ impl ProviderTransportPool {
             evictions: self.evictions.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::SeqCst),
             peak_in_flight: self.peak_in_flight.load(Ordering::SeqCst),
+            account_failure_fences,
         }
     }
 }
@@ -199,6 +262,7 @@ impl Drop for TransportRequestGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::ProviderTransportPool;
+    use model_protocol::provider_failure::ProviderFailureScope;
     use std::time::Duration;
 
     #[test]
@@ -247,5 +311,26 @@ mod tests {
         drop(guard_b);
         assert_eq!(pool.stats().in_flight, 0);
         assert!(pool.stats().peak_in_flight >= 2);
+    }
+
+    #[test]
+    fn account_failure_fence_is_scoped_by_account_revision_and_failure_scope() {
+        let pool = ProviderTransportPool::new(2);
+        assert!(!pool.record_provider_failure(1, "token-plan", ProviderFailureScope::Request));
+        assert!(!pool.provider_account_is_fenced(1, "token-plan"));
+
+        assert!(pool.record_provider_failure(1, "token-plan", ProviderFailureScope::Account));
+        assert!(pool.provider_account_is_fenced(1, "token-plan"));
+        assert!(!pool.provider_account_is_fenced(1, "deepseek"));
+        assert!(!pool.provider_account_is_fenced(2, "token-plan"));
+        assert_eq!(pool.stats().account_failure_fences, 1);
+    }
+
+    #[test]
+    fn account_failure_fence_expires_without_process_restart() {
+        let pool = ProviderTransportPool::new_with_ttls(2, Duration::from_secs(60), Duration::ZERO);
+        assert!(pool.record_provider_failure(1, "token-plan", ProviderFailureScope::Account));
+        assert!(!pool.provider_account_is_fenced(1, "token-plan"));
+        assert_eq!(pool.stats().account_failure_fences, 0);
     }
 }

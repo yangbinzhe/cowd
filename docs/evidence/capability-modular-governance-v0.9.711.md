@@ -5,7 +5,7 @@ Release status: passed
 Date: 2026-08-30
 
 Approved plan SHA-256:
-`48d2f94d2c0c14deabb9e9d704167e99f4cd1b2bab20afb03ea35969c3aac012`.
+`6903357b0d3e3e6a0b4695ad927d80694bac407307747a0b7cce48c5c8972ae3`.
 
 ## Deterministic closure
 

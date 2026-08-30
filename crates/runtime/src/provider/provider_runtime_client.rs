@@ -505,8 +505,16 @@ impl ProviderRuntimeClient {
         let entry = self
             .template_cache
             .resolve(&snapshot, &self.transport_pool, model)?;
+        if self.transport_pool.provider_account_is_fenced(
+            entry.request_context.profile.registry_revision,
+            &entry.request_context.profile.provider_name,
+        ) {
+            return Err(provider_account_fenced_message(
+                &entry.request_context.profile.provider_name,
+            ));
+        }
         let _request_guard = self.transport_pool.begin_request();
-        let response = entry
+        let response = match entry
             .client
             .send_message(&MessageRequest {
                 model: entry.model.clone(),
@@ -523,7 +531,17 @@ impl ProviderRuntimeClient {
                 ..MessageRequest::default()
             })
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.transport_pool.record_provider_failure(
+                    entry.request_context.profile.registry_revision,
+                    &entry.request_context.profile.provider_name,
+                    error.failure_scope(),
+                );
+                return Err(error.to_string());
+            }
+        };
         let text = response
             .content
             .iter()
@@ -877,6 +895,16 @@ impl ProviderRuntimeClient {
                 };
             }
         };
+        if self.transport_pool.provider_account_is_fenced(
+            entry.request_context.profile.registry_revision,
+            &entry.request_context.profile.provider_name,
+        ) {
+            let error = provider_account_fenced_error(&entry.request_context.profile.provider_name);
+            return ApiClientStream {
+                events: Box::pin(futures::stream::once(async move { Err(error) })),
+                transport_activity: None,
+            };
+        }
         let reasoning_effort = request_reasoning_effort(
             &entry.model,
             &entry.request_context.profile.model_capabilities,
@@ -1070,6 +1098,12 @@ async fn forward_provider_attempt(
         );
         let provider_context_window_limit = error.error.context_window_limit_hint();
         let provider_tool_protocol_failure = error.error.is_compatibility_tool_protocol_failure();
+        let provider_failure_scope = error.error.failure_scope();
+        transport_pool.record_provider_failure(
+            entry.request_context.profile.registry_revision,
+            &entry.request_context.profile.provider_name,
+            provider_failure_scope,
+        );
         let provider_resource_result = if error.error.is_downstream_overload() {
             crate::execution_core::graph::ResourceResultClass::DownstreamOverload
         } else if error.error.is_timeout() {
@@ -1086,11 +1120,29 @@ async fn forward_provider_attempt(
                     provider_resource_result,
                     error.error.retry_after(),
                     error.error.is_retryable(),
-                    error.error.failure_scope(),
+                    provider_failure_scope,
                 ),
             ))
             .await;
     }
+}
+
+fn provider_account_fenced_message(provider_account: &str) -> String {
+    format!(
+        "provider account `{provider_account}` is temporarily fenced after an account-scoped failure; retry after the burst window or reload provider configuration"
+    )
+}
+
+fn provider_account_fenced_error(provider_account: &str) -> RuntimeError {
+    RuntimeError::with_provider_failure_metadata_retry_after_and_scope(
+        provider_account_fenced_message(provider_account),
+        None,
+        false,
+        crate::execution_core::graph::ResourceResultClass::Failed,
+        None,
+        false,
+        model_protocol::provider_failure::ProviderFailureScope::Account,
+    )
 }
 
 fn evaluation_request_temperature() -> Option<f64> {
@@ -1716,7 +1768,11 @@ mod tests {
         request_reasoning_effort, tool_definitions_for_exposure,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
-    use crate::{AssistantEvent, ProviderRegistry, ProviderRuntimeClient, ProviderTransportPool};
+    use crate::{
+        ApiClient, ApiRequest, AssistantEvent, PromptAssembly, ProviderRegistry,
+        ProviderRuntimeClient, ProviderTransportPool,
+    };
+    use futures::StreamExt;
     use harness_contract::tool::ToolExposureProjection;
     use model_protocol::provider_capability::{CapabilityState, ProviderCapabilityProfile};
     use provider::{OutputContentBlock, ToolChoice, ToolDefinition};
@@ -1950,6 +2006,75 @@ mod tests {
         );
         ProviderRuntimeClient::new(registry, "primary".to_string(), Vec::new())
             .expect("single selected model must be valid");
+    }
+
+    #[tokio::test]
+    async fn shared_account_fence_blocks_control_and_streaming_before_network_dispatch() {
+        let registry = Arc::new(
+            ProviderRegistry::new(ProvidersConfig {
+                providers: HashMap::from([(
+                    "token-plan".to_string(),
+                    ProviderConfig {
+                        name: "token-plan".to_string(),
+                        base_url: "http://127.0.0.1:9/v1".to_string(),
+                        api_key: "test".to_string(),
+                        models: vec!["qwen3.8-max".to_string()],
+                        protocol: Some("completions".to_string()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
+                    },
+                )]),
+            })
+            .expect("registry"),
+        );
+        let pool = Arc::new(ProviderTransportPool::new(1));
+        let mut client = ProviderRuntimeClient::new_with_transport_pool(
+            Arc::clone(&registry),
+            Arc::clone(&pool),
+            "qwen3.8-max".to_string(),
+            Vec::new(),
+        )
+        .expect("client");
+        assert!(pool.record_provider_failure(
+            registry.revision(),
+            "token-plan",
+            model_protocol::provider_failure::ProviderFailureScope::Account,
+        ));
+
+        let control_error = client
+            .complete_control_analysis("qwen3.8-max", "system", "input", 32)
+            .await
+            .expect_err("control analysis must honor the shared fence");
+        assert!(control_error.contains("temporarily fenced"));
+
+        let request = ApiRequest {
+            prompt: PromptAssembly::new(vec!["system".to_string()]),
+            messages: Vec::new().into(),
+            model: "qwen3.8-max".to_string(),
+            reasoning_effort_override: None,
+            request_compiler_cache_hit: false,
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "qwen3.8-max",
+                32_768,
+                4_096,
+                0,
+                0,
+                0,
+            ),
+            provider_evidence_context: None,
+        };
+        let error = client
+            .stream(request)
+            .next()
+            .await
+            .expect("one fenced event")
+            .expect_err("stream must honor the shared fence");
+        assert_eq!(
+            error.provider_failure_scope(),
+            model_protocol::provider_failure::ProviderFailureScope::Account
+        );
+        assert!(error.to_string().contains("temporarily fenced"));
+        assert_eq!(pool.stats().in_flight, 0, "fenced calls must not dispatch");
     }
 
     #[test]
