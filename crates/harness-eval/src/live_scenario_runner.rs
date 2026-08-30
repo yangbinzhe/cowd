@@ -51,6 +51,12 @@ const LARGE_SCALE_SOURCE_PATHS: [&str; 12] = [
     "crates/runtime/src/recovery/runtime_event_reactor.rs",
 ];
 
+const GROUP_THEORY_SOURCE_PATHS: [&str; 3] = [
+    "crates/runtime/src/orchestration/mod.rs",
+    "crates/runtime/src/orchestration/intent_compiler.rs",
+    "crates/runtime/src/team/instantiation.rs",
+];
+
 const LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE: &str =
     "每个 Team 的 investigator→reviewer 本地依赖必须显式使用 `kind: review_of`；禁止用 `handoff`、`aggregate` 或普通先后关系替代独立复核语义。最终结论还必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”和独立复核声明“12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF”；只有 Runtime 的完整读取收据确实证明 investigator 与 reviewer 分别覆盖全部 12 个目标时才允许输出，否则必须判定任务未完成。";
 
@@ -538,6 +544,7 @@ impl LiveScenarioRunner {
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 0,
                     minimum_claimed_cross_team_edges: 0,
+                    evidence_profile: ArchitectureEvidenceProfile::Basic,
                 },
                 timeout: LiveScenarioTimeout::team(),
             },
@@ -547,6 +554,7 @@ impl LiveScenarioRunner {
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 2,
+                    evidence_profile: ArchitectureEvidenceProfile::Basic,
                 },
                 timeout: LiveScenarioTimeout::team(),
             },
@@ -563,10 +571,11 @@ impl LiveScenarioRunner {
         if group_theory_research_scenario_enabled() {
             scenario_specs.push(LiveScenarioSpec {
                 id: "live_group_theory_ai_research_simulation",
-                prompt: "这是一个必须在本次隔离执行环境中完成的深度任务：调研群论在当前 AI 中的应用，并形成可复核的测试测评方案。必须实际启动**恰好四个**协作 Team，不能把 Team 职责压缩成模型文本。每个 Team 恰好一个只读研究角色：该唯一终端角色必须在 `output_artifacts` 中声明本 Team 的 required result artifacts；不要添加自定义 acceptance 或无资源绑定的 `evidence` 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中以实际存在的完整源码路径的 `evidence_scope` 表达；禁止 `*`、`?` 或其他通配符。可使用且必须由最终 Team 复核的真实路径是 `crates/runtime/src/orchestration/mod.rs`、`crates/runtime/src/orchestration/intent_compiler.rs`、`crates/runtime/src/team/instantiation.rs`。Team A（数学与方法审查）负责明确群、群作用、表示、invariance/equivariance 的可证伪定义；Team B（应用调研）负责分别评估视觉/3D、科学机器学习或分子材料、机器人或控制等应用，并区分已读取证据与推断；Team C（实验与评测）负责设计 C4 对称性保持/破坏对照的指标、预期、局限与可复现步骤（只读环境不得声称已写入或执行外部实验）；Team D（综合与风险）必须在收到 A、B、C 的经过授权的结构化证据交接之后，比较收益、失败模式、适用边界并输出最终建议。A、B、C 可以并行；不得在三份事实交接完成前开始 D 的实质综合。不得编造论文、链接、实验结果或工具输出；无法通过本次只读工具取得的外部事实必须标为待验证。最终结论需明确包含 `C4`、列出至少三个本工作区实际读取到的完整 `crates/.../*.rs` 源码路径，并说明研究、调研、分析、处理、模拟各环节的输入/输出。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；不要调用 bash 或任何写工具。",
+                prompt: "这是一个必须在本次隔离执行环境中完成的深度任务：调研群论在当前 AI 中的应用，并形成可复核的测试测评方案。必须实际启动**恰好四个**协作 Team，不能把 Team 职责压缩成模型文本。每个 Team 恰好一个只读研究角色：该唯一终端角色必须在 `output_artifacts` 中声明本 Team 的 required result artifacts；不要添加自定义 acceptance 或无资源绑定的 `evidence` 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中以实际存在的完整源码路径的 `evidence_scope` 表达；禁止 `*`、`?` 或其他通配符。A、B、C 的 `evidence_contract` 必须为空；D 的 `evidence_contract` 必须恰好包含以下三个 `evidence_scope`，不能把它们提前分配给 A、B、C。可使用且必须由最终 Team D 自己独立完整读取并复核的真实路径是 `crates/runtime/src/orchestration/mod.rs`、`crates/runtime/src/orchestration/intent_compiler.rs`、`crates/runtime/src/team/instantiation.rs`。Team A（数学与方法审查）负责明确群、群作用、表示、invariance/equivariance 的可证伪定义；Team B（应用调研）负责分别评估视觉/3D、科学机器学习或分子材料、机器人或控制等应用，并区分已读取证据与推断；Team C（实验与评测）负责设计 C4 对称性保持/破坏对照的指标、预期、局限与可复现步骤（只读环境不得声称已写入或执行外部实验）；Team D（综合与风险）必须在收到 A、B、C 的经过授权的结构化证据交接之后，亲自完整读取上述三个路径，比较收益、失败模式、适用边界并输出最终建议。A、B、C 可以并行；不得在三份事实交接完成前开始 D 的实质综合。不得编造论文、链接、实验结果或工具输出；无法通过本次只读工具取得的外部事实必须标为待验证。最终结论需明确包含 `C4`、列出至少三个本工作区实际读取到的完整 `crates/.../*.rs` 源码路径，并说明研究、调研、分析、处理、模拟各环节的输入/输出。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 4,
                     minimum_claimed_cross_team_edges: 3,
+                    evidence_profile: ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis,
                 },
                 timeout: LiveScenarioTimeout::team(),
             });
@@ -578,6 +587,7 @@ impl LiveScenarioRunner {
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 6,
                     minimum_claimed_cross_team_edges: 5,
+                    evidence_profile: ArchitectureEvidenceProfile::LargeScaleIndependentReview,
                 },
                 timeout: LiveScenarioTimeout::large_scale(),
             });
@@ -1557,11 +1567,24 @@ enum LiveAcceptance {
     ArchitectureQuality {
         minimum_teams: usize,
         minimum_claimed_cross_team_edges: usize,
+        evidence_profile: ArchitectureEvidenceProfile,
     },
     EscalatedTeam {
         minimum_teams: usize,
         minimum_escalations: usize,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchitectureEvidenceProfile {
+    Basic,
+    /// Four one-role Teams with a single three-input sink. The sink Team must
+    /// itself reacquire all three exact sources; global lineage coverage is
+    /// insufficient because predecessor receipts prove handoff, not review.
+    GroupTheoryFinalSynthesis,
+    /// Six two-role Teams; every exact source must be independently acquired
+    /// by two distinct Agent identities.
+    LargeScaleIndependentReview,
 }
 
 impl LiveAcceptance {
@@ -1613,58 +1636,102 @@ impl LiveAcceptance {
             Self::ArchitectureQuality {
                 minimum_teams,
                 minimum_claimed_cross_team_edges,
+                evidence_profile,
             } => {
                 let team_health = projected_team_health(projections);
                 let claimed_cross_team_edges = claimed_cross_team_edge_count(projections);
                 let quality = architecture_quality(timeline, projections);
-                let team_projection = team_health.satisfies(minimum_teams);
-                let edges_satisfied = claimed_cross_team_edges >= minimum_claimed_cross_team_edges;
-                let presentation_checks =
-                    if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 {
-                        large_scale_presentation_checks(response)
-                    } else {
-                        Vec::new()
+                let team_projection = team_health.satisfies(minimum_teams)
+                    && match evidence_profile {
+                        ArchitectureEvidenceProfile::Basic => true,
+                        ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis => {
+                            team_health.team_count == 4 && team_health.agent_count == 4
+                        }
+                        ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
+                            team_health.team_count == 6 && team_health.agent_count == 12
+                        }
                     };
+                let edges_satisfied = match evidence_profile {
+                    ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis => {
+                        claimed_cross_team_edges == 3
+                    }
+                    ArchitectureEvidenceProfile::Basic
+                    | ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
+                        claimed_cross_team_edges >= minimum_claimed_cross_team_edges
+                    }
+                };
+                let presentation_checks = match evidence_profile {
+                    ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
+                        large_scale_presentation_checks(response)
+                    }
+                    ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis => {
+                        group_theory_presentation_checks(response)
+                    }
+                    ArchitectureEvidenceProfile::Basic => Vec::new(),
+                };
                 let presentation_satisfied = presentation_checks
                     .iter()
                     .all(|check| check["passed"].as_bool() == Some(true));
                 let complete_source_paths =
                     complete_exact_source_receipt_paths(timeline, projections);
-                let missing_complete_source_paths =
-                    if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 {
-                        LARGE_SCALE_SOURCE_PATHS
-                            .iter()
-                            .filter(|path| !complete_source_paths.contains(**path))
-                            .copied()
-                            .collect::<Vec<_>>()
-                    } else {
-                        Vec::new()
-                    };
-                let complete_source_coverage = minimum_teams < 6
-                    || minimum_claimed_cross_team_edges < 5
-                    || missing_complete_source_paths.is_empty();
+                let required_complete_source_paths: &[&str] = match evidence_profile {
+                    ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
+                        &LARGE_SCALE_SOURCE_PATHS
+                    }
+                    ArchitectureEvidenceProfile::Basic
+                    | ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis => &[],
+                };
+                let missing_complete_source_paths = required_complete_source_paths
+                    .iter()
+                    .filter(|path| !complete_source_paths.contains(**path))
+                    .copied()
+                    .collect::<Vec<_>>();
+                let complete_source_coverage = missing_complete_source_paths.is_empty();
                 let independently_reviewed_source_paths =
                     independently_reviewed_complete_source_receipt_paths(timeline, projections);
-                let missing_independently_reviewed_source_paths =
-                    if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 {
-                        LARGE_SCALE_SOURCE_PATHS
+                let required_independent_source_paths: &[&str] = match evidence_profile {
+                    ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
+                        &LARGE_SCALE_SOURCE_PATHS
+                    }
+                    ArchitectureEvidenceProfile::Basic
+                    | ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis => &[],
+                };
+                let missing_independently_reviewed_source_paths = required_independent_source_paths
+                    .iter()
+                    .filter(|path| !independently_reviewed_source_paths.contains(**path))
+                    .copied()
+                    .collect::<Vec<_>>();
+                let independent_source_review =
+                    missing_independently_reviewed_source_paths.is_empty();
+                let terminal_team_ids = terminal_semantic_team_ids(projections);
+                let terminal_team_source_paths =
+                    complete_exact_source_receipt_paths_for_semantic_teams(
+                        timeline,
+                        projections,
+                        &terminal_team_ids,
+                    );
+                let missing_terminal_team_source_paths =
+                    if evidence_profile == ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis {
+                        GROUP_THEORY_SOURCE_PATHS
                             .iter()
-                            .filter(|path| !independently_reviewed_source_paths.contains(**path))
+                            .filter(|path| !terminal_team_source_paths.contains(**path))
                             .copied()
                             .collect::<Vec<_>>()
                     } else {
                         Vec::new()
                     };
-                let independent_source_review = minimum_teams < 6
-                    || minimum_claimed_cross_team_edges < 5
-                    || missing_independently_reviewed_source_paths.is_empty();
+                let terminal_team_source_review = evidence_profile
+                    != ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis
+                    || (terminal_team_ids.len() == 1
+                        && missing_terminal_team_source_paths.is_empty());
                 let mut checks = vec![
                     json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                     json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
                     json!({"name": "completed_evidence_team", "required": minimum_teams, "passed": team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
                     json!({"name": "claimed_cross_team_edges", "required": minimum_claimed_cross_team_edges, "observed": claimed_cross_team_edges, "passed": edges_satisfied}),
-                    json!({"name": "runtime_attested_complete_source_coverage", "required": if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 { 12 } else { 0 }, "observed": complete_source_paths.len(), "missing": missing_complete_source_paths, "passed": complete_source_coverage}),
-                    json!({"name": "runtime_attested_independent_source_review", "required": if minimum_teams >= 6 && minimum_claimed_cross_team_edges >= 5 { 12 } else { 0 }, "observed": independently_reviewed_source_paths.len(), "missing": missing_independently_reviewed_source_paths, "receipt_rule": "distinct exact-content receipts from two different Agent identities", "passed": independent_source_review}),
+                    json!({"name": "runtime_attested_complete_source_coverage", "required": required_complete_source_paths.len(), "observed": complete_source_paths.len(), "missing": missing_complete_source_paths, "passed": complete_source_coverage}),
+                    json!({"name": "runtime_attested_independent_source_review", "required": required_independent_source_paths.len(), "observed": independently_reviewed_source_paths.len(), "missing": missing_independently_reviewed_source_paths, "receipt_rule": "distinct exact-content receipts from two different Agent identities", "passed": independent_source_review}),
+                    json!({"name": "runtime_attested_terminal_team_source_review", "required": if evidence_profile == ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis { GROUP_THEORY_SOURCE_PATHS.len() } else { 0 }, "observed": terminal_team_source_paths.len(), "terminal_semantic_team_ids": terminal_team_ids, "missing": missing_terminal_team_source_paths, "receipt_rule": "exact-content read receipt must belong to the unique sink Team Agent identity", "passed": terminal_team_source_review}),
                 ];
                 checks.extend(presentation_checks);
                 LiveAcceptanceResult {
@@ -1674,6 +1741,7 @@ impl LiveAcceptance {
                         && edges_satisfied
                         && complete_source_coverage
                         && independent_source_review
+                        && terminal_team_source_review
                         && presentation_satisfied,
                     quality: Some(quality.clone()),
                     checks,
@@ -1699,6 +1767,19 @@ impl LiveAcceptance {
             }
         }
     }
+}
+
+fn group_theory_presentation_checks(response: &str) -> Vec<Value> {
+    let required_stages = ["研究", "调研", "分析", "处理", "模拟"];
+    let paths_present = GROUP_THEORY_SOURCE_PATHS
+        .iter()
+        .all(|path| response.contains(path));
+    let stages_present = required_stages.iter().all(|stage| response.contains(stage));
+    vec![
+        json!({"name": "presentation_contains_c4", "passed": response.contains("C4")}),
+        json!({"name": "presentation_lists_all_required_source_paths", "required": GROUP_THEORY_SOURCE_PATHS.len(), "passed": paths_present}),
+        json!({"name": "presentation_covers_research_pipeline", "required": required_stages, "passed": stages_present}),
+    ]
 }
 
 fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
@@ -1918,6 +1999,82 @@ fn independently_reviewed_complete_source_receipt_paths(
         .into_iter()
         .filter_map(|(path, agents)| (agents.len() >= 2).then_some(path))
         .collect()
+}
+
+/// Resolve terminal semantic Teams from the Runtime-owned Program topology,
+/// never from model-chosen labels such as "final", "review", or "Team D".
+/// A terminal Team is a required instance with incoming claimed edges and no
+/// outgoing edge. The group-theory gate additionally requires this set to
+/// contain exactly one sink.
+fn terminal_semantic_team_ids(projections: &[Value]) -> BTreeSet<String> {
+    let mut terminal = BTreeSet::new();
+    for projection in projections {
+        let Some(program) = projection.pointer("/graph/orchestration/collaboration_program") else {
+            continue;
+        };
+        let mut from = BTreeSet::new();
+        let mut to = BTreeSet::new();
+        for edge in program
+            .get("edges")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(instance_id) = edge.get("from").and_then(Value::as_str) {
+                from.insert(instance_id.to_string());
+            }
+            if let Some(instance_id) = edge.get("to").and_then(Value::as_str) {
+                to.insert(instance_id.to_string());
+            }
+        }
+        let sinks = to.difference(&from).collect::<BTreeSet<_>>();
+        for instance in program
+            .get("team_instances")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let instance_id = instance.get("instance_id").and_then(Value::as_str);
+            let semantic_node_id = instance.get("semantic_node_id").and_then(Value::as_str);
+            if let (Some(instance_id), Some(semantic_node_id)) = (instance_id, semantic_node_id) {
+                if sinks.iter().any(|sink| sink.as_str() == instance_id) {
+                    terminal.insert(semantic_node_id.to_string());
+                }
+            }
+        }
+    }
+    terminal
+}
+
+fn complete_exact_source_receipt_paths_for_semantic_teams(
+    timeline: &Value,
+    projections: &[Value],
+    semantic_team_ids: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut receipt_agents = BTreeMap::<String, BTreeSet<String>>::new();
+    collect_complete_exact_source_receipt_agents(timeline, &mut receipt_agents);
+    for projection in projections {
+        collect_complete_exact_source_receipt_agents(projection, &mut receipt_agents);
+    }
+    receipt_agents
+        .into_iter()
+        .filter_map(|(path, agents)| {
+            agents
+                .iter()
+                .any(|identity| {
+                    semantic_team_ids
+                        .iter()
+                        .any(|team_id| receipt_identity_belongs_to_semantic_team(identity, team_id))
+                })
+                .then_some(path)
+        })
+        .collect()
+}
+
+fn receipt_identity_belongs_to_semantic_team(identity: &str, semantic_team_id: &str) -> bool {
+    identity
+        .split(':')
+        .any(|component| component == semantic_team_id)
 }
 
 fn collect_complete_exact_source_receipt_agents(
@@ -2962,12 +3119,14 @@ mod tests {
         let result = LiveAcceptance::ArchitectureQuality {
             minimum_teams: 1,
             minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
         .evaluate(answer, &receipts, &[json!({"agents": [], "teams": []})]);
         assert!(!result.passed);
         let result = LiveAcceptance::ArchitectureQuality {
             minimum_teams: 1,
             minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
         .evaluate(
             answer,
@@ -2995,6 +3154,7 @@ mod tests {
         let result = LiveAcceptance::ArchitectureQuality {
             minimum_teams: 1,
             minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
         .evaluate(
             answer,
@@ -3259,6 +3419,94 @@ mod tests {
     }
 
     #[test]
+    fn group_theory_gate_requires_exact_reads_from_the_unique_sink_team() {
+        fn receipt(path: &str, sequence: u64, semantic_team_id: &str) -> Value {
+            json!({
+                "observed_at_sequence": sequence,
+                "tool_name": "read_file",
+                "target": {
+                    "kind": "workspace",
+                    "scope": {
+                        "access_mode": "read",
+                        "coverage": "exact_content",
+                        "path": {
+                            "workspace_relative_path": path,
+                            "observed_revision_or_digest": "d".repeat(64),
+                        }
+                    }
+                },
+                "evidence_ref": {
+                    "evidence_ref": {
+                        "id": format!("agent-tool:team-graph:program:{semantic_team_id}:0:role:1:1:{sequence}:read_file:digest:read-receipt")
+                    }
+                }
+            })
+        }
+
+        let projection = |receipt_team: &str| {
+            let receipts = GROUP_THEORY_SOURCE_PATHS
+                .iter()
+                .enumerate()
+                .map(|(index, path)| receipt(path, index as u64 + 1, receipt_team))
+                .collect::<Vec<_>>();
+            json!({
+                "agents": [
+                    {"id": "a", "status": "completed"},
+                    {"id": "b", "status": "completed"},
+                    {"id": "c", "status": "completed"},
+                    {"id": "d", "status": "completed"}
+                ],
+                "teams": [
+                    {"id": "team-a", "status": "completed"},
+                    {"id": "team-b", "status": "completed"},
+                    {"id": "team-c", "status": "completed"},
+                    {"id": "team-d", "status": "completed"}
+                ],
+                "observed_acceptance": {"observed_evidence": receipts},
+                "graph": {
+                    "graph_id": "root",
+                    "orchestration": {"collaboration_program": {
+                        "edges": [
+                            {"from": "team-a:1", "to": "team-d:1", "edge_id": "a-d", "state": "claimed", "delivery_receipt": {}, "claim_receipt": {}},
+                            {"from": "team-b:1", "to": "team-d:1", "edge_id": "b-d", "state": "claimed", "delivery_receipt": {}, "claim_receipt": {}},
+                            {"from": "team-c:1", "to": "team-d:1", "edge_id": "c-d", "state": "claimed", "delivery_receipt": {}, "claim_receipt": {}}
+                        ],
+                        "team_instances": [
+                            {"instance_id": "team-a:1", "semantic_node_id": "team-a", "required": true},
+                            {"instance_id": "team-b:1", "semantic_node_id": "team-b", "required": true},
+                            {"instance_id": "team-c:1", "semantic_node_id": "team-c", "required": true},
+                            {"instance_id": "team-d:1", "semantic_node_id": "team-d", "required": true}
+                        ]
+                    }}
+                }
+            })
+        };
+        let response = format!(
+            "C4 研究 调研 分析 处理 模拟 {}",
+            GROUP_THEORY_SOURCE_PATHS.join(" ")
+        );
+        let acceptance = LiveAcceptance::ArchitectureQuality {
+            minimum_teams: 4,
+            minimum_claimed_cross_team_edges: 3,
+            evidence_profile: ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis,
+        };
+
+        let predecessor_only = acceptance.evaluate(&response, &json!({}), &[projection("team-a")]);
+        assert!(predecessor_only.checks.iter().any(|check| {
+            check["name"] == "runtime_attested_terminal_team_source_review"
+                && check["passed"] == false
+                && check["observed"] == 0
+        }));
+
+        let sink_review = acceptance.evaluate(&response, &json!({}), &[projection("team-d")]);
+        assert!(sink_review.checks.iter().any(|check| {
+            check["name"] == "runtime_attested_terminal_team_source_review"
+                && check["passed"] == true
+                && check["observed"] == GROUP_THEORY_SOURCE_PATHS.len()
+        }));
+    }
+
+    #[test]
     fn source_receipt_gate_rejects_acquisition_receipts_not_promoted_to_agent_acceptance() {
         let raw_receipt = json!({
             "observed_at_sequence": 1,
@@ -3365,6 +3613,7 @@ mod tests {
         assert!(LiveAcceptance::ArchitectureQuality {
             minimum_teams: 1,
             minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
         .requires_descendant_team_closure());
         assert!(LiveAcceptance::EscalatedTeam {
@@ -3375,6 +3624,7 @@ mod tests {
         assert!(!LiveAcceptance::ArchitectureQuality {
             minimum_teams: 0,
             minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
         .requires_descendant_team_closure());
     }
@@ -3411,6 +3661,7 @@ mod tests {
         let result = LiveAcceptance::ArchitectureQuality {
             minimum_teams: 3,
             minimum_claimed_cross_team_edges: 2,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
         .evaluate(answer, &receipts, &[projection]);
 
@@ -3492,6 +3743,7 @@ mod tests {
         let result = LiveAcceptance::ArchitectureQuality {
             minimum_teams: 0,
             minimum_claimed_cross_team_edges: 0,
+            evidence_profile: ArchitectureEvidenceProfile::Basic,
         }
         .evaluate(
             answer,
