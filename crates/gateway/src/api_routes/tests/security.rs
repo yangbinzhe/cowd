@@ -476,6 +476,73 @@
     }
 
     #[tokio::test]
+    async fn writer_detach_releases_its_process_local_session_lease() {
+        let store = Arc::new(UnifiedSessionStore::open_in_memory().unwrap());
+        store
+            .create_session(&new_api_session_record("session-detach", None))
+            .await
+            .unwrap();
+        let state = test_state_with_store(store);
+        let attached = state
+            .services
+            .session
+            .attach_session_value(
+                "session-detach",
+                "principal:local-human:surface:tui:detach-writer",
+                "tui",
+                Some("writer"),
+            )
+            .await;
+        assert_eq!(attached["ok"], true);
+        let app = api_router(state);
+
+        let acquire = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runtime/session-leases/acquire")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:detach-writer")
+                    .body(Body::from(r#"{"session_id":"session-detach"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(acquire.status(), StatusCode::OK);
+
+        let detached = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sessions/session-detach/detach")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-cowd-observer-id", "tui:detach-writer")
+                    .body(Body::from(r#"{"surface":"tui"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detached.status(), StatusCode::OK);
+
+        let leases = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/runtime/session-leases")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let leases: serde_json::Value = serde_json::from_slice(
+            &to_bytes(leases.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(leases["total"], 0);
+    }
+
+    #[tokio::test]
     async fn runtime_control_plane_reports_durable_store_and_task_state() {
         let root = test_temp_dir("runtime-control-plane-durable");
         let workspace = root.join("workspace");

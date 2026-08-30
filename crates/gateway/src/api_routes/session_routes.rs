@@ -1228,6 +1228,27 @@ async fn detach_session_handler(
             )
         })?;
     let actor_id = surface_actor_id(&principal, observer_id);
+    if state
+        .services
+        .session
+        .lifecycle_attachment_role(&id, &actor_id)
+        .await
+        .as_deref()
+        == Some("writer")
+    {
+        if let Some(registry) = state.session_lease_registry.as_ref() {
+            let owner = super::session_lease_owner(&principal, observer_id);
+            let released = registry.release(&id, &owner).await;
+            if released.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                tracing::warn!(
+                    session_id = %id,
+                    lease_owner = %owner,
+                    result = %released,
+                    "writer detach could not confirm its Runtime session lease cleanup"
+                );
+            }
+        }
+    }
     Ok(Json(
         state
             .services
