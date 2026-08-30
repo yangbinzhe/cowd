@@ -25,7 +25,6 @@ RUN_ROOT="$(mktemp -d /tmp/cowd-real-qwen-gateway.XXXXXX)"
 # be reused. A caller may choose another durable evidence root explicitly.
 EVIDENCE_ROOT="${COWD_AI_HARNESS_REPORT_DIR:-$ROOT/target/acceptance/real-qwen}"
 CONFIG_HOME="$RUN_ROOT/config"
-ISOLATED_HOME="$RUN_ROOT/home"
 # Evaluation must inspect the actual source tree. Isolation applies to the
 # Gateway's config, credentials, authentication token and durable state, not
 # to the read-only source fixture presented to the model.
@@ -233,8 +232,7 @@ cargo build -p harness-eval --bin harness-eval
 GATEWAY_BINARY_SHA256="$(sha256sum "$BIN" | awk '{print $1}')"
 printf 'Gateway binary sha256: %s\n' "$GATEWAY_BINARY_SHA256" >&2
 
-mkdir -p "$CONFIG_HOME" "$ISOLATED_HOME/.cowd"
-cp "$SOURCE_MODELS_FILE" "$ISOLATED_HOME/.cowd/models.yaml"
+mkdir -p "$CONFIG_HOME"
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "$MODEL"
 providers:
@@ -271,7 +269,6 @@ EOF
 
 gateway_env=(
   COWD_CONFIG_HOME="$CONFIG_HOME"
-  HOME="$ISOLATED_HOME"
   COWD_LOG_STDERR=1
 )
 if [[ -n "$STAGED_CREDENTIAL_ENV" ]]; then
@@ -304,7 +301,7 @@ curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/healthz" >/dev/null
 # Promote through the broker's preview/confirmation protocol so this harness
 # never duplicates the manager capability list.
 current_entitlement="$(printf '%s\n' "$TOKEN" | env \
-  COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$ISOLATED_HOME" \
+  COWD_CONFIG_HOME="$CONFIG_HOME" \
   "$BIN" auth profile show)"
 profile_epoch="$(jq -r '.credential_epoch' <<<"$current_entitlement")"
 profile_revision="$(jq -r '.profile_revision' <<<"$current_entitlement")"
@@ -312,11 +309,11 @@ app_profiles="$(jq -r \
   '.app_profiles | to_entries | map("\(.key)=\(.value)") | join(",")' \
   <<<"$current_entitlement")"
 profile_preview="$(printf '%s\n' "$TOKEN" | env \
-  COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$ISOLATED_HOME" \
+  COWD_CONFIG_HOME="$CONFIG_HOME" \
   "$BIN" auth profile preview --core-profile core_manager --apps "$app_profiles")"
 profile_confirmation="$(jq -r '.confirmation_digest' <<<"$profile_preview")"
 printf '%s\n' "$TOKEN" | env \
-  COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$ISOLATED_HOME" \
+  COWD_CONFIG_HOME="$CONFIG_HOME" \
   "$BIN" auth profile set \
     --core-profile core_manager \
     --apps "$app_profiles" \
@@ -389,7 +386,6 @@ if [[ -n "${COWD_EVAL_TIMEOUT_SECS:-}" ]]; then
 fi
 env \
   COWD_CONFIG_HOME="$CONFIG_HOME" \
-  HOME="$ISOLATED_HOME" \
   CARGO_HOME="$CARGO_HOME_DIR" \
   RUSTUP_HOME="$RUSTUP_HOME_DIR" \
   COWD_API_TOKEN="$TOKEN" \
