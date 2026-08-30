@@ -374,6 +374,17 @@
             .is_some(),
             "an explicit empty risk list is a valid review result"
         );
+        for field in ["unresolved", "unresolved_or_risks"] {
+            let candidate = format!("{{\"summary\":\"checked\",\"{field}\":[]}}");
+            assert!(
+                normalized_team_terminal_candidate(
+                    &candidate,
+                    &["summary".into(), field.into()],
+                )
+                .is_some(),
+                "an explicit empty {field} list is a valid reviewed disclosure"
+            );
+        }
         let technical = normalized_team_terminal_candidate(
             "Updated the implementation and completed a fresh verification read.",
             &["implementation".into(), "source_verification".into()],

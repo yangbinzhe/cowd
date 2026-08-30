@@ -1684,6 +1684,53 @@ fn structured_agent_output_normalizes_only_exact_contract_headings() {
 }
 
 #[test]
+fn explicit_terminal_sections_outrank_embedded_contract_examples() {
+    let report = concat!(
+        "# Reviewer terminal report\n\n",
+        "## findings\n",
+        "The reviewed parser accepts examples such as `",
+        "{\"evidence\":\"embedded source example\",\"review\":\"not the terminal\"}",
+        "`, but the source example is not this report's contract.\n\n",
+        "## evidence\n",
+        "tool://runtime-read-receipt\n\n",
+        "## summary\n",
+        "Independent review completed with no contradiction.\n\n",
+        "## unresolved\n",
+        "[]\n",
+    );
+
+    let output = structured_agent_output(report).expect("explicit terminal contract");
+    assert_eq!(
+        output["summary"],
+        "Independent review completed with no contradiction."
+    );
+    assert_eq!(output["unresolved"], "[]");
+    assert!(output["findings"]
+        .as_str()
+        .is_some_and(|value| value.contains("embedded source example")));
+    assert_ne!(output["evidence"], "embedded source example");
+}
+
+#[test]
+fn disclosure_fields_share_explicit_empty_list_semantics() {
+    for field in ["risks", "unresolved", "unresolved_or_risks"] {
+        assert!(structured_contract_field_materialized(
+            field,
+            Some(&serde_json::json!([])),
+        ));
+        assert!(!structured_contract_field_materialized(field, None));
+        assert!(!structured_contract_field_materialized(
+            field,
+            Some(&serde_json::Value::Null),
+        ));
+        assert!(!structured_contract_field_materialized(
+            field,
+            Some(&serde_json::json!("")),
+        ));
+    }
+}
+
+#[test]
 fn declared_custom_artifact_accepts_exact_json_or_markdown_only() {
     let required = vec![
         "applications_survey".to_string(),

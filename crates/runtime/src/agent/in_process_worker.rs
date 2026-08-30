@@ -3063,15 +3063,20 @@ fn structured_field_materialized(
     field: harness_contract::team::TeamStructuredOutputField,
     value: Option<&serde_json::Value>,
 ) -> bool {
-    if matches!(
-        field,
-        harness_contract::team::TeamStructuredOutputField::Risks
-            | harness_contract::team::TeamStructuredOutputField::Unresolved
-    ) {
-        // An explicit empty list is a meaningful reviewed conclusion: no
-        // risks or unresolved work were identified. The key must still be
-        // present; omission, null, or an empty prose string remains
-        // non-materialized.
+    structured_contract_field_materialized(field.as_str(), value)
+}
+
+/// Canonical materialization semantics for fixed Team presentation fields.
+///
+/// Disclosure fields distinguish an explicit empty list (reviewed, with no
+/// items found) from an omitted or null field. Host presentation recovery and
+/// delegated Agent acceptance must share this exact rule so a valid terminal
+/// cannot be accepted by one boundary and rejected by the other.
+pub(crate) fn structured_contract_field_materialized(
+    field: &str,
+    value: Option<&serde_json::Value>,
+) -> bool {
+    if matches!(field, "risks" | "unresolved" | "unresolved_or_risks") {
         value.is_some_and(|value| {
             matches!(value, serde_json::Value::Array(_)) || materialized_json_value(value)
         })
@@ -3349,7 +3354,7 @@ pub(crate) fn structured_agent_output(
             }
         }
     }
-    if let Some(object) = text
+    let embedded_contract = text
         .char_indices()
         .filter(|(_, character)| *character == '{')
         .filter_map(|(start, _)| parse_first_contract_json(&text[start..]))
@@ -3363,10 +3368,7 @@ pub(crate) fn structured_agent_output(
         // `{"id","title","mitigation"}`). Prefer the outermost terminal
         // object: it carries the primary `summary` field and the largest
         // field set, so a quoted or nested fragment never wins.
-        .max_by_key(|object| (object.contains_key("summary"), object.len()))
-    {
-        return Some(object);
-    }
+        .max_by_key(|object| (object.contains_key("summary"), object.len()));
 
     // Some providers occasionally honor the requested field names but return
     // exact level-two Markdown sections instead of JSON. Normalize only those
@@ -3455,7 +3457,13 @@ pub(crate) fn structured_agent_output(
         }
     }
     flush(&mut object, active_field, &mut active_lines);
-    (!object.is_empty()).then_some(object)
+    // An explicit outer presentation contract is more authoritative than a
+    // JSON example embedded in its findings. This matters especially when an
+    // Agent is reviewing parsers, protocol fixtures, or data files whose
+    // source text legitimately contains allow-listed contract keys. Exact
+    // whole-response JSON and supported envelopes were already handled above;
+    // embedded JSON remains the final compatibility fallback.
+    (!object.is_empty()).then_some(object).or(embedded_contract)
 }
 
 /// Parse the fixed Team presentation contract plus any exact, Runtime-declared

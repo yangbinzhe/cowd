@@ -3969,12 +3969,7 @@ pub(super) fn missing_required_structured_fields(
             let value = output
                 .as_ref()
                 .and_then(|object| object.get(field.as_str()));
-            // `risks: []` is an explicit, meaningful review result. Treat it
-            // consistently with the delegated Agent evaluator rather than
-            // requesting a second model turn just to spell out "none".
-            let explicit_empty_risks = field.as_str() == "risks"
-                && value.is_some_and(|value| matches!(value, serde_json::Value::Array(_)));
-            !explicit_empty_risks && !structured_field_is_materialized(value)
+            !crate::agent_in_process_worker::structured_contract_field_materialized(field, value)
         })
         .cloned()
         .collect()
@@ -4096,10 +4091,10 @@ pub(super) fn missing_required_structured_field_from_object(
     object: &serde_json::Map<String, serde_json::Value>,
     field: &str,
 ) -> bool {
-    let value = object.get(field);
-    let explicit_empty_risks =
-        field == "risks" && value.is_some_and(|value| matches!(value, serde_json::Value::Array(_)));
-    !explicit_empty_risks && !structured_field_is_materialized(value)
+    !crate::agent_in_process_worker::structured_contract_field_materialized(
+        field,
+        object.get(field),
+    )
 }
 
 pub(super) fn narrative_terminal_field_is_safe(field: &str) -> bool {
