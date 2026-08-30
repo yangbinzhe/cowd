@@ -52,14 +52,6 @@ pub struct OpenAiCompatConfig {
     pub wire_protocol: OpenAiWireProtocol,
     /// Whether this endpoint supports OpenAI-compatible streamed usage chunks.
     pub request_stream_usage: bool,
-    /// Whether assistant tool-call continuations must retain the
-    /// `reasoning_content` field, including an explicitly empty value.
-    ///
-    /// Some thinking-mode compatible APIs validate this field's presence on
-    /// every replayed assistant tool-call frame. Keeping this capability on
-    /// the transport configuration makes the rule reusable without changing
-    /// the shared runtime message model.
-    pub requires_reasoning_content_roundtrip: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,7 +76,6 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_XAI_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: false,
-            requires_reasoning_content_roundtrip: false,
         }
     }
 
@@ -97,7 +88,6 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: true,
-            requires_reasoning_content_roundtrip: false,
         }
     }
 
@@ -112,7 +102,6 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_MOONSHOT_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: false,
-            requires_reasoning_content_roundtrip: false,
         }
     }
 
@@ -127,7 +116,6 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
             wire_protocol: OpenAiWireProtocol::Completions,
             request_stream_usage: true,
-            requires_reasoning_content_roundtrip: true,
         }
     }
 
@@ -1504,7 +1492,12 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
             "content": system,
         }));
     }
-    let require_reasoning_content_roundtrip = config.requires_reasoning_content_roundtrip;
+    // Resolve this from the exact model capability, not from the client
+    // constructor. Runtime-configured endpoints use the custom constructor;
+    // tying the continuation rule to `OpenAiCompatConfig::deepseek()` made the
+    // same model correct via environment routing and incorrect via config.
+    let require_reasoning_content_roundtrip =
+        ProviderCapabilityProfile::reasoning_content_roundtrip_required(&request.model);
     for message in &request.messages {
         messages.extend(translate_message(
             message,
@@ -4323,7 +4316,7 @@ mod tests {
         use crate::types::{InputContentBlock, InputMessage};
 
         let request = MessageRequest {
-            model: "deepseek-v4-flash".to_string(),
+            model: "generic-thinking-model".to_string(),
             max_tokens: 100,
             messages: vec![
                 InputMessage::user_text("continue"),
@@ -4439,6 +4432,36 @@ mod tests {
             .as_array()
             .and_then(|messages| messages.first())
             .expect("assistant continuation message");
+        assert_eq!(assistant["reasoning_content"], "");
+        assert!(assistant["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn configured_compat_route_uses_model_reasoning_continuation_capability() {
+        use crate::types::{InputContentBlock, InputMessage};
+
+        let request = MessageRequest {
+            model: "deepseek-v4-flash".to_string(),
+            max_tokens: 100,
+            messages: vec![InputMessage {
+                role: "assistant".to_string(),
+                content: vec![InputContentBlock::ToolUse {
+                    id: "call_configured".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "Cargo.toml"}),
+                }],
+            }],
+            stream: false,
+            ..Default::default()
+        };
+
+        // Runtime-configured providers use the generic custom client shape.
+        // The exact model capability must still govern the payload.
+        let payload = build_chat_completion_request(&request, OpenAiCompatConfig::openai());
+        let assistant = payload["messages"]
+            .as_array()
+            .and_then(|messages| messages.first())
+            .expect("configured assistant continuation");
         assert_eq!(assistant["reasoning_content"], "");
         assert!(assistant["tool_calls"].is_array());
     }

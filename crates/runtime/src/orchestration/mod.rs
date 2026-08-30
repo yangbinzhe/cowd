@@ -2428,10 +2428,10 @@ fn result_from_outcome(
         decision.validation_findings.sort();
         decision.validation_findings.dedup();
     }
-    // A graph-level admission failure is distinct from a compiler rejection:
-    // its decision id now names an immutable, terminal Program.  Retrying the
-    // same id merely replays that Program, so return a typed recovery contract
-    // that tells the root control plane to create a fresh semantic decision.
+    // Once a Program exists, its graph owns retry and recovery. A terminal
+    // failure is not a model-repairable admission diagnostic: telling the
+    // same root turn to choose a fresh decision id would create a second set
+    // of Team side effects beside the immutable failed Program.
     if outcome.status == "blocked"
         && outcome
             .execution
@@ -2450,16 +2450,16 @@ fn result_from_outcome(
         failure_kinds.sort();
         failure_kinds.dedup();
         decision.recovery_hints.push(RecoveryHint {
-            code: "collaboration_terminal_program_replan".to_string(),
+            code: "collaboration_terminal_program_failed".to_string(),
             message: format!(
-                "The submitted Program reached a terminal admission failure ({}). Repair the semantic fields and resubmit a complete replacement with a fresh decision_id; the previous decision_id is immutable.",
+                "The admitted Program reached a terminal execution failure ({}). Its ExecutionGraph remains the sole retry/recovery authority; do not submit a replacement Program in this turn.",
                 if failure_kinds.is_empty() {
                     "unspecified".to_string()
                 } else {
                     failure_kinds.join(", ")
                 }
             ),
-            retryable: true,
+            retryable: false,
         });
     }
     let mut evidence = outcome.evidence;

@@ -21,6 +21,42 @@ fn trust_all_sessions_are_detected_for_orchestration_approval() {
 }
 
 #[test]
+fn terminal_program_failure_is_fail_closed_not_fresh_id_replan() {
+    let decision = RuntimeOrchestrationDecision {
+        selected_pattern: ExecutionPattern::Collaborate,
+        selected_template: None,
+        reason: "run teams".to_string(),
+        policy_gates: Vec::new(),
+        validation_findings: Vec::new(),
+        adjustments: Vec::new(),
+        required_approval: None,
+        recovery_hints: Vec::new(),
+        budget: json!({}),
+        permission: json!({}),
+        status: "blocked".to_string(),
+    };
+    let outcome = OperationOutcome {
+        status: "blocked".to_string(),
+        execution: json!({
+            "collaboration_diagnostics": [{
+                "code": "team_execution_not_completed",
+                "failure_kind": "provider_protocol",
+            }],
+        }),
+        evidence: json!({}),
+        guidance: "inspect the original graph".to_string(),
+    };
+
+    let result = result_from_outcome("request-1", decision, outcome);
+    assert_eq!(result.decision.recovery_hints.len(), 1);
+    assert_eq!(
+        result.decision.recovery_hints[0].code,
+        "collaboration_terminal_program_failed"
+    );
+    assert!(!result.decision.recovery_hints[0].retryable);
+}
+
+#[test]
 fn root_collaboration_role_selection_survives_strategy_binding() {
     let mut request = proposal(vec![node(
         "runtime-owned-team",

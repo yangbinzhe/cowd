@@ -2553,10 +2553,7 @@ pub(super) fn retryable_collaboration_compile_diagnostic(
                                 == Some(true))
                             .then(|| hint.get("code").and_then(serde_json::Value::as_str))
                             .flatten()
-                            .filter(|code| {
-                                code.starts_with("collaboration_compile_")
-                                    || *code == "collaboration_terminal_program_replan"
-                            })
+                            .filter(|code| code.starts_with("collaboration_compile_"))
                             .map(str::to_string)
                         })
                     })

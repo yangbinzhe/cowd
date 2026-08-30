@@ -395,20 +395,31 @@
             retryable_collaboration_compile_diagnostic(&messages).as_deref(),
             Some("collaboration_compile_completion_terminal_role_missing")
         );
+        assert!(!has_admitted_program_receipt(&messages));
     }
 
     #[test]
-    fn terminal_program_replan_receipt_is_identified_without_parsing_provider_prose() {
+    fn terminal_program_failure_is_not_model_repairable() {
         let messages = vec![ConversationMessage::tool_result(
             "team",
             harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-            r#"runtime orchestration blocked: {"kind":"runtime_orchestration_rejected","recovery_hints":[{"code":"collaboration_terminal_program_replan","retryable":true}]}"#,
+            r#"runtime orchestration blocked: {"kind":"runtime_orchestration_rejected","recovery_hints":[{"code":"collaboration_terminal_program_failed","retryable":false}],"collaboration_program":{"program_id":"program-1","lifecycle":"failed"}}"#,
             true,
         )];
-        assert_eq!(
-            retryable_collaboration_compile_diagnostic(&messages).as_deref(),
-            Some("collaboration_terminal_program_replan")
-        );
+        assert_eq!(retryable_collaboration_compile_diagnostic(&messages), None);
+        assert!(has_admitted_program_receipt(&messages));
+    }
+
+    #[test]
+    fn completed_program_is_also_an_admitted_program() {
+        let messages = vec![ConversationMessage::tool_result(
+            "team",
+            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+            r#"runtime orchestration completed: {"collaboration_program":{"program_id":"program-ok","lifecycle":"completed","required_team_count":1,"completed_required_instance_ids":["team:1"],"terminal_diagnostics":[]}}"#,
+            false,
+        )];
+        assert!(has_admitted_program_receipt(&messages));
+        assert!(has_completed_program_terminal(&messages));
     }
 
     #[test]

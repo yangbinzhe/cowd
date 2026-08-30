@@ -56,6 +56,12 @@ pub struct ProviderCapabilityProfile {
     pub streams_tool_arguments: CapabilityFact,
     pub supports_public_reasoning_summary: CapabilityFact,
     pub requires_reasoning_signature_roundtrip: CapabilityFact,
+    /// Whether Chat Completions assistant tool-call history must carry the
+    /// provider's opaque `reasoning_content` continuation field, including an
+    /// explicitly empty value. This is distinct from Anthropic-style signed
+    /// thinking blocks.
+    #[serde(default = "unknown_capability_fact")]
+    pub requires_reasoning_content_roundtrip: CapabilityFact,
 }
 
 const fn unknown_capability_fact() -> CapabilityFact {
@@ -74,6 +80,7 @@ impl ProviderCapabilityProfile {
             streams_tool_arguments: unknown,
             supports_public_reasoning_summary: unknown,
             requires_reasoning_signature_roundtrip: unknown,
+            requires_reasoning_content_roundtrip: unknown,
         }
     }
 
@@ -110,6 +117,12 @@ impl ProviderCapabilityProfile {
             ProviderProtocol::Completions => CapabilityState::Unknown,
             ProviderProtocol::Responses => CapabilityState::Unsupported,
         };
+        let reasoning_content_roundtrip =
+            if protocol == ProviderProtocol::Completions && Self::is_deepseek_v4(model) {
+                CapabilityState::Supported
+            } else {
+                CapabilityState::Unknown
+            };
         let mut profile = Self {
             supports_tool_calls: CapabilityFact::bundled(CapabilityState::Supported),
             supports_explicit_tool_choice: CapabilityFact::bundled(CapabilityState::Supported),
@@ -118,6 +131,9 @@ impl ProviderCapabilityProfile {
             streams_tool_arguments: CapabilityFact::bundled(CapabilityState::Supported),
             supports_public_reasoning_summary: CapabilityFact::bundled(public_reasoning),
             requires_reasoning_signature_roundtrip: CapabilityFact::bundled(signature_roundtrip),
+            requires_reasoning_content_roundtrip: CapabilityFact::bundled(
+                reasoning_content_roundtrip,
+            ),
         };
         if Self::explicit_tool_choice_known_unsupported(model, reasoning_effort) {
             profile.supports_explicit_tool_choice =
@@ -143,6 +159,18 @@ impl ProviderCapabilityProfile {
         _reasoning_effort: Option<&str>,
     ) -> bool {
         Self::is_deepseek_v4(model) || Self::is_qwen_37_plus(model)
+    }
+
+    /// The canonical wire fact for OpenAI-compatible assistant continuation
+    /// messages. Configured and environment-derived provider routes must call
+    /// this same resolver so constructor choice cannot change protocol
+    /// correctness.
+    #[must_use]
+    pub fn reasoning_content_roundtrip_required(model: &str) -> bool {
+        Self::resolve(ProviderProtocol::Completions, model)
+            .requires_reasoning_content_roundtrip
+            .state
+            == CapabilityState::Supported
     }
 
     /// Exact DeepSeek v4 family check. It matches the canonical model id only;
@@ -179,6 +207,9 @@ fn apply_configured_tags(profile: &mut ProviderCapabilityProfile, tags: &[String
             "public_reasoning_summary" => profile.supports_public_reasoning_summary = fact,
             "reasoning_signature_roundtrip" => {
                 profile.requires_reasoning_signature_roundtrip = fact;
+            }
+            "reasoning_content_roundtrip" => {
+                profile.requires_reasoning_content_roundtrip = fact;
             }
             _ => {}
         }
@@ -287,6 +318,29 @@ mod tests {
                 "DeepSeek v4 defaults to thinking mode and rejects tool_choice with 400"
             );
         }
+    }
+
+    #[test]
+    fn deepseek_v4_completions_requires_reasoning_content_roundtrip() {
+        let deepseek =
+            ProviderCapabilityProfile::resolve(ProviderProtocol::Completions, "deepseek-v4-flash");
+        assert_eq!(
+            deepseek.requires_reasoning_content_roundtrip,
+            CapabilityFact::bundled(CapabilityState::Supported)
+        );
+        assert!(
+            ProviderCapabilityProfile::reasoning_content_roundtrip_required(
+                "provider/deepseek-v4-pro"
+            )
+        );
+
+        let generic =
+            ProviderCapabilityProfile::resolve(ProviderProtocol::Completions, "generic-chat");
+        assert_eq!(
+            generic.requires_reasoning_content_roundtrip.state,
+            CapabilityState::Unknown
+        );
+        assert!(!ProviderCapabilityProfile::reasoning_content_roundtrip_required("qwen3.8-max"));
     }
 
     #[test]

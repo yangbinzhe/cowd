@@ -2431,6 +2431,36 @@ fn has_completed_program_terminal(messages: &[ConversationMessage]) -> bool {
     !completed_program_team_ids(messages).is_empty()
 }
 
+/// Whether Runtime admitted a durable collaboration Program, regardless of
+/// whether that Program completed successfully. The receipt is lifecycle
+/// authority; tool-result success is not. Once true, this root turn must not
+/// expose a second admission port for the same objective.
+fn has_admitted_program_receipt(messages: &[ConversationMessage]) -> bool {
+    messages
+        .iter()
+        .flat_map(|message| message.blocks.iter())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_name, output, ..
+            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
+                || tool_name.eq_ignore_ascii_case(
+                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
+                ) =>
+            {
+                orchestration_receipt_json(output)
+            }
+            _ => None,
+        })
+        .any(|receipt| {
+            receipt
+                .get("collaboration_program")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|program| program.get("program_id"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|program_id| !program_id.trim().is_empty())
+        })
+}
+
 fn completed_program_team_ids_from_receipt(receipt: &serde_json::Value) -> BTreeSet<String> {
     let Some(program) = receipt.get("collaboration_program") else {
         return BTreeSet::new();

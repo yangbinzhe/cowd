@@ -241,6 +241,7 @@ where
             if state.execution_role.is_delegated_leaf()
                 || state.collaboration_started
                 || has_completed_program_terminal(&state.tool_results)
+                || has_admitted_program_receipt(&state.tool_results)
             {
                 None
             } else {
@@ -3335,10 +3336,12 @@ where
         // from the typed Program terminal projection below.
         state.collaboration_started |= calls
             .iter()
-            .any(|call| successful_call_ids.contains(&call.id) && is_team_orchestration_call(call));
+            .any(|call| successful_call_ids.contains(&call.id) && is_team_orchestration_call(call))
+            || has_admitted_program_receipt(&result.messages);
         let root_control_plane_required = !state.execution_role.is_delegated_leaf()
             && !state.collaboration_started
             && !has_completed_program_terminal(&state.tool_results)
+            && !has_admitted_program_receipt(&state.tool_results)
             && state
                 .task_understanding
                 .as_ref()
@@ -3369,17 +3372,10 @@ where
                         harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
                             .to_string(),
                     ]));
-                    let terminal_program_replan =
-                        diagnostic == "collaboration_terminal_program_replan";
                     let reason = format!(
-                        "Runtime requires a corrected semantic collaboration submission now (bounded attempt {}/{}). The retryable Runtime diagnostic is `{diagnostic}`. Call submit_collaboration_decision in this next response with a complete replacement decision; repair exactly the diagnostic's field paths and allowed repairs, preserve valid workstreams, {}and do not write a conclusion or invoke any other tool.",
+                        "Runtime requires a corrected semantic collaboration submission now (bounded attempt {}/{}). The retryable Runtime diagnostic is `{diagnostic}`. Call submit_collaboration_decision in this next response with a complete replacement decision; repair exactly the diagnostic's field paths and allowed repairs, preserve valid workstreams, retain the current decision_id because no Program was admitted, and do not write a conclusion or invoke any other tool.",
                         state.team_orchestration_requests,
                         ROOT_CONTROL_PLANE_REPAIR_BUDGET,
-                        if terminal_program_replan {
-                            "use a fresh unique decision_id because the previous Program is terminal, "
-                        } else {
-                            "retain the current decision_id because no Program was admitted, "
-                        },
                     );
                     let mut item = ContextItem::new(
                         format!("runtime-root-collaboration-repair:{}", ticket.node_id),
