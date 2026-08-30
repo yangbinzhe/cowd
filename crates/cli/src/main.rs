@@ -49,11 +49,14 @@ fn auth_profile_entry(args: &[String]) -> std::process::ExitCode {
         [profile, command, rest @ ..] if profile == "profile" && command == "show" => {
             auth_profile_show(rest)
         }
+        [profile, command, rest @ ..] if profile == "profile" && command == "preview" => {
+            auth_profile_preview(rest)
+        }
         [profile, command, rest @ ..] if profile == "profile" && command == "set" => {
             auth_profile_set(rest)
         }
         _ => Err(
-            "usage: cowd auth profile show | cowd auth profile set --core-profile <id> --apps <app=profile[,app=profile]> --expected-epoch <n> --expected-revision <n> --confirm <digest>"
+            "usage: cowd auth profile show | cowd auth profile preview --core-profile <id> --apps <app=profile[,app=profile]|empty> | cowd auth profile set --core-profile <id> --apps <app=profile[,app=profile]|empty> --expected-epoch <n> --expected-revision <n> --confirm <digest>"
                 .to_string(),
         ),
     };
@@ -78,6 +81,28 @@ fn auth_profile_show(args: &[String]) -> Result<(), String> {
     println!(
         "{}",
         serde_json::to_string_pretty(&entitlement).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn auth_profile_preview(args: &[String]) -> Result<(), String> {
+    let flags = parse_exact_flags(args, &["--core-profile", "--apps"])?;
+    let credential = read_credential_stdin()?;
+    let client = auth_profile_client();
+    let (entitlement, confirmation_digest) = client
+        .preview_human_entitlements(
+            &credential,
+            flags["--core-profile"].clone(),
+            parse_app_profiles(&flags["--apps"])?,
+        )
+        .map_err(|error| error.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "entitlement": entitlement,
+            "confirmation_digest": confirmation_digest,
+        }))
+        .map_err(|error| error.to_string())?
     );
     Ok(())
 }
@@ -220,6 +245,9 @@ fn parse_exact_flags(
 
 fn parse_app_profiles(value: &str) -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut profiles = std::collections::BTreeMap::new();
+    if value.trim().is_empty() {
+        return Ok(profiles);
+    }
     for entry in value.split(',') {
         let (app_id, profile_id) = entry
             .split_once('=')
@@ -232,9 +260,6 @@ fn parse_app_profiles(value: &str) -> Result<std::collections::BTreeMap<String, 
         {
             return Err("--apps must contain unique non-empty app=profile entries".to_string());
         }
-    }
-    if profiles.is_empty() {
-        return Err("--apps must contain at least one app=profile entry".to_string());
     }
     Ok(profiles)
 }
@@ -348,6 +373,7 @@ mod tests {
         );
         assert!(parse_app_profiles("workbench=viewer,workbench=manager").is_err());
         assert!(parse_app_profiles("missing-separator").is_err());
+        assert!(parse_app_profiles("").unwrap().is_empty());
         let mut unknown = complete;
         unknown.extend(["--capability".to_string(), "app.read".to_string()]);
         assert!(parse_exact_flags(

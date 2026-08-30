@@ -434,6 +434,36 @@ fn root_progress_fingerprint(projection: &Value, statuses: &[Value]) -> String {
     .unwrap_or_default()
 }
 
+fn session_progress_fingerprint(timeline: &Value) -> String {
+    let events = timeline
+        .get("events")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let tail = events
+        .iter()
+        .rev()
+        .take(16)
+        .rev()
+        .map(|event| {
+            json!({
+                "created_at_ms": event.get("created_at_ms"),
+                "source": event.get("source"),
+                "sequence": event.get("sequence"),
+                "kind": event.get("kind"),
+                "status": event.get("status"),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&json!({
+        "event_count": events.len(),
+        "tail": tail,
+        "degraded": timeline.get("degraded"),
+        "degraded_reason": timeline.get("degraded_reason"),
+    }))
+    .unwrap_or_default()
+}
+
 fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
     let Some(nodes) = projection.pointer("/graph/nodes").and_then(Value::as_array) else {
         return RootExecutionTerminal::Pending;
@@ -775,6 +805,12 @@ impl LiveScenarioRunner {
             |error| json!({"status":"failed","error":error}),
             |_| json!({"status":"passed"}),
         );
+        let cleanup_passed = cleanup.get("status").and_then(Value::as_str) == Some("passed");
+        acceptance.checks.push(json!({
+            "name": "session_actor_cleanup",
+            "passed": cleanup_passed,
+        }));
+        acceptance.passed &= cleanup_passed;
         trace.extend(actor.drain_trace());
         json!({
             "scenario_id": spec.id,
@@ -815,6 +851,8 @@ impl LiveScenarioRunner {
         let mut last_progress_at = started;
         let mut last_message_fingerprint = None;
         let mut last_root_fingerprint = None;
+        let mut last_session_fingerprint = None;
+        let mut next_session_progress_probe = started;
         loop {
             let path = format!("/api/sessions/{session_id}/messages?limit=200");
             let response = self.get_json(&path);
@@ -865,6 +903,21 @@ impl LiveScenarioRunner {
                     }
                     if let RootExecutionTerminal::Failed(reason) = &observation.terminal {
                         return Err(reason.clone());
+                    }
+                }
+                let now = Instant::now();
+                if now >= next_session_progress_probe {
+                    next_session_progress_probe = now + Duration::from_secs(1);
+                    if let Ok(fingerprint) = self.session_progress_observation(session_id, trace) {
+                        match last_session_fingerprint.as_deref() {
+                            None => last_session_fingerprint = Some(fingerprint),
+                            Some(previous) if previous != fingerprint => {
+                                last_session_fingerprint = Some(fingerprint);
+                                progress_observations = progress_observations.saturating_add(1);
+                                last_progress_at = Instant::now();
+                            }
+                            Some(_) => {}
+                        }
                     }
                 }
                 if let Some(message) = messages.into_iter().rev().find(|message| {
@@ -959,6 +1012,57 @@ impl LiveScenarioRunner {
                     terminal,
                     fingerprint,
                 })
+            }
+            Err(error) => {
+                trace.push(json!({
+                    "method": "GET",
+                    "path": path,
+                    "request": Value::Null,
+                    "response": {"status": "error", "error": error},
+                }));
+                Err(error)
+            }
+        }
+    }
+
+    /// Observe Session-scoped durable activity while the root graph is
+    /// delegated into Team/Agent descendants. Root revisions intentionally do
+    /// not mirror every child transition, so using only the root creates false
+    /// inactivity timeouts for healthy collaboration Programs.
+    fn session_progress_observation(
+        &self,
+        session_id: &str,
+        trace: &mut Vec<Value>,
+    ) -> Result<String, String> {
+        let path = format!("/api/runtime/timeline?session_id={session_id}&limit=500");
+        match self.get_json(&path) {
+            Ok(timeline) => {
+                let fingerprint = session_progress_fingerprint(&timeline);
+                let events = timeline
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                trace.push(json!({
+                    "method": "GET",
+                    "path": path,
+                    "request": Value::Null,
+                    "response": {
+                        "status": "ok",
+                        "body": {
+                            "event_count": events.len(),
+                            "last_event": events.last().map(|event| json!({
+                                "created_at_ms": event.get("created_at_ms"),
+                                "source": event.get("source"),
+                                "sequence": event.get("sequence"),
+                                "kind": event.get("kind"),
+                                "status": event.get("status"),
+                            })),
+                            "degraded": timeline.get("degraded"),
+                        }
+                    }
+                }));
+                Ok(fingerprint)
             }
             Err(error) => {
                 trace.push(json!({
@@ -1129,6 +1233,7 @@ impl LiveScenarioRunner {
     ) -> Value {
         let projections = self.execution_lineage_projections(root_execution_id, trace);
         let mut receipts = Vec::new();
+        let mut succeeded = 0_usize;
         for projection in projections.into_iter().rev() {
             let Some(execution_id) = projection.get("execution_id").and_then(Value::as_str) else {
                 continue;
@@ -1144,6 +1249,7 @@ impl LiveScenarioRunner {
                 "payload": {"reason": "isolated live evaluation timed out; canceling owned execution"},
             });
             let response = actor.post_control_mutation(&path, request);
+            succeeded = succeeded.saturating_add(usize::from(response.is_ok()));
             trace.extend(actor.drain_trace());
             receipts.push(json!({
                 "execution_id": execution_id,
@@ -1151,7 +1257,17 @@ impl LiveScenarioRunner {
                 "response": response,
             }));
         }
-        json!({"attempted": receipts.len(), "receipts": receipts})
+        let attempted = receipts.len();
+        let failed = attempted.saturating_sub(succeeded);
+        let complete = attempted > 0 && failed == 0;
+        json!({
+            "status": if complete { "passed" } else { "failed" },
+            "attempted": attempted,
+            "succeeded": succeeded,
+            "failed": failed,
+            "reason": (attempted == 0).then_some("owned execution lineage was not observable for cancellation"),
+            "receipts": receipts,
+        })
     }
 
     fn get_json(&self, path: &str) -> Result<Value, String> {
@@ -1482,9 +1598,9 @@ impl LiveScenarioTimeout {
             // work is not visible as a root revision until a reduction or
             // handoff commits. These values govern only the isolated evaluator
             // process; the Runtime retains its own provider-progress policy.
-            initial_wait: Duration::from_secs(240),
-            inactivity_wait: Duration::from_secs(300),
-            max_wait: Duration::from_secs(900),
+            initial_wait: Duration::from_secs(360),
+            inactivity_wait: Duration::from_secs(600),
+            max_wait: Duration::from_secs(1_800),
         }
     }
 
@@ -3109,6 +3225,38 @@ mod tests {
     }
 
     #[test]
+    fn session_progress_fingerprint_tracks_descendant_durable_events() {
+        let first = json!({
+            "events": [{
+                "created_at_ms": 100,
+                "source": "runtime_lifecycle",
+                "sequence": 1,
+                "kind": "agent.provider.first_output",
+                "status": "running"
+            }],
+            "degraded": false
+        });
+        let second = json!({
+            "events": [
+                first["events"][0].clone(),
+                {
+                    "created_at_ms": 200,
+                    "source": "runtime_lifecycle",
+                    "sequence": 2,
+                    "kind": "agent.terminal",
+                    "status": "terminal"
+                }
+            ],
+            "degraded": false
+        });
+
+        assert_ne!(
+            session_progress_fingerprint(&first),
+            session_progress_fingerprint(&second)
+        );
+    }
+
+    #[test]
     fn team_acceptance_does_not_pass_without_a_real_projection_team_or_agents() {
         let answer =
             "runtime memory gateway event risk crates/runtime/src/lib.rs crates/memory/src/lib.rs";
@@ -3981,9 +4129,9 @@ mod tests {
         let team = LiveScenarioTimeout::team().with_cap(None);
         assert!(team.max_wait > direct.max_wait);
 
-        let capped = team.with_cap(Some(Duration::from_secs(300)));
-        assert_eq!(capped.max_wait, Duration::from_secs(300));
-        assert_eq!(capped.inactivity_wait, Duration::from_secs(300));
+        let capped = team.with_cap(Some(Duration::from_secs(600)));
+        assert_eq!(capped.max_wait, Duration::from_secs(600));
+        assert_eq!(capped.inactivity_wait, Duration::from_secs(600));
 
         // An accidentally tiny operator cap cannot make the team scenario
         // fail before it has had one normal progress window.
@@ -4005,8 +4153,8 @@ mod tests {
             "a submitted user message is not provider progress"
         );
         assert!(team.should_abort_for_inactivity(
-            Duration::from_secs(241),
-            Duration::from_secs(301),
+            Duration::from_secs(361),
+            Duration::from_secs(601),
             1,
         ));
     }

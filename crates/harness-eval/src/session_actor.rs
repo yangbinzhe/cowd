@@ -28,8 +28,14 @@ impl<'a> SessionActor<'a> {
         let body = model
             .filter(|value| !value.trim().is_empty())
             .map_or_else(|| json!({}), |model| json!({"model": model}));
-        let session = send_json(client.post(format!("{base_url}/api/sessions")).json(&body))
-            .map_err(|error| format!("create_session:{error}"))?;
+        let session = send_json(
+            client
+                .post(format!("{base_url}/api/sessions"))
+                .header("x-cowd-surface-id", surface_id)
+                .header("x-cowd-requested-capabilities", "mission.observe")
+                .json(&body),
+        )
+        .map_err(|error| format!("create_session:{error}"))?;
         let session_id = session
             .get("id")
             .or_else(|| session.get("session_id"))
@@ -78,12 +84,11 @@ impl<'a> SessionActor<'a> {
         body: Value,
     ) -> Result<Value, String> {
         let response = send_json(
-            self.writer_request(self.client.post(self.url(path)))
-                .header(
-                    "x-cowd-requested-capabilities",
-                    "runtime.maintenance.manage",
-                )
-                .json(&body),
+            self.request_with_capabilities(
+                self.client.post(self.url(path)),
+                "runtime.maintenance.manage",
+            )
+            .json(&body),
         );
         self.trace.push(trace_entry(
             "POST",
@@ -179,9 +184,18 @@ impl<'a> SessionActor<'a> {
     }
 
     fn writer_request(&self, request: RequestBuilder) -> RequestBuilder {
+        self.request_with_capabilities(request, "mission.observe")
+    }
+
+    fn request_with_capabilities(
+        &self,
+        request: RequestBuilder,
+        capabilities: &str,
+    ) -> RequestBuilder {
         request
             .header("x-cowd-surface-id", &self.surface_id)
             .header("x-cowd-observer-id", &self.observer_id)
+            .header("x-cowd-requested-capabilities", capabilities)
     }
 
     fn url(&self, path: &str) -> String {

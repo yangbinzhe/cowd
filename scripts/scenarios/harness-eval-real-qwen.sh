@@ -298,6 +298,32 @@ for _ in {1..240}; do
 done
 curl -fsS -H "Authorization: Bearer $TOKEN" "$BASE_URL/healthz" >/dev/null
 
+# The disposable credential starts with the product-safe operator profile.
+# Normal evaluation requests only mission.observe, while timeout cleanup needs
+# runtime.maintenance.manage to cancel the exact lineage owned by this actor.
+# Promote through the broker's preview/confirmation protocol so this harness
+# never duplicates the manager capability list.
+current_entitlement="$(printf '%s\n' "$TOKEN" | env \
+  COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$ISOLATED_HOME" \
+  "$BIN" auth profile show)"
+profile_epoch="$(jq -r '.credential_epoch' <<<"$current_entitlement")"
+profile_revision="$(jq -r '.profile_revision' <<<"$current_entitlement")"
+app_profiles="$(jq -r \
+  '.app_profiles | to_entries | map("\(.key)=\(.value)") | join(",")' \
+  <<<"$current_entitlement")"
+profile_preview="$(printf '%s\n' "$TOKEN" | env \
+  COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$ISOLATED_HOME" \
+  "$BIN" auth profile preview --core-profile core_manager --apps "$app_profiles")"
+profile_confirmation="$(jq -r '.confirmation_digest' <<<"$profile_preview")"
+printf '%s\n' "$TOKEN" | env \
+  COWD_CONFIG_HOME="$CONFIG_HOME" HOME="$ISOLATED_HOME" \
+  "$BIN" auth profile set \
+    --core-profile core_manager \
+    --apps "$app_profiles" \
+    --expected-epoch "$profile_epoch" \
+    --expected-revision "$profile_revision" \
+    --confirm "$profile_confirmation" >/dev/null
+
 # Process liveness precedes projector warm-up and control-plane latency
 # stabilization. Starting the evaluator in that interval creates a false
 # semantic-health failure even when the same isolated Gateway becomes ready a

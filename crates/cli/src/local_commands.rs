@@ -132,7 +132,7 @@ fn parse_output_format(args: &[String]) -> Result<(Vec<String>, OutputFormat), S
 
 fn print_help(output: OutputFormat) -> Result<(), String> {
     let message = format!(
-        "Cowd {}\n\nCore commands:\n  cowd\n  cowd gateway start|stop|restart|status|doctor|logs|repair|open\n  cowd apps list|status <id>|doctor [id]|logs <id>|restart <id>\n  cowd storage <action>\n  cowd storage ownership-cutover activate|rollback --request <json> [credential channel]\n  cowd auth profile show|set\n  cowd config list|show|doctor\n  cowd doctor\n  cowd skill list|show|validate|plan|install|status|rollback|remove\n  cowd tool list|doctor\n  cowd version",
+        "Cowd {}\n\nCore commands:\n  cowd\n  cowd gateway start|stop|restart|status|doctor|logs|repair|open\n  cowd apps list|status <id>|doctor [id]|logs <id>|restart <id>\n  cowd storage <action>\n  cowd storage ownership-cutover activate|rollback --request <json> [credential channel]\n  cowd auth profile show|preview|set\n  cowd config list|show|doctor\n  cowd doctor\n  cowd skill list|show|validate|plan|install|status|rollback|remove\n  cowd tool list|doctor\n  cowd version",
         env!("CARGO_PKG_VERSION")
     );
     if output == OutputFormat::Json {

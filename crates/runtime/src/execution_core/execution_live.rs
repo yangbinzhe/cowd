@@ -180,12 +180,21 @@ impl LiveExecutionRecord {
             return false;
         }
         if !allows_transition(self.live.status, status) {
-            tracing::warn!(
-                execution_id = %self.execution_id,
-                from = ?self.live.status,
-                to = ?status,
-                "ignored invalid Runtime live execution status transition"
-            );
+            if is_terminal_live_status(self.live.status) && !is_terminal_live_status(status) {
+                tracing::debug!(
+                    execution_id = %self.execution_id,
+                    terminal = ?self.live.status,
+                    stale = ?status,
+                    "absorbed stale Runtime live phase after terminal commit"
+                );
+            } else {
+                tracing::warn!(
+                    execution_id = %self.execution_id,
+                    from = ?self.live.status,
+                    to = ?status,
+                    "ignored invalid Runtime live execution status transition"
+                );
+            }
             return false;
         }
         let now = current_time_ms();
@@ -1741,6 +1750,13 @@ fn allows_transition(from: ExecutionLiveStatus, to: ExecutionLiveStatus) -> bool
     )
 }
 
+fn is_terminal_live_status(status: ExecutionLiveStatus) -> bool {
+    matches!(
+        status,
+        ExecutionLiveStatus::Complete | ExecutionLiveStatus::Error | ExecutionLiveStatus::Cancelled
+    )
+}
+
 fn context_usage_from_report(report: &ContextTurnReport) -> Option<ContextUsageProjection> {
     let ledger = report.ledger.as_ref()?;
     let input_tokens = ledger
@@ -2181,6 +2197,12 @@ mod tests {
             record.live.terminal_ref.as_deref(),
             Some("terminal:durable")
         );
+        assert_eq!(record.live.revision, revision);
+        assert!(!record.transition(
+            ExecutionLiveStatus::Finalizing,
+            Some("late child phase".to_string())
+        ));
+        assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
         assert_eq!(record.live.revision, revision);
     }
 
