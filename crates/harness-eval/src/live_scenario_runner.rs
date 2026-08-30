@@ -10,7 +10,11 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 
-use crate::{session_actor::SessionActor, HarnessEvalRunnerOptions};
+use crate::{
+    live_scenario_observer::{LiveScenarioObserver, MAX_DRAIN_PAGES_PER_PROBE},
+    session_actor::SessionActor,
+    HarnessEvalRunnerOptions,
+};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
@@ -487,6 +491,28 @@ impl RootExecutionTerminal {
 struct RootExecutionObservation {
     terminal: RootExecutionTerminal,
     fingerprint: String,
+    summary: Value,
+    response_body_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ExecutionLiveObservation {
+    fingerprint: String,
+    summary: Value,
+    response_body_bytes: u64,
+}
+
+fn live_terminal_belongs_to_root(observation: &ExecutionLiveObservation, root_id: &str) -> bool {
+    observation
+        .summary
+        .get("execution_id")
+        .and_then(Value::as_str)
+        == Some(root_id)
+        && observation
+            .summary
+            .get("live_status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "complete" | "error" | "cancelled"))
 }
 
 fn root_node_statuses(projection: &Value) -> Vec<Value> {
@@ -517,36 +543,6 @@ fn root_progress_fingerprint(projection: &Value, statuses: &[Value]) -> String {
         "live_status": live.get("status"),
         "live_output_bytes": live.get("output_bytes"),
         "live_last_progress_at_ms": live.get("last_progress_at_ms"),
-    }))
-    .unwrap_or_default()
-}
-
-fn session_progress_fingerprint(timeline: &Value) -> String {
-    let events = timeline
-        .get("events")
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let tail = events
-        .iter()
-        .rev()
-        .take(16)
-        .rev()
-        .map(|event| {
-            json!({
-                "created_at_ms": event.get("created_at_ms"),
-                "source": event.get("source"),
-                "sequence": event.get("sequence"),
-                "kind": event.get("kind"),
-                "status": event.get("status"),
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::to_string(&json!({
-        "event_count": events.len(),
-        "tail": tail,
-        "degraded": timeline.get("degraded"),
-        "degraded_reason": timeline.get("degraded_reason"),
     }))
     .unwrap_or_default()
 }
@@ -749,14 +745,14 @@ impl LiveScenarioRunner {
         }) && scenarios.iter().any(|scenario| {
             scenario.get("scenario_id").and_then(Value::as_str) == Some("live_team_projection")
         });
-        let collaboration_comparison = comparison_requested
-            .then(|| collaboration_comparison(&scenarios))
-            .unwrap_or_else(|| {
-                json!({
-                    "status": "skipped",
-                    "reason": "baseline/team projection pair was not selected",
-                })
-            });
+        let collaboration_comparison = if comparison_requested {
+            collaboration_comparison(&scenarios)
+        } else {
+            json!({
+                "status": "skipped",
+                "reason": "baseline/team projection pair was not selected",
+            })
+        };
         let comparison_passed = collaboration_comparison
             .get("status")
             .and_then(Value::as_str)
@@ -846,11 +842,23 @@ impl LiveScenarioRunner {
             );
         };
 
+        let mut observer = LiveScenarioObserver::default();
         let terminal =
-            self.wait_for_terminal_message(&session_id, execution_id_ref, &timeout, &mut trace);
+            self.wait_for_terminal_message(&session_id, execution_id_ref, &timeout, &mut observer);
         let Ok(terminal) = terminal else {
-            let mut diagnostics =
-                self.capture_diagnostics(&session_id, Some(execution_id_ref), &mut trace);
+            let terminal_error = terminal.err().unwrap_or_default();
+            let mut diagnostics = self.capture_diagnostics(
+                &session_id,
+                Some(execution_id_ref),
+                &mut observer,
+                started,
+                &mut trace,
+            );
+            let (observation_trace, observation_integrity) = observer.finalize();
+            if let Some(object) = diagnostics.as_object_mut() {
+                object.insert("observation_integrity".to_string(), observation_integrity);
+            }
+            trace.extend(observation_trace);
             let cleanup = self.cancel_execution_lineage(execution_id_ref, &mut actor, &mut trace);
             if let Some(object) = diagnostics.as_object_mut() {
                 object.insert("cancellation".to_string(), cleanup);
@@ -861,7 +869,7 @@ impl LiveScenarioRunner {
                 trace,
                 session_id,
                 execution_id,
-                terminal.err().unwrap_or_default(),
+                terminal_error,
                 diagnostics,
             );
         };
@@ -874,6 +882,7 @@ impl LiveScenarioRunner {
             execution_id_ref,
             started,
             &timeout,
+            &mut observer,
             &mut trace,
         );
         let timeline = descendant_wait.timeline;
@@ -909,6 +918,27 @@ impl LiveScenarioRunner {
             "passed": model_verified,
         }));
         acceptance.passed &= model_verified;
+        let (observation_trace, observation_integrity) = observer.finalize();
+        let observation_passed = observation_integrity.get("status").and_then(Value::as_str)
+            == Some("passed")
+            && observation_integrity
+                .get("timeline_drained")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && observation_integrity
+                .get("message_pages_drained")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && observation_integrity
+                .get("stall_detected")
+                .and_then(Value::as_bool)
+                == Some(false);
+        acceptance.checks.push(json!({
+            "name": "autonomous_observation_integrity",
+            "passed": observation_passed,
+            "evidence": observation_integrity.clone(),
+        }));
+        acceptance.passed &= observation_passed;
         let cleanup = actor.finish().map_or_else(
             |error| json!({"status":"failed","error":error}),
             |_| json!({"status":"passed"}),
@@ -919,6 +949,7 @@ impl LiveScenarioRunner {
             "passed": cleanup_passed,
         }));
         acceptance.passed &= cleanup_passed;
+        trace.extend(observation_trace);
         trace.extend(actor.drain_trace());
         json!({
             "scenario_id": spec.id,
@@ -931,6 +962,7 @@ impl LiveScenarioRunner {
             "runtime_commit_cursor": commit_cursor,
             "elapsed_ms": started.elapsed().as_millis(),
             "metrics": metrics,
+            "observation_integrity": observation_integrity,
             "timeout": {
                 "root_terminal_wait": terminal_wait.report,
                 "descendant_team_wait": descendant_wait.report,
@@ -952,133 +984,164 @@ impl LiveScenarioRunner {
         session_id: &str,
         root_execution_id: &str,
         timeout: &LiveScenarioTimeout,
-        trace: &mut Vec<Value>,
+        observer: &mut LiveScenarioObserver,
     ) -> Result<TerminalWait, String> {
         let started = Instant::now();
-        let mut progress_observations = 0_usize;
-        let mut last_progress_at = started;
-        let mut last_message_fingerprint = None;
-        let mut last_root_fingerprint = None;
-        let mut last_session_fingerprint = None;
+        let mut next_message_probe = started;
+        let mut next_root_probe = started;
         let mut next_session_progress_probe = started;
+        let mut root_terminal = RootExecutionTerminal::Pending;
         loop {
-            let path = format!("/api/sessions/{session_id}/messages?limit=200");
-            let response = self.get_json(&path);
-            trace.push(trace_json_entry("GET", path, Value::Null, &response));
-            if let Ok(value) = response {
-                let messages = value
-                    .as_array()
-                    .cloned()
-                    .or_else(|| value.get("messages").and_then(Value::as_array).cloned())
-                    .unwrap_or_default();
-                let fingerprint = messages
-                    .iter()
-                    .map(|message| {
-                        message
-                            .get("id")
-                            .or_else(|| message.get("message_id"))
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                    })
-                    .collect::<Vec<_>>()
-                    .join(":");
-                match last_message_fingerprint.as_deref() {
-                    // The first observation is only the submitted user input.
-                    // It is not execution progress and must not make a slow
-                    // first provider response eligible for the short
-                    // inactivity window.
-                    None => last_message_fingerprint = Some(fingerprint),
-                    Some(previous) if previous != fingerprint => {
-                        last_message_fingerprint = Some(fingerprint);
-                        progress_observations = progress_observations.saturating_add(1);
-                        last_progress_at = Instant::now();
-                    }
-                    Some(_) => {}
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let now = Instant::now();
+            let mut message_polled = false;
+            if now >= next_message_probe {
+                next_message_probe = now + Duration::from_secs(1);
+                self.poll_message_deltas(session_id, elapsed_ms, observer)?;
+                message_polled = true;
+            }
+            let live = self.execution_live_observation(session_id);
+            let live_path = format!("/api/sessions/{session_id}/execution/live");
+            let force_root_probe = match live.as_ref() {
+                Ok(observation) => {
+                    observer.observe_live(
+                        &live_path,
+                        &Ok(observation.summary.clone()),
+                        Some(&observation.fingerprint),
+                        Some(observation.response_body_bytes),
+                        elapsed_ms,
+                    );
+                    live_terminal_belongs_to_root(observation, root_execution_id)
                 }
-                let root = self.root_execution_observation(root_execution_id, trace);
-                if let Ok(observation) = root.as_ref() {
-                    match last_root_fingerprint.as_deref() {
-                        // As with the submitted user message, the initial root
-                        // snapshot establishes a baseline; it is not proof of
-                        // useful provider progress.
-                        None => last_root_fingerprint = Some(observation.fingerprint.clone()),
-                        Some(previous) if previous != observation.fingerprint => {
-                            last_root_fingerprint = Some(observation.fingerprint.clone());
-                            progress_observations = progress_observations.saturating_add(1);
-                            last_progress_at = Instant::now();
-                        }
-                        Some(_) => {}
-                    }
-                    if let RootExecutionTerminal::Failed(reason) = &observation.terminal {
-                        return Err(reason.clone());
-                    }
+                Err(error) => {
+                    observer.observe_live(&live_path, &Err(error.clone()), None, None, elapsed_ms);
+                    false
                 }
-                let now = Instant::now();
-                if now >= next_session_progress_probe {
-                    next_session_progress_probe = now + Duration::from_secs(1);
-                    if let Ok(fingerprint) = self.session_progress_observation(session_id, trace) {
-                        match last_session_fingerprint.as_deref() {
-                            None => last_session_fingerprint = Some(fingerprint),
-                            Some(previous) if previous != fingerprint => {
-                                last_session_fingerprint = Some(fingerprint);
-                                progress_observations = progress_observations.saturating_add(1);
-                                last_progress_at = Instant::now();
-                            }
-                            Some(_) => {}
+            };
+            if now >= next_root_probe
+                || (force_root_probe && root_terminal == RootExecutionTerminal::Pending)
+            {
+                next_root_probe = now + Duration::from_secs(2);
+                let root = self.root_execution_observation(root_execution_id);
+                let root_path = format!("/api/runtime/executions/{root_execution_id}");
+                match root {
+                    Ok(observation) => {
+                        observer.observe_root(
+                            &root_path,
+                            &Ok(observation.summary),
+                            Some(&observation.fingerprint),
+                            Some(observation.response_body_bytes),
+                            elapsed_ms,
+                        );
+                        root_terminal = observation.terminal;
+                        if let RootExecutionTerminal::Failed(reason) = &root_terminal {
+                            return Err(reason.clone());
                         }
                     }
-                }
-                if let Some(message) = messages.into_iter().rev().find(|message| {
-                    message.get("role").and_then(Value::as_str) == Some("assistant")
-                        && !message_text(message).trim().is_empty()
-                }) {
-                    match root {
-                        Ok(RootExecutionObservation {
-                            terminal: RootExecutionTerminal::Completed,
-                            ..
-                        }) => {
-                            return Ok(TerminalWait {
-                                message,
-                                report: timeout.report(
-                                    started.elapsed(),
-                                    last_progress_at.elapsed(),
-                                    progress_observations,
-                                    "root_execution_terminal_and_message",
-                                ),
-                            });
-                        }
-                        Ok(RootExecutionObservation {
-                            terminal: RootExecutionTerminal::Failed(reason),
-                            ..
-                        }) => return Err(reason),
-                        Ok(RootExecutionObservation {
-                            terminal: RootExecutionTerminal::Pending,
-                            ..
-                        })
-                        | Err(_) => {}
+                    Err(error) => {
+                        observer.observe_root(&root_path, &Err(error), None, None, elapsed_ms);
                     }
+                }
+            }
+            if now >= next_session_progress_probe {
+                next_session_progress_probe = now + Duration::from_secs(1);
+                self.poll_timeline_deltas(session_id, elapsed_ms, observer)?;
+            }
+            if root_terminal == RootExecutionTerminal::Completed && !message_polled {
+                self.poll_message_deltas(session_id, elapsed_ms, observer)?;
+            }
+            if let Some(message) = observer
+                .assistant_message()
+                .filter(|message| !message_text(message).trim().is_empty())
+            {
+                match &root_terminal {
+                    RootExecutionTerminal::Completed => {
+                        // Close the observation window only after both durable
+                        // delta streams have been drained at the terminal
+                        // boundary. A root can complete between periodic probes.
+                        self.poll_message_deltas(session_id, elapsed_ms, observer)?;
+                        self.poll_timeline_deltas(session_id, elapsed_ms, observer)?;
+                        return Ok(TerminalWait {
+                            message,
+                            report: timeout.report(
+                                started.elapsed(),
+                                Duration::from_millis(observer.since_last_progress_ms(elapsed_ms)),
+                                observer.progress_observations() as usize,
+                                "root_execution_terminal_and_message",
+                                observer.phase(),
+                                observer.last_active_phase(),
+                            ),
+                        });
+                    }
+                    RootExecutionTerminal::Failed(reason) => return Err(reason.clone()),
+                    RootExecutionTerminal::Pending => {}
                 }
             }
             let elapsed = started.elapsed();
-            let since_progress = last_progress_at.elapsed();
+            let elapsed_ms = elapsed.as_millis() as u64;
+            let since_progress = Duration::from_millis(observer.since_last_progress_ms(elapsed_ms));
+            if since_progress >= Duration::from_secs(30) {
+                observer.mark_quiet();
+            }
             if elapsed >= timeout.max_wait {
+                observer.mark_stalled();
                 return Err(format!(
-                    "timed out after {}ms waiting for a durable assistant message; maximum scenario wait={}ms, progress_observations={progress_observations}",
+                    "timed out after {}ms waiting for a durable assistant message; maximum scenario wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
                     elapsed.as_millis(),
                     timeout.max_wait.as_millis(),
+                    observer.phase(),
+                    observer.last_active_phase(),
+                    observer.progress_observations(),
+                    observer.next_message_sequence(),
+                    observer.timeline_cursor().unwrap_or("-"),
                 ));
             }
-            if timeout.should_abort_for_inactivity(elapsed, since_progress, progress_observations) {
+            if timeout.should_abort_for_inactivity(
+                elapsed,
+                since_progress,
+                observer.progress_observations() as usize,
+            ) {
+                observer.mark_stalled();
                 return Err(format!(
-                    "no durable execution progress for {}ms after {}ms; inactivity window={}ms, maximum scenario wait={}ms, progress_observations={progress_observations}",
+                    "no durable execution progress for {}ms after {}ms; inactivity window={}ms, maximum scenario wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
                     since_progress.as_millis(),
                     elapsed.as_millis(),
                     timeout.inactivity_wait.as_millis(),
                     timeout.max_wait.as_millis(),
+                    observer.phase(),
+                    observer.last_active_phase(),
+                    observer.progress_observations(),
+                    observer.next_message_sequence(),
+                    observer.timeline_cursor().unwrap_or("-"),
                 ));
             }
             thread::sleep(self.poll_interval);
         }
+    }
+
+    fn execution_live_observation(
+        &self,
+        session_id: &str,
+    ) -> Result<ExecutionLiveObservation, String> {
+        let path = format!("/api/sessions/{session_id}/execution/live");
+        let response = self.get_json(&path)?;
+        let response_body_bytes = serde_json::to_vec(&response)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or_default();
+        let live = response.get("live").unwrap_or(&Value::Null);
+        let summary = json!({
+            "execution_id": response.get("execution_id"),
+            "live_revision": live.get("revision"),
+            "live_status": live.get("status"),
+            "live_output_bytes": live.get("output_bytes"),
+            "live_last_progress_at_ms": live.get("last_progress_at_ms"),
+        });
+        let fingerprint = serde_json::to_string(&summary).unwrap_or_default();
+        Ok(ExecutionLiveObservation {
+            fingerprint,
+            summary,
+            response_body_bytes,
+        })
     }
 
     /// A delegated AgentTask shares the parent session's durable message
@@ -1088,116 +1151,97 @@ impl LiveScenarioRunner {
     fn root_execution_observation(
         &self,
         execution_id: &str,
-        trace: &mut Vec<Value>,
     ) -> Result<RootExecutionObservation, String> {
         let path = format!("/api/runtime/executions/{execution_id}");
-        let response = self.get_json(&path);
-        match response {
+        match self.get_json(&path) {
             Ok(projection) => {
+                let response_body_bytes = serde_json::to_vec(&projection)
+                    .map(|bytes| bytes.len() as u64)
+                    .unwrap_or_default();
                 let terminal = root_execution_terminal_state(&projection);
                 let statuses = root_node_statuses(&projection);
                 let fingerprint = root_progress_fingerprint(&projection, &statuses);
                 let live = projection.get("live").unwrap_or(&Value::Null);
-                trace.push(json!({
-                    "method": "GET",
-                    "path": path,
-                    "request": Value::Null,
-                    "response": {
-                        "status": "ok",
-                        "body": {
-                            "execution_id": projection.get("execution_id"),
-                            "revision": projection.get("revision"),
-                            "terminal_state": terminal.as_str(),
-                            "node_statuses": statuses,
-                            "live_revision": live.get("revision"),
-                            "live_status": live.get("status"),
-                            "live_output_bytes": live.get("output_bytes"),
-                            "live_last_progress_at_ms": live.get("last_progress_at_ms"),
-                        }
-                    }
-                }));
+                let summary = json!({
+                    "execution_id": projection.get("execution_id"),
+                    "revision": projection.get("revision"),
+                    "terminal_state": terminal.as_str(),
+                    "node_statuses": statuses,
+                    "live_revision": live.get("revision"),
+                    "live_status": live.get("status"),
+                    "live_output_bytes": live.get("output_bytes"),
+                    "live_last_progress_at_ms": live.get("last_progress_at_ms"),
+                });
                 Ok(RootExecutionObservation {
                     terminal,
                     fingerprint,
+                    summary,
+                    response_body_bytes,
                 })
             }
-            Err(error) => {
-                trace.push(json!({
-                    "method": "GET",
-                    "path": path,
-                    "request": Value::Null,
-                    "response": {"status": "error", "error": error},
-                }));
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
-    /// Observe Session-scoped durable activity while the root graph is
-    /// delegated into Team/Agent descendants. Root revisions intentionally do
-    /// not mirror every child transition, so using only the root creates false
-    /// inactivity timeouts for healthy collaboration Programs.
-    fn session_progress_observation(
+    fn poll_message_deltas(
         &self,
         session_id: &str,
-        trace: &mut Vec<Value>,
-    ) -> Result<String, String> {
-        let path = format!("/api/runtime/timeline?session_id={session_id}&limit=500");
-        match self.get_json(&path) {
-            Ok(timeline) => {
-                let fingerprint = session_progress_fingerprint(&timeline);
-                let events = timeline
-                    .get("events")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                trace.push(json!({
-                    "method": "GET",
-                    "path": path,
-                    "request": Value::Null,
-                    "response": {
-                        "status": "ok",
-                        "body": {
-                            "event_count": events.len(),
-                            "last_event": events.last().map(|event| json!({
-                                "created_at_ms": event.get("created_at_ms"),
-                                "source": event.get("source"),
-                                "sequence": event.get("sequence"),
-                                "kind": event.get("kind"),
-                                "status": event.get("status"),
-                            })),
-                            "degraded": timeline.get("degraded"),
-                        }
-                    }
-                }));
-                Ok(fingerprint)
-            }
-            Err(error) => {
-                trace.push(json!({
-                    "method": "GET",
-                    "path": path,
-                    "request": Value::Null,
-                    "response": {"status": "error", "error": error},
-                }));
-                Err(error)
+        elapsed_ms: u64,
+        observer: &mut LiveScenarioObserver,
+    ) -> Result<(), String> {
+        for _ in 0..MAX_DRAIN_PAGES_PER_PROBE {
+            let path = observer.message_path(session_id);
+            let response = self.get_json(&path);
+            let page = observer.observe_message_page(&path, &response, elapsed_ms)?;
+            if !page.has_more {
+                return Ok(());
             }
         }
+        observer.fail_integrity(format!(
+            "message pagination exceeded {} pages without draining",
+            MAX_DRAIN_PAGES_PER_PROBE
+        ))
+    }
+
+    /// Drain every durable Session/Runtime timeline delta from the last v2
+    /// cursor. Root revisions intentionally do not mirror every delegated
+    /// Team transition, so cursor-complete Session activity is an independent
+    /// progress and evidence source.
+    fn poll_timeline_deltas(
+        &self,
+        session_id: &str,
+        elapsed_ms: u64,
+        observer: &mut LiveScenarioObserver,
+    ) -> Result<(), String> {
+        for _ in 0..MAX_DRAIN_PAGES_PER_PROBE {
+            let path = observer.timeline_path(session_id);
+            let response = self.get_json(&path);
+            let page = observer.observe_timeline_page(&path, &response, elapsed_ms)?;
+            if !page.has_more {
+                return Ok(());
+            }
+        }
+        observer.fail_integrity(format!(
+            "timeline pagination exceeded {} pages without draining",
+            MAX_DRAIN_PAGES_PER_PROBE
+        ))
     }
 
     fn capture_diagnostics(
         &self,
         session_id: &str,
         execution_id: Option<&str>,
+        observer: &mut LiveScenarioObserver,
+        scenario_started: Instant,
         trace: &mut Vec<Value>,
     ) -> Value {
-        let timeline_path = format!("/api/runtime/timeline?session_id={session_id}&limit=500");
-        let timeline = self.get_json(&timeline_path);
-        trace.push(trace_json_entry(
-            "GET",
-            timeline_path,
-            Value::Null,
-            &timeline,
-        ));
+        let timeline_error = self
+            .poll_timeline_deltas(
+                session_id,
+                scenario_started.elapsed().as_millis() as u64,
+                observer,
+            )
+            .err();
         let projection = execution_id.map(|id| {
             let path = format!("/api/runtime/executions/{id}?detail_scope=full");
             let response = self.get_json(&path);
@@ -1205,7 +1249,8 @@ impl LiveScenarioRunner {
             response.unwrap_or_else(|error| json!({"error": error}))
         });
         json!({
-            "timeline": timeline.unwrap_or_else(|error| json!({"error": error})),
+            "timeline": observer.timeline(),
+            "timeline_collection_error": timeline_error,
             "projection": projection.unwrap_or(Value::Null),
         })
     }
@@ -1255,27 +1300,48 @@ impl LiveScenarioRunner {
         root_execution_id: &str,
         scenario_started: Instant,
         timeout: &LiveScenarioTimeout,
+        observer: &mut LiveScenarioObserver,
         trace: &mut Vec<Value>,
     ) -> DescendantTeamWait {
         let wait_started = Instant::now();
         let mut observations = 0_usize;
         loop {
-            let timeline_path = format!("/api/runtime/timeline?session_id={session_id}&limit=500");
-            let timeline_response = self.get_json(&timeline_path);
-            trace.push(trace_json_entry(
-                "GET",
-                timeline_path,
-                Value::Null,
-                &timeline_response,
-            ));
-            let timeline = timeline_response.unwrap_or_else(|error| json!({"error": error}));
+            let timeline_error = self
+                .poll_timeline_deltas(
+                    session_id,
+                    scenario_started.elapsed().as_millis() as u64,
+                    observer,
+                )
+                .err();
+            let timeline = observer.timeline();
             // The public projection makes child execution lineage explicit. A
             // session ingress graph often delegates provider/tool/team work to
             // descendants, so reporting only the root would incorrectly claim
             // zero model rounds and zero token/tool usage for a real execution.
             let projections = self.execution_lineage_projections(root_execution_id, trace);
-            let result = acceptance.evaluate(response_text, &timeline, &projections);
+            let mut result = acceptance.evaluate(response_text, &timeline, &projections);
             observations = observations.saturating_add(1);
+
+            if let Some(error) = timeline_error {
+                result.checks.push(json!({
+                    "name": "autonomous_observation_integrity",
+                    "passed": false,
+                    "error": error.clone(),
+                }));
+                result.passed = false;
+                return DescendantTeamWait {
+                    timeline,
+                    projections,
+                    acceptance: result,
+                    report: json!({
+                        "required": acceptance.requires_descendant_team_closure(),
+                        "elapsed_ms": wait_started.elapsed().as_millis(),
+                        "observations": observations,
+                        "terminal_reason": "timeline_observation_integrity_failed",
+                        "error": error,
+                    }),
+                };
+            }
 
             if !acceptance.requires_descendant_team_closure() || result.passed {
                 return DescendantTeamWait {
@@ -1743,6 +1809,8 @@ impl LiveScenarioTimeout {
         since_progress: Duration,
         progress_observations: usize,
         terminal_reason: &str,
+        phase: &str,
+        last_active_phase: &str,
     ) -> Value {
         json!({
             "initial_wait_ms": self.initial_wait.as_millis(),
@@ -1752,6 +1820,8 @@ impl LiveScenarioTimeout {
             "since_last_progress_ms": since_progress.as_millis(),
             "progress_observations": progress_observations,
             "terminal_reason": terminal_reason,
+            "phase": phase,
+            "last_active_phase": last_active_phase,
         })
     }
 
@@ -3407,35 +3477,26 @@ mod tests {
     }
 
     #[test]
-    fn session_progress_fingerprint_tracks_descendant_durable_events() {
-        let first = json!({
-            "events": [{
-                "created_at_ms": 100,
-                "source": "runtime_lifecycle",
-                "sequence": 1,
-                "kind": "agent.provider.first_output",
-                "status": "running"
-            }],
-            "degraded": false
-        });
-        let second = json!({
-            "events": [
-                first["events"][0].clone(),
-                {
-                    "created_at_ms": 200,
-                    "source": "runtime_lifecycle",
-                    "sequence": 2,
-                    "kind": "agent.terminal",
-                    "status": "terminal"
-                }
-            ],
-            "degraded": false
-        });
+    fn descendant_live_terminal_never_forces_root_terminal_polling() {
+        let child = ExecutionLiveObservation {
+            fingerprint: "child".to_string(),
+            summary: json!({
+                "execution_id": "child-execution",
+                "live_status": "complete",
+            }),
+            response_body_bytes: 1,
+        };
+        assert!(!live_terminal_belongs_to_root(&child, "root-execution"));
 
-        assert_ne!(
-            session_progress_fingerprint(&first),
-            session_progress_fingerprint(&second)
-        );
+        let root = ExecutionLiveObservation {
+            fingerprint: "root".to_string(),
+            summary: json!({
+                "execution_id": "root-execution",
+                "live_status": "complete",
+            }),
+            response_body_bytes: 1,
+        };
+        assert!(live_terminal_belongs_to_root(&root, "root-execution"));
     }
 
     #[test]

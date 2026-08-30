@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 mod auto_strategy_paired;
 mod certification;
 mod evolution;
+mod live_scenario_observer;
 mod live_scenario_runner;
 mod measurement;
 mod paired_performance;

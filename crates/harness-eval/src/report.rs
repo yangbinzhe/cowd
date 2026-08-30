@@ -503,20 +503,36 @@ fn push_deep_live_gate_item(items: &mut Vec<HarnessEvalReportGateItem>, level: &
                         .is_some_and(|value| !value.is_empty())
                 })
     });
+    let all_observations_complete = live_scenarios.iter().all(|scenario| {
+        let observation = scenario
+            .get("observation_integrity")
+            .unwrap_or(&Value::Null);
+        observation.get("status").and_then(Value::as_str) == Some("passed")
+            && observation.get("cursor_monotonic").and_then(Value::as_bool) == Some(true)
+            && observation.get("timeline_drained").and_then(Value::as_bool) == Some(true)
+            && observation
+                .get("message_pages_drained")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && observation.get("omitted_changes").and_then(Value::as_u64) == Some(0)
+            && observation.get("stall_detected").and_then(Value::as_bool) == Some(false)
+    });
     items.push(HarnessEvalReportGateItem::new(
         "deep_live_gateway_scenarios",
         live.get("status").and_then(Value::as_str) == Some("passed")
             && live_scenarios.len() >= required_live_scenarios
-            && all_traces_complete,
+            && all_traces_complete
+            && all_observations_complete,
         true,
         format!(
-            "live_status={}, scenarios={}, required_scenarios={}, complete_traces={}",
+            "live_status={}, scenarios={}, required_scenarios={}, complete_traces={}, complete_observations={}",
             live.get("status")
                 .and_then(Value::as_str)
                 .unwrap_or("missing"),
             live_scenarios.len(),
             required_live_scenarios,
-            all_traces_complete
+            all_traces_complete,
+            all_observations_complete
         ),
         "run deep evaluation against an explicit isolated COWD_EVAL_GATEWAY_URL and retain durable session, terminal, execution and cursor traces for every live scenario",
     ));
@@ -865,6 +881,14 @@ mod gate_tests {
                         "session_id": "session-1",
                         "terminal_id": "terminal-1",
                         "execution_id": "execution-1"
+                    },
+                    "observation_integrity": {
+                        "status": "passed",
+                        "cursor_monotonic": true,
+                        "timeline_drained": true,
+                        "message_pages_drained": true,
+                        "omitted_changes": 0,
+                        "stall_detected": false
                     }
                 }]
             }
@@ -878,6 +902,39 @@ mod gate_tests {
             .expect("gate item");
         assert_eq!(item.status, "passed");
         assert!(item.evidence.contains("required_scenarios=1"));
+        assert!(item.evidence.contains("complete_observations=true"));
+    }
+
+    #[test]
+    fn deep_gate_rejects_a_live_scenario_without_complete_observation_evidence() {
+        let report = json!({
+            "level": "deep",
+            "live_gateway_scenarios": {
+                "status": "passed",
+                "selected_scenario_ids": ["live_group_theory_ai_research_simulation"],
+                "scenarios": [{
+                    "status": "passed",
+                    "production_trace": {
+                        "session_id": "session-1",
+                        "terminal_id": "terminal-1",
+                        "execution_id": "execution-1"
+                    },
+                    "observation_integrity": {
+                        "status": "passed",
+                        "cursor_monotonic": true,
+                        "timeline_drained": false,
+                        "message_pages_drained": true,
+                        "omitted_changes": 0,
+                        "stall_detected": false
+                    }
+                }]
+            }
+        });
+
+        let gate = evaluate_report_gate(&report);
+        let item = gate_item(&gate, "deep_live_gateway_scenarios");
+        assert_eq!(item.status, "failed");
+        assert!(item.evidence.contains("complete_observations=false"));
     }
 
     #[test]
