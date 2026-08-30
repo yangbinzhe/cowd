@@ -1778,7 +1778,11 @@ mod tests {
     use provider::{OutputContentBlock, ToolChoice, ToolDefinition};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn incomplete_provider_stream_is_never_promoted_to_terminal_success() {
@@ -2075,6 +2079,94 @@ mod tests {
         );
         assert!(error.to_string().contains("temporarily fenced"));
         assert_eq!(pool.stats().in_flight, 0, "fenced calls must not dispatch");
+    }
+
+    #[tokio::test]
+    async fn token_plan_control_failure_fences_the_sibling_stream_after_one_http_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture listener");
+        let address = listener.local_addr().expect("fixture address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed_requests = Arc::clone(&requests);
+        let fixture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("first request");
+            let mut buffer = vec![0_u8; 16 * 1024];
+            let _ = socket.read(&mut buffer).await.expect("read request");
+            observed_requests.fetch_add(1, Ordering::SeqCst);
+            let body = r#"{"error":{"message":"Your token-plan 1-week quota has been exhausted. The quota will reset later.","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        let registry = Arc::new(
+            ProviderRegistry::new(ProvidersConfig {
+                providers: HashMap::from([(
+                    "token-plan".to_string(),
+                    ProviderConfig {
+                        name: "token-plan".to_string(),
+                        base_url: format!("http://{address}/v1"),
+                        api_key: "test".to_string(),
+                        models: vec!["qwen3.8-max".to_string()],
+                        protocol: Some("completions".to_string()),
+                        parallel_tool_calls: Default::default(),
+                        early_tool_start: Default::default(),
+                    },
+                )]),
+            })
+            .expect("registry"),
+        );
+        let pool = Arc::new(ProviderTransportPool::new(1));
+        let mut client = ProviderRuntimeClient::new_with_transport_pool(
+            Arc::clone(&registry),
+            Arc::clone(&pool),
+            "qwen3.8-max".to_string(),
+            Vec::new(),
+        )
+        .expect("client");
+
+        let control_error = client
+            .complete_control_analysis("qwen3.8-max", "system", "input", 32)
+            .await
+            .expect_err("quota response must fail");
+        assert!(control_error.contains("quota has been exhausted"));
+        fixture.await.expect("fixture task");
+        assert!(pool.provider_account_is_fenced(registry.revision(), "token-plan"));
+
+        let request = ApiRequest {
+            prompt: PromptAssembly::new(vec!["system".to_string()]),
+            messages: Vec::new().into(),
+            model: "qwen3.8-max".to_string(),
+            reasoning_effort_override: None,
+            request_compiler_cache_hit: false,
+            budget: crate::context_ledger::RequestBudgetReport::for_attempt(
+                "qwen3.8-max",
+                32_768,
+                4_096,
+                0,
+                0,
+                0,
+            ),
+            provider_evidence_context: None,
+        };
+        let error = client
+            .stream(request)
+            .next()
+            .await
+            .expect("one fenced event")
+            .expect_err("sibling stream must be fenced");
+        assert_eq!(
+            error.provider_failure_scope(),
+            model_protocol::provider_failure::ProviderFailureScope::Account
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.stats().in_flight, 0);
     }
 
     #[test]
