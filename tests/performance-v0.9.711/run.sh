@@ -13,6 +13,8 @@ esac
 
 export CARGO_INCREMENTAL=0
 export RUST_BACKTRACE=0
+cargo test -p gateway active_session_register_remove_microbench_gate \
+  -- --ignored --nocapture --test-threads=1
 python3 tests/performance-v0.9.711/compare.py run \
   --manifest tests/performance-v0.9.711/manifest.yaml \
   --mode "$MODE" \

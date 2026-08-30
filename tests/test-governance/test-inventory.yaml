@@ -95,6 +95,9 @@ ignored_tests:
   runtime_projection_performance:
     marker: scripts/test/runtime-projection-performance.sh
     runner: scripts/validate.sh manual runtime-projection-performance
+  architecture_performance:
+    marker: tests/performance-v0.9.711/run.sh
+    runner: tests/performance-v0.9.711/run.sh candidate
   reference_app:
     marker: scripts/test/reference-app.sh
     runner: scripts/test/reference-app.sh

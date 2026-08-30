@@ -30,7 +30,7 @@ check_empty() {
 gateway_production_sources() {
   while IFS= read -r file; do
     awk '/#\[cfg\(test\)\]/{exit} {print FILENAME ":" FNR ":" $0}' "$file"
-  done < <(rg --files crates/gateway/src -g '*.rs')
+  done < <(rg --files crates/gateway/src -g '*.rs' -g '!**/tests/**' -g '!**/tests.rs')
 }
 
 scan_gateway_production() {
@@ -74,7 +74,7 @@ check_empty "compat harness workspace residue" \
   rg -n "compat-harness|compat_harness" Cargo.toml crates/*/Cargo.toml crates --glob '*.rs' --glob '!**/tests/**'
 
 check_empty "api crate naming residue" \
-  rg -n "crates/api|api::" crates --glob '*.rs' --glob 'Cargo.toml'
+  rg -n "crates/api|(^|[^[:alnum:]_])api::" crates --glob '*.rs' --glob 'Cargo.toml'
 
 check_empty "obsolete internal cowd package alias residue" \
   bash -c 'rg -n "cowd_memory|cowd_storage|mod cowd_|pub mod cowd_" crates --glob "*.rs" | rg -v "^crates/runtime/src/lib.rs:[0-9]+:(pub mod cowd_(dirs|event);|pub use cowd_(dirs|event)(::|;|\\{))" || true'
@@ -83,7 +83,7 @@ check_empty "AI bin install residue" \
   rg -n "~/AI/bin|AI/bin" README.md docs scripts crates --glob '*.rs' --glob '*.md' --glob '*.sh' --glob 'Cargo.toml' --glob '!scripts/architecture/check-boundaries.sh'
 
 check_empty "gateway routes must not own business/storage/runtime internals" \
-  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates/gateway/src/api_routes -g "*.rs" -g "!cross_plane_routes.rs") | rg -n "MatrixSqliteRepository|MfgStore::open\\(|Store::open\\(|rusqlite|Connection::open|SqliteConnectionManager::file|ConfigLoader::default_for|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt" || true'
+  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates/gateway/src/api_routes -g "*.rs" -g "!cross_plane_routes.rs" -g "!**/tests/**" -g "!**/tests.rs") | rg -n "MatrixSqliteRepository|MfgStore::open\\(|Store::open\\(|rusqlite|Connection::open|SqliteConnectionManager::file|ConfigLoader::default_for|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt" || true'
 
 check_empty "non-cross-plane routes must not call cross-plane route control helpers" \
   rg -n "cross_plane_routes::(cross_plane_control|save_cross_plane_state|ensure_cross_plane_loaded|decide_connector_action)" \
@@ -183,10 +183,10 @@ check_empty "gateway main must not own business registries" \
   bash -c 'awk "/#\\[cfg\\(test\\)\\]/{exit} {print}" crates/gateway/src/main.rs | rg -n "GlobalToolRegistry|SkillRegistry|PluginManager|CrossPlaneAction|CrossPlaneAuditRecord|CrossPlaneExecutionReceipt|MfgStore::open|MatrixSqliteRepository|UnifiedSessionStore::open|TaskKernel::open|current_tool_registry|build_runtime_plugin_state|RuntimePluginState" || true'
 
 check_empty "matrix core must not contain product APP semantics outside ownership cutover" \
-  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates/matrix/core crates/matrix/repository -g "*.rs" -g "Cargo.toml" -g "!ownership_import.rs") | rg -n "Mfg|mfg|manufacturing|server_manufacturing" | rg -v "crates/matrix/core/src/lib.rs:[0-9]+:.*MfgOwnershipSplitSnapshotV1" || true'
+  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates/matrix/core crates/matrix/repository -g "*.rs" -g "Cargo.toml" -g "!ownership_import.rs" -g "!**/tests/**" -g "!**/tests.rs") | rg -n "Mfg|mfg|manufacturing|server_manufacturing" | rg -v "crates/matrix/core/src/lib.rs:[0-9]+:.*MfgOwnershipSplitSnapshotV1" || true'
 
 check_empty "production direct sqlite opens must stay in storage/repository adapters" \
-  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} !/^[[:space:]]*\\/\\// {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates -g "*.rs" -g "!**/tests/**" -g "!crates/storage/**" -g "!crates/connector/src/source.rs" -g "!crates/connector/src/lib.rs" -g "!crates/session/src/persistence/**" -g "!crates/memory/src/store/**" -g "!crates/memory/src/session/session_store.rs" -g "!crates/memory/src/session/state_rebuilder.rs" -g "!crates/memory/src/knowledge/mod.rs" -g "!crates/memory/src/kernel/cognitive.rs" -g "!crates/memory/src/lifecycle/maintenance.rs" -g "!crates/memory/src/ops/sqlite_persistence.rs" -g "!crates/matrix/repository/**" -g "!crates/runtime/src/recovery/runtime_event_store.rs" -g "!crates/runtime/src/mission/task.rs" -g "!crates/runtime/src/team/team_discovery.rs" -g "!crates/runtime/src/context/artifact.rs" -g "!crates/gateway/src/infrastructure/selected_storage.rs") | rg -n "Connection::open\\(|SqliteConnectionManager::file|TaskKernel::open\\(|UnifiedSessionStore::open\\(|MfgStore::open\\(|SqliteStore::open\\(|MatrixSqliteRepository::open\\(|Store::open\\(" | rg -v "open_in_memory|/tests/|^crates/gateway/src/api_routes/mod.rs:|^crates/gateway/src/kernel/task_kernel.rs:|^crates/gateway/src/kernel/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example)" || true'
+  bash -c 'while IFS= read -r file; do awk "/#\\[cfg\\(test\\)\\]/{exit} !/^[[:space:]]*\\/\\// {print FILENAME \":\" FNR \":\" \$0}" "$file"; done < <(rg --files crates -g "*.rs" -g "!**/tests/**" -g "!**/tests.rs" -g "!crates/storage/**" -g "!crates/connector/src/source.rs" -g "!crates/connector/src/lib.rs" -g "!crates/session/src/persistence/**" -g "!crates/memory/src/store/**" -g "!crates/memory/src/session/session_store.rs" -g "!crates/memory/src/session/state_rebuilder.rs" -g "!crates/memory/src/knowledge/mod.rs" -g "!crates/memory/src/kernel/cognitive.rs" -g "!crates/memory/src/lifecycle/maintenance.rs" -g "!crates/memory/src/ops/sqlite_persistence.rs" -g "!crates/matrix/repository/**" -g "!crates/runtime/src/recovery/runtime_event_store.rs" -g "!crates/runtime/src/mission/task.rs" -g "!crates/runtime/src/team/team_discovery.rs" -g "!crates/runtime/src/context/artifact.rs" -g "!crates/gateway/src/infrastructure/selected_storage.rs") | rg -n "Connection::open\\(|SqliteConnectionManager::file|TaskKernel::open\\(|UnifiedSessionStore::open\\(|MfgStore::open\\(|SqliteStore::open\\(|MatrixSqliteRepository::open\\(|Store::open\\(" | rg -v "open_in_memory|/tests/|^crates/gateway/src/api_routes/mod.rs:|^crates/gateway/src/kernel/task_kernel.rs:|^crates/gateway/src/kernel/session_kernel.rs:|^crates/gateway/src/main.rs:1[0-9][0-9][0-9][0-9]:|^crates/memory/src/.*:[0-9]+:.*(tmp|test|example)" || true'
 
 check_empty "storage direct-open allowlist must stay empty" \
   bash -c 'if [[ "$(tr -d "[:space:]" < crates/storage/direct-open-allowlist.json)" != "[]" ]]; then cat crates/storage/direct-open-allowlist.json; fi'

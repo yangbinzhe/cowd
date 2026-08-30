@@ -46,7 +46,7 @@ ignored_lines="$(rg -n '#\[ignore' crates --glob '*.rs' || true)"
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
   case "$line" in
-    *gateway-global-env.sh*|*COWD_AI_HARNESS_LIVE=1*|*COWD_TEST_POSTGRES_URL*|*memory-performance.sh*|*runtime-projection-performance.sh*|*reference-app.sh*|*reference-app-performance.sh*|*lark-live.sh*|*public-search-live.sh*) ;;
+    *gateway-global-env.sh*|*COWD_AI_HARNESS_LIVE=1*|*COWD_TEST_POSTGRES_URL*|*memory-performance.sh*|*runtime-projection-performance.sh*|*tests/performance-v0.9.711/run.sh*|*reference-app.sh*|*reference-app-performance.sh*|*lark-live.sh*|*public-search-live.sh*) ;;
     *) fail "ignored test has no canonical runner classification: $line" ;;
   esac
 done <<<"$ignored_lines"
@@ -64,6 +64,7 @@ while IFS=: read -r file line_number marker; do
     *COWD_TEST_POSTGRES_URL*) runner="scripts/test/postgres-contract.sh" ;;
     *memory-performance.sh*) runner="scripts/test/memory-performance.sh" ;;
     *runtime-projection-performance.sh*) runner="scripts/test/runtime-projection-performance.sh" ;;
+    *tests/performance-v0.9.711/run.sh*) runner="tests/performance-v0.9.711/run.sh" ;;
     *reference-app.sh*) runner="scripts/test/reference-app.sh" ;;
     *reference-app-performance.sh*) runner="scripts/test/reference-app-performance.sh" ;;
     *lark-live.sh*) runner="scripts/test/lark-live.sh" ;;
