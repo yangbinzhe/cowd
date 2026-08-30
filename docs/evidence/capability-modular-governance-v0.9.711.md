@@ -5,7 +5,7 @@ Release status: passed
 Date: 2026-08-30
 
 Approved plan SHA-256:
-`8fac8f2aa7c5cc20cf525e9517206962f4d64d43d012373af1070782643f3724`.
+`9a06aeac725ff27cff4c9696f909350b79b94576fbf563c9f05ac39df556be4e`.
 
 ## Deterministic closure
 
@@ -47,6 +47,11 @@ exhausted its weekly quota. Publication is forbidden unless those reports match 
 new clean release candidate and pass in the order group-theory research, then 6-Team
 collaboration. The resulting release certifies framework behavior on DeepSeek and
 must not be represented as a Qwen 3.8 Max model-quality pass.
+
+P7.10 makes the explicit paid-scenario selection the single activation authority.
+Legacy expensive-scenario opt-ins remain available only when no explicit selection
+exists; unknown or unregistered selected IDs fail before Session or Provider dispatch,
+so a zero-scenario invocation can no longer be reported as a live pass.
 
 ## Performance and capability conservation
 

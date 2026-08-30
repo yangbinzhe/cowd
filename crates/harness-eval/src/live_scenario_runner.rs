@@ -14,25 +14,42 @@ use crate::{session_actor::SessionActor, HarnessEvalRunnerOptions};
 
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
+const GROUP_THEORY_SCENARIO_ID: &str = "live_group_theory_ai_research_simulation";
+const LARGE_SCALE_SCENARIO_ID: &str = "live_qwen38_large_scale_collaboration";
+
+fn env_flag_enabled(key: &str) -> bool {
+    matches!(
+        std::env::var(key).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+fn scenario_enabled(
+    selected: Option<&BTreeSet<String>>,
+    scenario_id: &str,
+    legacy_opt_in: bool,
+) -> bool {
+    selected.map_or(legacy_opt_in, |ids| ids.contains(scenario_id))
+}
 
 /// Keep the expensive, real-provider research exercise opt-in.  It is a
 /// production-path acceptance scenario, but should not silently add provider
 /// usage to the standard regression suite.
 fn group_theory_research_scenario_enabled() -> bool {
-    matches!(
-        std::env::var("COWD_EVAL_GROUP_THEORY_RESEARCH")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    let selected = selected_live_scenario_ids();
+    scenario_enabled(
+        selected.as_ref(),
+        GROUP_THEORY_SCENARIO_ID,
+        env_flag_enabled("COWD_EVAL_GROUP_THEORY_RESEARCH"),
     )
 }
 
 fn large_scale_collaboration_scenario_enabled() -> bool {
-    matches!(
-        std::env::var("COWD_EVAL_LARGE_SCALE_COLLABORATION")
-            .ok()
-            .as_deref(),
-        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    let selected = selected_live_scenario_ids();
+    scenario_enabled(
+        selected.as_ref(),
+        LARGE_SCALE_SCENARIO_ID,
+        env_flag_enabled("COWD_EVAL_LARGE_SCALE_COLLABORATION"),
     )
 }
 
@@ -72,6 +89,35 @@ fn selected_live_scenario_ids() -> Option<BTreeSet<String>> {
         .map(ToOwned::to_owned)
         .collect::<BTreeSet<_>>();
     (!selected.is_empty()).then_some(selected)
+}
+
+fn live_scenario_selection_errors(
+    selected: Option<&BTreeSet<String>>,
+    registered: &BTreeSet<String>,
+) -> Vec<Value> {
+    selected
+        .map(|selected| {
+            selected
+                .difference(registered)
+                .map(|scenario_id| {
+                    json!({
+                        "kind": "unregistered_live_scenario",
+                        "scenario_id": scenario_id,
+                        "message": "selected live scenario is not registered for this invocation",
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn live_scenario_selection_passed(
+    selected: Option<&BTreeSet<String>>,
+    selection_errors: &[Value],
+    selected_spec_count: usize,
+) -> bool {
+    selection_errors.is_empty()
+        && selected.is_none_or(|selected| selected_spec_count == selected.len())
 }
 
 fn live_provider_token_limit() -> Result<u64, String> {
@@ -641,7 +687,7 @@ impl LiveScenarioRunner {
         ];
         if group_theory_research_scenario_enabled() {
             scenario_specs.push(LiveScenarioSpec {
-                id: "live_group_theory_ai_research_simulation",
+                id: GROUP_THEORY_SCENARIO_ID,
                 prompt: "这是一个必须在本次隔离执行环境中完成的深度任务：调研群论在当前 AI 中的应用，并形成可复核的测试测评方案。必须实际启动**恰好四个**协作 Team，不能把 Team 职责压缩成模型文本。每个 Team 恰好一个只读研究角色：该唯一终端角色必须在 `output_artifacts` 中声明本 Team 的 required result artifacts；不要添加自定义 acceptance 或无资源绑定的 `evidence` 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中以实际存在的完整源码路径的 `evidence_scope` 表达；禁止 `*`、`?` 或其他通配符。A、B、C 的 `evidence_contract` 必须为空；D 的 `evidence_contract` 必须恰好包含以下三个 `evidence_scope`，不能把它们提前分配给 A、B、C。可使用且必须由最终 Team D 自己独立完整读取并复核的真实路径是 `crates/runtime/src/orchestration/mod.rs`、`crates/runtime/src/orchestration/intent_compiler.rs`、`crates/runtime/src/team/instantiation.rs`。Team A（数学与方法审查）负责明确群、群作用、表示、invariance/equivariance 的可证伪定义；Team B（应用调研）负责分别评估视觉/3D、科学机器学习或分子材料、机器人或控制等应用，并区分已读取证据与推断；Team C（实验与评测）负责设计 C4 对称性保持/破坏对照的指标、预期、局限与可复现步骤（只读环境不得声称已写入或执行外部实验）；Team D（综合与风险）必须在收到 A、B、C 的经过授权的结构化证据交接之后，亲自完整读取上述三个路径，比较收益、失败模式、适用边界并输出最终建议。A、B、C 可以并行；不得在三份事实交接完成前开始 D 的实质综合。不得编造论文、链接、实验结果或工具输出；无法通过本次只读工具取得的外部事实必须标为待验证。最终结论需明确包含 `C4`、列出至少三个本工作区实际读取到的完整 `crates/.../*.rs` 源码路径，并说明研究、调研、分析、处理、模拟各环节的输入/输出。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 4,
@@ -653,7 +699,7 @@ impl LiveScenarioRunner {
         }
         if large_scale_collaboration_scenario_enabled() {
             scenario_specs.push(LiveScenarioSpec {
-                id: "live_qwen38_large_scale_collaboration",
+                id: LARGE_SCALE_SCENARIO_ID,
                 prompt: "这是一次单 Program 大规模协同压力验收，必须由当前 Runtime 实际执行，禁止用根模型文本伪装 Team 或 Agent。必须创建**恰好六个**协作 Team；每个 Team 必须恰好包含两个只读角色：investigator 与 reviewer。investigator 先读取并分析本 Team 的源码范围；所有目标文件都明确要求全文件覆盖，必须使用 read_file/read_many 的 `complete: true` 读取到 EOF，不能把首个窗口当作完整文件。reviewer 必须依赖 investigator，独立复核其完整证据，并作为该 Team 唯一 terminal role。terminal reviewer 必须在 `output_artifacts` 中声明 required result artifacts：`findings`、`source_paths`、`evidence`、`summary`、`unresolved`。不要添加自定义 acceptance，也不要添加无资源绑定的 evidence 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中用实际存在的完整源码路径作为 `evidence_scope`；禁止通配符。Team A（编排与 Program 真相）读取 `crates/runtime/src/orchestration/mod.rs` 和 `crates/runtime/src/orchestration/compiler.rs`；Team B（意图、模板与 Team 实例化）读取 `crates/runtime/src/orchestration/intent_compiler.rs` 和 `crates/runtime/src/team/instantiation.rs`；Team C（Agent 执行与结果验证）读取 `crates/runtime/src/agent/in_process_worker.rs` 和 `crates/runtime/src/agent/result_validator.rs`；Team D（Gateway 背压与语义健康）读取 `crates/gateway/src/runtime_host/task_set.rs` 和 `crates/gateway/src/infrastructure/gateway_health.rs`。A、B、C、D 必须作为第一波并行执行。Team E（对抗性交叉审查）读取 `crates/runtime/src/conversation/host.rs` 和 `crates/runtime/src/execution_core/graph/executors/verify.rs`，必须同时依赖并实际消费 A 与 B 的完整结构化交接，审查显式拓扑、证据资格和终态收敛，不能提前开始。Team F（容量、恢复与最终综合）读取 `crates/runtime/src/execution_core/services.rs` 和 `crates/runtime/src/recovery/runtime_event_reactor.rs`，必须同时依赖并实际消费 C、D、E 的完整结构化交接，比较正常、过载、取消、恢复和维护追赶路径，最后输出整体结论。Program 必须形成至少五条跨 Team 依赖：A→E、B→E、C→F、D→F、E→F。最终结论必须列出至少六个本次实际读取的完整源码路径，明确区分已验证事实、源码推断与未执行的模拟；给出并发波次、关键瓶颈、失效模式、容量边界和是否适合继续扩大规模的结论。若且仅若 E 与 F 都确实收到并使用了完整上游结果，最终结论必须原样给出验收声明“E/F 结构化交接已完整消费”；若事实不成立，禁止输出该声明且本任务不得判为完成。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；禁止 bash 和任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 6,
@@ -664,6 +710,14 @@ impl LiveScenarioRunner {
             });
         }
         let selected_scenario_ids = selected_live_scenario_ids();
+        let registered_scenario_ids = scenario_specs
+            .iter()
+            .map(|spec| spec.id.to_string())
+            .collect::<BTreeSet<_>>();
+        let selection_errors = live_scenario_selection_errors(
+            selected_scenario_ids.as_ref(),
+            &registered_scenario_ids,
+        );
         let scenario_specs = scenario_specs
             .into_iter()
             .filter(|spec| {
@@ -672,10 +726,19 @@ impl LiveScenarioRunner {
                     .is_none_or(|selected| selected.contains(spec.id))
             })
             .collect::<Vec<_>>();
-        let scenarios = scenario_specs
-            .into_iter()
-            .map(|spec| self.run_scenario(spec, max_provider_tokens))
-            .collect::<Vec<_>>();
+        let selection_passed = live_scenario_selection_passed(
+            selected_scenario_ids.as_ref(),
+            &selection_errors,
+            scenario_specs.len(),
+        );
+        let scenarios = if selection_passed {
+            scenario_specs
+                .into_iter()
+                .map(|spec| self.run_scenario(spec, max_provider_tokens))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         let passed = scenarios
             .iter()
             .filter(|scenario| scenario.get("status").and_then(Value::as_str) == Some("passed"))
@@ -701,7 +764,7 @@ impl LiveScenarioRunner {
         let metrics = aggregate_scenario_metrics(&scenarios);
         json!({
             "kind": "harness_eval.live_gateway_scenarios",
-            "status": if health_passed && passed == scenarios.len() && comparison_passed { "passed" } else { "failed" },
+            "status": if health_passed && selection_passed && passed == scenarios.len() && comparison_passed { "passed" } else { "failed" },
             "gateway_url": self.base_url,
             "model": self.model,
             "max_provider_tokens_per_scenario": max_provider_tokens,
@@ -711,6 +774,8 @@ impl LiveScenarioRunner {
             "health_observations": health_observations,
             "scenario_count": scenarios.len(),
             "selected_scenario_ids": selected_scenario_ids,
+            "selection_errors": selection_errors,
+            "selection_status": if selection_passed { "passed" } else { "failed" },
             "passed": passed,
             "failed": scenarios.len().saturating_sub(passed),
             "metrics": metrics,
@@ -3130,6 +3195,43 @@ fn env_duration_millis(key: &str, default: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_live_scenario_selection_is_the_activation_authority() {
+        let selected = BTreeSet::from([GROUP_THEORY_SCENARIO_ID.to_string()]);
+        assert!(scenario_enabled(
+            Some(&selected),
+            GROUP_THEORY_SCENARIO_ID,
+            false
+        ));
+        assert!(!scenario_enabled(
+            Some(&selected),
+            LARGE_SCALE_SCENARIO_ID,
+            true
+        ));
+    }
+
+    #[test]
+    fn legacy_expensive_scenario_opt_in_only_applies_without_selection() {
+        assert!(scenario_enabled(None, GROUP_THEORY_SCENARIO_ID, true));
+        assert!(!scenario_enabled(None, GROUP_THEORY_SCENARIO_ID, false));
+    }
+
+    #[test]
+    fn unknown_or_unscheduled_explicit_scenarios_fail_before_dispatch() {
+        let selected = BTreeSet::from([GROUP_THEORY_SCENARIO_ID.to_string()]);
+        let unregistered = BTreeSet::new();
+        let errors = live_scenario_selection_errors(Some(&selected), &unregistered);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["scenario_id"], GROUP_THEORY_SCENARIO_ID);
+        assert!(!live_scenario_selection_passed(Some(&selected), &errors, 0));
+
+        let registered = BTreeSet::from([GROUP_THEORY_SCENARIO_ID.to_string()]);
+        let errors = live_scenario_selection_errors(Some(&selected), &registered);
+        assert!(errors.is_empty());
+        assert!(!live_scenario_selection_passed(Some(&selected), &errors, 0));
+        assert!(live_scenario_selection_passed(Some(&selected), &errors, 1));
+    }
 
     #[test]
     fn live_prompt_carries_an_explicit_shared_provider_token_lease() {

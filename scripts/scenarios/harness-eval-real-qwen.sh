@@ -227,7 +227,7 @@ fi
 CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
-SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "${COWD_EVAL_GROUP_THEORY_RESEARCH:-0}" "${COWD_EVAL_LARGE_SCALE_COLLABORATION:-0}" "$MAX_PROVIDER_TOKENS" | sha256sum | awk '{print $1}')"
+SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" | sha256sum | awk '{print $1}')"
 EVIDENCE_KEY="$(printf '%s\n' "deep-real-v4" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
 if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
   prior_evidence="$({
