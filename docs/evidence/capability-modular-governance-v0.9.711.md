@@ -5,7 +5,7 @@ Release status: passed
 Date: 2026-08-30
 
 Approved plan SHA-256:
-`6903357b0d3e3e6a0b4695ad927d80694bac407307747a0b7cce48c5c8972ae3`.
+`8fac8f2aa7c5cc20cf525e9517206962f4d64d43d012373af1070782643f3724`.
 
 ## Deterministic closure
 
@@ -41,9 +41,12 @@ explicit shared total-token lease. The canonical runner rebuilds CLI and harness
 binds commit/tree/source archive/route/scenario/binary provenance, rejects native
 Bailian generation, and accepts only Qwen Token Plan or the configured DeepSeek
 route. Live certification is recorded outside the repository under the approved
-plan root; publication is forbidden unless those reports match this clean release
-candidate and pass in the order small smoke, group-theory research, then 6-Team
-collaboration.
+plan root. P7.9 records the user's explicit authorization to finish the two remaining
+provider-neutral collaboration scenarios with `deepseek-v4-flash` after Token Plan
+exhausted its weekly quota. Publication is forbidden unless those reports match the
+new clean release candidate and pass in the order group-theory research, then 6-Team
+collaboration. The resulting release certifies framework behavior on DeepSeek and
+must not be represented as a Qwen 3.8 Max model-quality pass.
 
 ## Performance and capability conservation
 
