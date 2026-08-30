@@ -665,7 +665,11 @@ where
                      and the scale recommendation when the objective requests them. Never emit Runtime \
                      Team ids, evidence-bundle headers, delivery counters, JSON transport wrappers, \
                      `[truncated]`, tool calls, or promises to continue. Do not claim that unresolved \
-                     work is empty when any Team reports unresolved items. End with a complete conclusion; \
+                     work is empty when any Team reports unresolved items. A verified \
+                     `root_runtime_attestation` is authoritative only for aggregate execution and receipt \
+                     satisfaction: use it to resolve role-local visibility gaps, but never let it erase \
+                     semantic risks or unresolved items in Team evidence. Preserve every phrase that the \
+                     original objective explicitly requires verbatim. End with a complete conclusion; \
                      never stop mid-sentence. Do not shorten or omit required content merely to satisfy \
                      an arbitrary character target. When this is an intermediate synthesis layer, \
                      preserve all material evidence for the next layer instead of pretending to \

@@ -1818,8 +1818,12 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
                         .get("team_id")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("team");
-                    (envelope.pipeline_status
-                        == harness_contract::outcome::PipelineStatus::Completed
+                    (entry
+                        .get("working_state_verified")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                        && envelope.pipeline_status
+                            == harness_contract::outcome::PipelineStatus::Completed
                         && envelope.delivery_status
                             == harness_contract::outcome::DeliveryStatus::Satisfied
                         && envelope.unresolved.is_empty()
@@ -1892,9 +1896,8 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
             .or(verified_evidence_bundle_summaries)
             .map(collaboration_evidence_carrier)
     };
-    let verified_terminal_carrier = typed_candidate_verified && working_state_verified
-        || typed_team_carrier_verified
-        || evidence_bundle_verified && working_state_verified;
+    let verified_terminal_carrier = working_state_verified
+        && (typed_candidate_verified || typed_team_carrier_verified || evidence_bundle_verified);
     (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed")
         && verified_terminal_carrier
         && terminal_summary.is_some()
@@ -1909,10 +1912,20 @@ fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String>
 const COLLABORATION_EVIDENCE_CARRIER_KIND: &str = "cowd.runtime.collaboration_evidence.v1";
 
 fn collaboration_evidence_carrier(team_results: Vec<String>) -> String {
+    let verified_terminal_count = team_results.len();
     serde_json::json!({
         "kind": COLLABORATION_EVIDENCE_CARRIER_KIND,
-        "team_count": team_results.len(),
+        "team_count": verified_terminal_count,
         "team_results": team_results,
+        "root_runtime_attestation": {
+            "status": "verified",
+            "authority": "parent_runtime_projection",
+            "working_state_verified": true,
+            "verified_terminal_count": verified_terminal_count,
+            "all_carried_team_terminals_verified": true,
+            "scope": "aggregate_execution_and_receipt_satisfaction_only",
+            "role_local_visibility_gaps_do_not_negate_aggregate_attestation": true
+        },
         "presentation_contract": "root_model_synthesis_required"
     })
     .to_string()
@@ -4163,10 +4176,6 @@ fn collaboration_answer_quality_findings(answer: &str, objective: &str) -> Vec<S
     if trimmed.matches("```").count() % 2 != 0 {
         findings.push("final answer contains an unclosed code fence".to_string());
     }
-    if trimmed.chars().last().is_some_and(char::is_alphanumeric) {
-        findings.push("final answer appears to stop mid-sentence".to_string());
-    }
-
     let source_paths = collaboration_source_paths(trimmed);
     let required_source_paths = if objective.contains("至少六个") {
         6
@@ -4266,9 +4275,60 @@ fn collaboration_answer_quality_findings(answer: &str, objective: &str) -> Vec<S
             );
         }
     }
+    for claim in required_verbatim_claims(objective) {
+        if !trimmed.contains(&claim) {
+            findings.push(format!(
+                "final answer is missing required verbatim claim: {claim}"
+            ));
+        }
+    }
     findings.sort();
     findings.dedup();
     findings
+}
+
+fn required_verbatim_claims(objective: &str) -> BTreeSet<String> {
+    const CONTEXT_CHARS: usize = 96;
+    const MARKERS: &[&str] = &[
+        "原样给出",
+        "原样包含",
+        "原样输出",
+        "逐字给出",
+        "逐字包含",
+        "逐字输出",
+        "include verbatim",
+        "output verbatim",
+        "state verbatim",
+        "include exactly",
+        "output exactly",
+    ];
+    let mut claims = BTreeSet::new();
+    for (opening, closing) in [('“', '”'), ('「', '」'), ('\"', '\"')] {
+        let mut search_start = 0_usize;
+        while let Some(relative_open) = objective[search_start..].find(opening) {
+            let open = search_start + relative_open;
+            let content_start = open + opening.len_utf8();
+            let Some(relative_close) = objective[content_start..].find(closing) else {
+                break;
+            };
+            let close = content_start + relative_close;
+            let prefix = objective[..open]
+                .chars()
+                .rev()
+                .take(CONTEXT_CHARS)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let claim = objective[content_start..close].trim();
+            if !claim.is_empty() && MARKERS.iter().any(|marker| prefix.contains(marker)) {
+                claims.insert(claim.to_string());
+            }
+            search_start = close + closing.len_utf8();
+        }
+    }
+    claims
 }
 
 fn collaboration_source_paths(value: &str) -> BTreeSet<String> {

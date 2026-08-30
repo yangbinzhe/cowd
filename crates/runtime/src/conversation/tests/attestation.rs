@@ -1141,6 +1141,30 @@
         assert!(is_collaboration_evidence_carrier(&summary));
         assert!(summary.contains("team-runtime: # Verified Team evidence bundle"));
         assert!(summary.contains("crates/memory/src/store/mod.rs"));
+        let carrier: serde_json::Value = serde_json::from_str(&summary).expect("typed carrier");
+        assert_eq!(
+            carrier.pointer("/root_runtime_attestation/status"),
+            Some(&serde_json::json!("verified"))
+        );
+        assert_eq!(
+            carrier.pointer("/root_runtime_attestation/verified_terminal_count"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            carrier.pointer(
+                "/root_runtime_attestation/role_local_visibility_gaps_do_not_negate_aggregate_attestation"
+            ),
+            Some(&serde_json::json!(true))
+        );
+
+        let mut root_unverified = receipt.clone();
+        root_unverified["working_state_verified"] = serde_json::json!(false);
+        assert!(verified_team_terminal_summary(&root_unverified).is_none());
+
+        let mut child_unverified = receipt.clone();
+        child_unverified["team_terminals"][1]["working_state_verified"] =
+            serde_json::json!(false);
+        assert!(verified_team_terminal_summary(&child_unverified).is_none());
 
         let mut unverified = receipt;
         unverified["team_terminals"][1]["terminal_summary_kind"] =

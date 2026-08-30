@@ -1032,16 +1032,13 @@
     }
 
     #[test]
-    fn collaboration_quality_gate_rejects_truncation_and_incomplete_endings() {
+    fn collaboration_quality_gate_rejects_explicit_truncation_and_missing_evidence() {
         let objective = "最终结论必须列出至少三个完整源码路径，明确区分已验证事实、源码推断与未执行的模拟，并给出并发波次、关键瓶颈、失效模式和容量边界。";
         let invalid = "## 已验证事实\n- crates/runtime/src/lib.rs\n- crates/memory/src/lib.rs\n[truncated]\n源码推断、未执行的模拟、并发波次、关键瓶颈、失效模式、容量边界：Op";
         let findings = collaboration_answer_quality_findings(invalid, objective);
         assert!(findings
             .iter()
             .any(|finding| finding.contains("[truncated]")));
-        assert!(findings
-            .iter()
-            .any(|finding| finding.contains("stop mid-sentence")));
         assert!(findings
             .iter()
             .any(|finding| finding.contains("requires at least 3")));
@@ -1054,6 +1051,51 @@
         assert_eq!(
             collaboration_answer_quality_findings(answer, objective),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn collaboration_quality_gate_is_language_neutral_at_sentence_end() {
+        let objective = "给出已验证事实。";
+        assert!(collaboration_answer_quality_findings("已验证事实：结论可扩展", objective)
+            .is_empty());
+        assert!(collaboration_answer_quality_findings("Verified facts: scalable", "verified facts")
+            .is_empty());
+        assert!(collaboration_answer_quality_findings("```text\n未闭合", objective)
+            .iter()
+            .any(|finding| finding.contains("unclosed code fence")));
+    }
+
+    #[test]
+    fn collaboration_quality_gate_enforces_only_explicit_verbatim_claims() {
+        let objective = "普通引用“不是合同”；最终必须原样包含声明“12/12 已完成”，并原样给出“交接已消费”。";
+        assert_eq!(
+            required_verbatim_claims(objective),
+            BTreeSet::from(["12/12 已完成".to_string(), "交接已消费".to_string()])
+        );
+        let findings = collaboration_answer_quality_findings("普通引用不是合同。", objective);
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.contains("required verbatim claim"))
+                .count(),
+            2
+        );
+        assert!(collaboration_answer_quality_findings(
+            "验收：12/12 已完成；交接已消费。",
+            objective
+        )
+        .is_empty());
+        assert!(required_verbatim_claims("术语“Program”只是普通引用。").is_empty());
+
+        let acceptance_objective = "若事实成立，最终结论必须原样给出验收声明“E/F 结构化交接已完整消费”；还必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”和独立复核声明“12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF”。";
+        assert_eq!(
+            required_verbatim_claims(acceptance_objective),
+            BTreeSet::from([
+                "12/12 目标源码已完整读取到 EOF".to_string(),
+                "12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF".to_string(),
+                "E/F 结构化交接已完整消费".to_string(),
+            ])
         );
     }
 

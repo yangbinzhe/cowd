@@ -5,7 +5,7 @@ Release status: passed
 Date: 2026-08-30
 
 Approved plan SHA-256:
-`9f3420ccf8ccefb44a0e7607a38e43bb09b860c99e2c904580b814ccdc4fe887`.
+`68d27050d8ed02f70346101fdeba18a3b253ae683c74fa74bc9d4b1b46179e8e`.
 
 ## Deterministic closure
 
@@ -60,6 +60,14 @@ presentation recovery has been attempted may Runtime wrap the provider's existin
 narrative into missing presentation fields. Missing risk or unresolved disclosures
 become an explicit `provider_omitted_after_bounded_recovery` warning and are never
 silently converted to an empty list; fixed evidence is never synthesized.
+
+P7.12 makes root collaboration synthesis consume a strict aggregate Runtime
+attestation only after the parent and every carried Team terminal have verified
+working state and satisfied delivery. This resolves role-local receipt visibility
+without widening child permissions or erasing semantic risks. The final quality
+gate is language-neutral and enforces objective phrases explicitly marked for
+verbatim inclusion; a complete Chinese answer is no longer rejected merely because
+its final Unicode character is alphanumeric.
 
 ## Performance and capability conservation
 
