@@ -5,7 +5,7 @@ Status: deterministic implementation closure passed
 Date: 2026-08-31
 
 Approved plan SHA-256:
-`12e933ce512a09da86fc2bab2f1a1eef351fdb87a53464986d3cb599ebb0dc5a`.
+`4a731c32826e1092320be71316abc6c03b51629aea3fca214003a36933a04f17`.
 
 ## Root cause
 
@@ -71,8 +71,10 @@ business-state owners.
   `runtime.outcome.recorded.v1` event. Both its event status and terminal class
   must be `succeeded`; failed, partial and missing outcomes fail closed.
 - A tool scenario passes only with a complete successful
-  `tool.invocation.completed` Runtime receipt. Provider capability metadata,
-  prose claims and usage counters cannot substitute for an executed effect.
+  `tool.invocation.completed` Runtime receipt bound to the expected operation
+  and exact resource target. Provider capability metadata, unrelated tools,
+  wrong-target reads, prose claims and usage counters cannot substitute for
+  the required executed effect.
 - The tool fixture receives the exact `read:Cargo.toml` resource lease it
   requires; no workspace-wide read or weakened Runtime policy was introduced.
 

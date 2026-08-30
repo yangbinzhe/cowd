@@ -655,7 +655,10 @@ impl LiveScenarioRunner {
             LiveScenarioSpec {
                 id: "live_tool_evidence",
                 prompt: "请读取当前工作区的 Cargo.toml，给出 workspace package version 和文件路径。必须通过只读工具取得证据，不要猜测。",
-                acceptance: LiveAcceptance::RequiresToolEvidence,
+                acceptance: LiveAcceptance::RequiresToolEvidence {
+                    tool_name: "read_file",
+                    target_path: "Cargo.toml",
+                },
                 timeout: LiveScenarioTimeout::tool(),
             },
             LiveScenarioSpec {
@@ -1865,7 +1868,10 @@ struct DescendantTeamWait {
 #[derive(Clone, Copy)]
 enum LiveAcceptance {
     Contains(&'static str),
-    RequiresToolEvidence,
+    RequiresToolEvidence {
+        tool_name: &'static str,
+        target_path: &'static str,
+    },
     ArchitectureQuality {
         minimum_teams: usize,
         minimum_claimed_cross_team_edges: usize,
@@ -1918,8 +1924,12 @@ impl LiveAcceptance {
                     json!({"name": "response_contains", "expected": expected, "passed": response.contains(expected)}),
                 ],
             },
-            Self::RequiresToolEvidence => {
-                let tool_evidence = has_successful_runtime_tool_completion(timeline);
+            Self::RequiresToolEvidence {
+                tool_name,
+                target_path,
+            } => {
+                let tool_evidence =
+                    has_successful_runtime_tool_completion(timeline, tool_name, target_path);
                 LiveAcceptanceResult {
                     passed: !response.trim().is_empty() && tool_evidence,
                     quality: None,
@@ -3258,7 +3268,11 @@ fn root_business_outcome(timeline: &Value, root_execution_id: &str) -> RootBusin
 /// Successful tool evidence is a canonical Runtime completion receipt. It is
 /// deliberately not a recursive key search: provider capability metadata and
 /// zero-valued usage summaries are declarations, not executed effects.
-fn has_successful_runtime_tool_completion(timeline: &Value) -> bool {
+fn has_successful_runtime_tool_completion(
+    timeline: &Value,
+    expected_tool_name: &str,
+    expected_target_path: &str,
+) -> bool {
     timeline
         .get("events")
         .and_then(Value::as_array)
@@ -3268,15 +3282,28 @@ fn has_successful_runtime_tool_completion(timeline: &Value) -> bool {
             event.get("kind").and_then(Value::as_str) == Some("tool.invocation.completed")
                 && event.get("status").and_then(Value::as_str) == Some("completed")
                 && event.pointer("/payload/status").and_then(Value::as_str) == Some("completed")
-                && ["invocation_id", "tool_call_id", "tool_name"]
-                    .iter()
-                    .all(|key| {
-                        event
-                            .get("payload")
-                            .and_then(|payload| payload.get(*key))
+                && event.pointer("/payload/tool_name").and_then(Value::as_str)
+                    == Some(expected_tool_name)
+                && event.pointer("/payload/is_error").and_then(Value::as_bool) == Some(false)
+                && event
+                    .pointer("/payload/input_preview")
+                    .and_then(Value::as_str)
+                    .and_then(|input| serde_json::from_str::<Value>(input).ok())
+                    .and_then(|input| {
+                        input
+                            .get("path")
                             .and_then(Value::as_str)
-                            .is_some_and(|value| !value.trim().is_empty())
+                            .map(ToString::to_string)
                     })
+                    .as_deref()
+                    == Some(expected_target_path)
+                && ["invocation_id", "tool_call_id"].iter().all(|key| {
+                    event
+                        .get("payload")
+                        .and_then(|payload| payload.get(*key))
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.trim().is_empty())
+                })
         })
 }
 
@@ -3342,9 +3369,18 @@ mod tests {
                 "status": "completed",
                 "invocation_id": "tool-invocation-1",
                 "tool_call_id": "tool-call-1",
-                "tool_name": "read_file"
+                "tool_name": "read_file",
+                "input_preview": "{\"path\":\"Cargo.toml\"}",
+                "is_error": false
             }
         })
+    }
+
+    fn tool_acceptance() -> LiveAcceptance {
+        LiveAcceptance::RequiresToolEvidence {
+            tool_name: "read_file",
+            target_path: "Cargo.toml",
+        }
     }
 
     #[test]
@@ -4302,18 +4338,13 @@ mod tests {
 
     #[test]
     fn tool_acceptance_rejects_answer_without_runtime_evidence() {
-        let result = LiveAcceptance::RequiresToolEvidence.evaluate(
-            "Cargo.toml",
-            &json!({"events": []}),
-            &[],
-            "root",
-        );
+        let result = tool_acceptance().evaluate("Cargo.toml", &json!({"events": []}), &[], "root");
         assert!(!result.passed);
     }
 
     #[test]
     fn tool_acceptance_requires_completed_runtime_receipt_and_succeeded_outcome() {
-        let result = LiveAcceptance::RequiresToolEvidence.evaluate(
+        let result = tool_acceptance().evaluate(
             "Cargo.toml version 0.9.712",
             &successful_root_outcome_timeline(json!({"events": [completed_tool_event()]})),
             &[],
@@ -4321,7 +4352,7 @@ mod tests {
         );
         assert!(result.passed);
 
-        let result = LiveAcceptance::RequiresToolEvidence.evaluate(
+        let result = tool_acceptance().evaluate(
             "Cargo.toml",
             &successful_root_outcome_timeline(json!({"events": [{
                 "kind": "tool.invocation.failed",
@@ -4337,11 +4368,34 @@ mod tests {
             "root",
         );
         assert!(!result.passed);
+
+        let mut wrong_tool = completed_tool_event();
+        wrong_tool["payload"]["tool_name"] = json!("glob_search");
+        let result = tool_acceptance().evaluate(
+            "Cargo.toml",
+            &successful_root_outcome_timeline(json!({"events": [wrong_tool]})),
+            &[],
+            "root",
+        );
+        assert!(!result.passed, "an unrelated successful tool must not pass");
+
+        let mut wrong_target = completed_tool_event();
+        wrong_target["payload"]["input_preview"] = json!("{\"path\":\"README.md\"}");
+        let result = tool_acceptance().evaluate(
+            "Cargo.toml",
+            &successful_root_outcome_timeline(json!({"events": [wrong_target]})),
+            &[],
+            "root",
+        );
+        assert!(
+            !result.passed,
+            "a successful read of the wrong target must not pass"
+        );
     }
 
     #[test]
     fn provider_metadata_and_zero_tool_count_are_not_live_tool_evidence() {
-        let result = LiveAcceptance::RequiresToolEvidence.evaluate(
+        let result = tool_acceptance().evaluate(
             "I read Cargo.toml",
             &successful_root_outcome_timeline(json!({"events": [{
                 "kind": "provider.request.packed",
@@ -4370,12 +4424,11 @@ mod tests {
                     }
                 }
             ]});
-            let result =
-                LiveAcceptance::RequiresToolEvidence.evaluate("Cargo.toml", &timeline, &[], "root");
+            let result = tool_acceptance().evaluate("Cargo.toml", &timeline, &[], "root");
             assert!(!result.passed, "{status}/{class} must fail closed");
         }
 
-        let missing = LiveAcceptance::RequiresToolEvidence.evaluate(
+        let missing = tool_acceptance().evaluate(
             "Cargo.toml",
             &json!({"events": [completed_tool_event()]}),
             &[],
