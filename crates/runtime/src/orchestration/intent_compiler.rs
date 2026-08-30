@@ -32,7 +32,7 @@ use crate::{
 
 use super::{GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationCommand};
 
-pub const INTENT_COMPILER_REVISION: &str = "collaboration-intent/v2";
+pub const INTENT_COMPILER_REVISION: &str = "collaboration-intent/v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,6 +188,12 @@ pub fn compile_turn_scoped_intent(
                 .unwrap_or_default(),
             &catalog,
             request.constraints.permission_ceiling,
+            workstream.evidence_contract.iter().any(|criterion| {
+                matches!(
+                    criterion,
+                    ModelSemanticAcceptanceCriterion::EvidenceScope { .. }
+                )
+            }),
         )?;
         validate_workstream_artifact_contract(
             workstream_index,
@@ -520,6 +526,7 @@ fn compile_team(
     cross_workstream_consumers: BTreeSet<String>,
     catalog: &[AgentCatalogEntry],
     ceiling: PermissionMode,
+    terminal_owns_workstream_evidence: bool,
 ) -> Result<CompiledTeam, IntentCompilerError> {
     require_non_empty(
         &team.team_key,
@@ -587,6 +594,7 @@ fn compile_team(
             &outgoing,
             terminal_role.as_deref(),
             cross_workstream_consumers.contains(&role.role_id),
+            terminal_owns_workstream_evidence,
         );
         // `output_artifacts` are not merely dependency-routing labels for a
         // terminal role.  They are the Team's promised terminal result
@@ -923,6 +931,7 @@ fn derive_behavior(
     outgoing: &BTreeMap<String, usize>,
     terminal_role: Option<&str>,
     consumes_cross_workstream_input: bool,
+    terminal_owns_workstream_evidence: bool,
 ) -> Vec<RoleBehaviorFacet> {
     let mut behavior = Vec::new();
     let incoming_kinds = incoming.get(canonical_id).cloned().unwrap_or_default();
@@ -952,12 +961,19 @@ fn derive_behavior(
             mode: "semantic_aggregate".to_string(),
         });
     }
+    // A workstream-level evidence_scope is a Team result obligation, not
+    // merely an authorization hint. Its terminal carrier must independently
+    // acquire that bounded evidence even when it also consumes predecessor
+    // artifacts. Without this lowering, an aggregate sink is classified as
+    // an upstream-only zero-tool reducer and can never satisfy the scope that
+    // Runtime already admitted and leased to its Team.
     if role.acceptance.iter().any(|criterion| {
         matches!(
             criterion,
             ModelSemanticAcceptanceCriterion::EvidenceScope { .. }
         )
-    }) {
+    }) || (terminal_owns_workstream_evidence && terminal_role == Some(canonical_id))
+    {
         behavior.push(RoleBehaviorFacet::ReacquireEvidence { required: true });
     }
     if terminal_role == Some(canonical_id) {
@@ -1493,10 +1509,42 @@ mod tests {
         assert!(role["behavior"].as_array().is_some_and(|facets| facets
             .iter()
             .any(|facet| facet["kind"] == "upstream_consumption")));
+        assert!(!role["behavior"].as_array().is_some_and(|facets| facets
+            .iter()
+            .any(|facet| facet["kind"] == "reacquire_evidence" && facet["required"] == true)));
         assert_eq!(
             role["acceptance"],
             serde_json::json!(["artifact:final_recommendation"])
         );
+    }
+
+    #[test]
+    fn workstream_evidence_scope_reacquires_on_terminal_upstream_consumer() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut valid = decision();
+        append_cross_workstream_synthesizer(
+            &mut valid,
+            "summary",
+            vec!["runtime-audit".to_string()],
+        );
+        valid.workstreams[1].evidence_contract.push(
+            ModelSemanticAcceptanceCriterion::EvidenceScope {
+                operation: "read".to_string(),
+                resource: "crates/runtime/src/orchestration/mod.rs".to_string(),
+            },
+        );
+
+        let compiled = compile_turn_scoped_intent(&request(), &valid, &services)
+            .expect("bounded Team evidence must remain executable at the terminal carrier");
+        let role = &compiled.template_proposal["teams"][1]["template"]["roles"][0];
+        let behavior = role["behavior"].as_array().expect("typed behavior");
+        assert!(behavior
+            .iter()
+            .any(|facet| facet["kind"] == "upstream_consumption"));
+        assert!(behavior
+            .iter()
+            .any(|facet| { facet["kind"] == "reacquire_evidence" && facet["required"] == true }));
     }
 
     #[test]
