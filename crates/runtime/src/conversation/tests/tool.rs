@@ -2172,11 +2172,11 @@
         .await;
         let summary = result.expect("blocked is a governed terminal completion");
 
-        // Two bounded main-turn attempts, plus exactly one zero-tool failure
-        // explanation attempt. The narrator failure must return to the
-        // structured blocked answer without re-locking Runtime or trying a
-        // second provider candidate.
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        // Exactly two bounded main-turn attempts. Once the governed recovery
+        // is exhausted, Runtime must produce the structured blocked answer
+        // locally instead of calling the same protocol-invalid provider a
+        // third time just to narrate its own failure.
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(summary.terminal_completion, GoalCompletion::Partial);
         // The fallback explanation follows the user's original language.

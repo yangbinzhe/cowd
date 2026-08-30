@@ -533,14 +533,24 @@ where
         attempt_id: &str,
     ) -> Result<(String, Option<String>, Vec<String>, String), String> {
         let language = crate::conversation::user_reply_language(objective);
-        if let Some((cached, cached_attempt_id)) = {
+        let (cached, protocol_recovery_exhausted) = {
             let state = self.state.lock().await;
-            state
-                .terminal_failure_explanation
-                .clone()
-                .zip(state.terminal_failure_attempt_id.clone())
-        } {
+            (
+                state
+                    .terminal_failure_explanation
+                    .clone()
+                    .zip(state.terminal_failure_attempt_id.clone()),
+                state.provider_protocol_recovery_attempts > PROVIDER_PROTOCOL_RECOVERY_BUDGET,
+            )
+        };
+        if let Some((cached, cached_attempt_id)) = cached {
             return Ok((cached, None, Vec::new(), cached_attempt_id));
+        }
+        // The same provider already received its single governed protocol
+        // recovery. Calling it once more merely to narrate that exhaustion
+        // adds cost and reopens the protocol boundary with no path to success.
+        if protocol_recovery_exhausted {
+            return Err(user_facing_blocked_answer(raw, language));
         }
         let visible_facts = serde_json::to_string(envelope)
             .map_err(|error| format!("encode terminal delivery envelope: {error}"))?;
