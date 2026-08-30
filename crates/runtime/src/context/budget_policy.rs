@@ -14,7 +14,7 @@ pub const FALLBACK_MODEL_CONTEXT_WINDOW: u32 = 128_000;
 pub const DEFAULT_SUBAGENT_BUDGET_TOKENS: usize = 20_000;
 const MIN_PREFERRED_OUTPUT_TOKENS: u64 = 4_000;
 const MAX_PREFERRED_OUTPUT_TOKENS: u64 = 32_000;
-const MIN_OUTPUT_FLOOR_TOKENS: u64 = 2_000;
+const MIN_OUTPUT_FLOOR_TOKENS: u64 = 1_024;
 const MAX_OUTPUT_FLOOR_TOKENS: u64 = 8_000;
 
 /// Facts available when Runtime materializes one concrete provider attempt.
@@ -365,7 +365,7 @@ mod tests {
 
         assert!(budget.executable);
         assert_eq!(budget.preferred_output_tokens, 4_000);
-        assert_eq!(budget.floor_output_tokens, 2_000);
+        assert_eq!(budget.floor_output_tokens, 1_024);
         assert_eq!(budget.requested_output_tokens, 4_000);
     }
 
@@ -374,7 +374,7 @@ mod tests {
         let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
             context_window_tokens: 16_384,
             max_output_tokens: 64_000,
-            fixed_input_tokens: 13_000,
+            fixed_input_tokens: 14_000,
             required_input_tokens: 1_500,
             protocol_overhead_tokens: 200,
             safety_margin_tokens: 164,
@@ -402,6 +402,23 @@ mod tests {
     }
 
     #[test]
+    fn provider_output_budget_preserves_a_viable_small_window_continuation() {
+        let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
+            context_window_tokens: 16_384,
+            max_output_tokens: 64_000,
+            fixed_input_tokens: 13_652,
+            required_input_tokens: 423,
+            protocol_overhead_tokens: 128,
+            safety_margin_tokens: 319,
+        });
+
+        assert_eq!(budget.available_output_tokens, 1_862);
+        assert_eq!(budget.floor_output_tokens, 1_024);
+        assert_eq!(budget.requested_output_tokens, 1_862);
+        assert!(budget.executable);
+    }
+
+    #[test]
     fn provider_output_budget_honors_small_provider_maximum() {
         let budget = ProviderOutputBudget::derive(ProviderOutputBudgetInputs {
             context_window_tokens: 1_000_000,
@@ -420,7 +437,7 @@ mod tests {
     #[test]
     fn provider_output_budget_matches_supported_window_matrix() {
         for (window, provider_max, expected_preferred, expected_floor) in [
-            (16_384, 64_000, 4_000, 2_000),
+            (16_384, 64_000, 4_000, 1_024),
             (128_000, 64_000, 8_000, 2_000),
             (1_000_000, 384_000, 32_000, 8_000),
         ] {

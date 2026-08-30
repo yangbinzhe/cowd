@@ -1392,7 +1392,7 @@
         assert_eq!(request.budget.provider_max_output_tokens, 64_000);
         assert_eq!(request.budget.max_output_source, "assumed");
         assert_eq!(request.budget.preferred_output_tokens, 4_000);
-        assert_eq!(request.budget.output_floor_tokens, 2_000);
+        assert_eq!(request.budget.output_floor_tokens, 1_024);
         assert!(request.budget.executable);
         assert!(request.budget.fixed_input_tokens <= request.budget.hard_input_cap_tokens);
     }
