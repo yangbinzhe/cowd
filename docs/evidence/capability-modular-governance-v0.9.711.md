@@ -5,7 +5,7 @@ Release status: passed
 Date: 2026-08-30
 
 Approved plan SHA-256:
-`9a06aeac725ff27cff4c9696f909350b79b94576fbf563c9f05ac39df556be4e`.
+`9f3420ccf8ccefb44a0e7607a38e43bb09b860c99e2c904580b814ccdc4fe887`.
 
 ## Deterministic closure
 
@@ -52,6 +52,14 @@ P7.10 makes the explicit paid-scenario selection the single activation authority
 Legacy expensive-scenario opt-ins remain available only when no explicit selection
 exists; unknown or unregistered selected IDs fail before Session or Provider dispatch,
 so a zero-scenario invocation can no longer be reported as a live pass.
+
+P7.11 separates receipt-backed semantic acceptance from provider terminal-format
+compliance. Evidence scopes, independent review, changes and upstream consumption
+remain fail-closed. Only after those facts are satisfied and one bounded zero-tool
+presentation recovery has been attempted may Runtime wrap the provider's existing
+narrative into missing presentation fields. Missing risk or unresolved disclosures
+become an explicit `provider_omitted_after_bounded_recovery` warning and are never
+silently converted to an empty list; fixed evidence is never synthesized.
 
 ## Performance and capability conservation
 

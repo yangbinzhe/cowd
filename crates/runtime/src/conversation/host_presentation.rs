@@ -4040,6 +4040,21 @@ pub(super) fn normalized_declared_custom_terminal_after_recovery(
     candidate: &str,
     required: &[String],
 ) -> Option<String> {
+    normalized_terminal_after_bounded_recovery(candidate, required)
+}
+
+/// Close a presentation-only contract after a bounded provider recovery and
+/// after Runtime has already verified all evidence scopes.
+///
+/// This never creates evidence or semantic findings. Narrative fields and
+/// declared custom wrappers retain the provider's own terminal wording. A
+/// missing disclosure is represented as an explicit Runtime-observed gap,
+/// never as an empty list (which would falsely claim that the provider found
+/// no risk or unresolved work).
+pub(super) fn normalized_terminal_after_bounded_recovery(
+    candidate: &str,
+    required: &[String],
+) -> Option<String> {
     let body = candidate.trim();
     if body.is_empty()
         || body.starts_with("<synthesized_terminal")
@@ -4056,18 +4071,52 @@ pub(super) fn normalized_declared_custom_terminal_after_recovery(
         if !missing_required_structured_field_from_object(&object, field) {
             continue;
         }
-        if fixed_team_terminal_field(field) {
+        let value = if narrative_terminal_field_is_safe(field) {
+            match field.as_str() {
+                "findings" => object
+                    .get("summary")
+                    .filter(|value| structured_field_is_materialized(Some(value)))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
+                "summary" => object
+                    .get("findings")
+                    .filter(|value| structured_field_is_materialized(Some(value)))
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
+                _ => serde_json::Value::String(body.to_string()),
+            }
+        } else if matches!(
+            field.as_str(),
+            "risks" | "unresolved" | "unresolved_or_risks"
+        ) {
+            serde_json::json!([{
+                "kind": "runtime_presentation_gap",
+                "status": "provider_omitted_after_bounded_recovery",
+                "field": field,
+                "no_empty_state_inferred": true,
+            }])
+        } else if fixed_team_terminal_field(field) {
+            // Evidence, decisions, and other fixed semantic declarations
+            // remain provider/receipt owned and cannot be manufactured here.
             return None;
-        }
-        let value = object
-            .get("summary")
-            .or_else(|| object.get("findings"))
-            .filter(|value| structured_field_is_materialized(Some(value)))
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::String(body.to_string()));
+        } else {
+            // Runtime-declared custom artifacts already accept an exact
+            // provider-authored summary wrapper in the ordinary recovery
+            // path. Preserve that authority while closing sibling fields.
+            object
+                .get("summary")
+                .or_else(|| object.get("findings"))
+                .filter(|value| structured_field_is_materialized(Some(value)))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(body.to_string()))
+        };
         object.insert(field.clone(), value);
     }
-    serde_json::to_string(&object).ok()
+    required
+        .iter()
+        .all(|field| !missing_required_structured_field_from_object(&object, field))
+        .then(|| serde_json::to_string(&object).ok())
+        .flatten()
 }
 
 pub(super) fn fixed_team_terminal_field(field: &str) -> bool {

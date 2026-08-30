@@ -447,6 +447,48 @@
             .is_none(),
             "fixed evidence may never be manufactured by presentation recovery"
         );
+
+        let closed = normalized_terminal_after_bounded_recovery(
+            "## findings\nVerified both bounded sources.\n\n## evidence\ntool://read-a\ntool://read-b",
+            &[
+                "source_paths".into(),
+                "evidence".into(),
+                "findings".into(),
+                "summary".into(),
+                "unresolved".into(),
+            ],
+        )
+        .expect("receipt-satisfied terminal should close presentation-only gaps");
+        let closed =
+            serde_json::from_str::<serde_json::Value>(&closed).expect("closed terminal JSON");
+        assert_eq!(closed["findings"], "Verified both bounded sources.");
+        assert_eq!(closed["summary"], "Verified both bounded sources.");
+        assert_eq!(closed["source_paths"], "Verified both bounded sources.");
+        assert_eq!(closed["evidence"], "tool://read-a\ntool://read-b");
+        assert_eq!(
+            closed["unresolved"][0]["status"],
+            "provider_omitted_after_bounded_recovery"
+        );
+        assert_eq!(closed["unresolved"][0]["no_empty_state_inferred"], true);
+        assert_ne!(closed["unresolved"], serde_json::json!([]));
+        assert!(
+            normalized_terminal_after_bounded_recovery(
+                "## summary\nReview complete.",
+                &["evidence".into(), "summary".into(), "unresolved".into()],
+            )
+            .is_none(),
+            "bounded recovery still cannot manufacture fixed evidence"
+        );
+        for invalid in ["", "<tool_call>{}</tool_call>", "```tool_use\n{}\n```"] {
+            assert!(
+                normalized_terminal_after_bounded_recovery(
+                    invalid,
+                    &["summary".into(), "unresolved".into()],
+                )
+                .is_none(),
+                "empty or executable protocol output must remain rejected"
+            );
+        }
     }
 
     #[test]
@@ -2566,7 +2608,11 @@
         );
         assert_eq!(output["evidence"], "receipt://runtime-read");
         assert_eq!(output["summary"], "Review complete.");
-        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "one bounded structured recovery must close the provider-authored terminal without a redundant retry"
+        );
         assert!(
             saw_clean_terminal_prompt.load(Ordering::SeqCst),
             "format recovery must exclude the exploratory transcript"
