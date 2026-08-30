@@ -22,6 +22,16 @@ pub(crate) struct RuntimeSessionBootstrapSnapshot {
     pub(crate) plugin_registry: PluginRegistry,
 }
 
+impl RuntimeSessionBootstrapSnapshot {
+    #[must_use]
+    pub(crate) fn model_context_window(&self, model: &str) -> u32 {
+        runtime::model_context_window_with_overrides(
+            model,
+            Some(self.feature_config.model_context_windows()),
+        )
+    }
+}
+
 impl RuntimeBootstrapState {
     #[must_use]
     pub(crate) fn session_snapshot(&self) -> RuntimeSessionBootstrapSnapshot {

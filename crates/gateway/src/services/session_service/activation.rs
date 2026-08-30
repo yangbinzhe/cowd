@@ -51,13 +51,12 @@ impl SessionSource {
         guidance
     }
 
-    fn system_prompt(&self) -> Vec<String> {
+    fn system_prompt_builder(&self) -> runtime::SystemPromptBuilder {
         self.source_guidance()
             .into_iter()
             .fold(runtime::SystemPromptBuilder::new(), |builder, guidance| {
                 builder.with_source_guidance(guidance)
             })
-            .build()
     }
 }
 
@@ -923,7 +922,7 @@ impl SessionActivationCoordinator {
             .activate_persisted_session(
                 session_id,
                 Some(&model),
-                request.source.system_prompt(),
+                request.source.system_prompt_builder(),
                 self.recovery,
             )
             .await
@@ -1844,13 +1843,19 @@ mod tests {
             SessionSource::Internal,
             SessionSource::MissionControl,
         ] {
-            let prompt = source.system_prompt().join("\n");
+            let prompt = source
+                .system_prompt_builder()
+                .with_model_profile("surface-test", 128_000)
+                .build()
+                .join("\n");
             assert!(prompt.contains("You are Cowd"));
             assert!(prompt.contains(runtime::COWD_IDENTITY_CONTRACT_VERSION));
             assert!(!prompt.contains("外部 surface 的用户体验要求"));
         }
         let surface_prompt = SessionSource::Surface("feishu".to_string())
-            .system_prompt()
+            .system_prompt_builder()
+            .with_model_profile("surface-test", 128_000)
+            .build()
             .join("\n");
         assert!(surface_prompt.contains("You are Cowd"));
         assert!(surface_prompt.contains(runtime::COWD_IDENTITY_CONTRACT_VERSION));

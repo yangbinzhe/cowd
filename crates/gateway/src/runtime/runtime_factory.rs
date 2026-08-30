@@ -76,6 +76,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
     session.model = Some(model.clone());
     let session_resume_packet =
         merge_resume_context_packets(session_db_resume_context_packet(&session), resume_context);
+    let model_ctx = runtime_session_snapshot.model_context_window(&model);
     let RuntimeSessionBootstrapSnapshot {
         feature_config,
         tool_registry,
@@ -86,8 +87,6 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         runtime::permissions::SessionExecutionPolicyControl::from_policy(execution_policy.clone());
     let policy = permission_policy_with_control(policy_control, &feature_config, &tool_registry)
         .map_err(std::io::Error::other)?;
-    let overrides = feature_config.model_context_windows();
-    let model_ctx = runtime::model_context_window_with_overrides(&model, Some(overrides));
     let workspace_item = workspace_context_item(&session, model_ctx);
     let workspace_root = session
         .workspace_root()

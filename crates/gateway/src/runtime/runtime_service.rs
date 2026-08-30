@@ -2923,7 +2923,7 @@ impl RuntimeService {
         &self,
         session_id: &str,
         model_hint: Option<&str>,
-        system_prompt: Vec<String>,
+        system_prompt: runtime::SystemPromptBuilder,
         recovery: runtime::SessionRecoveryConfig,
     ) -> Result<(), String> {
         if self.has_active_session(session_id) {
@@ -3788,7 +3788,7 @@ impl RuntimeService {
         session: runtime::Session,
         session_id: &str,
         model: &str,
-        system_prompt: Vec<String>,
+        system_prompt: runtime::SystemPromptBuilder,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
         let policy = self.effective_session_execution_policy(session_id);
         self.build_session_runtime_entry_with_execution_policy(
@@ -3806,10 +3806,19 @@ impl RuntimeService {
         session: runtime::Session,
         session_id: &str,
         model: &str,
-        system_prompt: Vec<String>,
+        system_prompt: runtime::SystemPromptBuilder,
         policy: &runtime::SessionExecutionPolicy,
         resume_context: Option<runtime::ResumeContextPacket>,
     ) -> Result<crate::runtime_entry::GatewayRuntimeEntry, String> {
+        let bootstrap = self
+            .session_bootstrap
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let model_context_window = bootstrap.model_context_window(model);
+        let system_prompt = system_prompt
+            .with_model_profile(model, model_context_window)
+            .build();
         let entry = crate::runtime_factory::create_runtime_entry(
             self.runtime_services(),
             self.provider_registry(),
@@ -3824,10 +3833,7 @@ impl RuntimeService {
             policy.clone(),
             None,
             None,
-            self.session_bootstrap
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
+            bootstrap,
             resume_context,
         )
         .map_err(|error| error.to_string())?;

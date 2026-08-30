@@ -201,6 +201,8 @@ pub struct SystemPromptBuilder {
     append_sections: Vec<String>,
     project_context: Option<ProjectContext>,
     config: Option<RuntimeConfig>,
+    active_model: Option<String>,
+    model_context_window: Option<u32>,
 }
 
 impl SystemPromptBuilder {
@@ -252,6 +254,17 @@ impl SystemPromptBuilder {
         self
     }
 
+    /// Pins the resolved model profile used by the Runtime carrier that will
+    /// receive this prompt. Gateway activation supplies this from the same
+    /// immutable bootstrap snapshot passed to the carrier factory, preventing
+    /// prompt capacity policy from drifting across a concurrent config reload.
+    #[must_use]
+    pub fn with_model_profile(mut self, model: impl Into<String>, context_window: u32) -> Self {
+        self.active_model = Some(model.into());
+        self.model_context_window = Some(context_window);
+        self
+    }
+
     #[must_use]
     pub fn append_section(mut self, section: impl Into<String>) -> Self {
         self.append_sections.push(section.into());
@@ -292,6 +305,9 @@ impl SystemPromptBuilder {
 
     fn uses_compact_capability_primer(&self) -> bool {
         const COMPACT_PRIMER_MAX_CONTEXT_TOKENS: u32 = 32_768;
+        if let Some(context_window) = self.model_context_window {
+            return context_window <= COMPACT_PRIMER_MAX_CONTEXT_TOKENS;
+        }
         let Some(config) = self.config.as_ref() else {
             return false;
         };
@@ -305,9 +321,9 @@ impl SystemPromptBuilder {
     fn environment_section(&self) -> String {
         let mut lines = vec!["# Environment context".to_string()];
         let active_model = self
-            .config
-            .as_ref()
-            .and_then(RuntimeConfig::model)
+            .active_model
+            .as_deref()
+            .or_else(|| self.config.as_ref().and_then(RuntimeConfig::model))
             .filter(|model| !model.trim().is_empty())
             .unwrap_or("unknown");
         lines.extend(prepend_bullets(vec![
@@ -994,6 +1010,18 @@ mod tests {
             "capacity-safe stable prompt must leave room for history, tools and output"
         );
         fs::remove_dir_all(root).expect("cleanup compact model config");
+    }
+
+    #[test]
+    fn pinned_model_profile_controls_capacity_and_environment_identity() {
+        let rendered = SystemPromptBuilder::new()
+            .with_model_profile("gateway-small", 16_384)
+            .render();
+
+        assert!(rendered.contains("Active model: gateway-small"));
+        assert!(rendered.contains("Collaboration invariants:"));
+        assert!(!rendered
+            .contains("Each declared result artifact is a required terminal structured field"));
     }
 
     #[test]
