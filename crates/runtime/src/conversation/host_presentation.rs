@@ -536,15 +536,19 @@ where
         let (cached, protocol_recovery_exhausted) = {
             let state = self.state.lock().await;
             (
-                state
-                    .terminal_failure_explanation
-                    .clone()
-                    .zip(state.terminal_failure_attempt_id.clone()),
+                state.terminal_failure_narration.clone(),
                 state.provider_protocol_recovery_attempts > PROVIDER_PROTOCOL_RECOVERY_BUDGET,
             )
         };
-        if let Some((cached, cached_attempt_id)) = cached {
-            return Ok((cached, None, Vec::new(), cached_attempt_id));
+        if let Some(cached) = cached {
+            return Ok(match cached {
+                TerminalFailureNarration::Local(answer) => {
+                    (answer, None, Vec::new(), attempt_id.to_string())
+                }
+                TerminalFailureNarration::Provider { answer, attempt_id } => {
+                    (answer, None, Vec::new(), attempt_id)
+                }
+            });
         }
         // The same provider already received its single governed protocol
         // recovery. Calling it once more merely to narrate that exhaustion
@@ -581,8 +585,10 @@ where
         match narration {
             Ok((explanation, model, models_used, provider_attempt_id)) => {
                 let mut state = self.state.lock().await;
-                state.terminal_failure_explanation = Some(explanation.clone());
-                state.terminal_failure_attempt_id = Some(provider_attempt_id.clone());
+                state.terminal_failure_narration = Some(TerminalFailureNarration::Provider {
+                    answer: explanation.clone(),
+                    attempt_id: provider_attempt_id.clone(),
+                });
                 Ok((explanation, model, models_used, provider_attempt_id))
             }
             Err(error) => {
@@ -1121,8 +1127,7 @@ where
             {
                 let mut state = self.state.lock().await;
                 state.terminal_override = None;
-                state.terminal_failure_explanation = None;
-                state.terminal_failure_attempt_id = None;
+                state.terminal_failure_narration = None;
                 state.clean_terminal_synthesis_next = false;
             }
             let next = dynamic_node(
@@ -1626,8 +1631,7 @@ where
                 // A streamed narrator attempt that did not reach the graph
                 // commit boundary is no longer reusable. Do not let an abort
                 // from a sibling Synthesize node erase this owner's cache.
-                state.terminal_failure_explanation = None;
-                state.terminal_failure_attempt_id = None;
+                state.terminal_failure_narration = None;
             }
             presentation
         };

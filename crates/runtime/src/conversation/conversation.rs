@@ -18,6 +18,7 @@ mod context_plane;
 mod evidence_terminal_plane;
 #[path = "provider_plane.rs"]
 mod provider_plane;
+use provider_plane::TurnProviderState;
 #[path = "tool_plane.rs"]
 mod tool_plane;
 #[path = "turn_engine.rs"]
@@ -91,6 +92,7 @@ use memory::types::{Message as MemMessage, MessageRole as MemMessageRole};
 
 const MAX_RUNTIME_PROVIDER_RETRIES_PER_MODEL: u8 = 1;
 const DEFAULT_RUNTIME_PROVIDER_RETRY_DELAY: Duration = Duration::from_millis(250);
+pub(crate) const MAX_EVALUATION_PROVIDER_TOKEN_LEASE: u64 = 20_000_000;
 use memory::{MemoryKernel, MemoryTurnContext};
 use model_protocol::telemetry::SessionTracer;
 use serde_json::{Map, Value};
@@ -127,7 +129,7 @@ pub(crate) struct EvaluationProviderTokenLease {
 
 impl EvaluationProviderTokenLease {
     fn new(lease_id: &str, limit: u64) -> Result<Self, RuntimeError> {
-        if lease_id.trim().is_empty() || limit == 0 || limit > 2_000_000 {
+        if lease_id.trim().is_empty() || limit == 0 || limit > MAX_EVALUATION_PROVIDER_TOKEN_LEASE {
             return Err(RuntimeError::new(
                 "evaluation provider token lease identity/limit is invalid",
             ));
@@ -2774,6 +2776,8 @@ impl std::error::Error for ToolError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeError {
     message: String,
+    provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope,
+    provider_account_key: Option<String>,
     provider_context_window_limit: Option<u32>,
     provider_tool_protocol_failure: bool,
     tool_exposure_miss: bool,
@@ -2789,6 +2793,8 @@ impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
+            provider_account_key: None,
             provider_context_window_limit: None,
             provider_tool_protocol_failure: false,
             tool_exposure_miss: false,
@@ -2807,6 +2813,8 @@ impl RuntimeError {
     ) -> Self {
         Self {
             message: message.into(),
+            provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
+            provider_account_key: None,
             provider_context_window_limit,
             provider_tool_protocol_failure: false,
             tool_exposure_miss: false,
@@ -2844,8 +2852,31 @@ impl RuntimeError {
         provider_retry_after: Option<Duration>,
         provider_retryable: bool,
     ) -> Self {
+        Self::with_provider_failure_metadata_retry_after_and_scope(
+            message,
+            provider_context_window_limit,
+            provider_tool_protocol_failure,
+            provider_resource_result,
+            provider_retry_after,
+            provider_retryable,
+            model_protocol::provider_failure::ProviderFailureScope::Request,
+        )
+    }
+
+    #[must_use]
+    pub fn with_provider_failure_metadata_retry_after_and_scope(
+        message: impl Into<String>,
+        provider_context_window_limit: Option<u32>,
+        provider_tool_protocol_failure: bool,
+        provider_resource_result: crate::execution_core::graph::ResourceResultClass,
+        provider_retry_after: Option<Duration>,
+        provider_retryable: bool,
+        provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope,
+    ) -> Self {
         Self {
             message: message.into(),
+            provider_failure_scope,
+            provider_account_key: None,
             provider_context_window_limit,
             provider_tool_protocol_failure,
             tool_exposure_miss: false,
@@ -2861,6 +2892,8 @@ impl RuntimeError {
     pub fn with_tool_exposure_miss(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            provider_failure_scope: model_protocol::provider_failure::ProviderFailureScope::Request,
+            provider_account_key: None,
             provider_context_window_limit: None,
             provider_tool_protocol_failure: true,
             tool_exposure_miss: true,
@@ -2877,6 +2910,12 @@ impl RuntimeError {
     #[must_use]
     pub const fn with_provider_usage(mut self, usage: TokenUsage) -> Self {
         self.provider_usage = Some(usage);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_provider_account_key(mut self, account_key: Option<String>) -> Self {
+        self.provider_account_key = account_key;
         self
     }
 
@@ -2921,6 +2960,18 @@ impl RuntimeError {
     #[must_use]
     pub const fn provider_retryable(&self) -> bool {
         self.provider_retryable
+    }
+
+    #[must_use]
+    pub const fn provider_failure_scope(
+        &self,
+    ) -> model_protocol::provider_failure::ProviderFailureScope {
+        self.provider_failure_scope
+    }
+
+    #[must_use]
+    pub fn provider_account_key(&self) -> Option<&str> {
+        self.provider_account_key.as_deref()
     }
 
     #[must_use]
@@ -3541,8 +3592,10 @@ pub struct ConversationRuntime<C, T> {
         std::sync::Mutex<Option<crate::execution_core::TurnStrategyDecisionState>>,
     /// Revisioned tool set visible to the next provider request.
     tool_exposure_state: std::sync::Mutex<Option<ToolExposureState>>,
-    /// Turn-local cost/usefulness evidence for dynamic Tool exposure.
-    turn_tool_exposure_metrics: std::sync::Mutex<TurnToolExposureMetrics>,
+    /// Turn-local Tool exposure evidence and provider-account circuit state.
+    /// The circuit survives Host model-node replans and resets at the next
+    /// turn epoch together with request metrics.
+    turn_tool_exposure_metrics: std::sync::Mutex<TurnProviderState>,
     /// Tools coupled to the PromptOnly Skill selected for the active turn.
     /// Runtime folds these into the first provider exposure so Skill guidance
     /// and its executable capability arrive atomically.

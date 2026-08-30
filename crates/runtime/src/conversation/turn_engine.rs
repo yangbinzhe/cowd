@@ -245,7 +245,7 @@ where
             turn_governed_tool_plans: std::sync::Mutex::new(Vec::new()),
             active_turn_strategy: std::sync::Mutex::new(None),
             tool_exposure_state: std::sync::Mutex::new(None),
-            turn_tool_exposure_metrics: std::sync::Mutex::new(TurnToolExposureMetrics::default()),
+            turn_tool_exposure_metrics: std::sync::Mutex::new(TurnProviderState::default()),
             active_skill_tool_refs: std::sync::Mutex::new(BTreeSet::new()),
             tool_exposure_revision: AtomicU64::new(0),
             request_compiler: crate::PreparedRequestCompiler::new(

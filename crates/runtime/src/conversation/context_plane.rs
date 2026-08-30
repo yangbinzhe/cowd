@@ -332,8 +332,11 @@ where
         if let Ok(mut guard) = self.turn_model_observations.lock() {
             guard.clear();
         }
-        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
-            metrics.reset(self.api_client.tool_schema_cache_stats());
+        if let Ok(mut provider_state) = self.turn_tool_exposure_metrics.lock() {
+            provider_state
+                .tool_exposure
+                .reset(self.api_client.tool_schema_cache_stats());
+            provider_state.unavailable_accounts.clear();
         }
         if let Ok(mut metrics) = self.turn_stable_prefix_metrics.lock() {
             metrics.reset();
@@ -369,7 +372,7 @@ where
     pub(super) fn tool_exposure_metrics(&self) -> ToolExposureMetrics {
         self.turn_tool_exposure_metrics
             .lock()
-            .map(|metrics| metrics.projection())
+            .map(|state| state.tool_exposure.projection())
             .unwrap_or_default()
     }
 
@@ -716,8 +719,8 @@ where
             serde_json::from_str::<harness_contract::tool::ToolDiscoveryReceipt>(output)
         else {
             tracing::warn!("tool_search returned a non-canonical discovery receipt");
-            if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
-                metrics.observe_invalid_search();
+            if let Ok(mut state) = self.turn_tool_exposure_metrics.lock() {
+                state.tool_exposure.observe_invalid_search();
             }
             return None;
         };
@@ -766,11 +769,11 @@ where
                 notice.get_or_insert_default().extend(activated_ids);
             }
         }
-        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+        if let Ok(mut state) = self.turn_tool_exposure_metrics.lock() {
             if count_as_search {
-                metrics.observe_search(&activation);
+                state.tool_exposure.observe_search(&activation);
             } else {
-                metrics.observe_activation(&activation);
+                state.tool_exposure.observe_activation(&activation);
             }
         }
         Some(activation)
@@ -851,8 +854,8 @@ where
         if activation.activated_ids().next().is_some() {
             exposure.reason =
                 "bootstrap plus recently successful session tools rehydrated".to_string();
-            if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
-                metrics.observe_activation(&activation);
+            if let Ok(mut state) = self.turn_tool_exposure_metrics.lock() {
+                state.tool_exposure.observe_activation(&activation);
             }
         }
     }

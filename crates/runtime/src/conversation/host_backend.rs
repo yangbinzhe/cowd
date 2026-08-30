@@ -2,6 +2,43 @@
 
 use super::*;
 
+fn terminal_provider_route_intervention(
+    goal_id: &str,
+    ticket: &NodeExecutionTicket,
+    scope: model_protocol::provider_failure::ProviderFailureScope,
+) -> RuntimeIntervention {
+    let reason = match scope {
+        model_protocol::provider_failure::ProviderFailureScope::Account => {
+            "the configured provider account is unavailable (credentials, balance, quota, or plan capacity); model replanning cannot repair account state"
+        }
+        model_protocol::provider_failure::ProviderFailureScope::Configuration => {
+            "no valid configured provider route remains; model replanning cannot repair runtime configuration"
+        }
+        model_protocol::provider_failure::ProviderFailureScope::Request => {
+            "the provider route is unavailable"
+        }
+    };
+    RuntimeIntervention {
+        goal_id: goal_id.to_string(),
+        kind: RuntimeInterventionKind::Block,
+        reason: reason.to_string(),
+        evidence_refs: vec![format!("execution_node:{}", ticket.node_id)],
+        expected_graph_revision: None,
+    }
+}
+
+fn provider_blocked_reason(terminal: bool, intervention_reason: &str, evidence: &str) -> String {
+    if terminal {
+        format!(
+            "Execution blocked because the provider route is unavailable: {intervention_reason}\n\nExact provider evidence: {evidence}\n\nNo same-account retry or model replan was attempted. Committed goal, tool receipts, and evidence state were retained. Restore the account/configuration or select a separately configured provider account, then start a new turn."
+        )
+    } else {
+        format!(
+            "Execution blocked after repeated provider failures: {intervention_reason}\n\nExact provider validation evidence: {evidence}\n\nCommitted goal and evidence state were retained. Provide a new provider, constraint, or explicit replan to continue."
+        )
+    }
+}
+
 #[async_trait]
 impl<C, T> ScopedNodeBackend for TurnModelStepBackend<C, T>
 where
@@ -2373,6 +2410,8 @@ where
                 // changes strategy, or produces an honest blocked result.
                 let protocol_failure = error.is_provider_tool_protocol_failure();
                 let tool_exposure_miss = error.is_tool_exposure_miss();
+                let provider_failure_scope = error.provider_failure_scope();
+                let terminal_provider_route_failure = provider_failure_scope.route_is_unavailable();
                 let provider_usage = error.provider_usage();
                 let effect_receipts = error.effect_receipts().to_vec();
                 let reason = error.to_string();
@@ -2467,7 +2506,9 @@ where
                     observation.cost_delta.cached_tokens = u64::from(usage.cache_read_input_tokens);
                 }
                 observation.failure_class = Some(ObservationFailureClass::Provider);
-                let intervention = if post_receipt_failure && !tool_exposure_miss {
+                let intervention = if terminal_provider_route_failure {
+                    terminal_provider_route_intervention(&goal_id, ticket, provider_failure_scope)
+                } else if post_receipt_failure && !tool_exposure_miss {
                     let already_synthesizing =
                         clean_terminal_synthesis || clean_terminal_synthesis_attempted;
                     // A tool-protocol violation inside the zero-tool synthesis
@@ -2552,14 +2593,21 @@ where
                             )
                         }
                         RuntimeInterventionKind::Block => {
-                            state.terminal_override = Some((
-                                GoalCompletion::Partial,
-                                format!(
-                                    "Execution blocked after repeated provider failures: {}\n\nExact provider validation evidence: {}\n\nCommitted goal and evidence state were retained. Provide a new provider, constraint, or explicit replan to continue.",
-                                    intervention.reason,
-                                    protocol_failure_detail.as_deref().unwrap_or(&reason),
-                                ),
-                            ));
+                            let blocked_reason = provider_blocked_reason(
+                                terminal_provider_route_failure,
+                                &intervention.reason,
+                                protocol_failure_detail.as_deref().unwrap_or(&reason),
+                            );
+                            if terminal_provider_route_failure {
+                                let language =
+                                    crate::conversation::user_reply_language(&state.content);
+                                state.terminal_failure_narration =
+                                    Some(TerminalFailureNarration::Local(
+                                        user_facing_blocked_answer(&blocked_reason, language),
+                                    ));
+                            }
+                            state.terminal_override =
+                                Some((GoalCompletion::Partial, blocked_reason));
                             let mut node = dynamic_node(
                                 ticket,
                                 iteration,

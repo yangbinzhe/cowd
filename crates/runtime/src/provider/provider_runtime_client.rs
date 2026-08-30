@@ -1079,13 +1079,14 @@ async fn forward_provider_attempt(
         };
         let _ = sender
             .send(Err(
-                RuntimeError::with_provider_failure_metadata_and_retry_after(
+                RuntimeError::with_provider_failure_metadata_retry_after_and_scope(
                     error.error.to_string(),
                     provider_context_window_limit,
                     provider_tool_protocol_failure,
                     provider_resource_result,
                     error.error.retry_after(),
                     error.error.is_retryable(),
+                    error.error.failure_scope(),
                 ),
             ))
             .await;
@@ -1094,7 +1095,10 @@ async fn forward_provider_attempt(
 
 fn evaluation_request_temperature() -> Option<f64> {
     (std::env::var("COWD_EVAL_HARNESS").as_deref() == Ok("1")
-        && std::env::var("COWD_EVAL_CORPUS_ID").as_deref() == Ok("auto-strategy-v1"))
+        && matches!(
+            std::env::var("COWD_EVAL_CORPUS_ID").ok().as_deref(),
+            Some("auto-strategy-v1" | "live-scenarios-v1")
+        ))
     .then(|| {
         std::env::var("COWD_MODEL_TEMPERATURE")
             .ok()

@@ -2,11 +2,136 @@
 
 use super::*;
 
+#[derive(Debug, Default)]
+pub(super) struct TurnProviderState {
+    pub(super) tool_exposure: TurnToolExposureMetrics,
+    pub(super) unavailable_accounts: BTreeSet<String>,
+}
+
+impl std::ops::Deref for TurnProviderState {
+    type Target = TurnToolExposureMetrics;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tool_exposure
+    }
+}
+
+impl std::ops::DerefMut for TurnProviderState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tool_exposure
+    }
+}
+
 impl<C, T> ConversationRuntime<C, T>
 where
     C: ApiClient,
     T: ToolExecutor,
 {
+    fn provider_account_key_for_model(&self, model: &str) -> Option<String> {
+        self.api_client.provider_name_for_model(model).map(|name| {
+            self.provider_resource_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .account_for(&name, model)
+        })
+    }
+
+    fn provider_account_unavailable(&self, account: Option<&String>) -> bool {
+        account.is_some_and(|account| {
+            self.turn_tool_exposure_metrics
+                .lock()
+                .map(|state| state.unavailable_accounts.contains(account))
+                .unwrap_or(false)
+        })
+    }
+
+    fn mark_provider_account_unavailable(&self, error: &RuntimeError) {
+        if error.provider_failure_scope()
+            != model_protocol::provider_failure::ProviderFailureScope::Account
+        {
+            return;
+        }
+        if let (Some(account), Ok(mut state)) = (
+            error.provider_account_key(),
+            self.turn_tool_exposure_metrics.lock(),
+        ) {
+            state.unavailable_accounts.insert(account.to_string());
+        }
+    }
+
+    fn next_available_provider_candidate(
+        &self,
+        candidates: &mut VecDeque<String>,
+    ) -> Option<(String, Option<String>)> {
+        while let Some(model) = candidates.pop_front() {
+            let account = self.provider_account_key_for_model(&model);
+            if !self.provider_account_unavailable(account.as_ref()) {
+                return Some((model, account));
+            }
+        }
+        None
+    }
+
+    fn discover_tools_with_metrics(&self) -> harness_contract::tool::ToolDiscoveryReceipt {
+        let started = Instant::now();
+        let discovery = self.tool_executor.tool_discovery_receipt();
+        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
+            metrics.observe_catalog_lookup(started.elapsed());
+        }
+        discovery
+    }
+
+    fn configure_terminal_tool_exposure(&mut self, reason: &str) {
+        let revision = self
+            .tool_exposure_revision
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        let discovery = self.discover_tools_with_metrics();
+        self.api_client.configure_tool_exposure(
+            ToolExposureState {
+                catalog_revision: discovery.catalog_revision,
+                bootstrap: Default::default(),
+                active: Default::default(),
+                deferred: discovery
+                    .descriptors
+                    .iter()
+                    .map(|descriptor| descriptor.canonical_id.clone())
+                    .collect(),
+                reason: reason.to_string(),
+                revision,
+                fallback_full: false,
+            }
+            .projection(0),
+        );
+    }
+
+    fn pack_timed_provider_attempt(
+        &self,
+        prompt: &PromptAssembly,
+        messages: &HistoryView,
+        model: &str,
+        inventory: ProviderContextInventory,
+    ) -> Result<ApiRequest, RuntimeError> {
+        let started = Instant::now();
+        let request = self.pack_provider_attempt(prompt, messages, model, inventory);
+        crate::execution_core::performance::observe_duration(
+            "request_materialize_ms",
+            started.elapsed(),
+        );
+        request
+    }
+
+    fn observe_provider_downstream_overload(
+        result: crate::execution_core::graph::ResourceResultClass,
+    ) {
+        if result == crate::execution_core::graph::ResourceResultClass::DownstreamOverload {
+            crate::execution_core::performance::observe_count(
+                "provider_downstream_overload_total",
+                1,
+            );
+        }
+    }
+
     /// Require one text-only provider response after a governed evidence
     /// checkpoint. The normal dynamic tool exposure is restored afterwards.
     pub(crate) fn require_next_model_final_response(&self) {
@@ -121,32 +246,7 @@ where
         presentation: Option<(&str, &str, &str, u64)>,
     ) -> Result<(ModelStepResult, Option<String>), RuntimeError> {
         let started_at = Instant::now();
-        let revision = self
-            .tool_exposure_revision
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1);
-        let discovery_started = Instant::now();
-        let discovery = self.tool_executor.tool_discovery_receipt();
-        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
-            metrics.observe_catalog_lookup(discovery_started.elapsed());
-        }
-        let deferred = discovery
-            .descriptors
-            .iter()
-            .map(|descriptor| descriptor.canonical_id.clone())
-            .collect();
-        self.api_client.configure_tool_exposure(
-            ToolExposureState {
-                catalog_revision: discovery.catalog_revision,
-                bootstrap: Default::default(),
-                active: Default::default(),
-                deferred,
-                reason: exposure_reason.to_string(),
-                revision,
-                fallback_full: false,
-            }
-            .projection(0),
-        );
+        self.configure_terminal_tool_exposure(exposure_reason);
 
         let mut prompt = PromptAssembly::new(self.system_prompt.clone());
         prompt.push_trusted_system(crate::prompt::runtime_clock_section());
@@ -157,7 +257,10 @@ where
         let mut presentation_attempt_sequence = 0_u32;
         let mut provider_attempt_sequence = 0_u32;
 
-        for model in self.model_candidates_for_turn(objective) {
+        let mut candidates = VecDeque::from(self.model_candidates_for_turn(objective));
+        while let Some((model, provider_account_key)) =
+            self.next_available_provider_candidate(&mut candidates)
+        {
             'candidate_attempt: loop {
                 let mut request =
                     match self.pack_provider_attempt(&prompt, &messages, &model, inventory) {
@@ -310,6 +413,7 @@ where
                 token_reservations.reconcile(usage)?;
                 self.reconcile_provider_context_usage(usage);
                 if let Some(error) = stream_run.failure {
+                    let error = error.with_provider_account_key(provider_account_key.clone());
                     if self.cancellation_token.is_cancelled()
                         || error.to_string().to_ascii_lowercase().contains("cancelled")
                     {
@@ -340,6 +444,13 @@ where
                                 reason: "terminal_provider_attempt_failed".to_string(),
                             },
                         });
+                    }
+                    if error.provider_failure_scope()
+                        == model_protocol::provider_failure::ProviderFailureScope::Account
+                    {
+                        self.mark_provider_account_unavailable(&error);
+                        last_error = Some(error);
+                        break 'candidate_attempt;
                     }
                     return Err(error);
                 }
@@ -777,11 +888,7 @@ where
                 .ok()
                 .and_then(|notice| notice.clone())
         };
-        let discovery_started = Instant::now();
-        let discovery = self.tool_executor.tool_discovery_receipt();
-        if let Ok(mut metrics) = self.turn_tool_exposure_metrics.lock() {
-            metrics.observe_catalog_lookup(discovery_started.elapsed());
-        }
+        let discovery = self.discover_tools_with_metrics();
         let available_tools = discovery
             .descriptors
             .iter()
@@ -1096,14 +1203,11 @@ where
         let mut calibration_retries = BTreeSet::new();
         let mut provider_retries = BTreeMap::<String, u8>::new();
         let mut provider_attempt_sequence = 0_u32;
-        while let Some(model) = candidates.pop_front() {
-            let materialize_started = Instant::now();
+        while let Some((model, provider_account_key)) =
+            self.next_available_provider_candidate(&mut candidates)
+        {
             let materialized =
-                self.pack_provider_attempt(&prompt, &request_messages, &model, inventory);
-            crate::execution_core::performance::observe_duration(
-                "request_materialize_ms",
-                materialize_started.elapsed(),
-            );
+                self.pack_timed_provider_attempt(&prompt, &request_messages, &model, inventory);
             let mut request = match materialized {
                 Ok(request) => request,
                 Err(error) => {
@@ -1254,14 +1358,7 @@ where
                 "provider_output_tokens_per_second",
                 u64::from(usage.output_tokens).saturating_mul(1_000) / service_ms,
             );
-            if resource_result_class
-                == crate::execution_core::graph::ResourceResultClass::DownstreamOverload
-            {
-                crate::execution_core::performance::observe_count(
-                    "provider_downstream_overload_total",
-                    1,
-                );
-            }
+            Self::observe_provider_downstream_overload(resource_result_class);
             self.record_provider_resource_outcome(
                 provider_lease.as_ref(),
                 provider_queue_wait,
@@ -1273,6 +1370,7 @@ where
                 .reconcile(usage)
                 .map_err(|error| error.with_effect_receipts(early_tool_receipts.clone()))?;
             if let Some(error) = stream_run.failure {
+                let error = error.with_provider_account_key(provider_account_key.clone());
                 if provider_retry_is_fenced(provider_retry_fenced, early_tool_receipts.len()) {
                     return Err(if early_tool_receipts.is_empty() {
                         error
@@ -1282,6 +1380,13 @@ where
                 }
                 if error.is_provider_tool_protocol_failure() {
                     return Err(error);
+                }
+                if error.provider_failure_scope()
+                    == model_protocol::provider_failure::ProviderFailureScope::Account
+                {
+                    self.mark_provider_account_unavailable(&error);
+                    last_error = Some(error);
+                    continue;
                 }
                 if let Some(observed_limit) = error.provider_context_window_limit() {
                     if calibration_retries.insert(model.clone())

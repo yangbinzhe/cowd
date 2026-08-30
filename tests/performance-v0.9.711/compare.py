@@ -97,6 +97,7 @@ def run(args: argparse.Namespace) -> None:
     root = Path.cwd()
     manifest_path = Path(args.manifest)
     manifest = load_yaml(manifest_path)
+    os.environ["COWD_PERF_VARIANT"] = "uncached" if args.mode == "baseline" else "cached"
     status = git(root, "status", "--porcelain").splitlines()
     allowed = manifest["environment"].get("allowed_dirty_prefixes", [])
     unexpected = [
@@ -108,6 +109,8 @@ def run(args: argparse.Namespace) -> None:
         raise SystemExit(f"performance run has unexpected dirty paths: {unexpected}")
     workloads = []
     for entry in manifest["workloads"]:
+        if args.only and entry["id"] not in args.only:
+            continue
         workload = json.loads((manifest_path.parent / entry["file"]).read_text(encoding="utf-8"))
         workload["direction"] = entry["direction"]
         workloads.append(
@@ -120,6 +123,7 @@ def run(args: argparse.Namespace) -> None:
         "tree": git(root, "rev-parse", "HEAD^{tree}"),
         "worktree_digest": worktree_digest(root),
         "governance_dirty_paths": status,
+        "paired_variant": os.environ["COWD_PERF_VARIANT"],
         "workloads": workloads,
     }
     output = Path(args.output)
@@ -132,7 +136,15 @@ def compare(args: argparse.Namespace) -> None:
     baseline = json.loads(Path(args.baseline).read_text(encoding="utf-8"))
     candidate = json.loads(Path(args.candidate).read_text(encoding="utf-8"))
     current = {item["id"]: item for item in candidate["workloads"]}
+    targets = {}
+    if args.manifest:
+        targets = {
+            item["id"]: float(item["target_percent"])
+            for item in load_yaml(Path(args.manifest))["workloads"]
+            if "target_percent" in item
+        }
     failures = []
+    target_failures = []
     for previous in baseline["workloads"]:
         actual = current[previous["id"]]
         old = previous["summary"]["median"]
@@ -143,8 +155,14 @@ def compare(args: argparse.Namespace) -> None:
         print(f"{previous['id']}: {change:+.2f}%")
         if change < -float(args.max_regression):
             failures.append(previous["id"])
+        if previous["id"] in targets and change < targets[previous["id"]]:
+            target_failures.append(
+                f"{previous['id']}={change:+.2f}%<{targets[previous['id']]:.2f}%"
+            )
     if failures:
         raise SystemExit(f"performance regression: {', '.join(failures)}")
+    if target_failures:
+        raise SystemExit(f"performance target missed: {', '.join(target_failures)}")
 
 
 def main() -> None:
@@ -154,10 +172,12 @@ def main() -> None:
     runner.add_argument("--manifest", required=True)
     runner.add_argument("--mode", choices=["baseline", "candidate"], required=True)
     runner.add_argument("--output", required=True)
+    runner.add_argument("--only", action="append")
     comparator = commands.add_parser("compare")
     comparator.add_argument("--baseline", required=True)
     comparator.add_argument("--candidate", required=True)
     comparator.add_argument("--max-regression", default="5")
+    comparator.add_argument("--manifest")
     args = parser.parse_args()
     if args.command == "run":
         run(args)

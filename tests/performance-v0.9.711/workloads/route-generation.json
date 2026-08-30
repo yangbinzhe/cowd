@@ -1,5 +1,5 @@
 {
   "id": "route-generation",
-  "command": "cargo check -p gateway --all-targets",
+  "command": "target/debug/route-openapi-bench ${COWD_PERF_VARIANT}",
   "env": { "CARGO_INCREMENTAL": "0" }
 }

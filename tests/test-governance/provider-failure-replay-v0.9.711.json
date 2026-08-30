@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "candidate_baseline": "b28680e712cbd3f4740c830cb9d10c2977bea61c",
+  "policy": {
+    "offline_replay_required_before_paid_provider": true,
+    "one_paid_scenario_per_invocation": true,
+    "same_execution_gap_rerun_default": "deny",
+    "native_bailian_generation_allowed": false,
+    "qwen_generation_route": "qwen-tokenplan"
+  },
+  "cases": [
+    {
+      "id": "deepseek_http_402_insufficient_balance",
+      "observed_shape": "HTTP 402 / Insufficient Balance",
+      "root_cause": "request retryability did not carry provider account scope",
+      "replay_tests": [
+        "provider::account_exhaustion_is_distinct_from_transient_rate_limit",
+        "runtime::account_failure_skips_same_account_models_but_preserves_independent_fallback",
+        "runtime::account_failure_blocks_after_one_provider_request_without_replan_or_switch"
+      ],
+      "expected": "one same-account provider request, deterministic blocked terminal, no narrator call"
+    },
+    {
+      "id": "token_plan_http_429_plan_exhausted",
+      "observed_shape": "HTTP 429 / insufficient_quota / plan reset timestamp",
+      "root_cause": "quota exhaustion and transient rate limiting shared one status-based class",
+      "replay_tests": [
+        "provider::account_exhaustion_is_distinct_from_transient_rate_limit",
+        "runtime::account_failure_skips_same_account_models_but_preserves_independent_fallback"
+      ],
+      "expected": "account scope, non-retryable, independently configured provider fallback preserved"
+    },
+    {
+      "id": "deepseek_reasoning_tool_continuation",
+      "observed_shape": "HTTP 400 when assistant tool continuation omitted reasoning_content",
+      "root_cause": "wire capability was inferred from constructor instead of model profile",
+      "replay_tests": [
+        "provider::deepseek_tool_continuation_keeps_reasoning_content_field_even_when_empty",
+        "provider::configured_compat_route_uses_model_reasoning_continuation_capability",
+        "provider::deepseek_tool_continuation_roundtrips_captured_reasoning_content"
+      ],
+      "expected": "configured DeepSeek round-trips empty or captured reasoning_content; generic routes unchanged"
+    },
+    {
+      "id": "accepted_program_fresh_id_replan",
+      "observed_shape": "failed accepted Program created a second Team population in the same turn",
+      "root_cause": "accepted terminal failure was treated as a compiler rejection",
+      "replay_tests": [
+        "runtime::terminal_program_failure_is_fail_closed_not_fresh_id_replan"
+      ],
+      "expected": "one Program authority per turn after acceptance"
+    },
+    {
+      "id": "deepseek_scale_heading_semantic_split",
+      "observed_shape": "scale subject in Markdown heading and decision in its body",
+      "root_cause": "evaluator discarded heading context before checking the body",
+      "replay_tests": [
+        "harness_eval::scale_recommendation_requires_subject_and_decision_in_the_same_semantic_block",
+        "harness_eval::observed_deepseek_scale_section_is_semantically_complete"
+      ],
+      "expected": "heading context applies only to its following section; unrelated sections fail closed"
+    },
+    {
+      "id": "stale_gateway_binary_candidate_mismatch",
+      "observed_shape": "runtime receipt contained source-deleted recovery hint",
+      "root_cause": "manual run reused an old target/debug/cowd binary",
+      "replay_tests": [
+        "scripts/scenarios/harness-eval-real-qwen.sh: clean HEAD/source archive/Gateway binary/execution key gate"
+      ],
+      "expected": "candidate source and executable provenance are inseparable; matching gap blocks rerun"
+    },
+    {
+      "id": "embedded_json_hijacked_terminal_contract",
+      "observed_shape": "review prose contained a JSON protocol example before explicit terminal sections",
+      "root_cause": "embedded JSON recovery outranked the outer presentation contract",
+      "replay_tests": [
+        "runtime::explicit_terminal_sections_outrank_embedded_contract_examples",
+        "runtime::disclosure_fields_share_explicit_empty_list_semantics"
+      ],
+      "expected": "top-level JSON > explicit outer sections > embedded compatibility JSON"
+    }
+  ]
+}

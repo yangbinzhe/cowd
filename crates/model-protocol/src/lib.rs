@@ -18,6 +18,7 @@ pub mod oauth;
 pub mod provider_capability;
 pub mod provider_catalog;
 pub mod provider_config;
+pub mod provider_failure;
 pub mod telemetry;
 pub mod usage;
 

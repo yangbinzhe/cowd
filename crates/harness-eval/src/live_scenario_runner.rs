@@ -74,10 +74,48 @@ fn selected_live_scenario_ids() -> Option<BTreeSet<String>> {
     (!selected.is_empty()).then_some(selected)
 }
 
+fn live_provider_token_limit() -> Result<u64, String> {
+    let raw = std::env::var("COWD_EVAL_MAX_PROVIDER_TOKENS").map_err(|_| {
+        "COWD_EVAL_MAX_PROVIDER_TOKENS is required for every live provider scenario".to_string()
+    })?;
+    let limit = raw.parse::<u64>().map_err(|_| {
+        "COWD_EVAL_MAX_PROVIDER_TOKENS must be an integer token capacity".to_string()
+    })?;
+    if limit == 0 || limit > 20_000_000 {
+        return Err("COWD_EVAL_MAX_PROVIDER_TOKENS must be between 1 and 20000000".to_string());
+    }
+    Ok(limit)
+}
+
+fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) -> String {
+    let control = json!({
+        "corpus_id": "live-scenarios-v1",
+        "workspace_fixture": "none",
+        "provider_constraint": "configured_single_route",
+        "temperature_milli": 0,
+        "resource_scopes": ["provider", "provider_account", "provider_token_pool"],
+        "budget_lease_id": format!("live-scenario:{spec_id}:{}", uuid::Uuid::new_v4()),
+        "max_total_tokens": max_total_tokens,
+        "prompt": prompt,
+    });
+    format!("COWD_EVAL_CONTROL {control}\n{prompt}")
+}
+
 /// Run production-path scenarios against an explicitly supplied, isolated
 /// Gateway. This runner never constructs Runtime objects or fakes receipts:
 /// every result is derived from public Gateway responses and durable messages.
 pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
+    let max_provider_tokens = match live_provider_token_limit() {
+        Ok(limit) => limit,
+        Err(reason) => {
+            return json!({
+                "kind": "harness_eval.live_gateway_scenarios",
+                "status": "gated",
+                "reason": reason,
+                "scenarios": [],
+            });
+        }
+    };
     let Some(base_url) = std::env::var("COWD_EVAL_GATEWAY_URL")
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_string())
@@ -140,7 +178,7 @@ pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
         poll_interval,
         model: options.provider.clone(),
     };
-    runner.run()
+    runner.run(max_provider_tokens)
 }
 
 struct LiveScenarioRunner {
@@ -507,7 +545,7 @@ fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
 }
 
 impl LiveScenarioRunner {
-    fn run(&self) -> Value {
+    fn run(&self, max_provider_tokens: u64) -> Value {
         let health_observations = [
             ("gateway", "/healthz", LiveHealthContract::Gateway),
             (
@@ -633,7 +671,7 @@ impl LiveScenarioRunner {
             .collect::<Vec<_>>();
         let scenarios = scenario_specs
             .into_iter()
-            .map(|spec| self.run_scenario(spec))
+            .map(|spec| self.run_scenario(spec, max_provider_tokens))
             .collect::<Vec<_>>();
         let passed = scenarios
             .iter()
@@ -663,6 +701,7 @@ impl LiveScenarioRunner {
             "status": if health_passed && passed == scenarios.len() && comparison_passed { "passed" } else { "failed" },
             "gateway_url": self.base_url,
             "model": self.model,
+            "max_provider_tokens_per_scenario": max_provider_tokens,
             "timeout_cap_ms": self.timeout_cap.map(|value| value.as_millis()),
             "poll_interval_ms": self.poll_interval.as_millis(),
             "health_status": if health_passed { "passed" } else { "failed" },
@@ -677,7 +716,7 @@ impl LiveScenarioRunner {
         })
     }
 
-    fn run_scenario(&self, spec: LiveScenarioSpec) -> Value {
+    fn run_scenario(&self, spec: LiveScenarioSpec, max_provider_tokens: u64) -> Value {
         let started = Instant::now();
         let mut trace = Vec::new();
         let timeout = spec.timeout.with_cap(self.timeout_cap);
@@ -697,6 +736,7 @@ impl LiveScenarioRunner {
         } else {
             spec.prompt.to_string()
         };
+        let prompt = controlled_live_prompt(spec.id, prompt, max_provider_tokens);
         let admission = actor.post_mutation(
             &format!("/api/sessions/{session_id}/messages"),
             json!({
@@ -3087,6 +3127,26 @@ fn env_duration_millis(key: &str, default: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_prompt_carries_an_explicit_shared_provider_token_lease() {
+        let controlled = controlled_live_prompt(
+            "live_group_theory_ai_research_simulation",
+            "complete the research".to_string(),
+            5_000_000,
+        );
+        let (header, prompt) = controlled.split_once('\n').expect("control header");
+        let encoded = header
+            .strip_prefix("COWD_EVAL_CONTROL ")
+            .expect("typed evaluation prefix");
+        let control: Value = serde_json::from_str(encoded).expect("control JSON");
+        assert_eq!(control["corpus_id"], "live-scenarios-v1");
+        assert_eq!(control["max_total_tokens"], 5_000_000);
+        assert!(control["budget_lease_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("live-scenario:live_group_theory")));
+        assert_eq!(prompt, "complete the research");
+    }
 
     #[test]
     fn live_health_contracts_accept_only_semantically_ready_payloads() {

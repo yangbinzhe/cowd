@@ -2,6 +2,8 @@ use std::env::VarError;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
+use model_protocol::provider_failure::ProviderFailureScope;
+
 const GENERIC_FATAL_WRAPPER_MARKERS: &[&str] = &[
     "something went wrong while processing your request",
     "please try again, or use /new to start a fresh session",
@@ -27,7 +29,10 @@ const QUOTA_EXHAUSTED_MARKERS: &[&str] = &[
     "quota exhausted",
     "quota is exhausted",
     "credit balance is insufficient",
+    "insufficient balance",
     "billing quota exceeded",
+    "plan has been exhausted",
+    "plan is exhausted",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,6 +221,38 @@ impl ApiError {
         }
     }
 
+    /// State scope that must change before this route can succeed.
+    ///
+    /// Runtime consumes this typed fact and must not re-parse provider error
+    /// prose. Retryability remains a separate request-level decision.
+    #[must_use]
+    pub fn failure_scope(&self) -> ProviderFailureScope {
+        match self {
+            Self::RetriesExhausted { last_error, .. } => last_error.failure_scope(),
+            Self::MissingCredentials { .. }
+            | Self::ExpiredOAuthToken
+            | Self::Auth(_)
+            | Self::InvalidApiKeyEnv(_) => ProviderFailureScope::Account,
+            Self::Api { status, .. }
+                if matches!(status.as_u16(), 401 | 402 | 403) || self.is_quota_exhausted() =>
+            {
+                ProviderFailureScope::Account
+            }
+            Self::NoProviderConfigured { .. } | Self::InvalidProviderConfig { .. } => {
+                ProviderFailureScope::Configuration
+            }
+            Self::ContextWindowExceeded { .. }
+            | Self::Http(_)
+            | Self::Io(_)
+            | Self::Json { .. }
+            | Self::Api { .. }
+            | Self::RequestBodyTooLarge { .. }
+            | Self::InvalidSseFrame(_)
+            | Self::CompatibilityToolProtocol(_)
+            | Self::BackoffOverflow { .. } => ProviderFailureScope::Request,
+        }
+    }
+
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
@@ -385,6 +422,7 @@ impl ApiError {
             Self::Api { status, .. } if matches!(status.as_u16(), 401 | 403) => "provider_auth",
             Self::ContextWindowExceeded { .. } => "context_window",
             Self::Api { .. } if self.is_context_window_failure() => "context_window",
+            Self::Api { .. } if self.is_quota_exhausted() => "provider_quota",
             Self::Api { status, .. } if status.as_u16() == 429 => "provider_rate_limit",
             Self::Api { .. } if self.is_generic_fatal_wrapper() => "provider_internal",
             Self::Api { .. } => "provider_error",

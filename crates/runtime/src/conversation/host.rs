@@ -616,8 +616,7 @@ where
             clean_terminal_synthesis_next: false,
             clean_terminal_synthesis_attempted: false,
             clean_terminal_retry_attempted: false,
-            terminal_failure_explanation: None,
-            terminal_failure_attempt_id: None,
+            terminal_failure_narration: None,
             consecutive_tool_failure_batches: 0,
             consecutive_low_novelty_batches: 0,
             successful_tool_calls: 0,
@@ -1415,21 +1414,25 @@ fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl
     let Some(encoded) = line.strip_prefix(EVALUATION_TURN_CONTROL_PREFIX) else {
         return Ok(None);
     };
-    if std::env::var("COWD_EVAL_HARNESS").as_deref() != Ok("1")
-        || std::env::var("COWD_EVAL_CORPUS_ID").as_deref() != Ok("auto-strategy-v1")
-    {
+    let configured_corpus = std::env::var("COWD_EVAL_CORPUS_ID").ok();
+    if std::env::var("COWD_EVAL_HARNESS").as_deref() != Ok("1") {
         return Ok(None);
     }
     let mut control = serde_json::from_str::<EvaluationTurnControl>(encoded)
         .map_err(|error| RuntimeError::new(format!("invalid evaluation turn control: {error}")))?;
-    if control.corpus_id != "auto-strategy-v1" || prompt.trim().is_empty() {
+    if !matches!(
+        control.corpus_id.as_str(),
+        "auto-strategy-v1" | "live-scenarios-v1"
+    ) || configured_corpus.as_deref() != Some(control.corpus_id.as_str())
+        || prompt.trim().is_empty()
+    {
         return Err(RuntimeError::new(
             "evaluation turn control corpus or prompt is invalid",
         ));
     }
     if control.budget_lease_id.trim().is_empty()
         || control.max_total_tokens == 0
-        || control.max_total_tokens > 2_000_000
+        || control.max_total_tokens > crate::conversation::MAX_EVALUATION_PROVIDER_TOKEN_LEASE
     {
         return Err(RuntimeError::new(
             "evaluation provider token lease is invalid",
@@ -2765,13 +2768,10 @@ struct TurnGraphState {
     clean_terminal_synthesis_next: bool,
     clean_terminal_synthesis_attempted: bool,
     clean_terminal_retry_attempted: bool,
-    /// Cached LLM-generated user-facing explanation for a partial/blocked
-    /// terminal. Generated at most once per turn; the raw reason stays in the
-    /// result tree and activity detail for audit.
-    terminal_failure_explanation: Option<String>,
-    /// Actual provider attempt that produced the cached explanation. Re-entry
-    /// must never invent a base attempt the Surface never observed.
-    terminal_failure_attempt_id: Option<String>,
+    /// Cached local or provider-authored explanation for a partial/blocked
+    /// terminal. A local projection proves no narration call is permitted;
+    /// provider output retains the exact observed attempt identity.
+    terminal_failure_narration: Option<TerminalFailureNarration>,
     consecutive_tool_failure_batches: usize,
     consecutive_low_novelty_batches: usize,
     successful_tool_calls: usize,
@@ -2831,6 +2831,12 @@ struct TurnGraphState {
     pending_controlled_recovery_claim_fingerprints: Vec<String>,
     pending_disposition_inputs: Vec<crate::session_input::SessionInputRecord>,
     input_disposition_repairs: u8,
+}
+
+#[derive(Clone)]
+enum TerminalFailureNarration {
+    Local(String),
+    Provider { answer: String, attempt_id: String },
 }
 
 fn model_context_for_step(

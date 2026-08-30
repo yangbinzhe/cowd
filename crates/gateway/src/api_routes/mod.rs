@@ -49,6 +49,7 @@ mod approval_routes;
 mod audit_routes;
 mod binding;
 mod capability_contract;
+pub(crate) use capability_contract::benchmark_openapi_document;
 pub(crate) mod connector_routes;
 mod context_routes;
 mod core_routes;

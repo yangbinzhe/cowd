@@ -1302,6 +1302,22 @@
     }
 
     #[test]
+    fn deep_live_scenario_token_lease_has_a_bounded_non_truncating_capacity() {
+        let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+        let guard = registry
+            .install("session-large-live", "eval-large-live", 8_000_000)
+            .expect("large collaboration budget must fit the governed hard ceiling");
+        assert_eq!(guard.snapshot().unwrap().limit, 8_000_000);
+        assert!(registry
+            .install(
+                "session-over-limit",
+                "eval-over-limit",
+                crate::conversation::MAX_EVALUATION_PROVIDER_TOKEN_LEASE + 1,
+            )
+            .is_err());
+    }
+
+    #[test]
     fn candidate_packer_accounts_for_history_schema_and_omits_packet_tail() {
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -1428,6 +1444,98 @@
                 ]
             };
             Box::pin(futures::stream::iter(events))
+        }
+    }
+
+    #[derive(Clone)]
+    struct AccountScopedRouteApi {
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        separate_fallback_account: bool,
+    }
+
+    impl ApiClient for AccountScopedRouteApi {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let model = request.model.clone();
+            self.requests.lock().expect("requests").push(model.clone());
+            let events = if model == "primary" || !self.separate_fallback_account {
+                vec![Err(
+                    RuntimeError::with_provider_failure_metadata_retry_after_and_scope(
+                        "Insufficient Balance",
+                        None,
+                        false,
+                        crate::execution_core::graph::ResourceResultClass::Failed,
+                        None,
+                        false,
+                        model_protocol::provider_failure::ProviderFailureScope::Account,
+                    ),
+                )]
+            } else {
+                vec![
+                    Ok(AssistantEvent::TextDelta(
+                        "independent account fallback".to_string(),
+                    )),
+                    Ok(AssistantEvent::MessageStop),
+                ]
+            };
+            Box::pin(futures::stream::iter(events))
+        }
+
+        fn provider_name_for_model(&self, model: &str) -> Option<String> {
+            if model == "fallback" && self.separate_fallback_account {
+                Some("qwen-tokenplan".to_string())
+            } else {
+                Some("deepseek".to_string())
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TurnAccountCircuitApi {
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+        fallback_attempts: Arc<AtomicUsize>,
+    }
+
+    impl ApiClient for TurnAccountCircuitApi {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            let model = request.model;
+            self.requests.lock().unwrap().push(model.clone());
+            let events = if model == "primary" {
+                vec![Err(
+                    RuntimeError::with_provider_failure_metadata_retry_after_and_scope(
+                        "Insufficient Balance",
+                        None,
+                        false,
+                        crate::execution_core::graph::ResourceResultClass::Failed,
+                        None,
+                        false,
+                        model_protocol::provider_failure::ProviderFailureScope::Account,
+                    ),
+                )]
+            } else if self.fallback_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![Err(RuntimeError::new(
+                    "independent fallback request failed once",
+                ))]
+            } else {
+                vec![
+                    Ok(AssistantEvent::TextDelta("fallback recovered".to_string())),
+                    Ok(AssistantEvent::MessageStop),
+                ]
+            };
+            Box::pin(futures::stream::iter(events))
+        }
+
+        fn provider_name_for_model(&self, model: &str) -> Option<String> {
+            Some(if model == "primary" {
+                "deepseek".to_string()
+            } else {
+                "qwen-tokenplan".to_string()
+            })
         }
     }
 
@@ -1721,6 +1829,115 @@
                 head.contains("You are Cowd") && head.contains(COWD_IDENTITY_CONTRACT_VERSION)
             })
         }));
+    }
+
+    #[tokio::test]
+    async fn account_failure_skips_same_account_models_but_preserves_independent_fallback() {
+        let same_account_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut same_account = ConversationRuntime::new(
+            Session::new(),
+            AccountScopedRouteApi {
+                requests: Arc::clone(&same_account_requests),
+                separate_fallback_account: false,
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            SystemPromptBuilder::new().build(),
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        same_account.set_active_model("primary");
+        *same_account.fallbacks.write().unwrap() = vec!["fallback".to_string()];
+        same_account
+            .begin_turn_strategy("account-failure-same", "answer")
+            .unwrap();
+        let error = same_account
+            .execute_model_step("answer", true)
+            .await
+            .expect_err("same account must be exhausted after one provider request");
+        assert_eq!(
+            error.provider_failure_scope(),
+            model_protocol::provider_failure::ProviderFailureScope::Account
+        );
+        assert_eq!(
+            same_account_requests.lock().unwrap().as_slice(),
+            &["primary".to_string()]
+        );
+
+        let independent_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut independent = ConversationRuntime::new(
+            Session::new(),
+            AccountScopedRouteApi {
+                requests: Arc::clone(&independent_requests),
+                separate_fallback_account: true,
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            SystemPromptBuilder::new().build(),
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        independent.set_active_model("primary");
+        *independent.fallbacks.write().unwrap() = vec!["fallback".to_string()];
+        independent
+            .begin_turn_strategy("account-failure-independent", "answer")
+            .unwrap();
+        let result = independent
+            .execute_model_step("answer", true)
+            .await
+            .expect("a separately configured provider account remains a valid fallback");
+        assert!(matches!(
+            result.intent,
+            ModelStepIntent::FinalAnswer { ref text } if text == "independent account fallback"
+        ));
+        assert_eq!(
+            independent_requests.lock().unwrap().as_slice(),
+            &["primary".to_string(), "fallback".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn account_circuit_survives_multiple_model_nodes_in_the_same_turn() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            TurnAccountCircuitApi {
+                requests: Arc::clone(&requests),
+                fallback_attempts: Arc::new(AtomicUsize::new(0)),
+            },
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            SystemPromptBuilder::new().build(),
+        )
+        .without_memory()
+        .with_model_context_window(128_000);
+        runtime.set_active_model("primary");
+        *runtime.fallbacks.write().unwrap() = vec!["fallback".to_string()];
+        runtime.begin_turn_runtime_epoch();
+        runtime
+            .begin_turn_strategy("account-circuit-turn", "answer")
+            .unwrap();
+
+        runtime
+            .execute_model_step("answer", true)
+            .await
+            .expect_err("independent fallback fails its first request");
+        let result = runtime
+            .execute_model_step("answer", false)
+            .await
+            .expect("second model node uses only the still-available account");
+        assert!(matches!(
+            result.intent,
+            ModelStepIntent::FinalAnswer { ref text } if text == "fallback recovered"
+        ));
+        assert_eq!(
+            requests.lock().unwrap().as_slice(),
+            &[
+                "primary".to_string(),
+                "fallback".to_string(),
+                "fallback".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

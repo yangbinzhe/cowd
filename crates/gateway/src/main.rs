@@ -93,6 +93,24 @@ mod surface_host;
 
 pub use boundary_policy::{GatewayBoundaryPolicy, GatewayResponsibility};
 
+/// Hidden deterministic workload for the route/OpenAPI performance gate.
+/// The uncached branch is the pre-P7.5 authority path; the cached branch is
+/// the production projection. Both consume the exact same static catalog.
+#[doc(hidden)]
+pub fn route_openapi_benchmark(iterations: usize, cached: bool) -> u64 {
+    let mut checksum = 0_u64;
+    for _ in 0..iterations.max(1) {
+        let document = std::hint::black_box(api_routes::benchmark_openapi_document(cached));
+        checksum = checksum.saturating_add(
+            document["paths"]
+                .as_object()
+                .map_or(0, |paths| paths.len() as u64),
+        );
+        std::hint::black_box(document);
+    }
+    checksum
+}
+
 /// Operator-only storage cutover entry used by the thin CLI binary.
 pub fn storage_entry(args: &[String]) -> std::process::ExitCode {
     if args.first().map(String::as_str) == Some("ownership-cutover") {

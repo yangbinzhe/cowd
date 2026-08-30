@@ -39,6 +39,34 @@ PROVIDER_CREDENTIAL=""
 STAGED_CREDENTIAL_REF=""
 STAGED_CREDENTIAL_ENV=""
 
+# One invocation owns exactly one paid scenario and one explicit total-token
+# authorization. This is a pre-dispatch runaway boundary, not a request-output
+# downgrade: every scenario has a quality-preserving minimum based on its
+# frozen acceptance topology.
+SCENARIO_ID="${COWD_EVAL_LIVE_SCENARIOS:-}"
+MAX_PROVIDER_TOKENS="${COWD_EVAL_MAX_PROVIDER_TOKENS:-}"
+[[ -n "$SCENARIO_ID" && "$SCENARIO_ID" != *,* ]] || {
+  echo 'set COWD_EVAL_LIVE_SCENARIOS to exactly one paid scenario id' >&2
+  exit 2
+}
+case "$SCENARIO_ID" in
+  live_direct_terminal) MIN_PROVIDER_TOKENS=100000 ;;
+  live_tool_evidence) MIN_PROVIDER_TOKENS=250000 ;;
+  live_single_architecture_baseline) MIN_PROVIDER_TOKENS=750000 ;;
+  live_team_projection|live_agent_escalation) MIN_PROVIDER_TOKENS=2000000 ;;
+  live_group_theory_ai_research_simulation) MIN_PROVIDER_TOKENS=5000000 ;;
+  live_qwen38_large_scale_collaboration) MIN_PROVIDER_TOKENS=8000000 ;;
+  *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
+esac
+[[ "$MAX_PROVIDER_TOKENS" =~ ^[0-9]+$ ]] || {
+  echo 'COWD_EVAL_MAX_PROVIDER_TOKENS must be an explicit integer authorization' >&2
+  exit 2
+}
+if ((MAX_PROVIDER_TOKENS < MIN_PROVIDER_TOKENS || MAX_PROVIDER_TOKENS > 20000000)); then
+  echo "scenario $SCENARIO_ID requires COWD_EVAL_MAX_PROVIDER_TOKENS between $MIN_PROVIDER_TOKENS and 20000000" >&2
+  exit 2
+fi
+
 cleanup() {
   local status=$?
   if [[ -n "$PROGRESS_PID" ]]; then
@@ -151,6 +179,20 @@ resolve_installed_route() {
     echo "model ${MODEL} has no provider mapping in ${SOURCE_MODELS_FILE}" >&2
     exit 2
   }
+  model_lower="${MODEL,,}"
+  provider_lower="${PROVIDER_ID,,}"
+  if [[ "$provider_lower" == *bailian* || "$provider_lower" == *dashscope* ]]; then
+    echo "native Bailian generation is forbidden; Bailian is reserved for embedding only" >&2
+    exit 2
+  fi
+  if [[ "$model_lower" == qwen* && "$provider_lower" != "qwen-tokenplan" ]]; then
+    echo "Qwen generation must use the qwen-tokenplan provider, got ${PROVIDER_ID}" >&2
+    exit 2
+  fi
+  if [[ "$model_lower" == deepseek* && "$provider_lower" != "deepseek" ]]; then
+    echo "DeepSeek generation must use the configured deepseek provider, got ${PROVIDER_ID}" >&2
+    exit 2
+  fi
   PROVIDER_BASE_URL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" base_url)"
   PROVIDER_PROTOCOL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" protocol)"
   PROVIDER_CREDENTIAL="$(yaml_provider_field "$SOURCE_CONFIG_FILE" "$PROVIDER_ID" api_key)"
@@ -185,7 +227,7 @@ fi
 CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
-SCENARIO_FINGERPRINT="$(printf '%s\n' "${COWD_EVAL_LIVE_SCENARIOS:-default}" "${COWD_EVAL_GROUP_THEORY_RESEARCH:-0}" "${COWD_EVAL_LARGE_SCALE_COLLABORATION:-0}" | sha256sum | awk '{print $1}')"
+SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "${COWD_EVAL_GROUP_THEORY_RESEARCH:-0}" "${COWD_EVAL_LARGE_SCALE_COLLABORATION:-0}" "$MAX_PROVIDER_TOKENS" | sha256sum | awk '{print $1}')"
 EVIDENCE_KEY="$(printf '%s\n' "deep-real-v4" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
 if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
   prior_evidence="$({
@@ -270,6 +312,9 @@ EOF
 gateway_env=(
   COWD_CONFIG_HOME="$CONFIG_HOME"
   COWD_LOG_STDERR=1
+  COWD_EVAL_HARNESS=1
+  COWD_EVAL_CORPUS_ID=live-scenarios-v1
+  COWD_MODEL_TEMPERATURE=0
 )
 if [[ -n "$STAGED_CREDENTIAL_ENV" ]]; then
   gateway_env+=("$STAGED_CREDENTIAL_ENV=$PROVIDER_CREDENTIAL")

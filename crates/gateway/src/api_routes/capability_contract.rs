@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, sync::OnceLock};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -94,6 +94,13 @@ pub(crate) fn gateway_capability_contract() -> GatewayCapabilityContract {
 }
 
 pub(crate) fn gateway_capability_contract_for_apps() -> GatewayCapabilityContract {
+    static CONTRACT: OnceLock<GatewayCapabilityContract> = OnceLock::new();
+    CONTRACT
+        .get_or_init(gateway_capability_contract_for_apps_uncached)
+        .clone()
+}
+
+fn gateway_capability_contract_for_apps_uncached() -> GatewayCapabilityContract {
     gateway_capability_contract_from_routes(gateway_route_manifest_for_apps())
 }
 
@@ -142,13 +149,34 @@ fn gateway_capability_contract_from_routes(
 }
 
 pub(crate) fn gateway_openapi_document() -> Value {
-    let contract = gateway_capability_contract();
-    gateway_openapi_document_from_contract(contract, Map::new())
+    static DOCUMENT: OnceLock<Value> = OnceLock::new();
+    DOCUMENT
+        .get_or_init(|| {
+            gateway_openapi_document_from_contract(gateway_capability_contract(), Map::new())
+        })
+        .clone()
 }
 
 pub(crate) fn gateway_openapi_document_for_apps() -> Value {
-    let contract = gateway_capability_contract_for_apps();
-    gateway_openapi_document_from_contract(contract, Map::new())
+    static DOCUMENT: OnceLock<Value> = OnceLock::new();
+    DOCUMENT
+        .get_or_init(gateway_openapi_document_for_apps_uncached)
+        .clone()
+}
+
+fn gateway_openapi_document_for_apps_uncached() -> Value {
+    gateway_openapi_document_from_contract(
+        gateway_capability_contract_for_apps_uncached(),
+        Map::new(),
+    )
+}
+
+pub(crate) fn benchmark_openapi_document(cached: bool) -> Value {
+    if cached {
+        gateway_openapi_document_for_apps()
+    } else {
+        gateway_openapi_document_for_apps_uncached()
+    }
 }
 
 fn gateway_openapi_document_from_contract(
@@ -2961,6 +2989,23 @@ mod tests {
         assert!(paths.contains_key("/api/apps/{app_id}/operations/{operation_id}/invoke"));
         assert!(paths.keys().all(|path| !path.starts_with("/api/apps/mfg")));
         assert!(document["components"]["schemas"]["MfgApiErrorV1"].is_null());
+    }
+
+    #[test]
+    fn cached_openapi_projection_is_exactly_equal_to_the_uncached_authority() {
+        let authority = gateway_openapi_document_for_apps_uncached();
+        let first = gateway_openapi_document_for_apps();
+        let second = gateway_openapi_document_for_apps();
+        assert_eq!(first, authority);
+        assert_eq!(second, authority);
+        assert_eq!(
+            first["x-cowd-route-catalog-digest"],
+            authority["x-cowd-route-catalog-digest"]
+        );
+        assert_eq!(
+            first["paths"].as_object().map(|paths| paths.len()),
+            Some(441)
+        );
     }
 
     #[test]

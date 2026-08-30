@@ -616,6 +616,35 @@
     }
 
     #[derive(Clone)]
+    struct AccountUnavailableProviderClient {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    impl ApiClient for AccountUnavailableProviderClient {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(stream::iter(vec![Err(
+                RuntimeError::with_provider_failure_metadata_retry_after_and_scope(
+                    "Insufficient Balance",
+                    None,
+                    false,
+                    crate::execution_core::graph::ResourceResultClass::Failed,
+                    None,
+                    false,
+                    model_protocol::provider_failure::ProviderFailureScope::Account,
+                ),
+            )]))
+        }
+
+        fn provider_name_for_model(&self, _model: &str) -> Option<String> {
+            Some("deepseek".to_string())
+        }
+    }
+
+    #[derive(Clone)]
     struct ProtocolFailureThenFinalClient {
         attempts: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<ApiRequest>>>,
@@ -2247,6 +2276,47 @@
             1,
             "provider recovery must still produce exactly one terminal goal completion"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn account_failure_blocks_after_one_provider_request_without_replan_or_switch() {
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            AccountUnavailableProviderClient {
+                attempts: Arc::clone(&attempts),
+            },
+            NoopToolExecutor,
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["answer directly".to_string()],
+        )
+        .without_memory();
+
+        let (_runtime, result) = submit_test_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            "answer without wasting provider calls",
+            &SharedPrompter::none(),
+            test_execution_lineage(),
+        )
+        .await;
+        let summary = result.expect("account failure is a governed blocked terminal");
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(summary.terminal_completion, GoalCompletion::Partial);
+        assert!(summary.final_answer.contains("provider route is unavailable"));
+        let events = services.event_store().all_events(300).expect("events");
+        let interventions = events
+            .iter()
+            .filter(|event| event.kind == "goal.intervention")
+            .collect::<Vec<_>>();
+        assert_eq!(interventions.len(), 1);
+        assert!(interventions[0].payload.to_string().contains("\"block\""));
+        assert!(!events.iter().any(|event| {
+            event.kind == "goal.intervention"
+                && (event.payload.to_string().contains("\"replan\"")
+                    || event.payload.to_string().contains("\"switch\""))
+        }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
