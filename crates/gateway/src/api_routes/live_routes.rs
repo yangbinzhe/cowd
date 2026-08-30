@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     task::{Context, Poll},
     time::{SystemTime, UNIX_EPOCH},
@@ -89,6 +89,14 @@ struct SubscriptionEntry {
     pending_previews: Mutex<BTreeMap<String, QueuedEnvelope>>,
     revisions: watch::Sender<Arc<SubscriptionRevision>>,
     active_connection: AtomicBool,
+    disconnect_lease_cleanup: Option<DisconnectLeaseCleanup>,
+}
+
+#[derive(Clone)]
+struct DisconnectLeaseCleanup {
+    live_registry: Weak<LiveRegistry>,
+    lease_registry: Arc<session::SessionLeaseRegistry>,
+    lease_owner: String,
 }
 
 #[derive(Clone)]
@@ -203,6 +211,15 @@ async fn create_live_subscription(
         deleted: false,
     });
     let (revision_tx, _) = watch::channel(revision);
+    let disconnect_lease_cleanup =
+        state
+            .session_lease_registry
+            .as_ref()
+            .map(|registry| DisconnectLeaseCleanup {
+                live_registry: Arc::downgrade(&state.live_registry),
+                lease_registry: Arc::clone(registry),
+                lease_owner: super::session_lease_owner(&principal, &surface_instance),
+            });
     let entry = Arc::new(SubscriptionEntry {
         id: id.clone(),
         principal_hash: hash_text(&principal_binding),
@@ -217,6 +234,7 @@ async fn create_live_subscription(
         pending_previews: Mutex::new(BTreeMap::new()),
         revisions: revision_tx,
         active_connection: AtomicBool::new(false),
+        disconnect_lease_cleanup,
     });
     let response = entry.public();
     subscriptions.insert(id, entry);
@@ -2055,6 +2073,72 @@ impl Drop for PhysicalLiveStream {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         self.entry.active_connection.store(false, Ordering::Release);
+        if let Some(cleanup) = self.entry.disconnect_lease_cleanup.clone() {
+            let entry = Arc::clone(&self.entry);
+            tokio::spawn(async move {
+                // Physical SSE reconnects are transparent and normally begin
+                // within five seconds. Only a sustained disconnect owns
+                // Surface lease cleanup; a replacement connection cancels it.
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                release_disconnected_surface_session_leases(&entry, &cleanup).await;
+            });
+        }
+    }
+}
+
+async fn release_disconnected_surface_session_leases(
+    entry: &Arc<SubscriptionEntry>,
+    cleanup: &DisconnectLeaseCleanup,
+) {
+    if entry.active_connection.load(Ordering::Acquire) {
+        return;
+    }
+    let session_ids = entry
+        .snapshot()
+        .selector
+        .sources
+        .iter()
+        .filter(|source| source.kind == LiveSourceKind::Session)
+        .map(|source| source.id.clone())
+        .collect::<BTreeSet<_>>();
+    let active_session_ids = if let Some(registry) = cleanup.live_registry.upgrade() {
+        registry
+            .subscriptions
+            .read()
+            .await
+            .values()
+            .filter(|candidate| {
+                candidate.principal_binding == entry.principal_binding
+                    && candidate.surface_instance == entry.surface_instance
+                    && candidate.active_connection.load(Ordering::Acquire)
+            })
+            .flat_map(|candidate| {
+                candidate
+                    .snapshot()
+                    .selector
+                    .sources
+                    .iter()
+                    .filter(|source| source.kind == LiveSourceKind::Session)
+                    .map(|source| source.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<BTreeSet<_>>()
+    } else {
+        BTreeSet::new()
+    };
+    for session_id in session_ids.difference(&active_session_ids) {
+        let released = cleanup
+            .lease_registry
+            .release(session_id, &cleanup.lease_owner)
+            .await;
+        if released.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            tracing::warn!(
+                session_id,
+                lease_owner = %cleanup.lease_owner,
+                result = %released,
+                "disconnected Surface lease cleanup was not confirmed"
+            );
+        }
     }
 }
 
@@ -2491,6 +2575,7 @@ mod tests {
             pending_previews: Mutex::new(BTreeMap::new()),
             revisions,
             active_connection: AtomicBool::new(false),
+            disconnect_lease_cleanup: None,
         })
     }
 
@@ -3112,6 +3197,40 @@ mod tests {
         let rendered = format!("{current_after_barrier:?}");
         assert!(rendered.contains("current-after-barrier"));
         assert!(!rendered.contains("old-after-barrier"));
+    }
+
+    #[tokio::test]
+    async fn sustained_surface_disconnect_releases_only_after_reconnect_fence() {
+        let entry = test_entry(LiveSelector {
+            sources: vec![test_source("session-disconnected")],
+        });
+        let live_registry = Arc::new(LiveRegistry::new());
+        live_registry
+            .subscriptions
+            .write()
+            .await
+            .insert(entry.id.clone(), Arc::clone(&entry));
+        let lease_registry = Arc::new(session::SessionLeaseRegistry::default());
+        let owner = "principal:test:observer:webui:test";
+        assert_eq!(
+            lease_registry
+                .acquire("session-disconnected", owner, "collaborative")
+                .await["ok"],
+            true
+        );
+        let cleanup = DisconnectLeaseCleanup {
+            live_registry: Arc::downgrade(&live_registry),
+            lease_registry: Arc::clone(&lease_registry),
+            lease_owner: owner.to_string(),
+        };
+
+        entry.active_connection.store(true, Ordering::Release);
+        release_disconnected_surface_session_leases(&entry, &cleanup).await;
+        assert_eq!(lease_registry.list().await.len(), 1);
+
+        entry.active_connection.store(false, Ordering::Release);
+        release_disconnected_surface_session_leases(&entry, &cleanup).await;
+        assert!(lease_registry.list().await.is_empty());
     }
 
     #[tokio::test]
