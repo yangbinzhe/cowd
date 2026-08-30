@@ -13,29 +13,7 @@ where
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
         if self.state.lock().await.terminal_override.is_some() {
-            // A verified Host-admitted Team already produced the canonical
-            // terminal synthesis. Do not spend another provider/tool loop
-            // restating or re-executing that checked result in the parent.
-            let mut synthesize = dynamic_node(
-                ticket,
-                0,
-                "precommitted-terminal-synthesize",
-                ExecutionNodeKind::Synthesize,
-                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
-                "inline_model",
-            );
-            synthesize.executor_kind =
-                crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
-            return Ok(NodeExecutionOutcome::new(completed_result(
-                Some(format!("{}:precommitted-terminal", ticket.graph_id)),
-                ExecutionUsage::default(),
-            ))
-            .with_replan(ExecutionGraphReplan {
-                nodes: vec![synthesize.clone()],
-                edges: dynamic_edges(&ticket.node_id, &[synthesize]),
-                reason: "verified Team terminal result bypassed duplicate parent model execution"
-                    .to_string(),
-            }));
+            return Ok(precommitted_terminal_outcome(ticket));
         }
         let prefetched_review_calls = {
             let mut state = self.state.lock().await;
@@ -2819,6 +2797,33 @@ where
         tracing::debug!(node_id = %ticket.node_id, "committed model transcript published");
         Ok(())
     }
+}
+
+/// Builds the graph transition used when a verified Host-admitted Team has
+/// already produced the canonical terminal result. Keeping this transition
+/// outside the provider stage makes the early-exit invariant explicit and
+/// prevents protocol recovery changes from growing the model executor.
+fn precommitted_terminal_outcome(ticket: &NodeExecutionTicket) -> NodeExecutionOutcome {
+    let mut synthesize = dynamic_node(
+        ticket,
+        0,
+        "precommitted-terminal-synthesize",
+        ExecutionNodeKind::Synthesize,
+        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND,
+        "inline_model",
+    );
+    synthesize.executor_kind =
+        crate::execution_core::graph::executors::SynthesizeNodeExecutor::KIND.to_string();
+    NodeExecutionOutcome::new(completed_result(
+        Some(format!("{}:precommitted-terminal", ticket.graph_id)),
+        ExecutionUsage::default(),
+    ))
+    .with_replan(ExecutionGraphReplan {
+        nodes: vec![synthesize.clone()],
+        edges: dynamic_edges(&ticket.node_id, &[synthesize]),
+        reason: "verified Team terminal result bypassed duplicate parent model execution"
+            .to_string(),
+    })
 }
 
 #[async_trait]
