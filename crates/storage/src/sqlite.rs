@@ -303,15 +303,23 @@ impl SqliteExecutor {
     ) -> Result<Self, StorageError> {
         let pool = Pool::builder()
             .max_size(profile.max_connections)
+            // r2d2 defaults `min_idle` to `max_size`. For file-backed SQLite
+            // that eagerly opens several connections in parallel, and every
+            // connection initialization executes `PRAGMA journal_mode=WAL`.
+            // The concurrent journal-mode transition can race with itself and
+            // surface a spurious `database is locked` during process startup.
+            // Establish WAL through one eager connection and let the pool
+            // grow lazily under real demand without changing its max capacity.
+            .min_idle(Some(1))
             .connection_timeout(Duration::from_millis(profile.checkout_timeout_ms))
             .build(manager)
             .map_err(|error| {
                 StorageError::Other(format!("sqlite pool initialization failed: {error}"))
             })?;
-        tracing::warn!(
+        tracing::debug!(
             identity = %identity,
             live_sqlite_pools = sqlite_pool_tracker::live_sqlite_pool_count(),
-            "SQLite r2d2 pool constructed; PostgreSQL-mode processes must observe zero such pools"
+            "SQLite r2d2 pool constructed"
         );
         let executor = Self {
             inner: Arc::new(SqliteExecutorInner {
@@ -654,6 +662,33 @@ mod tests {
             .unwrap();
         assert_eq!(foreign_keys, 1);
         assert!(second.metrics().checkout_count >= 2);
+    }
+
+    #[test]
+    fn file_pool_establishes_wal_once_then_scales_to_its_full_capacity() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = SqliteExecutionProfile {
+            max_connections: 8,
+            ..SqliteExecutionProfile::for_domain_name("runtime_events")
+        };
+        let executor = SqliteExecutor::open_file(
+            "storage-executor-lazy-start".to_string(),
+            directory.path().join("lazy-start.sqlite"),
+            profile,
+        )
+        .unwrap();
+
+        let initial = executor.inner.pool.state();
+        assert_eq!(initial.connections, 1);
+        assert_eq!(initial.idle_connections, 1);
+
+        let leases = (0..8)
+            .map(|_| executor.checkout().unwrap())
+            .collect::<Vec<_>>();
+        let saturated = executor.inner.pool.state();
+        assert_eq!(saturated.connections, 8);
+        assert_eq!(saturated.idle_connections, 0);
+        drop(leases);
     }
 
     #[test]

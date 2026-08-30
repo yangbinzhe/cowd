@@ -207,7 +207,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                             &upstream_evidence,
                         );
                     let evidence_satisfied =
-                        (requires_new_tool_evidence && produced_evidence) || retained_upstream;
+                        evidence_policy.evidence_satisfied(produced_evidence, retained_upstream);
                     let role = packet.team_role_assignment();
                     if requires_new_tool_evidence && result.usage.tool_calls == 0 {
                         invalid_team_slots.push(format!("{predecessor_id}:zero_tool_calls"));
@@ -240,7 +240,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                     } else {
                         satisfied_team_criteria.insert("summary".to_string());
                     }
-                    if evidence_satisfied {
+                    if evidence_policy.has_evidence_obligation() && evidence_satisfied {
                         satisfied_team_criteria.insert("evidence".to_string());
                     }
                     if completed_acceptance {
@@ -805,6 +805,20 @@ mod tests {
             },
         );
         assert!(produced_team_evidence(&result));
+    }
+
+    #[test]
+    fn team_verification_does_not_invent_evidence_debt_for_structured_only_contract() {
+        let requirements = vec![harness_contract::team::TeamAcceptanceRequirement {
+            criterion: "artifact:definitions".to_string(),
+            check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                name: "definitions".to_string(),
+            },
+        }];
+        let policy = crate::agent_result_validator::team_evidence_policy(&requirements);
+
+        assert!(!policy.has_evidence_obligation());
+        assert!(policy.evidence_satisfied(false, false));
     }
 
     #[test]

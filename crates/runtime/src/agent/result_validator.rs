@@ -7,6 +7,28 @@ pub(crate) struct TeamEvidencePolicy {
     pub consumes_upstream: bool,
 }
 
+impl TeamEvidencePolicy {
+    #[must_use]
+    pub(crate) const fn has_evidence_obligation(self) -> bool {
+        self.requires_new_tool_evidence || self.consumes_upstream
+    }
+
+    /// Evaluate only the evidence portion of a typed Team contract. A Team
+    /// whose frozen contract contains structured output checks but no
+    /// evidence check has no evidence debt to satisfy; this is distinct from
+    /// an explicit evidence check whose receipt is missing.
+    #[must_use]
+    pub(crate) const fn evidence_satisfied(
+        self,
+        produced_new: bool,
+        retained_upstream: bool,
+    ) -> bool {
+        !self.has_evidence_obligation()
+            || (self.requires_new_tool_evidence && produced_new)
+            || (self.consumes_upstream && retained_upstream)
+    }
+}
+
 /// Compile the evidence policy once for both Agent terminal admission and
 /// Team delivery verification. Keeping this classification shared prevents a
 /// role from becoming Completed under a weaker interpretation than the Team
@@ -173,9 +195,6 @@ pub fn validate_agent_return(
                 })
             {
                 return Err(AgentResultValidationError::MissingEvidence);
-            }
-            if !requires_new_tool_evidence && !consumes_upstream {
-                return Err(AgentResultValidationError::UnsatisfiedAcceptance);
             }
         } else {
             if !task.evidence_refs.is_empty() && returned.evidence_refs.is_empty() {
@@ -521,6 +540,52 @@ mod tests {
         returned.outcome = r#"{"runtime_findings":"upstream-grounded result"}"#.to_string();
         returned.tool_calls = 0;
         returned.evidence_refs = vec![upstream];
+        assert_eq!(validate_agent_return(&task, &returned), Ok(()));
+    }
+
+    #[test]
+    fn structured_only_team_contract_has_no_implicit_evidence_debt() {
+        let mut task = team_task();
+        task.acceptance = vec!["artifact:definitions".to_string(), "summary".to_string()];
+        task.output_acceptance = vec![
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "artifact:definitions".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                    name: "definitions".to_string(),
+                },
+            },
+            harness_contract::team::TeamAcceptanceRequirement {
+                criterion: "summary".to_string(),
+                check: harness_contract::team::TeamAcceptanceCheck::StructuredField {
+                    field: harness_contract::team::TeamStructuredOutputField::Summary,
+                },
+            },
+        ];
+        task.required_acceptance = harness_contract::context::RequiredAcceptance {
+            criteria: task.acceptance.clone(),
+            evidence_obligations: Vec::new(),
+        };
+
+        let mut returned = team_return(&task);
+        returned.outcome =
+            r#"{"definitions":["group"],"summary":"bounded conceptual result"}"#.to_string();
+        returned.tool_calls = 0;
+        returned.evidence_refs.clear();
+        returned.observed_acceptance = harness_contract::context::ObservedAcceptance {
+            satisfied_criteria: task.acceptance.clone(),
+            observed_evidence: Vec::new(),
+            unresolved_obligation_ids: Vec::new(),
+        };
+        let (_, evaluation) = crate::acceptance_evaluator::AcceptanceEvaluator::evaluate_terminal(
+            &task.required_acceptance,
+            returned.observed_acceptance.satisfied_criteria.clone(),
+            Vec::new(),
+        );
+        returned.acceptance_evaluation = Some(evaluation);
+
+        let policy = team_evidence_policy(&task.output_acceptance);
+        assert!(!policy.has_evidence_obligation());
+        assert!(policy.evidence_satisfied(false, false));
         assert_eq!(validate_agent_return(&task, &returned), Ok(()));
     }
 
