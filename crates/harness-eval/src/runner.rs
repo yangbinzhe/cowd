@@ -628,15 +628,25 @@ fn build_evidence_manifest(
     let repo = std::env::current_dir()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
-    let commit = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+    // Isolated real-provider runs intentionally replace HOME, so Git may
+    // reject the workspace through its safe.directory policy even though the
+    // outer launcher already resolved and archived the immutable candidate.
+    // Prefer that launcher-attested identity and retain direct Git discovery
+    // only for ordinary in-process/local runs.
+    let commit = nonempty_env("COWD_EVAL_CANDIDATE_SHA").unwrap_or_else(|| {
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    });
+    let candidate_source_sha256 = nonempty_env("COWD_EVAL_CANDIDATE_SOURCE_SHA256");
+    let target_repo_dirty_state = nonempty_env("COWD_EVAL_TARGET_REPO_DIRTY_STATE")
+        .unwrap_or_else(|| "not_checked_by_library_runner".to_string());
     let execution_key = std::env::var("COWD_EVAL_EVIDENCE_KEY")
         .ok()
         .filter(|value| !value.trim().is_empty());
@@ -645,6 +655,7 @@ fn build_evidence_manifest(
         "report_id": null,
         "repo": repo,
         "commit": commit,
+        "candidate_source_sha256": candidate_source_sha256,
         "version": env!("CARGO_PKG_VERSION"),
         "command": format!(
             "harness-eval {}{}",
@@ -661,9 +672,16 @@ fn build_evidence_manifest(
             "source": token_usage_source,
         },
         "tool_calls": tool_calls,
-        "target_repo_dirty_state": "not_checked_by_library_runner",
+        "target_repo_dirty_state": target_repo_dirty_state,
         "notes": "regression-lane manifest; terminal certification is produced by harness-eval certify from independently collected sources"
     })
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn mission_runtime_collaboration_failure(

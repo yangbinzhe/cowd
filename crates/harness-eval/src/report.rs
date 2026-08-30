@@ -449,171 +449,244 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         ),
         "deep/real reports may not claim real model evidence with zero provider rounds",
     ));
+    push_manifest_gate_item(&mut items, evidence_manifest, real_model_claimed);
+
+    push_execution_level_gate_items(
+        &mut items,
+        ExecutionLevelGateContext {
+            is_quick,
+            complex,
+            real_tools,
+            parity,
+            tool_calls,
+            tool_log_count,
+            total_tokens,
+            live_total_tokens,
+            usage_source,
+        },
+    );
+
+    push_deep_live_gate_item(&mut items, level, live);
+
+    HarnessEvalReportGate::from_items(items)
+}
+
+fn push_deep_live_gate_item(items: &mut Vec<HarnessEvalReportGateItem>, level: &str, live: &Value) {
+    if level != "deep" {
+        return;
+    }
+    let live_scenarios = live
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let selected_scenario_count = live
+        .get("selected_scenario_ids")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    // A full deep suite requires broad coverage. A focused costly run is
+    // judged against exactly its selected set; an unknown selection retains
+    // the broad three-scenario floor.
+    let required_live_scenarios = if selected_scenario_count > 0 {
+        selected_scenario_count
+    } else {
+        3
+    };
+    let all_traces_complete = live_scenarios.iter().all(|scenario| {
+        scenario.get("status").and_then(Value::as_str) == Some("passed")
+            && ["session_id", "terminal_id", "execution_id"]
+                .iter()
+                .all(|field| {
+                    scenario
+                        .pointer(&format!("/production_trace/{field}"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                })
+    });
     items.push(HarnessEvalReportGateItem::new(
-        "evidence_manifest_complete",
-        evidence_manifest.get("kind").and_then(Value::as_str)
-            == Some("harness_eval.evidence_manifest")
-            && evidence_manifest
-                .get("repo")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-            && evidence_manifest
-                .get("commit")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-            && evidence_manifest
-                .get("version")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-            && evidence_manifest
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty()),
+        "deep_live_gateway_scenarios",
+        live.get("status").and_then(Value::as_str) == Some("passed")
+            && live_scenarios.len() >= required_live_scenarios
+            && all_traces_complete,
         true,
         format!(
-            "repo={}, commit={}, version={}",
-            evidence_manifest
+            "live_status={}, scenarios={}, required_scenarios={}, complete_traces={}",
+            live.get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            live_scenarios.len(),
+            required_live_scenarios,
+            all_traces_complete
+        ),
+        "run deep evaluation against an explicit isolated COWD_EVAL_GATEWAY_URL and retain durable session, terminal, execution and cursor traces for every live scenario",
+    ));
+}
+
+struct ExecutionLevelGateContext<'a> {
+    is_quick: bool,
+    complex: &'a Value,
+    real_tools: &'a Value,
+    parity: &'a Value,
+    tool_calls: u64,
+    tool_log_count: u64,
+    total_tokens: u64,
+    live_total_tokens: u64,
+    usage_source: &'a str,
+}
+
+fn push_execution_level_gate_items(
+    items: &mut Vec<HarnessEvalReportGateItem>,
+    context: ExecutionLevelGateContext<'_>,
+) {
+    if context.is_quick {
+        items.push(HarnessEvalReportGateItem::new(
+            "quick_smoke_declares_no_tool_lane",
+            context.tool_calls == 0 && context.usage_source == "deterministic_smoke",
+            true,
+            format!(
+                "tool_calls={}, usage_source={}",
+                context.tool_calls, context.usage_source
+            ),
+            "quick must either stay explicitly deterministic or be promoted to full eval",
+        ));
+        return;
+    }
+
+    let complex_ok = context
+        .complex
+        .get("failed")
+        .and_then(Value::as_u64)
+        .is_some_and(|failed| failed == 0)
+        && context
+            .complex
+            .get("average_score")
+            .and_then(Value::as_f64)
+            .is_some_and(|score| score >= 0.9);
+    let real_tool_calls = context
+        .real_tools
+        .get("tool_calls")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    items.push(HarnessEvalReportGateItem::new(
+        "complex_scenarios_passed",
+        complex_ok,
+        true,
+        format!(
+            "failed={}, average={}",
+            context
+                .complex
+                .get("failed")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            context
+                .complex
+                .get("average_score")
+                .and_then(Value::as_f64)
+                .unwrap_or_default()
+        ),
+        "full/deep eval must execute the complex scenario suite",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "complex_tool_calls_nonzero",
+        context.tool_calls > 0 && real_tool_calls > 0,
+        true,
+        format!(
+            "trace_tool_calls={}, real_tool_calls={real_tool_calls}",
+            context.tool_calls
+        ),
+        "full/deep eval cannot pass complex scenarios with zero real tool evidence",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "token_usage_nonzero_or_estimated",
+        (context.total_tokens > 0 || context.live_total_tokens > 0)
+            && context.usage_source != "unavailable",
+        true,
+        format!(
+            "trace_total_tokens={}, live_total_tokens={}, usage_source={}",
+            context.total_tokens, context.live_total_tokens, context.usage_source
+        ),
+        "record provider usage or explicit deterministic/estimated fallback",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "events_observations_parity",
+        context.parity.get("status").and_then(Value::as_str) == Some("passed")
+            && context.tool_calls == context.tool_log_count,
+        true,
+        format!(
+            "parity={}, tool_calls={}, tool_log_count={}",
+            context
+                .parity
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("missing"),
+            context.tool_calls,
+            context.tool_log_count
+        ),
+        "tool events, observations, and report trace must share one count",
+    ));
+}
+
+fn push_manifest_gate_item(
+    items: &mut Vec<HarnessEvalReportGateItem>,
+    manifest: &Value,
+    real_model_claimed: bool,
+) {
+    let commit = manifest
+        .get("commit")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    let source_sha256 = manifest
+        .get("candidate_source_sha256")
+        .and_then(Value::as_str);
+    let dirty_state = manifest
+        .get("target_repo_dirty_state")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    let complete = manifest.get("kind").and_then(Value::as_str)
+        == Some("harness_eval.evidence_manifest")
+        && manifest
+            .get("repo")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && valid_git_commit(commit)
+        && manifest
+            .get("version")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && manifest
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+        && (!real_model_claimed
+            || (source_sha256.is_some_and(valid_sha256) && dirty_state == "clean"));
+    items.push(HarnessEvalReportGateItem::new(
+        "evidence_manifest_complete",
+        complete,
+        true,
+        format!(
+            "repo={}, commit={}, source_sha256={}, dirty_state={}, version={}",
+            manifest
                 .get("repo")
                 .and_then(Value::as_str)
                 .unwrap_or("missing"),
-            evidence_manifest
-                .get("commit")
-                .and_then(Value::as_str)
-                .unwrap_or("missing"),
-            evidence_manifest
+            commit,
+            source_sha256.unwrap_or("missing"),
+            dirty_state,
+            manifest
                 .get("version")
                 .and_then(Value::as_str)
                 .unwrap_or("missing")
         ),
         "write a complete evidence manifest before accepting the report package",
     ));
+}
 
-    if is_quick {
-        items.push(HarnessEvalReportGateItem::new(
-            "quick_smoke_declares_no_tool_lane",
-            tool_calls == 0 && usage_source == "deterministic_smoke",
-            true,
-            format!("tool_calls={tool_calls}, usage_source={usage_source}"),
-            "quick must either stay explicitly deterministic or be promoted to full eval",
-        ));
-    } else {
-        let complex_ok = complex
-            .get("failed")
-            .and_then(Value::as_u64)
-            .is_some_and(|failed| failed == 0)
-            && complex
-                .get("average_score")
-                .and_then(Value::as_f64)
-                .is_some_and(|score| score >= 0.9);
-        let real_tool_calls = real_tools
-            .get("tool_calls")
-            .and_then(Value::as_u64)
-            .unwrap_or_default();
-        items.push(HarnessEvalReportGateItem::new(
-            "complex_scenarios_passed",
-            complex_ok,
-            true,
-            format!(
-                "failed={}, average={}",
-                complex
-                    .get("failed")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default(),
-                complex
-                    .get("average_score")
-                    .and_then(Value::as_f64)
-                    .unwrap_or_default()
-            ),
-            "full/deep eval must execute the complex scenario suite",
-        ));
-        items.push(HarnessEvalReportGateItem::new(
-            "complex_tool_calls_nonzero",
-            tool_calls > 0 && real_tool_calls > 0,
-            true,
-            format!("trace_tool_calls={tool_calls}, real_tool_calls={real_tool_calls}"),
-            "full/deep eval cannot pass complex scenarios with zero real tool evidence",
-        ));
-        items.push(HarnessEvalReportGateItem::new(
-            "token_usage_nonzero_or_estimated",
-            (total_tokens > 0 || live_total_tokens > 0) && usage_source != "unavailable",
-            true,
-            format!(
-                "trace_total_tokens={total_tokens}, live_total_tokens={live_total_tokens}, usage_source={usage_source}"
-            ),
-            "record provider usage or explicit deterministic/estimated fallback",
-        ));
-        items.push(HarnessEvalReportGateItem::new(
-            "events_observations_parity",
-            parity.get("status").and_then(Value::as_str) == Some("passed")
-                && tool_calls == tool_log_count,
-            true,
-            format!(
-                "parity={}, tool_calls={}, tool_log_count={}",
-                parity
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("missing"),
-                tool_calls,
-                tool_log_count
-            ),
-            "tool events, observations, and report trace must share one count",
-        ));
-    }
+fn valid_git_commit(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
-    if level == "deep" {
-        let live = report.get("live_gateway_scenarios").unwrap_or(&Value::Null);
-        let live_scenarios = live
-            .get("scenarios")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let selected_scenario_count = live
-            .get("selected_scenario_ids")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        // A full deep suite requires broad coverage.  A caller may explicitly
-        // select a costly isolated scenario, however; that focused run must
-        // be judged against exactly the selected set rather than an impossible
-        // three-scenario threshold.  An empty or unknown selection still
-        // fails because the observed count cannot satisfy the requirement.
-        let required_live_scenarios = if selected_scenario_count > 0 {
-            selected_scenario_count
-        } else {
-            3
-        };
-        let all_traces_complete = live_scenarios.iter().all(|scenario| {
-            scenario.get("status").and_then(Value::as_str) == Some("passed")
-                && scenario
-                    .pointer("/production_trace/session_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-                && scenario
-                    .pointer("/production_trace/terminal_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-                && scenario
-                    .pointer("/production_trace/execution_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-        });
-        items.push(HarnessEvalReportGateItem::new(
-            "deep_live_gateway_scenarios",
-            live.get("status").and_then(Value::as_str) == Some("passed")
-                && live_scenarios.len() >= required_live_scenarios
-                && all_traces_complete,
-            true,
-            format!(
-                "live_status={}, scenarios={}, required_scenarios={}, complete_traces={}",
-                live.get("status").and_then(Value::as_str).unwrap_or("missing"),
-                live_scenarios.len(),
-                required_live_scenarios,
-                all_traces_complete
-            ),
-            "run deep evaluation against an explicit isolated COWD_EVAL_GATEWAY_URL and retain durable session, terminal, execution and cursor traces for every live scenario",
-        ));
-    }
-
-    HarnessEvalReportGate::from_items(items)
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn scenario_status<'a>(scenarios: &'a [Value], capability: &str) -> Option<&'a str> {
@@ -724,6 +797,29 @@ mod gate_tests {
     use super::*;
     use serde_json::json;
 
+    fn real_manifest_report(commit: &str, source_sha256: Option<&str>, dirty: &str) -> Value {
+        json!({
+            "level": "deep",
+            "authorized_real_model": true,
+            "evidence_manifest": {
+                "kind": "harness_eval.evidence_manifest",
+                "repo": "/workspace/cowd",
+                "commit": commit,
+                "candidate_source_sha256": source_sha256,
+                "target_repo_dirty_state": dirty,
+                "version": "0.9.711",
+                "command": "harness-eval deep --allow-real-model"
+            }
+        })
+    }
+
+    fn gate_item<'a>(gate: &'a HarnessEvalReportGate, name: &str) -> &'a HarnessEvalReportGateItem {
+        gate.items
+            .iter()
+            .find(|item| item.name == name)
+            .expect("gate item")
+    }
+
     #[test]
     fn gate_accepts_real_gateway_model_metrics_without_report_reviewer() {
         let report = json!({
@@ -782,6 +878,49 @@ mod gate_tests {
             .expect("gate item");
         assert_eq!(item.status, "passed");
         assert!(item.evidence.contains("required_scenarios=1"));
+    }
+
+    #[test]
+    fn real_model_manifest_rejects_unknown_or_unbound_candidate_identity() {
+        let unknown = evaluate_report_gate(&real_manifest_report(
+            "unknown",
+            Some(&"a".repeat(64)),
+            "clean",
+        ));
+        assert_eq!(
+            gate_item(&unknown, "evidence_manifest_complete").status,
+            "failed"
+        );
+
+        let unchecked = evaluate_report_gate(&real_manifest_report(
+            &"b".repeat(40),
+            Some(&"c".repeat(64)),
+            "not_checked_by_library_runner",
+        ));
+        assert_eq!(
+            gate_item(&unchecked, "evidence_manifest_complete").status,
+            "failed"
+        );
+
+        let unarchived =
+            evaluate_report_gate(&real_manifest_report(&"d".repeat(40), None, "clean"));
+        assert_eq!(
+            gate_item(&unarchived, "evidence_manifest_complete").status,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn real_model_manifest_accepts_clean_archived_candidate_identity() {
+        let gate = evaluate_report_gate(&real_manifest_report(
+            &"e".repeat(40),
+            Some(&"f".repeat(64)),
+            "clean",
+        ));
+        assert_eq!(
+            gate_item(&gate, "evidence_manifest_complete").status,
+            "passed"
+        );
     }
 }
 

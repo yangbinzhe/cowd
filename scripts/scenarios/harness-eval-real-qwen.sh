@@ -186,8 +186,8 @@ fi
 CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
-SCENARIO_FINGERPRINT="$(printf '%s\n' "${COWD_EVAL_LIVE_SCENARIOS:-default}" "${COWD_EVAL_GROUP_THEORY_RESEARCH:-0}" | sha256sum | awk '{print $1}')"
-EVIDENCE_KEY="$(printf '%s\n' "deep-real-v3" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
+SCENARIO_FINGERPRINT="$(printf '%s\n' "${COWD_EVAL_LIVE_SCENARIOS:-default}" "${COWD_EVAL_GROUP_THEORY_RESEARCH:-0}" "${COWD_EVAL_LARGE_SCALE_COLLABORATION:-0}" | sha256sum | awk '{print $1}')"
+EVIDENCE_KEY="$(printf '%s\n' "deep-real-v4" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
 if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
   prior_evidence="$({
     find "$EVIDENCE_ROOT/runs" -type f -name report.json -exec jq -r --arg key "$EVIDENCE_KEY" '
@@ -371,5 +371,8 @@ env \
   COWD_EVAL_REAL_MODEL=1 \
   COWD_EVAL_EVIDENCE_KEY="$EVIDENCE_KEY" \
   COWD_EVAL_BINARY_SHA256="$GATEWAY_BINARY_SHA256" \
+  COWD_EVAL_CANDIDATE_SHA="$CANDIDATE_SHA" \
+  COWD_EVAL_CANDIDATE_SOURCE_SHA256="$CANDIDATE_SOURCE_SHA256" \
+  COWD_EVAL_TARGET_REPO_DIRTY_STATE=clean \
   COWD_AI_HARNESS_REPORT_DIR="$EVIDENCE_ROOT" \
   "${EVAL_COMMAND[@]}"
