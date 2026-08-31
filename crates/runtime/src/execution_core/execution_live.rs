@@ -1745,8 +1745,20 @@ fn allows_transition(from: ExecutionLiveStatus, to: ExecutionLiveStatus) -> bool
             CallingModel | Thinking | WaitingApproval | Finalizing | Complete | Error | Cancelled
         ) | (
             WaitingApproval,
-            CallingModel | CallingTool | Thinking | Finalizing | Error | Cancelled
-        ) | (Finalizing, Complete | Error | Cancelled)
+            CallingModel | CallingTool | Thinking | Finalizing | Error | Cancelled // Finalizing is a presentation phase, not a durable terminal commit.
+                                                                                   // Terminal synthesis may still be superseded by a quality-gate retry
+                                                                                   // or a graph replan.  Only Complete/Error/Cancelled are absorbing.
+        ) | (
+            Finalizing,
+            PreparingContext
+                | CallingModel
+                | Thinking
+                | CallingTool
+                | WaitingApproval
+                | Complete
+                | Error
+                | Cancelled
+        )
     )
 }
 
@@ -2204,6 +2216,32 @@ mod tests {
         ));
         assert_eq!(record.live.status, ExecutionLiveStatus::Complete);
         assert_eq!(record.live.revision, revision);
+    }
+
+    #[test]
+    fn finalizing_remains_recoverable_until_a_durable_terminal_commit() {
+        let mut record = LiveExecutionRecord::new(
+            "session-finalizing-replan".to_string(),
+            "execution-finalizing-replan".to_string(),
+            "turn-finalizing-replan".to_string(),
+        );
+        assert!(record.transition(
+            ExecutionLiveStatus::CallingModel,
+            Some("drafting terminal candidate".to_string())
+        ));
+        assert!(record.transition(
+            ExecutionLiveStatus::Finalizing,
+            Some("synthesizing terminal".to_string())
+        ));
+        assert!(record.transition(
+            ExecutionLiveStatus::PreparingContext,
+            Some("terminal candidate superseded".to_string())
+        ));
+        assert!(record.transition(
+            ExecutionLiveStatus::CallingModel,
+            Some("terminal quality retry".to_string())
+        ));
+        assert_eq!(record.live.status, ExecutionLiveStatus::CallingModel);
     }
 
     #[test]
