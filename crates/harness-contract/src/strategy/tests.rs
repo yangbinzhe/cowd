@@ -427,6 +427,16 @@ fn explicit_read_only_language_suppresses_incidental_write_terms() {
 }
 
 #[test]
+fn read_only_research_environment_does_not_turn_result_outputs_into_workspace_writes() {
+    let decision = decide_strategy(&StrategyInput::from_prompt(
+        "四个 Team 在只读环境中完成调研和模拟，输出最终建议；只能使用只读工具，不要调用 bash 或任何写工具。",
+    ));
+
+    assert!(!decision.understanding.requires_write);
+    assert!(decision.understanding.requests_multi_agent);
+}
+
+#[test]
 fn local_source_research_does_not_request_external_fact_transport() {
     let decision = decide_strategy(&StrategyInput::from_prompt(
         "启动两个研究团队并行调研当前工作区源码并给出代码证据",

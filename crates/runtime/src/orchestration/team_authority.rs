@@ -91,6 +91,22 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
     understanding: &harness_contract::strategy::TaskUnderstanding,
     workspace_root: &Path,
 ) {
+    let ephemeral_team_nodes = request
+        .ephemeral_team_templates
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let ephemeral_write_nodes = request
+        .ephemeral_team_templates
+        .iter()
+        .filter(|(_, snapshot)| {
+            snapshot.revision.manifest.roles.iter().any(|role| {
+                role.grant_ceiling
+                    .contains(&harness_contract::agent::AgentCapability::Write)
+            })
+        })
+        .map(|(node_id, _)| node_id.clone())
+        .collect::<BTreeSet<_>>();
     let Some(proposal) = request.proposal.as_mut() else {
         return;
     };
@@ -130,7 +146,14 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
         .iter()
         .map(|node| {
             let profile = (node.recipe == CapabilityRecipeId::Team).then(|| {
-                team_authority_profile(node, requires_write, understanding.requires_external_facts)
+                team_authority_profile(
+                    node,
+                    requires_write,
+                    understanding.requires_external_facts,
+                    ephemeral_team_nodes
+                        .contains(&node.node_id)
+                        .then_some(ephemeral_write_nodes.contains(&node.node_id)),
+                )
             });
             if node.recipe == CapabilityRecipeId::Team {
                 tracing::debug!(
@@ -151,11 +174,6 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
     // workspace/user custom template. Otherwise this authority pass injects
     // legacy `researcher`/`synthesizer` plans before the compiler sees the
     // snapshot's user-defined role ids.
-    let ephemeral_team_nodes = request
-        .ephemeral_team_templates
-        .keys()
-        .cloned()
-        .collect::<BTreeSet<_>>();
     let mut profile_positions = BTreeMap::<TeamAuthorityProfile, usize>::new();
     let mut scopes = Vec::new();
     for (index, node) in proposal.nodes.iter_mut().enumerate() {
@@ -511,13 +529,16 @@ fn team_authority_profile(
     node: &GraphSemanticNode,
     request_requires_write: bool,
     request_requires_external_facts: bool,
+    ephemeral_requires_write: Option<bool>,
 ) -> TeamAuthorityProfile {
     let template = node
         .template
         .as_deref()
         .unwrap_or_default()
         .trim_start_matches("builtin/");
-    let custom_template = template.starts_with("workspace/") || template.starts_with("user/");
+    let custom_template = template.starts_with("workspace/")
+        || template.starts_with("user/")
+        || ephemeral_requires_write.is_some();
     if template == "cowd/external-research-synthesis" {
         return TeamAuthorityProfile::ExternalResearch;
     }
@@ -546,7 +567,8 @@ fn team_authority_profile(
     // read-only family. When the admitted intent requires workspace writes,
     // Runtime treats the Team as write-capable; the template's own role
     // ceilings and the bounded focus scopes still crop the actual grants.
-    if request_requires_write && (custom_template || node.template.is_none()) {
+    let custom_requires_write = ephemeral_requires_write.unwrap_or(request_requires_write);
+    if custom_requires_write && (custom_template || node.template.is_none()) {
         TeamAuthorityProfile::WorkspaceWrite
     } else if request_requires_external_facts {
         TeamAuthorityProfile::ExternalResearch
@@ -1592,6 +1614,39 @@ fn workspace_focus_score(objective: &str, path: &str) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_ephemeral_role_ceiling_overrides_global_write_intent() {
+        let node = GraphSemanticNode {
+            node_id: "read-only-ephemeral-team".to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: "research without workspace mutation".to_string(),
+            depends_on: Vec::new(),
+            multiplicity: 1,
+            focuses: Vec::new(),
+            managed_agent_escalation: ManagedAgentEscalationRequirement::None,
+            template: None,
+            target_session_id: None,
+            output_artifacts: vec!["terminal_synthesis".to_string()],
+            evidence_contract: vec!["evidence".to_string()],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
+        };
+
+        assert_eq!(
+            team_authority_profile(&node, true, false, Some(false)),
+            TeamAuthorityProfile::WorkspaceRead,
+            "a frozen read-only custom Team must not inherit unrelated global write intent"
+        );
+        assert_eq!(
+            team_authority_profile(&node, true, false, Some(true)),
+            TeamAuthorityProfile::WorkspaceWrite,
+            "a frozen Team with an explicit write-capable role keeps its write authority"
+        );
+    }
 
     #[test]
     fn declared_team_roles_keep_semantics_while_runtime_rebinds_their_scopes() {

@@ -2681,6 +2681,49 @@ async fn workspace_root_scope_is_a_valid_hierarchical_lock_scope() {
 }
 
 #[tokio::test]
+async fn conflicting_effect_leaf_scopes_are_deferred_without_deadlocking_the_wave() {
+    let (registry, state, commits) = harness();
+    let executor = Arc::new(TestExecutor::new(Vec::new(), Duration::from_millis(20)));
+    registry.register(executor.clone()).unwrap();
+    let supervisor = crate::RuntimeExecutionSupervisor::new(Arc::new(test_runner(
+        registry,
+        state.clone(),
+        commits,
+    )));
+    let mut graph = test_graph("conflicting effect leaves");
+    for id in ["first", "second"] {
+        let mut item = node(id);
+        item.kind = ExecutionNodeKind::Materialize;
+        item.resource_scopes = vec!["write:.".to_string()];
+        graph.nodes.push(item);
+    }
+    let graph_id = graph.id.clone();
+
+    let (_, report) = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.submit_and_wait(
+            graph,
+            ExecutionGraphCommand::Start {
+                expected_revision: 0,
+            },
+        ),
+    )
+    .await
+    .expect("a conflicting sibling must defer instead of blocking wave admission")
+    .expect("serialized effect leaves complete");
+
+    let terminal = state.load(&graph_id).unwrap();
+    assert_eq!(
+        report.completed, 2,
+        "report={report:?} statuses={:?} results={:?}",
+        terminal.node_statuses, terminal.node_results
+    );
+    assert_eq!(report.failed, 0);
+    assert_eq!(executor.max_running.load(Ordering::SeqCst), 1);
+    supervisor.shutdown().await;
+}
+
+#[tokio::test]
 async fn workspace_absolute_scope_is_normalized_before_locking() {
     let (registry, state, commits) = harness();
     registry

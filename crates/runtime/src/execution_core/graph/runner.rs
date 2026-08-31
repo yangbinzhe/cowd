@@ -25,9 +25,9 @@ use super::registry::{
 };
 use super::resources::{
     ExecutionResourceKind, ExecutionResourceLease, ExecutionResourceManager,
-    ResourceAdmissionDecision, ResourceAdmissionRequest, ResourceWaitReason, ScopeLockLease,
-    ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource, WorktreeLease,
-    WorktreeLeaseManager, WorktreeLeaseRequest, WorktreeOwnership,
+    ResourceAdmissionDecision, ResourceAdmissionRequest, ResourceWaitReason, ScopeLockError,
+    ScopeLockLease, ScopeLockManager, ScopeLockMode, ScopeLockRequest, ScopedResource,
+    WorktreeLease, WorktreeLeaseManager, WorktreeLeaseRequest, WorktreeOwnership,
 };
 use super::state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
 
@@ -748,7 +748,7 @@ impl ExecutionGraphRunner {
                 continue;
             }
             let resources = match self
-                .acquire_node_resources(graph.as_ref(), &node, deadline_at_ms)
+                .acquire_node_resources(graph.as_ref(), &node, deadline_at_ms, Some(Duration::ZERO))
                 .await
             {
                 Ok(resources) => resources,
@@ -1390,7 +1390,7 @@ impl ExecutionGraphRunner {
         } else {
             let admission_graph = self.state_store.load_snapshot_async(graph_id).await?;
             let resources = self
-                .acquire_node_resources(admission_graph.as_ref(), &node, deadline_at_ms)
+                .acquire_node_resources(admission_graph.as_ref(), &node, deadline_at_ms, None)
                 .await?;
             let resource_kind = resources
                 .resource
@@ -1695,6 +1695,7 @@ impl ExecutionGraphRunner {
         graph: &ExecutionGraph,
         node: &harness_contract::execution_graph::ExecutionNodeSpec,
         deadline_at_ms: Option<u64>,
+        scope_wait: Option<Duration>,
     ) -> Result<NodeResourceGuards, ExecutionRunnerError> {
         let resource_kind = match node.kind {
             harness_contract::execution_graph::ExecutionNodeKind::AgentTask => {
@@ -1703,19 +1704,15 @@ impl ExecutionGraphRunner {
             harness_contract::execution_graph::ExecutionNodeKind::Materialize => {
                 Some(ExecutionResourceKind::Tool)
             }
-            // Subgraph is a durable orchestration container, not an Agent.
-            // Its child AgentTask leaves acquire their own Agent permits. If
-            // the parent container also held one while awaiting the child, a
-            // one-slot Agent quota would deadlock parent and child.
-            harness_contract::execution_graph::ExecutionNodeKind::Subgraph => None,
-            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => {
-                // ToolBatch is a container. Each leaf invocation is admitted
-                // by ToolExecutionPlane; taking a second Tool lease here can
-                // deadlock a one-slot quota.
-                // Model-supplied paths deliberately do not become container
-                // scopes: the governed leaves validate their own exact path
-                // demand and record a per-call failure. That preserves valid
-                // sibling progress when one read path is mistyped.
+            harness_contract::execution_graph::ExecutionNodeKind::Subgraph
+            | harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => {
+                // Subgraph and ToolBatch are durable orchestration
+                // containers. Their child Agent/tool leaves acquire the
+                // authoritative resource and scope leases. Holding a path
+                // lock here while synchronously awaiting a descendant that
+                // needs the same path creates a parent-waits-child / child-
+                // waits-parent deadlock. Keep validation at the container
+                // boundary, but defer ownership to the actual effect leaf.
                 for scope in &node.resource_scopes {
                     if let Some(path) = scope.strip_prefix("read:") {
                         let _ = self.scoped_resource_for_path(&node.id, path, false)?;
@@ -1869,13 +1866,22 @@ impl ExecutionGraphRunner {
             None
         } else {
             Some(
-                self.scope_locks
-                    .acquire(scope_requests, None)
-                    .await
-                    .map_err(|error| ExecutionRunnerError::Resource {
-                        node_id: node.id.clone(),
-                        reason: error.to_string(),
-                    })?,
+                match self.scope_locks.acquire(scope_requests, scope_wait).await {
+                    Ok(lease) => lease,
+                    Err(ScopeLockError::TimedOut { .. }) if scope_wait.is_some() => {
+                        return Err(ExecutionRunnerError::ResourceDeferred {
+                            node_id: node.id.clone(),
+                            reason: "scope lock is currently owned by another effect leaf"
+                                .to_string(),
+                        });
+                    }
+                    Err(error) => {
+                        return Err(ExecutionRunnerError::Resource {
+                            node_id: node.id.clone(),
+                            reason: error.to_string(),
+                        });
+                    }
+                },
             )
         };
         let worktree = worktree_path
