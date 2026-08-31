@@ -2448,6 +2448,122 @@ mod tests {
         );
     }
 
+    #[test]
+    fn episodes_and_advisory_pattern_survive_physical_store_reopen() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let home = root.path().join("home");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let signature = harness_contract::evolution::CollaborationSemanticSignature {
+            normalizer_revision: 1,
+            workstream_shapes: Vec::new(),
+            dependency_shapes: Vec::new(),
+            required_capability_ids: vec!["cap.read".to_string()],
+            required_skill_ids: Vec::new(),
+            required_tool_capabilities: Vec::new(),
+            acceptance_kinds: vec!["evidence".to_string()],
+            result_field_shapes: vec!["report".to_string()],
+        }
+        .normalized();
+        let pattern_id =
+            harness_contract::evolution::CollaborationSemanticPattern::deterministic_id(
+                &signature.digest(),
+            );
+        let pattern_stream = format!("evolution:pattern:{pattern_id}");
+
+        {
+            let services = crate::RuntimeServices::builder(&home, &workspace)
+                .build()
+                .expect("first persistent runtime");
+            for revision in 1..=3_u64 {
+                let episode = harness_contract::evolution::CollaborationExperienceEpisode {
+                    schema_version:
+                        harness_contract::evolution::COLLABORATION_EXPERIENCE_SCHEMA_VERSION,
+                    episode_id: harness_contract::evolution::CollaborationExperienceEpisode::deterministic_id(
+                        &format!("persistent-program-{revision}"),
+                        revision,
+                    ),
+                    session_ref_hash: "sha256:session".to_string(),
+                    turn_ref_hash: format!("sha256:persistent-turn-{revision}"),
+                    program_id: format!("persistent-program-{revision}"),
+                    program_revision: revision,
+                    intent_digest: "sha256:intent".to_string(),
+                    binding_digest: "sha256:binding".to_string(),
+                    capacity_profile_digest: "sha256:capacity".to_string(),
+                    approval_policy_digest: "sha256:approval".to_string(),
+                    semantic_signature: signature.clone(),
+                    outcome:
+                        harness_contract::evolution::CollaborationExperienceOutcome::Completed,
+                    evidence_refs: vec![format!("evidence:{revision}")],
+                    coverage: harness_contract::evolution::CollaborationEvidenceCoverage {
+                        required_obligation_count: 1,
+                        satisfied_obligation_count: 1,
+                        coverage_basis_points: 10_000,
+                        reusable: true,
+                    },
+                    latency_ms: 1,
+                    resource_summary: harness_contract::evolution::CollaborationResourceSummary {
+                        parallel_demand: 1,
+                        context_reservation_tokens: 1,
+                        output_reservation_tokens: 1,
+                    },
+                    completed_at_ms: revision,
+                };
+                services
+                    .event_store()
+                    .append(crate::RuntimeEventInput {
+                        stream_id: format!("evolution:experience:{}", episode.episode_id),
+                        scope: crate::RuntimeEventScope::Evolution,
+                        kind: "evolution.collaboration_experience.recorded.v1".to_string(),
+                        status: Some("eligible".to_string()),
+                        actor: Some("test".to_string()),
+                        refs: Vec::new(),
+                        payload: serde_json::json!({"episode": episode}),
+                    })
+                    .expect("persistent episode event");
+            }
+            refresh_collaboration_semantic_patterns(&services).expect("first projection");
+            assert_eq!(
+                services
+                    .event_store()
+                    .list_stream(&pattern_stream)
+                    .expect("pattern stream")
+                    .len(),
+                1
+            );
+        }
+
+        let reopened = crate::RuntimeServices::builder(&home, &workspace)
+            .build()
+            .expect("reopened persistent runtime");
+        assert_eq!(
+            reopened
+                .event_store()
+                .replay_scope_kind(
+                    crate::RuntimeEventScope::Evolution,
+                    "evolution.collaboration_experience.recorded.v1",
+                )
+                .expect("reopened episodes")
+                .len(),
+            3
+        );
+        let patterns = reopened
+            .collaboration_semantic_patterns(8)
+            .expect("reopened patterns");
+        assert_eq!(patterns.len(), 1);
+        assert!(patterns[0].is_actionable());
+        refresh_collaboration_semantic_patterns(&reopened).expect("replay after reopen");
+        assert_eq!(
+            reopened
+                .event_store()
+                .list_stream(&pattern_stream)
+                .expect("replayed pattern stream")
+                .len(),
+            1,
+            "physical restart and replay cannot duplicate an advisory revision"
+        );
+    }
+
     #[tokio::test]
     async fn terminal_episode_is_singleton_across_reconcile_and_startup_replay() {
         use harness_contract::execution_graph::{

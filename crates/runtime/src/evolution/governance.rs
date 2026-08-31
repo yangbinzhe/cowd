@@ -3558,4 +3558,163 @@ mod tests {
         assert_eq!(review.status, ReleaseChangeReviewStatus::Pending);
         assert!(service.release_assignments().unwrap().is_empty());
     }
+
+    #[test]
+    fn governed_canary_and_stable_state_survive_physical_store_reopen() {
+        let root = tempfile::tempdir().expect("governance root");
+        let store_path = root.path().join("runtime.sqlite");
+        let candidate_id = candidate().candidate_id;
+
+        {
+            let store = Arc::new(RuntimeEventStore::try_open(&store_path).expect("event store"));
+            let service = EvolutionGovernanceService::new(
+                Arc::clone(&store),
+                Arc::new(ApprovalQueue::new(store)),
+            );
+            service.create_candidate(candidate()).expect("candidate");
+            let candidate = service
+                .record_comparison(eligible_report())
+                .expect("comparison");
+            let review = service
+                .request_canary_review(&candidate.candidate_id)
+                .expect("canary review");
+            let principal = crate::security::test_human_interactive_principal();
+            let lease = crate::security::test_verified_decision_lease(
+                &review.review_id,
+                release_action_key(review.action),
+                review.subject.scope_ref(),
+                review_digest(&review),
+            );
+            let canary = service
+                .decide_review(
+                    &principal,
+                    &lease,
+                    &review.review_id,
+                    ReleaseChangeReviewDecision::Approve,
+                    "persistent canary".to_string(),
+                )
+                .expect("canary decision")
+                .expect("canary assignment");
+            service
+                .record_canary_observation(CanaryObservationReport {
+                    report_id: "persistent-observation".to_string(),
+                    candidate_id: candidate.candidate_id.clone(),
+                    canary_assignment_id: canary.assignment_id,
+                    generation: canary.generation,
+                    source_run_refs: vec!["agent-run:persistent-canary".to_string()],
+                    evidence_refs: vec![EvidenceRef::observed(
+                        "evaluation",
+                        "persistent-canary-window",
+                    )],
+                    sample_count: 40,
+                    minimum_samples: 10,
+                    observed_duration_ms: 120_000,
+                    minimum_duration_ms: 60_000,
+                    hard_gates_passed: true,
+                    protected_dimensions_noninferior: true,
+                    created_at_ms: now_ms(),
+                })
+                .expect("canary observation");
+            let stable = service
+                .request_stable_review(&candidate.candidate_id)
+                .expect("stable review");
+            let stable_lease = crate::security::test_verified_decision_lease(
+                &stable.review_id,
+                release_action_key(stable.action),
+                stable.subject.scope_ref(),
+                review_digest(&stable),
+            );
+            service
+                .decide_review(
+                    &principal,
+                    &stable_lease,
+                    &stable.review_id,
+                    ReleaseChangeReviewDecision::Approve,
+                    "persistent stable".to_string(),
+                )
+                .expect("stable decision")
+                .expect("stable assignment");
+        }
+
+        let reopened_store =
+            Arc::new(RuntimeEventStore::try_open(&store_path).expect("reopened event store"));
+        let reopened = EvolutionGovernanceService::new(
+            Arc::clone(&reopened_store),
+            Arc::new(ApprovalQueue::new(reopened_store)),
+        );
+        let recovered = reopened
+            .candidate(&candidate_id)
+            .expect("recovered candidate");
+        assert_eq!(
+            recovered.lifecycle,
+            EvolutionCandidateLifecycle::EvaluatedEligible
+        );
+        assert!(recovered.canary_observation.is_some());
+        let assignments = reopened
+            .release_assignments()
+            .expect("recovered assignments");
+        assert!(assignments
+            .iter()
+            .any(|assignment| assignment.action == ReleaseChangeAction::PromoteCanary));
+        assert!(assignments
+            .iter()
+            .any(|assignment| assignment.action == ReleaseChangeAction::PromoteStable));
+        assert_eq!(
+            reopened
+                .review(
+                    recovered
+                        .stable_review_ref
+                        .as_deref()
+                        .expect("stable review ref"),
+                )
+                .expect("recovered stable review")
+                .status,
+            ReleaseChangeReviewStatus::Approved
+        );
+
+        let rollback = reopened
+            .request_release_change(ReleaseChangeRequest {
+                request_id: "persistent-rollback".to_string(),
+                subject: recovered.subject,
+                action: ReleaseChangeAction::Rollback,
+                selector: Some(RevisionSelector::ExactApprovedRevision { revision: 1 }),
+                candidate_id: None,
+                evidence_refs: vec![EvidenceRef::observed("incident", "persistent-rollback")],
+            })
+            .expect("rollback review");
+        let principal = crate::security::test_human_interactive_principal();
+        let rollback_lease = crate::security::test_verified_decision_lease(
+            &rollback.review_id,
+            release_action_key(rollback.action),
+            rollback.subject.scope_ref(),
+            review_digest(&rollback),
+        );
+        reopened
+            .decide_review(
+                &principal,
+                &rollback_lease,
+                &rollback.review_id,
+                ReleaseChangeReviewDecision::Approve,
+                "persistent rollback".to_string(),
+            )
+            .expect("rollback decision")
+            .expect("rollback assignment");
+        drop(reopened);
+
+        let final_store =
+            Arc::new(RuntimeEventStore::try_open(&store_path).expect("final event store reopen"));
+        let final_service = EvolutionGovernanceService::new(
+            Arc::clone(&final_store),
+            Arc::new(ApprovalQueue::new(final_store)),
+        );
+        assert!(final_service
+            .release_assignments()
+            .expect("final recovered assignments")
+            .iter()
+            .any(|assignment| {
+                assignment.action == ReleaseChangeAction::Rollback
+                    && assignment.selector
+                        == Some(RevisionSelector::ExactApprovedRevision { revision: 1 })
+            }));
+    }
 }
