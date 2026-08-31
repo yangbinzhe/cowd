@@ -1082,12 +1082,28 @@ fn derive_behavior(
     // artifacts. Without this lowering, an aggregate sink is classified as
     // an upstream-only zero-tool reducer and can never satisfy the scope that
     // Runtime already admitted and leased to its Team.
+    let consumes_upstream = !incoming_kinds.is_empty() || consumes_cross_workstream_input;
+    let requests_independent_effect = role.required_capabilities.iter().any(|capability| {
+        matches!(
+            capability
+                .trim()
+                .replace('-', "_")
+                .to_ascii_lowercase()
+                .as_str(),
+            "network" | "web" | "write" | "test" | "status" | "logs" | "rollback"
+        )
+    });
     if role.acceptance.iter().any(|criterion| {
         matches!(
             criterion,
             ModelSemanticAcceptanceCriterion::EvidenceScope { .. }
         )
     }) || (terminal_owns_workstream_evidence && terminal_role == Some(canonical_id))
+        // A handoff is an input edge, not a declaration that the consumer is
+        // a zero-tool reducer. Explicit effect capabilities mean this role is
+        // expected to do new governed work after consuming the artifact (for
+        // example design -> implementation or result -> reproduction).
+        || (consumes_upstream && requests_independent_effect)
     {
         behavior.push(RoleBehaviorFacet::ReacquireEvidence { required: true });
     }
@@ -2096,5 +2112,40 @@ mod tests {
             "test".to_string(),
             "write".to_string(),
         ]));
+    }
+
+    #[test]
+    fn upstream_effect_role_is_not_downgraded_to_zero_tool_reducer() {
+        let mut role = decision().workstreams[0].team.roles.remove(0);
+        role.required_capabilities = vec![
+            "read".to_string(),
+            "search".to_string(),
+            "write".to_string(),
+            "test".to_string(),
+        ];
+        let canonical_id = canonical_role_id(&role.role_id);
+        let incoming = BTreeMap::from([(
+            canonical_id.clone(),
+            vec![ModelCollaborationDependencyKind::Handoff],
+        )]);
+
+        let behavior = derive_behavior(
+            &role,
+            &canonical_id,
+            &incoming,
+            &BTreeMap::new(),
+            None,
+            false,
+            false,
+        );
+
+        assert!(behavior.iter().any(|facet| matches!(
+            facet,
+            RoleBehaviorFacet::UpstreamConsumption { required: true }
+        )));
+        assert!(behavior.iter().any(|facet| matches!(
+            facet,
+            RoleBehaviorFacet::ReacquireEvidence { required: true }
+        )));
     }
 }

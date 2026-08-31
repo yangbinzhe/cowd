@@ -210,7 +210,8 @@ fn required_host_tool_alternatives(capability: &str) -> &'static [&'static str] 
 
 pub(crate) fn agent_tool_permission(tool: &str) -> PermissionMode {
     match tool {
-        "write_file" | "edit_file" | "execute_code" => PermissionMode::WorkspaceWrite,
+        "write_file" | "edit_file" => PermissionMode::WorkspaceWrite,
+        "execute_code" => PermissionMode::ReadOnly,
         "bash" | "checkpoint_restore" | "mcp_tool" => PermissionMode::DangerFullAccess,
         _ => PermissionMode::ReadOnly,
     }
@@ -277,6 +278,10 @@ mod tests {
         assert_eq!(
             resolved.permission_policy.required_mode_for("bash"),
             PermissionMode::DangerFullAccess
+        );
+        assert_eq!(
+            resolved.permission_policy.required_mode_for("execute_code"),
+            PermissionMode::ReadOnly
         );
     }
 

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use sandbox_launcher::{shell_command, SandboxLaunchSpec};
+use sandbox_launcher::{shell_command, SandboxLaunchSpec, SandboxWorkspaceAccess};
 
 pub struct SandboxResult {
     pub stdout: String,
@@ -60,6 +60,11 @@ pub fn execute_code_in_workspace(
     };
     let mut spec = SandboxLaunchSpec::workspace(&workspace);
     spec.working_directory = Some(workspace.clone());
+    // Arbitrary code may inspect a Team's already-authorized workspace, but
+    // all mutations must go through path-aware ToolHost contracts. This also
+    // keeps a sandbox process compensatable without trying to infer paths
+    // from source code.
+    spec.workspace_access = SandboxWorkspaceAccess::ReadOnly;
     // `execute_code` is a data-analysis primitive, not an alternate network
     // client. Keep its registered no-network effect truthful at execution
     // time; callers that need network access must use governed network tools.
@@ -274,6 +279,30 @@ mod tests {
             "sandbox unexpectedly reached a host-network listener: {}",
             result.stderr
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandboxed_code_cannot_mutate_the_workspace() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace =
+            std::env::temp_dir().join(format!("cowd-execute-code-readonly-{}", std::process::id()));
+        std::fs::create_dir_all(&workspace).expect("test workspace");
+        let denied = workspace.join("denied.txt");
+        let result = execute_code_in_workspace(
+            "python",
+            "from pathlib import Path; Path('denied.txt').write_text('escaped')",
+            None,
+            &workspace,
+        );
+        assert_ne!(
+            result.exit_code, 0,
+            "workspace write unexpectedly succeeded"
+        );
+        assert!(!denied.exists());
+        std::fs::remove_dir(&workspace).expect("remove empty test workspace");
     }
 
     #[test]

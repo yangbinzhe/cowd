@@ -220,17 +220,15 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
                 // preventing a broad authorization lease from becoming an
                 // unverifiable `read:.` acceptance obligation.
                 let declared_scopes = declared_evidence_scopes(&node.evidence_contract);
-                let custom_scopes = if declared_scopes.is_empty() {
-                    bounded_workspace_focus_scopes(
-                        workspace_root,
-                        &request.intent,
-                        focus_count,
-                        node_requires_write,
-                        explicit_team,
-                    )
-                } else {
-                    declared_scopes
-                };
+                let custom_scopes = custom_team_resource_scopes(
+                    declared_scopes,
+                    node_uses_external,
+                    workspace_root,
+                    &request.intent,
+                    focus_count,
+                    node_requires_write,
+                    explicit_team,
+                );
                 tracing::debug!(
                     node = %node.node_id,
                     template,
@@ -392,6 +390,34 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
         .extend(scopes.into_iter().map(|scope| format!("resource:{scope}")));
     request.capabilities.sort();
     request.capabilities.dedup();
+}
+
+fn custom_team_resource_scopes(
+    declared_scopes: Vec<String>,
+    uses_external: bool,
+    workspace_root: &Path,
+    intent: &str,
+    focus_count: usize,
+    requires_write: bool,
+    explicit_team: bool,
+) -> Vec<String> {
+    if !declared_scopes.is_empty() {
+        return declared_scopes;
+    }
+    if uses_external {
+        // The immutable Agent profile already proves this custom Team
+        // contains network researchers. Binding it to an arbitrary local
+        // directory would advertise network capability while cropping every
+        // physical network tool.
+        return vec!["network:*".to_string()];
+    }
+    bounded_workspace_focus_scopes(
+        workspace_root,
+        intent,
+        focus_count,
+        requires_write,
+        explicit_team,
+    )
 }
 
 fn declared_evidence_scopes(evidence_contract: &[String]) -> Vec<String> {
@@ -1734,6 +1760,36 @@ mod tests {
                 "network:*".to_string(),
                 "read:crates/runtime/src/orchestration/mod.rs".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn custom_external_team_receives_network_lease_without_model_authorship() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        assert_eq!(
+            custom_team_resource_scopes(
+                Vec::new(),
+                true,
+                workspace.path(),
+                "research current external sources",
+                4,
+                false,
+                true,
+            ),
+            vec!["network:*".to_string()]
+        );
+        assert_eq!(
+            custom_team_resource_scopes(
+                vec!["read:README.md".to_string()],
+                true,
+                workspace.path(),
+                "research current external sources",
+                4,
+                false,
+                true,
+            ),
+            vec!["read:README.md".to_string()],
+            "an explicit narrower evidence contract remains authoritative"
         );
     }
 

@@ -192,7 +192,7 @@ fn resolve_effect_properties(
                 PermissionOperation::Execute,
                 target,
             )],
-            required_permission: ToolPermissionMode::WorkspaceWrite,
+            required_permission: ToolPermissionMode::ReadOnly,
             approval_class: ToolApprovalClass::Policy,
             uses_network: false,
             spawns_process: true,
@@ -788,16 +788,13 @@ mod tests {
             "execute_code",
             &json!({
                 "language": "python",
-                "code": "from pathlib import Path; Path('result.json').write_text('{}')"
+                "code": "print(sum(range(10)))"
             }),
-            ToolPermissionMode::WorkspaceWrite,
+            ToolPermissionMode::ReadOnly,
         );
 
         assert_eq!(descriptor.effect_kind, ToolEffectKind::Process);
-        assert_eq!(
-            descriptor.required_permission,
-            ToolPermissionMode::WorkspaceWrite
-        );
+        assert_eq!(descriptor.required_permission, ToolPermissionMode::ReadOnly);
         assert_eq!(descriptor.approval_class, ToolApprovalClass::Policy);
         assert!(descriptor.spawns_process);
         assert!(!descriptor.uses_network);

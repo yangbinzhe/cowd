@@ -799,12 +799,41 @@ fn test_tool_descriptor_for_input(
     tool_name: &str,
     input: &serde_json::Value,
 ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-    use harness_contract::policy::{PermissionOperation, PermissionResource, PermissionScope};
+    use harness_contract::policy::{
+        DataClassification, EffectAssessment, EffectBlastRadius, EffectExternality, EffectNovelty,
+        EffectReversibility, PermissionOperation, PermissionResource, PermissionScope,
+    };
     use harness_contract::tool::{
         ToolApprovalClass, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
         ToolPermissionMode,
     };
 
+    if tool_name == "execute_code" {
+        return Some(ToolEffectDescriptor {
+            tool_id: tool_name.to_string(),
+            descriptor_hash: "test-host:execute_code".to_string(),
+            effect_kind: ToolEffectKind::Process,
+            idempotency: ToolIdempotency::Unknown,
+            scopes: vec![PermissionScope {
+                resource: PermissionResource::Shell,
+                operation: PermissionOperation::Execute,
+                target: None,
+            }],
+            required_permission: ToolPermissionMode::ReadOnly,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+            assessment: EffectAssessment {
+                reversibility: EffectReversibility::Reversible,
+                externality: EffectExternality::Workspace,
+                data_sensitivity: DataClassification::Internal,
+                novelty: EffectNovelty::NewTarget,
+                blast_radius: EffectBlastRadius::Workspace,
+            },
+        });
+    }
     let (effect_kind, operation, required_permission, resource) = match tool_name {
         "read_file" | "grep_search" | "glob_search" => (
             ToolEffectKind::Read,
@@ -1214,6 +1243,43 @@ fn permission_policy_uses_the_explicit_packet_ceiling() {
         policy.required_mode_for("write_file"),
         PermissionMode::WorkspaceWrite
     );
+}
+
+#[test]
+fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
+    let root = tempfile::tempdir().expect("scoped workspace");
+    let build = |scopes: Vec<String>| ScopedRuntimeToolExecutor {
+        host: Arc::new(EchoRuntimeExecutionHost),
+        allowed_tools: BTreeSet::from(["execute_code".to_string()]),
+        session_id: "session".to_string(),
+        sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
+        policy_revision: 1,
+        memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        model_lease: "model".to_string(),
+        execution_id: "graph".to_string(),
+        node_id: "node".to_string(),
+        attempt: 1,
+        workspace_root: root.path().to_path_buf(),
+        path_identity_resolver: Arc::new(
+            crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+                .expect("path identities"),
+        ),
+        scope_locks: Arc::new(ScopeLockManager::new()),
+        commit_service: None,
+        resource_scopes: Some(scopes),
+        managed_invocation: None,
+        next_receipt_sequence: AtomicU64::new(0),
+        receipts: Mutex::new(Vec::new()),
+        provider_model_obligations: Vec::new(),
+    };
+    let input = r#"{"language":"python","code":"print(1)"}"#;
+
+    build(vec!["read:.".to_string()])
+        .enforce_resource_ceiling("execute_code", input)
+        .expect("whole-workspace read lease admits the read-only sandbox");
+    assert!(build(vec!["read:src".to_string()])
+        .enforce_resource_ceiling("execute_code", input)
+        .is_err());
 }
 
 #[tokio::test]

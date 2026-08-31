@@ -2152,6 +2152,9 @@ impl ScopedRuntimeToolExecutor {
             .host
             .delegated_tool_effect_descriptor(tool_name, &input)
             .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
+        let bounded_sandbox_process = descriptor.spawns_process
+            && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Process
+            && crate::delegated_tool_effect_is_bounded(&descriptor);
         if descriptor.spawns_process
             || matches!(
                 descriptor.effect_kind,
@@ -2162,6 +2165,22 @@ impl ScopedRuntimeToolExecutor {
                     | harness_contract::tool::ToolEffectKind::Unknown
             )
         {
+            if bounded_sandbox_process {
+                return allowed_scopes
+                    .iter()
+                    .any(|scope| {
+                        matches!(
+                            scope.trim(),
+                            "read:." | "read:./" | "write:." | "write:./" | "workspace:."
+                        )
+                    })
+                    .then_some(())
+                    .ok_or_else(|| {
+                        ToolError::new(format!(
+                            "tool `{tool_name}` requires a whole-workspace read lease for its read-only sandbox"
+                        ))
+                    });
+            }
             return Err(ToolError::new(format!(
                 "tool `{tool_name}` cannot prove a bounded Team resource scope"
             )));
@@ -2216,7 +2235,12 @@ impl ScopedRuntimeToolExecutor {
             .delegated_tool_effect_descriptor(tool_name, &parsed_input)
             .ok_or_else(|| ToolError::new("tool has no enforceable Runtime effect descriptor"))?;
         let requested = crate::governed_tool_plan::resource_scope_from_effect(&descriptor);
-        let resource_scopes = if requested.network {
+        let bounded_sandbox_process = descriptor.spawns_process
+            && descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Process
+            && crate::delegated_tool_effect_is_bounded(&descriptor);
+        let resource_scopes = if bounded_sandbox_process {
+            vec!["read:.".to_string()]
+        } else if requested.network {
             vec!["network:*".to_string()]
         } else {
             let mode = if descriptor.effect_kind == harness_contract::tool::ToolEffectKind::Write {
@@ -2245,12 +2269,20 @@ impl ScopedRuntimeToolExecutor {
         } else {
             ScopeLockMode::Read
         };
-        let lock_requests = requested
-            .paths
+        let lock_paths = if bounded_sandbox_process {
+            vec![".".to_string()]
+        } else {
+            requested.paths.clone()
+        };
+        let lock_requests = lock_paths
             .iter()
             .map(|path| {
-                self.path_identity_resolver
-                    .resolve_planned_file(path)
+                let identity = if bounded_sandbox_process {
+                    self.path_identity_resolver.resolve_existing(path)
+                } else {
+                    self.path_identity_resolver.resolve_planned_file(path)
+                };
+                identity
                     .map(|identity| ScopeLockRequest {
                         scope: ScopedResource::workspace_object(identity),
                         mode: lock_mode,

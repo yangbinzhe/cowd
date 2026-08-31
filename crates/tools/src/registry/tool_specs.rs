@@ -1098,7 +1098,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                 "required": ["language", "code"],
                 "additionalProperties": false
             }),
-            required_permission: PermissionMode::WorkspaceWrite,
+            required_permission: PermissionMode::ReadOnly,
         },
     ]
 }
