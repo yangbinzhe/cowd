@@ -20,6 +20,13 @@ fn explicit_team_cardinality_is_distinct_from_agent_cardinality() {
     assert_eq!(explicit_team_count("start three research teams"), 3);
     assert_eq!(explicit_team_count("请使用恰好3个Team完成真实任务"), 3);
     assert_eq!(
+        explicit_team_count(
+            "必须创建恰好四个 Team，每个 Team 恰好四个角色，共 16 个 Agent；后续六项验收都必须完成"
+        ),
+        4,
+        "the first exact Team contract must win over unrelated later cardinalities"
+    );
+    assert_eq!(
         understand(&StrategyInput::from_prompt(
             "恰好 3 个 turn-scoped custom Team workstream，全部真实执行"
         ))

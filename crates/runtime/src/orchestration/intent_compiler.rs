@@ -53,6 +53,11 @@ pub struct CollaborationCompileDiagnostic {
     pub missing_capabilities: Vec<String>,
     pub missing_skills: Vec<String>,
     pub missing_tools: Vec<String>,
+    /// Exact capability sets currently backed by runnable immutable Agent
+    /// Definitions. This is repair context, never an authorization grant.
+    pub available_capability_profiles: Vec<Vec<String>>,
+    /// Exact skill references currently present in the runnable catalog.
+    pub available_skill_refs: Vec<String>,
     pub authorization_gap: bool,
     pub repairability: String,
     pub allowed_repairs: Vec<String>,
@@ -68,6 +73,8 @@ impl CollaborationCompileDiagnostic {
             missing_capabilities: Vec::new(),
             missing_skills: Vec::new(),
             missing_tools: Vec::new(),
+            available_capability_profiles: Vec::new(),
+            available_skill_refs: Vec::new(),
             authorization_gap: false,
             repairability: "model_revise".to_string(),
             allowed_repairs: vec!["supply_complete_semantic_intent".to_string()],
@@ -88,10 +95,32 @@ impl CollaborationCompileDiagnostic {
             missing_capabilities,
             missing_skills,
             missing_tools,
+            available_capability_profiles: Vec::new(),
+            available_skill_refs: Vec::new(),
             authorization_gap: false,
             repairability: "model_revise".to_string(),
-            allowed_repairs: vec!["adjust_capability_skill_or_tool_requirements".to_string()],
+            allowed_repairs: vec![
+                "choose_one_supported_agent_capability_profile".to_string(),
+                "split_incompatible_capabilities_across_roles".to_string(),
+                "remove_unavailable_skill_or_tool_requirements".to_string(),
+            ],
         }
+    }
+
+    fn with_agent_catalog(mut self, catalog: &[AgentCatalogEntry]) -> Self {
+        self.available_capability_profiles = catalog
+            .iter()
+            .map(|entry| canonical_set(&entry.capabilities))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.available_skill_refs = catalog
+            .iter()
+            .flat_map(|entry| entry.skill_refs.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self
     }
 }
 
@@ -863,6 +892,7 @@ fn resolve_role(
             Vec::new(),
             tools,
         )
+        .with_agent_catalog(catalog)
         .into());
     }
     let mut invalid_or_unauthorized = Vec::new();
@@ -883,7 +913,7 @@ fn resolve_role(
         diagnostic.authorization_gap = true;
         diagnostic.repairability = "user_decision".to_string();
         diagnostic.allowed_repairs = vec!["request_authorized_capabilities".to_string()];
-        return Err(diagnostic.into());
+        return Err(diagnostic.with_agent_catalog(catalog).into());
     }
     let available_tools = resolve_agent_capability(AgentCapabilityRequest {
         role_id: role.role_id.clone(),
@@ -903,6 +933,7 @@ fn resolve_role(
             Vec::new(),
             missing_tools,
         )
+        .with_agent_catalog(catalog)
         .into());
     }
     let mut eligible = catalog
@@ -939,7 +970,9 @@ fn resolve_role(
             })
     });
     eligible.into_iter().next().ok_or_else(|| {
-        CollaborationCompileDiagnostic::resolver(&role.role_id, capabilities, skills, tools).into()
+        CollaborationCompileDiagnostic::resolver(&role.role_id, capabilities, skills, tools)
+            .with_agent_catalog(catalog)
+            .into()
     })
 }
 
@@ -1852,7 +1885,53 @@ mod tests {
         invalid.workstreams[0].team.roles[0].required_skills = vec!["skill/unknown@1".to_string()];
         let error = compile_turn_scoped_intent(&request(), &invalid, &services)
             .expect_err("unknown skill must fail closed");
-        assert!(error.to_string().contains("role_resolution_gap"));
-        assert!(error.to_string().contains("skill/unknown@1"));
+        let IntentCompilerError::Diagnostic(diagnostic) = error else {
+            panic!("expected typed resolution diagnostic")
+        };
+        assert_eq!(diagnostic.code, "role_resolution_gap");
+        assert_eq!(diagnostic.missing_skills, vec!["skill/unknown@1"]);
+        assert!(diagnostic.available_skill_refs.is_empty());
+        assert!(diagnostic.available_capability_profiles.contains(&vec![
+            "network".to_string(),
+            "read".to_string(),
+            "search".to_string()
+        ]));
+    }
+
+    #[test]
+    fn incompatible_capability_union_returns_exact_runnable_profiles() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let catalog = services
+            .definition_registry()
+            .runnable_agent_catalog()
+            .expect("runnable Agent catalog");
+        let mut role = decision().workstreams[0].team.roles.remove(0);
+        role.required_capabilities = vec![
+            "read".to_string(),
+            "search".to_string(),
+            "network".to_string(),
+            "write".to_string(),
+        ];
+        let error = resolve_role(&role, &catalog, PermissionMode::DangerFullAccess)
+            .expect_err("network and workspace mutation require separate Agent identities");
+        let IntentCompilerError::Diagnostic(diagnostic) = error else {
+            panic!("expected typed resolution diagnostic")
+        };
+        assert_eq!(diagnostic.code, "role_resolution_gap");
+        assert!(diagnostic
+            .allowed_repairs
+            .iter()
+            .any(|repair| { repair == "split_incompatible_capabilities_across_roles" }));
+        assert!(diagnostic.available_capability_profiles.contains(&vec![
+            "network".to_string(),
+            "read".to_string(),
+            "search".to_string()
+        ]));
+        assert!(diagnostic.available_capability_profiles.contains(&vec![
+            "read".to_string(),
+            "search".to_string(),
+            "test".to_string(),
+            "write".to_string(),
+        ]));
     }
 }

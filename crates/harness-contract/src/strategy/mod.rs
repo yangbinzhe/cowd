@@ -3410,6 +3410,14 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
         ("七", "seven", 7),
         ("八", "eight", 8),
     ];
+    // `恰好`/`正好`/`exactly` is a stronger cardinality contract than the
+    // permissive natural-language heuristics below.  In long prompts those
+    // heuristics can otherwise connect an unrelated later number to a distant
+    // `Team` token and silently inflate the requested topology.  Preserve the
+    // first explicit exact contract: it is the user's unambiguous instruction.
+    if let Some(exact) = explicit_exact_team_count(&normalized, COUNTS) {
+        return exact;
+    }
     let ordinal_count = explicit_team_ordinal_count(&normalized);
     let mut cardinal_normalized = normalized.clone();
     for (chinese, _, count) in COUNTS {
@@ -3524,6 +3532,35 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
         requested = ordinal_count;
     }
     requested
+}
+
+fn explicit_exact_team_count(normalized: &str, counts: &[(&str, &str, u8)]) -> Option<u8> {
+    let mut first_match: Option<(usize, u8)> = None;
+    for (chinese, english, count) in counts {
+        let arabic = count.to_string();
+        let patterns = [
+            format!("恰好{chinese}个 team"),
+            format!("正好{chinese}个 team"),
+            format!("恰好{chinese}个团队"),
+            format!("正好{chinese}个团队"),
+            format!("恰好{arabic}个team"),
+            format!("正好{arabic}个team"),
+            format!("恰好 {arabic} 个 team"),
+            format!("正好 {arabic} 个 team"),
+            format!("exactly {english} teams"),
+            format!("exactly {arabic} teams"),
+            format!("exactly {english} team"),
+            format!("exactly {arabic} team"),
+        ];
+        for pattern in patterns {
+            if let Some(offset) = normalized.find(&pattern) {
+                if first_match.map_or(true, |(first_offset, _)| offset < first_offset) {
+                    first_match = Some((offset, *count));
+                }
+            }
+        }
+    }
+    first_match.map(|(_, count)| count)
 }
 
 /// Whether an explicitly requested multi-Team collaboration includes a typed

@@ -3398,6 +3398,7 @@ where
             bounded_evidence_role && failed == 0 && !scope_keys.is_empty() && newly_scoped == 0;
         let mut automatic_focus_verification = None;
         let mut state = self.state.lock().await;
+        let mut root_collaboration_repair_scheduled = false;
         // A successful Team-admission call has already created the durable
         // Program authority.  Keep only this turn-local "do not submit the
         // same admission again" marker; completion is still read exclusively
@@ -3452,6 +3453,7 @@ where
                     item.visibility = ContextVisibility::Private;
                     item.evidence = vec![format!("execution_node:{}", ticket.node_id)];
                     state.pending_next_model_context.push(item);
+                    root_collaboration_repair_scheduled = true;
                 }
             }
         }
@@ -3603,12 +3605,11 @@ where
         if repeated_success {
             state.duplicate_tool_calls = state.duplicate_tool_calls.saturating_add(tool_calls);
         }
-        if failed > 0 {
-            state.consecutive_tool_failure_batches =
-                state.consecutive_tool_failure_batches.saturating_add(1);
-        } else {
-            state.consecutive_tool_failure_batches = 0;
-        }
+        state.consecutive_tool_failure_batches = next_consecutive_tool_failure_batches(
+            state.consecutive_tool_failure_batches,
+            failed,
+            root_collaboration_repair_scheduled,
+        );
         if failed == 0 && (low_novelty || scope_saturated || evidence_saturated) {
             state.consecutive_low_novelty_batches =
                 state.consecutive_low_novelty_batches.saturating_add(1);

@@ -66,6 +66,18 @@ const STRUCTURED_OUTPUT_RECOVERY_BUDGET: u8 = 2;
 /// it never expands follow-up Team authority after a collaboration starts.
 const ROOT_CONTROL_PLANE_REPAIR_BUDGET: usize = 3;
 
+fn next_consecutive_tool_failure_batches(
+    current: usize,
+    failed_calls: usize,
+    bounded_semantic_repair_scheduled: bool,
+) -> usize {
+    if failed_calls == 0 || bounded_semantic_repair_scheduled {
+        0
+    } else {
+        current.saturating_add(1)
+    }
+}
+
 /// The root collaboration contract has a deliberately small, durable control
 /// plane. Capability discovery is useful, but it must not satisfy the action
 /// obligation that admits a Program. Keeping this as Runtime state prevents a

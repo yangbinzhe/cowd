@@ -410,6 +410,13 @@
     }
 
     #[test]
+    fn bounded_semantic_repairs_do_not_trip_the_unrelated_tool_failure_fuse() {
+        assert_eq!(next_consecutive_tool_failure_batches(1, 1, true), 0);
+        assert_eq!(next_consecutive_tool_failure_batches(1, 1, false), 2);
+        assert_eq!(next_consecutive_tool_failure_batches(7, 0, false), 0);
+    }
+
+    #[test]
     fn terminal_program_failure_is_not_model_repairable() {
         let messages = vec![ConversationMessage::tool_result(
             "team",

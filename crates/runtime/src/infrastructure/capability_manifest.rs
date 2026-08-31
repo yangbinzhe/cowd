@@ -3,6 +3,8 @@
 //! The manifest makes Cowd's higher-level harness affordances visible to the
 //! model without coupling tool implementations back into runtime.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -23,6 +25,8 @@ use crate::orchestration::request::{
 use harness_contract::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy};
 use harness_contract::orchestration::CapabilityRecipeId;
 use harness_contract::policy::PermissionMode;
+
+use crate::AgentCatalogEntry;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapability {
@@ -596,6 +600,7 @@ pub fn compact_runtime_capability_primer() -> String {
         String::new(),
         "Collaboration invariants:".to_string(),
         "- Explicit Teams/roles/organization require active `submit_collaboration_decision` semantic workstreams; preserve names and do not substitute templates. Reusable templates require `runtime_capabilities(detail=team_templates)` first.".to_string(),
+        "- One role resolves to one immutable Agent profile. Baseline profiles are [read], [read,search], [read,search,network], and [read,search,write,test]; never union network and write into one role, and omit skills unless agent_catalog returned the exact reference.".to_string(),
         "- Runtime resolves physical Agents, leases, grants, tools and graph IDs. Declare typed dependencies/results; one terminal synthesis role emits every required artifact, including evidence and explicit empty unresolved lists.".to_string(),
         "- Independent verification requires `review_of`; handoff/aggregate is not independent review. Exact-file evidence means line 1 through EOF plus digest; if it cannot fit, fail closed and repartition.".to_string(),
         "- Repair validation findings; never retry an unchanged rejected recipe or invent operations/role IDs.".to_string(),
@@ -646,6 +651,7 @@ pub fn runtime_capabilities_response_with_leased_decision(
         leased_decision,
         &available_tools,
         None,
+        None,
     )
 }
 
@@ -658,6 +664,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
     leased_decision: Option<&RuntimeExecutionDecision>,
     available_tool_names: &[String],
     team_template_entries: Option<&[RuntimeTeamTemplateCatalogEntry]>,
+    agent_catalog_entries: Option<&[AgentCatalogEntry]>,
 ) -> Value {
     // The provider transport validates this enum for native function calls,
     // but compatibility transports and persisted/replayed calls can still
@@ -704,6 +711,7 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         &execution_decision,
         &action_selection,
         &catalog,
+        agent_catalog_entries,
     );
     let runtime_orchestrate_enabled = available_tool_names
         .iter()
@@ -1157,6 +1165,7 @@ fn backend_capabilities(
     execution_decision: &RuntimeExecutionDecision,
     action_selection: &crate::execution_core::RuntimeActionSelectionReport,
     catalog: &RuntimeCapabilityCatalog,
+    agent_catalog_entries: Option<&[AgentCatalogEntry]>,
 ) -> Value {
     let templates = catalog
         .templates
@@ -1194,16 +1203,41 @@ fn backend_capabilities(
             "protocols": protocols,
             "guidance": "focus_partition_plans must use role ids from collaboration_templates[].roles exactly; unknown role ids are rejected at compile time.",
         }),
-        "agent_catalog" => json!({
-            "role_intents": ["planner", "researcher", "executor", "reviewer", "merger", "memory_curator", "human"],
-            "role_intents_note": "role_intents are generic capability labels, not team template roles. Use detail=team_templates to obtain the exact legal roles for each template.",
-            "execution_profiles": [
-                {"role": "planner", "tool_mode": "read_only", "purpose": "plan and decompose"},
-                {"role": "researcher", "tool_mode": "read_only", "purpose": "parallel evidence gathering"},
-                {"role": "executor", "tool_mode": "write_workspace", "purpose": "apply bounded changes"},
-                {"role": "reviewer", "tool_mode": "read_only", "purpose": "independent verification"}
-            ]
-        }),
+        "agent_catalog" => {
+            let runnable_agents = agent_catalog_entries
+                .unwrap_or_default()
+                .iter()
+                .map(|entry| {
+                    json!({
+                        "definition_ref": format!(
+                            "{}@{}",
+                            entry.definition_ref.definition_id.as_str(),
+                            entry.definition_ref.revision,
+                        ),
+                        "name": entry.name,
+                        "capabilities": entry.capabilities,
+                        "skill_refs": entry.skill_refs,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let capability_profiles = agent_catalog_entries
+                .unwrap_or_default()
+                .iter()
+                .map(|entry| {
+                    let mut profile = entry.capabilities.clone();
+                    profile.sort();
+                    profile.dedup();
+                    profile
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            json!({
+                "runnable_agents": runnable_agents,
+                "capability_profiles": capability_profiles,
+                "guidance": "Each semantic role must choose requirements satisfied by one listed immutable Agent. Do not union profiles. Split network research from workspace mutation when no single profile contains both; use only exact listed skill_refs.",
+            })
+        }
         "orchestration_options" => {
             let compact_templates: Vec<Value> = catalog
                 .templates
@@ -1793,6 +1827,7 @@ mod tests {
             None,
             &["runtime_orchestrate".to_string()],
             Some(&entries),
+            None,
         );
         assert_eq!(
             response["collaboration_templates"][0]["template_id"],
@@ -1809,6 +1844,7 @@ mod tests {
             Some("team_templates"),
             None,
             &["runtime_orchestrate".to_string()],
+            None,
             None,
         );
         let templates = response["collaboration_templates"]
@@ -2153,6 +2189,7 @@ mod tests {
             None,
             None,
             &["runtime_capabilities".to_string(), "read_many".to_string()],
+            None,
             None,
         );
 

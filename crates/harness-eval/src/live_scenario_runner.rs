@@ -162,7 +162,11 @@ fn autonomous_deepseek_spec() -> Result<LiveScenarioSpec, String> {
             minimum_claims,
             minimum_reviews: minimum_proposals,
             minimum_challenges,
-            minimum_cross_team_edges: if scale == 24 { 6 } else { 5 },
+            // With four Teams and A/B/C all required in the first wave, the
+            // truthful maximum acyclic cross-Team fan-in is exactly the
+            // three typed deliveries A->D, B->D and C->D. A threshold of
+            // five or six silently contradicted the concurrency contract.
+            minimum_cross_team_edges: 3,
             minimum_discussions: if scale == 24 { 12 } else { 8 },
             output_path: AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,
         },
@@ -4010,8 +4014,19 @@ mod tests {
             assert!(prompt.contains("propose_work"));
             assert!(prompt.contains("bid/claim"));
             assert!(prompt.contains("challenge"));
+            assert!(prompt.contains("A→D、B→D、C→D"));
             assert!(prompt.contains(AUTONOMOUS_DEEPSEEK_OUTPUT_PATH));
         }
+        assert_eq!(
+            harness_contract::strategy::explicit_team_count(&template.prompt_16),
+            4,
+            "16-Agent role and WorkItem counts must not contaminate Team cardinality"
+        );
+        assert_eq!(
+            harness_contract::strategy::explicit_team_count(&template.prompt_24),
+            4,
+            "24-Agent role and WorkItem counts must not contaminate Team cardinality"
+        );
     }
 
     fn autonomous_projection(reread_verified: bool) -> Value {

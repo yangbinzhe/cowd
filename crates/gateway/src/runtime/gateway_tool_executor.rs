@@ -752,6 +752,10 @@ impl GatewayToolExecutor {
                 .runtime_services
                 .get()
                 .and_then(|services| services.definition_registry().runnable_team_catalog().ok());
+            let agent_catalog = self
+                .runtime_services
+                .get()
+                .and_then(|services| services.definition_registry().runnable_agent_catalog().ok());
             return serde_json::to_string_pretty(
                 &runtime::runtime_capabilities_response_with_leased_decision_and_tools(
                     &input.intent,
@@ -761,6 +765,7 @@ impl GatewayToolExecutor {
                     leased_decision.as_ref(),
                     &self.available_tool_names(),
                     team_templates.as_deref(),
+                    agent_catalog.as_deref(),
                 ),
             )
             .map_err(|error| ToolError::new(error.to_string()));
