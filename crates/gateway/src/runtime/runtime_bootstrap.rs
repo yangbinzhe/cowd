@@ -435,8 +435,10 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
                 "required": ["operation"],
                 "additionalProperties": false
             }),
-            // Reads keep the registered fast path; publish is a bounded state
-            // mutation and must carry a signed WorkspaceWrite authorization.
+            // Publish is a bounded Runtime-state mutation, not a workspace
+            // file effect. The executor still requires an immutable Team
+            // binding and revision CAS, while read-only Teams remain able to
+            // exchange findings and close their collaboration loop.
             required_permission: ToolPermissionMode::ReadOnly,
             effect_resolver: runtime_effect_resolver("runtime.team_board"),
         },

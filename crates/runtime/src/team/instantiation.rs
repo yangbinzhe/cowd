@@ -495,18 +495,12 @@ impl TeamInstantiationService {
                         role.role_id
                     ));
                 }
-                // Output materialization and source provenance are orthogonal
-                // contracts. Make the source mode explicit so the shared
-                // Agent/Team evidence policy never has to infer it from a
-                // custom artifact name. Runtime-attached predecessor results
-                // use UpstreamEvidence; a bounded read/network lease uses
-                // ScopedEvidence. A pure structured artifact with neither
-                // remains ungrounded and fails closed.
-                add_explicit_evidence_acceptance(
-                    &mut slot_acceptance,
-                    upstream_only_consumer,
-                    &node_resource_scopes,
-                );
+                // Output materialization and source provenance are
+                // orthogonal contracts. Runtime-attached predecessor results
+                // use UpstreamEvidence. Fresh source obligations come only
+                // from the frozen evidence contract; a resource lease is an
+                // authority ceiling and must never invent delivery debt.
+                add_explicit_evidence_acceptance(&mut slot_acceptance, upstream_only_consumer);
                 let resource_scopes =
                     role_bounded_evidence_scopes(&slot_acceptance, &node_resource_scopes);
                 // Collaboration escalation is a Runtime-assigned exception,
@@ -1287,29 +1281,15 @@ fn independently_observable_scope(scope: &str) -> bool {
         && !matches!(target.trim(), "." | "./" | "*")
 }
 
-fn bounded_runtime_evidence_scope(scope: &str) -> bool {
-    let scope = scope.trim();
-    if scope == "network:*" {
-        return true;
-    }
-    let Some((kind, target)) = scope.split_once(':') else {
-        return false;
-    };
-    matches!(kind, "read" | "workspace")
-        && !target.trim().is_empty()
-        && !matches!(target.trim(), "." | "./" | "*")
-}
-
-fn add_explicit_evidence_acceptance(
-    acceptance: &mut Vec<String>,
-    upstream_only_consumer: bool,
-    resource_scopes: &[String],
-) {
-    if upstream_only_consumer
-        || resource_scopes
-            .iter()
-            .any(|scope| bounded_runtime_evidence_scope(scope))
-    {
+fn add_explicit_evidence_acceptance(acceptance: &mut Vec<String>, upstream_only_consumer: bool) {
+    // Resource scopes are authority ceilings, not delivery obligations. An
+    // explicit Team contract may deliberately ask a role for structured
+    // analysis while leaving its evidence_contract empty. Turning every
+    // authorized directory into a required acceptance scope contradicts that
+    // frozen contract and creates unrelated scan loops. An upstream-only
+    // reducer is different: consuming its predecessor envelope is the action
+    // that grounds its synthesis, so Runtime makes that obligation explicit.
+    if upstream_only_consumer {
         acceptance.push("evidence".to_string());
         acceptance.sort();
         acceptance.dedup();
@@ -2245,24 +2225,17 @@ mod acceptance_contract_tests {
     }
 
     #[test]
-    fn evidence_mode_is_explicit_for_bounded_sources_and_upstream_synthesis() {
+    fn evidence_mode_follows_explicit_contract_and_upstream_synthesis() {
         let mut source_acceptance = vec!["artifact:source_report".to_string()];
-        add_explicit_evidence_acceptance(
-            &mut source_acceptance,
-            false,
-            &["read:crates/runtime/src/lib.rs".to_string()],
-        );
+        add_explicit_evidence_acceptance(&mut source_acceptance, false);
         assert_eq!(
             source_acceptance,
-            vec!["artifact:source_report".to_string(), "evidence".to_string()]
+            vec!["artifact:source_report".to_string()],
+            "resource authority alone must not add an evidence obligation"
         );
 
         let mut upstream_acceptance = vec!["artifact:final_report".to_string()];
-        add_explicit_evidence_acceptance(
-            &mut upstream_acceptance,
-            true,
-            &["read:.".to_string(), "session:session-1".to_string()],
-        );
+        add_explicit_evidence_acceptance(&mut upstream_acceptance, true);
         let requirements = team_acceptance_contract(
             &upstream_acceptance,
             &["read:.".to_string(), "session:session-1".to_string()],
@@ -2276,11 +2249,7 @@ mod acceptance_contract_tests {
         }));
 
         let mut ungrounded = vec!["artifact:free_form".to_string()];
-        add_explicit_evidence_acceptance(
-            &mut ungrounded,
-            false,
-            &["read:.".to_string(), "session:session-1".to_string()],
-        );
+        add_explicit_evidence_acceptance(&mut ungrounded, false);
         assert_eq!(ungrounded, vec!["artifact:free_form".to_string()]);
     }
 
@@ -2474,6 +2443,28 @@ mod acceptance_contract_tests {
                 name: "definitions_report".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn resource_authority_does_not_invent_focus_acceptance_debt() {
+        let mut structured_only = vec![
+            "artifact:definitions".to_string(),
+            "artifact:unresolved".to_string(),
+        ];
+        add_explicit_evidence_acceptance(&mut structured_only, false);
+        assert_eq!(
+            structured_only,
+            vec![
+                "artifact:definitions".to_string(),
+                "artifact:unresolved".to_string(),
+            ],
+            "read/search authority is not an implicit evidence contract"
+        );
+
+        add_explicit_evidence_acceptance(&mut structured_only, true);
+        assert!(structured_only
+            .iter()
+            .any(|criterion| criterion == "evidence"));
     }
 
     #[test]

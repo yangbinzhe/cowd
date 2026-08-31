@@ -812,7 +812,8 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         "runtime_orchestrate": {
             "available": runtime_orchestrate_available,
             "blocked_reasons": orchestration_blocked_reasons,
-            "required_permission": "workspace-write",
+            "required_permission": "read-only",
+            "shared_template_publish_permission": "workspace-write",
             "recommended_actions": execution_decision.recommended_actions,
             "expected_projection": action_selection.expected_projection,
             "details": "request detail=orchestration_options or runtime_action_contract for the full stateful action contract",

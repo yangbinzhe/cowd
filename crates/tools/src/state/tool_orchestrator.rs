@@ -162,6 +162,13 @@ fn resolve_effect_properties(
             target.clone(),
         )
     };
+    let control_scope = || {
+        scope(
+            PermissionResource::Tool,
+            PermissionOperation::Control,
+            target.clone(),
+        )
+    };
 
     match resolver.resolver_id.as_str() {
         "builtin.command" => {
@@ -223,13 +230,34 @@ fn resolve_effect_properties(
                     mutates_packages: false,
                     mutates_system: false,
                 }
-            } else {
+            } else if operation == "propose_template" {
+                // Publishing a reusable shared definition is a durable
+                // workspace/catalog mutation and retains the write gate.
                 EffectProperties {
                     effect_kind: ToolEffectKind::Write,
                     idempotency: ToolIdempotency::IdempotentWithKey,
                     scopes: vec![write_scope()],
                     required_permission: ToolPermissionMode::WorkspaceWrite,
                     approval_class: ToolApprovalClass::Policy,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }
+            } else {
+                // propose/revise/control/route_input mutate only the bounded
+                // Runtime execution state already owned by this Session.
+                // Runtime independently validates every graph, resource and
+                // permission edge; these operations cannot grant file or
+                // external authority. Classifying them as workspace writes
+                // prevented read-only collaboration from recovering its own
+                // graph and broke the autonomous control loop.
+                EffectProperties {
+                    effect_kind: ToolEffectKind::Read,
+                    idempotency: ToolIdempotency::IdempotentWithKey,
+                    scopes: vec![control_scope()],
+                    required_permission: ToolPermissionMode::ReadOnly,
+                    approval_class: ToolApprovalClass::None,
                     uses_network: false,
                     spawns_process: false,
                     mutates_packages: false,
@@ -243,12 +271,16 @@ fn resolve_effect_properties(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if operation == "publish" {
+                // Team-board publication is an internal, binding-scoped
+                // collaboration checkpoint. It never mutates workspace or
+                // external state, and the executor enforces Team identity,
+                // revision CAS and visibility independently.
                 EffectProperties {
-                    effect_kind: ToolEffectKind::Write,
+                    effect_kind: ToolEffectKind::Read,
                     idempotency: ToolIdempotency::IdempotentWithKey,
-                    scopes: vec![write_scope()],
-                    required_permission: ToolPermissionMode::WorkspaceWrite,
-                    approval_class: ToolApprovalClass::Policy,
+                    scopes: vec![control_scope()],
+                    required_permission: ToolPermissionMode::ReadOnly,
+                    approval_class: ToolApprovalClass::None,
                     uses_network: false,
                     spawns_process: false,
                     mutates_packages: false,
@@ -938,15 +970,57 @@ mod tests {
             &json!({"intent": "propose", "operation": "propose"}),
             ToolPermissionMode::ReadOnly,
         );
+        let revise = resolve_registered_tool_effect(
+            &resolver,
+            "runtime_orchestrate",
+            &json!({"intent": "recover", "operation": "revise"}),
+            ToolPermissionMode::ReadOnly,
+        );
+        let publish_template = resolve_registered_tool_effect(
+            &resolver,
+            "runtime_orchestrate",
+            &json!({"intent": "publish", "operation": "propose_template"}),
+            ToolPermissionMode::ReadOnly,
+        );
 
         assert_eq!(inspect.effect_kind, ToolEffectKind::Read);
         assert_eq!(inspect.required_permission, ToolPermissionMode::ReadOnly);
-        assert_eq!(propose.effect_kind, ToolEffectKind::Write);
+        assert_eq!(propose.effect_kind, ToolEffectKind::Read);
+        assert_eq!(propose.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(propose.idempotency, ToolIdempotency::IdempotentWithKey);
+        assert_eq!(revise.effect_kind, ToolEffectKind::Read);
+        assert_eq!(revise.required_permission, ToolPermissionMode::ReadOnly);
+        assert!(revise.scopes.iter().all(|scope| {
+            scope.resource == PermissionResource::Tool
+                && scope.operation == PermissionOperation::Control
+        }));
+        assert_eq!(publish_template.effect_kind, ToolEffectKind::Write);
         assert_eq!(
-            propose.required_permission,
+            publish_template.required_permission,
             ToolPermissionMode::WorkspaceWrite
         );
-        assert_eq!(propose.idempotency, ToolIdempotency::IdempotentWithKey);
+    }
+
+    #[test]
+    fn team_board_publish_is_readonly_internal_control_state() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "runtime.team_board".to_string(),
+            resolver_version: 1,
+        };
+        let publish = resolve_registered_tool_effect(
+            &resolver,
+            "team_board",
+            &json!({"operation": "publish", "summary": "bounded finding"}),
+            ToolPermissionMode::ReadOnly,
+        );
+
+        assert_eq!(publish.effect_kind, ToolEffectKind::Read);
+        assert_eq!(publish.required_permission, ToolPermissionMode::ReadOnly);
+        assert_eq!(publish.approval_class, ToolApprovalClass::None);
+        assert!(publish.scopes.iter().all(|scope| {
+            scope.resource == PermissionResource::Tool
+                && scope.operation == PermissionOperation::Control
+        }));
     }
 
     #[test]

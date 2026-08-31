@@ -3729,7 +3729,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_control_writes_require_authentic_current_session_authorization() {
+    async fn external_writes_require_authorization_and_internal_control_requires_binding() {
         let registry = GatewayToolRegistry::builtin()
             .with_runtime_tools(vec![
                 RuntimeToolDefinition {
@@ -3792,11 +3792,17 @@ mod tests {
             request.sandbox_posture = harness_contract::policy::SandboxPosture::HostFullAccess;
             request
         };
+        let team_input = json!({"operation":"publish","expected_revision":0,"kind":"finding","summary":"bounded"});
+        let direct = executor
+            .execute("team_board", &team_input.to_string())
+            .await
+            .expect_err("direct Team-board publication must retain its immutable Agent binding");
+        assert!(direct
+            .to_string()
+            .contains("immutable Team Agent execution binding"));
+        assert!(!direct.to_string().contains("Runtime authorization"));
+
         for (tool_name, input) in [
-            (
-                "team_board",
-                json!({"operation":"publish","expected_revision":0,"kind":"finding","summary":"bounded"}),
-            ),
             (
                 "mcp_tool",
                 json!({"qualifiedName":"server.write","arguments":{}}),
@@ -3823,7 +3829,15 @@ mod tests {
                 .is_some_and(|error| error.contains("requires signed Runtime authorization")));
         }
 
-        let team_input = json!({"operation":"publish","expected_revision":0,"kind":"finding","summary":"bounded"});
+        let request = make_request("team_board", team_input.clone());
+        let outcome =
+            runtime::RuntimeExecutionHost::execute_runtime_tool(&executor, &request).await;
+        assert_eq!(outcome.status, runtime::RuntimeToolExecutionStatus::Failed);
+        assert!(outcome.error.as_deref().is_some_and(|error| {
+            error.contains("immutable Team Agent execution binding")
+                && !error.contains("authorization")
+        }));
+
         let mut forged = make_request("team_board", team_input.clone());
         let mut authorization = signed_test_authorization(&executor, "team_board", &team_input, 7);
         authorization.authorization_lease.signature = "forged".to_string();
