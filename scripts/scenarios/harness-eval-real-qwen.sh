@@ -118,6 +118,25 @@ monitor_progress() {
           readiness: (.summary.projection.control_readiness.actions // [])
         }' \
       || true
+    curl -fsS \
+      -H "Authorization: Bearer $TOKEN" \
+      "$BASE_URL/api/sessions/executions" 2>/dev/null \
+      | jq -c '{
+          event: "harness_eval_execution_progress",
+          sessions: [.items[]? | {
+            session_id,
+            latest_execution_id,
+            active_execution_ids,
+            executions: [.executions[]? | {
+              execution_id,
+              turn_id,
+              status,
+              graph_id,
+              updated_at_ms
+            }]
+          }]
+        }' \
+      || true
     sleep "$interval"
   done
 }

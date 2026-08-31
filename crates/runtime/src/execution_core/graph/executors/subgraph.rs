@@ -200,8 +200,17 @@ impl NodeExecutor for TeamSubgraphExecutor {
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, NodeExecutorError> {
+        let admission_started_at = std::time::Instant::now();
         let mut request = self.request(&ticket.node_id, &ticket.payload_ref)?;
         let child_graph_id = format!("team-graph:{}", request.team_id);
+        tracing::info!(
+            parent_graph_id = %ticket.graph_id,
+            parent_node_id = %ticket.node_id,
+            %child_graph_id,
+            team_id = %request.team_id,
+            attempt = ticket.attempt,
+            "Team child admission started"
+        );
         let teams = self
             .teams
             .upgrade()
@@ -256,6 +265,13 @@ impl NodeExecutor for TeamSubgraphExecutor {
             node_id: ticket.node_id.clone(),
             reason,
         })?;
+        tracing::info!(
+            parent_graph_id = %ticket.graph_id,
+            parent_node_id = %ticket.node_id,
+            %child_graph_id,
+            elapsed_ms = admission_started_at.elapsed().as_millis() as u64,
+            "Team child predecessor deliveries reconciled"
+        );
         let projection = match teams.admit_or_resume(request).await {
             Ok(projection) => projection,
             Err(reason) => {
@@ -278,6 +294,16 @@ impl NodeExecutor for TeamSubgraphExecutor {
                 });
             }
         };
+        tracing::info!(
+            parent_graph_id = %ticket.graph_id,
+            parent_node_id = %ticket.node_id,
+            %child_graph_id,
+            lifecycle = ?projection.lifecycle,
+            status = %projection.status,
+            agent_count = projection.tasks.len(),
+            elapsed_ms = admission_started_at.elapsed().as_millis() as u64,
+            "Team child admitted or resumed"
+        );
         crate::orchestration::collaboration_coordinator::mark_team_admitted(
             &ticket.graph_id,
             &ticket.node_id,

@@ -238,7 +238,10 @@ async fn submit_runtime_orchestration_request_with_mode(
     cancellation: Option<crate::CancellationToken>,
     submission_mode: OrchestrationSubmissionMode,
 ) -> RuntimeOrchestrationResult {
+    let submission_started_at = std::time::Instant::now();
     if let Some(intent) = request.collaboration_intent.take() {
+        let decision_id = intent.decision_id.clone();
+        let workstream_count = intent.workstreams.len();
         match intent_compiler::compile_turn_scoped_intent(&request, &intent, services) {
             Ok(compiled) => {
                 request.proposal = Some(compiled.proposal);
@@ -248,6 +251,12 @@ async fn submit_runtime_orchestration_request_with_mode(
                 // role set; the compiler, not a later model-assisted focus
                 // selector, owns the exact turn-scoped Team snapshot.
                 request.selection_mode = Some(harness_contract::team::TeamSelectionMode::Explicit);
+                tracing::info!(
+                    %decision_id,
+                    workstream_count,
+                    elapsed_ms = submission_started_at.elapsed().as_millis() as u64,
+                    "turn-scoped collaboration intent compiled"
+                );
             }
             Err(error) => return rejected_intent_compiler_result(&request, error),
         }
@@ -259,6 +268,15 @@ async fn submit_runtime_orchestration_request_with_mode(
     if let Err(error) = materialize_ephemeral_team_template(&mut request, services) {
         return rejected_ephemeral_template_result(&request, error);
     }
+    tracing::info!(
+        team_count = request.proposal.as_ref().map_or(0, |proposal| proposal
+            .nodes
+            .iter()
+            .filter(|node| node.recipe == CapabilityRecipeId::Team)
+            .count()),
+        elapsed_ms = submission_started_at.elapsed().as_millis() as u64,
+        "turn-scoped Team templates materialized"
+    );
     let understanding = leased_decision
         .map(|decision| decision.strategy.understanding.clone())
         .unwrap_or_else(|| planner::understand_runtime_orchestration_request(&request));
@@ -266,6 +284,15 @@ async fn submit_runtime_orchestration_request_with_mode(
         &mut request,
         &understanding,
         services.workspace_root(),
+    );
+    tracing::info!(
+        team_count = request.proposal.as_ref().map_or(0, |proposal| proposal
+            .nodes
+            .iter()
+            .filter(|node| node.recipe == CapabilityRecipeId::Team)
+            .count()),
+        elapsed_ms = submission_started_at.elapsed().as_millis() as u64,
+        "collaboration semantic authority bound"
     );
     tracing::debug!(
         session = ?request.session_id,
@@ -393,6 +420,12 @@ async fn submit_runtime_orchestration_request_with_mode(
     if matches!(decision.status.as_str(), "rejected" | "needs_approval") {
         return result_without_runtime(&request, decision);
     }
+    tracing::info!(
+        status = %decision.status,
+        selected_pattern = %decision.selected_pattern.as_str(),
+        elapsed_ms = submission_started_at.elapsed().as_millis() as u64,
+        "collaboration request passed admission validation"
+    );
 
     let request_id = request_id(&request);
     let operation = request.operation;
@@ -1006,6 +1039,7 @@ async fn propose(
     cancellation: Option<crate::CancellationToken>,
     submission_mode: OrchestrationSubmissionMode,
 ) -> Result<OperationOutcome, String> {
+    let admission_started_at = std::time::Instant::now();
     let mut compiled =
         compile_orchestration_with_repair(request_id, request, plan, parent_execution, services)
             .map_err(|error| format!("semantic_compile_failed:{error}"))?;
@@ -1015,6 +1049,12 @@ async fn propose(
     }
     let work_estimate = compiled.work_estimate.clone();
     let graph_id = compiled.graph.id.clone();
+    tracing::info!(
+        %graph_id,
+        node_count = compiled.graph.nodes.len(),
+        elapsed_ms = admission_started_at.elapsed().as_millis() as u64,
+        "collaboration root graph compiled"
+    );
     match services.graph_state_store().load_async(&graph_id).await {
         Ok(existing) => {
             if mutation_applied(&existing, mutation_id(request)?) {
@@ -1038,10 +1078,20 @@ async fn propose(
     let mut graph = services
         .compile_graph_agent_intents(compiled.graph)
         .map_err(|error| format!("agent_binding_compilation_failed:{error}"))?;
+    tracing::info!(
+        %graph_id,
+        elapsed_ms = admission_started_at.elapsed().as_millis() as u64,
+        "collaboration root Agent intents compiled"
+    );
     collaboration_coordinator::prepare_program_admission(
         &mut graph,
         services.team_runtime().as_ref(),
     )?;
+    tracing::info!(
+        %graph_id,
+        elapsed_ms = admission_started_at.elapsed().as_millis() as u64,
+        "collaboration Program admission bindings frozen"
+    );
     if submission_mode == OrchestrationSubmissionMode::AdmitBackground {
         let registered = services
             .execution_supervisor()
@@ -1078,10 +1128,21 @@ async fn propose(
         .register_graph(graph)
         .await
         .map_err(|error| format!("graph_registration_failed:{error}"))?;
+    tracing::info!(
+        %graph_id,
+        revision = registered.revision,
+        elapsed_ms = admission_started_at.elapsed().as_millis() as u64,
+        "collaboration root graph registered; awaiting terminal execution"
+    );
     let run = services
         .execution_supervisor()
         .admit_registered_and_wait_terminal(&registered.id);
     let (_, report) = await_with_cancellation(run, cancellation, services, &graph_id).await?;
+    tracing::info!(
+        %graph_id,
+        elapsed_ms = admission_started_at.elapsed().as_millis() as u64,
+        "collaboration root graph reached terminal execution"
+    );
     collaboration_coordinator::reconcile_terminal_program(&graph_id, services).await?;
     let projection = services
         .execution_supervisor()
