@@ -4832,7 +4832,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_inventory_uses_permission_ceiling_but_excludes_unbounded_processes() {
+    fn delegated_inventory_allows_only_workspace_bounded_processes() {
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         let mut request = runtime::RuntimeOrchestrationCommand::from_model(
             harness_contract::orchestration::ModelRuntimeOrchestrationInput {
@@ -4868,8 +4868,8 @@ mod tests {
         assert!(inventory.contains(&"read_file".to_string()));
         assert!(inventory.contains(&"write_file".to_string()));
         assert!(inventory.contains(&"web_search".to_string()));
+        assert!(inventory.contains(&"execute_code".to_string()));
         assert!(!inventory.contains(&"bash".to_string()));
-        assert!(!inventory.contains(&"execute_code".to_string()));
         assert!(!inventory.contains(&"runtime_orchestrate".to_string()));
     }
 

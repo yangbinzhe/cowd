@@ -17,7 +17,11 @@ pub struct ToolSpec {
 #[must_use]
 pub fn builtin_effect_resolver_spec(name: &str) -> ToolEffectResolverSpec {
     let resolver_id = match normalize_tool_name(name).as_str() {
-        "bash" | "powershell" | "power_shell" | "repl" | "execute_code" => "builtin.command",
+        "bash" | "powershell" | "power_shell" | "repl" => "builtin.command",
+        // `execute_code` always enters the kernel-hardened workspace sandbox
+        // with a bounded timeout/output budget.  It must not inherit the
+        // arbitrary host-shell descriptor used by `bash`.
+        "execute_code" => "builtin.sandboxed_command",
         "read_file"
         | "read_many"
         | "glob_search"
@@ -1138,6 +1142,14 @@ mod tests {
         assert_eq!(
             builtin_effect_resolver_spec("web_search").resolver_id,
             "builtin.network"
+        );
+        assert_eq!(
+            builtin_effect_resolver_spec("execute_code").resolver_id,
+            "builtin.sandboxed_command"
+        );
+        assert_eq!(
+            builtin_effect_resolver_spec("bash").resolver_id,
+            "builtin.command"
         );
     }
 

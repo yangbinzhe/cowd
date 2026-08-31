@@ -205,13 +205,45 @@ pub trait RuntimeExecutionHost: Send + Sync {
 pub fn delegated_tool_effect_is_bounded(
     descriptor: &harness_contract::tool::ToolEffectDescriptor,
 ) -> bool {
-    !descriptor.spawns_process
-        && !matches!(
+    use harness_contract::policy::{EffectBlastRadius, EffectExternality, EffectReversibility};
+    use harness_contract::tool::{ToolApprovalClass, ToolEffectKind, ToolPermissionMode};
+
+    if descriptor.mutates_packages
+        || descriptor.mutates_system
+        || matches!(
             descriptor.effect_kind,
-            harness_contract::tool::ToolEffectKind::Process
-                | harness_contract::tool::ToolEffectKind::Package
-                | harness_contract::tool::ToolEffectKind::System
-                | harness_contract::tool::ToolEffectKind::Destructive
-                | harness_contract::tool::ToolEffectKind::Unknown
+            ToolEffectKind::Package
+                | ToolEffectKind::System
+                | ToolEffectKind::Destructive
+                | ToolEffectKind::Unknown
+        )
+    {
+        return false;
+    }
+    if !descriptor.spawns_process {
+        return true;
+    }
+
+    // Process creation is delegable only when the concrete registered
+    // effect proves a workspace-bounded sandbox. Arbitrary shell commands
+    // remain DangerFullAccess/User effects and therefore fail this gate;
+    // a model cannot manufacture these descriptor fields.
+    !descriptor.uses_network
+        && descriptor.required_permission != ToolPermissionMode::DangerFullAccess
+        && matches!(
+            descriptor.approval_class,
+            ToolApprovalClass::None | ToolApprovalClass::Policy
+        )
+        && matches!(
+            descriptor.assessment.externality,
+            EffectExternality::Internal | EffectExternality::Workspace
+        )
+        && matches!(
+            descriptor.assessment.blast_radius,
+            EffectBlastRadius::Item | EffectBlastRadius::Workspace
+        )
+        && matches!(
+            descriptor.assessment.reversibility,
+            EffectReversibility::Reversible | EffectReversibility::Compensatable
         )
 }

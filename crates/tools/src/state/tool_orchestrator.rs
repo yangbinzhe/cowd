@@ -180,6 +180,25 @@ fn resolve_effect_properties(
             let properties = command_effect(command);
             properties
         }
+        "builtin.sandboxed_command" => EffectProperties {
+            // The implementation is still a real child process and remains
+            // visible to capacity accounting, but its authority is bounded
+            // to the workspace sandbox rather than arbitrary host command
+            // execution. Code contents cannot opt out of this posture.
+            effect_kind: ToolEffectKind::Process,
+            idempotency: ToolIdempotency::Unknown,
+            scopes: vec![scope(
+                PermissionResource::Shell,
+                PermissionOperation::Execute,
+                target,
+            )],
+            required_permission: ToolPermissionMode::WorkspaceWrite,
+            approval_class: ToolApprovalClass::Policy,
+            uses_network: false,
+            spawns_process: true,
+            mutates_packages: false,
+            mutates_system: false,
+        },
         "builtin.readonly" | "runtime.readonly" => EffectProperties {
             effect_kind: ToolEffectKind::Read,
             idempotency: ToolIdempotency::Idempotent,
@@ -755,6 +774,42 @@ mod tests {
         assert_eq!(
             destructive.required_permission,
             ToolPermissionMode::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn execute_code_is_a_workspace_bounded_sandbox_process() {
+        let resolver = ToolEffectResolverSpec {
+            resolver_id: "builtin.sandboxed_command".to_string(),
+            resolver_version: 1,
+        };
+        let descriptor = resolve_registered_tool_effect(
+            &resolver,
+            "execute_code",
+            &json!({
+                "language": "python",
+                "code": "from pathlib import Path; Path('result.json').write_text('{}')"
+            }),
+            ToolPermissionMode::WorkspaceWrite,
+        );
+
+        assert_eq!(descriptor.effect_kind, ToolEffectKind::Process);
+        assert_eq!(
+            descriptor.required_permission,
+            ToolPermissionMode::WorkspaceWrite
+        );
+        assert_eq!(descriptor.approval_class, ToolApprovalClass::Policy);
+        assert!(descriptor.spawns_process);
+        assert!(!descriptor.uses_network);
+        assert!(!descriptor.mutates_packages);
+        assert!(!descriptor.mutates_system);
+        assert_eq!(
+            descriptor.assessment.externality,
+            EffectExternality::Workspace
+        );
+        assert_eq!(
+            descriptor.assessment.blast_radius,
+            EffectBlastRadius::Workspace
         );
     }
 

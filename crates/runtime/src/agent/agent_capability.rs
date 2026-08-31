@@ -268,6 +268,7 @@ mod tests {
         assert!(resolved.allowed_tools.contains("write_file"));
         assert!(resolved.allowed_tools.contains("edit_file"));
         assert!(resolved.allowed_tools.contains("bash"));
+        assert!(resolved.allowed_tools.contains("execute_code"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
         assert_eq!(
             resolved.permission_policy.required_mode_for("write_file"),
@@ -277,6 +278,26 @@ mod tests {
             resolved.permission_policy.required_mode_for("bash"),
             PermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn sandboxed_execute_code_satisfies_test_without_host_shell_authority() {
+        let resolved = resolve_agent_capability(AgentCapabilityRequest {
+            role_id: "tester".to_string(),
+            allowed_capabilities: vec!["read".to_string(), "test".to_string()],
+            evidence_duties: vec!["test_report".to_string()],
+        });
+        let host_tools = ["read_file", "grep_search", "execute_code"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let binding = bind_agent_capability_to_host(&resolved, &host_tools);
+
+        assert!(binding.missing_capabilities.is_empty());
+        assert!(binding.missing_tool_alternatives.is_empty());
+        assert!(binding.allowed_tools.contains("execute_code"));
+        assert!(!binding.allowed_tools.contains("bash"));
     }
 
     #[test]

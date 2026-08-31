@@ -60,6 +60,10 @@ pub fn execute_code_in_workspace(
     };
     let mut spec = SandboxLaunchSpec::workspace(&workspace);
     spec.working_directory = Some(workspace.clone());
+    // `execute_code` is a data-analysis primitive, not an alternate network
+    // client. Keep its registered no-network effect truthful at execution
+    // time; callers that need network access must use governed network tools.
+    spec.network_enabled = false;
     spec.require_kernel_hardening = true;
     let prepared = match shell_command(&command, &spec) {
         Ok(prepared) => prepared,
@@ -249,6 +253,27 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = execute_code("bash", "test ! -e \"$HOME/.cowd\"");
         assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandboxed_code_cannot_reach_host_network_namespace() {
+        let _guard = crate::test_process_environment_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("host listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let result = execute_code(
+            "python",
+            &format!(
+                "import socket, sys\ns=socket.socket()\ns.settimeout(1)\ntry:\n s.connect(('127.0.0.1', {port}))\nexcept OSError:\n sys.exit(0)\nsys.exit(9)"
+            ),
+        );
+        assert_eq!(
+            result.exit_code, 0,
+            "sandbox unexpectedly reached a host-network listener: {}",
+            result.stderr
+        );
     }
 
     #[test]
