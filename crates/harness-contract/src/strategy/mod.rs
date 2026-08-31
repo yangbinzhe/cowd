@@ -2526,14 +2526,17 @@ pub fn understand(input: &StrategyInput) -> TaskUnderstanding {
     // occurrence of "team" as an affirmative collaboration request turns a
     // user-selected single-agent execution mode into its opposite.
     let forbids_team = explicitly_forbids_collaboration(&normalized);
+    let affirmative_collaboration = affirmative_collaboration_text(&normalized);
     let required_team_count = if forbids_team {
         0
     } else {
-        explicit_team_count(&normalized)
-            .max(u8::from(explicit_team_execution_required(&normalized)))
+        explicit_team_count(&affirmative_collaboration).max(u8::from(
+            explicit_team_execution_required(&affirmative_collaboration),
+        ))
     };
-    let requests_multi_agent =
-        (contains_any(&normalized, MULTI_AGENT_TERMS) || required_team_count > 0) && !forbids_team;
+    let requests_multi_agent = (contains_any(&affirmative_collaboration, MULTI_AGENT_TERMS)
+        || required_team_count > 0)
+        && !forbids_team;
     let requires_managed_collaboration_escalation =
         explicit_managed_collaboration_escalation_required(&normalized) && !forbids_team;
     let collaboration_reference = if contains_any(
@@ -2658,6 +2661,64 @@ fn explicitly_forbids_collaboration(normalized: &str) -> bool {
             "single-agent",
         ],
     )
+}
+
+/// Remove clauses that mention collaboration vocabulary only to forbid the
+/// model from inventing or preselecting a topology. These are not requests to
+/// disable Runtime-owned collaboration: they merely leave topology selection
+/// to the framework. Keeping this clause-local prevents an unrelated `必须`
+/// elsewhere in the prompt from combining with `Team` into a false singular
+/// execution obligation.
+fn affirmative_collaboration_text(normalized: &str) -> String {
+    normalized
+        .split(['。', '；', ';', '！', '!', '？', '?', '\n'])
+        .filter(|clause| !is_non_prescriptive_topology_clause(clause))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_non_prescriptive_topology_clause(clause: &str) -> bool {
+    let mentions_topology = contains_any(
+        clause,
+        &[
+            "team",
+            "agent",
+            "团队",
+            "智能体",
+            "角色",
+            "模板",
+            "编排拓扑",
+            "orchestration topology",
+            "role",
+            "template",
+        ],
+    );
+    mentions_topology
+        && contains_any(
+            clause,
+            &[
+                "不要自行指定",
+                "不得自行指定",
+                "不要指定",
+                "不得指定",
+                "无需指定",
+                "不需要指定",
+                "不要预设",
+                "不得预设",
+                "不要自行设计",
+                "不得自行设计",
+                "不要自行选择",
+                "不得自行选择",
+                "do not specify",
+                "don't specify",
+                "must not specify",
+                "without specifying",
+                "do not predefine",
+                "don't predefine",
+                "do not invent",
+                "don't invent",
+            ],
+        )
 }
 
 /// Returns whether a prompt contains an unambiguous instruction not to invoke
@@ -3332,6 +3393,7 @@ pub fn explicit_team_count(prompt: &str) -> u8 {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    let normalized = affirmative_collaboration_text(&normalized);
     const COUNTS: &[(&str, &str, u8)] = &[
         ("一", "one", 1),
         ("二", "two", 2),
@@ -3485,7 +3547,7 @@ pub fn explicit_team_fan_in_required(prompt: &str) -> bool {
 /// `TaskUnderstanding`; downstream Runtime code uses `required_team_count`.
 #[must_use]
 pub fn explicit_team_execution_required(prompt: &str) -> bool {
-    let normalized = prompt.to_ascii_lowercase();
+    let normalized = affirmative_collaboration_text(&prompt.to_ascii_lowercase());
     let mentions_team = [
         "团队",
         "协作",

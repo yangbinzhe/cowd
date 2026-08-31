@@ -1234,13 +1234,17 @@ fn explicit_workspace_paths(
         })
         .map(|token| token.trim_matches(['`', '\'', '"']))
         .filter(|token| !is_definition_like_token(workspace_root, token))
-        .filter(|token| is_probable_workspace_path_token(workspace_root, token))
         .filter(|token| {
             token.starts_with('/')
                 || token.starts_with("./")
                 || (token.contains('/') && !token.contains("://") && !token.starts_with("http"))
         })
         .filter_map(|token| {
+            let pattern_prefix = workspace_pattern_existing_prefix(token, allow_missing)?;
+            let token = pattern_prefix.as_deref().unwrap_or(token);
+            if !is_probable_workspace_path_token(workspace_root, token) {
+                return None;
+            }
             let workspace_candidate = if token.starts_with('/') {
                 std::path::PathBuf::from(token)
             } else {
@@ -1276,6 +1280,45 @@ fn explicit_workspace_paths(
     paths.sort();
     paths.dedup();
     paths
+}
+
+/// A read-only source family such as `crates/**/*.rs` authorizes its longest
+/// explicit existing ancestor, not an arbitrary directory chosen from
+/// workspace ordering. Pattern paths never authorize a write or a missing
+/// ancestor, and parent traversal remains rejected by canonical containment.
+fn workspace_pattern_existing_prefix(token: &str, allow_missing: bool) -> Option<Option<String>> {
+    let pattern_segment = |segment: &str| {
+        segment == "..."
+            || segment.contains('*')
+            || segment.contains('?')
+            || segment.contains('[')
+            || segment.contains(']')
+    };
+    let segments = token.split('/').collect::<Vec<_>>();
+    if segments.iter().any(|segment| *segment == "..") {
+        return None;
+    }
+    let Some(pattern_index) = segments.iter().position(|segment| pattern_segment(segment)) else {
+        return Some(None);
+    };
+    if allow_missing {
+        return None;
+    }
+    let prefix_segments = &segments[..pattern_index];
+    if prefix_segments
+        .iter()
+        .all(|segment| segment.is_empty() || *segment == ".")
+    {
+        return None;
+    }
+    let mut prefix = prefix_segments.join("/");
+    if token.starts_with('/') && !prefix.starts_with('/') {
+        prefix.insert(0, '/');
+    }
+    while prefix.ends_with('/') && prefix.len() > 1 {
+        prefix.pop();
+    }
+    Some(Some(prefix))
 }
 
 /// Tokens are only treated as workspace paths when they are:
@@ -1888,6 +1931,39 @@ mod tests {
         let objective = "启动两个并行团队检查 crates/runtime 与 crates/provider，不要修改文件";
         let scopes = bounded_workspace_focus_scopes(workspace.path(), objective, 2, false, true);
         assert_eq!(scopes, vec!["read:crates/provider", "read:crates/runtime"]);
+    }
+
+    #[test]
+    fn read_only_source_patterns_bind_their_existing_workspace_ancestor() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
+            .expect("workspace source tree");
+
+        for pattern in ["crates/**/*.rs", "crates/.../*.rs"] {
+            let objective = format!("只读核查 {pattern} 中的源码证据，不修改文件");
+            assert_eq!(
+                explicit_workspace_resource_scopes(workspace.path(), &objective, false),
+                vec!["read:crates"]
+            );
+        }
+    }
+
+    #[test]
+    fn source_patterns_never_widen_write_or_escape_the_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
+            .expect("workspace source tree");
+
+        assert!(
+            explicit_workspace_resource_scopes(workspace.path(), "修改 crates/**/*.rs", true,)
+                .is_empty()
+        );
+        assert!(explicit_workspace_resource_scopes(
+            workspace.path(),
+            "只读检查 ../secrets/**/*.rs",
+            false,
+        )
+        .is_empty());
     }
 
     #[test]

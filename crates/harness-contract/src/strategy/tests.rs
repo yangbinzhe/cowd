@@ -1539,6 +1539,28 @@ fn automatic_team_width_uses_generic_responsibility_units_not_product_names() {
 }
 
 #[test]
+fn topology_non_prescription_does_not_become_a_singular_team_obligation() {
+    let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 crates/.../*.rs 源码路径；不要自行指定 Team、Agent、角色、模板或编排拓扑。";
+    let decision = decide_strategy(&StrategyInput::from_prompt(prompt));
+
+    assert_eq!(decision.understanding.required_team_count, 0);
+    assert_eq!(decision.understanding.independent_workstreams, 3);
+    assert!(!decision.understanding.requests_multi_agent);
+    assert_eq!(decision.selected_candidate, ExecutionCandidateKind::Team);
+    assert_eq!(explicit_team_count(prompt), 0);
+    assert!(!explicit_team_execution_required(prompt));
+}
+
+#[test]
+fn positive_team_cardinality_survives_a_separate_topology_non_prescription() {
+    let prompt = "必须启动三个 Team 分别审查三个责任域；不要自行添加额外角色或模板。";
+    let understanding = understand(&StrategyInput::from_prompt(prompt));
+
+    assert_eq!(understanding.required_team_count, 3);
+    assert!(understanding.requests_multi_agent);
+}
+
+#[test]
 fn collaboration_obligation_rejects_zero_or_forbidden_team() {
     let automatic = understand(&StrategyInput::from_prompt(
         "全面审查 runtime、gateway、frontend 三个独立责任域，分别取得工具证据后汇总",

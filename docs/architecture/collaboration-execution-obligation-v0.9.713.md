@@ -56,14 +56,34 @@ terminate honestly when exhausted.
 ## Cardinality semantics
 
 Explicit requests preserve exact cardinality. Automatic selection freezes a
-nonzero minimum within the observed Team-slot ceiling; it may accept a larger
-semantic proposal, but never a collapsed one. `team_slots` is a resource
-ceiling, not a second semantic source.
+nonzero semantic minimum independently of the observed Team-slot ceiling; it
+may accept a larger semantic proposal, but never a collapsed one. `team_slots`
+controls concurrent admission and serialized waves only. It is not a second
+semantic source and cannot erase required Teams.
 
 Generic independently accountable units such as responsibility domains,
 modules, dimensions, tracks and evidence sources now contribute to normalized
 workstream width. Product-specific names remain compatibility signals, not the
 only path to automatic collaboration.
+
+Collaboration vocabulary is interpreted per clause. A clause such as “do not
+predefine Team/Agent topology” leaves selection to Runtime and is removed from
+affirmative Team/cardinality detection; an unrelated “must list evidence” in a
+different clause cannot turn that mention into an exact one-Team contract.
+True collaboration prohibitions and affirmative exact-Team instructions retain
+their prior meaning.
+
+## Scope-type isolation
+
+Evaluation metering labels (`provider`, `provider_account` and
+`provider_token_pool`) remain accounting dimensions and are filtered before
+semantic focus planning. Only typed authority/evidence scopes may become focus
+leases. Read-only path families such as `crates/**/*.rs` and
+`crates/.../*.rs` normalize to their longest existing, canonical workspace
+ancestor (`read:crates`). Pattern paths cannot grant writes, name missing
+ancestors or escape through parent traversal. This prevents directory order
+from selecting unrelated evidence while preserving fail-closed workspace
+authority.
 
 ## Recovery and failure behavior
 
@@ -82,10 +102,12 @@ scope. Focused paid scenarios may pass as component evidence but never set
 scenario set and a passing baseline-versus-Team comparison; skipped comparison
 is a certification failure.
 
-`live_implicit_collaboration_obligation` contains no Team, Agent, role, template
-or topology instruction. It requests three generic responsibility domains with
-real tool evidence and accepts only a projection with at least three completed
-Teams. This is the primary production-path regression for the original defect.
+`live_implicit_collaboration_obligation` contains no affirmative Team, Agent,
+role, template or topology instruction. Its non-prescription clause cannot
+become an execution request. It requests three generic responsibility domains
+with real tool evidence and accepts only a projection with at least three
+completed Teams. This is the primary production-path regression for the
+original defect.
 
 ## Projection contract
 

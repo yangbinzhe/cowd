@@ -704,15 +704,16 @@ where
         if strategy.selected_candidate == harness_contract::strategy::ExecutionCandidateKind::Team {
             let automatic_minimum_team_count = u8::try_from(selected_strategy_focus_count(&strategy))
                 .unwrap_or(u8::MAX);
+            let evaluation_focus_scopes = evaluation_control
+                .as_ref()
+                .map(evaluation_semantic_focus_scopes)
+                .unwrap_or_default();
             let plans =
                 selected_strategy_focus_plans(
                     &strategy,
                     &resolved_objective,
                     services.workspace_root(),
-                    evaluation_control
-                        .as_ref()
-                        .map(|control| control.resource_scopes.as_slice())
-                        .unwrap_or_default(),
+                    &evaluation_focus_scopes,
                 );
             strategy = runtime
                 .lock()
@@ -1410,6 +1411,27 @@ struct EvaluationTurnControl {
     budget_lease_id: String,
     max_total_tokens: u64,
     prompt: String,
+}
+
+fn evaluation_semantic_focus_scopes(control: &EvaluationTurnControl) -> Vec<String> {
+    control
+        .resource_scopes
+        .iter()
+        .filter(|scope| {
+            [
+                "read:",
+                "write:",
+                "workspace:",
+                "network:",
+                "session:",
+                "worktree:",
+                "system:",
+            ]
+            .iter()
+            .any(|prefix| scope.starts_with(prefix))
+        })
+        .cloned()
+        .collect()
 }
 
 fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl>, RuntimeError> {
@@ -2556,20 +2578,17 @@ fn parent_merge_actuals(
 fn selected_strategy_focus_count(
     strategy: &crate::execution_core::TurnStrategyDecisionState,
 ) -> usize {
-    let understanding = &strategy.decision.strategy.understanding;
-    let semantic_width = understanding
-        .required_team_count
-        .max(understanding.independent_workstreams)
-        .max(1);
-    // `team_slots` is a live resource ceiling, not a semantic minimum or a
-    // role-count heuristic. The frozen TaskUnderstanding controls how many
-    // independent focus plans we request; ResourceManager admits them later.
+    semantic_team_focus_count(&strategy.decision.strategy.understanding)
+}
+
+fn semantic_team_focus_count(
+    understanding: &harness_contract::strategy::TaskUnderstanding,
+) -> usize {
     usize::from(
-        strategy
-            .resource_snapshot
-            .team_slots
-            .max(1)
-            .min(u16::from(semantic_width)),
+        understanding
+            .required_team_count
+            .max(understanding.independent_workstreams)
+            .max(1),
     )
 }
 

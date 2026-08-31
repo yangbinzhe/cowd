@@ -13,10 +13,11 @@ is recorded in the external execution ledger tied to the candidate SHA.
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo check --workspace --all-targets`: passed.
-- harness-contract strategy tests: 61 passed, including generic responsibility
+- harness-contract strategy tests: 63 passed, including generic responsibility
   units, explicit exact cardinality, automatic minimum cardinality and invalid
-  obligation rejection.
-- Runtime library: 1933 passed, 0 failed, 2 ignored in the full package run.
+  obligation rejection, plus mixed-clause topology polarity.
+- Runtime library: 1938 passed, 0 failed, 2 ignored in the amended full package
+  run.
 - Harness Eval library: 140 passed, 0 failed.
 - Automatic proposal collapse, durable event/recovery/downgrade, provider
   exposure, root control-plane admission and terminal cardinality tests passed.
@@ -32,6 +33,10 @@ is recorded in the external execution ledger tied to the candidate SHA.
   payload, secondary-section and acceptance gates passed.
 - Edge production build passed.
 - `git diff --check`, Bash syntax and enforcement-pattern scans passed.
+- The four-cause integration regression proves the exact implicit three-domain
+  prompt freezes an automatic three-Team minimum, discards provider metering
+  labels as focus scopes, and binds all read-only source-family focus slots to
+  canonical `read:crates` authority even when live Team capacity is one.
 
 ## Static-analysis baseline disclosure
 

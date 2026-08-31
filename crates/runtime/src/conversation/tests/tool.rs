@@ -47,6 +47,113 @@
     }
 
     #[test]
+    fn semantic_team_width_is_not_reduced_by_live_capacity() {
+        let understanding = harness_contract::strategy::understand(
+            &harness_contract::strategy::StrategyInput::from_prompt(
+                "审查三个独立责任域，分别取得工具证据后综合",
+            ),
+        );
+        assert_eq!(understanding.independent_workstreams, 3);
+        assert_eq!(semantic_team_focus_count(&understanding), 3);
+
+        // Scheduling capacity is deliberately absent from this function's
+        // inputs: a one-slot runtime may serialize three Teams but may not
+        // erase two semantic obligations.
+        let one_slot_snapshot = harness_contract::strategy::StrategyResourceSnapshot {
+            team_slots: 1,
+            ..Default::default()
+        };
+        assert_eq!(one_slot_snapshot.team_slots, 1);
+        assert_eq!(semantic_team_focus_count(&understanding), 3);
+    }
+
+    #[test]
+    fn evaluation_metering_labels_are_not_semantic_focus_scopes() {
+        let control = EvaluationTurnControl {
+            corpus_id: "live-scenarios-v1".to_string(),
+            workspace_fixture: "none".to_string(),
+            provider_constraint: "normal".to_string(),
+            temperature_milli: 0,
+            resource_scopes: vec![
+                "provider".to_string(),
+                "provider_account".to_string(),
+                "provider_token_pool".to_string(),
+                "read:crates".to_string(),
+                "network:*".to_string(),
+            ],
+            budget_lease_id: "lease".to_string(),
+            max_total_tokens: 1,
+            prompt: "inspect crates".to_string(),
+        };
+
+        assert_eq!(
+            evaluation_semantic_focus_scopes(&control),
+            vec!["read:crates".to_string(), "network:*".to_string()]
+        );
+    }
+
+    #[test]
+    fn implicit_three_domain_prompt_freezes_three_bounded_team_obligations() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
+            .expect("workspace source tree");
+        let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 crates/.../*.rs 源码路径；不要自行指定 Team、Agent、角色、模板或编排拓扑。";
+        let understanding = harness_contract::strategy::understand(
+            &harness_contract::strategy::StrategyInput::from_prompt(prompt),
+        );
+        let control = EvaluationTurnControl {
+            corpus_id: "live-scenarios-v1".to_string(),
+            workspace_fixture: "none".to_string(),
+            provider_constraint: "normal".to_string(),
+            temperature_milli: 0,
+            resource_scopes: vec![
+                "provider".to_string(),
+                "provider_account".to_string(),
+                "provider_token_pool".to_string(),
+            ],
+            budget_lease_id: "lease".to_string(),
+            max_total_tokens: 1,
+            prompt: prompt.to_string(),
+        };
+        let forced_scopes = evaluation_semantic_focus_scopes(&control);
+        let plans = crate::orchestration::team_authority::derive_team_focus_partition_plans(
+            prompt,
+            workspace.path(),
+            &forced_scopes,
+            semantic_team_focus_count(&understanding),
+            false,
+            understanding.requests_multi_agent,
+            false,
+        );
+        let obligation = harness_contract::strategy::CollaborationExecutionObligation::for_selected_team(
+            &understanding,
+            u8::try_from(semantic_team_focus_count(&understanding)).expect("bounded width"),
+            plans
+                .iter()
+                .flat_map(|plan| plan.slots.iter().map(|slot| slot.focus_id.clone())),
+        )
+        .expect("automatic collaboration obligation");
+        let researcher = plans
+            .iter()
+            .find(|plan| plan.role_id == "researcher")
+            .expect("researcher focus plan");
+
+        assert_eq!(understanding.required_team_count, 0);
+        assert!(forced_scopes.is_empty());
+        assert_eq!(researcher.slots.len(), 3);
+        assert!(researcher
+            .slots
+            .iter()
+            .all(|slot| slot.capability_cropped_refs == vec!["read:crates"]));
+        assert_eq!(obligation.minimum_team_count, 3);
+        assert_eq!(obligation.exact_team_count, None);
+        assert_eq!(
+            obligation.source,
+            harness_contract::strategy::CollaborationObligationSource::AutomaticStrategy
+        );
+    }
+
+    #[test]
     fn terminal_commit_state_is_owned_by_the_exact_synthesize_attempt() {
         let owner = ("graph:synthesize".to_string(), 2);
 
