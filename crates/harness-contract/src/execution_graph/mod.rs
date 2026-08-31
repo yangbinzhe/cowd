@@ -359,6 +359,22 @@ mod tests {
         model.work = Some(work);
         model.payload_ref = "private-model-prompt-and-binding".to_string();
         graph.nodes.push(model);
+        graph.work_states.insert(
+            "model".to_string(),
+            ExecutionWorkRuntimeState {
+                status: ExecutionWorkRuntimeStatus::Claimed,
+                claim: Some(ExecutionWorkClaim {
+                    claimant_instance_id: "agent-a".to_string(),
+                    claimant_role_id: None,
+                    claim_token: "private-claim-authority".to_string(),
+                    claimed_at_ms: 1,
+                    heartbeat_at_ms: 1,
+                    lease_expires_at_ms: 2,
+                    graph_revision: 1,
+                }),
+                ..ExecutionWorkRuntimeState::default()
+            },
+        );
 
         let encoded = serde_json::to_string(&project_execution_graph(&graph)).expect("projection");
         assert!(!encoded.contains("private-context-lease"));
@@ -366,6 +382,8 @@ mod tests {
         assert!(!encoded.contains("private-reasoning-policy"));
         assert!(!encoded.contains("private-evidence-selector"));
         assert!(!encoded.contains("private-model-prompt-and-binding"));
+        assert!(!encoded.contains("private-claim-authority"));
+        assert!(encoded.contains("<redacted>"));
         assert!(encoded.contains("execution-payload:model"));
     }
 }

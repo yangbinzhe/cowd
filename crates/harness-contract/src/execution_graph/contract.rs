@@ -158,8 +158,49 @@ pub struct ExecutionWorkRuntimeState {
     pub submission_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub review_findings: Vec<String>,
+    /// Immutable review receipts for every submitted revision. Acceptance is
+    /// derived from distinct eligible reviewers of the current submission,
+    /// rather than from a presentation-only status flip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviews: Vec<ExecutionWorkReview>,
+    /// Runtime-attested bids for dynamically proposed work. The bidder
+    /// identity and clock are injected by the managed Agent binding; model
+    /// payloads can supply only bounded rationale and estimates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bids: Vec<ExecutionWorkBid>,
     #[serde(default)]
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionWorkBid {
+    pub bidder_instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bidder_role_id: Option<String>,
+    pub rationale: String,
+    pub estimated_cost: u64,
+    pub bid_at_ms: u64,
+    pub graph_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionWorkReviewVerdict {
+    Accept,
+    Challenge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionWorkReview {
+    pub reviewer_instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_role_id: Option<String>,
+    pub verdict: ExecutionWorkReviewVerdict,
+    pub submission_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding: Option<String>,
+    pub reviewed_at_ms: u64,
+    pub graph_revision: u64,
 }
 
 /// A typed dependency predicate. It consumes only Runtime-attested terminal
@@ -230,6 +271,15 @@ pub struct ExecutionWorkContract {
     /// identity and is used when this optional semantic id is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration_work_id: Option<String>,
+    /// Bounded public objective for Agent-proposed work. Static compiler-owned
+    /// nodes keep this empty because their complete task stays in payload_ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    /// Immutable proposer identity injected from the managed Agent binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposal_evidence_refs: Vec<String>,
     pub role: ExecutionWorkRole,
     #[serde(default = "default_required_work")]
     pub required: bool,
@@ -274,6 +324,9 @@ impl ExecutionWorkContract {
     pub fn new(role: ExecutionWorkRole) -> Self {
         Self {
             collaboration_work_id: None,
+            objective: None,
+            proposed_by: None,
+            proposal_evidence_refs: Vec::new(),
             role,
             required: true,
             dependency: ExecutionDependencyPolicy::All,
@@ -1725,6 +1778,11 @@ pub struct ExecutionGraph {
     /// in legacy graphs decode as implicit `offered` for nodes with work.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub work_states: BTreeMap<String, ExecutionWorkRuntimeState>,
+    /// Agent-proposed work remains inside the canonical ExecutionGraph owner
+    /// without pretending to be an executable physical node. Active managed
+    /// Agents execute these bounded items through the collaboration port.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub autonomous_work: BTreeMap<String, ExecutionWorkContract>,
     pub recovery_cursor: ExecutionRecoveryCursor,
     /// Durable fact packet produced by the Runtime finally reducer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1751,6 +1809,7 @@ impl ExecutionGraph {
             node_statuses: BTreeMap::new(),
             node_results: BTreeMap::new(),
             work_states: BTreeMap::new(),
+            autonomous_work: BTreeMap::new(),
             recovery_cursor: ExecutionRecoveryCursor::default(),
             delivery_envelope: None,
             terminal_presentation: None,
@@ -1793,6 +1852,22 @@ pub enum ExecutionGraphCommand {
         expected_revision: u64,
         node_id: String,
     },
+    ProposeWork {
+        expected_revision: u64,
+        work_id: String,
+        contract: Box<ExecutionWorkContract>,
+    },
+    BidWork {
+        expected_revision: u64,
+        work_id: String,
+        bidder_instance_id: String,
+        bidder_role_id: Option<String>,
+        #[serde(default)]
+        bidder_capabilities: Vec<String>,
+        rationale: String,
+        estimated_cost: u64,
+        bid_at_ms: u64,
+    },
     ClaimWork {
         expected_revision: u64,
         node_id: String,
@@ -1827,12 +1902,18 @@ pub enum ExecutionGraphCommand {
         expected_revision: u64,
         node_id: String,
         reviewer_instance_id: String,
+        reviewer_role_id: Option<String>,
+        #[serde(default)]
+        reviewed_at_ms: u64,
     },
     ChallengeWork {
         expected_revision: u64,
         node_id: String,
         reviewer_instance_id: String,
+        reviewer_role_id: Option<String>,
         finding: String,
+        #[serde(default)]
+        reviewed_at_ms: u64,
     },
     SubmitApproval {
         expected_revision: u64,

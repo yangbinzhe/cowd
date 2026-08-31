@@ -443,20 +443,40 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         RuntimeToolDefinition {
             name: "collaboration_control".to_string(),
             description: Some(
-                "Inspect the Team work marketplace or claim, heartbeat, release, submit, accept, and challenge a bounded work item. Runtime derives Agent identity, role, capabilities, Team graph and clock from the immutable binding; callers can provide only semantic action and revision/token fences. Use inspect before a mutation and use the returned current revision and claim token."
+                "Inspect the Team work marketplace; propose bounded new work; bid on another Agent's proposal; or claim, heartbeat, release, submit, accept, and challenge work. Runtime derives Agent identity, role, capabilities, Team graph and clock from the immutable binding. Use inspect before mutations, propose_work with a stable idempotency key, and bid before claiming Agent-proposed work. submission_ref must be this Agent's durable tool evidence ref or `team-board:<entry_id>` from its own published board result."
                     .to_string(),
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "operation": { "type": "string", "enum": ["inspect", "claim", "heartbeat", "release", "submit", "accept", "challenge"] },
+                    "operation": { "type": "string", "enum": ["inspect", "propose_work", "bid", "claim", "heartbeat", "release", "submit", "accept", "challenge"] },
                     "expected_revision": { "type": "integer", "minimum": 0 },
                     "expected_work_revision": { "type": "integer", "minimum": 0, "description": "Per-work CAS fence returned by inspect; required for mutations and allows unrelated work items to commit concurrently." },
                     "work_node_id": { "type": "string", "minLength": 1 },
                     "claim_token": { "type": "string", "minLength": 1 },
                     "lease_duration_ms": { "type": "integer", "minimum": 5000, "maximum": 300000 },
                     "submission_ref": { "type": "string", "minLength": 1 },
-                    "finding": { "type": "string", "minLength": 1, "maxLength": 4000 }
+                    "finding": { "type": "string", "minLength": 1, "maxLength": 4000 },
+                    "rationale": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                    "estimated_cost": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+                    "proposal": {
+                        "type": "object",
+                        "properties": {
+                            "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 160 },
+                            "objective": { "type": "string", "minLength": 1, "maxLength": 2000 },
+                            "role": { "type": "string", "enum": ["plan", "tool", "evidence_analyze", "cross_check", "synthesize", "verify"] },
+                            "required_capabilities": { "type": "array", "maxItems": 16, "description": "Exact native tool ids required from a bidder's immutable Agent binding; omit when no extra tool capability is needed.", "items": { "type": "string", "minLength": 1 } },
+                            "input_artifact_refs": { "type": "array", "maxItems": 32, "items": { "type": "string", "minLength": 1 } },
+                            "output_artifact_kinds": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "minLength": 1 } },
+                            "evidence_refs": { "type": "array", "maxItems": 32, "items": { "type": "string", "minLength": 1 } },
+                            "expected_input_tokens": { "type": "integer", "minimum": 0, "maximum": 500000 },
+                            "expected_output_tokens": { "type": "integer", "minimum": 0, "maximum": 500000 },
+                            "expected_duration_ms": { "type": "integer", "minimum": 0, "maximum": 3600000 },
+                            "scheduling_priority": { "type": "integer", "minimum": 0, "maximum": 255 }
+                        },
+                        "required": ["idempotency_key", "objective", "role", "output_artifact_kinds"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["operation"],
                 "additionalProperties": false

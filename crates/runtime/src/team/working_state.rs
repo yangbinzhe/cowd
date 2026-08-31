@@ -67,12 +67,37 @@ pub struct TeamWorkingStateAcknowledgeRequest {
 #[serde(rename_all = "snake_case")]
 pub enum CollaborationControlOperation {
     Inspect,
+    ProposeWork,
+    Bid,
     Claim,
     Heartbeat,
     Release,
     Submit,
     Accept,
     Challenge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaborationWorkProposal {
+    pub idempotency_key: String,
+    pub objective: String,
+    pub role: harness_contract::execution_graph::ExecutionWorkRole,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub input_artifact_refs: Vec<String>,
+    pub output_artifact_kinds: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub expected_input_tokens: u64,
+    #[serde(default)]
+    pub expected_output_tokens: u64,
+    #[serde(default)]
+    pub expected_duration_ms: u64,
+    #[serde(default)]
+    pub scheduling_priority: u8,
 }
 
 /// Semantic Agent request. Graph/team/claimant/reviewer authority is never
@@ -98,6 +123,12 @@ pub struct CollaborationControlRequest {
     pub submission_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<CollaborationWorkProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_cost: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

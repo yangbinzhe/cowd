@@ -8,6 +8,7 @@ use reqwest::{
     blocking::Client,
     header::{HeaderMap, HeaderValue, AUTHORIZATION},
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
@@ -20,6 +21,8 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 const GROUP_THEORY_SCENARIO_ID: &str = "live_group_theory_ai_research_simulation";
 const LARGE_SCALE_SCENARIO_ID: &str = "live_qwen38_large_scale_collaboration";
+const AUTONOMOUS_DEEPSEEK_SCENARIO_ID: &str = "live_autonomous_collaboration_deepseek";
+const AUTONOMOUS_DEEPSEEK_OUTPUT_PATH: &str = "group-theory-ai-autonomous-evaluation.html";
 const IMPLICIT_COLLABORATION_SCENARIO_ID: &str = "live_implicit_collaboration_obligation";
 const RELEASE_CERTIFICATION_SCENARIOS: [&str; 6] = [
     "live_direct_terminal",
@@ -102,6 +105,69 @@ fn large_scale_collaboration_scenario_enabled() -> bool {
         LARGE_SCALE_SCENARIO_ID,
         env_flag_enabled("COWD_EVAL_LARGE_SCALE_COLLABORATION"),
     )
+}
+
+fn autonomous_deepseek_scenario_enabled() -> bool {
+    let selected = selected_live_scenario_ids();
+    scenario_enabled(
+        selected.as_ref(),
+        AUTONOMOUS_DEEPSEEK_SCENARIO_ID,
+        env_flag_enabled("COWD_EVAL_AUTONOMOUS_COLLABORATION"),
+    )
+}
+
+#[derive(Deserialize)]
+struct AutonomousDeepseekTemplate {
+    schema_version: u32,
+    scenario_id: String,
+    output_path: String,
+    prompt_16: String,
+    prompt_24: String,
+}
+
+fn autonomous_deepseek_spec() -> Result<LiveScenarioSpec, String> {
+    let template: AutonomousDeepseekTemplate = serde_json::from_str(include_str!(
+        "../templates/autonomous-collaboration-deepseek-v1.json"
+    ))
+    .map_err(|error| format!("invalid autonomous DeepSeek template: {error}"))?;
+    if template.schema_version != 1
+        || template.scenario_id != AUTONOMOUS_DEEPSEEK_SCENARIO_ID
+        || template.output_path != AUTONOMOUS_DEEPSEEK_OUTPUT_PATH
+    {
+        return Err("autonomous DeepSeek template identity is invalid".to_string());
+    }
+    let scale = std::env::var("COWD_EVAL_AUTONOMOUS_AGENT_SCALE")
+        .unwrap_or_else(|_| "16".to_string())
+        .parse::<usize>()
+        .map_err(|_| "COWD_EVAL_AUTONOMOUS_AGENT_SCALE must be 16 or 24".to_string())?;
+    let (prompt, minimum_work_items, minimum_proposals, minimum_claims, minimum_challenges) =
+        match scale {
+            16 => (template.prompt_16, 24, 8, 12, 3),
+            24 => (template.prompt_24, 32, 12, 18, 4),
+            _ => return Err("COWD_EVAL_AUTONOMOUS_AGENT_SCALE must be 16 or 24".to_string()),
+        };
+    Ok(LiveScenarioSpec {
+        id: AUTONOMOUS_DEEPSEEK_SCENARIO_ID,
+        // The template is compiled into the evaluator binary and one spec is
+        // built per process, so promoting the selected owned string to a
+        // process-lifetime prompt keeps the long established static spec
+        // contract without introducing production state or an extra clone.
+        prompt: Box::leak(prompt.into_boxed_str()),
+        acceptance: LiveAcceptance::AutonomousCollaboration {
+            minimum_teams: 4,
+            minimum_agents: scale,
+            minimum_work_items,
+            minimum_proposals,
+            minimum_bids: minimum_claims,
+            minimum_claims,
+            minimum_reviews: minimum_proposals,
+            minimum_challenges,
+            minimum_cross_team_edges: if scale == 24 { 6 } else { 5 },
+            minimum_discussions: if scale == 24 { 12 } else { 8 },
+            output_path: AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,
+        },
+        timeout: LiveScenarioTimeout::large_scale(),
+    })
 }
 
 const LARGE_SCALE_SOURCE_PATHS: [&str; 12] = [
@@ -787,6 +853,26 @@ impl LiveScenarioRunner {
                 },
                 timeout: LiveScenarioTimeout::large_scale(),
             });
+        }
+        if autonomous_deepseek_scenario_enabled() {
+            match autonomous_deepseek_spec() {
+                Ok(spec) => scenario_specs.push(spec),
+                Err(error) => {
+                    return json!({
+                        "kind": "harness_eval.live_gateway_scenarios",
+                        "status": "failed",
+                        "claim_scope": claim_scope.as_str(),
+                        "claim_status": "component_failed",
+                        "release_certified": false,
+                        "health_status": if health_passed { "passed" } else { "failed" },
+                        "health_observations": health_observations,
+                        "scenario_count": 0,
+                        "passed": 0,
+                        "failed": 1,
+                        "configuration_error": error,
+                    });
+                }
+            }
         }
         let selected_scenario_ids = selected_live_scenario_ids();
         let registered_scenario_ids = scenario_specs
@@ -1723,6 +1809,7 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
     let elapsed_ms = elapsed.as_millis() as u64;
     let output_tokens_per_second =
         (elapsed_ms > 0).then(|| output_tokens.saturating_mul(1_000) as f64 / elapsed_ms as f64);
+    let autonomy = autonomy_metrics(projections, AUTONOMOUS_DEEPSEEK_OUTPUT_PATH);
     json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -1734,6 +1821,23 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
         "tool_calls": tool_calls,
         "agent_count": agents.len().max(projected_health.agent_count),
         "team_count": teams.len().max(projected_health.team_count),
+        "work_item_count": autonomy.work_items,
+        "proposed_work_item_count": autonomy.proposed_work_items,
+        "distinct_proposer_count": autonomy.distinct_proposers,
+        "work_bid_count": autonomy.bid_count,
+        "distinct_bidder_count": autonomy.distinct_bidders,
+        "accepted_work_item_count": autonomy.accepted_work_items,
+        "claimed_work_item_count": autonomy.claimed_work_items,
+        "autonomous_claimed_work_item_count": autonomy.autonomous_claimed_work_items,
+        "distinct_claimant_count": autonomy.distinct_claimants,
+        "work_review_count": autonomy.review_count,
+        "distinct_reviewer_count": autonomy.distinct_reviewers,
+        "challenge_finding_count": autonomy.challenge_findings,
+        "challenged_work_item_count": autonomy.challenged_work_items,
+        "unresolved_challenged_work_item_count": autonomy.unresolved_challenged_work_items,
+        "discussion_count": autonomy.discussions,
+        "output_artifact_kind_count": autonomy.output_artifact_kinds,
+        "output_materialization_count": autonomy.output_materializations,
         "wall_ms": elapsed_ms,
         "first_token_latency_ms": first_token_latency_ms,
         "wall_tokens_per_second": wall_tokens_per_second.or(output_tokens_per_second),
@@ -1997,6 +2101,19 @@ enum LiveAcceptance {
         minimum_teams: usize,
         minimum_escalations: usize,
     },
+    AutonomousCollaboration {
+        minimum_teams: usize,
+        minimum_agents: usize,
+        minimum_work_items: usize,
+        minimum_proposals: usize,
+        minimum_bids: usize,
+        minimum_claims: usize,
+        minimum_reviews: usize,
+        minimum_challenges: usize,
+        minimum_cross_team_edges: usize,
+        minimum_discussions: usize,
+        output_path: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2019,6 +2136,9 @@ impl LiveAcceptance {
                 minimum_teams: 1..,
                 ..
             } | Self::EscalatedTeam {
+                minimum_teams: 1..,
+                ..
+            } | Self::AutonomousCollaboration {
                 minimum_teams: 1..,
                 ..
             }
@@ -2184,6 +2304,74 @@ impl LiveAcceptance {
                         json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                         json!({"name": "completed_escalated_teams", "required": minimum_teams, "passed": teams_satisfied, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
                         json!({"name": "runtime_attested_agent_escalation", "required": minimum_escalations, "observed": escalation_count, "passed": escalations_satisfied}),
+                    ],
+                }
+            }
+            Self::AutonomousCollaboration {
+                minimum_teams,
+                minimum_agents,
+                minimum_work_items,
+                minimum_proposals,
+                minimum_bids,
+                minimum_claims,
+                minimum_reviews,
+                minimum_challenges,
+                minimum_cross_team_edges,
+                minimum_discussions,
+                output_path,
+            } => {
+                let team_health = projected_team_health(projections);
+                let autonomy = autonomy_metrics(projections, output_path);
+                let cross_team_edges = claimed_cross_team_edge_count(projections);
+                let teams_satisfied = team_health.team_count == minimum_teams
+                    && team_health.completed_teams == minimum_teams
+                    && team_health.failed_teams == 0;
+                let agents_satisfied = team_health.agent_count == minimum_agents
+                    && team_health.completed_agents == minimum_agents
+                    && team_health.failed_agents == 0;
+                let market_satisfied = autonomy.work_items >= minimum_work_items
+                    && autonomy.proposed_work_items >= minimum_proposals
+                    && autonomy.distinct_proposers >= minimum_proposals
+                    && autonomy.bid_count >= minimum_bids
+                    && autonomy.distinct_bidders >= minimum_agents / 2
+                    && autonomy.autonomous_claimed_work_items >= minimum_proposals;
+                let work_satisfied = market_satisfied
+                    && autonomy.accepted_work_items >= minimum_work_items
+                    && autonomy.claimed_work_items >= minimum_claims
+                    && autonomy.distinct_claimants >= minimum_agents / 2;
+                let review_satisfied = autonomy.challenge_findings >= minimum_challenges
+                    && autonomy.challenged_work_items >= minimum_challenges
+                    && autonomy.review_count >= minimum_reviews
+                    && autonomy.distinct_reviewers >= minimum_agents / 4
+                    && autonomy.unresolved_challenged_work_items == 0;
+                let discussions_satisfied = autonomy.discussions >= minimum_discussions;
+                let artifacts_satisfied = autonomy.output_artifact_kinds >= 4;
+                let edges_satisfied = cross_team_edges >= minimum_cross_team_edges;
+                let presentation_satisfied = response.contains(output_path);
+                let materialization_satisfied = autonomy.output_materializations == 1;
+                LiveAcceptanceResult {
+                    passed: !response.trim().is_empty()
+                        && teams_satisfied
+                        && agents_satisfied
+                        && work_satisfied
+                        && review_satisfied
+                        && discussions_satisfied
+                        && artifacts_satisfied
+                        && edges_satisfied
+                        && presentation_satisfied
+                        && materialization_satisfied,
+                    quality: None,
+                    checks: vec![
+                        json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
+                        json!({"name": "completed_autonomous_teams", "required": minimum_teams, "observed": team_health.team_count, "completed": team_health.completed_teams, "failed": team_health.failed_teams, "passed": teams_satisfied}),
+                        json!({"name": "completed_autonomous_agents", "required": minimum_agents, "observed": team_health.agent_count, "completed": team_health.completed_agents, "failed": team_health.failed_agents, "passed": agents_satisfied}),
+                        json!({"name": "runtime_work_market", "required_work_items": minimum_work_items, "observed_work_items": autonomy.work_items, "accepted_work_items": autonomy.accepted_work_items, "required_proposals": minimum_proposals, "observed_proposals": autonomy.proposed_work_items, "distinct_proposers": autonomy.distinct_proposers, "required_bids": minimum_bids, "observed_bids": autonomy.bid_count, "distinct_bidders": autonomy.distinct_bidders, "required_claims": minimum_claims, "observed_claims": autonomy.claimed_work_items, "autonomous_claimed_work_items": autonomy.autonomous_claimed_work_items, "distinct_claimants": autonomy.distinct_claimants, "passed": work_satisfied}),
+                        json!({"name": "durable_independent_review_cycle", "required_reviews": minimum_reviews, "observed_reviews": autonomy.review_count, "distinct_reviewers": autonomy.distinct_reviewers, "required_challenges": minimum_challenges, "challenge_findings": autonomy.challenge_findings, "challenged_work_items": autonomy.challenged_work_items, "unresolved_challenged_work_items": autonomy.unresolved_challenged_work_items, "passed": review_satisfied}),
+                        json!({"name": "bounded_team_discussions", "required": minimum_discussions, "observed": autonomy.discussions, "passed": discussions_satisfied}),
+                        json!({"name": "typed_output_artifacts", "required": 4, "observed": autonomy.output_artifact_kinds, "passed": artifacts_satisfied}),
+                        json!({"name": "claimed_cross_team_edges", "required": minimum_cross_team_edges, "observed": cross_team_edges, "passed": edges_satisfied}),
+                        json!({"name": "persisted_output_presented", "path": output_path, "passed": presentation_satisfied}),
+                        json!({"name": "runtime_attested_single_reread_materialization", "path": output_path, "observed": autonomy.output_materializations, "digests": autonomy.output_digests, "passed": materialization_satisfied}),
                     ],
                 }
             }
@@ -2759,6 +2947,295 @@ fn architecture_quality(timeline: &Value, projections: &[Value]) -> Architecture
         score,
         required: 3,
         criteria,
+    }
+}
+
+#[derive(Default)]
+struct AutonomyMetrics {
+    work_items: usize,
+    proposed_work_items: usize,
+    distinct_proposers: usize,
+    bid_count: usize,
+    distinct_bidders: usize,
+    accepted_work_items: usize,
+    claimed_work_items: usize,
+    autonomous_claimed_work_items: usize,
+    distinct_claimants: usize,
+    review_count: usize,
+    distinct_reviewers: usize,
+    challenge_findings: usize,
+    challenged_work_items: usize,
+    unresolved_challenged_work_items: usize,
+    discussions: usize,
+    output_artifact_kinds: usize,
+    output_materializations: usize,
+    output_digests: Vec<String>,
+}
+
+fn autonomy_metrics(projections: &[Value], output_path: &str) -> AutonomyMetrics {
+    let mut work_items = BTreeSet::new();
+    let mut proposed_work_items = BTreeSet::new();
+    let mut proposers = BTreeSet::new();
+    let mut bids = BTreeSet::new();
+    let mut bidders = BTreeSet::new();
+    let mut accepted_work_items = BTreeSet::new();
+    let mut claimed_work_items = BTreeSet::new();
+    let mut claimants = BTreeSet::new();
+    let mut reviews = BTreeSet::new();
+    let mut reviewers = BTreeSet::new();
+    let mut challenge_findings = BTreeSet::new();
+    let mut challenged_work_items = BTreeSet::new();
+    let mut unresolved_challenged_work_items = BTreeSet::new();
+    let mut discussions = BTreeSet::new();
+    let mut output_artifact_kinds = BTreeSet::new();
+    let mut materialization_receipts = BTreeSet::new();
+    let mut output_digests = BTreeSet::new();
+
+    for projection in projections {
+        let graph_id = projection
+            .pointer("/graph/graph_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unidentified-graph");
+        for node in projection
+            .pointer("/graph/nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(work) = node.get("work").filter(|value| value.is_object()) else {
+                continue;
+            };
+            let node_id = node
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unidentified-node");
+            let key = format!("{graph_id}:{node_id}");
+            work_items.insert(key.clone());
+            output_artifact_kinds.extend(
+                work.get("output_artifact_kinds")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|kind| !kind.trim().is_empty())
+                    .map(ToString::to_string),
+            );
+            let state = node.get("work_state").unwrap_or(&Value::Null);
+            let status = state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("offered");
+            if status == "accepted" {
+                accepted_work_items.insert(key.clone());
+            }
+            if let Some(claimant) = state
+                .pointer("/claim/claimant_instance_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                claimed_work_items.insert(key.clone());
+                claimants.insert(claimant.to_string());
+            }
+            let findings = state
+                .get("review_findings")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|finding| !finding.trim().is_empty())
+                .collect::<Vec<_>>();
+            if !findings.is_empty() {
+                challenged_work_items.insert(key.clone());
+                if status != "accepted" {
+                    unresolved_challenged_work_items.insert(key.clone());
+                }
+            }
+            for finding in findings {
+                challenge_findings.insert(format!("{key}:{finding}"));
+            }
+            collect_work_reviews(state, &key, &mut reviews, &mut reviewers);
+        }
+        for item in projection
+            .pointer("/graph/autonomous_work")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(work_id) = item
+                .get("work_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            else {
+                continue;
+            };
+            let key = format!("{graph_id}:{work_id}");
+            let work = item.get("work").unwrap_or(&Value::Null);
+            let state = item.get("state").unwrap_or(&Value::Null);
+            work_items.insert(key.clone());
+            proposed_work_items.insert(key.clone());
+            if let Some(proposer) = work
+                .get("proposed_by")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                proposers.insert(proposer.to_string());
+            }
+            output_artifact_kinds.extend(
+                work.get("output_artifact_kinds")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter(|kind| !kind.trim().is_empty())
+                    .map(ToString::to_string),
+            );
+            let status = state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("offered");
+            if status == "accepted" {
+                accepted_work_items.insert(key.clone());
+            }
+            if let Some(claimant) = state
+                .pointer("/claim/claimant_instance_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                claimed_work_items.insert(key.clone());
+                claimants.insert(claimant.to_string());
+            }
+            for (index, bid) in state
+                .get("bids")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if let Some(bidder) = bid
+                    .get("bidder_instance_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    bidders.insert(bidder.to_string());
+                    bids.insert(format!("{key}:{bidder}:{index}"));
+                }
+            }
+            let findings = state
+                .get("review_findings")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|finding| !finding.trim().is_empty())
+                .collect::<Vec<_>>();
+            if !findings.is_empty() {
+                challenged_work_items.insert(key.clone());
+                if status != "accepted" {
+                    unresolved_challenged_work_items.insert(key.clone());
+                }
+            }
+            for finding in findings {
+                challenge_findings.insert(format!("{key}:{finding}"));
+            }
+            collect_work_reviews(state, &key, &mut reviews, &mut reviewers);
+        }
+        for activity in projection
+            .get("activities")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if activity.get("kind").and_then(Value::as_str) == Some("discussion") {
+                if let Some(activity_id) = activity.get("activity_id").and_then(Value::as_str) {
+                    discussions.insert(activity_id.to_string());
+                }
+            }
+        }
+        for receipt in projection
+            .pointer("/delivery_envelope/workspace_materializations")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if receipt.get("target_path").and_then(Value::as_str) != Some(output_path)
+                || receipt.get("reread_verified").and_then(Value::as_bool) != Some(true)
+                || receipt.get("bytes").and_then(Value::as_u64) == Some(0)
+            {
+                continue;
+            }
+            let digest = receipt
+                .get("sha256")
+                .and_then(Value::as_str)
+                .filter(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+            let receipt_id = receipt
+                .get("receipt_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty());
+            if let (Some(receipt_id), Some(digest)) = (receipt_id, digest) {
+                materialization_receipts.insert(receipt_id.to_string());
+                output_digests.insert(digest.to_string());
+            }
+        }
+    }
+
+    AutonomyMetrics {
+        work_items: work_items.len(),
+        proposed_work_items: proposed_work_items.len(),
+        distinct_proposers: proposers.len(),
+        bid_count: bids.len(),
+        distinct_bidders: bidders.len(),
+        accepted_work_items: accepted_work_items.len(),
+        claimed_work_items: claimed_work_items.len(),
+        autonomous_claimed_work_items: claimed_work_items
+            .intersection(&proposed_work_items)
+            .count(),
+        distinct_claimants: claimants.len(),
+        review_count: reviews.len(),
+        distinct_reviewers: reviewers.len(),
+        challenge_findings: challenge_findings.len(),
+        challenged_work_items: challenged_work_items.len(),
+        unresolved_challenged_work_items: unresolved_challenged_work_items.len(),
+        discussions: discussions.len(),
+        output_artifact_kinds: output_artifact_kinds.len(),
+        output_materializations: materialization_receipts.len(),
+        output_digests: output_digests.into_iter().collect(),
+    }
+}
+
+fn collect_work_reviews(
+    state: &Value,
+    work_key: &str,
+    reviews: &mut BTreeSet<String>,
+    reviewers: &mut BTreeSet<String>,
+) {
+    for review in state
+        .get("reviews")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(reviewer) = review
+            .get("reviewer_instance_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(submission_ref) = review
+            .get("submission_ref")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        else {
+            continue;
+        };
+        let verdict = review
+            .get("verdict")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        reviewers.insert(reviewer.to_string());
+        reviews.insert(format!("{work_key}:{submission_ref}:{reviewer}:{verdict}"));
     }
 }
 
@@ -3518,6 +3995,154 @@ mod tests {
     fn legacy_expensive_scenario_opt_in_only_applies_without_selection() {
         assert!(scenario_enabled(None, GROUP_THEORY_SCENARIO_ID, true));
         assert!(!scenario_enabled(None, GROUP_THEORY_SCENARIO_ID, false));
+    }
+
+    #[test]
+    fn autonomous_deepseek_template_is_frozen_and_complete() {
+        let template: AutonomousDeepseekTemplate = serde_json::from_str(include_str!(
+            "../templates/autonomous-collaboration-deepseek-v1.json"
+        ))
+        .expect("autonomous template");
+        assert_eq!(template.schema_version, 1);
+        assert_eq!(template.scenario_id, AUTONOMOUS_DEEPSEEK_SCENARIO_ID);
+        assert_eq!(template.output_path, AUTONOMOUS_DEEPSEEK_OUTPUT_PATH);
+        for prompt in [&template.prompt_16, &template.prompt_24] {
+            assert!(prompt.contains("propose_work"));
+            assert!(prompt.contains("bid/claim"));
+            assert!(prompt.contains("challenge"));
+            assert!(prompt.contains(AUTONOMOUS_DEEPSEEK_OUTPUT_PATH));
+        }
+    }
+
+    fn autonomous_projection(reread_verified: bool) -> Value {
+        json!({
+            "revision": 3,
+            "agents": [{"id": "agent-a", "status": "completed"}],
+            "teams": [{"id": "team-a", "status": "completed"}],
+            "activities": [{
+                "activity_id": "activity:discussion:challenge-a",
+                "kind": "discussion",
+                "status": "completed"
+            }],
+            "graph": {
+                "graph_id": "team-graph-a",
+                "nodes": [{
+                    "node_id": "work-a",
+                    "work": {
+                        "output_artifact_kinds": ["research", "analysis", "simulation", "report"]
+                    },
+                    "work_state": {
+                        "status": "accepted",
+                        "claim": {"claimant_instance_id": "agent-a"},
+                        "review_findings": ["revise the counterexample"],
+                        "reviews": [{
+                            "reviewer_instance_id": "reviewer-a",
+                            "verdict": "challenge",
+                            "submission_ref": "artifact://work-a-v1"
+                        }]
+                    }
+                }],
+                "autonomous_work": [{
+                    "work_id": "agent-work-a",
+                    "work": {
+                        "proposed_by": "agent-proposer",
+                        "output_artifact_kinds": ["research"]
+                    },
+                    "state": {
+                        "status": "accepted",
+                        "claim": {"claimant_instance_id": "agent-a"},
+                        "bids": [{
+                            "bidder_instance_id": "agent-a",
+                            "rationale": "independent capability match"
+                        }],
+                        "reviews": [{
+                            "reviewer_instance_id": "reviewer-b",
+                            "verdict": "accept",
+                            "submission_ref": "team-board:agent-work-a"
+                        }]
+                    }
+                }],
+                "orchestration": {"collaboration_program": {"edges": [{
+                    "edge_id": "edge-a",
+                    "state": "claimed",
+                    "delivery_receipt": {"receipt_id": "delivery-a"},
+                    "claim_receipt": {"receipt_id": "claim-a"}
+                }]}}
+            },
+            "delivery_envelope": {"workspace_materializations": [{
+                "receipt_id": "materialize-a",
+                "target_path": AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,
+                "sha256": "a".repeat(64),
+                "bytes": 4096,
+                "reread_verified": reread_verified
+            }]}
+        })
+    }
+
+    #[test]
+    fn autonomy_metrics_deduplicate_runtime_facts_and_fail_closed_on_reread() {
+        let projection = autonomous_projection(true);
+        let metrics = autonomy_metrics(
+            &[projection.clone(), projection],
+            AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,
+        );
+        assert_eq!(metrics.work_items, 2);
+        assert_eq!(metrics.proposed_work_items, 1);
+        assert_eq!(metrics.distinct_proposers, 1);
+        assert_eq!(metrics.bid_count, 1);
+        assert_eq!(metrics.distinct_bidders, 1);
+        assert_eq!(metrics.accepted_work_items, 2);
+        assert_eq!(metrics.claimed_work_items, 2);
+        assert_eq!(metrics.autonomous_claimed_work_items, 1);
+        assert_eq!(metrics.distinct_claimants, 1);
+        assert_eq!(metrics.review_count, 2);
+        assert_eq!(metrics.distinct_reviewers, 2);
+        assert_eq!(metrics.challenge_findings, 1);
+        assert_eq!(metrics.challenged_work_items, 1);
+        assert_eq!(metrics.unresolved_challenged_work_items, 0);
+        assert_eq!(metrics.discussions, 1);
+        assert_eq!(metrics.output_artifact_kinds, 4);
+        assert_eq!(metrics.output_materializations, 1);
+
+        let missing_reread = autonomy_metrics(
+            &[autonomous_projection(false)],
+            AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,
+        );
+        assert_eq!(missing_reread.output_materializations, 0);
+    }
+
+    #[test]
+    fn autonomous_acceptance_requires_claim_review_discussion_edge_and_materialization() {
+        let acceptance = LiveAcceptance::AutonomousCollaboration {
+            minimum_teams: 1,
+            minimum_agents: 1,
+            minimum_work_items: 1,
+            minimum_proposals: 1,
+            minimum_bids: 1,
+            minimum_claims: 1,
+            minimum_reviews: 1,
+            minimum_challenges: 1,
+            minimum_cross_team_edges: 1,
+            minimum_discussions: 1,
+            output_path: AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,
+        };
+        let response = format!("已提交 {AUTONOMOUS_DEEPSEEK_OUTPUT_PATH}");
+        let timeline = successful_root_outcome_timeline(json!({}));
+        assert!(
+            acceptance
+                .evaluate(&response, &timeline, &[autonomous_projection(true)], "root",)
+                .passed
+        );
+        assert!(
+            !acceptance
+                .evaluate(
+                    &response,
+                    &timeline,
+                    &[autonomous_projection(false)],
+                    "root",
+                )
+                .passed
+        );
     }
 
     #[test]

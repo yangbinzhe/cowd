@@ -654,6 +654,12 @@ pub(super) fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::OfferWork {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::ProposeWork {
+            expected_revision, ..
+        }
+        | ExecutionGraphCommand::BidWork {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::ClaimWork {
             expected_revision, ..
         }
@@ -717,6 +723,8 @@ pub(super) fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str
         ExecutionGraphCommand::Cancel { reason, .. } => ("cancel", Some(reason)),
         ExecutionGraphCommand::CancelNode { reason, .. } => ("cancel_node", Some(reason)),
         ExecutionGraphCommand::OfferWork { .. } => ("offer_work", None),
+        ExecutionGraphCommand::ProposeWork { .. } => ("propose_work", None),
+        ExecutionGraphCommand::BidWork { rationale, .. } => ("bid_work", Some(rationale)),
         ExecutionGraphCommand::ClaimWork { .. } => ("claim_work", None),
         ExecutionGraphCommand::HeartbeatWork { .. } => ("heartbeat_work", None),
         ExecutionGraphCommand::ReleaseWork { reason, .. } => ("release_work", Some(reason)),

@@ -63,6 +63,12 @@ pub struct ExecutionNodeProjection {
 pub struct ExecutionWorkProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collaboration_work_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposal_evidence_refs: Vec<String>,
     pub role: ExecutionWorkRole,
     pub required: bool,
     pub dependency: ExecutionDependencyPolicy,
@@ -86,6 +92,9 @@ impl From<&ExecutionWorkContract> for ExecutionWorkProjection {
     fn from(work: &ExecutionWorkContract) -> Self {
         Self {
             collaboration_work_id: work.collaboration_work_id.clone(),
+            objective: work.objective.clone(),
+            proposed_by: work.proposed_by.clone(),
+            proposal_evidence_refs: work.proposal_evidence_refs.clone(),
             role: work.role,
             required: work.required,
             dependency: work.dependency.clone(),
@@ -126,6 +135,10 @@ pub struct ExecutionGraphProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<ExecutionOrchestrationMetadata>,
     pub nodes: Vec<ExecutionNodeProjection>,
+    /// Runtime-owned, Agent-proposed work that is executed by already active
+    /// managed Agents rather than scheduled as a second physical graph node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub autonomous_work: Vec<AutonomousWorkProjection>,
     pub edges: Vec<ExecutionEdgeProjection>,
     pub commit_cursor: u64,
     pub terminal_result_ref: Option<String>,
@@ -135,6 +148,13 @@ pub struct ExecutionGraphProjection {
     pub terminal_presentation: Option<crate::outcome::TerminalPresentation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<ExecutionWorkGraphProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutonomousWorkProjection {
+    pub work_id: String,
+    pub work: ExecutionWorkProjection,
+    pub state: super::ExecutionWorkRuntimeState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -200,8 +220,17 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                     work_state: node
                         .work
                         .as_ref()
-                        .map(|_| graph.work_states.get(&node.id).cloned().unwrap_or_default()),
+                        .map(|_| public_work_state(graph.work_states.get(&node.id))),
                 }
+            })
+            .collect(),
+        autonomous_work: graph
+            .autonomous_work
+            .iter()
+            .map(|(work_id, work)| AutonomousWorkProjection {
+                work_id: work_id.clone(),
+                work: ExecutionWorkProjection::from(work),
+                state: public_work_state(graph.work_states.get(work_id)),
             })
             .collect(),
         edges: graph
@@ -225,6 +254,18 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
         terminal_presentation: graph.terminal_presentation.clone(),
         work: project_work_graph(graph),
     }
+}
+
+fn public_work_state(
+    state: Option<&super::ExecutionWorkRuntimeState>,
+) -> super::ExecutionWorkRuntimeState {
+    let mut state = state.cloned().unwrap_or_default();
+    if let Some(claim) = state.claim.as_mut() {
+        // A claim token is a write authority, not an observability field.
+        // The binding-scoped control response returns it only to its owner.
+        claim.claim_token = "<redacted>".to_string();
+    }
+    state
 }
 
 fn public_payload_ref(node_id: &str) -> String {

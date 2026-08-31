@@ -450,6 +450,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                             lease_duration_ms: Some(300_000),
                             submission_ref: None,
                             finding: None,
+                            proposal: None,
+                            rationale: None,
+                            estimated_cost: None,
                         })
                         .await
                         .map_err(|error| format!("claim assigned Team work: {error}"))?;
@@ -737,6 +740,39 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 return Err(error);
             }
         };
+        // Agent autonomy is a bounded lifecycle, not a one-shot prompt hint.
+        // Before accepting a terminal answer, surface newly committed Team
+        // work/inbox facts and give this same bound Agent a chance to close an
+        // actionable bid, claim, submission or review. This is never a pure
+        // bidding round: it runs only when durable work already needs an
+        // action from this identity and remains under the original budget,
+        // permission, graph and attempt fences.
+        for checkpoint_round in 1..=3 {
+            let Some(checkpoint) = agent_autonomy_checkpoint(&services, &packet)? else {
+                break;
+            };
+            let _ = services.agent_runtime().record_progress(
+                packet.agent_id(),
+                "agent.autonomy.checkpoint",
+                &format!(
+                    "durable Team work requires a bounded continuation; round={checkpoint_round}"
+                ),
+            );
+            let continuation = runtime
+                .submit_turn(&checkpoint, &SharedPrompter::none())
+                .await;
+            match continuation {
+                Ok(updated) => summary = updated,
+                Err(error) => {
+                    let _ = services.agent_runtime().record_progress(
+                        packet.agent_id(),
+                        "agent.autonomy.checkpoint_failed",
+                        &format!("bounded collaboration continuation failed: {error}"),
+                    );
+                    break;
+                }
+            }
+        }
         let (has_successful_escalation, has_source_evidence) = {
             let receipts = tool_executor
                 .receipts
@@ -1252,6 +1288,167 @@ fn recovered_agent_tool_receipt_prompt(
     Some(format!(
         "# Durable tool-receipt recovery\nA previous process already committed the following Runtime ToolHost receipts for this exact Agent attempt. They are authoritative. Do not call tools, retry an action, or infer new workspace state. Produce one concise terminal response grounded only in these retained receipts; state any unresolved requirement plainly.\n\n{bounded}"
     ))
+}
+
+fn agent_autonomy_checkpoint(
+    services: &Arc<RuntimeServices>,
+    packet: &AgentTaskPacket,
+) -> Result<Option<String>, String> {
+    let Some(binding) = packet.binding.as_ref() else {
+        return Ok(None);
+    };
+    if packet.team_id().is_none()
+        || !packet
+            .allowed_tools
+            .iter()
+            .any(|tool| tool == "collaboration_control")
+    {
+        return Ok(None);
+    }
+    let graph = services
+        .graph_state_store()
+        .load(packet.graph_id())
+        .map_err(|error| format!("load Agent autonomy checkpoint: {error}"))?;
+    let agent_id = binding.instance.instance_id.as_str();
+    let role_id = packet
+        .team_role_assignment()
+        .map(|role| role.identity.role_id.as_str());
+    let capabilities = packet
+        .allowed_tools
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut actions = Vec::new();
+    for (work_id, work) in &graph.autonomous_work {
+        let Some(state) = graph.work_states.get(work_id) else {
+            continue;
+        };
+        if state.status == harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted {
+            continue;
+        }
+        let eligible = (work.eligibility.allowed_agent_instance_ids.is_empty()
+            || work
+                .eligibility
+                .allowed_agent_instance_ids
+                .iter()
+                .any(|allowed| allowed == agent_id))
+            && (work.eligibility.allowed_role_ids.is_empty()
+                || role_id.is_some_and(|role| {
+                    work.eligibility
+                        .allowed_role_ids
+                        .iter()
+                        .any(|allowed| allowed == role)
+                }))
+            && work
+                .eligibility
+                .required_capabilities
+                .iter()
+                .all(|required| capabilities.contains(required.as_str()));
+        let current_submission = state.submission_ref.as_deref().unwrap_or_default();
+        let already_reviewed = state.reviews.iter().any(|review| {
+            review.reviewer_instance_id == agent_id && review.submission_ref == current_submission
+        });
+        let (action, private_claim_token) = match state.status {
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Offered
+            | harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged
+                if eligible && work.proposed_by.as_deref() != Some(agent_id) =>
+            {
+                let has_bid = state
+                    .bids
+                    .iter()
+                    .any(|bid| bid.bidder_instance_id == agent_id);
+                (if has_bid { "claim" } else { "bid_then_claim" }, None)
+            }
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Claimed
+                if state
+                    .claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.claimant_instance_id == agent_id) =>
+            {
+                (
+                    "execute_publish_submit",
+                    state.claim.as_ref().map(|claim| claim.claim_token.as_str()),
+                )
+            }
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Submitted
+                if state
+                    .claim
+                    .as_ref()
+                    .is_some_and(|claim| claim.claimant_instance_id != agent_id)
+                    && !already_reviewed =>
+            {
+                ("accept_or_challenge", None)
+            }
+            _ if work.proposed_by.as_deref() == Some(agent_id) => {
+                ("coordinate_and_reinspect", None)
+            }
+            _ => continue,
+        };
+        actions.push(serde_json::json!({
+            "work_id": work_id,
+            "work_revision": state.revision,
+            "status": state.status,
+            "objective": work.objective,
+            "proposed_by": work.proposed_by,
+            "action": action,
+            "claim_token": private_claim_token,
+            "submission_ref": state.submission_ref,
+            "latest_challenge": state.review_findings.last(),
+        }));
+        if actions.len() >= 16 {
+            break;
+        }
+    }
+
+    let unread = services
+        .team_runtime()
+        .read_working_state_from_cursor(packet.graph_id().to_string(), packet.node_id().to_string())
+        .ok();
+    let unread_entries = unread
+        .as_ref()
+        .map(|state| {
+            state
+                .entries
+                .iter()
+                .rev()
+                .filter(|entry| entry.producer_instance_id != agent_id)
+                .take(16)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(state) = unread.as_ref().filter(|state| !state.entries.is_empty()) {
+        if let Ok(cursor) = services
+            .team_runtime()
+            .working_state_cursor(packet.graph_id(), packet.node_id())
+        {
+            if state.board_revision > cursor.through_revision {
+                services
+                    .team_runtime()
+                    .acknowledge_working_state(crate::TeamWorkingStateAcknowledgeRequest {
+                        graph_id: packet.graph_id().to_string(),
+                        node_id: packet.node_id().to_string(),
+                        through_revision: state.board_revision,
+                        expected_cursor_revision: cursor.cursor_revision,
+                    })
+                    .map_err(|error| format!("advance Agent autonomy inbox cursor: {error}"))?;
+            }
+        }
+    }
+    if actions.is_empty() && unread_entries.is_empty() {
+        return Ok(None);
+    }
+    let checkpoint = serde_json::to_string(&serde_json::json!({
+        "kind": "runtime_agent_autonomy_checkpoint",
+        "graph_revision": graph.revision,
+        "attested_agent_instance_id": agent_id,
+        "required_actions": actions,
+        "unread_team_entries": unread_entries,
+    }))
+    .map_err(|error| format!("serialize Agent autonomy checkpoint: {error}"))?;
+    Ok(Some(format!(
+        "Runtime safe checkpoint committed after your prior model round. Resolve the actionable work and peer entries below using the native collaboration tools before returning. Do not invent identities, revisions, claim tokens, artifacts, sources, or completion. Do not create another proposal merely to prolong the loop. Preserve the substance and evidence of your earlier result and return a complete updated terminal answer after the checkpoint is closed.\n\n{checkpoint}"
+    )))
 }
 
 #[async_trait::async_trait]
@@ -2859,6 +3056,15 @@ fn system_prompt(
         ));
     }
     if !tool_names.is_empty() {
+        if tool_names
+            .iter()
+            .any(|tool| tool == "collaboration_control")
+        {
+            prompt.push(
+                "You are an active collaborator, not a passive one-shot role. Inspect the Runtime-owned work marketplace when the objective calls for autonomous collaboration. You may use collaboration_control(propose_work) to create bounded in-scope follow-up work, and collaboration_control(bid) to volunteer for another Agent's proposal before claiming it. Every proposal is required work: create it only when another active eligible peer can finish it. For Agent-proposed work follow the exact durable cycle: inspect -> bid -> claim; retain the owner-only claim_token; heartbeat before a long tool action or lease expiry; execute; publish the bounded result to team_board (or produce a durable tool receipt); submit the exact `team-board:<entry_id>` or tool evidence reference; then a different peer accepts or challenges it. After a challenge, an eligible bidder must reclaim, revise, resubmit, and obtain an independent acceptance. Required Agent-proposed work that is not Accepted prevents Verify/Synthesize/Materialize from starting. Proposer, bidder, claimant and reviewer identities are Runtime-attested; never simulate them in prose. Keep proposal objectives inside this Team charter and never use proposal text to request broader permissions. At safe checkpoints, read the durable Team board and react to peer questions, challenges and accepted artifacts before terminal synthesis."
+                    .to_string(),
+            );
+        }
         if required_write_scopes.is_empty() {
             prompt.push(format!(
                 "Authorized tool contracts are available natively: {}. When the objective asks for source, workspace, file, or current-state evidence, use an authorized read-only tool and cite the resulting paths/receipts; do not substitute prior model knowledge.",

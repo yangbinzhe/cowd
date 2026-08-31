@@ -5,8 +5,9 @@ use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{
     apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionGraph,
     ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
-    ExecutionNodeStatus, ExecutionTransitionError, ExecutionWorkClaim, ExecutionWorkRuntimeState,
-    ExecutionWorkRuntimeStatus,
+    ExecutionNodeStatus, ExecutionTransitionError, ExecutionWorkBid, ExecutionWorkClaim,
+    ExecutionWorkReview, ExecutionWorkReviewPolicy, ExecutionWorkReviewVerdict,
+    ExecutionWorkRuntimeState, ExecutionWorkRuntimeStatus,
 };
 use harness_contract::tool::{ToolEffectDescriptor, ToolEffectKind, ToolIdempotency};
 use serde_json::json;
@@ -157,6 +158,7 @@ fn work_contract<'a>(
         .iter()
         .find(|node| node.id == node_id)
         .and_then(|node| node.work.as_ref())
+        .or_else(|| graph.autonomous_work.get(node_id))
         .ok_or_else(|| {
             ExecutionCommitError::InvalidCommand(format!(
                 "work node `{node_id}` does not exist or has no work contract"
@@ -242,6 +244,7 @@ fn validate_reviewer(
     graph: &ExecutionGraph,
     node_id: &str,
     reviewer_instance_id: &str,
+    reviewer_role_id: Option<&str>,
 ) -> Result<(), ExecutionCommitError> {
     if reviewer_instance_id.trim().is_empty() {
         return Err(ExecutionCommitError::InvalidCommand(format!(
@@ -260,7 +263,60 @@ fn validate_reviewer(
             "work `{node_id}` claimant cannot review its own submission"
         )));
     }
+    if let ExecutionWorkReviewPolicy::Peer {
+        eligible_role_ids, ..
+    } = &work_contract(graph, node_id)?.review_policy
+    {
+        if !eligible_role_ids.is_empty()
+            && reviewer_role_id
+                .is_none_or(|role| !eligible_role_ids.iter().any(|eligible| eligible == role))
+        {
+            return Err(ExecutionCommitError::InvalidCommand(format!(
+                "work `{node_id}` reviewer role is not eligible"
+            )));
+        }
+    }
     Ok(())
+}
+
+fn reconcile_terminal_node_work(
+    graph: &mut ExecutionGraph,
+    node_id: &str,
+    terminal_status: ExecutionNodeStatus,
+) {
+    if terminal_status != ExecutionNodeStatus::Completed {
+        return;
+    }
+    let Some(work) = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .and_then(|node| node.work.as_ref())
+    else {
+        return;
+    };
+    let Some(state) = graph.work_states.get_mut(node_id) else {
+        return;
+    };
+    if state.status != ExecutionWorkRuntimeStatus::Claimed {
+        return;
+    }
+    state.submission_ref = Some(
+        graph
+            .node_results
+            .get(node_id)
+            .and_then(|result| result.result_ref.clone())
+            .unwrap_or_else(|| format!("execution-node:{node_id}")),
+    );
+    state.status = match &work.review_policy {
+        harness_contract::execution_graph::ExecutionWorkReviewPolicy::None => {
+            ExecutionWorkRuntimeStatus::Accepted
+        }
+        harness_contract::execution_graph::ExecutionWorkReviewPolicy::Peer { .. } => {
+            ExecutionWorkRuntimeStatus::Submitted
+        }
+    };
+    state.revision = state.revision.saturating_add(1);
 }
 
 /// Merge an additive semantic revision into the graph-owned collaboration
@@ -942,6 +998,7 @@ impl ExecutionCommitService {
         // corresponding edge disposition.
         if to.is_terminal() {
             record_terminal_cross_team_edge_deliveries(&mut next, node_id)?;
+            reconcile_terminal_node_work(&mut next, node_id, to);
         }
         let transaction_id = format!("{}:{}:{}:{}", graph.id, node_id, next.revision, to as u8);
         let graph_event = ExecutionGraphEvent::NodeTransitioned {
@@ -1155,6 +1212,11 @@ impl ExecutionCommitService {
             )?;
             if transition.outcome.result.status.is_terminal() {
                 record_terminal_cross_team_edge_deliveries(&mut next, &transition.node_id)?;
+                reconcile_terminal_node_work(
+                    &mut next,
+                    &transition.node_id,
+                    transition.outcome.result.status,
+                );
             }
             transition_facts.push((
                 transition.node_id.clone(),
@@ -1689,6 +1751,118 @@ impl ExecutionCommitService {
                 next.work_states
                     .insert(node_id.clone(), ExecutionWorkRuntimeState::default());
             }
+            ExecutionGraphCommand::ProposeWork {
+                work_id, contract, ..
+            } => {
+                let objective = contract.objective.as_deref().unwrap_or_default().trim();
+                let proposer = contract.proposed_by.as_deref().unwrap_or_default().trim();
+                if work_id.trim().is_empty()
+                    || work_id.len() > 192
+                    || objective.is_empty()
+                    || objective.chars().count() > 2_000
+                    || proposer.is_empty()
+                    || contract.collaboration_work_id.as_deref() != Some(work_id.as_str())
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(
+                        "Agent work proposal has an invalid identity, objective or proposer"
+                            .to_string(),
+                    ));
+                }
+                if next.autonomous_work.len() >= 64
+                    || next.autonomous_work.contains_key(work_id)
+                    || next.nodes.iter().any(|node| node.id == *work_id)
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "Agent work proposal `{work_id}` is duplicate or exceeds the 64-item Team bound"
+                    )));
+                }
+                if contract.eligibility.required_capabilities.len() > 16
+                    || contract.input_artifact_refs.len() > 32
+                    || contract.output_artifact_kinds.is_empty()
+                    || contract.output_artifact_kinds.len() > 16
+                    || contract.proposal_evidence_refs.len() > 32
+                    || contract.expected_input_tokens > 500_000
+                    || contract.expected_output_tokens > 500_000
+                    || contract.expected_duration_ms > 3_600_000
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "Agent work proposal `{work_id}` exceeds bounded capability, artifact or cost policy"
+                    )));
+                }
+                next.autonomous_work
+                    .insert(work_id.clone(), (**contract).clone());
+                next.work_states.insert(
+                    work_id.clone(),
+                    ExecutionWorkRuntimeState {
+                        revision: 1,
+                        ..ExecutionWorkRuntimeState::default()
+                    },
+                );
+            }
+            ExecutionGraphCommand::BidWork {
+                work_id,
+                bidder_instance_id,
+                bidder_role_id,
+                bidder_capabilities,
+                rationale,
+                estimated_cost,
+                bid_at_ms,
+                ..
+            } => {
+                let contract = next.autonomous_work.get(work_id).ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "bid target `{work_id}` is not Agent-proposed work"
+                    ))
+                })?;
+                validate_work_claimant(
+                    work_id,
+                    contract,
+                    bidder_instance_id,
+                    bidder_role_id.as_deref(),
+                    bidder_capabilities,
+                )?;
+                if contract.proposed_by.as_deref() == Some(bidder_instance_id.as_str()) {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work proposer `{bidder_instance_id}` cannot bid on its own proposal"
+                    )));
+                }
+                let rationale = rationale.trim();
+                if rationale.is_empty()
+                    || rationale.chars().count() > 1_000
+                    || *estimated_cost > 1_000_000
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{work_id}` bid exceeds bounded rationale or cost policy"
+                    )));
+                }
+                let state = next.work_states.get_mut(work_id).ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "work `{work_id}` has no runtime state"
+                    ))
+                })?;
+                if !matches!(
+                    state.status,
+                    ExecutionWorkRuntimeStatus::Offered | ExecutionWorkRuntimeStatus::Challenged
+                ) || state
+                    .bids
+                    .iter()
+                    .any(|bid| bid.bidder_instance_id == *bidder_instance_id)
+                    || state.bids.len() >= 64
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{work_id}` is not open for this bid"
+                    )));
+                }
+                state.bids.push(ExecutionWorkBid {
+                    bidder_instance_id: bidder_instance_id.clone(),
+                    bidder_role_id: bidder_role_id.clone(),
+                    rationale: rationale.to_string(),
+                    estimated_cost: *estimated_cost,
+                    bid_at_ms: *bid_at_ms,
+                    graph_revision: graph.revision.saturating_add(1),
+                });
+                state.revision = state.revision.saturating_add(1);
+            }
             ExecutionGraphCommand::ClaimWork {
                 node_id,
                 claimant_instance_id,
@@ -1706,6 +1880,23 @@ impl ExecutionCommitService {
                     claimant_role_id.as_deref(),
                     claimant_capabilities,
                 )?;
+                if contract.proposed_by.as_deref() == Some(claimant_instance_id.as_str()) {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work proposer `{claimant_instance_id}` cannot claim its own proposal"
+                    )));
+                }
+                if contract.proposed_by.is_some()
+                    && next.work_states.get(node_id).is_none_or(|state| {
+                        !state
+                            .bids
+                            .iter()
+                            .any(|bid| bid.bidder_instance_id == *claimant_instance_id)
+                    })
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "Agent-proposed work `{node_id}` may only be claimed by an attested bidder"
+                    )));
+                }
                 if *lease_expires_at_ms <= *claimed_at_ms {
                     return Err(ExecutionCommitError::InvalidCommand(format!(
                         "work `{node_id}` claim lease must expire after claim time"
@@ -1808,9 +1999,22 @@ impl ExecutionCommitService {
             ExecutionGraphCommand::AcceptWork {
                 node_id,
                 reviewer_instance_id,
+                reviewer_role_id,
+                reviewed_at_ms,
                 ..
             } => {
-                validate_reviewer(&next, node_id, reviewer_instance_id)?;
+                validate_reviewer(
+                    &next,
+                    node_id,
+                    reviewer_instance_id,
+                    reviewer_role_id.as_deref(),
+                )?;
+                let minimum_reviewers = match &work_contract(&next, node_id)?.review_policy {
+                    ExecutionWorkReviewPolicy::None => 1,
+                    ExecutionWorkReviewPolicy::Peer {
+                        minimum_reviewers, ..
+                    } => usize::from((*minimum_reviewers).max(1)),
+                };
                 let state = next.work_states.get_mut(node_id).ok_or_else(|| {
                     ExecutionCommitError::InvalidCommand(format!(
                         "work `{node_id}` has no runtime state"
@@ -1821,16 +2025,64 @@ impl ExecutionCommitService {
                         "work `{node_id}` can only be accepted after submission"
                     )));
                 }
-                state.status = ExecutionWorkRuntimeStatus::Accepted;
+                let submission_ref = state.submission_ref.clone().ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` submitted state has no durable result reference"
+                    ))
+                })?;
+                if *reviewed_at_ms == 0
+                    || state
+                        .claim
+                        .as_ref()
+                        .is_some_and(|claim| *reviewed_at_ms < claim.claimed_at_ms)
+                    || state.reviews.len() >= 128
+                    || state.reviews.iter().any(|review| {
+                        review.submission_ref == submission_ref
+                            && review.reviewer_instance_id == *reviewer_instance_id
+                    })
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` review is stale, duplicate or exceeds the 128-receipt bound"
+                    )));
+                }
+                state.reviews.push(ExecutionWorkReview {
+                    reviewer_instance_id: reviewer_instance_id.clone(),
+                    reviewer_role_id: reviewer_role_id.clone(),
+                    verdict: ExecutionWorkReviewVerdict::Accept,
+                    submission_ref: submission_ref.clone(),
+                    finding: None,
+                    reviewed_at_ms: *reviewed_at_ms,
+                    graph_revision: graph.revision.saturating_add(1),
+                });
+                let accepted_reviewers = state
+                    .reviews
+                    .iter()
+                    .filter(|review| {
+                        review.submission_ref == submission_ref
+                            && review.verdict == ExecutionWorkReviewVerdict::Accept
+                    })
+                    .map(|review| review.reviewer_instance_id.as_str())
+                    .collect::<BTreeSet<_>>()
+                    .len();
+                if accepted_reviewers >= minimum_reviewers {
+                    state.status = ExecutionWorkRuntimeStatus::Accepted;
+                }
                 state.revision = state.revision.saturating_add(1);
             }
             ExecutionGraphCommand::ChallengeWork {
                 node_id,
                 reviewer_instance_id,
+                reviewer_role_id,
                 finding,
+                reviewed_at_ms,
                 ..
             } => {
-                validate_reviewer(&next, node_id, reviewer_instance_id)?;
+                validate_reviewer(
+                    &next,
+                    node_id,
+                    reviewer_instance_id,
+                    reviewer_role_id.as_deref(),
+                )?;
                 let finding = finding.trim();
                 if finding.is_empty() || finding.chars().count() > 4_000 {
                     return Err(ExecutionCommitError::InvalidCommand(format!(
@@ -1847,6 +2099,35 @@ impl ExecutionCommitService {
                         "work `{node_id}` can only be challenged after submission"
                     )));
                 }
+                let submission_ref = state.submission_ref.clone().ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` submitted state has no durable result reference"
+                    ))
+                })?;
+                if *reviewed_at_ms == 0
+                    || state
+                        .claim
+                        .as_ref()
+                        .is_some_and(|claim| *reviewed_at_ms < claim.claimed_at_ms)
+                    || state.reviews.len() >= 128
+                    || state.reviews.iter().any(|review| {
+                        review.submission_ref == submission_ref
+                            && review.reviewer_instance_id == *reviewer_instance_id
+                    })
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` review is stale, duplicate or exceeds the 128-receipt bound"
+                    )));
+                }
+                state.reviews.push(ExecutionWorkReview {
+                    reviewer_instance_id: reviewer_instance_id.clone(),
+                    reviewer_role_id: reviewer_role_id.clone(),
+                    verdict: ExecutionWorkReviewVerdict::Challenge,
+                    submission_ref,
+                    finding: Some(finding.to_string()),
+                    reviewed_at_ms: *reviewed_at_ms,
+                    graph_revision: graph.revision.saturating_add(1),
+                });
                 state.status = ExecutionWorkRuntimeStatus::Challenged;
                 state.claim = None;
                 state.review_findings.push(finding.to_string());
@@ -2210,6 +2491,13 @@ impl ExecutionCommitService {
             }
         }
         next.revision = next.revision.saturating_add(1);
+        if !next.autonomous_work.is_empty() {
+            validate_execution_graph(&next).map_err(|error| {
+                ExecutionCommitError::InvalidCommand(format!(
+                    "autonomous work command violates graph invariants: {error}"
+                ))
+            })?;
+        }
         let mut expected_domain_revisions = BTreeMap::new();
         let mut node_events: Vec<RuntimeTransactionEventInput> = next
             .node_statuses

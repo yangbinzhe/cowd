@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionGraph, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
     ExecutionOrchestrationMetadata, ExecutionParentBinding, ExecutionRecoveryCursor,
-    ExecutionServiceClass, ExecutionWorkRuntimeState,
+    ExecutionServiceClass, ExecutionWorkContract, ExecutionWorkRuntimeState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,10 @@ pub struct ExecutionGraphDelta {
     pub work_state_updates: BTreeMap<String, ExecutionWorkRuntimeState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_work_states: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub autonomous_work_updates: BTreeMap<String, ExecutionWorkContract>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_autonomous_work: Vec<String>,
     pub recovery_cursor: ExecutionRecoveryCursor,
 }
 
@@ -142,6 +146,18 @@ impl ExecutionGraphDelta {
                 .filter(|id| !next.work_states.contains_key(*id))
                 .cloned()
                 .collect(),
+            autonomous_work_updates: next
+                .autonomous_work
+                .iter()
+                .filter(|(id, work)| previous.autonomous_work.get(*id) != Some(*work))
+                .map(|(id, work)| (id.clone(), work.clone()))
+                .collect(),
+            removed_autonomous_work: previous
+                .autonomous_work
+                .keys()
+                .filter(|id| !next.autonomous_work.contains_key(*id))
+                .cloned()
+                .collect(),
             recovery_cursor: next.recovery_cursor.clone(),
         }
     }
@@ -202,6 +218,12 @@ impl ExecutionGraphDelta {
             graph.work_states.remove(id);
         }
         graph.work_states.extend(self.work_state_updates.clone());
+        for id in &self.removed_autonomous_work {
+            graph.autonomous_work.remove(id);
+        }
+        graph
+            .autonomous_work
+            .extend(self.autonomous_work_updates.clone());
         graph.recovery_cursor = self.recovery_cursor.clone();
         graph.revision = self.revision;
         Ok(())
@@ -260,6 +282,12 @@ impl ExecutionGraphDelta {
                     .iter()
                     .map(String::len)
                     .sum::<usize>(),
+            )
+            .saturating_add(
+                self.removed_autonomous_work
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
             );
         for node in &self.added_nodes {
             bytes = bytes
@@ -304,13 +332,49 @@ impl ExecutionGraphDelta {
                 .saturating_add(node_id.len())
                 .saturating_add(std::mem::size_of_val(state))
                 .saturating_add(state.submission_ref.as_ref().map_or(0, String::len))
-                .saturating_add(state.review_findings.iter().map(String::len).sum::<usize>());
+                .saturating_add(state.review_findings.iter().map(String::len).sum::<usize>())
+                .saturating_add(
+                    state
+                        .reviews
+                        .iter()
+                        .map(|review| {
+                            review.reviewer_instance_id.len()
+                                + review.reviewer_role_id.as_ref().map_or(0, String::len)
+                                + review.submission_ref.len()
+                                + review.finding.as_ref().map_or(0, String::len)
+                        })
+                        .sum::<usize>(),
+                )
+                .saturating_add(
+                    state
+                        .bids
+                        .iter()
+                        .map(|bid| {
+                            bid.bidder_instance_id.len()
+                                + bid.bidder_role_id.as_ref().map_or(0, String::len)
+                                + bid.rationale.len()
+                        })
+                        .sum::<usize>(),
+                );
             if let Some(claim) = &state.claim {
                 bytes = bytes
                     .saturating_add(claim.claimant_instance_id.len())
                     .saturating_add(claim.claimant_role_id.as_ref().map_or(0, String::len))
                     .saturating_add(claim.claim_token.len());
             }
+        }
+        for (work_id, work) in &self.autonomous_work_updates {
+            bytes = bytes
+                .saturating_add(work_id.len())
+                .saturating_add(std::mem::size_of_val(work))
+                .saturating_add(work.objective.as_ref().map_or(0, String::len))
+                .saturating_add(work.proposed_by.as_ref().map_or(0, String::len))
+                .saturating_add(
+                    work.proposal_evidence_refs
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>(),
+                );
         }
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }

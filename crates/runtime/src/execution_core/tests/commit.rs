@@ -1969,6 +1969,10 @@ fn work_marketplace_claims_are_cas_fenced_lease_bound_and_replayable() {
             ..Default::default()
         },
         output_artifact_kinds: vec!["research_note".to_string()],
+        review_policy: harness_contract::execution_graph::ExecutionWorkReviewPolicy::Peer {
+            minimum_reviewers: 2,
+            eligible_role_ids: Vec::new(),
+        },
         ..ExecutionWorkContract::new(ExecutionWorkRole::EvidenceAnalyze)
     });
     let registered = service.register_graph(graph).expect("register graph").graph;
@@ -2106,6 +2110,8 @@ fn work_marketplace_claims_are_cas_fenced_lease_bound_and_replayable() {
                 expected_revision: submitted.revision,
                 node_id: "agent-node".to_string(),
                 reviewer_instance_id: "agent-b".to_string(),
+                reviewer_role_id: Some("researcher".to_string()),
+                reviewed_at_ms: 260,
             }
         ),
         Err(ExecutionCommitError::InvalidCommand(_))
@@ -2117,7 +2123,9 @@ fn work_marketplace_claims_are_cas_fenced_lease_bound_and_replayable() {
                 expected_revision: submitted.revision,
                 node_id: "agent-node".to_string(),
                 reviewer_instance_id: "reviewer".to_string(),
+                reviewer_role_id: Some("reviewer".to_string()),
                 finding: "source coverage is incomplete".to_string(),
+                reviewed_at_ms: 270,
             },
         )
         .expect("independent reviewer challenges")
@@ -2161,17 +2169,37 @@ fn work_marketplace_claims_are_cas_fenced_lease_bound_and_replayable() {
         )
         .expect("reworked submission")
         .graph;
-    let accepted = service
+    let first_review = service
         .apply_command(
             &resubmitted,
             &ExecutionGraphCommand::AcceptWork {
                 expected_revision: resubmitted.revision,
                 node_id: "agent-node".to_string(),
                 reviewer_instance_id: "reviewer".to_string(),
+                reviewer_role_id: Some("reviewer".to_string()),
+                reviewed_at_ms: 360,
             },
         )
         .expect("independent acceptance")
         .graph;
+    assert_eq!(
+        first_review.work_states["agent-node"].status,
+        ExecutionWorkRuntimeStatus::Submitted
+    );
+    let accepted = service
+        .apply_command(
+            &first_review,
+            &ExecutionGraphCommand::AcceptWork {
+                expected_revision: first_review.revision,
+                node_id: "agent-node".to_string(),
+                reviewer_instance_id: "reviewer-2".to_string(),
+                reviewer_role_id: Some("reviewer".to_string()),
+                reviewed_at_ms: 370,
+            },
+        )
+        .expect("minimum distinct reviewer threshold accepts")
+        .graph;
+    assert_eq!(accepted.work_states["agent-node"].reviews.len(), 3);
     assert_eq!(
         accepted.work_states["agent-node"].status,
         ExecutionWorkRuntimeStatus::Accepted
@@ -2181,6 +2209,80 @@ fn work_marketplace_claims_are_cas_fenced_lease_bound_and_replayable() {
         .load(&accepted.id)
         .expect("replay graph");
     assert_eq!(replayed.work_states, accepted.work_states);
+}
+
+#[test]
+fn completed_physical_work_reconciles_to_runtime_accepted_without_peer_review() {
+    use harness_contract::execution_graph::{
+        ExecutionGraphCommand, ExecutionWorkContract, ExecutionWorkRole, ExecutionWorkRuntimeStatus,
+    };
+
+    let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+    let service = ExecutionCommitService::new(store);
+    let mut graph = agent_task_graph();
+    graph.nodes[0].work = Some(ExecutionWorkContract::new(
+        ExecutionWorkRole::EvidenceAnalyze,
+    ));
+    let graph = service.register_graph(graph).expect("register").graph;
+    let graph = service
+        .apply_command(
+            &graph,
+            &ExecutionGraphCommand::ClaimWork {
+                expected_revision: graph.revision,
+                node_id: "agent-node".to_string(),
+                claimant_instance_id: "agent-instance".to_string(),
+                claimant_role_id: None,
+                claimant_capabilities: Vec::new(),
+                claimed_at_ms: 10,
+                lease_expires_at_ms: 10_000,
+            },
+        )
+        .expect("claim")
+        .graph;
+    let graph = service
+        .transition_node(
+            &graph,
+            "agent-node",
+            ExecutionNodeStatus::Ready,
+            None,
+            Vec::new(),
+        )
+        .expect("ready")
+        .graph;
+    let graph = service
+        .transition_node(
+            &graph,
+            "agent-node",
+            ExecutionNodeStatus::Running,
+            None,
+            Vec::new(),
+        )
+        .expect("running")
+        .graph;
+    let graph = service
+        .transition_node(
+            &graph,
+            "agent-node",
+            ExecutionNodeStatus::Completed,
+            Some(ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some("artifact://agent-result".to_string()),
+                summary: Some("bounded result".to_string()),
+                evidence_refs: Vec::new(),
+                failure: None,
+                usage: Default::default(),
+                finished_at_ms: 100,
+            }),
+            Vec::new(),
+        )
+        .expect("completed")
+        .graph;
+    let state = &graph.work_states["agent-node"];
+    assert_eq!(state.status, ExecutionWorkRuntimeStatus::Accepted);
+    assert_eq!(
+        state.submission_ref.as_deref(),
+        Some("artifact://agent-result")
+    );
 }
 
 #[test]

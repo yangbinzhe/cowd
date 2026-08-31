@@ -7,7 +7,7 @@ use harness_contract::acceptance::{AcceptanceEvaluation, AcceptanceVerdict, Term
 use harness_contract::context::{EvidenceAccessRef, EvidenceRef};
 use harness_contract::execution_graph::{
     validate_execution_graph, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
-    ExecutionNodeResult, ExecutionNodeStatus,
+    ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -341,6 +341,16 @@ impl ExecutionGraphRunner {
 
     pub(crate) fn state_store(&self) -> &ExecutionGraphStateStore {
         &self.state_store
+    }
+
+    pub(crate) fn load_delegated_agent_tool_receipts(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        attempt: u32,
+    ) -> Result<Vec<super::commit_service::DurableAgentToolReceipt>, ExecutionCommitError> {
+        self.commit_service
+            .load_delegated_agent_tool_receipts(graph_id, node_id, attempt)
     }
 
     pub(crate) async fn recover_graph(
@@ -2252,20 +2262,20 @@ impl ExecutionGraphRunner {
                 .map(|node| node.id.clone())
                 .collect::<Vec<_>>();
             for node_id in planned {
-                let predecessors = graph
-                    .nodes
-                    .iter()
-                    .find(|node| node.id == node_id)
+                let node = graph.nodes.iter().find(|node| node.id == node_id);
+                let predecessors = node
                     .map(|node| dependency_predecessors(&graph, node))
                     .unwrap_or_default();
-                let dependency = graph
-                    .nodes
-                    .iter()
-                    .find(|node| node.id == node_id)
+                let dependency = node
                     .and_then(|node| node.work.as_ref())
                     .map(|work| work.dependency.clone())
                     .unwrap_or_default();
                 let target = dependency_target(&dependency, &predecessors);
+                let waits_for_autonomous_work = node
+                    .is_some_and(|node| autonomous_work_blocks_terminal(&graph, node.kind, target));
+                if waits_for_autonomous_work {
+                    continue;
+                }
                 if let Some(target) = target {
                     graph = self
                         .commit_service
@@ -2281,6 +2291,27 @@ impl ExecutionGraphRunner {
             }
         }
     }
+}
+
+fn autonomous_work_blocks_terminal(
+    graph: &ExecutionGraph,
+    node_kind: ExecutionNodeKind,
+    target: Option<ExecutionNodeStatus>,
+) -> bool {
+    target == Some(ExecutionNodeStatus::Ready)
+        && matches!(
+            node_kind,
+            ExecutionNodeKind::Synthesize
+                | ExecutionNodeKind::Verify
+                | ExecutionNodeKind::Materialize
+        )
+        && graph.autonomous_work.iter().any(|(work_id, work)| {
+            work.required
+                && graph.work_states.get(work_id).is_none_or(|state| {
+                    state.status
+                        != harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted
+                })
+        })
 }
 
 /// One predecessor lane carrying both its durable lifecycle status and its
@@ -2997,17 +3028,51 @@ mod dependency_policy_tests {
     };
     use harness_contract::execution_graph::{
         ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
-        ExecutionWorkContract, ExecutionWorkRole,
+        ExecutionWorkContract, ExecutionWorkRole, ExecutionWorkRuntimeState,
+        ExecutionWorkRuntimeStatus,
     };
 
     use super::{
-        aggregate_team_leaf_usage, dependency_predecessors, dependency_target,
-        quorum_tail_cancellations, team_child_terminal_result, verified_predecessor_status,
-        DependencyPredecessor,
+        aggregate_team_leaf_usage, autonomous_work_blocks_terminal, dependency_predecessors,
+        dependency_target, quorum_tail_cancellations, team_child_terminal_result,
+        verified_predecessor_status, DependencyPredecessor,
     };
 
     fn predecessor(status: ExecutionNodeStatus) -> DependencyPredecessor<'static> {
         DependencyPredecessor::status_only(status)
+    }
+
+    #[test]
+    fn required_autonomous_work_blocks_terminal_reducer_until_peer_acceptance() {
+        let mut graph = ExecutionGraph::new("autonomous work gate");
+        let mut work = ExecutionWorkContract::new(ExecutionWorkRole::CrossCheck);
+        work.collaboration_work_id = Some("agent-work-a".to_string());
+        work.objective = Some("independent cross-check".to_string());
+        work.proposed_by = Some("agent-a".to_string());
+        work.output_artifact_kinds = vec!["review".to_string()];
+        graph
+            .autonomous_work
+            .insert("agent-work-a".to_string(), work);
+        graph.work_states.insert(
+            "agent-work-a".to_string(),
+            ExecutionWorkRuntimeState {
+                status: ExecutionWorkRuntimeStatus::Claimed,
+                revision: 2,
+                ..ExecutionWorkRuntimeState::default()
+            },
+        );
+        assert!(autonomous_work_blocks_terminal(
+            &graph,
+            ExecutionNodeKind::Synthesize,
+            Some(ExecutionNodeStatus::Ready),
+        ));
+        graph.work_states.get_mut("agent-work-a").unwrap().status =
+            ExecutionWorkRuntimeStatus::Accepted;
+        assert!(!autonomous_work_blocks_terminal(
+            &graph,
+            ExecutionNodeKind::Synthesize,
+            Some(ExecutionNodeStatus::Ready),
+        ));
     }
 
     #[test]

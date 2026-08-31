@@ -1394,7 +1394,7 @@ mod tests {
             wake: Arc::new(tokio::sync::Notify::new()),
             test_store: Some(Arc::clone(&store)),
             worker_id: "worker-a".into(),
-            lease_ms: 30,
+            lease_ms: 500,
             max_attempts: 3,
         });
         let router_b = SessionInputRouter {
@@ -1404,7 +1404,7 @@ mod tests {
             wake: Arc::new(tokio::sync::Notify::new()),
             test_store: Some(Arc::clone(&store)),
             worker_id: "worker-b".into(),
-            lease_ms: 30,
+            lease_ms: 500,
             max_attempts: 3,
         };
         router_a
@@ -1413,14 +1413,17 @@ mod tests {
             .unwrap();
         let executor = Arc::new(SlowCountingExecutor {
             calls: AtomicUsize::new(0),
-            delay: Duration::from_millis(120),
+            delay: Duration::from_millis(1_500),
         });
         let task = {
             let router = Arc::clone(&router_a);
             let executor = Arc::clone(&executor);
             tokio::spawn(async move { router.route_pending_with(executor.as_ref(), 1).await })
         };
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        // Wait past the first 1/3-lease heartbeat but remain comfortably
+        // inside the renewed lease. Tiny 5-30ms wall-clock windows become a
+        // scheduler-contention test when the full suite runs in parallel.
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let second = router_b
             .route_pending_with(executor.as_ref(), 1)
             .await
@@ -1581,7 +1584,7 @@ mod tests {
             // executor below shortens the lease to 5 ms after its durable
             // commit, which deterministically simulates ownership changing
             // before the router can acknowledge the receipt.
-            lease_ms: 100,
+            lease_ms: 10_000,
             max_attempts: 3,
         };
         let router_b = SessionInputRouter {
@@ -1606,7 +1609,7 @@ mod tests {
         };
         let first = router_a.route_pending_with(&executor, 1).await.unwrap();
         assert_eq!(first.receipts[0].status, "blocked_ack");
-        tokio::time::sleep(Duration::from_millis(8)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         let second = router_b.route_pending_with(&executor, 1).await.unwrap();
         assert_eq!(second.materialized, 1);
         assert_eq!(executor.executions.load(Ordering::SeqCst), 2);

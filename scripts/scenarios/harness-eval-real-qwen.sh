@@ -25,10 +25,10 @@ RUN_ROOT="$(mktemp -d /tmp/cowd-real-qwen-gateway.XXXXXX)"
 # be reused. A caller may choose another durable evidence root explicitly.
 EVIDENCE_ROOT="${COWD_AI_HARNESS_REPORT_DIR:-$ROOT/target/acceptance/real-qwen}"
 CONFIG_HOME="$RUN_ROOT/config"
-# Evaluation must inspect the actual source tree. Isolation applies to the
-# Gateway's config, credentials, authentication token and durable state, not
-# to the read-only source fixture presented to the model.
-WORKSPACE="$ROOT"
+# Source-analysis scenarios default to the candidate tree. Artifact-producing
+# scenarios may point the Gateway at an explicit disposable workspace without
+# changing where the evaluator binary is built or where evidence is stored.
+WORKSPACE="${COWD_EVAL_WORKSPACE:-$ROOT}"
 GATEWAY_LOG="$RUN_ROOT/gateway.log"
 GATEWAY_PID=""
 PROGRESS_PID=""
@@ -57,6 +57,7 @@ case "$SCENARIO_ID" in
   live_team_projection|live_agent_escalation) MIN_PROVIDER_TOKENS=2000000 ;;
   live_group_theory_ai_research_simulation) MIN_PROVIDER_TOKENS=5000000 ;;
   live_qwen38_large_scale_collaboration) MIN_PROVIDER_TOKENS=8000000 ;;
+  live_autonomous_collaboration_deepseek) MIN_PROVIDER_TOKENS=12000000 ;;
   *) echo "unsupported paid live scenario: $SCENARIO_ID" >&2; exit 2 ;;
 esac
 [[ "$MAX_PROVIDER_TOKENS" =~ ^[0-9]+$ ]] || {
@@ -218,6 +219,15 @@ resolve_installed_route() {
 }
 
 resolve_installed_route
+if [[ "$SCENARIO_ID" == "live_autonomous_collaboration_deepseek" && "${MODEL,,}" != deepseek* ]]; then
+  echo "autonomous collaboration acceptance requires an explicit DeepSeek model, got ${MODEL}" >&2
+  exit 2
+fi
+[[ -d "$WORKSPACE" ]] || {
+  echo "evaluation workspace does not exist: $WORKSPACE" >&2
+  exit 2
+}
+WORKSPACE="$(cd "$WORKSPACE" && pwd -P)"
 command -v curl >/dev/null || { echo 'curl is required.' >&2; exit 2; }
 command -v ss >/dev/null || { echo 'ss is required.' >&2; exit 2; }
 command -v jq >/dev/null || { echo 'jq is required.' >&2; exit 2; }
@@ -228,7 +238,7 @@ fi
 CANDIDATE_SHA="$(git -C "$ROOT" rev-parse HEAD)"
 CANDIDATE_SOURCE_SHA256="$(git -C "$ROOT" archive --format=tar "$CANDIDATE_SHA" | sha256sum | awk '{print $1}')"
 ROUTE_FINGERPRINT="$(printf '%s\n' "$MODEL" "$PROVIDER_ID" "$PROVIDER_BASE_URL" "$PROVIDER_PROTOCOL" | sha256sum | awk '{print $1}')"
-SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" | sha256sum | awk '{print $1}')"
+SCENARIO_FINGERPRINT="$(printf '%s\n' "$SCENARIO_ID" "$MAX_PROVIDER_TOKENS" "${COWD_EVAL_AUTONOMOUS_AGENT_SCALE:-}" | sha256sum | awk '{print $1}')"
 EVIDENCE_KEY="$(printf '%s\n' "deep-real-v4" "$CANDIDATE_SHA" "$CANDIDATE_SOURCE_SHA256" "$ROUTE_FINGERPRINT" "$SCENARIO_FINGERPRINT" | sha256sum | awk '{print $1}')"
 if [[ "${COWD_EVAL_FORCE_RERUN:-0}" != "1" && -d "$EVIDENCE_ROOT/runs" ]]; then
   prior_evidence="$({

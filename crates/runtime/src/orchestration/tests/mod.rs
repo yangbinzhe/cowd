@@ -1424,6 +1424,9 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         lease_duration_ms: Some(60_000),
         submission_ref: None,
         finding: None,
+        proposal: None,
+        rationale: None,
+        estimated_cost: None,
     };
     let (claim_0, claim_1, claim_2, claim_3) = tokio::join!(
         services
@@ -1464,6 +1467,198 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .await
         .expect_err("stale per-work revision must be rejected");
     assert!(stale_work.contains("work revision mismatch"));
+    let proposal_receipt = services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[0].clone(),
+            operation: crate::CollaborationControlOperation::ProposeWork,
+            expected_revision: None,
+            expected_work_revision: Some(0),
+            work_node_id: None,
+            claim_token: None,
+            lease_duration_ms: None,
+            submission_ref: None,
+            finding: None,
+            proposal: Some(crate::CollaborationWorkProposal {
+                idempotency_key: "independent-cross-check-v1".to_string(),
+                objective: "independently cross-check the bounded source finding".to_string(),
+                role: harness_contract::execution_graph::ExecutionWorkRole::CrossCheck,
+                required_capabilities: Vec::new(),
+                input_artifact_refs: Vec::new(),
+                output_artifact_kinds: vec!["cross_check".to_string()],
+                evidence_refs: Vec::new(),
+                expected_input_tokens: 1_000,
+                expected_output_tokens: 500,
+                expected_duration_ms: 30_000,
+                scheduling_priority: 200,
+            }),
+            rationale: None,
+            estimated_cost: None,
+        })
+        .await
+        .expect("Agent work proposal");
+    let work_id = proposal_receipt
+        .pointer("/graph/autonomous_work/0/work_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("projected autonomous work id")
+        .to_string();
+    let self_bid = services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[0].clone(),
+            operation: crate::CollaborationControlOperation::Bid,
+            expected_revision: None,
+            expected_work_revision: Some(1),
+            work_node_id: Some(work_id.clone()),
+            claim_token: None,
+            lease_duration_ms: None,
+            submission_ref: None,
+            finding: None,
+            proposal: None,
+            rationale: Some("I proposed it".to_string()),
+            estimated_cost: Some(100),
+        })
+        .await
+        .expect_err("proposer cannot bid on own work");
+    assert!(self_bid.contains("cannot bid on its own proposal"));
+    let unbid_claim = services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[2].clone(),
+            operation: crate::CollaborationControlOperation::Claim,
+            expected_revision: None,
+            expected_work_revision: Some(1),
+            work_node_id: Some(work_id.clone()),
+            claim_token: None,
+            lease_duration_ms: Some(60_000),
+            submission_ref: None,
+            finding: None,
+            proposal: None,
+            rationale: None,
+            estimated_cost: None,
+        })
+        .await
+        .expect_err("Agent-proposed work requires an attested bid before claim");
+    assert!(unbid_claim.contains("only be claimed by an attested bidder"));
+    let bid_receipt = services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[1].clone(),
+            operation: crate::CollaborationControlOperation::Bid,
+            expected_revision: None,
+            expected_work_revision: Some(1),
+            work_node_id: Some(work_id.clone()),
+            claim_token: None,
+            lease_duration_ms: None,
+            submission_ref: None,
+            finding: None,
+            proposal: None,
+            rationale: Some("independent role can cross-check this artifact".to_string()),
+            estimated_cost: Some(1_500),
+        })
+        .await
+        .expect("independent Agent bid");
+    let bidder = bid_receipt
+        .pointer("/graph/autonomous_work/0/state/bids/0/bidder_instance_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("attested bidder identity");
+    let proposer = bid_receipt
+        .pointer("/graph/autonomous_work/0/work/proposed_by")
+        .and_then(serde_json::Value::as_str)
+        .expect("attested proposer identity");
+    assert_ne!(bidder, proposer);
+    let claim_receipt = services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[1].clone(),
+            operation: crate::CollaborationControlOperation::Claim,
+            expected_revision: None,
+            expected_work_revision: Some(2),
+            work_node_id: Some(work_id.clone()),
+            claim_token: None,
+            lease_duration_ms: Some(60_000),
+            submission_ref: None,
+            finding: None,
+            proposal: None,
+            rationale: None,
+            estimated_cost: None,
+        })
+        .await
+        .expect("winning bidder claims proposed work");
+    let owner_token = claim_receipt
+        .get("claim_token")
+        .and_then(serde_json::Value::as_str)
+        .expect("claim token is returned only to its owner");
+    assert!(!owner_token.is_empty());
+    assert_eq!(
+        claim_receipt
+            .pointer("/graph/autonomous_work/0/state/claim/claim_token")
+            .and_then(serde_json::Value::as_str),
+        Some("<redacted>")
+    );
+    let autonomous_graph = services
+        .graph_state_store()
+        .load(&registered.id)
+        .expect("autonomous Team graph");
+    assert_eq!(autonomous_graph.autonomous_work.len(), 1);
+    let autonomous_state = &autonomous_graph.work_states[&work_id];
+    assert_eq!(autonomous_state.bids.len(), 1);
+    assert_eq!(
+        autonomous_state.status,
+        harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Claimed
+    );
+    let autonomous_claim_token = autonomous_state
+        .claim
+        .as_ref()
+        .expect("autonomous claim")
+        .claim_token
+        .clone();
+    assert_eq!(owner_token, autonomous_claim_token);
+    let peer_release = services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[2].clone(),
+            operation: crate::CollaborationControlOperation::Release,
+            expected_revision: None,
+            expected_work_revision: Some(3),
+            work_node_id: Some(work_id.clone()),
+            claim_token: Some(autonomous_claim_token.clone()),
+            lease_duration_ms: None,
+            submission_ref: None,
+            finding: Some("attempted peer release".to_string()),
+            proposal: None,
+            rationale: None,
+            estimated_cost: None,
+        })
+        .await
+        .expect_err("a peer cannot use another Agent's leaked claim token");
+    assert!(peer_release.contains("attested Agent to own work"));
+    let forged_submission = services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[1].clone(),
+            operation: crate::CollaborationControlOperation::Submit,
+            expected_revision: None,
+            expected_work_revision: Some(3),
+            work_node_id: Some(work_id.clone()),
+            claim_token: Some(autonomous_claim_token.clone()),
+            lease_duration_ms: None,
+            submission_ref: Some("artifact://model-invented".to_string()),
+            finding: None,
+            proposal: None,
+            rationale: None,
+            estimated_cost: None,
+        })
+        .await
+        .expect_err("model-invented submission ref must fail closed");
+    assert!(forged_submission.contains("durable tool receipt or team-board entry"));
     let publish = crate::TeamWorkingStatePublishRequest {
         graph_id: registered.id.clone(),
         node_id: agent_nodes[0].clone(),
@@ -1519,12 +1714,82 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .expect("read after committed revision");
     assert!(after.entries.is_empty());
 
+    let autonomous_result = services
+        .team_runtime()
+        .publish_working_state(crate::TeamWorkingStatePublishRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[1].clone(),
+            expected_revision: 1,
+            kind: crate::TeamWorkingStateKind::Artifact,
+            summary: "independent cross-check accepted the bounded source finding".to_string(),
+            refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            visibility: crate::TeamWorkingStateVisibility::Team,
+            thread: None,
+        })
+        .await
+        .expect("claimant publishes durable result");
+    let result_entry_id = autonomous_result
+        .entries
+        .iter()
+        .find(|entry| entry.producer_instance_id == bidder)
+        .expect("claimant result entry")
+        .entry_id
+        .clone();
+    services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[1].clone(),
+            operation: crate::CollaborationControlOperation::Submit,
+            expected_revision: None,
+            expected_work_revision: Some(3),
+            work_node_id: Some(work_id.clone()),
+            claim_token: Some(autonomous_claim_token),
+            lease_duration_ms: None,
+            submission_ref: Some(format!("team-board:{result_entry_id}")),
+            finding: None,
+            proposal: None,
+            rationale: None,
+            estimated_cost: None,
+        })
+        .await
+        .expect("claimant submits durable board result");
+    services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[2].clone(),
+            operation: crate::CollaborationControlOperation::Accept,
+            expected_revision: None,
+            expected_work_revision: Some(4),
+            work_node_id: Some(work_id.clone()),
+            claim_token: None,
+            lease_duration_ms: None,
+            submission_ref: None,
+            finding: None,
+            proposal: None,
+            rationale: None,
+            estimated_cost: None,
+        })
+        .await
+        .expect("independent peer accepts proposed work");
+    let accepted_autonomous = services
+        .graph_state_store()
+        .load(&registered.id)
+        .expect("accepted autonomous graph");
+    assert_eq!(accepted_autonomous.work_states[&work_id].reviews.len(), 1);
+    assert_eq!(
+        accepted_autonomous.work_states[&work_id].status,
+        harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted
+    );
+
     let question = services
         .team_runtime()
         .publish_working_state(crate::TeamWorkingStatePublishRequest {
             graph_id: registered.id.clone(),
             node_id: agent_nodes[0].clone(),
-            expected_revision: 1,
+            expected_revision: 2,
             kind: crate::TeamWorkingStateKind::Question,
             summary: "Can the peer independently verify source coverage?".to_string(),
             refs: Vec::new(),
@@ -1551,7 +1816,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .publish_working_state(crate::TeamWorkingStatePublishRequest {
             graph_id: registered.id.clone(),
             node_id: agent_nodes[1].clone(),
-            expected_revision: 2,
+            expected_revision: 3,
             kind: crate::TeamWorkingStateKind::Response,
             summary: "Peer coverage check completed against the durable evidence.".to_string(),
             refs: vec!["evidence:test:v621".to_string()],
@@ -1570,7 +1835,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .team_runtime()
         .read_working_state_from_cursor(registered.id.clone(), agent_nodes[1].clone())
         .expect("offline peer replays committed inbox");
-    assert_eq!(unread.entries.len(), 3);
+    assert_eq!(unread.entries.len(), 4);
     let cursor = services
         .team_runtime()
         .acknowledge_working_state(crate::TeamWorkingStateAcknowledgeRequest {
@@ -1580,7 +1845,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
             expected_cursor_revision: 0,
         })
         .expect("advance durable peer cursor");
-    assert_eq!(cursor.through_revision, 3);
+    assert_eq!(cursor.through_revision, 4);
     assert!(services
         .team_runtime()
         .read_working_state_from_cursor(registered.id.clone(), agent_nodes[1].clone())
@@ -1593,7 +1858,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .publish_working_state(crate::TeamWorkingStatePublishRequest {
             graph_id: registered.id,
             node_id: agent_nodes[0].clone(),
-            expected_revision: 3,
+            expected_revision: 4,
             kind: crate::TeamWorkingStateKind::Finding,
             summary: "raw chain-of-thought must remain private".to_string(),
             refs: Vec::new(),

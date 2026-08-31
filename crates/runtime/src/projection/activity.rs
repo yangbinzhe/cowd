@@ -387,6 +387,137 @@ fn project_single_execution_activities_from_events(
         );
     }
 
+    for (index, item) in graph.autonomous_work.iter().enumerate() {
+        let activity_id = format!(
+            "activity:execution:{}:work:{}",
+            graph.graph_id, item.work_id
+        );
+        let status = match item.state.status {
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Offered => "ready",
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Claimed => "running",
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Submitted => "waiting",
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted => "completed",
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged => "blocked",
+        };
+        let public_summary = format!(
+            "{} · proposed_by={} · bids={} · reviews={}",
+            item.work
+                .objective
+                .as_deref()
+                .unwrap_or("Agent-proposed work"),
+            item.work
+                .proposed_by
+                .as_deref()
+                .unwrap_or("runtime-attested"),
+            item.state.bids.len(),
+            item.state.reviews.len(),
+        );
+        activities.insert(
+            activity_id.clone(),
+            ExecutionActivityProjection {
+                schema_version: EXECUTION_ACTIVITY_SCHEMA_VERSION,
+                activity_id,
+                scope: root_scope.clone(),
+                kind: ExecutionActivityKind::Artifact,
+                node_id: Some(item.work_id.clone()),
+                display_label: item.work.objective.clone(),
+                phase: Some("autonomous_work".to_string()),
+                visibility: vec![ActivityVisibility::Operational, ActivityVisibility::Audit],
+                parent_activity_id: Some(root_id.clone()),
+                initiator_activity_id: Some(root_id.clone()),
+                causal_parent_ids: Vec::new(),
+                dependency_ids: Vec::new(),
+                parallel_group_id: None,
+                team_run_id: graph
+                    .graph_id
+                    .strip_prefix("team-graph:")
+                    .map(str::to_string),
+                agent_instance_id: item
+                    .state
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.claimant_instance_id.clone()),
+                agent_run_id: None,
+                skill_id: None,
+                skill_revision: None,
+                skill_activation_id: None,
+                tool_contract_id: Some("collaboration_control".to_string()),
+                tool_call_id: None,
+                approval_id: None,
+                status: status.to_string(),
+                status_reason_kind: None,
+                blocked_by_activity_ids: Vec::new(),
+                evidence_ready: (!item.work.proposal_evidence_refs.is_empty()).then_some(true),
+                effect_summary: None,
+                acceptance_summary: (!item.state.reviews.is_empty()).then(|| {
+                    let satisfied = item
+                        .state
+                        .reviews
+                        .iter()
+                        .filter(|review| {
+                            review.verdict
+                                == harness_contract::execution_graph::ExecutionWorkReviewVerdict::Accept
+                        })
+                        .count() as u32;
+                    let required = match &item.work.review_policy {
+                        harness_contract::execution_graph::ExecutionWorkReviewPolicy::None => 0,
+                        harness_contract::execution_graph::ExecutionWorkReviewPolicy::Peer {
+                            minimum_reviewers,
+                            ..
+                        } => u32::from(*minimum_reviewers),
+                    };
+                    AcceptanceSummaryProjection {
+                        satisfied,
+                        unsatisfied: required.saturating_sub(satisfied),
+                        framework_invalid: false,
+                        unresolved: u32::from(
+                            item.state.status
+                                == harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged,
+                        ),
+                    }
+                }),
+                work_status: Some(format!("{:?}", item.state.status).to_ascii_lowercase()),
+                work_revision: Some(item.state.revision),
+                claimant_instance_id: item
+                    .state
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.claimant_instance_id.clone()),
+                claimant_role_id: item
+                    .state
+                    .claim
+                    .as_ref()
+                    .and_then(|claim| claim.claimant_role_id.clone()),
+                claim_lease_expires_at_ms: item
+                    .state
+                    .claim
+                    .as_ref()
+                    .map(|claim| claim.lease_expires_at_ms),
+                input_artifact_refs: item.work.input_artifact_refs.clone(),
+                output_artifact_kinds: item.work.output_artifact_kinds.clone(),
+                status_reason: (item.state.status
+                    == harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged)
+                    .then(|| item.state.review_findings.last().cloned())
+                    .flatten(),
+                required: item.work.required,
+                started_at_ms: item.state.claim.as_ref().map(|claim| claim.claimed_at_ms),
+                completed_at_ms: (item.state.status
+                    == harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted)
+                    .then(|| item.state.claim.as_ref().map(|claim| claim.heartbeat_at_ms))
+                    .flatten(),
+                duration_ms: None,
+                sequence: graph.nodes.len() as u64 + index as u64 + 1,
+                commit_cursor: graph.commit_cursor,
+                public_summary: Some(public_summary),
+                result_summary: item.state.submission_ref.clone(),
+                artifact_refs: item.work.input_artifact_refs.clone(),
+                evidence_refs: item.work.proposal_evidence_refs.clone(),
+                definition_refs: Vec::new(),
+                detail_capability: Some(activity_detail_capability(&graph.graph_id)),
+            },
+        );
+    }
+
     insert_descendant_graph_activities(&mut activities, scope, &root_scope);
 
     let team_activity_by_run = activities
@@ -2241,6 +2372,9 @@ mod tests {
             usage: Default::default(),
             work: Some(harness_contract::execution_graph::ExecutionWorkProjection {
                 collaboration_work_id: None,
+                objective: None,
+                proposed_by: None,
+                proposal_evidence_refs: Vec::new(),
                 role: harness_contract::execution_graph::ExecutionWorkRole::Verify,
                 required,
                 dependency: Default::default(),
@@ -2270,6 +2404,7 @@ mod tests {
             lineage: None,
             orchestration: None,
             nodes,
+            autonomous_work: Vec::new(),
             edges: Vec::new(),
             commit_cursor: 1,
             terminal_result_ref: None,

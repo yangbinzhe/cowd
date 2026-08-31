@@ -152,6 +152,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 node_statuses: BTreeMap::new(),
                 node_results: BTreeMap::new(),
                 work_states: BTreeMap::new(),
+                autonomous_work: BTreeMap::new(),
                 recovery_cursor: ExecutionRecoveryCursor::default(),
             },
             role_nodes: BTreeMap::new(),

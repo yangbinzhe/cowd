@@ -196,6 +196,9 @@ struct CollaborationControlToolRequest {
     lease_duration_ms: Option<u64>,
     submission_ref: Option<String>,
     finding: Option<String>,
+    proposal: Option<runtime::CollaborationWorkProposal>,
+    rationale: Option<String>,
+    estimated_cost: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -721,6 +724,9 @@ impl GatewayToolExecutor {
                     lease_duration_ms: input.lease_duration_ms,
                     submission_ref: input.submission_ref,
                     finding: input.finding,
+                    proposal: input.proposal,
+                    rationale: input.rationale,
+                    estimated_cost: input.estimated_cost,
                 })
                 .await
                 .map_err(ToolError::new)?;
@@ -3131,7 +3137,29 @@ mod tests {
         .expect("semantic control payload");
         assert_eq!(valid.expected_work_revision, Some(0));
 
-        for forbidden in ["agent_instance_id", "role_id", "team_id", "graph_id"] {
+        let proposal = serde_json::from_value::<CollaborationControlToolRequest>(json!({
+            "operation": "propose_work",
+            "expected_work_revision": 0,
+            "proposal": {
+                "idempotency_key": "cross-check-v1",
+                "objective": "cross-check the accepted source artifact",
+                "role": "cross_check",
+                "output_artifact_kinds": ["review"]
+            }
+        }))
+        .expect("bounded proposal payload");
+        assert_eq!(
+            proposal.operation,
+            runtime::CollaborationControlOperation::ProposeWork
+        );
+
+        for forbidden in [
+            "agent_instance_id",
+            "role_id",
+            "team_id",
+            "graph_id",
+            "work_id",
+        ] {
             let mut payload = json!({"operation":"inspect"});
             payload[forbidden] = json!("forged");
             assert!(

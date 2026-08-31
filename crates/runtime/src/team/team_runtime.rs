@@ -3,6 +3,7 @@
 //! TeamRuntime compiles collaboration semantics and reads projections. It owns
 //! no scheduler, worker, state file, or process-global registry.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use harness_contract::{
@@ -10,6 +11,7 @@ use harness_contract::{
     reality::EvidenceRef,
     team::{TeamInstantiationRequest, TeamTemplateRevisionRef},
 };
+use sha2::{Digest, Sha256};
 
 use crate::execution_core::ExecutionStateStoreError;
 use crate::{
@@ -653,13 +655,189 @@ impl TeamRuntime {
                 })
                 .map_err(|error| error.to_string());
         }
-        let expected_work_revision = request.expected_work_revision.ok_or_else(|| {
-            "collaboration control mutation requires expected_work_revision".to_string()
-        })?;
-        let work_node_id = request
-            .work_node_id
+        let proposed_contract = if request.operation == CollaborationControlOperation::ProposeWork {
+            let proposal = request.proposal.as_ref().ok_or_else(|| {
+                "collaboration propose_work requires a bounded proposal".to_string()
+            })?;
+            let idempotency_key = proposal.idempotency_key.trim();
+            if idempotency_key.is_empty() || idempotency_key.chars().count() > 160 {
+                return Err(
+                    "collaboration proposal idempotency_key must contain 1..160 characters"
+                        .to_string(),
+                );
+            }
+            let mut known_refs = packet
+                .evidence_refs
+                .iter()
+                .flat_map(|reference| {
+                    [
+                        reference.evidence_ref.id.clone(),
+                        reference.retrieval_selector.clone(),
+                    ]
+                })
+                .filter(|value| !value.trim().is_empty())
+                .collect::<BTreeSet<_>>();
+            for result in graph.node_results.values() {
+                known_refs.extend(result.result_ref.iter().cloned());
+                known_refs.extend(
+                    result
+                        .evidence_refs
+                        .iter()
+                        .map(|reference| reference.evidence_ref.id.clone()),
+                );
+            }
+            if let Some(team_id) = packet.team_id() {
+                if let Ok(board) = self.working_state_for_graph(team_id, &graph.id) {
+                    known_refs.extend(board.entries.iter().flat_map(|entry| {
+                        entry.refs.iter().chain(entry.artifact_refs.iter()).cloned()
+                    }));
+                }
+            }
+            if proposal
+                .input_artifact_refs
+                .iter()
+                .chain(proposal.evidence_refs.iter())
+                .any(|reference| !known_refs.contains(reference))
+            {
+                return Err(
+                    "collaboration proposal references evidence or artifacts not held by the Team"
+                        .to_string(),
+                );
+            }
+            let eligible_peer_exists = graph.nodes.iter().any(|node| {
+                node.id != request.node_id
+                    && node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+                    && graph
+                        .node_statuses
+                        .get(&node.id)
+                        .is_some_and(|status| !status.is_terminal())
+                    && serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).is_ok_and(
+                        |candidate| {
+                            proposal.required_capabilities.iter().all(|required| {
+                                candidate.allowed_tools.iter().any(|tool| tool == required)
+                            })
+                        },
+                    )
+            });
+            if !eligible_peer_exists {
+                return Err(
+                    "collaboration proposal has no other active eligible Agent in this Team"
+                        .to_string(),
+                );
+            }
+            let work_id = format!(
+                "agent-work:{:x}",
+                Sha256::digest(
+                    format!(
+                        "{}:{}:{idempotency_key}",
+                        graph.id, binding.instance.instance_id
+                    )
+                    .as_bytes()
+                )
+            );
+            let mut contract =
+                harness_contract::execution_graph::ExecutionWorkContract::new(proposal.role);
+            contract.collaboration_work_id = Some(work_id.clone());
+            contract.objective = Some(proposal.objective.trim().to_string());
+            contract.proposed_by = Some(binding.instance.instance_id.clone());
+            contract.proposal_evidence_refs = proposal.evidence_refs.clone();
+            contract.required_evidence_refs = proposal.evidence_refs.clone();
+            contract.eligibility.required_capabilities = proposal.required_capabilities.clone();
+            contract.input_artifact_refs = proposal.input_artifact_refs.clone();
+            contract.output_artifact_kinds = proposal.output_artifact_kinds.clone();
+            contract.review_policy =
+                harness_contract::execution_graph::ExecutionWorkReviewPolicy::Peer {
+                    minimum_reviewers: 1,
+                    eligible_role_ids: Vec::new(),
+                };
+            contract.expected_input_tokens = proposal.expected_input_tokens;
+            contract.expected_output_tokens = proposal.expected_output_tokens;
+            contract.expected_duration_ms = proposal.expected_duration_ms;
+            contract.scheduling_priority = proposal.scheduling_priority;
+            Some((work_id, contract))
+        } else {
+            None
+        };
+        if let Some((work_id, contract)) = proposed_contract.as_ref() {
+            if let Some(existing) = graph.autonomous_work.get(work_id) {
+                if existing != contract {
+                    return Err(format!(
+                        "collaboration proposal idempotency key collides with different work `{work_id}`"
+                    ));
+                }
+                let projection = self
+                    .execution
+                    .graph_projection(&graph.id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                return Ok(serde_json::json!({
+                    "operation": request.operation,
+                    "attested_agent_instance_id": binding.instance.instance_id,
+                    "accepted_revision": graph.revision,
+                    "idempotent_replay": true,
+                    "claim_token": null,
+                    "graph": projection,
+                }));
+            }
+        }
+        if request.operation == CollaborationControlOperation::Submit {
+            let submission_ref = request
+                .submission_ref
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "collaboration submit requires submission_ref".to_string())?;
+            let durable_tool_ref = self
+                .execution
+                .load_delegated_agent_tool_receipts(&graph.id, &request.node_id, packet.attempt)?
+                .into_iter()
+                .any(|receipt| {
+                    receipt.outcome.evidence_ref == submission_ref
+                        || receipt.outcome.observed_evidence.iter().any(|evidence| {
+                            evidence.evidence_ref.as_ref().is_some_and(|reference| {
+                                reference.evidence_ref.id == submission_ref
+                                    || reference.retrieval_selector == submission_ref
+                            })
+                        })
+                });
+            let durable_board_ref = submission_ref
+                .strip_prefix("team-board:")
+                .and_then(|entry_id| {
+                    packet.team_id().and_then(|team_id| {
+                        self.working_state_for_graph(team_id, &graph.id)
+                            .ok()
+                            .and_then(|board| {
+                                board.entries.into_iter().find(|entry| {
+                                    entry.entry_id == entry_id
+                                        && entry.producer_instance_id
+                                            == binding.instance.instance_id
+                                })
+                            })
+                    })
+                })
+                .is_some();
+            if !durable_tool_ref && !durable_board_ref {
+                return Err(
+                    "collaboration submission_ref must name this Agent's durable tool receipt or team-board entry"
+                        .to_string(),
+                );
+            }
+        }
+        let expected_work_revision = if proposed_contract.is_some() {
+            request.expected_work_revision.unwrap_or(0)
+        } else {
+            request.expected_work_revision.ok_or_else(|| {
+                "collaboration control mutation requires expected_work_revision".to_string()
+            })?
+        };
+        let work_node_id = proposed_contract
+            .as_ref()
+            .map(|(work_id, _)| work_id.clone())
+            .or(request.work_node_id.clone())
             .unwrap_or_else(|| request.node_id.clone());
-        if !graph.nodes.iter().any(|node| node.id == work_node_id) {
+        if proposed_contract.is_none()
+            && !graph.nodes.iter().any(|node| node.id == work_node_id)
+            && !graph.autonomous_work.contains_key(&work_node_id)
+        {
             return Err(format!(
                 "collaboration control work node `{work_node_id}` is outside Team graph `{}`",
                 graph.id
@@ -695,14 +873,56 @@ impl TeamRuntime {
                     "collaboration work revision mismatch for `{work_node_id}`: expected {expected_work_revision}, actual {observed_work_revision}"
                 ));
             }
+            if matches!(
+                request.operation,
+                CollaborationControlOperation::Heartbeat
+                    | CollaborationControlOperation::Release
+                    | CollaborationControlOperation::Submit
+            ) && current
+                .work_states
+                .get(&work_node_id)
+                .and_then(|state| state.claim.as_ref())
+                .is_none_or(|claim| claim.claimant_instance_id != binding.instance.instance_id)
+            {
+                return Err(format!(
+                    "collaboration {} requires the attested Agent to own work `{work_node_id}`",
+                    serde_json::to_value(request.operation)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "mutation".to_string())
+                ));
+            }
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
             let command = match request.operation {
                 CollaborationControlOperation::Inspect => unreachable!(),
+                CollaborationControlOperation::ProposeWork => {
+                    let (_, contract) = proposed_contract.as_ref().expect("proposal was validated");
+                    harness_contract::execution_graph::ExecutionGraphCommand::ProposeWork {
+                        expected_revision: current.revision,
+                        work_id: work_node_id.clone(),
+                        contract: Box::new(contract.clone()),
+                    }
+                }
+                CollaborationControlOperation::Bid => {
+                    harness_contract::execution_graph::ExecutionGraphCommand::BidWork {
+                        expected_revision: current.revision,
+                        work_id: work_node_id.clone(),
+                        bidder_instance_id: binding.instance.instance_id.clone(),
+                        bidder_role_id: role_id.clone(),
+                        bidder_capabilities: packet.allowed_tools.clone(),
+                        rationale: request
+                            .rationale
+                            .clone()
+                            .ok_or_else(|| "collaboration bid requires rationale".to_string())?,
+                        estimated_cost: request.estimated_cost.unwrap_or_default(),
+                        bid_at_ms: now_ms,
+                    }
+                }
                 CollaborationControlOperation::Claim => {
-                    let lease_duration_ms = request.lease_duration_ms.unwrap_or(60_000);
+                    let lease_duration_ms = request.lease_duration_ms.unwrap_or(300_000);
                     if !(5_000..=300_000).contains(&lease_duration_ms) {
                         return Err(
                             "collaboration claim lease_duration_ms must be within 5000..300000"
@@ -720,7 +940,7 @@ impl TeamRuntime {
                     }
                 }
                 CollaborationControlOperation::Heartbeat => {
-                    let lease_duration_ms = request.lease_duration_ms.unwrap_or(60_000);
+                    let lease_duration_ms = request.lease_duration_ms.unwrap_or(300_000);
                     if !(5_000..=300_000).contains(&lease_duration_ms) {
                         return Err(
                             "collaboration heartbeat lease_duration_ms must be within 5000..300000"
@@ -768,6 +988,8 @@ impl TeamRuntime {
                         expected_revision: current.revision,
                         node_id: work_node_id.clone(),
                         reviewer_instance_id: binding.instance.instance_id.clone(),
+                        reviewer_role_id: role_id.clone(),
+                        reviewed_at_ms: now_ms,
                     }
                 }
                 CollaborationControlOperation::Challenge => {
@@ -775,9 +997,11 @@ impl TeamRuntime {
                         expected_revision: current.revision,
                         node_id: work_node_id.clone(),
                         reviewer_instance_id: binding.instance.instance_id.clone(),
+                        reviewer_role_id: role_id.clone(),
                         finding: request.finding.clone().ok_or_else(|| {
                             "collaboration challenge requires finding".to_string()
                         })?,
+                        reviewed_at_ms: now_ms,
                     }
                 }
             };
@@ -807,6 +1031,17 @@ impl TeamRuntime {
         let receipt = receipt.ok_or_else(|| {
             format!("collaboration control contention budget exhausted for `{work_node_id}`")
         })?;
+        let committed_graph = self
+            .graphs
+            .load_async(graph.id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let caller_claim_token = committed_graph
+            .work_states
+            .get(&work_node_id)
+            .and_then(|state| state.claim.as_ref())
+            .filter(|claim| claim.claimant_instance_id == binding.instance.instance_id)
+            .map(|claim| claim.claim_token.clone());
         let projection = self
             .execution
             .graph_projection(&graph.id)
@@ -816,6 +1051,7 @@ impl TeamRuntime {
             "operation": request.operation,
             "attested_agent_instance_id": binding.instance.instance_id,
             "accepted_revision": receipt.accepted_revision,
+            "claim_token": caller_claim_token,
             "graph": projection,
         }))
     }

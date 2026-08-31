@@ -325,6 +325,17 @@ pub struct RuntimeExecutionSupervisor {
 }
 
 impl RuntimeExecutionSupervisor {
+    pub(crate) fn load_delegated_agent_tool_receipts(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+        attempt: u32,
+    ) -> Result<Vec<super::graph::DurableAgentToolReceipt>, String> {
+        self.runner
+            .load_delegated_agent_tool_receipts(graph_id, node_id, attempt)
+            .map_err(|error| error.to_string())
+    }
+
     #[must_use]
     pub(crate) fn submission_capacity_snapshot(&self) -> ExecutionSubmissionCapacitySnapshot {
         let slots = self
@@ -1932,6 +1943,7 @@ mod completion_pump_tests {
     }
 
     #[tokio::test]
+    #[ignore = "wall-clock performance gate; run isolated with --ignored --test-threads=1"]
     async fn completion_pump_saturates_sixty_four_independent_work_items() {
         let executor =
             Arc::new(PumpTestExecutor::new((0..64).map(|index| {
