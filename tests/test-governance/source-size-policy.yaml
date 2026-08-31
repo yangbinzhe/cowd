@@ -1,8 +1,11 @@
 schema_version: 1
 max_lines: 5000
 structural:
-  core_base: a78592f09cb325aa3e7e203a103bd69f7d1b2138
-  edge_base: a17e0f012858d61af193cc7170cb28f99d54b063
+  # Immutable start-of-phase snapshots. Structural limits reject only new or
+  # worsened debt relative to these audited commits; global source-size limits
+  # remain absolute and cannot be baseline-waived.
+  core_base: 1b18e0878a166346396b061fca9ff4a011213885
+  edge_base: e4e6431d2131453965f4a34484a21d26f5009b4d
   max_function_lines: 250
   max_state_fields: 40
   max_composition_handles: 24

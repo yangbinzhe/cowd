@@ -38,6 +38,150 @@ pub struct TeamRuntime {
     missions: Arc<MissionRuntime>,
 }
 
+/// Return the collaboration market as a bounded, action-first control view.
+///
+/// The public graph projection is intentionally rich enough for operators and
+/// Surfaces, but returning that entire projection to every model-side inspect
+/// buried the mutation fences and eligible work behind tens of kilobytes of
+/// topology. This view contains only the state an Agent can act on. Full graph
+/// observability remains available through the graph and Mission APIs.
+fn collaboration_control_view(
+    operation: CollaborationControlOperation,
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    caller_node_id: &str,
+    caller_instance_id: &str,
+    caller_role_id: Option<&str>,
+    accepted_revision: Option<u64>,
+    claim_token: Option<String>,
+    idempotent_replay: bool,
+) -> serde_json::Value {
+    use harness_contract::execution_graph::ExecutionWorkRuntimeStatus;
+
+    let active_peers = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.id != caller_node_id
+                && node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+                && graph
+                    .node_statuses
+                    .get(&node.id)
+                    .is_some_and(|status| !status.is_terminal())
+        })
+        .filter_map(|node| {
+            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                .ok()
+                .map(|packet| {
+                    serde_json::json!({
+                        "node_id": node.id,
+                        "instance_id": packet.assignment.instance_id,
+                        "role_id": packet.assignment.role_id,
+                        "capabilities": packet.allowed_tools,
+                    })
+                })
+        })
+        .collect::<Vec<_>>();
+
+    let assigned_work = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let work = node.work.as_ref()?;
+            let state = graph.work_states.get(&node.id).cloned().unwrap_or_default();
+            let identity = serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok();
+            Some(serde_json::json!({
+                "work_node_id": node.id,
+                "role_id": identity.as_ref().map(|packet| packet.assignment.role_id.as_str()),
+                "status": state.status,
+                "work_revision": state.revision,
+                "work_role": work.role,
+                "required": work.required,
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    let autonomous_work = graph
+        .autonomous_work
+        .iter()
+        .map(|(work_id, work)| {
+            let mut state = graph.work_states.get(work_id).cloned().unwrap_or_default();
+            if let Some(claim) = state.claim.as_mut() {
+                claim.claim_token = "<redacted>".to_string();
+            }
+            let already_bid = state
+                .bids
+                .iter()
+                .any(|bid| bid.bidder_instance_id == caller_instance_id);
+            let owner = state
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.claimant_instance_id == caller_instance_id);
+            let proposed_by_caller = work.proposed_by.as_deref() == Some(caller_instance_id);
+            let mut next_actions = Vec::new();
+            match state.status {
+                ExecutionWorkRuntimeStatus::Offered | ExecutionWorkRuntimeStatus::Challenged => {
+                    if !proposed_by_caller && !already_bid {
+                        next_actions.push("bid");
+                    }
+                    if !proposed_by_caller && already_bid {
+                        next_actions.push("claim");
+                    }
+                }
+                ExecutionWorkRuntimeStatus::Claimed if owner => {
+                    next_actions.extend(["heartbeat", "submit"]);
+                }
+                ExecutionWorkRuntimeStatus::Submitted if !owner && !proposed_by_caller => {
+                    next_actions.extend(["accept", "challenge"]);
+                }
+                ExecutionWorkRuntimeStatus::Claimed
+                | ExecutionWorkRuntimeStatus::Submitted
+                | ExecutionWorkRuntimeStatus::Accepted => {}
+            }
+            serde_json::json!({
+                "work_node_id": work_id,
+                "objective": work.objective,
+                "proposed_by": work.proposed_by,
+                "required_capabilities": work.eligibility.required_capabilities,
+                "output_artifact_kinds": work.output_artifact_kinds,
+                "status": state.status,
+                "work_revision": state.revision,
+                "bids": state.bids,
+                "claim": state.claim,
+                "submission_ref": state.submission_ref,
+                "reviews": state.reviews,
+                "review_findings": state.review_findings,
+                "next_actions_for_caller": next_actions,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "action_guide": {
+            "rule": "Use each work item's work_revision as expected_work_revision. Agent-proposed work requires bid before claim; only the claim owner receives claim_token; a different peer must accept or challenge a submission.",
+            "propose_work": {"operation": "propose_work", "expected_work_revision": 0, "proposal": {"idempotency_key": "stable-key", "objective": "bounded objective", "role": "cross_check", "output_artifact_kinds": ["cross_check"]}},
+            "bid": {"operation": "bid", "work_node_id": "<id>", "expected_work_revision": "<revision>", "rationale": "bounded rationale", "estimated_cost": 0},
+            "claim": {"operation": "claim", "work_node_id": "<id>", "expected_work_revision": "<revision>", "lease_duration_ms": 300000},
+            "submit": {"operation": "submit", "work_node_id": "<id>", "expected_work_revision": "<revision>", "claim_token": "<owner-token>", "submission_ref": "team-board:<entry_id>"},
+            "review": {"operation": "accept|challenge", "work_node_id": "<id>", "expected_work_revision": "<revision>"}
+        },
+        "accepted_revision": accepted_revision,
+        "attested_agent_instance_id": caller_instance_id,
+        "caller": {"node_id": caller_node_id, "role_id": caller_role_id},
+        "claim_token": claim_token,
+        "graph_id": graph.id,
+        "graph_revision": graph.revision,
+        "idempotent_replay": idempotent_replay,
+        "marketplace": {
+            "active_peer_count": active_peers.len(),
+            "active_peers": active_peers,
+            "assigned_work": assigned_work,
+            "autonomous_work": autonomous_work,
+            "can_propose_work": !active_peers.is_empty(),
+        },
+        "operation": operation,
+    })
+}
+
 impl TeamRuntime {
     #[must_use]
     pub fn new(
@@ -642,18 +786,16 @@ impl TeamRuntime {
             .team_role_assignment()
             .map(|role| role.identity.role_id.clone());
         if request.operation == CollaborationControlOperation::Inspect {
-            return self
-                .execution
-                .graph_projection(&graph.id)
-                .await
-                .map(|projection| {
-                    serde_json::json!({
-                        "operation": "inspect",
-                        "attested_agent_instance_id": binding.instance.instance_id,
-                        "graph": projection,
-                    })
-                })
-                .map_err(|error| error.to_string());
+            return Ok(collaboration_control_view(
+                request.operation,
+                &graph,
+                &request.node_id,
+                &binding.instance.instance_id,
+                role_id.as_deref(),
+                None,
+                None,
+                false,
+            ));
         }
         let proposed_contract = if request.operation == CollaborationControlOperation::ProposeWork {
             let proposal = request.proposal.as_ref().ok_or_else(|| {
@@ -765,19 +907,16 @@ impl TeamRuntime {
                         "collaboration proposal idempotency key collides with different work `{work_id}`"
                     ));
                 }
-                let projection = self
-                    .execution
-                    .graph_projection(&graph.id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                return Ok(serde_json::json!({
-                    "operation": request.operation,
-                    "attested_agent_instance_id": binding.instance.instance_id,
-                    "accepted_revision": graph.revision,
-                    "idempotent_replay": true,
-                    "claim_token": null,
-                    "graph": projection,
-                }));
+                return Ok(collaboration_control_view(
+                    request.operation,
+                    &graph,
+                    &request.node_id,
+                    &binding.instance.instance_id,
+                    role_id.as_deref(),
+                    Some(graph.revision),
+                    None,
+                    true,
+                ));
             }
         }
         if request.operation == CollaborationControlOperation::Submit {
@@ -1042,18 +1181,16 @@ impl TeamRuntime {
             .and_then(|state| state.claim.as_ref())
             .filter(|claim| claim.claimant_instance_id == binding.instance.instance_id)
             .map(|claim| claim.claim_token.clone());
-        let projection = self
-            .execution
-            .graph_projection(&graph.id)
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(serde_json::json!({
-            "operation": request.operation,
-            "attested_agent_instance_id": binding.instance.instance_id,
-            "accepted_revision": receipt.accepted_revision,
-            "claim_token": caller_claim_token,
-            "graph": projection,
-        }))
+        Ok(collaboration_control_view(
+            request.operation,
+            &committed_graph,
+            &request.node_id,
+            &binding.instance.instance_id,
+            role_id.as_deref(),
+            Some(receipt.accepted_revision),
+            caller_claim_token,
+            false,
+        ))
     }
 
     /// Rebuild the team-local collaboration projection from events committed

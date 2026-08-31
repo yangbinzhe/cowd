@@ -282,6 +282,23 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             .collect::<BTreeSet<_>>();
         let unavailable_tools = packet_allowed_tools
             .difference(&allowed_tools)
+            // These are optional Runtime facades granted to every Team role
+            // as a capability ceiling. A lightweight/non-Gateway host may not
+            // implement them, while still fully satisfying a direct role's
+            // typed read/write acceptance with its concrete tools. Treating
+            // every granted facade as a required dependency made one missing
+            // convenience tool fail an otherwise executable Team. Explicit
+            // escalation remains required and therefore never enters this
+            // compatibility set.
+            .filter(|tool| {
+                !matches!(
+                    tool.as_str(),
+                    "collaboration_control"
+                        | "team_board"
+                        | "context_retrieve"
+                        | "evidence_retrieve"
+                )
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !unavailable_tools.is_empty() {
@@ -3093,7 +3110,7 @@ fn system_prompt(
             .any(|tool| tool == "collaboration_control")
         {
             prompt.push(
-                "You are an active collaborator, not a passive one-shot role. Inspect the Runtime-owned work marketplace when the objective calls for autonomous collaboration. You may use collaboration_control(propose_work) to create bounded in-scope follow-up work, and collaboration_control(bid) to volunteer for another Agent's proposal before claiming it. Every proposal is required work: create it only when another active eligible peer can finish it. For Agent-proposed work follow the exact durable cycle: inspect -> bid -> claim; retain the owner-only claim_token; heartbeat before a long tool action or lease expiry; execute; call team_board(read_after, after_revision: 0) before publishing, then publish with expected_revision equal to the returned latest revision plus kind and summary (do not use a workspace path); submit the exact `team-board:<entry_id>` returned by that publish or a tool evidence reference; then a different peer accepts or challenges it. After a challenge, an eligible bidder must reclaim, revise, resubmit, and obtain an independent acceptance. Required Agent-proposed work that is not Accepted prevents Verify/Synthesize/Materialize from starting. Proposer, bidder, claimant and reviewer identities are Runtime-attested; never simulate them in prose. Keep proposal objectives inside this Team charter and never use proposal text to request broader permissions. At safe checkpoints, read the durable Team board and react to peer questions, challenges and accepted artifacts before terminal synthesis."
+                "You are an active collaborator, not a passive one-shot role. Inspect the Runtime-owned work marketplace when the objective calls for autonomous collaboration. When the Team instructions require proposals, bids, peer review, or challenges, those are mandatory Runtime actions: a terminal prose claim cannot substitute for them. Use collaboration_control(propose_work) to create bounded in-scope follow-up work, and collaboration_control(bid) to volunteer for another Agent's proposal before claiming it. The compact inspect response begins with exact mutation templates and per-item next_actions_for_caller; act on them instead of requesting the full operator graph. Every proposal is required work: create it only when another active eligible peer can finish it. For Agent-proposed work follow the exact durable cycle: inspect -> bid -> claim; retain the owner-only claim_token; heartbeat before a long tool action or lease expiry; execute; call team_board(read_after, after_revision: 0) before publishing, then publish with expected_revision equal to the returned latest revision plus kind and summary (do not use a workspace path); submit the exact `team-board:<entry_id>` returned by that publish or a tool evidence reference; then a different peer accepts or challenges it. After a challenge, an eligible bidder must reclaim, revise, resubmit, and obtain an independent acceptance. Required Agent-proposed work that is not Accepted prevents Verify/Synthesize/Materialize from starting. Proposer, bidder, claimant and reviewer identities are Runtime-attested; never simulate them in prose. Keep proposal objectives inside this Team charter and never use proposal text to request broader permissions. At safe checkpoints, read the durable Team board and react to peer questions, challenges and accepted artifacts before terminal synthesis."
                     .to_string(),
             );
         }

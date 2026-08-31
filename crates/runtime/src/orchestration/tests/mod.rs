@@ -1378,6 +1378,50 @@ fn failed_team_requirement_projects_a_typed_program_diagnostic() {
     assert!(diagnostics[0].retryable);
 }
 
+async fn assert_compact_collaboration_market(
+    services: &RuntimeServices,
+    graph_id: &str,
+    agent_nodes: &[String],
+) {
+    assert!(agent_nodes.len() >= 5);
+    let inspect = services
+        .team_runtime()
+        .apply_collaboration_control(crate::CollaborationControlRequest {
+            graph_id: graph_id.to_string(),
+            node_id: agent_nodes[0].clone(),
+            operation: crate::CollaborationControlOperation::Inspect,
+            expected_revision: None,
+            expected_work_revision: None,
+            work_node_id: None,
+            claim_token: None,
+            lease_duration_ms: None,
+            submission_ref: None,
+            finding: None,
+            proposal: None,
+            rationale: None,
+            estimated_cost: None,
+        })
+        .await
+        .expect("compact collaboration market inspect");
+    assert!(inspect.get("graph").is_none());
+    assert!(inspect.pointer("/action_guide/propose_work").is_some());
+    assert_eq!(
+        inspect
+            .pointer("/marketplace/active_peer_count")
+            .and_then(serde_json::Value::as_u64),
+        Some((agent_nodes.len() - 1) as u64)
+    );
+    let inspect_json = serde_json::to_string_pretty(&inspect).expect("serialize market inspect");
+    assert!(
+        inspect_json.len() < 16_384,
+        "inspect must stay model-visible"
+    );
+    assert!(
+        inspect_json.find("action_guide") < inspect_json.find("attested_agent_instance_id"),
+        "action guide must precede identity metadata in model-visible output"
+    );
+}
+
 #[tokio::test]
 async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
     let services = RuntimeServices::in_memory().expect("runtime services");
@@ -1431,7 +1475,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
         .map(|node| node.id.clone())
         .collect::<Vec<_>>();
-    assert!(agent_nodes.len() >= 5);
+    assert_compact_collaboration_market(&services, &registered.id, &agent_nodes).await;
     let claim_request = |node_id: String| crate::CollaborationControlRequest {
         graph_id: registered.id.clone(),
         node_id: node_id.clone(),
@@ -1518,7 +1562,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .await
         .expect("Agent work proposal");
     let work_id = proposal_receipt
-        .pointer("/graph/autonomous_work/0/work_id")
+        .pointer("/marketplace/autonomous_work/0/work_node_id")
         .and_then(serde_json::Value::as_str)
         .expect("projected autonomous work id")
         .to_string();
@@ -1582,11 +1626,11 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .await
         .expect("independent Agent bid");
     let bidder = bid_receipt
-        .pointer("/graph/autonomous_work/0/state/bids/0/bidder_instance_id")
+        .pointer("/marketplace/autonomous_work/0/bids/0/bidder_instance_id")
         .and_then(serde_json::Value::as_str)
         .expect("attested bidder identity");
     let proposer = bid_receipt
-        .pointer("/graph/autonomous_work/0/work/proposed_by")
+        .pointer("/marketplace/autonomous_work/0/proposed_by")
         .and_then(serde_json::Value::as_str)
         .expect("attested proposer identity");
     assert_ne!(bidder, proposer);
@@ -1616,7 +1660,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
     assert!(!owner_token.is_empty());
     assert_eq!(
         claim_receipt
-            .pointer("/graph/autonomous_work/0/state/claim/claim_token")
+            .pointer("/marketplace/autonomous_work/0/claim/claim_token")
             .and_then(serde_json::Value::as_str),
         Some("<redacted>")
     );

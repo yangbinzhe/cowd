@@ -1464,6 +1464,9 @@ pub(crate) fn team_acceptance_contract(
                         },
                     }
                 }
+                _ if criterion.starts_with("independent_review:") => {
+                    independent_review_requirement(criterion)
+                }
                 "implementation" => TeamAcceptanceRequirement {
                     criterion: criterion.clone(),
                     check: TeamAcceptanceCheck::WorkspaceChange {
@@ -1556,6 +1559,17 @@ pub(crate) fn team_acceptance_contract(
             Ok(check)
         })
         .collect()
+}
+
+/// An independent review is a typed `review_of` relationship verified by the
+/// intent compiler, not an instruction to invent an unrelated source scope.
+/// Its durable predecessor evidence is separate from the `review` output field
+/// and from any explicit fresh `evidence_scope` acquisition.
+fn independent_review_requirement(criterion: &str) -> TeamAcceptanceRequirement {
+    TeamAcceptanceRequirement {
+        criterion: criterion.to_string(),
+        check: TeamAcceptanceCheck::UpstreamEvidence,
+    }
 }
 
 fn is_policy_only_acceptance_clause(criterion: &str) -> bool {
@@ -2789,6 +2803,10 @@ mod acceptance_contract_tests {
         assert!(!contract
             .iter()
             .any(|requirement| requirement.check == TeamAcceptanceCheck::UpstreamReview));
+        assert!(contract.iter().any(|requirement| {
+            requirement.criterion == "independent_review:researcher"
+                && requirement.check == TeamAcceptanceCheck::UpstreamEvidence
+        }));
         assert!(contract.iter().any(|requirement| {
             requirement.criterion == "structured_field:verification_report"
                 && requirement.check

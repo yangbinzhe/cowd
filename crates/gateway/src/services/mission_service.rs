@@ -698,14 +698,13 @@ impl MissionService {
         );
         let mut cache = self.projection_cache.lock().await;
         if let Some(entry) = cache.get(&cache_key) {
-            // Summary snapshots are an SSE baseline, not a second current
-            // truth owner. Reusing the last bounded baseline across unrelated
-            // Runtime commits avoids rebuilding hundreds of Mission nodes on
-            // the first panel open; the consumer resumes from its cursor and
-            // receives exact deltas. Canonical Session membership still
-            // invalidates the baseline, while full graph reads remain strictly
-            // cursor-current.
-            if (!include_execution_details || entry.snapshot.cursor == latest_cursor)
+            // Both polling and SSE consumers use this endpoint as current
+            // Runtime truth. A summary cached across graph commits makes live
+            // Teams look permanently planned until an unrelated Session
+            // membership change or terminal rebuild. Keep the bounded summary
+            // payload, but invalidate it on the same commit cursor as the full
+            // graph. SSE still resumes cheaply from the returned cursor.
+            if entry.snapshot.cursor == latest_cursor
                 && entry.canonical_sessions == sessions
                 && entry.snapshot.projection.workspace.active_session_id == active_session_id
             {
@@ -1693,6 +1692,41 @@ mod tests {
             serde_json::from_value(control["snapshot"].clone())
                 .expect("typed snapshot must round-trip");
         let _ = snapshot.projection.mission_graph.nodes.len();
+    }
+
+    #[tokio::test]
+    async fn mission_summary_cache_advances_on_runtime_graph_commits() {
+        let service = scoped_mission_service();
+        let initial = service
+            .mission_control_summary(None)
+            .await
+            .expect("initial mission summary");
+        let initial_cursor = initial["summary"]["cursor"]
+            .as_u64()
+            .expect("initial cursor");
+        let initial_revision = initial["summary"]["revision"]
+            .as_u64()
+            .expect("initial revision");
+
+        service
+            .events()
+            .append_fixture(runtime::RuntimeEventInput {
+                stream_id: "mission-live-projection".to_string(),
+                scope: runtime::RuntimeEventScope::ExecutionGraph,
+                kind: "execution.node.running.v1".to_string(),
+                status: Some("running".to_string()),
+                actor: Some("test".to_string()),
+                refs: Vec::new(),
+                payload: serde_json::json!({"node_id": "agent-1"}),
+            })
+            .expect("append live graph event");
+
+        let refreshed = service
+            .mission_control_summary(None)
+            .await
+            .expect("refreshed mission summary");
+        assert!(refreshed["summary"]["cursor"].as_u64() > Some(initial_cursor));
+        assert!(refreshed["summary"]["revision"].as_u64() > Some(initial_revision));
     }
 
     #[tokio::test]
