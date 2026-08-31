@@ -1657,6 +1657,7 @@ fn orchestration_preflight_with_catalog(
         template_proposal: None,
         collaboration_intent: None,
         collaboration_semantic_intent: None,
+        tool_inventory: None,
         ephemeral_team_templates: Default::default(),
 
         input_disposition: None,

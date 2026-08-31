@@ -1751,17 +1751,27 @@ impl GatewayToolExecutor {
             .find_map(|(name, permission)| (name == tool_name).then_some(permission))
     }
 
-    /// A team request must carry explicit least-privilege capabilities into
-    /// its protocol packets. Models are not required to enumerate the local
-    /// read-only catalog in tool JSON, and forwarding arbitrary names would
-    /// let a prompt define its own delegation boundary. Gateway therefore
-    /// intersects caller hints with its active catalog and adds the active
-    /// read-only evidence tools. Lifecycle controls never propagate to leaf
-    /// agents.
+    /// A team request must carry an exact least-privilege ToolHost snapshot
+    /// into its protocol packets. Models cannot define this boundary.
+    /// Gateway crops the pinned catalog by the active CLI allowlist, Session
+    /// permission ceiling, and bounded-Team effect predicate. Lifecycle
+    /// controls never propagate to leaf Agents.
     fn bind_delegated_capabilities(&self, request: &mut runtime::RuntimeOrchestrationCommand) {
-        let mut allowed_tools = self
-            .available_tool_names()
+        let lease = self.tool_host.pin_snapshot();
+        let catalog_revision = lease.catalog_receipt().catalog_revision;
+        let permission_by_tool = lease
+            .snapshot()
+            .catalog
+            .permission_specs(self.allowed_tools.as_ref())
+            .unwrap_or_default()
             .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut allowed_tools = lease
+            .snapshot()
+            .catalog
+            .definitions(self.allowed_tools.as_ref())
+            .into_iter()
+            .map(|definition| definition.name)
             .filter(|name| {
                 !is_gateway_runtime_control_tool(name)
                     || matches!(
@@ -1769,7 +1779,19 @@ impl GatewayToolExecutor {
                         "request_collaboration_escalation" | "collaboration_control" | "team_board"
                     )
             })
-            .filter(|name| self.tool_permission_mode(name) == Some(ToolPermissionMode::ReadOnly))
+            .filter(|name| {
+                permission_by_tool
+                    .get(name)
+                    .copied()
+                    .is_some_and(|required| {
+                        request.constraints.permission_ceiling.permits(required)
+                    })
+            })
+            .filter(|name| {
+                runtime::delegated_tool_effect_is_bounded(
+                    &lease.describe_effect(name, &serde_json::json!({})),
+                )
+            })
             .collect::<Vec<_>>();
         allowed_tools.sort();
         allowed_tools.dedup();
@@ -1785,9 +1807,13 @@ impl GatewayToolExecutor {
         });
         request
             .capabilities
-            .extend(allowed_tools.into_iter().map(|tool| format!("tool:{tool}")));
+            .extend(allowed_tools.iter().map(|tool| format!("tool:{tool}")));
         request.capabilities.sort();
         request.capabilities.dedup();
+        request.tool_inventory = Some(runtime::RuntimeToolInventorySnapshot {
+            catalog_revision,
+            available_tools: allowed_tools,
+        });
     }
 }
 
@@ -4756,6 +4782,7 @@ mod tests {
             ephemeral_team_templates: Default::default(),
             collaboration_intent: None,
             collaboration_semantic_intent: None,
+            tool_inventory: None,
 
             input_disposition: None,
             selection_mode: None,
@@ -4789,6 +4816,60 @@ mod tests {
         assert!(request
             .capabilities
             .contains(&"backend:process_jsonl".to_string()));
+        let inventory = request
+            .tool_inventory
+            .as_ref()
+            .expect("Gateway must attest a concrete delegated inventory");
+        assert!(inventory.catalog_revision > 0);
+        assert_eq!(
+            inventory.available_tools,
+            delegated
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn delegated_inventory_uses_permission_ceiling_but_excludes_unbounded_processes() {
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        let mut request = runtime::RuntimeOrchestrationCommand::from_model(
+            harness_contract::orchestration::ModelRuntimeOrchestrationInput {
+                intent: "research and update the workspace".to_string(),
+                operation: runtime::RuntimeOrchestrationOperation::Inspect,
+                inspect_execution_id: None,
+                proposal: None,
+                template_proposal: None,
+                control: None,
+                input_disposition: None,
+                evidence_refs: Vec::new(),
+                constraints: Default::default(),
+            },
+            runtime::RuntimeOrchestrationBinding {
+                model_lease: None,
+                session_id: Some("session".to_string()),
+                lineage: None,
+                mission_id: None,
+                selection_mode: None,
+                strategy_binding: None,
+                capabilities: Vec::new(),
+                surface: None,
+                permission_ceiling: harness_contract::policy::PermissionMode::DangerFullAccess,
+            },
+        );
+
+        executor.bind_delegated_capabilities(&mut request);
+
+        let inventory = &request
+            .tool_inventory
+            .expect("Gateway must bind the active catalog")
+            .available_tools;
+        assert!(inventory.contains(&"read_file".to_string()));
+        assert!(inventory.contains(&"write_file".to_string()));
+        assert!(inventory.contains(&"web_search".to_string()));
+        assert!(!inventory.contains(&"bash".to_string()));
+        assert!(!inventory.contains(&"execute_code".to_string()));
+        assert!(!inventory.contains(&"runtime_orchestrate".to_string()));
     }
 
     #[test]

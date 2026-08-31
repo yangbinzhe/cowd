@@ -22,6 +22,51 @@ pub struct ResolvedAgentCapability {
     pub capability_summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCapabilityHostBinding {
+    pub allowed_tools: BTreeSet<String>,
+    pub missing_capabilities: Vec<String>,
+    pub missing_tool_alternatives: Vec<String>,
+}
+
+/// Bind a semantic capability grant to one concrete ToolHost snapshot.
+///
+/// Most capabilities merely crop an allowlist. Capabilities that promise an
+/// externally observable effect (network access, workspace mutation, test
+/// execution, or rollback) additionally require at least one physical tool
+/// contract that can perform that effect. This prevents admission from
+/// advertising a capability that Agent startup would later silently erase.
+#[must_use]
+pub fn bind_agent_capability_to_host(
+    resolved: &ResolvedAgentCapability,
+    host_tools: &BTreeSet<String>,
+) -> AgentCapabilityHostBinding {
+    let allowed_tools = resolved
+        .allowed_tools
+        .intersection(host_tools)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut missing_capabilities = Vec::new();
+    let mut missing_tool_alternatives = BTreeSet::new();
+    for capability in &resolved.requested_capabilities {
+        let alternatives = required_host_tool_alternatives(capability);
+        if alternatives.is_empty()
+            || alternatives
+                .iter()
+                .any(|candidate| host_tools.contains(*candidate))
+        {
+            continue;
+        }
+        missing_capabilities.push(capability.clone());
+        missing_tool_alternatives.extend(alternatives.iter().map(|tool| (*tool).to_string()));
+    }
+    AgentCapabilityHostBinding {
+        allowed_tools,
+        missing_capabilities,
+        missing_tool_alternatives: missing_tool_alternatives.into_iter().collect(),
+    }
+}
+
 pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgentCapability {
     let requested_capabilities = normalize_capabilities(request.allowed_capabilities);
     let mut allowed_tools = BTreeSet::new();
@@ -127,7 +172,7 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             required_mode: PermissionMode::ReadOnly,
         },
         "network" | "web" => CapabilityMapping {
-            tools: &["web_search", "web_fetch", "tool_search"],
+            tools: &["web_search", "web_fetch", "tool_search", "mcp_tool"],
             required_mode: PermissionMode::ReadOnly,
         },
         "write" => CapabilityMapping {
@@ -135,11 +180,11 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             required_mode: PermissionMode::WorkspaceWrite,
         },
         "test" | "status" | "logs" => CapabilityMapping {
-            tools: &["bash", "read_file", "grep_search"],
+            tools: &["bash", "execute_code", "read_file", "grep_search"],
             required_mode: PermissionMode::WorkspaceWrite,
         },
         "rollback" => CapabilityMapping {
-            tools: &["bash", "read_file", "grep_search"],
+            tools: &["bash", "checkpoint_restore", "read_file", "grep_search"],
             required_mode: PermissionMode::DangerFullAccess,
         },
         "tool_call" => CapabilityMapping {
@@ -153,10 +198,20 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
     }
 }
 
+fn required_host_tool_alternatives(capability: &str) -> &'static [&'static str] {
+    match capability {
+        "network" | "web" => &["web_search", "web_fetch", "mcp_tool"],
+        "write" => &["write_file", "edit_file"],
+        "test" => &["bash", "execute_code"],
+        "rollback" => &["bash", "checkpoint_restore"],
+        _ => &[],
+    }
+}
+
 pub(crate) fn agent_tool_permission(tool: &str) -> PermissionMode {
     match tool {
-        "write_file" | "edit_file" => PermissionMode::WorkspaceWrite,
-        "bash" => PermissionMode::DangerFullAccess,
+        "write_file" | "edit_file" | "execute_code" => PermissionMode::WorkspaceWrite,
+        "bash" | "checkpoint_restore" | "mcp_tool" => PermissionMode::DangerFullAccess,
         _ => PermissionMode::ReadOnly,
     }
 }
@@ -236,5 +291,56 @@ mod tests {
         assert!(resolved.allowed_tools.contains("web_search"));
         assert!(resolved.allowed_tools.contains("web_fetch"));
         assert!(resolved.allowed_tools.contains("tool_search"));
+    }
+
+    #[test]
+    fn host_binding_rejects_capability_without_physical_effect_tool() {
+        let resolved = resolve_agent_capability(AgentCapabilityRequest {
+            role_id: "external-researcher".to_string(),
+            allowed_capabilities: vec![
+                "read".to_string(),
+                "search".to_string(),
+                "network".to_string(),
+            ],
+            evidence_duties: Vec::new(),
+        });
+        let host_tools = ["read_file", "tool_search", "context_retrieve"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let binding = bind_agent_capability_to_host(&resolved, &host_tools);
+
+        assert_eq!(binding.missing_capabilities, vec!["network"]);
+        assert_eq!(
+            binding.missing_tool_alternatives,
+            vec!["mcp_tool", "web_fetch", "web_search"]
+        );
+        assert!(binding.allowed_tools.contains("read_file"));
+        assert!(!binding.allowed_tools.contains("web_search"));
+    }
+
+    #[test]
+    fn host_binding_keeps_only_attested_tools_when_effect_is_backed() {
+        let resolved = resolve_agent_capability(AgentCapabilityRequest {
+            role_id: "external-researcher".to_string(),
+            allowed_capabilities: vec!["network".to_string()],
+            evidence_duties: Vec::new(),
+        });
+        let host_tools = ["web_search", "context_retrieve", "unknown_tool"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        let binding = bind_agent_capability_to_host(&resolved, &host_tools);
+
+        assert!(binding.missing_capabilities.is_empty());
+        assert_eq!(
+            binding.allowed_tools,
+            ["context_retrieve", "web_search"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
     }
 }

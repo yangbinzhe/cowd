@@ -197,3 +197,21 @@ pub trait RuntimeExecutionHost: Send + Sync {
         None
     }
 }
+
+/// Whether a concrete effect descriptor is safe to carry through a bounded
+/// delegated Team lease. Admission and Agent activation must share this
+/// predicate or the latter can silently erase tools promised by the former.
+#[must_use]
+pub fn delegated_tool_effect_is_bounded(
+    descriptor: &harness_contract::tool::ToolEffectDescriptor,
+) -> bool {
+    !descriptor.spawns_process
+        && !matches!(
+            descriptor.effect_kind,
+            harness_contract::tool::ToolEffectKind::Process
+                | harness_contract::tool::ToolEffectKind::Package
+                | harness_contract::tool::ToolEffectKind::System
+                | harness_contract::tool::ToolEffectKind::Destructive
+                | harness_contract::tool::ToolEffectKind::Unknown
+        )
+}

@@ -25,9 +25,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    resolve_agent_capability,
+    bind_agent_capability_to_host, resolve_agent_capability,
     team_template_candidate::{ProposedDependency, ProposedRole, TeamTemplateProposal},
-    AgentCapabilityRequest, AgentCatalogEntry, RuntimeServices,
+    AgentCapabilityRequest, AgentCatalogEntry, RuntimeServices, RuntimeToolInventorySnapshot,
 };
 
 use super::{GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationCommand};
@@ -217,6 +217,7 @@ pub fn compile_turn_scoped_intent(
                 .cloned()
                 .unwrap_or_default(),
             &catalog,
+            request.tool_inventory.as_ref(),
             request.constraints.permission_ceiling,
             workstream.evidence_contract.iter().any(|criterion| {
                 matches!(
@@ -573,6 +574,7 @@ fn compile_team(
     team: &harness_contract::orchestration::ModelTurnScopedTeamIntent,
     cross_workstream_consumers: BTreeSet<String>,
     catalog: &[AgentCatalogEntry],
+    tool_inventory: Option<&RuntimeToolInventorySnapshot>,
     ceiling: PermissionMode,
     terminal_owns_workstream_evidence: bool,
 ) -> Result<CompiledTeam, IntentCompilerError> {
@@ -634,7 +636,7 @@ fn compile_team(
         let canonical_id = canonical_ids
             .get(&role.role_id)
             .expect("canonical role id exists");
-        let selected = resolve_role(role, catalog, ceiling)?;
+        let selected = resolve_role(role, catalog, tool_inventory, ceiling)?;
         let behavior = derive_behavior(
             role,
             canonical_id,
@@ -665,8 +667,8 @@ fn compile_team(
             responsibility: role.responsibility.trim().to_string(),
             agent_definition_ref: format!(
                 "{}@{}",
-                selected.definition_ref.definition_id.as_str(),
-                selected.definition_ref.revision
+                selected.entry.definition_ref.definition_id.as_str(),
+                selected.entry.definition_ref.revision
             ),
             grant_ceiling: canonical_set(&role.required_capabilities),
             fixed_count: None,
@@ -675,14 +677,17 @@ fn compile_team(
             acceptance,
             input_artifacts: canonical_set(&role.input_artifacts),
             output_artifacts: canonical_set(&role.output_artifacts),
-            allowed_tool_contract_refs: canonical_tool_refs(&role.required_tools),
+            allowed_tool_contract_refs: selected
+                .executable_tools
+                .clone()
+                .unwrap_or_else(|| canonical_tool_refs(&role.required_tools)),
             allowed_skill_refs: canonical_set(&role.required_skills),
             behavior,
         });
         resolved_bindings.push(serde_json::json!({
             "role_id": canonical_id,
-            "definition": selected.definition_ref.definition_id.as_str(),
-            "revision": selected.definition_ref.revision,
+            "definition": selected.entry.definition_ref.definition_id.as_str(),
+            "revision": selected.entry.definition_ref.revision,
             "required_capabilities": canonical_set(&role.required_capabilities),
             "required_skills": canonical_set(&role.required_skills),
             "required_tools": canonical_set(&role.required_tools),
@@ -877,11 +882,20 @@ fn validate_independent_review_contracts(
     Ok(())
 }
 
+#[derive(Debug)]
+struct HostResolvedRole {
+    entry: AgentCatalogEntry,
+    /// `Some` means an authenticated host inventory was present and this is
+    /// the complete immutable executable allowlist for the role.
+    executable_tools: Option<Vec<String>>,
+}
+
 fn resolve_role(
     role: &ModelRoleIntent,
     catalog: &[AgentCatalogEntry],
+    tool_inventory: Option<&RuntimeToolInventorySnapshot>,
     ceiling: PermissionMode,
-) -> Result<AgentCatalogEntry, IntentCompilerError> {
+) -> Result<HostResolvedRole, IntentCompilerError> {
     let capabilities = canonical_set(&role.required_capabilities);
     let skills = canonical_set(&role.required_skills);
     let tools = canonical_tool_refs(&role.required_tools);
@@ -915,12 +929,12 @@ fn resolve_role(
         diagnostic.allowed_repairs = vec!["request_authorized_capabilities".to_string()];
         return Err(diagnostic.with_agent_catalog(catalog).into());
     }
-    let available_tools = resolve_agent_capability(AgentCapabilityRequest {
+    let resolved_capability = resolve_agent_capability(AgentCapabilityRequest {
         role_id: role.role_id.clone(),
         allowed_capabilities: capabilities.clone(),
         evidence_duties: Vec::new(),
-    })
-    .allowed_tools;
+    });
+    let available_tools = &resolved_capability.allowed_tools;
     let missing_tools = tools
         .iter()
         .filter(|tool| !available_tools.contains(*tool))
@@ -936,6 +950,46 @@ fn resolve_role(
         .with_agent_catalog(catalog)
         .into());
     }
+    let executable_tools = if let Some(inventory) = tool_inventory {
+        let host_tools = inventory
+            .available_tools
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let host_binding = bind_agent_capability_to_host(&resolved_capability, &host_tools);
+        let mut host_missing_tools = tools
+            .iter()
+            .filter(|tool| !host_tools.contains(*tool))
+            .cloned()
+            .collect::<Vec<_>>();
+        host_missing_tools.extend(host_binding.missing_tool_alternatives.clone());
+        host_missing_tools.sort();
+        host_missing_tools.dedup();
+        if !host_missing_tools.is_empty() || !host_binding.missing_capabilities.is_empty() {
+            let mut diagnostic = CollaborationCompileDiagnostic::resolver(
+                &role.role_id,
+                host_binding.missing_capabilities,
+                Vec::new(),
+                host_missing_tools,
+            );
+            diagnostic.code = "host_tool_inventory_gap".to_string();
+            diagnostic.phase = CollaborationCompilePhase::Bind;
+            diagnostic.repairability = "runtime_or_user_decision".to_string();
+            diagnostic.allowed_repairs = vec![
+                "enable_one_required_tool_in_the_active_gateway_catalog".to_string(),
+                "raise_the_session_permission_ceiling_if_authorized".to_string(),
+                "revise_the_role_to_remove_an_unavailable_effect_capability".to_string(),
+            ];
+            diagnostic.semantic_ids.push(format!(
+                "tool_catalog_revision:{}",
+                inventory.catalog_revision
+            ));
+            return Err(diagnostic.with_agent_catalog(catalog).into());
+        }
+        Some(host_binding.allowed_tools.into_iter().collect())
+    } else {
+        None
+    };
     let mut eligible = catalog
         .iter()
         .filter(|entry| {
@@ -969,10 +1023,15 @@ fn resolve_role(
                     .cmp(&right.definition_ref.revision)
             })
     });
-    eligible.into_iter().next().ok_or_else(|| {
-        CollaborationCompileDiagnostic::resolver(&role.role_id, capabilities, skills, tools)
-            .with_agent_catalog(catalog)
-            .into()
+    let entry = eligible.into_iter().next().ok_or_else(|| {
+        IntentCompilerError::Diagnostic(
+            CollaborationCompileDiagnostic::resolver(&role.role_id, capabilities, skills, tools)
+                .with_agent_catalog(catalog),
+        )
+    })?;
+    Ok(HostResolvedRole {
+        entry,
+        executable_tools,
     })
 }
 
@@ -1729,6 +1788,73 @@ mod tests {
     }
 
     #[test]
+    fn gateway_inventory_is_frozen_into_every_compiled_role_allowlist() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut bound_request = request();
+        bound_request.tool_inventory = Some(RuntimeToolInventorySnapshot {
+            catalog_revision: 42,
+            available_tools: vec![
+                "context_retrieve".to_string(),
+                "read_file".to_string(),
+                "team_board".to_string(),
+            ],
+        });
+
+        let compiled = compile_turn_scoped_intent(&bound_request, &decision(), &services)
+            .expect("host-backed semantic compilation");
+        let proposal: TeamTemplateProposal =
+            serde_json::from_value(compiled.template_proposal["teams"][0]["template"].clone())
+                .expect("compiled template proposal");
+
+        for role in proposal.roles {
+            assert_eq!(
+                role.allowed_tool_contract_refs,
+                vec![
+                    "context_retrieve".to_string(),
+                    "read_file".to_string(),
+                    "team_board".to_string(),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn network_capability_without_a_physical_network_tool_fails_pre_admission() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut bound_request = request();
+        bound_request.constraints.permission_ceiling = PermissionMode::DangerFullAccess;
+        bound_request.tool_inventory = Some(RuntimeToolInventorySnapshot {
+            catalog_revision: 77,
+            available_tools: vec![
+                "context_retrieve".to_string(),
+                "read_file".to_string(),
+                "tool_search".to_string(),
+            ],
+        });
+        let mut network_decision = decision();
+        network_decision.workstreams[0].team.roles[0].required_capabilities = vec![
+            "read".to_string(),
+            "search".to_string(),
+            "network".to_string(),
+        ];
+
+        let error = compile_turn_scoped_intent(&bound_request, &network_decision, &services)
+            .expect_err("network label without an executor must fail before graph admission");
+        let IntentCompilerError::Diagnostic(diagnostic) = error else {
+            panic!("expected host inventory diagnostic");
+        };
+        assert_eq!(diagnostic.code, "host_tool_inventory_gap");
+        assert_eq!(diagnostic.phase, CollaborationCompilePhase::Bind);
+        assert_eq!(diagnostic.missing_capabilities, vec!["network"]);
+        assert!(diagnostic.missing_tools.contains(&"web_search".to_string()));
+        assert!(diagnostic
+            .semantic_ids
+            .contains(&"tool_catalog_revision:77".to_string()));
+    }
+
+    #[test]
     fn rejects_glob_evidence_scope_before_program_admission() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         let mut invalid = decision();
@@ -1912,7 +2038,7 @@ mod tests {
             "network".to_string(),
             "write".to_string(),
         ];
-        let error = resolve_role(&role, &catalog, PermissionMode::DangerFullAccess)
+        let error = resolve_role(&role, &catalog, None, PermissionMode::DangerFullAccess)
             .expect_err("network and workspace mutation require separate Agent identities");
         let IntentCompilerError::Diagnostic(diagnostic) = error else {
             panic!("expected typed resolution diagnostic")

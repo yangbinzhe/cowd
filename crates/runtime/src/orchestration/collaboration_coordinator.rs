@@ -241,6 +241,7 @@ pub(crate) fn compile_collaboration_intent_patch(
         }),
         collaboration_intent: None,
         collaboration_semantic_intent: None,
+        tool_inventory: None,
         control: None,
         template_proposal: None,
         ephemeral_team_templates,

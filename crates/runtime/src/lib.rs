@@ -353,7 +353,8 @@ pub use agent::{
     SubAgentToolMode,
 };
 pub use agent_capability::{
-    resolve_agent_capability, AgentCapabilityRequest, ResolvedAgentCapability,
+    bind_agent_capability_to_host, resolve_agent_capability, AgentCapabilityHostBinding,
+    AgentCapabilityRequest, ResolvedAgentCapability,
 };
 pub use agent_catalog::{AgentCatalog, AgentCatalogEntry};
 pub use agent_evaluation::{project_self_models, AgentRunEvaluation, AgentSelfModel};
@@ -627,7 +628,7 @@ pub use orchestration::{
     GraphMutationProposal, GraphSemanticNode, RuntimeControlKind, RuntimeControlRequest,
     RuntimeControlScope, RuntimeOrchestrationBinding, RuntimeOrchestrationCommand,
     RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision, RuntimeOrchestrationOperation,
-    RuntimeOrchestrationResult, RuntimeStateSnapshot, SemanticFocus,
+    RuntimeOrchestrationResult, RuntimeStateSnapshot, RuntimeToolInventorySnapshot, SemanticFocus,
 };
 pub use outcome_projector::{
     OutcomeProjectionCheckpoint, OutcomeProjectionDlqEntry, OutcomeProjectionHealth,
@@ -817,8 +818,8 @@ pub use tool_execution_plane::{
     ToolExecutionAdmission, ToolExecutionPlane, ToolExecutionPlaneError, ToolExecutionPlaneStats,
 };
 pub use tool_host::{
-    RuntimeExecutionHost, RuntimeToolExecutionOutcome, RuntimeToolExecutionRequest,
-    RuntimeToolExecutionStatus, ToolProgressSink,
+    delegated_tool_effect_is_bounded, RuntimeExecutionHost, RuntimeToolExecutionOutcome,
+    RuntimeToolExecutionRequest, RuntimeToolExecutionStatus, ToolProgressSink,
 };
 pub use tool_invocation::{
     now_ms as tool_invocation_now_ms, ToolFailureKind, ToolInvocationRecord, ToolInvocationStatus,

@@ -146,6 +146,16 @@ pub struct RuntimeOrchestrationBinding {
     pub permission_ceiling: PermissionMode,
 }
 
+/// Exact delegable ToolHost view pinned by the authenticated orchestration
+/// ingress.  Capability names describe intent; this snapshot proves which
+/// physical tool contracts can actually be bound for the admitted Program.
+/// It is Runtime-owned and deliberately cannot be supplied by model JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeToolInventorySnapshot {
+    pub catalog_revision: u64,
+    pub available_tools: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeOrchestrationCommand {
     pub intent: String,
@@ -166,6 +176,10 @@ pub struct RuntimeOrchestrationCommand {
     /// Program when graph compilation succeeds and is never model writable.
     #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
     pub collaboration_semantic_intent: Option<CollaborationSemanticIntentSnapshot>,
+    /// Gateway-attested, permission-cropped ToolHost inventory used to turn
+    /// semantic role capabilities into an immutable executable allowlist.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
+    pub tool_inventory: Option<RuntimeToolInventorySnapshot>,
     /// Runtime-owned session-scoped templates keyed by semantic Team node.
     /// Model JSON cannot populate this map; a Coordinator attaches a
     /// validated immutable snapshot before semantic compilation.
@@ -204,6 +218,7 @@ impl RuntimeOrchestrationCommand {
             template_proposal: input.template_proposal,
             collaboration_intent: None,
             collaboration_semantic_intent: None,
+            tool_inventory: None,
             ephemeral_team_templates: BTreeMap::new(),
             control: input.control,
             input_disposition: input.input_disposition,
@@ -256,6 +271,49 @@ impl Default for RuntimeOrchestrationConstraints {
             surface_latency_sensitive: None,
             permission_ceiling: PermissionMode::ReadOnly,
         }
+    }
+}
+
+#[cfg(test)]
+mod tool_inventory_tests {
+    use super::*;
+
+    #[test]
+    fn model_deserialization_cannot_forge_tool_inventory() {
+        let command = RuntimeOrchestrationCommand::from_model(
+            ModelRuntimeOrchestrationInput {
+                intent: "inspect".to_string(),
+                operation: RuntimeOrchestrationOperation::Inspect,
+                inspect_execution_id: None,
+                proposal: None,
+                template_proposal: None,
+                control: None,
+                input_disposition: None,
+                evidence_refs: Vec::new(),
+                constraints: Default::default(),
+            },
+            RuntimeOrchestrationBinding {
+                model_lease: None,
+                session_id: None,
+                lineage: None,
+                mission_id: None,
+                selection_mode: None,
+                strategy_binding: None,
+                capabilities: Vec::new(),
+                surface: None,
+                permission_ceiling: PermissionMode::ReadOnly,
+            },
+        );
+        let mut value = serde_json::to_value(command).expect("serialize command");
+        value["tool_inventory"] = serde_json::json!({
+            "catalog_revision": 999,
+            "available_tools": ["write_file"]
+        });
+
+        let decoded: RuntimeOrchestrationCommand =
+            serde_json::from_value(value).expect("deserialize command");
+
+        assert!(decoded.tool_inventory.is_none());
     }
 }
 

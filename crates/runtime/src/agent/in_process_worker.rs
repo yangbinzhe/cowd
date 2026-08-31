@@ -280,6 +280,16 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     || delegated_tool_supports_bounded_scope(host.as_ref(), tool)
             })
             .collect::<BTreeSet<_>>();
+        let unavailable_tools = packet_allowed_tools
+            .difference(&allowed_tools)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unavailable_tools.is_empty() {
+            return Err(format!(
+                "agent_tool_inventory_drift: admitted Tool contracts are unavailable or no longer bounded on the active host: {}",
+                unavailable_tools.join(", ")
+            ));
+        }
         let tool_names = allowed_tools.iter().cloned().collect::<Vec<_>>();
         let memory_context = memory::MemoryTurnContext::new(
             packet.session_id(),
@@ -2872,17 +2882,7 @@ fn resource_paths_from_input(input: &serde_json::Value) -> Vec<String> {
 
 fn delegated_tool_supports_bounded_scope(host: &dyn RuntimeExecutionHost, tool_name: &str) -> bool {
     host.delegated_tool_effect_descriptor(tool_name, &serde_json::json!({}))
-        .is_some_and(|descriptor| {
-            !descriptor.spawns_process
-                && !matches!(
-                    descriptor.effect_kind,
-                    harness_contract::tool::ToolEffectKind::Process
-                        | harness_contract::tool::ToolEffectKind::Package
-                        | harness_contract::tool::ToolEffectKind::System
-                        | harness_contract::tool::ToolEffectKind::Destructive
-                        | harness_contract::tool::ToolEffectKind::Unknown
-                )
-        })
+        .is_some_and(|descriptor| crate::delegated_tool_effect_is_bounded(&descriptor))
 }
 
 fn resource_path_is_authorized(

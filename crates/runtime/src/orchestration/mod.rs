@@ -86,7 +86,7 @@ pub use request::{
     CapabilityRecipeId, GraphMutationProposal, GraphSemanticNode, RuntimeControlKind,
     RuntimeControlRequest, RuntimeControlScope, RuntimeOrchestrationBinding,
     RuntimeOrchestrationCommand, RuntimeOrchestrationConstraints, RuntimeOrchestrationOperation,
-    SemanticFocus,
+    RuntimeToolInventorySnapshot, SemanticFocus,
 };
 pub use result::{
     RecoveryHint, RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
