@@ -1752,9 +1752,11 @@ struct ScenarioTokenUsage {
     record_count: u64,
 }
 
-/// Summarize node-level usage across the canonical root and all of its
-/// durable child projections. `ExecutionNodeProjection::usage` is the only
-/// metric source here; no report-time token estimation is allowed.
+/// Summarize physical leaf usage across the canonical root and all durable
+/// child projections. Container nodes intentionally carry cumulative child
+/// usage for local recovery/projection and are therefore never additive.
+/// Provider tokens belong to `inline_model`; tool effects belong to
+/// `tool_batch`. No report-time token estimation is allowed.
 fn execution_graph_usage_metrics(projections: &[Value]) -> ScenarioTokenUsage {
     let mut seen_nodes = BTreeSet::new();
     let mut usage = ScenarioTokenUsage::default();
@@ -1775,16 +1777,30 @@ fn execution_graph_usage_metrics(projections: &[Value]) -> ScenarioTokenUsage {
             if !seen_nodes.insert(format!("{graph_id}:{node_id}")) {
                 continue;
             }
+            let kind = node.get("kind").and_then(Value::as_str).unwrap_or_default();
+            if !matches!(kind, "inline_model" | "tool_batch") {
+                continue;
+            }
             let node_usage = node.get("usage").unwrap_or(&Value::Null);
-            if let Some(model) = node_usage.get("model").and_then(Value::as_str) {
-                if !model.trim().is_empty() {
-                    usage.models.insert(model.to_string());
+            if kind == "inline_model" {
+                if let Some(model) = node_usage.get("model").and_then(Value::as_str) {
+                    if !model.trim().is_empty() {
+                        usage.models.insert(model.to_string());
+                    }
                 }
             }
-            let input_tokens = value_u64(node_usage, &["input_tokens"]);
-            let output_tokens = value_u64(node_usage, &["output_tokens"]);
-            let cache_tokens = value_u64(node_usage, &["cached_tokens"]);
-            let tool_calls = value_u64(node_usage, &["tool_calls"]);
+            let input_tokens = (kind == "inline_model")
+                .then(|| value_u64(node_usage, &["input_tokens"]))
+                .unwrap_or_default();
+            let output_tokens = (kind == "inline_model")
+                .then(|| value_u64(node_usage, &["output_tokens"]))
+                .unwrap_or_default();
+            let cache_tokens = (kind == "inline_model")
+                .then(|| value_u64(node_usage, &["cached_tokens"]))
+                .unwrap_or_default();
+            let tool_calls = (kind == "tool_batch")
+                .then(|| value_u64(node_usage, &["tool_calls"]))
+                .unwrap_or_default();
             if input_tokens > 0 || output_tokens > 0 || cache_tokens > 0 || tool_calls > 0 {
                 usage.record_count = usage.record_count.saturating_add(1);
             }
@@ -1792,7 +1808,7 @@ fn execution_graph_usage_metrics(projections: &[Value]) -> ScenarioTokenUsage {
             usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
             usage.cache_tokens = usage.cache_tokens.saturating_add(cache_tokens);
             usage.tool_calls = usage.tool_calls.saturating_add(tool_calls);
-            if node.get("kind").and_then(Value::as_str) == Some("inline_model")
+            if kind == "inline_model"
                 && node.get("status").and_then(Value::as_str) == Some("completed")
             {
                 usage.model_rounds = usage.model_rounds.saturating_add(1);
@@ -4596,7 +4612,10 @@ mod tests {
                 "graph_id": "root",
                 "nodes": [
                     {"node_id": "model", "kind": "inline_model", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 21, "output_tokens": 8, "cached_tokens": 3, "tool_calls": 0}},
-                    {"node_id": "tool", "kind": "tool_batch", "status": "completed", "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "tool_calls": 1}}
+                    {"node_id": "tool", "kind": "tool_batch", "status": "completed", "usage": {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "tool_calls": 1}},
+                    {"node_id": "agent", "kind": "agent_task", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 21, "output_tokens": 8, "cached_tokens": 3, "tool_calls": 1}},
+                    {"node_id": "synthesis", "kind": "synthesize", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 21, "output_tokens": 8, "cached_tokens": 3, "tool_calls": 1}},
+                    {"node_id": "child", "kind": "subgraph", "status": "completed", "usage": {"model": "deepseek-v4-flash", "input_tokens": 21, "output_tokens": 8, "cached_tokens": 3, "tool_calls": 1}}
                 ]
             }
         });

@@ -29,6 +29,7 @@ use thiserror::Error;
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 use super::goal::GoalStore;
 use super::graph::{
+    aggregate_team_leaf_usage,
     executors::{
         AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
         SynthesizeNodeExecutor, TeamSubgraphExecutor, VerifyNodeExecutor,
@@ -4061,37 +4062,18 @@ async fn project_team_terminal_outcome(
         .map(|result| result.finished_at_ms)
         .max()
         .unwrap_or_else(now_ms);
-    let duration_ms = graph.node_results.values().fold(0_u64, |total, result| {
-        total.saturating_add(result.usage.duration_ms)
-    });
-    let usage = graph.node_results.values().fold(
-        harness_contract::outcome::OutcomeUsage::default(),
-        |mut usage, result| {
-            usage.input_tokens = Some(
-                usage
-                    .input_tokens
-                    .unwrap_or_default()
-                    .saturating_add(result.usage.input_tokens),
-            );
-            usage.output_tokens = Some(
-                usage
-                    .output_tokens
-                    .unwrap_or_default()
-                    .saturating_add(result.usage.output_tokens),
-            );
-            usage.cached_tokens = Some(
-                usage
-                    .cached_tokens
-                    .unwrap_or_default()
-                    .saturating_add(result.usage.cached_tokens),
-            );
-            usage.tool_calls = usage.tool_calls.saturating_add(result.usage.tool_calls);
-            usage.duplicate_tool_calls = usage
-                .duplicate_tool_calls
-                .saturating_add(result.usage.duplicate_tool_calls);
-            usage
-        },
-    );
+    let leaf_usage = aggregate_team_leaf_usage(&graph);
+    let duration_ms = leaf_usage.duration_ms;
+    let usage = harness_contract::outcome::OutcomeUsage {
+        input_tokens: Some(leaf_usage.input_tokens),
+        output_tokens: Some(leaf_usage.output_tokens),
+        cached_tokens: Some(leaf_usage.cached_tokens),
+        evaluation_tokens: None,
+        tool_calls: leaf_usage.tool_calls,
+        duplicate_tool_calls: leaf_usage.duplicate_tool_calls,
+        retries: 0,
+        max_observed_concurrency: leaf_usage.max_tool_concurrency_observed,
+    };
     let mut evidence_refs = graph
         .node_results
         .values()

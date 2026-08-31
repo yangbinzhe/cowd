@@ -207,6 +207,12 @@ where
         objective: &str,
         evidence: &str,
     ) -> Result<ModelStepResult, RuntimeError> {
+        // This owner creates an isolated reduction request directly rather
+        // than passing through `execute_model_step`, so it must apply the
+        // request-local reasoning overlay itself. Otherwise reasoning-capable
+        // providers may spend the terminal budget on private reasoning and
+        // produce no user-visible answer after evidence has been committed.
+        self.require_next_model_reasoning_effort("none");
         let evidence = if evidence.trim().is_empty() {
             "No checked tool receipt was available; give an honest bounded answer and name the missing evidence."
         } else {
@@ -256,6 +262,11 @@ where
         let mut models_tried = Vec::new();
         let mut presentation_attempt_sequence = 0_u32;
         let mut provider_attempt_sequence = 0_u32;
+        let one_shot_reasoning_effort = self
+            .next_model_reasoning_effort
+            .lock()
+            .ok()
+            .and_then(|mut effort| effort.take());
 
         let mut candidates = VecDeque::from(self.model_candidates_for_turn(objective));
         while let Some((model, provider_account_key)) =
@@ -275,6 +286,7 @@ where
                             break 'candidate_attempt;
                         }
                     };
+                request.reasoning_effort_override = one_shot_reasoning_effort.clone();
                 let mut token_reservations = match ProviderTokenReservationSet::acquire(
                     self.evaluation_provider_token_lease.as_ref(),
                     self.delegated_provider_budget.as_ref(),

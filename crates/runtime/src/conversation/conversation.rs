@@ -347,8 +347,19 @@ impl EvaluationProviderTokenReservation {
                     .saturating_add(self.reserved.saturating_sub(actual))
                     .min(lease.limit);
             } else {
-                lease.breached = true;
-                lease.remaining = 0;
+                // Provider tokenizers are authoritative while the preflight
+                // budget is necessarily an estimate. A measured variance is
+                // not a global lease breach when still-unreserved Session
+                // headroom can pay it. Outstanding concurrent reservations
+                // have already been removed from `remaining`, so this charge
+                // cannot steal their capacity or exceed the hard lease.
+                let unreserved_delta = actual.saturating_sub(self.reserved);
+                if unreserved_delta <= lease.remaining {
+                    lease.remaining = lease.remaining.saturating_sub(unreserved_delta);
+                } else {
+                    lease.breached = true;
+                    lease.remaining = 0;
+                }
             }
             lease.outstanding = lease.outstanding.saturating_sub(1);
             self.reconciled = true;

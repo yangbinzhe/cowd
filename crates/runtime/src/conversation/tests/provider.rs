@@ -1328,6 +1328,63 @@
     }
 
     #[test]
+    fn evaluation_lease_charges_provider_estimation_variance_to_real_headroom() {
+        let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+        let guard = registry
+            .install("session-variance", "eval-variance", 1_000)
+            .expect("evaluation lease");
+        let lease = guard.lease();
+        let mut request = token_reservation_request();
+        let mut reservation =
+            ProviderTokenReservationSet::acquire(Some(&lease), None, "test", &mut request)
+                .expect("estimated request fits");
+        reservation.mark_dispatched();
+        reservation
+            .reconcile(model_protocol::usage::TokenUsage {
+                input_tokens: 350,
+                output_tokens: 100,
+                cache_read_input_tokens: 50,
+                ..Default::default()
+            })
+            .expect("measured variance fits the unreserved lease headroom");
+
+        let snapshot = guard.snapshot().expect("settled snapshot");
+        assert_eq!(snapshot.consumed, 500);
+        assert_eq!(snapshot.input_consumed, 350);
+        assert_eq!(snapshot.output_consumed, 100);
+        assert_eq!(snapshot.cached_consumed, 50);
+        assert_eq!(snapshot.outstanding, 0);
+        assert!(!snapshot.breached);
+    }
+
+    #[test]
+    fn evaluation_lease_still_breaches_when_actual_usage_exceeds_headroom() {
+        let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+        let guard = registry
+            .install("session-overrun", "eval-overrun", 300)
+            .expect("evaluation lease");
+        let lease = guard.lease();
+        let mut request = token_reservation_request();
+        let mut reservation =
+            ProviderTokenReservationSet::acquire(Some(&lease), None, "test", &mut request)
+                .expect("estimated request fits");
+        reservation.mark_dispatched();
+        reservation
+            .reconcile(model_protocol::usage::TokenUsage {
+                input_tokens: 350,
+                output_tokens: 100,
+                cache_read_input_tokens: 50,
+                ..Default::default()
+            })
+            .expect("evaluation reconciliation is infallible");
+
+        let snapshot = guard.snapshot().expect("breached snapshot");
+        assert_eq!(snapshot.consumed, snapshot.limit);
+        assert_eq!(snapshot.outstanding, 0);
+        assert!(snapshot.breached);
+    }
+
+    #[test]
     fn deep_live_scenario_token_lease_has_a_bounded_non_truncating_capacity() {
         let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
         let guard = registry
@@ -2068,7 +2125,14 @@
 
     #[derive(Clone)]
     struct CalibrationRecordingApi {
-        windows: Arc<std::sync::Mutex<Vec<(u64, String)>>>,
+        requests: Arc<std::sync::Mutex<Vec<CalibrationRequestRecord>>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CalibrationRequestRecord {
+        context_window_tokens: u64,
+        context_window_source: String,
+        reasoning_effort_override: Option<String>,
     }
 
     impl ApiClient for CalibrationRecordingApi {
@@ -2077,12 +2141,13 @@
             request: ApiRequest,
         ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
             let attempt = {
-                let mut windows = self.windows.lock().expect("windows");
-                windows.push((
-                    request.budget.context_window_tokens,
-                    request.budget.context_window_source.clone(),
-                ));
-                windows.len()
+                let mut requests = self.requests.lock().expect("requests");
+                requests.push(CalibrationRequestRecord {
+                    context_window_tokens: request.budget.context_window_tokens,
+                    context_window_source: request.budget.context_window_source.clone(),
+                    reasoning_effort_override: request.reasoning_effort_override.clone(),
+                });
+                requests.len()
             };
             let events = if attempt == 1 {
                 vec![Err(RuntimeError::with_provider_context_window_limit(
@@ -2101,9 +2166,9 @@
 
     #[tokio::test]
     async fn explicit_provider_limit_calibrates_once_and_repackages_the_same_model() {
-        let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let api = CalibrationRecordingApi {
-            windows: Arc::clone(&windows),
+            requests: Arc::clone(&requests),
         };
         let mut runtime = ConversationRuntime::new(
             Session::new(),
@@ -2124,11 +2189,12 @@
             .await
             .expect("calibrated retry should complete");
         assert_eq!(result.model.as_deref(), Some("private-model"));
-        let windows = windows.lock().expect("windows");
-        assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].0, 128_000);
-        assert_eq!(windows[1].0, 32_768);
-        assert_eq!(windows[1].1, "calibrated");
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].context_window_tokens, 128_000);
+        assert_eq!(requests[1].context_window_tokens, 32_768);
+        assert_eq!(requests[1].context_window_source, "calibrated");
+        assert_eq!(requests[1].reasoning_effort_override, None);
     }
 
     #[tokio::test]
@@ -2138,9 +2204,9 @@
             ResourceQuota,
         };
 
-        let windows = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let api = CalibrationRecordingApi {
-            windows: Arc::clone(&windows),
+            requests: Arc::clone(&requests),
         };
         let granted = Arc::new(AtomicUsize::new(0));
         let manager = Arc::new(ExecutionResourceManager::new([(
@@ -2180,8 +2246,15 @@
             .await
             .expect_err("clean terminal must not retry after its provider attempt");
         assert!(error.to_string().contains("maximum context length"));
-        let windows = windows.lock().expect("windows");
-        assert_eq!(windows.as_slice(), &[(128_000, "assumed".to_string())]);
+        let requests = requests.lock().expect("requests");
+        assert_eq!(
+            requests.as_slice(),
+            &[CalibrationRequestRecord {
+                context_window_tokens: 128_000,
+                context_window_source: "assumed".to_string(),
+                reasoning_effort_override: Some("none".to_string()),
+            }]
+        );
         let mut live_events = Vec::new();
         while let Ok(event) = receiver.try_recv() {
             live_events.push(serde_json::to_string(&event).expect("serialize live event"));

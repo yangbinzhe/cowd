@@ -36,7 +36,7 @@ pub use resources::{
 };
 #[cfg(test)]
 pub(crate) use runner::validate_worktree_path;
-pub(crate) use runner::ExecutionGraphRunner;
+pub(crate) use runner::{aggregate_team_leaf_usage, ExecutionGraphRunner};
 pub use runner::{ExecutionRunReport, ExecutionRunnerError};
 pub use state_store::{ExecutionGraphStateStore, ExecutionStateStoreError};
 

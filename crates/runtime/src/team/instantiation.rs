@@ -1395,9 +1395,29 @@ pub(crate) fn team_acceptance_contract(
                 .collect::<Vec<_>>()
         })
         .filter(|scopes| !scopes.is_empty());
+    let independent_review = criteria
+        .iter()
+        .any(|criterion| criterion.starts_with("independent_review:"));
     let structured = |criterion: &str, field| TeamAcceptanceRequirement {
         criterion: criterion.to_string(),
         check: TeamAcceptanceCheck::StructuredField { field },
+    };
+    let known_structured_field = |name: &str| match name {
+        "summary" => Some(TeamStructuredOutputField::Summary),
+        "findings" => Some(TeamStructuredOutputField::Findings),
+        "plan" => Some(TeamStructuredOutputField::Plan),
+        "implementation" => Some(TeamStructuredOutputField::Implementation),
+        "source_verification" => Some(TeamStructuredOutputField::SourceVerification),
+        "review" => Some(TeamStructuredOutputField::Review),
+        "risks" => Some(TeamStructuredOutputField::Risks),
+        "unresolved" => Some(TeamStructuredOutputField::Unresolved),
+        "key_decisions" => Some(TeamStructuredOutputField::KeyDecisions),
+        "unresolved_or_risks" => Some(TeamStructuredOutputField::UnresolvedOrRisks),
+        "proposal" => Some(TeamStructuredOutputField::Proposal),
+        "critique" => Some(TeamStructuredOutputField::Critique),
+        "mitigation" => Some(TeamStructuredOutputField::Mitigation),
+        "checkpoint" => Some(TeamStructuredOutputField::Checkpoint),
+        _ => None,
     };
     criteria
         .iter()
@@ -1421,6 +1441,21 @@ pub(crate) fn team_acceptance_contract(
                 "proposal" => structured(criterion, TeamStructuredOutputField::Proposal),
                 "critique" => structured(criterion, TeamStructuredOutputField::Critique),
                 "checkpoint" => structured(criterion, TeamStructuredOutputField::Checkpoint),
+                _ if criterion.starts_with("structured_field:") => {
+                    let name = criterion.trim_start_matches("structured_field:").trim();
+                    if name.is_empty() {
+                        return Err("Team structured field name is empty".to_string());
+                    }
+                    TeamAcceptanceRequirement {
+                        criterion: criterion.clone(),
+                        check: known_structured_field(name).map_or_else(
+                            || TeamAcceptanceCheck::StructuredArtifact {
+                                name: name.to_string(),
+                            },
+                            |field| TeamAcceptanceCheck::StructuredField { field },
+                        ),
+                    }
+                }
                 _ if criterion.starts_with("artifact:") => {
                     let name = criterion.trim_start_matches("artifact:").trim();
                     if name.is_empty() {
@@ -1455,7 +1490,13 @@ pub(crate) fn team_acceptance_contract(
                 },
                 "review" => TeamAcceptanceRequirement {
                     criterion: criterion.clone(),
-                    check: TeamAcceptanceCheck::UpstreamReview,
+                    check: if independent_review {
+                        TeamAcceptanceCheck::StructuredField {
+                            field: TeamStructuredOutputField::Review,
+                        }
+                    } else {
+                        TeamAcceptanceCheck::UpstreamReview
+                    },
                 },
                 "evidence" => TeamAcceptanceRequirement {
                     criterion: criterion.clone(),
@@ -2406,6 +2447,36 @@ mod acceptance_contract_tests {
     }
 
     #[test]
+    fn semantic_structured_fields_remain_typed_at_team_lowering() {
+        let contract = team_acceptance_contract(
+            &[
+                "structured_field:review".to_string(),
+                "structured_field:verification_report".to_string(),
+            ],
+            &[],
+            true,
+            false,
+        )
+        .expect("semantic structured fields are output obligations");
+        assert_eq!(
+            contract[0].check,
+            TeamAcceptanceCheck::StructuredField {
+                field: TeamStructuredOutputField::Review,
+            }
+        );
+        assert_eq!(
+            contract[1].check,
+            TeamAcceptanceCheck::StructuredArtifact {
+                name: "verification_report".to_string(),
+            }
+        );
+        assert!(
+            team_acceptance_contract(&["structured_field:  ".to_string()], &[], true, false,)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn network_evidence_is_a_bounded_team_acceptance_scope() {
         let contract = team_acceptance_contract(
             &["findings".to_string(), "evidence".to_string()],
@@ -2663,6 +2734,44 @@ mod acceptance_contract_tests {
                 && requirement.check
                     == TeamAcceptanceCheck::ScopedEvidence {
                         scopes: vec!["read:fixtures/write/target.txt".to_string()],
+                    }
+        }));
+        assert!(contract.iter().any(|requirement| {
+            requirement.criterion == "review"
+                && requirement.check == TeamAcceptanceCheck::UpstreamReview
+        }));
+    }
+
+    #[test]
+    fn read_only_independent_review_does_not_require_upstream_changes() {
+        let contract = team_acceptance_contract(
+            &[
+                "evidence".to_string(),
+                "independent_review:researcher".to_string(),
+                "review".to_string(),
+                "structured_field:verification_report".to_string(),
+            ],
+            &["read:crates".to_string()],
+            true,
+            false,
+        )
+        .expect("read-only independent review has a typed contract");
+
+        assert!(contract.iter().any(|requirement| {
+            requirement.criterion == "review"
+                && requirement.check
+                    == TeamAcceptanceCheck::StructuredField {
+                        field: TeamStructuredOutputField::Review,
+                    }
+        }));
+        assert!(!contract
+            .iter()
+            .any(|requirement| requirement.check == TeamAcceptanceCheck::UpstreamReview));
+        assert!(contract.iter().any(|requirement| {
+            requirement.criterion == "structured_field:verification_report"
+                && requirement.check
+                    == TeamAcceptanceCheck::StructuredArtifact {
+                        name: "verification_report".to_string(),
                     }
         }));
     }
