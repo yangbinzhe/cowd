@@ -52,6 +52,32 @@
     use std::sync::Arc;
     use std::time::Duration;
 
+    struct CollaborationAvailableExecutor;
+
+    #[async_trait::async_trait]
+    impl ToolExecutor for CollaborationAvailableExecutor {
+        async fn execute_output(
+            &self,
+            _tool_name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
+            Err(crate::ToolError::new(
+                "provider strategy fixture does not execute tools",
+            ))
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            vec![
+                "runtime_capabilities".to_string(),
+                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID.to_string(),
+            ]
+        }
+
+        fn collaboration_runtime_available(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn provider_retry_fence_activates_for_prior_or_same_attempt_effect_receipt() {
         assert!(!provider_retry_is_fenced(false, 0));
@@ -245,7 +271,7 @@
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
-            StaticToolExecutor::new(),
+            CollaborationAvailableExecutor,
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         )
@@ -2650,15 +2676,21 @@
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
-            StaticToolExecutor::new(),
+            CollaborationAvailableExecutor,
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         )
         .without_memory()
         .with_runtime_event_store(Arc::clone(&store));
         let admitted = runtime
-            .begin_turn_strategy("root-collaboration-contract", "分析并解决这个问题")
+            .begin_turn_strategy(
+                "root-collaboration-contract",
+                "启动两个协作团队分析并解决这个问题",
+            )
             .expect("admit strategy");
+        runtime
+            .set_turn_strategy_focus_partitions(Vec::new(), 2)
+            .expect("freeze explicit collaboration obligation");
         runtime
             .bind_turn_strategy_execution("root-collaboration-contract", "root-graph")
             .expect("bind strategy graph");
@@ -3116,6 +3148,7 @@
                 > selected.revision
         );
         assert_eq!(downgraded.payload["selected_candidate"], "direct");
+        assert!(downgraded.payload["collaboration_obligation"].is_null());
         assert!(downgraded.payload["reason"]
             .as_str()
             .expect("visible reason")
@@ -3128,7 +3161,7 @@
         let runtime = ConversationRuntime::new(
             Session::new(),
             MockApi,
-            StaticToolExecutor::new(),
+            CollaborationAvailableExecutor,
             PermissionPolicy::new(PermissionMode::WorkspaceWrite),
             vec!["system".to_string()],
         )
@@ -3155,9 +3188,29 @@
                     output_contract: Vec::new(),
                     output_acceptance: Vec::new(),
                 }],
-            }])
+            }], 1)
             .expect("set evidence scope");
         let selected = runtime.active_turn_strategy().expect("selected state");
+        let frozen_events = store
+            .list_stream(&format!("session:{}", runtime.session_id()))
+            .expect("frozen strategy events");
+        assert!(
+            frozen_events.iter().any(|event| {
+                event.kind == "runtime.strategy.selected"
+                    && event.payload["collaboration_obligation"].is_object()
+            }),
+            "frozen event stream: {frozen_events:#?}"
+        );
+        let recovered = runtime
+            .recover_turn_strategy_identity("provider-turn", "provider-graph")
+            .expect("recover frozen strategy identity");
+        assert_eq!(
+            recovered
+                .collaboration_obligation
+                .as_ref()
+                .map(|obligation| obligation.minimum_team_count),
+            Some(1)
+        );
         {
             let mut guard = runtime
                 .active_turn_strategy

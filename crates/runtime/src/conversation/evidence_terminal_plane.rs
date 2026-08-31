@@ -1315,6 +1315,20 @@ where
                 "root collaboration control plane requires at least one Team",
             ));
         }
+        let frozen_required_team_count = self
+            .active_turn_strategy()
+            .and_then(|state| state.decision.collaboration_obligation)
+            .map(|obligation| obligation.required_team_count())
+            .ok_or_else(|| {
+                RuntimeError::new(
+                    "root collaboration control plane requires a frozen execution obligation",
+                )
+            })?;
+        if frozen_required_team_count != required_team_count {
+            return Err(RuntimeError::new(format!(
+                "root collaboration cardinality diverged from frozen obligation: expected {frozen_required_team_count}, observed {required_team_count}"
+            )));
+        }
         let decision = self.revise_active_turn_strategy(
             harness_contract::strategy::ExecutionCandidateKind::Team,
             harness_contract::core::ExecutionPattern::Collaborate,
@@ -1353,6 +1367,9 @@ where
                 state.status = recovered.status;
                 state.resource_snapshot = recovered.resource_snapshot;
                 state.collaboration_receipt = recovered.collaboration_receipt;
+                if recovered.collaboration_obligation.is_some() {
+                    state.decision.collaboration_obligation = recovered.collaboration_obligation;
+                }
                 state.focus_partition_plans = recovered.focus_partition_plans;
                 state.decision.decision_id = recovered.decision_id;
                 state.decision.decision_revision = recovered.revision;
@@ -1487,6 +1504,14 @@ where
                         .get("collaboration_receipt")
                         .filter(|value| !value.is_null())
                         .cloned(),
+                    collaboration_obligation: payload
+                        .get("collaboration_obligation")
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .and_then(|obligation: harness_contract::strategy::CollaborationExecutionObligation| {
+                            obligation.validate().ok().map(|()| obligation)
+                        }),
                     focus_partition_plans: payload
                         .get("evidence_scopes")
                         .cloned()
@@ -1516,6 +1541,7 @@ where
             let previous = state.clone();
             if state.selected_candidate == selected_candidate
                 && state.decision.pattern() == pattern
+                && state.status == status
                 && status == crate::execution_core::TurnStrategyDecisionStatus::Running
             {
                 return Ok(state.decision.clone());
@@ -1531,7 +1557,9 @@ where
                     .active_turn_strategy
                     .lock()
                     .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? =
-                    Some(previous);
+                    Some(previous.clone());
+                self.tool_executor
+                    .bind_execution_decision(previous.decision);
                 return Err(error);
             }
         }
@@ -1732,16 +1760,56 @@ where
     pub(crate) fn set_turn_strategy_focus_partitions(
         &self,
         plans: Vec<harness_contract::team::FocusPartitionPlan>,
+        automatic_minimum_team_count: u8,
     ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
-        let mut guard = self
-            .active_turn_strategy
-            .lock()
-            .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| RuntimeError::new("focus partitions have no turn strategy owner"))?;
-        state.focus_partition_plans = plans;
-        Ok(state.clone())
+        let (updated, previous, already_bound) = {
+            let mut guard = self
+                .active_turn_strategy
+                .lock()
+                .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))?;
+            let state = guard
+                .as_mut()
+                .ok_or_else(|| RuntimeError::new("focus partitions have no turn strategy owner"))?;
+            let previous = state.clone();
+            let focus_ids = plans
+                .iter()
+                .flat_map(|plan| plan.slots.iter())
+                .map(|slot| slot.focus_id.clone())
+                .collect::<Vec<_>>();
+            let obligation = (state.selected_candidate
+                == harness_contract::strategy::ExecutionCandidateKind::Team)
+                .then(|| {
+                    harness_contract::strategy::CollaborationExecutionObligation::for_selected_team(
+                        &state.decision.strategy.understanding,
+                        automatic_minimum_team_count,
+                        focus_ids,
+                    )
+                    .map_err(RuntimeError::new)
+                })
+                .transpose()?;
+            state.focus_partition_plans = plans;
+            state.decision.collaboration_obligation = obligation;
+            (state.clone(), previous, state.execution_graph_ref.is_some())
+        };
+        self.tool_executor
+            .bind_execution_decision(updated.decision.clone());
+        if already_bound {
+            if let Err(error) = self.append_turn_strategy_event(
+                "runtime.strategy.selected",
+                &updated,
+                "focus partitions and collaboration execution obligation frozen",
+            ) {
+                *self
+                    .active_turn_strategy
+                    .lock()
+                    .map_err(|_| RuntimeError::new("turn strategy owner lock poisoned"))? =
+                    Some(previous.clone());
+                self.tool_executor
+                    .bind_execution_decision(previous.decision);
+                return Err(error);
+            }
+        }
+        Ok(updated)
     }
 
     pub(crate) fn finish_turn_strategy(
@@ -1910,6 +1978,7 @@ where
                 "status": state.status,
                 "reason": reason,
                 "collaboration_receipt": state.collaboration_receipt,
+                "collaboration_obligation": state.decision.collaboration_obligation,
                 "evidence_scopes": state.focus_partition_plans,
                 "outcome": state.outcome,
                 "provider_selection": self.provider_selection_receipt

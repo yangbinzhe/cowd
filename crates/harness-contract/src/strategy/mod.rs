@@ -10,7 +10,7 @@ use crate::core::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +77,118 @@ pub struct TaskUnderstanding {
     /// text parsing merely proposes the reference.
     #[serde(default)]
     pub collaboration_reference: CollaborationReference,
+}
+
+/// Why a selected Team strategy owns an executable collaboration obligation.
+///
+/// This is deliberately distinct from `requests_multi_agent`: the latter is
+/// normalized user intent, while this enum records the admitted Runtime
+/// authority that every downstream enforcement point must consume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationObligationSource {
+    ExplicitRequest,
+    AutomaticStrategy,
+}
+
+/// Canonical, durable Team execution requirement for one admitted turn.
+///
+/// Strategy selection freezes this contract before provider exposure. Runtime
+/// may ask the model to author the semantic topology, but a final answer cannot
+/// weaken or bypass the minimum encoded here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationExecutionObligation {
+    pub source: CollaborationObligationSource,
+    pub minimum_team_count: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_team_count: Option<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_focus_ids: Vec<String>,
+    pub proposal_required: bool,
+}
+
+impl CollaborationExecutionObligation {
+    pub fn for_selected_team(
+        understanding: &TaskUnderstanding,
+        automatic_minimum_team_count: u8,
+        focus_ids: impl IntoIterator<Item = String>,
+    ) -> Result<Self, String> {
+        if understanding.forbids_team {
+            return Err("a forbidden Team cannot own a collaboration obligation".to_string());
+        }
+        let required_focus_ids = focus_ids
+            .into_iter()
+            .filter(|focus_id| !focus_id.trim().is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let (source, minimum_team_count, exact_team_count) =
+            if understanding.required_team_count > 0 {
+                (
+                    CollaborationObligationSource::ExplicitRequest,
+                    understanding.required_team_count,
+                    Some(understanding.required_team_count),
+                )
+            } else if understanding.requests_multi_agent {
+                (
+                    CollaborationObligationSource::ExplicitRequest,
+                    automatic_minimum_team_count,
+                    None,
+                )
+            } else {
+                (
+                    CollaborationObligationSource::AutomaticStrategy,
+                    automatic_minimum_team_count,
+                    None,
+                )
+            };
+        let obligation = Self {
+            source,
+            minimum_team_count,
+            exact_team_count,
+            required_focus_ids,
+            proposal_required: true,
+        };
+        obligation.validate()?;
+        Ok(obligation)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.minimum_team_count == 0 {
+            return Err("collaboration obligation requires at least one Team".to_string());
+        }
+        if self
+            .exact_team_count
+            .is_some_and(|count| count != self.minimum_team_count)
+        {
+            return Err("an exact Team count must equal the frozen minimum Team count".to_string());
+        }
+        if matches!(
+            self.source,
+            CollaborationObligationSource::AutomaticStrategy
+        ) && self.required_focus_ids.is_empty()
+        {
+            return Err(
+                "an automatic Team obligation requires at least one frozen focus".to_string(),
+            );
+        }
+        if !self.proposal_required {
+            return Err("a Team execution obligation must require a typed proposal".to_string());
+        }
+        if self
+            .required_focus_ids
+            .windows(2)
+            .any(|ids| ids[0] >= ids[1])
+        {
+            return Err("required focus ids must be sorted and unique".to_string());
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn required_team_count(&self) -> u8 {
+        self.minimum_team_count
+    }
 }
 
 /// Typed continuation reference produced by strategy understanding.
@@ -2898,7 +3010,7 @@ fn independent_workstreams(normalized: &str) -> u8 {
     .iter()
     .filter(|term| normalized.contains(**term))
     .count();
-    let explicit_team_handoff = contains_any(
+    let explicit_team_handoff = if contains_any(
         normalized,
         &[
             "另一个团队",
@@ -2909,9 +3021,11 @@ fn independent_workstreams(normalized: &str) -> u8 {
             "second team",
             "next team",
         ],
-    )
-    .then_some(2)
-    .unwrap_or_default();
+    ) {
+        2
+    } else {
+        0
+    };
     (domains as u8)
         .max(explicit_workstream_count(normalized))
         .max(explicit_team_handoff)
@@ -3135,7 +3249,23 @@ fn explicit_workstream_count(normalized: &str) -> u8 {
         ("七", "seven", 7),
         ("八", "eight", 8),
     ];
-    const CHINESE_ROLES: &[&str] = &["研究员", "智能体", "代理", "成员", "工作流", "任务线"];
+    const CHINESE_ROLES: &[&str] = &[
+        "研究员",
+        "智能体",
+        "代理",
+        "成员",
+        "工作流",
+        "任务线",
+        // Provider/product-neutral responsibility units. These describe
+        // independently accountable work, not a particular repository's
+        // component names.
+        "责任域",
+        "领域",
+        "模块",
+        "方面",
+        "维度",
+        "证据源",
+    ];
     const ENGLISH_ROLES: &[&str] = &[
         "researcher",
         "researchers",
@@ -3145,6 +3275,18 @@ fn explicit_workstream_count(normalized: &str) -> u8 {
         "workers",
         "workstream",
         "workstreams",
+        "domain",
+        "domains",
+        "area",
+        "areas",
+        "module",
+        "modules",
+        "dimension",
+        "dimensions",
+        "track",
+        "tracks",
+        "evidence source",
+        "evidence sources",
     ];
     let mut requested = 0;
     for (chinese, english, count) in COUNTS {

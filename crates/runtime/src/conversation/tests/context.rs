@@ -628,6 +628,10 @@
                 "grep_search".to_string(),
             ]
         }
+
+        fn collaboration_runtime_available(&self) -> bool {
+            true
+        }
     }
 
     #[test]
@@ -1416,6 +1420,9 @@
         runtime
             .begin_turn_strategy("orchestration-gate-turn", "必须实际启动协作团队完成分析")
             .expect("turn strategy admission");
+        runtime
+            .set_turn_strategy_focus_partitions(Vec::new(), 1)
+            .expect("freeze root collaboration obligation");
         runtime.require_next_model_orchestration_only();
         runtime
             .execute_model_step("必须实际启动协作团队完成分析", true)

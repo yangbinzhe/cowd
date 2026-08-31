@@ -282,12 +282,23 @@
     #[test]
     fn completed_root_team_forces_a_text_only_presentation_turn() {
         let verified = BTreeSet::from(["runtime-team:audited".to_string()]);
-        assert!(root_team_terminal_requires_text_only(false, 1, &verified));
-        assert!(!root_team_terminal_requires_text_only(true, 1, &verified));
-        assert!(!root_team_terminal_requires_text_only(false, 0, &verified));
+        let obligation = test_collaboration_obligation(1);
+        assert!(root_team_terminal_requires_text_only(
+            false,
+            Some(&obligation),
+            &verified
+        ));
+        assert!(!root_team_terminal_requires_text_only(
+            true,
+            Some(&obligation),
+            &verified
+        ));
+        assert!(!root_team_terminal_requires_text_only(
+            false, None, &verified
+        ));
         assert!(!root_team_terminal_requires_text_only(
             false,
-            1,
+            Some(&obligation),
             &BTreeSet::new()
         ));
     }

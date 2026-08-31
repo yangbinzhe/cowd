@@ -946,7 +946,10 @@ where
                 "runtime Skill tool references applied to the current provider request"
             );
         }
-        if decision.strategy.understanding.required_team_count > 0 {
+        let collaboration_obligation = self
+            .active_turn_strategy()
+            .and_then(|state| state.decision.collaboration_obligation);
+        if let Some(obligation) = collaboration_obligation {
             for tool in [
                 "runtime_capabilities",
                 harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
@@ -955,11 +958,13 @@ where
                 exposure.deferred.remove(tool);
             }
             exposure.reason =
-                "explicit team requirement forces orchestration tools active".to_string();
+                "collaboration execution obligation forces orchestration tools active".to_string();
             tracing::info!(
                 team_required = true,
+                obligation_source = ?obligation.source,
+                minimum_team_count = obligation.minimum_team_count,
                 active = ?exposure.active,
-                "explicit team requirement forced orchestration exposure"
+                "collaboration execution obligation forced orchestration exposure"
             );
         }
         let one_shot_tool_overlay =

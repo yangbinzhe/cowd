@@ -20,6 +20,53 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_DEFAULT_SCENARIO_TIMEOUT: Duration = Duration::from_secs(600);
 const GROUP_THEORY_SCENARIO_ID: &str = "live_group_theory_ai_research_simulation";
 const LARGE_SCALE_SCENARIO_ID: &str = "live_qwen38_large_scale_collaboration";
+const IMPLICIT_COLLABORATION_SCENARIO_ID: &str = "live_implicit_collaboration_obligation";
+const RELEASE_CERTIFICATION_SCENARIOS: [&str; 6] = [
+    "live_direct_terminal",
+    "live_tool_evidence",
+    "live_single_architecture_baseline",
+    IMPLICIT_COLLABORATION_SCENARIO_ID,
+    "live_team_projection",
+    "live_agent_escalation",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveClaimScope {
+    Focused,
+    ReleaseCertification,
+}
+
+impl LiveClaimScope {
+    fn from_environment() -> Result<Self, String> {
+        match std::env::var("COWD_EVAL_CLAIM_SCOPE")
+            .unwrap_or_else(|_| "focused".to_string())
+            .trim()
+        {
+            "focused" => Ok(Self::Focused),
+            "release-certification" => Ok(Self::ReleaseCertification),
+            value => Err(format!(
+                "COWD_EVAL_CLAIM_SCOPE must be `focused` or `release-certification`, got `{value}`"
+            )),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Focused => "focused",
+            Self::ReleaseCertification => "release-certification",
+        }
+    }
+}
+
+fn release_certification_scenarios_present(scenarios: &[Value]) -> bool {
+    let observed = scenarios
+        .iter()
+        .filter_map(|scenario| scenario.get("scenario_id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    RELEASE_CERTIFICATION_SCENARIOS
+        .iter()
+        .all(|scenario_id| observed.contains(scenario_id))
+}
 
 fn env_flag_enabled(key: &str) -> bool {
     matches!(
@@ -165,6 +212,19 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) 
 /// Gateway. This runner never constructs Runtime objects or fakes receipts:
 /// every result is derived from public Gateway responses and durable messages.
 pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
+    let claim_scope = match LiveClaimScope::from_environment() {
+        Ok(scope) => scope,
+        Err(reason) => {
+            return json!({
+                "kind": "harness_eval.live_gateway_scenarios",
+                "status": "gated",
+                "claim_scope": "invalid",
+                "release_certified": false,
+                "reason": reason,
+                "scenarios": [],
+            });
+        }
+    };
     let max_provider_tokens = match live_provider_token_limit() {
         Ok(limit) => limit,
         Err(reason) => {
@@ -237,6 +297,7 @@ pub fn run_live_gateway_scenarios(options: &HarnessEvalRunnerOptions) -> Value {
         timeout_cap,
         poll_interval,
         model: options.provider.clone(),
+        claim_scope,
     };
     runner.run(max_provider_tokens)
 }
@@ -247,6 +308,7 @@ struct LiveScenarioRunner {
     timeout_cap: Option<Duration>,
     poll_interval: Duration,
     model: Option<String>,
+    claim_scope: LiveClaimScope,
 }
 
 #[derive(Clone, Copy)]
@@ -598,6 +660,7 @@ fn root_execution_terminal_state(projection: &Value) -> RootExecutionTerminal {
 
 impl LiveScenarioRunner {
     fn run(&self, max_provider_tokens: u64) -> Value {
+        let claim_scope = self.claim_scope;
         let health_observations = [
             ("gateway", "/healthz", LiveHealthContract::Gateway),
             (
@@ -666,6 +729,16 @@ impl LiveScenarioRunner {
                 prompt: "请单独完成一次复杂架构审查，不要启动团队：分别分析 runtime、memory、gateway 的职责边界、各自的 canonical state 或事件真相、一个潜在风险，并给出至少三个完整的 `crates/.../*.rs` 源码路径作为证据。只陈述本次实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 0,
+                    minimum_claimed_cross_team_edges: 0,
+                    evidence_profile: ArchitectureEvidenceProfile::Basic,
+                },
+                timeout: LiveScenarioTimeout::team(),
+            },
+            LiveScenarioSpec {
+                id: IMPLICIT_COLLABORATION_SCENARIO_ID,
+                prompt: "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 `crates/.../*.rs` 源码路径，只陈述工具证据能够验证的事实；不要自行指定 Team、Agent、角色、模板或编排拓扑。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具，不要调用 bash 或任何写工具。",
+                acceptance: LiveAcceptance::ArchitectureQuality {
+                    minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 0,
                     evidence_profile: ArchitectureEvidenceProfile::Basic,
                 },
@@ -763,14 +836,41 @@ impl LiveScenarioRunner {
                 "reason": "baseline/team projection pair was not selected",
             })
         };
-        let comparison_passed = collaboration_comparison
+        let comparison_status = collaboration_comparison
             .get("status")
             .and_then(Value::as_str)
-            .is_some_and(|status| matches!(status, "passed" | "skipped"));
+            .unwrap_or("failed");
+        let comparison_passed = comparison_status == "passed"
+            || (claim_scope == LiveClaimScope::Focused && comparison_status == "skipped");
+        let certification_scenarios_present = release_certification_scenarios_present(&scenarios);
+        let release_certified = claim_scope == LiveClaimScope::ReleaseCertification
+            && selected_scenario_ids.is_none()
+            && certification_scenarios_present
+            && comparison_status == "passed"
+            && health_passed
+            && selection_passed
+            && passed == scenarios.len();
+        let claim_status = match claim_scope {
+            LiveClaimScope::Focused
+                if health_passed
+                    && selection_passed
+                    && passed == scenarios.len()
+                    && comparison_passed =>
+            {
+                "component_passed"
+            }
+            LiveClaimScope::Focused => "component_failed",
+            LiveClaimScope::ReleaseCertification if release_certified => "certified",
+            LiveClaimScope::ReleaseCertification => "certification_failed",
+        };
         let metrics = aggregate_scenario_metrics(&scenarios);
         json!({
             "kind": "harness_eval.live_gateway_scenarios",
-            "status": if health_passed && selection_passed && passed == scenarios.len() && comparison_passed { "passed" } else { "failed" },
+            "status": if health_passed && selection_passed && passed == scenarios.len() && comparison_passed && (claim_scope == LiveClaimScope::Focused || release_certified) { "passed" } else { "failed" },
+            "claim_scope": claim_scope.as_str(),
+            "claim_status": claim_status,
+            "release_certified": release_certified,
+            "certification_scenarios_present": certification_scenarios_present,
             "gateway_url": self.base_url,
             "model": self.model,
             "max_provider_tokens_per_scenario": max_provider_tokens,
@@ -3402,6 +3502,24 @@ mod tests {
     fn legacy_expensive_scenario_opt_in_only_applies_without_selection() {
         assert!(scenario_enabled(None, GROUP_THEORY_SCENARIO_ID, true));
         assert!(!scenario_enabled(None, GROUP_THEORY_SCENARIO_ID, false));
+    }
+
+    #[test]
+    fn release_certification_requires_every_registered_core_scenario() {
+        let complete = RELEASE_CERTIFICATION_SCENARIOS
+            .iter()
+            .map(|scenario_id| json!({"scenario_id": scenario_id, "status": "passed"}))
+            .collect::<Vec<_>>();
+        assert!(release_certification_scenarios_present(&complete));
+
+        let incomplete = complete
+            .into_iter()
+            .filter(|scenario| {
+                scenario.get("scenario_id").and_then(Value::as_str)
+                    != Some(IMPLICIT_COLLABORATION_SCENARIO_ID)
+            })
+            .collect::<Vec<_>>();
+        assert!(!release_certification_scenarios_present(&incomplete));
     }
 
     #[test]

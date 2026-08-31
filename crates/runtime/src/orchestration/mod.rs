@@ -253,7 +253,7 @@ async fn submit_runtime_orchestration_request_with_mode(
         }
     }
     bind_strategy(&mut request, leased_decision, parent_execution.as_ref());
-    if let Err(error) = validate_explicit_team_cardinality(&request, leased_decision) {
+    if let Err(error) = validate_collaboration_obligation_cardinality(&request, leased_decision) {
         return rejected_explicit_team_cardinality_result(&request, error);
     }
     if let Err(error) = materialize_ephemeral_team_template(&mut request, services) {
@@ -499,18 +499,19 @@ fn rejected_intent_compiler_result(
 /// it may neither collapse required Teams nor add hidden pre-planned Teams.
 /// This is intentionally evaluated against the already-bound turn strategy,
 /// never against a model-supplied count.
-fn validate_explicit_team_cardinality(
+fn validate_collaboration_obligation_cardinality(
     request: &RuntimeOrchestrationCommand,
     leased_decision: Option<&RuntimeExecutionDecision>,
 ) -> Result<(), String> {
-    let required = u16::from(
-        leased_decision
-            .map(|decision| decision.strategy.understanding.required_team_count)
-            .unwrap_or_default(),
-    );
-    if required == 0 || request.operation != RuntimeOrchestrationOperation::Propose {
+    let Some(obligation) =
+        leased_decision.and_then(|decision| decision.collaboration_obligation.as_ref())
+    else {
+        return Ok(());
+    };
+    if request.operation != RuntimeOrchestrationOperation::Propose {
         return Ok(());
     }
+    let required = u16::from(obligation.minimum_team_count);
     let actual = request.proposal.as_ref().map_or(0, |proposal| {
         proposal
             .nodes
@@ -519,8 +520,14 @@ fn validate_explicit_team_cardinality(
             .map(|node| node.multiplicity)
             .sum::<u16>()
     });
-    (actual == required).then_some(()).ok_or_else(|| {
-        format!("explicit_team_requirement_count_mismatch:required={required}:proposed={actual}")
+    let cardinality_valid = obligation
+        .exact_team_count
+        .map_or(actual >= required, |exact| actual == u16::from(exact));
+    cardinality_valid.then_some(()).ok_or_else(|| {
+        format!(
+            "collaboration_obligation_count_mismatch:source={:?}:minimum={required}:exact={:?}:proposed={actual}",
+            obligation.source, obligation.exact_team_count
+        )
     })
 }
 

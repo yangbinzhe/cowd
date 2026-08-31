@@ -53,6 +53,7 @@ case "$SCENARIO_ID" in
   live_direct_terminal) MIN_PROVIDER_TOKENS=100000 ;;
   live_tool_evidence) MIN_PROVIDER_TOKENS=250000 ;;
   live_single_architecture_baseline) MIN_PROVIDER_TOKENS=750000 ;;
+  live_implicit_collaboration_obligation) MIN_PROVIDER_TOKENS=2000000 ;;
   live_team_projection|live_agent_escalation) MIN_PROVIDER_TOKENS=2000000 ;;
   live_group_theory_ai_research_simulation) MIN_PROVIDER_TOKENS=5000000 ;;
   live_qwen38_large_scale_collaboration) MIN_PROVIDER_TOKENS=8000000 ;;

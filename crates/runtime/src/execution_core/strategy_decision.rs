@@ -3,8 +3,8 @@ use harness_contract::core::{
     TaskRisk,
 };
 use harness_contract::strategy::{
-    decide_strategy, CollaborationLiftEstimate, ExecutionCandidateKind, StrategyDecision,
-    StrategyInput, StrategyResourceSnapshot,
+    decide_strategy, CollaborationExecutionObligation, CollaborationLiftEstimate,
+    ExecutionCandidateKind, StrategyDecision, StrategyInput, StrategyResourceSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -23,6 +23,9 @@ pub struct RuntimeExecutionDecision {
     pub turn_ref: Option<String>,
     pub user_intent_preview: String,
     pub strategy: StrategyDecision,
+    /// Frozen Team execution contract shared by every Runtime consumer.
+    #[serde(default)]
+    pub collaboration_obligation: Option<CollaborationExecutionObligation>,
     pub candidate_patterns: Vec<RuntimeExecutionPatternCandidate>,
     pub evidence_mode: EvidenceAcquisitionMode,
     pub recommended_template: Option<CollaborationTemplateId>,
@@ -244,6 +247,9 @@ impl TurnStrategyDecisionState {
                 spec.compile_target
             });
         self.decision.lease.locked_pattern = pattern;
+        if selected_candidate != ExecutionCandidateKind::Team {
+            self.decision.collaboration_obligation = None;
+        }
         Ok(())
     }
 
@@ -276,6 +282,9 @@ impl TurnStrategyDecisionState {
                 spec.compile_target
             });
         self.decision.lease.locked_pattern = effective_pattern;
+        if selected_candidate != ExecutionCandidateKind::Team {
+            self.decision.collaboration_obligation = None;
+        }
         Ok(())
     }
 }
@@ -514,6 +523,7 @@ fn build_runtime_execution_decision_inner(
         turn_ref: None,
         user_intent_preview: user_input.chars().take(180).collect(),
         strategy: strategy.clone(),
+        collaboration_obligation: None,
         candidate_patterns,
         evidence_mode,
         recommended_template: (!delegated_leaf).then_some(template_decision.template_id),

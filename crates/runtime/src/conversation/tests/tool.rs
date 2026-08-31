@@ -2662,7 +2662,7 @@
         let (_runtime, result) = submit_test_owned_conversation_turn(
             runtime,
             Arc::clone(&services),
-            "review the architecture with a Team",
+            "review the architecture thoroughly",
             &SharedPrompter::none(),
             test_execution_lineage(),
         )
@@ -2968,18 +2968,31 @@
             false,
             ROOT_CONTROL_PLANE_REPAIR_BUDGET
         ));
+        let collaboration_obligation = test_collaboration_obligation(2);
         assert_eq!(
-            required_team_execution_count_for_execution_context(2, true, false),
+            required_team_execution_count_for_execution_context(
+                Some(&collaboration_obligation),
+                true,
+                false,
+            ),
             0,
             "a delegated leaf must not recursively inherit the parent Team requirement"
         );
         assert_eq!(
-            required_team_execution_count_for_execution_context(2, false, true),
+            required_team_execution_count_for_execution_context(
+                Some(&collaboration_obligation),
+                false,
+                true,
+            ),
             0,
             "quoted candidate output must not turn an isolated blind Judge into a Team obligation"
         );
         assert_eq!(
-            required_team_execution_count_for_execution_context(2, false, false),
+            required_team_execution_count_for_execution_context(
+                Some(&collaboration_obligation),
+                false,
+                false,
+            ),
             2,
             "production root turns still enforce their typed Team contract"
         );

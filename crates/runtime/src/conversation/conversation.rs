@@ -644,12 +644,17 @@ fn enforce_explicit_team_requirement(
     decision: &crate::execution_core::RuntimeExecutionDecision,
     intent: ModelStepIntent,
 ) -> ModelStepIntent {
-    if !first_step || decision.strategy.understanding.required_team_count == 0 {
+    let Some(obligation) = decision.collaboration_obligation.as_ref() else {
+        return intent;
+    };
+    if !first_step {
         return intent;
     }
 
     tracing::info!(
         explicit_team = true,
+        obligation_source = ?obligation.source,
+        minimum_team_count = obligation.minimum_team_count,
         intent_kind = ?match &intent {
             ModelStepIntent::ToolCalls { .. } => "tool_calls",
             ModelStepIntent::FinalAnswer { .. } => "final_answer",
@@ -3238,6 +3243,7 @@ struct RecoveredTurnStrategyIdentity {
     resource_snapshot: harness_contract::strategy::StrategyResourceSnapshot,
     candidate_estimates: Vec<harness_contract::strategy::ExecutionCandidateEstimate>,
     collaboration_receipt: Option<serde_json::Value>,
+    collaboration_obligation: Option<harness_contract::strategy::CollaborationExecutionObligation>,
     focus_partition_plans: Vec<harness_contract::team::FocusPartitionPlan>,
     pattern: harness_contract::core::ExecutionPattern,
 }

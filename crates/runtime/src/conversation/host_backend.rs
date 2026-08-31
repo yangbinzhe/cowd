@@ -260,12 +260,16 @@ where
             {
                 None
             } else {
-                state.task_understanding.as_ref().and_then(|value| {
-                    (value.required_team_count > 0).then_some((
-                        value.required_team_count,
+                state.collaboration_obligation.as_ref().map(|obligation| {
+                    (
+                        obligation.required_team_count(),
                         state.root_control_plane_phase,
-                        value.required_workspace_evidence_scopes.clone(),
-                    ))
+                        state
+                            .task_understanding
+                            .as_ref()
+                            .map(|value| value.required_workspace_evidence_scopes.clone())
+                            .unwrap_or_default(),
+                    )
                 })
             }
         };
@@ -1186,12 +1190,9 @@ where
                 let next = match intent {
                     ModelStepIntent::FinalAnswer { text } => 'final_answer: {
                         let mut text = strip_trailing_simulated_tool_markup(text);
-                        let task_understanding = state.task_understanding.clone();
                         let required_team_executions =
                             required_team_execution_count_for_execution_context(
-                                task_understanding
-                                    .as_ref()
-                                    .map_or(0, |value| value.required_team_count),
+                                state.collaboration_obligation.as_ref(),
                                 state.execution_role.is_delegated_leaf(),
                                 state.evaluation_judge_only,
                             );
@@ -3395,10 +3396,7 @@ where
             && !state.collaboration_started
             && !has_completed_program_terminal(&state.tool_results)
             && !has_admitted_program_receipt(&state.tool_results)
-            && state
-                .task_understanding
-                .as_ref()
-                .is_some_and(|understanding| understanding.required_team_count > 0);
+            && state.collaboration_obligation.is_some();
         if root_control_plane_required {
             let next_phase = root_control_plane_phase_after_tool_batch(
                 state.root_control_plane_phase,
@@ -3641,10 +3639,7 @@ where
         let newly_completed_program_team_ids = completed_program_team_ids(&result.messages);
         let completed_root_team_this_batch = root_team_terminal_requires_text_only(
             state.execution_role.is_delegated_leaf(),
-            state
-                .task_understanding
-                .as_ref()
-                .map_or(0, |understanding| understanding.required_team_count),
+            state.collaboration_obligation.as_ref(),
             &newly_completed_program_team_ids,
         );
         state.tool_results.extend(result.messages);

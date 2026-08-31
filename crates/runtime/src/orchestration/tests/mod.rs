@@ -130,20 +130,57 @@ fn explicit_team_requirement_rejects_collapsed_or_extra_workstreams() {
     let mut decision =
         crate::execution_core::build_runtime_execution_decision("two independent reviews", None);
     decision.strategy.understanding.required_team_count = 2;
+    decision.collaboration_obligation = Some(
+        harness_contract::strategy::CollaborationExecutionObligation {
+            source: harness_contract::strategy::CollaborationObligationSource::ExplicitRequest,
+            minimum_team_count: 2,
+            exact_team_count: Some(2),
+            required_focus_ids: Vec::new(),
+            proposal_required: true,
+        },
+    );
     let one_team = proposal(vec![node(
         "runtime-review",
         CapabilityRecipeId::Team,
         Vec::new(),
     )]);
-    let error = validate_explicit_team_cardinality(&one_team, Some(&decision))
+    let error = validate_collaboration_obligation_cardinality(&one_team, Some(&decision))
         .expect_err("one Team cannot satisfy an explicit two-Team obligation");
-    assert!(error.contains("required=2:proposed=1"));
+    assert!(error.contains("minimum=2:exact=Some(2):proposed=1"));
 
     let two_teams = proposal(vec![
         node("runtime-review", CapabilityRecipeId::Team, Vec::new()),
         node("gateway-review", CapabilityRecipeId::Team, Vec::new()),
     ]);
-    assert!(validate_explicit_team_cardinality(&two_teams, Some(&decision)).is_ok());
+    assert!(validate_collaboration_obligation_cardinality(&two_teams, Some(&decision)).is_ok());
+}
+
+#[test]
+fn automatic_collaboration_obligation_rejects_collapsed_workstreams() {
+    let mut decision =
+        crate::execution_core::build_runtime_execution_decision("three evidence domains", None);
+    decision.collaboration_obligation = Some(
+        harness_contract::strategy::CollaborationExecutionObligation {
+            source: harness_contract::strategy::CollaborationObligationSource::AutomaticStrategy,
+            minimum_team_count: 3,
+            exact_team_count: None,
+            required_focus_ids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            proposal_required: true,
+        },
+    );
+    let one_team = proposal(vec![node(
+        "collapsed",
+        CapabilityRecipeId::Team,
+        Vec::new(),
+    )]);
+    assert!(validate_collaboration_obligation_cardinality(&one_team, Some(&decision)).is_err());
+
+    let three_teams = proposal(vec![
+        node("a", CapabilityRecipeId::Team, Vec::new()),
+        node("b", CapabilityRecipeId::Team, Vec::new()),
+        node("c", CapabilityRecipeId::Team, Vec::new()),
+    ]);
+    assert!(validate_collaboration_obligation_cardinality(&three_teams, Some(&decision)).is_ok());
 }
 
 #[test]

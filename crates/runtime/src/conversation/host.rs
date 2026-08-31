@@ -553,6 +553,7 @@ where
         let state = Arc::new(tokio::sync::Mutex::new(TurnGraphState {
             content: content.to_string(),
             task_understanding: None,
+            collaboration_obligation: None,
             prompter: prompter.clone(),
             first_model_step: true,
             pending_next_model_context: Vec::new(),
@@ -701,6 +702,8 @@ where
             )?;
         }
         if strategy.selected_candidate == harness_contract::strategy::ExecutionCandidateKind::Team {
+            let automatic_minimum_team_count = u8::try_from(selected_strategy_focus_count(&strategy))
+                .unwrap_or(u8::MAX);
             let plans =
                 selected_strategy_focus_plans(
                     &strategy,
@@ -714,7 +717,7 @@ where
             strategy = runtime
                 .lock()
                 .await
-                .set_turn_strategy_focus_partitions(plans)?;
+                .set_turn_strategy_focus_partitions(plans, automatic_minimum_team_count)?;
         }
         if evaluation_control.is_some() && evaluation_topology_forbids_team() {
             let mut item = ContextItem::new(
@@ -735,6 +738,8 @@ where
             let mut graph_state = state.lock().await;
             graph_state.task_understanding =
                 Some(strategy.decision.strategy.understanding.clone());
+            graph_state.collaboration_obligation =
+                strategy.decision.collaboration_obligation.clone();
             graph_state.context_window = context_window;
             graph_state.safety_lease = crate::execution_core::SafetyFusePolicy::derive(
                 context_window,
@@ -1653,8 +1658,14 @@ fn collaboration_team_slots(provider_available: usize, agent_available: usize) -
     provider_available.min(agent_available)
 }
 
-fn structured_team_count(understanding: &harness_contract::strategy::TaskUnderstanding) -> usize {
-    usize::from(understanding.required_team_count.max(1))
+fn structured_team_count(strategy: &crate::execution_core::TurnStrategyDecisionState) -> usize {
+    strategy
+        .decision
+        .collaboration_obligation
+        .as_ref()
+        .map_or(0, |obligation| {
+            usize::from(obligation.required_team_count())
+        })
 }
 
 /// Submit the admitted Team strategy as a Coordinator-owned Program intent
@@ -1716,7 +1727,7 @@ async fn submit_selected_program_intent(
             services.path_identity_resolver(),
         );
         let parent_goal_satisfied = team_phase_satisfies_parent_goal(
-            structured_team_count(&strategy.decision.strategy.understanding),
+            structured_team_count(strategy),
             parent_requires_write,
             parent_write_satisfied,
             recovered_team_ids.len(),
@@ -2184,7 +2195,7 @@ fn team_orchestration_request_available(
 }
 
 fn required_team_execution_count_for_execution_context(
-    required_team_count: u8,
+    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
     delegated_agent_role: bool,
     evaluation_judge_only: bool,
 ) -> usize {
@@ -2197,7 +2208,20 @@ fn required_team_execution_count_for_execution_context(
     if delegated_agent_role || evaluation_judge_only {
         0
     } else {
-        usize::from(required_team_count)
+        obligation.map_or(0, |value| usize::from(value.required_team_count()))
+    }
+}
+
+#[cfg(test)]
+fn test_collaboration_obligation(
+    minimum_team_count: u8,
+) -> harness_contract::strategy::CollaborationExecutionObligation {
+    harness_contract::strategy::CollaborationExecutionObligation {
+        source: harness_contract::strategy::CollaborationObligationSource::AutomaticStrategy,
+        minimum_team_count,
+        exact_team_count: None,
+        required_focus_ids: Vec::new(),
+        proposal_required: true,
     }
 }
 
@@ -2708,6 +2732,9 @@ struct TurnGraphState {
     /// Strategy ingress parses the objective once. Later Team acceptance and
     /// graph repair paths consume this structured authority.
     task_understanding: Option<harness_contract::strategy::TaskUnderstanding>,
+    /// Read-only hot-path copy of the durable turn strategy obligation.
+    /// ConversationRuntime remains the sole owner and event source.
+    collaboration_obligation: Option<harness_contract::strategy::CollaborationExecutionObligation>,
     prompter: SharedPrompter,
     first_model_step: bool,
     /// Runtime-authored checkpoint instructions that must be inserted in the
@@ -3352,10 +3379,10 @@ impl<T: ToolExecutor> crate::conversation::EarlyToolDispatcher for HostEarlyTool
 
 fn root_team_terminal_requires_text_only(
     delegated_leaf: bool,
-    required_team_count: u8,
+    obligation: Option<&harness_contract::strategy::CollaborationExecutionObligation>,
     newly_completed_program_team_ids: &BTreeSet<String>,
 ) -> bool {
-    !delegated_leaf && required_team_count > 0 && !newly_completed_program_team_ids.is_empty()
+    !delegated_leaf && obligation.is_some() && !newly_completed_program_team_ids.is_empty()
 }
 
 /// Return missing user-named source scopes for a typed root admission call.
