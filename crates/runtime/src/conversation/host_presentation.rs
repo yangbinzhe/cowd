@@ -2645,8 +2645,9 @@ pub(super) fn focus_acceptance_is_met(
 pub(super) fn should_force_focus_synthesis(
     focus_acceptance_met: bool,
     required_scopes: &[String],
-    _repeated_evidence_saturation: bool,
+    repeated_evidence_saturation: bool,
     has_retained_terminal_candidate: bool,
+    exact_workspace_evidence: bool,
 ) -> bool {
     if !focus_acceptance_met {
         return false;
@@ -2655,19 +2656,17 @@ pub(super) fn should_force_focus_synthesis(
     // missing deterministic read. Once the typed receipt closes the exact
     // obligation, another provider answer creates a stale second-final race;
     // the retained candidate owns the text and the receipt owns the evidence.
-    if has_retained_terminal_candidate {
+    if has_retained_terminal_candidate && exact_workspace_evidence {
         return true;
     }
-    // A bounded read-only role has no additional acceptance obligation once
-    // its exact scope is proven.  Leaving native tools enabled here invites
-    // the provider to keep rediscovering the same source and, worse, lets a
-    // later malformed/exhausted request turn a successful receipt into a
-    // blocked Team.  Move directly to the text-only terminal presentation;
-    // the synthesis still has every retained receipt in context.
-    //
-    // This is about the role's immutable evidence contract, not its display
-    // name, template, or any catalog-specific behavior.
-    !required_scopes.is_empty()
+    // An exact file receipt is mechanically complete, so another acquisition
+    // round can add no evidence required by this role. A directory/network
+    // scope is different: it is an exploration authority and responsibility
+    // zone. One descendant receipt establishes in-scope provenance but does
+    // not prove that investigation is complete. Keep discovery available
+    // until the provider returns a grounded terminal answer or the existing
+    // bounded novelty policy observes repeated saturation.
+    !required_scopes.is_empty() && (exact_workspace_evidence || repeated_evidence_saturation)
 }
 
 pub(super) fn should_recover_missing_required_write(
@@ -3548,56 +3547,42 @@ pub(super) fn successful_runtime_focus_scope_keys(
         .collect()
 }
 
-/// A `read:` Focus may authorize either a file or a directory. `read_file`
-/// cannot satisfy the latter when passed the directory itself, so choose one
-/// deterministic regular descendant for the Runtime-authored verification.
-/// The governed ToolHost still performs the actual read and creates the
-/// receipt; this lookup only selects a safe, already-authorized target.
+/// Resolve only an exact existing regular file for Runtime-owned verification.
+/// A directory is exploration authority, not an exact evidence target.
 pub(super) fn focus_verification_read_path(path: &str, workspace_root: &Path) -> Option<String> {
     if path == "." {
         return None;
     }
     let candidate = workspace_root.join(path);
-    let metadata = std::fs::symlink_metadata(&candidate).ok();
-    if metadata.as_ref().is_none_or(|metadata| !metadata.is_dir()) {
-        return Some(path.to_string());
+    let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return None;
     }
     let root = workspace_root.canonicalize().ok()?;
-    let file = first_regular_workspace_file(&candidate, &root)?;
+    let file = candidate.canonicalize().ok()?;
     file.strip_prefix(&root)
         .ok()?
         .to_str()
         .map(|relative| relative.replace('\\', "/"))
 }
 
-pub(super) fn first_regular_workspace_file(
-    directory: &Path,
+pub(super) fn focus_scopes_are_exact_workspace_files(
+    scopes: &[String],
     workspace_root: &Path,
-) -> Option<PathBuf> {
-    let mut directories = vec![directory.to_path_buf()];
-    while let Some(directory) = directories.pop() {
-        let mut entries = std::fs::read_dir(directory)
-            .ok()?
-            .flatten()
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries.into_iter().rev() {
-            let file_type = entry.file_type().ok()?;
-            if file_type.is_symlink() {
-                continue;
-            }
-            let path = entry.path();
-            if file_type.is_file() {
-                let canonical = path.canonicalize().ok()?;
-                if canonical.starts_with(workspace_root) {
-                    return Some(canonical);
-                }
-            } else if file_type.is_dir() {
-                directories.push(path);
-            }
-        }
-    }
-    None
+) -> bool {
+    !scopes.is_empty()
+        && scopes.iter().all(|scope| {
+            let path = scope
+                .strip_prefix("read:")
+                .or_else(|| scope.strip_prefix("write:"))
+                .or_else(|| scope.strip_prefix("verify_after_write:"))
+                .or_else(|| scope.strip_prefix("verify_upstream_change:"));
+            path.and_then(|path| {
+                let (_, normalized) = normalize_workspace_scope(&format!("read:{path}"))?;
+                focus_verification_read_path(&normalized, workspace_root)
+            })
+            .is_some()
+        })
 }
 
 pub(super) fn concrete_focus_verification_scopes(
@@ -3647,6 +3632,7 @@ pub(super) fn should_prefetch_focus_verification(
     bounded_evidence_role: bool,
     already_prefetched: bool,
     pending_scopes: &[String],
+    workspace_root: &Path,
 ) -> bool {
     first_model_step
         && bounded_evidence_role
@@ -3655,6 +3641,7 @@ pub(super) fn should_prefetch_focus_verification(
         && pending_scopes
             .iter()
             .all(|scope| scope.starts_with("read:") || scope.starts_with("verify_upstream_change:"))
+        && focus_scopes_are_exact_workspace_files(pending_scopes, workspace_root)
 }
 
 pub(super) fn typed_satisfied_focus_acceptance_scope_keys(

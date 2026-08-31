@@ -59,6 +59,7 @@ where
                 state.bounded_evidence_role,
                 state.focus_verification_prefetched,
                 &state.focus_acceptance_pending_scopes,
+                self.services.workspace_root(),
             );
             let calls = reviewer_prefetch
                 .then(|| {
@@ -1467,25 +1468,38 @@ where
                             && !reasoning_only_response
                             && !text.trim().is_empty()
                         {
-                            if state.pending_focus_terminal_candidate.is_none() {
+                            let concrete_verification_scopes = concrete_focus_verification_scopes(
+                                &state.focus_acceptance_pending_scopes,
+                                &state.focus_observed_evidence,
+                                self.services.path_identity_resolver(),
+                            );
+                            let verification_calls = focus_verification_tool_calls(
+                                &concrete_verification_scopes,
+                                state.iterations,
+                                self.services.workspace_root(),
+                            );
+                            let broad_discovery_recovery = verification_calls.is_none();
+                            let recovery_available = if broad_discovery_recovery {
+                                state.focus_discovery_replans < 2
+                            } else {
+                                state.pending_focus_terminal_candidate.is_none()
+                            };
+                            if recovery_available {
                                 let pending = state.focus_acceptance_pending_scopes.join(", ");
-                                let instruction = format!(
-                                    "Runtime Focus acceptance recovery (mandatory): retain the candidate final JSON, but do not finish yet. Complete the missing Runtime-verified action(s) with native tools: {pending}. For verify_after_write:path, perform a new exact-path read after this role's committed write receipt. For verify_upstream_change:path, independently read the exact upstream-changed path. Do not return another final answer until these actions complete."
-                                );
-                                state.pending_focus_terminal_candidate = Some(text.clone());
+                                let instruction = if broad_discovery_recovery {
+                                    state.focus_discovery_replans =
+                                        state.focus_discovery_replans.saturating_add(1);
+                                    format!(
+                                        "Runtime Focus evidence recovery (mandatory): the prior answer was discarded because the broad authority scope `{pending}` has no source receipt. Use the available discovery tools (glob_search/grep_search/read_file as applicable) to locate and inspect semantically relevant evidence inside that scope, then produce a new grounded terminal answer. A directory is not represented by an arbitrary file. Do not return another unsupported answer."
+                                    )
+                                } else {
+                                    state.pending_focus_terminal_candidate = Some(text.clone());
+                                    format!(
+                                        "Runtime Focus acceptance recovery (mandatory): retain the candidate final JSON, but do not finish yet. Complete the missing Runtime-verified action(s) with native tools: {pending}. For verify_after_write:path, perform a new exact-path read after this role's committed write receipt. For verify_upstream_change:path, independently read the exact upstream-changed path. Do not return another final answer until these actions complete."
+                                    )
+                                };
                                 state.assistant_messages.pop();
                                 state.pending_transcript.remove(&ticket.node_id);
-                                let concrete_verification_scopes =
-                                    concrete_focus_verification_scopes(
-                                        &state.focus_acceptance_pending_scopes,
-                                        &state.focus_observed_evidence,
-                                        self.services.path_identity_resolver(),
-                                    );
-                                let verification_calls = focus_verification_tool_calls(
-                                    &concrete_verification_scopes,
-                                    state.iterations,
-                                    self.services.workspace_root(),
-                                );
                                 state.content.push_str("\n\n");
                                 state.content.push_str(&instruction);
                                 let mut item = ContextItem::new(
@@ -3604,11 +3618,16 @@ where
         let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
         let repeated_evidence_saturation = state.consecutive_low_novelty_batches
             >= evidence_saturation_limit(bounded_evidence_role);
+        let exact_workspace_evidence = focus_scopes_are_exact_workspace_files(
+            &focus_acceptance_scopes,
+            self.services.workspace_root(),
+        );
         let focus_synthesis_ready = should_force_focus_synthesis(
             focus_acceptance_met,
             &focus_acceptance_scopes,
             repeated_evidence_saturation,
             has_retained_focus_terminal_candidate,
+            exact_workspace_evidence,
         );
         let successful_write_observed = write_obligation_satisfied(
             state.required_write_for_completion,

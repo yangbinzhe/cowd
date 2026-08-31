@@ -729,7 +729,7 @@
         let read_scope = vec!["read:crates/runtime".to_string()];
 
         assert!(
-            should_force_focus_synthesis(true, &read_scope, false, false,),
+            should_force_focus_synthesis(true, &read_scope, false, false, true),
             "a completed exact read contract must immediately enter text-only synthesis"
         );
         assert!(should_force_focus_synthesis(
@@ -737,24 +737,39 @@
             &["verify_upstream_change:crates/runtime".to_string()],
             false,
             false,
+            true,
         ));
         assert!(
-            should_force_focus_synthesis(true, &read_scope, false, true),
+            should_force_focus_synthesis(true, &read_scope, false, true, true),
             "a retained terminal candidate must finalize as soon as its exact read is verified"
         );
         assert!(
-            should_force_focus_synthesis(true, &read_scope, true, false),
+            should_force_focus_synthesis(true, &read_scope, true, false, false),
             "a bounded read role must converge after repeated responsibility-zone saturation"
         );
         assert!(
-            should_force_focus_synthesis(true, &["write:src/lib.rs".to_string()], false, false,),
+            should_force_focus_synthesis(
+                true,
+                &["write:src/lib.rs".to_string()],
+                false,
+                false,
+                true,
+            ),
             "effect contracts must synthesize immediately after their exact obligation completes"
         );
         assert!(!should_force_focus_synthesis(
             false,
             &read_scope,
             true,
-            true
+            true,
+            true,
+        ));
+        assert!(!should_force_focus_synthesis(
+            true,
+            &["read:crates".to_string()],
+            false,
+            false,
+            false,
         ));
     }
 

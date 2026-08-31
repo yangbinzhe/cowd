@@ -743,6 +743,11 @@
     #[test]
     fn focus_verification_compiles_exact_required_reads_and_post_write_reads() {
         let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("fixtures")).expect("fixtures");
+        for path in ["source.txt", "a.txt", "b.txt"] {
+            std::fs::write(workspace.path().join("fixtures").join(path), path)
+                .expect("exact fixture");
+        }
         let calls = focus_verification_tool_calls(
             &[
                 "read:fixtures/source.txt".into(),
@@ -775,7 +780,7 @@
     }
 
     #[test]
-    fn focus_verification_reads_a_deterministic_descendant_for_directory_scope() {
+    fn focus_verification_never_substitutes_a_descendant_for_directory_scope() {
         let workspace = tempfile::tempdir().expect("workspace");
         std::fs::create_dir_all(workspace.path().join("crates/gateway/src")).expect("gateway tree");
         std::fs::write(
@@ -789,21 +794,28 @@
         )
         .expect("gateway source");
 
-        let calls =
-            focus_verification_tool_calls(&["read:crates/gateway".into()], 8, workspace.path())
-                .expect("directory verification call");
-
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "read_file");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&calls[0].input).expect("read input"),
-            serde_json::json!({"path": "crates/gateway/Cargo.toml", "complete": true})
-        );
+        assert!(focus_verification_tool_calls(
+            &["read:crates/gateway".into()],
+            8,
+            workspace.path()
+        )
+        .is_none());
+        assert!(!focus_scopes_are_exact_workspace_files(
+            &["read:crates/gateway".into()],
+            workspace.path()
+        ));
+        assert!(focus_scopes_are_exact_workspace_files(
+            &["read:crates/gateway/src/lib.rs".into()],
+            workspace.path()
+        ));
     }
 
     #[test]
     fn runtime_followup_verification_uses_a_fresh_node_namespace() {
         let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("fixtures")).expect("fixtures");
+        std::fs::write(workspace.path().join("fixtures/target.txt"), "verified")
+            .expect("target");
         let ticket = NodeExecutionTicket {
             graph_id: "graph".to_string(),
             node_id: "graph:3:tools-1".to_string(),
@@ -836,27 +848,52 @@
 
     #[test]
     fn only_first_step_bounded_focus_evidence_is_prefetched() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("fixtures")).expect("fixtures");
+        std::fs::write(workspace.path().join("fixtures/target.txt"), "target")
+            .expect("target");
         let scopes = vec!["verify_upstream_change:fixtures/target.txt".to_string()];
         assert!(should_prefetch_focus_verification(
-            true, true, false, &scopes
+            true,
+            true,
+            false,
+            &scopes,
+            workspace.path(),
         ));
         assert!(!should_prefetch_focus_verification(
-            false, true, false, &scopes
+            false,
+            true,
+            false,
+            &scopes,
+            workspace.path(),
         ));
         assert!(!should_prefetch_focus_verification(
-            true, true, true, &scopes
+            true,
+            true,
+            true,
+            &scopes,
+            workspace.path(),
         ));
         assert!(!should_prefetch_focus_verification(
             true,
             true,
             false,
-            &["verify_after_write:fixtures/target.txt".into()]
+            &["verify_after_write:fixtures/target.txt".into()],
+            workspace.path(),
         ));
         assert!(should_prefetch_focus_verification(
             true,
             true,
             false,
-            &["read:fixtures/target.txt".into()]
+            &["read:fixtures/target.txt".into()],
+            workspace.path(),
+        ));
+        assert!(!should_prefetch_focus_verification(
+            true,
+            true,
+            false,
+            &["read:fixtures".into()],
+            workspace.path(),
         ));
     }
 

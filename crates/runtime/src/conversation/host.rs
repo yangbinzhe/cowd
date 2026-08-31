@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -613,6 +613,7 @@ where
             focus_observed_evidence: Vec::new(),
             focus_action_rejections: 0,
             pending_focus_terminal_candidate: None,
+            focus_discovery_replans: 0,
             focus_verification_prefetched: false,
             clean_terminal_synthesis_next: false,
             clean_terminal_synthesis_attempted: false,
@@ -2821,6 +2822,9 @@ struct TurnGraphState {
     focus_observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
     focus_action_rejections: u8,
     pending_focus_terminal_candidate: Option<String>,
+    /// Number of discarded terminal answers that tried to conclude before a
+    /// broad directory/network Focus had any governed source receipt.
+    focus_discovery_replans: u8,
     /// Runtime can prefetch a reviewer's immutable upstream-change scopes
     /// once, without spending a provider request to rediscover exact paths.
     focus_verification_prefetched: bool,
