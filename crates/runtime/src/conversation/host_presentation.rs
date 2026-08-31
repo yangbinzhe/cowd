@@ -776,12 +776,6 @@ where
         &self,
         ticket: &NodeExecutionTicket,
     ) -> Result<NodeExecutionOutcome, String> {
-        if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
-            bus.emit(CowdEvent::ExecutionPhase {
-                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
-                detail: Some("synthesizing terminal".to_string()),
-            });
-        }
         let pending_inputs = self
             .runtime
             .lock()
@@ -858,6 +852,17 @@ where
                     .map_err(|error| error.to_string())?,
             );
             return Ok(outcome);
+        }
+        // A synthesis node can be superseded by durable input and replan into
+        // another model node.  Do not publish Finalizing before that barrier:
+        // the live-status projection correctly treats Finalizing as a
+        // one-way terminal-preparation state, while the graph still has a
+        // legitimate replan path above.
+        if let Some(bus) = self.runtime.lock().await.cowd_bus().cloned() {
+            bus.emit(CowdEvent::ExecutionPhase {
+                status: harness_contract::projection::ExecutionLiveStatus::Finalizing,
+                detail: Some("synthesizing terminal".to_string()),
+            });
         }
         let projection = self
             .services

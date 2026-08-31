@@ -403,13 +403,13 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
         RuntimeToolDefinition {
             name: "team_board".to_string(),
             description: Some(
-                "Publish or retrieve bounded semantic Team working-state checkpoints. Runtime binds the caller's Team, role, Agent instance and graph; raw private reasoning and arbitrary topology are rejected.".to_string(),
+                "Publish or retrieve bounded semantic Team working-state checkpoints. Runtime binds the caller's Team, role, Agent instance and graph; raw private reasoning and arbitrary topology are rejected. First call read_after with after_revision: 0, then publish with expected_revision equal to the returned latest revision (including 0 for an empty board); publish also requires kind and summary. Use the returned entry_id as team-board:<entry_id> when collaboration_control submit requires a durable submission_ref.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "operation": { "type": "string", "enum": ["publish", "read_after", "read_exact"] },
-                    "expected_revision": { "type": "integer", "minimum": 0 },
+                    "expected_revision": { "type": "integer", "minimum": 0, "description": "Required for publish: the latest revision returned by read_after/read_exact; use 0 only when the board is empty." },
                     "kind": {
                         "type": "string",
                         "enum": ["finding", "evidence", "decision", "conflict", "unresolved", "blocker", "user_intervention", "artifact", "proposal", "question", "response", "resolution"]
@@ -418,7 +418,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
                     "refs": { "type": "array", "items": { "type": "string" } },
                     "artifact_refs": { "type": "array", "items": { "type": "string" } },
                     "visibility": { "type": "string", "enum": ["team", "role", "private"] },
-                    "after_revision": { "type": "integer", "minimum": 0 },
+                    "after_revision": { "type": "integer", "minimum": 0, "description": "For the initial bounded board read use 0; the response returns the latest revision for a later publish CAS." },
                     "exact_revision": { "type": "integer", "minimum": 1 }
                     ,"thread": {
                         "type": "object",
