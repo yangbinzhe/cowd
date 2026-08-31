@@ -1145,7 +1145,8 @@ mod tests {
             let events = store
                 .list_scope(runtime::RuntimeEventScope::Skill, 10)
                 .expect("Skill usage events");
-            if !events.is_empty() || Instant::now() >= deadline {
+            let health = workspace_skill_cache_health(&temp.root);
+            if (!events.is_empty() && health.usage_persisted > 0) || Instant::now() >= deadline {
                 break events;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
