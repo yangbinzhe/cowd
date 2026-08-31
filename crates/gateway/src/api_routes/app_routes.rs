@@ -1871,7 +1871,23 @@ mod tests {
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .expect("iframe request timeout");
                 let mut request = [0_u8; 4096];
-                let read = stream.read(&mut request).expect("read iframe request");
+                let read = match stream.read(&mut request) {
+                    Ok(0) => continue,
+                    Ok(read) => read,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => panic!("read iframe request: {error}"),
+                };
                 let request = String::from_utf8_lossy(&request[..read]);
                 let child = request.starts_with("GET /child ");
                 let body = if child {
@@ -1884,12 +1900,21 @@ mod tests {
                 } else {
                     String::new()
                 };
-                write!(
+                if let Err(error) = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{csp}X-Content-Type-Options: nosniff\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
-                )
-                .expect("write iframe response");
+                ) {
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                    ) {
+                        continue;
+                    }
+                    panic!("write iframe response: {error}");
+                }
             }
         });
         let output = std::process::Command::new(chromium)
