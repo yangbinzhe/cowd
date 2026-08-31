@@ -37,6 +37,7 @@ fn terminal_program_failure_is_fail_closed_not_fresh_id_replan() {
     };
     let outcome = OperationOutcome {
         status: "blocked".to_string(),
+        disposition: RuntimeOrchestrationDisposition::Admitted,
         execution: json!({
             "collaboration_diagnostics": [{
                 "code": "team_execution_not_completed",
@@ -48,6 +49,11 @@ fn terminal_program_failure_is_fail_closed_not_fresh_id_replan() {
     };
 
     let result = result_from_outcome("request-1", decision, outcome);
+    assert_eq!(
+        result.disposition,
+        RuntimeOrchestrationDisposition::Admitted
+    );
+    assert_eq!(result.model_receipt()["disposition"], "admitted");
     assert_eq!(result.decision.recovery_hints.len(), 1);
     assert_eq!(
         result.decision.recovery_hints[0].code,

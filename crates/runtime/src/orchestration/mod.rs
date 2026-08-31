@@ -90,7 +90,7 @@ pub use request::{
 };
 pub use result::{
     RecoveryHint, RuntimeOrchestrationApprovalRequirement, RuntimeOrchestrationDecision,
-    RuntimeOrchestrationResult, RuntimeStateSnapshot,
+    RuntimeOrchestrationDisposition, RuntimeOrchestrationResult, RuntimeStateSnapshot,
 };
 
 /// An Agent-triggered follow-up is an additive Program revision, not a new
@@ -844,6 +844,7 @@ async fn propose_template(
         let published = services.publish_approved_template_candidate(&approval_id)?;
         return Ok(OperationOutcome {
             status: "completed".to_string(),
+            disposition: RuntimeOrchestrationDisposition::PreAdmission,
             execution: json!({
                 "kind": "runtime.template_candidate",
                 "status": "published",
@@ -859,6 +860,7 @@ async fn propose_template(
     }
     Ok(OperationOutcome {
         status: "pending_approval".to_string(),
+        disposition: RuntimeOrchestrationDisposition::PreAdmission,
         execution: json!({
             "kind": "runtime.template_candidate",
             "status": "pending_approval",
@@ -877,6 +879,7 @@ async fn propose_template(
 #[derive(Debug)]
 struct OperationOutcome {
     status: String,
+    disposition: RuntimeOrchestrationDisposition,
     execution: Value,
     evidence: Value,
     guidance: String,
@@ -984,6 +987,7 @@ async fn inspect(
     };
     Ok(OperationOutcome {
         status: "inspected".to_string(),
+        disposition: RuntimeOrchestrationDisposition::Inspection,
         execution: serde_json::to_value(snapshot)
             .map_err(|error| format!("runtime_snapshot_encode_failed:{error}"))?,
         evidence: json!({"accepted": true, "executed": false, "operation": "inspect"}),
@@ -1051,6 +1055,7 @@ async fn propose(
             .map_err(|error| format!("background_graph_admission_failed:{error}"))?;
         return Ok(OperationOutcome {
             status: "admitted".to_string(),
+            disposition: RuntimeOrchestrationDisposition::Admitted,
             execution: json!({
                 "type": "execution_graph_admission",
                 "status": "admitted",
@@ -1679,6 +1684,11 @@ fn completed_projection(
         .find_map(|node| node.result_ref.clone());
     Ok(OperationOutcome {
         status: status.to_string(),
+        disposition: if operation == RuntimeOrchestrationOperation::Inspect {
+            RuntimeOrchestrationDisposition::Inspection
+        } else {
+            RuntimeOrchestrationDisposition::Admitted
+        },
         execution: json!({
             "type": "execution_graph_run",
             "status": status,
@@ -1690,14 +1700,20 @@ fn completed_projection(
             "collaboration_program": collaboration_program,
             "collaboration_diagnostics": collaboration_diagnostics,
             "completion_findings": completion_findings,
+            "quality_findings": team_assessment.quality_findings,
         }),
         evidence: json!({
-            "accepted": status == "completed",
+            // Compatibility field: accepted means the orchestration request
+            // crossed the admission transaction, not that every business
+            // obligation was satisfied. `status` carries business outcome.
+            "accepted": operation != RuntimeOrchestrationOperation::Inspect,
+            "execution_admitted": operation != RuntimeOrchestrationOperation::Inspect,
             "executed": operation != RuntimeOrchestrationOperation::Inspect,
             "operation": operation.as_str(),
             "graph_id": graph_id,
             "reused": reused,
             "completion_findings": completion_findings,
+            "quality_findings": team_assessment.quality_findings,
             "team_ids": team_assessment.team_ids,
             "working_state_verified": team_assessment.has_teams.then_some(team_assessment.working_state_verified),
             "focus_overlap_verified": team_assessment.has_teams.then_some(team_assessment.focus_overlap_verified),
@@ -1873,6 +1889,7 @@ struct TeamSubgraphAssessment {
     teams: Vec<Value>,
     team_terminals: Vec<Value>,
     findings: Vec<String>,
+    quality_findings: Vec<String>,
 }
 
 fn assess_team_subgraphs(
@@ -1995,7 +2012,10 @@ fn assess_team_subgraphs(
             ));
         }
         if overlap.exceeded {
-            assessment.findings.push(format!(
+            // Observed overlap can only be known after Agents have executed.
+            // It is a quality/redundancy signal for future dispatch and
+            // evaluation, never a retroactive admission rejection.
+            assessment.quality_findings.push(format!(
                 "team_focus_overlap_budget_exceeded:{team_id}:{}bp>{}bp",
                 overlap.maximum_overlap_bp, overlap.allowed_overlap_bp
             ));
@@ -2480,6 +2500,7 @@ fn result_from_outcome(
     RuntimeOrchestrationResult {
         request_id: request_id.to_string(),
         status: outcome.status,
+        disposition: outcome.disposition,
         decision,
         execution: outcome.execution,
         evidence,
@@ -2503,6 +2524,7 @@ fn result_without_runtime_with_id(
     RuntimeOrchestrationResult {
         request_id: request_id.to_string(),
         status: status.clone(),
+        disposition: RuntimeOrchestrationDisposition::PreAdmission,
         decision,
         execution: json!({"type":"orchestration_not_submitted","status":status}),
         evidence: json!({

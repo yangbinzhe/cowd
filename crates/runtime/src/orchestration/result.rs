@@ -3,6 +3,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+/// Transaction boundary for one Runtime orchestration response.
+///
+/// This is deliberately orthogonal to business status. An admitted Program
+/// may end blocked or failed while still being a successfully transported,
+/// durable execution receipt. Conversely, a pre-admission rejection must
+/// prove that no graph or child effect was started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeOrchestrationDisposition {
+    Inspection,
+    #[default]
+    PreAdmission,
+    Admitted,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeStateSnapshot {
     pub snapshot_generation: u64,
@@ -58,6 +73,8 @@ pub struct RuntimeOrchestrationDecision {
 pub struct RuntimeOrchestrationResult {
     pub request_id: String,
     pub status: String,
+    #[serde(default)]
+    pub disposition: RuntimeOrchestrationDisposition,
     pub decision: RuntimeOrchestrationDecision,
     pub execution: Value,
     pub evidence: Value,
@@ -124,6 +141,7 @@ impl RuntimeOrchestrationResult {
             "receipt_id": format!("runtime-orchestration-receipt:{}", self.request_id),
             "request_id": self.request_id,
             "status": self.status,
+            "disposition": self.disposition,
             "decision": {
                 "selected_pattern": self.decision.selected_pattern,
                 "selected_template": self.decision.selected_template,
@@ -142,6 +160,8 @@ impl RuntimeOrchestrationResult {
                 "terminal_result_available": terminal_result_ref.is_some(),
                 "terminal_result_kind": terminal_result_kind,
                 "focus_overlap_assessment": execution.get("focus_overlap_assessment"),
+                "quality_findings": execution.get("quality_findings"),
+                "execution_admitted": self.evidence.get("execution_admitted"),
             },
             "team_id": self.evidence.get("team_id"),
             "team_ids": self.evidence.get("team_ids"),
@@ -158,6 +178,7 @@ impl RuntimeOrchestrationResult {
                 "compiled": self.evidence.get("compiled"),
                 "strategy_lease_id": self.evidence.get("strategy_lease_id"),
                 "accepted": self.evidence.get("accepted"),
+                "execution_admitted": self.evidence.get("execution_admitted"),
                 "executed": self.evidence.get("executed"),
                 "reused": self.evidence.get("reused"),
                 "graph_id": self.evidence.get("graph_id"),
@@ -170,6 +191,7 @@ impl RuntimeOrchestrationResult {
                 "committed_write_paths": self.evidence.get("committed_write_paths"),
                 "write_attempt_paths": self.evidence.get("write_attempt_paths"),
                 "child_usage": self.evidence.get("child_usage"),
+                "quality_findings": self.evidence.get("quality_findings"),
             },
             "terminal_summary": terminal_summary,
             "delivery_envelope": delivery_envelope,
@@ -207,6 +229,7 @@ mod tests {
         RuntimeOrchestrationResult {
             request_id: "runtime-orch-1".to_string(),
             status: "completed".to_string(),
+            disposition: RuntimeOrchestrationDisposition::Admitted,
             decision: RuntimeOrchestrationDecision {
                 selected_pattern: ExecutionPattern::Collaborate,
                 selected_template: Some("research_synthesis".to_string()),
@@ -254,6 +277,7 @@ mod tests {
         let receipt = outcome.model_receipt();
 
         assert_eq!(receipt["status"], "completed");
+        assert_eq!(receipt["disposition"], "admitted");
         assert_eq!(receipt["execution"]["type"], "execution_graph_run");
         assert!(receipt["execution"].get("projection").is_none());
         assert!(receipt["execution"].get("terminal_result_ref").is_none());
@@ -321,5 +345,51 @@ mod tests {
         assert!(receipt["execution"]
             .get("collaboration_diagnostics")
             .is_none());
+    }
+
+    #[test]
+    fn admitted_blocked_receipt_preserves_completed_team_truth_and_quality_findings() {
+        let mut outcome = result(json!({
+            "type": "execution_graph_run",
+            "status": "blocked",
+            "quality_findings": [
+                "team_focus_overlap_budget_exceeded:research:7200bp>5000bp"
+            ],
+            "collaboration_program": {
+                "program_id": "program-a",
+                "lifecycle": "blocked",
+                "completed_required_instance_ids": ["research:1"]
+            },
+            "team_terminals": [{
+                "team_id": "research",
+                "terminal_summary": "independent evidence completed",
+                "delivery_envelope": {"envelope_id": "envelope-research"}
+            }]
+        }));
+        outcome.status = "blocked".to_string();
+        outcome.evidence = json!({
+            "accepted": true,
+            "execution_admitted": true,
+            "executed": true,
+            "graph_id": "graph-1",
+            "quality_findings": [
+                "team_focus_overlap_budget_exceeded:research:7200bp>5000bp"
+            ]
+        });
+
+        let receipt = outcome.model_receipt();
+
+        assert_eq!(receipt["status"], "blocked");
+        assert_eq!(receipt["disposition"], "admitted");
+        assert_eq!(receipt["execution"]["execution_admitted"], true);
+        assert_eq!(receipt["evidence"]["execution_admitted"], true);
+        assert_eq!(receipt["team_terminals"][0]["team_id"], "research");
+        assert_eq!(
+            receipt["collaboration_program"]["completed_required_instance_ids"][0],
+            "research:1"
+        );
+        assert!(receipt["execution"]["quality_findings"][0]
+            .as_str()
+            .is_some_and(|finding| finding.starts_with("team_focus_overlap_budget_exceeded:")));
     }
 }

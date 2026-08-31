@@ -891,13 +891,7 @@ impl GatewayToolExecutor {
                 findings = ?result.decision.validation_findings,
                 "runtime orchestration request completed"
             );
-            if orchestration_tool_protocol_failed(
-                &result.status,
-                result
-                    .evidence
-                    .get("accepted")
-                    .and_then(serde_json::Value::as_bool),
-            ) {
+            if orchestration_tool_protocol_failed(result.disposition, &result.status) {
                 let receipt = serde_json::json!({
                     "kind": "runtime_orchestration_rejected",
                     "status": result.status,
@@ -1735,9 +1729,12 @@ impl GatewayToolExecutor {
     }
 }
 
-fn orchestration_tool_protocol_failed(status: &str, accepted: Option<bool>) -> bool {
-    matches!(status, "rejected" | "unavailable")
-        || (matches!(status, "blocked" | "failed") && accepted != Some(true))
+fn orchestration_tool_protocol_failed(
+    disposition: runtime::orchestration::RuntimeOrchestrationDisposition,
+    status: &str,
+) -> bool {
+    disposition == runtime::orchestration::RuntimeOrchestrationDisposition::PreAdmission
+        && matches!(status, "rejected" | "unavailable" | "blocked" | "failed")
 }
 
 fn resource_capability_keywords(kind: &str, mime: Option<&str>, intent: &str) -> Vec<String> {
@@ -3050,13 +3047,25 @@ mod tests {
 
     #[test]
     fn admitted_program_terminals_are_receipts_not_tool_protocol_failures() {
-        assert!(orchestration_tool_protocol_failed("rejected", None));
-        assert!(orchestration_tool_protocol_failed("unavailable", None));
-        assert!(orchestration_tool_protocol_failed("blocked", Some(false)));
-        assert!(orchestration_tool_protocol_failed("failed", None));
-        assert!(!orchestration_tool_protocol_failed("completed", Some(true)));
-        assert!(!orchestration_tool_protocol_failed("blocked", Some(true)));
-        assert!(!orchestration_tool_protocol_failed("failed", Some(true)));
+        use runtime::orchestration::RuntimeOrchestrationDisposition::{
+            Admitted, Inspection, PreAdmission,
+        };
+
+        assert!(orchestration_tool_protocol_failed(PreAdmission, "rejected"));
+        assert!(orchestration_tool_protocol_failed(
+            PreAdmission,
+            "unavailable"
+        ));
+        assert!(orchestration_tool_protocol_failed(PreAdmission, "blocked"));
+        assert!(orchestration_tool_protocol_failed(PreAdmission, "failed"));
+        assert!(!orchestration_tool_protocol_failed(
+            PreAdmission,
+            "needs_approval"
+        ));
+        assert!(!orchestration_tool_protocol_failed(Admitted, "completed"));
+        assert!(!orchestration_tool_protocol_failed(Admitted, "blocked"));
+        assert!(!orchestration_tool_protocol_failed(Admitted, "failed"));
+        assert!(!orchestration_tool_protocol_failed(Inspection, "inspected"));
     }
 
     #[test]
