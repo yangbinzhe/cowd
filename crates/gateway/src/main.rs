@@ -499,6 +499,7 @@ fn build_memory_config(
     mc.store.vector.dimension = src.vector.dimension;
     mc.store.vector.timeout_secs = src.vector.timeout_secs;
     mc.store.vector.batch_size = src.vector.batch_size;
+    mc.store.vector.max_input_tokens = src.vector.max_input_tokens;
     mc.identity.role = src.identity.role.clone();
     mc.identity.language = src.identity.language.clone();
     if mc.store.vector.enabled

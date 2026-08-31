@@ -353,6 +353,9 @@ pub struct VectorConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
+    /// Maximum tokens accepted by one embedding input (0 = model-derived).
+    #[serde(default)]
+    pub max_input_tokens: usize,
 }
 
 fn default_timeout() -> u64 {
@@ -372,6 +375,7 @@ impl Default for VectorConfig {
             dimension: 0,
             timeout_secs: 30,
             batch_size: 32,
+            max_input_tokens: 0,
         }
     }
 }

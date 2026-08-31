@@ -4060,6 +4060,7 @@ pub fn build_cc_memory_config_with_budget(
         dimension: mem.vector.dimension,
         timeout_secs: mem.vector.timeout_secs,
         batch_size: mem.vector.batch_size,
+        max_input_tokens: mem.vector.max_input_tokens,
     };
     if vector_config.enabled
         && !vector_config.model.trim().is_empty()

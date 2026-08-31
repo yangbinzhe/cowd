@@ -477,6 +477,12 @@ pub struct VectorConfig {
     pub timeout_secs: u64,
     /// Maximum batch size for embedding requests.
     pub batch_size: usize,
+    /// Maximum tokens accepted by one embedding input (0 = infer from model).
+    ///
+    /// This is a per-input limit, not a batch limit. The embedding client keeps
+    /// safety headroom and chunks longer inputs before any provider request.
+    #[serde(default)]
+    pub max_input_tokens: usize,
 }
 
 impl VectorConfig {
@@ -521,6 +527,7 @@ impl Default for VectorConfig {
             // 启动 reconciliation 因 batch 超限 400 而降级；发送端另有
             // 400 自适应降半重试兜底。
             batch_size: 20,
+            max_input_tokens: 0,
         }
     }
 }

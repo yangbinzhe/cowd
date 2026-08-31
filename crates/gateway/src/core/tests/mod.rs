@@ -88,6 +88,7 @@ memory:
   vector:
     enabled: true
     model: embedding-model
+    max_input_tokens: 4096
 "#,
     )
     .expect("write config");
@@ -102,6 +103,7 @@ memory:
         "https://provider.example/v1/embeddings"
     );
     assert_eq!(memory_config.store.vector.api_key, "test-key");
+    assert_eq!(memory_config.store.vector.max_input_tokens, 4096);
     assert!(memory_config.compression.llm.enabled);
     assert_eq!(memory_config.compression.llm.api_url, "");
     assert!(memory_config.compression.llm.api_key.is_empty());

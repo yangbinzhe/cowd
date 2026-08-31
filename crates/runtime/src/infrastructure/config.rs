@@ -1415,6 +1415,10 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
         let batch_size = optional_usize(v, "batch_size", "merged settings.memory.vector")?.or(
             optional_usize(v, "batchSize", "merged settings.memory.vector")?,
         );
+        let max_input_tokens =
+            optional_usize(v, "max_input_tokens", "merged settings.memory.vector")?.or(
+                optional_usize(v, "maxInputTokens", "merged settings.memory.vector")?,
+            );
 
         // Environment variable overrides.
         let resolved_model = std::env::var("COWD_MEMORY_VECTOR_MODEL")
@@ -1441,6 +1445,7 @@ fn parse_optional_memory_config(root: &JsonValue) -> Result<MemoryConfig, Config
             api_key: resolved_api_key,
             timeout_secs: timeout_secs.unwrap_or(defaults.timeout_secs),
             batch_size: batch_size.unwrap_or(defaults.batch_size),
+            max_input_tokens: max_input_tokens.unwrap_or(defaults.max_input_tokens),
         }
     } else {
         // No vector section; still apply env var overrides.
