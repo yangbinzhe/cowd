@@ -1225,12 +1225,9 @@ fn terminal_candidate_acceptance(
             .filter_map(|criterion| criterion.strip_prefix("artifact:"))
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
-        acceptance.extend(
-            team_result_fields
-                .iter()
-                .filter(|field| !typed_artifacts.contains(field.as_str()))
-                .cloned(),
-        );
+        acceptance.extend(team_result_fields.iter().filter_map(|field| {
+            (!typed_artifacts.contains(field.as_str())).then(|| format!("artifact:{field}"))
+        }));
     }
     acceptance.sort();
     acceptance.dedup();
@@ -2720,7 +2717,11 @@ mod acceptance_contract_tests {
                 &["summary".to_string(), "evidence".to_string()],
                 true,
             ),
-            vec!["evidence".to_string(), "summary".to_string()]
+            vec![
+                "artifact:evidence".to_string(),
+                "artifact:summary".to_string(),
+                "evidence".to_string(),
+            ]
         );
         assert_eq!(
             terminal_candidate_acceptance(

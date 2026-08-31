@@ -1323,11 +1323,25 @@ fn canonical_acceptance(
         })
         .map(criterion_key)
         .collect::<Vec<_>>();
+    // Declared outputs are owned deliverables, not merely routing labels.
+    // Lower every one to a structural artifact check so non-terminal
+    // producers cannot complete without materializing the payload promised
+    // to their successors. Source/effect proof remains exclusively attached
+    // to explicit evidence_scope / committed_effect criteria.
+    values.extend(
+        output_artifacts
+            .iter()
+            .map(|artifact| artifact_criterion_key(artifact)),
+    );
     if let Some(fields) = terminal_result_fields {
         values.extend(fields.iter().map(|field| artifact_criterion_key(field)));
     }
     if values.is_empty() {
-        values.push("evidence".to_string());
+        // A role with no declared routed output still owes an inspectable
+        // terminal result. Do not invent a source-evidence obligation: that
+        // would require a bounded lease the semantic decision never asked
+        // for and would conflate reporting with evidence acquisition.
+        values.push("artifact:summary".to_string());
     }
     values.sort();
     values.dedup();
@@ -1336,10 +1350,9 @@ fn canonical_acceptance(
 
 fn criterion_key(criterion: &ModelSemanticAcceptanceCriterion) -> String {
     match criterion {
-        // The existing Team runtime already verifies its declared result
-        // field names directly (`summary`, `evidence`, `findings`, ...). Keep
-        // that compatibility at the lowering boundary; the semantic contract
-        // retains the tagged `Artifact` form in provenance.
+        // Preserve the tagged semantic distinction through Runtime lowering.
+        // In particular, artifact `evidence` is a structured result field;
+        // only EvidenceScope means fresh Runtime-observed evidence.
         ModelSemanticAcceptanceCriterion::Artifact { artifact } => artifact_criterion_key(artifact),
         ModelSemanticAcceptanceCriterion::EvidenceScope {
             operation,
@@ -1362,28 +1375,7 @@ fn criterion_key(criterion: &ModelSemanticAcceptanceCriterion) -> String {
 
 fn artifact_criterion_key(artifact: &str) -> String {
     let artifact = artifact.trim();
-    if matches!(
-        artifact,
-        "evidence"
-            | "summary"
-            | "findings"
-            | "plan"
-            | "implementation"
-            | "source_verification"
-            | "review"
-            | "risks"
-            | "unresolved"
-            | "key_decisions"
-            | "unresolved_or_risks"
-            | "proposal"
-            | "critique"
-            | "mitigation"
-            | "checkpoint"
-    ) {
-        artifact.to_string()
-    } else {
-        format!("artifact:{artifact}")
-    }
+    format!("artifact:{artifact}")
 }
 
 fn canonical_role_id(value: &str) -> String {
@@ -2002,7 +1994,7 @@ mod tests {
         let roles = &compiled.template_proposal["teams"][0]["template"]["roles"];
         assert!(roles[1]["acceptance"]
             .as_array()
-            .is_some_and(|criteria| criteria.iter().any(|value| value == "unresolved")));
+            .is_some_and(|criteria| criteria.iter().any(|value| value == "artifact:unresolved")));
     }
 
     #[test]
@@ -2036,11 +2028,54 @@ mod tests {
     }
 
     #[test]
-    fn evidence_artifact_keeps_the_runtime_provenance_contract() {
-        assert_eq!(artifact_criterion_key("evidence"), "evidence");
+    fn evidence_artifact_remains_distinct_from_runtime_evidence_scope() {
+        assert_eq!(artifact_criterion_key("evidence"), "artifact:evidence");
         assert_eq!(
             artifact_criterion_key("definitions_report"),
             "artifact:definitions_report"
+        );
+    }
+
+    #[test]
+    fn every_declared_role_output_is_structurally_verified() {
+        let role = ModelRoleIntent {
+            role_id: "producer".to_string(),
+            display_name: None,
+            responsibility: "produce a handoff".to_string(),
+            required_capabilities: vec!["read".to_string()],
+            required_skills: Vec::new(),
+            required_tools: Vec::new(),
+            cardinality: Default::default(),
+            acceptance: Vec::new(),
+            input_artifacts: Vec::new(),
+            output_artifacts: vec!["evidence".to_string(), "handoff".to_string()],
+        };
+        assert_eq!(
+            canonical_acceptance(&role, None),
+            vec![
+                "artifact:evidence".to_string(),
+                "artifact:handoff".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn role_without_output_defaults_to_structured_summary_not_source_debt() {
+        let role = ModelRoleIntent {
+            role_id: "observer".to_string(),
+            display_name: None,
+            responsibility: "observe upstream state".to_string(),
+            required_capabilities: vec!["read".to_string()],
+            required_skills: Vec::new(),
+            required_tools: Vec::new(),
+            cardinality: Default::default(),
+            acceptance: Vec::new(),
+            input_artifacts: Vec::new(),
+            output_artifacts: Vec::new(),
+        };
+        assert_eq!(
+            canonical_acceptance(&role, None),
+            vec!["artifact:summary".to_string()]
         );
     }
 
