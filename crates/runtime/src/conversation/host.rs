@@ -4005,7 +4005,8 @@ fn terminal_delivery_envelope(
     use harness_contract::outcome::{
         DeliveryBranchStatus, DeliveryBranchTerminal, DeliveryCoverage, DeliveryEnvelope,
         DeliveryStatus, DeliveryUnresolved, PipelineStatus, UserAnswerContract,
-        VerifiedDeliveryReference,
+        VerifiedDeliveryEffect, VerifiedDeliveryReference, VerifiedEffectStatus,
+        WorkspaceMaterializationReceipt,
     };
 
     let branch_terminals = projection
@@ -4041,6 +4042,73 @@ fn terminal_delivery_envelope(
                 .map(move |reference| VerifiedDeliveryReference {
                     reference_id: reference.evidence_ref.id.clone(),
                     kind: reference.evidence_ref.ref_type.clone(),
+                    source_execution_id: Some(node.node_id.clone()),
+                })
+        })
+        .collect::<Vec<_>>();
+    let workspace_materializations = projection
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.kind == harness_contract::execution_graph::ExecutionNodeKind::Materialize
+                && node.status == ExecutionNodeStatus::Completed
+        })
+        .filter_map(|node| {
+            node.summary
+                .as_deref()
+                .and_then(|summary| {
+                    serde_json::from_str::<WorkspaceMaterializationReceipt>(summary).ok()
+                })
+                .filter(|receipt| receipt.reread_verified)
+        })
+        .collect::<Vec<_>>();
+    let verified_artifacts = projection
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.kind == harness_contract::execution_graph::ExecutionNodeKind::Materialize
+                && node.status == ExecutionNodeStatus::Completed
+        })
+        .flat_map(|node| {
+            node.evidence_refs
+                .iter()
+                .filter(|reference| {
+                    reference.is_durable()
+                        && reference.evidence_ref.ref_type != "runtime_change"
+                        && !reference.retrieval_selector.trim().is_empty()
+                })
+                .map(move |reference| VerifiedDeliveryReference {
+                    reference_id: reference.retrieval_selector.clone(),
+                    kind: reference.evidence_ref.ref_type.clone(),
+                    source_execution_id: Some(node.node_id.clone()),
+                })
+        })
+        .collect::<Vec<_>>();
+    let verified_effects = projection
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.kind == harness_contract::execution_graph::ExecutionNodeKind::Materialize
+        })
+        .flat_map(|node| {
+            let applied = workspace_materializations
+                .iter()
+                .find(|receipt| receipt.receipt_id.ends_with(&node.node_id));
+            node.usage
+                .runtime_write_attempt_paths
+                .iter()
+                .map(move |path| VerifiedDeliveryEffect {
+                    effect_id: applied.map_or_else(
+                        || format!("materialization-not-applied:{}:{path}", node.node_id),
+                        |receipt| receipt.write_effect_id.clone(),
+                    ),
+                    kind: "workspace_write".to_string(),
+                    status: if applied.is_some() {
+                        VerifiedEffectStatus::Applied
+                    } else {
+                        VerifiedEffectStatus::NotApplied
+                    },
+                    receipt_ref: applied.map(|receipt| receipt.receipt_id.clone()),
                     source_execution_id: Some(node.node_id.clone()),
                 })
         })
@@ -4106,8 +4174,9 @@ fn terminal_delivery_envelope(
         delivery_status,
         branch_terminals,
         verified_receipts,
-        verified_artifacts: Vec::new(),
-        verified_effects: Vec::new(),
+        verified_artifacts,
+        verified_effects,
+        workspace_materializations,
         coverage: DeliveryCoverage::default(),
         unresolved,
         conflicts: Vec::new(),
@@ -4335,6 +4404,190 @@ fn collaboration_answer_quality_findings(answer: &str, objective: &str) -> Vec<S
     findings.sort();
     findings.dedup();
     findings
+}
+
+/// Reject only explicit contradictions of committed Runtime facts. This is a
+/// monotonicity gate, not a prose scorer: omission remains the concern of the
+/// ordinary quality gate, while a claim that completed work/effects do not
+/// exist can never be committed over a newer DeliveryEnvelope.
+fn delivery_truth_contradictions(
+    answer: &str,
+    envelope: &harness_contract::outcome::DeliveryEnvelope,
+) -> Vec<String> {
+    use harness_contract::outcome::{DeliveryBranchStatus, DeliveryStatus, VerifiedEffectStatus};
+
+    let normalized = answer.to_ascii_lowercase();
+    let contains_any =
+        |patterns: &[&str]| patterns.iter().any(|pattern| normalized.contains(pattern));
+    let completed_branches = envelope
+        .branch_terminals
+        .iter()
+        .filter(|branch| branch.status == DeliveryBranchStatus::Completed)
+        .count();
+    let applied_effects = envelope
+        .verified_effects
+        .iter()
+        .filter(|effect| effect.status == VerifiedEffectStatus::Applied)
+        .count();
+    let mut findings = Vec::new();
+    if completed_branches > 0
+        && contains_any(&[
+            "没有任何团队执行",
+            "没有团队被执行",
+            "未启动任何团队",
+            "没有任何 agent 执行",
+            "no team was executed",
+            "no teams were executed",
+            "no agent was executed",
+            "nothing was executed",
+        ])
+    {
+        findings.push(format!(
+            "answer denies {completed_branches} committed completed branch(es)"
+        ));
+    }
+    if completed_branches > 1
+        && contains_any(&[
+            "只有一个团队",
+            "仅有一个团队",
+            "只有一个节点",
+            "only one team",
+            "only one node",
+        ])
+    {
+        findings.push(format!(
+            "answer collapses {completed_branches} completed branches into one"
+        ));
+    }
+    if envelope.delivery_status == DeliveryStatus::Satisfied
+        && contains_any(&[
+            "任务没有完成",
+            "任务未完成",
+            "工作没有完成",
+            "task was not completed",
+            "work was not completed",
+            "nothing completed",
+        ])
+    {
+        findings.push("answer denies a satisfied delivery".to_string());
+    }
+    if !envelope.workspace_materializations.is_empty()
+        && contains_any(&[
+            "未生成任何文件",
+            "没有生成任何文件",
+            "没有写入任何文件",
+            "未生成任何产物",
+            "no file was produced",
+            "no files were produced",
+            "no artifact was produced",
+            "no workspace write",
+        ])
+    {
+        findings.push(format!(
+            "answer denies {} reread-verified workspace materialization(s)",
+            envelope.workspace_materializations.len()
+        ));
+    }
+    if applied_effects > 0
+        && contains_any(&[
+            "没有应用任何变更",
+            "未应用任何变更",
+            "没有发生写入",
+            "no changes were applied",
+            "no write was applied",
+            "no effects were applied",
+        ])
+    {
+        findings.push(format!(
+            "answer denies {applied_effects} committed applied effect(s)"
+        ));
+    }
+    findings.sort();
+    findings.dedup();
+    findings
+}
+
+fn runtime_verified_delivery_fallback(
+    envelope: &harness_contract::outcome::DeliveryEnvelope,
+) -> String {
+    use harness_contract::outcome::{DeliveryBranchStatus, UserAnswerFormat};
+
+    let completed_branches = envelope
+        .branch_terminals
+        .iter()
+        .filter(|branch| branch.status == DeliveryBranchStatus::Completed)
+        .map(|branch| branch.branch_id.clone())
+        .collect::<Vec<_>>();
+    let materializations = envelope
+        .workspace_materializations
+        .iter()
+        .map(|receipt| {
+            serde_json::json!({
+                "path": receipt.target_path,
+                "sha256": receipt.sha256,
+                "bytes": receipt.bytes,
+                "reread_verified": receipt.reread_verified,
+            })
+        })
+        .collect::<Vec<_>>();
+    let unresolved = envelope
+        .unresolved
+        .iter()
+        .map(|item| item.summary.clone())
+        .collect::<Vec<_>>();
+    let facts = serde_json::json!({
+        "delivery_status": envelope.delivery_status,
+        "completed_branches": completed_branches,
+        "workspace_materializations": materializations,
+        "unresolved": unresolved,
+        "envelope_id": envelope.envelope_id,
+        "envelope_revision": envelope.revision,
+    });
+    if envelope.user_answer_contract.format == UserAnswerFormat::StrictJson {
+        return serde_json::to_string_pretty(&facts).unwrap_or_else(|_| "{}".to_string());
+    }
+    let chinese = envelope.user_answer_contract.language.starts_with("zh");
+    if chinese {
+        format!(
+            "运行时已验证交付事实：状态为 `{:?}`；已完成分支 {} 个（{}）；已回读校验的工作区文件 {} 个（{}）；未解决事项 {} 个{}。",
+            envelope.delivery_status,
+            completed_branches.len(),
+            completed_branches.join("、"),
+            materializations.len(),
+            envelope
+                .workspace_materializations
+                .iter()
+                .map(|receipt| format!("{} [{}]", receipt.target_path, receipt.sha256))
+                .collect::<Vec<_>>()
+                .join("、"),
+            unresolved.len(),
+            if unresolved.is_empty() {
+                String::new()
+            } else {
+                format!("：{}", unresolved.join("；"))
+            }
+        )
+    } else {
+        format!(
+            "Runtime-verified delivery: status `{:?}`; {} completed branch(es) ({}); {} reread-verified workspace file(s) ({}); {} unresolved item(s){}.",
+            envelope.delivery_status,
+            completed_branches.len(),
+            completed_branches.join(", "),
+            materializations.len(),
+            envelope
+                .workspace_materializations
+                .iter()
+                .map(|receipt| format!("{} [{}]", receipt.target_path, receipt.sha256))
+                .collect::<Vec<_>>()
+                .join(", "),
+            unresolved.len(),
+            if unresolved.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", unresolved.join("; "))
+            }
+        )
+    }
 }
 
 fn required_verbatim_claims(objective: &str) -> BTreeSet<String> {

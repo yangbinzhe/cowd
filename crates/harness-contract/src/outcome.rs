@@ -104,6 +104,25 @@ pub struct VerifiedDeliveryEffect {
     pub source_execution_id: Option<String>,
 }
 
+/// Runtime-attested workspace materialization. The receipt is valid only when
+/// the committed bytes were read back from the target and matched `sha256`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceMaterializationReceipt {
+    pub receipt_id: String,
+    pub source_execution_id: String,
+    pub source_node_id: String,
+    pub source_result_ref: String,
+    pub target_path: String,
+    pub artifact_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sha256: Option<String>,
+    pub sha256: String,
+    pub bytes: u64,
+    pub write_effect_id: String,
+    pub reread_verified: bool,
+    pub materialized_at_ms: u64,
+}
+
 /// Deterministic obligation coverage computed from RequiredAcceptance and
 /// ObservedAcceptance by Runtime.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -241,6 +260,11 @@ pub struct DeliveryEnvelope {
     pub verified_artifacts: Vec<VerifiedDeliveryReference>,
     #[serde(default)]
     pub verified_effects: Vec<VerifiedDeliveryEffect>,
+    /// Exact Runtime-owned workspace writes that were committed and read back.
+    /// Presentation may summarize these receipts but cannot manufacture or
+    /// weaken them.
+    #[serde(default)]
+    pub workspace_materializations: Vec<WorkspaceMaterializationReceipt>,
     #[serde(default)]
     pub coverage: DeliveryCoverage,
     #[serde(default)]
@@ -263,6 +287,9 @@ pub enum AnswerOrigin {
     TerminalNarrator,
     FallbackModel,
     ProgrammaticFallback,
+    /// Deterministic presentation rendered exclusively from a committed
+    /// DeliveryEnvelope after a model draft contradicted Runtime truth.
+    RuntimeVerifiedFallback,
     CancellationReceipt,
 }
 

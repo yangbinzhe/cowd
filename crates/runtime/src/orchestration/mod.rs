@@ -1397,6 +1397,7 @@ async fn revise(
             &proposal.completion,
             &mutation.semantic_node_instances,
             &proposal.nodes,
+            &mutation.nodes,
         );
         let mut collaboration_program = compiler::collaboration_program_from_proposal(
             proposal,

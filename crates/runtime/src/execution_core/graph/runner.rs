@@ -1690,6 +1690,9 @@ impl ExecutionGraphRunner {
             harness_contract::execution_graph::ExecutionNodeKind::AgentTask => {
                 Some(ExecutionResourceKind::Agent)
             }
+            harness_contract::execution_graph::ExecutionNodeKind::Materialize => {
+                Some(ExecutionResourceKind::Tool)
+            }
             // Subgraph is a durable orchestration container, not an Agent.
             // Its child AgentTask leaves acquire their own Agent permits. If
             // the parent container also held one while awaiting the child, a

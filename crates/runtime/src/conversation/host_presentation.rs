@@ -725,6 +725,9 @@ where
                         }
                     }
                     validation_feedback = collaboration_answer_quality_findings(&answer, objective);
+                    validation_feedback.extend(delivery_truth_contradictions(&answer, envelope));
+                    validation_feedback.sort();
+                    validation_feedback.dedup();
                     if validation_feedback.is_empty() {
                         return Ok((answer, model, all_models_used, provider_attempt_id));
                     }
@@ -944,12 +947,12 @@ where
                 |candidate| candidate.answer_origin,
             );
         let (
-            final_answer,
-            answer_origin,
-            fallback_reason,
+            mut final_answer,
+            mut answer_origin,
+            mut fallback_reason,
             narrator_model,
             attempted_models,
-            committed_attempt_id,
+            mut committed_attempt_id,
         ) = if delegated_leaf {
             let answer = terminal_override
                 .as_ref()
@@ -1086,6 +1089,18 @@ where
                 }
             }
         };
+        if !delegated_leaf {
+            let contradictions = delivery_truth_contradictions(&final_answer, &envelope);
+            if !contradictions.is_empty() {
+                final_answer = runtime_verified_delivery_fallback(&envelope);
+                answer_origin = harness_contract::outcome::AnswerOrigin::RuntimeVerifiedFallback;
+                fallback_reason = Some(format!(
+                    "terminal candidate contradicted committed Runtime truth: {}",
+                    contradictions.join("; ")
+                ));
+                committed_attempt_id = format!("{committed_attempt_id}:runtime-truth-fallback");
+            }
+        }
         if self
             .runtime
             .lock()
@@ -2043,7 +2058,7 @@ pub(super) fn dynamic_node(
         resource_scopes: Vec::new(),
         work: Some(
             harness_contract::execution_graph::ExecutionWorkContract::new(match kind {
-                ExecutionNodeKind::ToolBatch => {
+                ExecutionNodeKind::ToolBatch | ExecutionNodeKind::Materialize => {
                     harness_contract::execution_graph::ExecutionWorkRole::Tool
                 }
                 ExecutionNodeKind::Verify | ExecutionNodeKind::Approval => {

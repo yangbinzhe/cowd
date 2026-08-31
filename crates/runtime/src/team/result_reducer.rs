@@ -287,6 +287,7 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
     let mut verified_receipts = Vec::new();
     let mut verified_artifacts = Vec::new();
     let mut verified_effects = Vec::new();
+    let mut workspace_materializations = Vec::new();
     let mut required_obligation_ids = Vec::new();
     let mut satisfied_obligation_ids = Vec::new();
     let mut unresolved = Vec::new();
@@ -460,6 +461,93 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
         }
     }
 
+    let materialize_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ExecutionNodeKind::Materialize)
+        .collect::<Vec<_>>();
+    for node in &materialize_nodes {
+        let status = graph
+            .node_statuses
+            .get(&node.id)
+            .copied()
+            .unwrap_or(ExecutionNodeStatus::Blocked);
+        let result = graph.node_results.get(&node.id);
+        if status != ExecutionNodeStatus::Completed {
+            unresolved.push(DeliveryUnresolved {
+                unresolved_id: format!("materialization:{}", node.id),
+                kind: "workspace_materialization".to_string(),
+                summary: result
+                    .and_then(|result| result.summary.clone())
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Required workspace materialization `{}` did not complete.",
+                            node.id
+                        )
+                    }),
+                source_execution_id: Some(node.id.clone()),
+                obligation_id: None,
+            });
+        }
+        if let Some(result) = result {
+            if let Some(receipt) = result
+                .summary
+                .as_deref()
+                .and_then(|summary| {
+                    serde_json::from_str::<
+                    harness_contract::outcome::WorkspaceMaterializationReceipt,
+                >(summary).ok()
+                })
+                .filter(|receipt| receipt.reread_verified)
+            {
+                verified_receipts.push(VerifiedDeliveryReference {
+                    reference_id: receipt.receipt_id.clone(),
+                    kind: "workspace_materialization".to_string(),
+                    source_execution_id: Some(node.id.clone()),
+                });
+                workspace_materializations.push(receipt);
+            }
+            for (index, reference) in result.evidence_refs.iter().enumerate() {
+                if reference.is_durable() && !reference.retrieval_selector.trim().is_empty() {
+                    verified_artifacts.push(VerifiedDeliveryReference {
+                        reference_id: reference.retrieval_selector.clone(),
+                        kind: reference.evidence_ref.ref_type.clone(),
+                        source_execution_id: Some(node.id.clone()),
+                    });
+                }
+                if reference.evidence_ref.ref_type == "runtime_change" {
+                    let Ok(receipt) = serde_json::from_str::<
+                        harness_contract::agent::AgentChangeReceipt,
+                    >(&reference.evidence_ref.id) else {
+                        continue;
+                    };
+                    applied_writes.insert((node.id.clone(), receipt.path.clone()));
+                    verified_effects.push(VerifiedDeliveryEffect {
+                        effect_id: stable_effect_id(&node.id, &receipt.path),
+                        kind: "workspace_write".to_string(),
+                        status: VerifiedEffectStatus::Applied,
+                        receipt_ref: Some(format!(
+                            "execution-node:{}:write-sequence:{}:{index}",
+                            node.id, receipt.write_sequence
+                        )),
+                        source_execution_id: Some(node.id.clone()),
+                    });
+                }
+            }
+            for path in &result.usage.runtime_write_attempt_paths {
+                if !applied_writes.contains(&(node.id.clone(), path.clone())) {
+                    verified_effects.push(VerifiedDeliveryEffect {
+                        effect_id: stable_effect_id(&node.id, path),
+                        kind: "workspace_write".to_string(),
+                        status: VerifiedEffectStatus::NotApplied,
+                        receipt_ref: None,
+                        source_execution_id: Some(node.id.clone()),
+                    });
+                }
+            }
+        }
+    }
+
     branch_terminals.sort_by(|left, right| left.branch_id.cmp(&right.branch_id));
     verified_receipts.sort_by(|left, right| left.reference_id.cmp(&right.reference_id));
     verified_receipts.dedup_by(|left, right| left.reference_id == right.reference_id);
@@ -468,6 +556,8 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
     verified_effects.sort_by(|left, right| left.effect_id.cmp(&right.effect_id));
     verified_effects
         .dedup_by(|left, right| left.effect_id == right.effect_id && left.status == right.status);
+    workspace_materializations.sort_by(|left, right| left.receipt_id.cmp(&right.receipt_id));
+    workspace_materializations.dedup_by(|left, right| left.receipt_id == right.receipt_id);
     required_obligation_ids.sort();
     required_obligation_ids.dedup();
     satisfied_obligation_ids.sort();
@@ -508,12 +598,19 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
     let has_not_applied = verified_effects
         .iter()
         .any(|effect| effect.status == VerifiedEffectStatus::NotApplied);
+    let materializations_satisfied = materialize_nodes.iter().all(|node| {
+        graph.node_statuses.get(&node.id) == Some(&ExecutionNodeStatus::Completed)
+            && workspace_materializations
+                .iter()
+                .any(|receipt| receipt.receipt_id.ends_with(&node.id))
+    });
     let delivery_status = if !branch_terminals.is_empty()
         && completed == branch_terminals.len()
         && verification_satisfied
         && coverage_basis_points == 10_000
         && unresolved.is_empty()
         && !has_not_applied
+        && materializations_satisfied
     {
         DeliveryStatus::Satisfied
     } else if completed > 0 {
@@ -539,6 +636,7 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
         verified_receipts,
         verified_artifacts,
         verified_effects,
+        workspace_materializations,
         coverage: DeliveryCoverage {
             required_obligation_ids,
             satisfied_obligation_ids,
@@ -763,6 +861,7 @@ mod tests {
     use harness_contract::outcome::{
         AnswerCandidate, AnswerContentKind, AnswerObjectiveScope, AnswerOrigin, AnswerValidation,
         AnswerValidationStatus, DeliveryStatus, VerifiedEffectStatus,
+        WorkspaceMaterializationReceipt,
     };
     use harness_contract::team::RoleBehaviorFacet;
 
@@ -1371,5 +1470,75 @@ mod tests {
             !is_synthesizer_role(&packet, Some(&binding)),
             "a role without the typed Reducer facet is never a synthesizer"
         );
+    }
+
+    #[test]
+    fn delivery_envelope_carries_reread_verified_materialization_truth() {
+        let mut graph = ExecutionGraph::new("materialized Team delivery");
+        add_evidence_branch(&mut graph, "researcher", "checked evidence", false);
+        let mut materialize =
+            ExecutionNodeSpec::new(ExecutionNodeKind::Materialize, "materialize", "{}");
+        materialize.id = "materialize-report".to_string();
+        graph
+            .node_statuses
+            .insert(materialize.id.clone(), ExecutionNodeStatus::Completed);
+        let receipt = WorkspaceMaterializationReceipt {
+            receipt_id: "materialization:graph:materialize-report".to_string(),
+            source_execution_id: "graph".to_string(),
+            source_node_id: "researcher".to_string(),
+            source_result_ref: "result:researcher".to_string(),
+            target_path: "reports/final.md".to_string(),
+            artifact_kind: "report".to_string(),
+            before_sha256: None,
+            sha256: "sha256:abcd".to_string(),
+            bytes: 42,
+            write_effect_id: "write:report".to_string(),
+            reread_verified: true,
+            materialized_at_ms: 1,
+        };
+        let change = harness_contract::agent::AgentChangeReceipt {
+            path: "reports/final.md".to_string(),
+            before_sha256: None,
+            after_sha256: "sha256:abcd".to_string(),
+            write_sequence: 1,
+        };
+        let mut usage = ExecutionUsage::default();
+        usage.runtime_write_attempt_paths = vec!["reports/final.md".to_string()];
+        let mut materialized_result = result(ExecutionNodeStatus::Completed, usage);
+        materialized_result.summary = Some(serde_json::to_string(&receipt).unwrap());
+        materialized_result.evidence_refs = vec![
+            EvidenceAccessRef::durable(
+                EvidenceRef::observed("runtime_change", serde_json::to_string(&change).unwrap()),
+                "a".repeat(64),
+                1,
+                "application/json",
+                "execution-graph://graph/node/materialize-report".to_string(),
+                "workspace",
+            ),
+            EvidenceAccessRef::durable(
+                EvidenceRef::observed("report", "reports/final.md"),
+                "b".repeat(64),
+                42,
+                "text/markdown",
+                "workspace://reports/final.md".to_string(),
+                "workspace",
+            ),
+        ];
+        graph
+            .node_results
+            .insert(materialize.id.clone(), materialized_result);
+        graph.nodes.push(materialize);
+
+        let envelope = build_delivery_envelope(&graph);
+
+        assert_eq!(envelope.workspace_materializations, vec![receipt]);
+        assert!(envelope
+            .verified_effects
+            .iter()
+            .any(|effect| effect.status == VerifiedEffectStatus::Applied));
+        assert!(envelope
+            .verified_artifacts
+            .iter()
+            .any(|artifact| artifact.reference_id == "workspace://reports/final.md"));
     }
 }

@@ -517,6 +517,7 @@ mod tests {
             verified_receipts: Vec::new(),
             verified_artifacts: Vec::new(),
             verified_effects: Vec::new(),
+            workspace_materializations: Vec::new(),
             coverage: Default::default(),
             unresolved: Vec::new(),
             conflicts: Vec::new(),

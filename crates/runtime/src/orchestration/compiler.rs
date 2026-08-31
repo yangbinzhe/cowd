@@ -7,14 +7,16 @@ use harness_contract::execution_graph::{
     validate_execution_graph, CollaborationEdgeKind, CollaborationProgram,
     CollaborationProgramEdge, CollaborationTeamInstance, CrossTeamInputContract,
     DependencyPredicate, ExecutionDependencyPolicy, ExecutionEdge, ExecutionEdgeKind,
-    ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeSpec,
-    ExecutionNodeStatus, ExecutionOrchestrationMetadata, ExecutionParentBinding,
-    ExecutionWorkContract, ExecutionWorkRole,
+    ExecutionGraph, ExecutionGraphCommand, ExecutionMaterializationContent,
+    ExecutionMaterializationRequest, ExecutionNodeKind, ExecutionNodeSpec, ExecutionNodeStatus,
+    ExecutionOrchestrationMetadata, ExecutionParentBinding, ExecutionWorkContract,
+    ExecutionWorkRole,
 };
 use harness_contract::team::{
     FocusPartitionPlan, FocusPartitionSlot, TeamInstantiationRequest, TeamSelectionMode,
     TeamTemplateDefinitionId, TeamTemplateRevisionRef, TeamTemplateSelector,
 };
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::execution_core::graph::executors::AgentTaskExecutor;
@@ -202,6 +204,7 @@ pub fn compile_orchestration_with_capacity(
             &proposal.completion,
             &compiled.semantic_node_instances,
             &proposal.nodes,
+            &graph.nodes,
         ),
         collaboration_program,
     });
@@ -525,6 +528,74 @@ pub fn compile_graph_mutation(
                     }
                 }
             }
+        }
+    }
+    let mut materialized_targets = BTreeSet::new();
+    for semantic in proposal
+        .nodes
+        .iter()
+        .filter(|semantic| semantic.required && semantic.recipe == CapabilityRecipeId::Team)
+    {
+        let write_paths = semantic
+            .resource_scopes
+            .iter()
+            .filter_map(|scope| scope.strip_prefix("write:"))
+            .map(|path| path.trim_start_matches("./").to_string())
+            .collect::<BTreeSet<_>>();
+        let Some(source_node_id) = semantic_node_instances
+            .get(&semantic.node_id)
+            .and_then(|instances| instances.last())
+            .cloned()
+        else {
+            continue;
+        };
+        for artifact in &semantic.output_artifacts {
+            let target_path = artifact.trim_start_matches("./");
+            let path_like = target_path.contains('/') || target_path.contains('.');
+            if !path_like
+                || !write_paths.contains(target_path)
+                || !materialized_targets.insert(target_path.to_string())
+            {
+                continue;
+            }
+            let digest = format!(
+                "{:x}",
+                Sha256::digest(format!("{graph_id}:{source_node_id}:{target_path}").as_bytes())
+            );
+            let materialize_id = format!("materialize:{}", &digest[..24]);
+            let request = ExecutionMaterializationRequest {
+                source_node_id: source_node_id.clone(),
+                target_path: target_path.to_string(),
+                artifact_kind: artifact.clone(),
+                content: ExecutionMaterializationContent::ExistingOrSourceSummary,
+                expected_sha256: None,
+            };
+            let mut node = ExecutionNodeSpec::new(
+                ExecutionNodeKind::Materialize,
+                crate::execution_core::graph::executors::MaterializeNodeExecutor::KIND,
+                serde_json::to_string(&request).map_err(|error| {
+                    OrchestrationCompileError::InvalidProposal(error.to_string())
+                })?,
+            );
+            node.id = materialize_id.clone();
+            node.idempotency_key = format!("{graph_id}:{materialize_id}");
+            node.resource_scopes = vec![format!("write:{target_path}")];
+            node.acceptance.required_evidence = vec![artifact.clone()];
+            let mut work = ExecutionWorkContract::new(ExecutionWorkRole::Tool);
+            work.required = true;
+            work.output_artifact_kinds = vec![artifact.clone()];
+            node.work = Some(work);
+            nodes.push(node);
+            edges.push(ExecutionEdge {
+                from: source_node_id.clone(),
+                to: materialize_id.clone(),
+                kind: ExecutionEdgeKind::DependsOn,
+            });
+            edges.push(ExecutionEdge {
+                from: source_node_id.clone(),
+                to: materialize_id,
+                kind: ExecutionEdgeKind::Produces,
+            });
         }
     }
     if semantic_ids.is_empty() {
@@ -1253,6 +1324,7 @@ pub(crate) fn materialize_completion(
     completion: &harness_contract::execution_graph::ExecutionCompletionContract,
     instances: &BTreeMap<String, Vec<String>>,
     semantic_nodes: &[GraphSemanticNode],
+    physical_nodes: &[ExecutionNodeSpec],
 ) -> harness_contract::execution_graph::ExecutionCompletionContract {
     let mut materialized = completion.clone();
     let required_semantic = semantic_nodes
@@ -1279,6 +1351,17 @@ pub(crate) fn materialize_completion(
             })
             .collect()
     };
+    materialized.required_node_ids.sort();
+    materialized.required_node_ids.dedup();
+    materialized.required_node_ids.extend(
+        physical_nodes
+            .iter()
+            .filter(|node| {
+                node.kind == ExecutionNodeKind::Materialize
+                    && node.work.as_ref().is_some_and(|work| work.required)
+            })
+            .map(|node| node.id.clone()),
+    );
     materialized.required_node_ids.sort();
     materialized.required_node_ids.dedup();
     // Required artifact kinds must be reachable by an authorized node. A model
@@ -1516,7 +1599,7 @@ mod tests {
         let dependency = default_cross_team_dependency(
             CapabilityRecipeId::Team,
             ExecutionDependencyPolicy::All,
-            &[],
+            &["terminal_synthesis".to_string()],
             2,
         );
         let ExecutionDependencyPolicy::EvidenceReady { predicate, .. } = dependency else {

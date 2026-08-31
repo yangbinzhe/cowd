@@ -1,5 +1,6 @@
 mod agent;
 mod approval;
+mod materialize;
 mod scoped;
 mod subgraph;
 mod synthesize;
@@ -8,6 +9,7 @@ mod verify;
 
 pub use agent::{AgentTaskBackend, AgentTaskBackendResolver, AgentTaskExecutor};
 pub use approval::{graph_approval_id, parse_graph_approval_id, ApprovalNodeExecutor};
+pub use materialize::MaterializeNodeExecutor;
 pub use scoped::{ScopedNodeBackend, ScopedNodeBackendResolver, ScopedNodeExecutor};
 pub use subgraph::TeamSubgraphExecutor;
 pub use synthesize::{SynthesizeBackend, SynthesizeBackendResolver, SynthesizeNodeExecutor};

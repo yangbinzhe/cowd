@@ -199,6 +199,7 @@ pub fn validate_execution_graph(
             && (matches!(
                 node.kind,
                 ExecutionNodeKind::Subgraph
+                    | ExecutionNodeKind::Materialize
                     | ExecutionNodeKind::Synthesize
                     | ExecutionNodeKind::Approval
                     | ExecutionNodeKind::SessionDispatch

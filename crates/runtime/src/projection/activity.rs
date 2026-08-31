@@ -803,7 +803,9 @@ fn activity_kind(kind: ExecutionNodeKind, executor_kind: &str) -> ExecutionActiv
         ExecutionNodeKind::InlineModel | ExecutionNodeKind::Synthesize => {
             ExecutionActivityKind::Model
         }
-        ExecutionNodeKind::ToolBatch => ExecutionActivityKind::ToolBatch,
+        ExecutionNodeKind::ToolBatch | ExecutionNodeKind::Materialize => {
+            ExecutionActivityKind::ToolBatch
+        }
         ExecutionNodeKind::AgentTask => ExecutionActivityKind::Agent,
         ExecutionNodeKind::Subgraph
             if executor_kind == crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR =>
@@ -1195,6 +1197,7 @@ fn node_phase(kind: ExecutionNodeKind) -> &'static str {
         ExecutionNodeKind::AgentTask => "agent",
         ExecutionNodeKind::Subgraph => "delegation",
         ExecutionNodeKind::Verify => "verification",
+        ExecutionNodeKind::Materialize => "materialization",
         ExecutionNodeKind::Synthesize => "synthesis",
         ExecutionNodeKind::Approval => "approval",
         ExecutionNodeKind::SessionDispatch => "dispatch",

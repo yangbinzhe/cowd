@@ -234,7 +234,7 @@ fn node(
 
 const fn work_role(kind: ExecutionNodeKind) -> ExecutionWorkRole {
     match kind {
-        ExecutionNodeKind::ToolBatch => ExecutionWorkRole::Tool,
+        ExecutionNodeKind::ToolBatch | ExecutionNodeKind::Materialize => ExecutionWorkRole::Tool,
         ExecutionNodeKind::Verify | ExecutionNodeKind::Approval => ExecutionWorkRole::Verify,
         ExecutionNodeKind::Synthesize => ExecutionWorkRole::Synthesize,
         ExecutionNodeKind::AgentTask | ExecutionNodeKind::Subgraph => {

@@ -13,10 +13,72 @@ pub enum ExecutionNodeKind {
     AgentTask,
     Subgraph,
     Verify,
+    Materialize,
     Synthesize,
     Approval,
     SessionDispatch,
     Timer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionMaterializationContent {
+    /// Preserve a non-empty existing target; otherwise write the complete
+    /// durable source result summary.
+    ExistingOrSourceSummary,
+    SourceSummary,
+    SourceJsonField {
+        field: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionMaterializationRequest {
+    pub source_node_id: String,
+    pub target_path: String,
+    pub artifact_kind: String,
+    pub content: ExecutionMaterializationContent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_sha256: Option<String>,
+}
+
+impl ExecutionMaterializationRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.source_node_id.trim().is_empty()
+            || self.target_path.trim().is_empty()
+            || self.artifact_kind.trim().is_empty()
+        {
+            return Err(
+                "materialization source, target and artifact kind are required".to_string(),
+            );
+        }
+        let target = std::path::Path::new(&self.target_path);
+        if target.is_absolute()
+            || target.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err("materialization target must be a workspace-relative path".to_string());
+        }
+        if let ExecutionMaterializationContent::SourceJsonField { field } = &self.content {
+            if field.trim().is_empty() {
+                return Err("materialization JSON field is empty".to_string());
+            }
+        }
+        if self.expected_sha256.as_ref().is_some_and(|digest| {
+            digest.strip_prefix("sha256:").is_none_or(|hex| {
+                hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        }) {
+            return Err("materialization expected_sha256 is invalid".to_string());
+        }
+        Ok(())
+    }
 }
 
 /// Semantic responsibility inside the canonical execution graph.
@@ -2236,5 +2298,22 @@ mod dependency_policy_tests {
         let mut invalid = escalation;
         invalid.base_revision = 0;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn materialization_request_rejects_scope_escape_and_invalid_digest() {
+        let mut request = ExecutionMaterializationRequest {
+            source_node_id: "source".to_string(),
+            target_path: "reports/final.md".to_string(),
+            artifact_kind: "report".to_string(),
+            content: ExecutionMaterializationContent::SourceSummary,
+            expected_sha256: Some(format!("sha256:{}", "a".repeat(64))),
+        };
+        assert!(request.validate().is_ok());
+        request.target_path = "../outside.md".to_string();
+        assert!(request.validate().is_err());
+        request.target_path = "reports/final.md".to_string();
+        request.expected_sha256 = Some("sha256:short".to_string());
+        assert!(request.validate().is_err());
     }
 }

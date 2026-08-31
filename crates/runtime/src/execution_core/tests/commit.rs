@@ -954,7 +954,8 @@ fn cross_team_edge_delivery_and_claim_are_fenced_by_node_attempts() {
             .iter()
             .filter(|edge| edge.kind.is_dependency())
             .count(),
-        1
+        0,
+        "CrossTeamHandoff is organizational; ArtifactRequires owns physical readiness"
     );
     let ready = service
         .transition_node(

@@ -31,8 +31,9 @@ use super::goal::GoalStore;
 use super::graph::{
     aggregate_team_leaf_usage,
     executors::{
-        AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor, ScopedNodeExecutor,
-        SynthesizeNodeExecutor, TeamSubgraphExecutor, VerifyNodeExecutor,
+        AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor,
+        MaterializeNodeExecutor, ScopedNodeExecutor, SynthesizeNodeExecutor, TeamSubgraphExecutor,
+        VerifyNodeExecutor,
     },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError, ExecutionServiceClass,
@@ -1089,6 +1090,10 @@ impl RuntimeServices {
             &agent_runtime,
         ))));
         let verify_executor = Arc::new(VerifyNodeExecutor::new(graph_state_store.clone()));
+        let materialize_executor = Arc::new(MaterializeNodeExecutor::new(
+            graph_state_store.clone(),
+            workspace_root.clone(),
+        ));
         let synthesize_executor = Arc::new(SynthesizeNodeExecutor::new());
         synthesize_executor.install_resolver(Arc::new(TeamResultReducer::new(
             graph_state_store.clone(),
@@ -1155,6 +1160,7 @@ impl RuntimeServices {
                     }),
                 )),
                 Arc::clone(&verify_executor) as Arc<dyn NodeExecutor>,
+                materialize_executor as Arc<dyn NodeExecutor>,
                 Arc::clone(&synthesize_executor) as Arc<dyn NodeExecutor>,
                 Arc::clone(&session_dispatch_executor) as Arc<dyn NodeExecutor>,
             ],

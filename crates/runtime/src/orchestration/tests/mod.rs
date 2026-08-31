@@ -1,5 +1,7 @@
 use super::*;
-use harness_contract::execution_graph::ExecutionCompletionContract;
+use harness_contract::execution_graph::{
+    ExecutionCompletionContract, ExecutionEdgeKind, ExecutionMaterializationRequest,
+};
 use harness_contract::policy::PermissionMode;
 
 #[test]
@@ -883,6 +885,79 @@ fn semantic_compiler_materializes_parallel_agents_and_synthesis() {
     let projection = harness_contract::execution_graph::project_execution_graph(&terminal);
     assert_eq!(graph_status(&projection), "completed");
     assert_eq!(completion.required_artifact_kinds, vec!["report"]);
+}
+
+#[test]
+fn semantic_compiler_inserts_required_workspace_materializer() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    ensure_test_mission(&services);
+    let mut team = parallel_research_team("report-team", Vec::new());
+    team.output_artifacts = vec!["reports/final.md".to_string()];
+    team.evidence_contract = vec!["summary".to_string(), "evidence".to_string()];
+    team.resource_scopes = vec![
+        "network:*".to_string(),
+        "read:crates/runtime".to_string(),
+        "write:reports/final.md".to_string(),
+    ];
+    let mut request = proposal(vec![team]);
+    request.intent =
+        "research the bounded sources and write the final report to reports/final.md".to_string();
+    request.constraints.permission_ceiling = PermissionMode::WorkspaceWrite;
+    request.constraints.requires_write = Some(true);
+    request.capabilities.extend([
+        "resource:network:*".to_string(),
+        "resource:read:crates/runtime".to_string(),
+        "resource:write:reports/final.md".to_string(),
+    ]);
+    request.proposal.as_mut().unwrap().completion = ExecutionCompletionContract {
+        required_node_ids: vec!["report-team".to_string()],
+        required_artifact_kinds: vec!["reports/final.md".to_string()],
+        allow_unresolved_conflicts: false,
+    };
+    team_authority::bind_semantic_resource_authority(&mut request, None, services.workspace_root());
+    let report_team = &mut request.proposal.as_mut().unwrap().nodes[0];
+    report_team.resource_scopes = vec![
+        "network:*".to_string(),
+        "read:crates/runtime".to_string(),
+        "session:session-v621".to_string(),
+        "write:reports/final.md".to_string(),
+    ];
+    for focus in &mut report_team.focuses {
+        focus.resource_scopes = report_team.resource_scopes.clone();
+    }
+    let plan = planner::plan_runtime_orchestration(&request);
+    let compiled = compiler::compile_orchestration(
+        "materialize-report",
+        &request,
+        &plan,
+        None,
+        Some(services.team_runtime().as_ref()),
+    )
+    .expect("required report graph compiles");
+
+    let materialize = compiled
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == ExecutionNodeKind::Materialize)
+        .expect("materializer node");
+    let payload: ExecutionMaterializationRequest =
+        serde_json::from_str(&materialize.payload_ref).unwrap();
+    assert_eq!(payload.target_path, "reports/final.md");
+    assert_eq!(materialize.resource_scopes, vec!["write:reports/final.md"]);
+    assert!(compiled
+        .graph
+        .orchestration
+        .as_ref()
+        .unwrap()
+        .completion
+        .required_node_ids
+        .contains(&materialize.id));
+    assert!(compiled
+        .graph
+        .edges
+        .iter()
+        .any(|edge| { edge.to == materialize.id && edge.kind == ExecutionEdgeKind::DependsOn }));
 }
 
 #[test]
@@ -2227,6 +2302,7 @@ fn add_team_patch_compiles_to_an_exact_active_program_revision() {
         &patch_proposal.completion,
         &mutation.semantic_node_instances,
         &patch_proposal.nodes,
+        &mutation.nodes,
     );
     let committed = services
         .commit_service()

@@ -1362,6 +1362,7 @@
             verified_receipts: Vec::new(),
             verified_artifacts: Vec::new(),
             verified_effects: Vec::new(),
+            workspace_materializations: Vec::new(),
             coverage: Default::default(),
             unresolved: Vec::new(),
             conflicts: Vec::new(),
@@ -1379,6 +1380,63 @@
             harness_contract::outcome::UserAnswerFormat::StrictJson;
         assert!(qualified_root_answer(r#"{"ok":true}"#, &envelope));
         assert!(!qualified_root_answer("not json", &envelope));
+    }
+
+    #[test]
+    fn terminal_truth_gate_rejects_contradictions_and_renders_typed_fallback() {
+        use harness_contract::outcome::{
+            DeliveryBranchStatus, DeliveryBranchTerminal, WorkspaceMaterializationReceipt,
+        };
+
+        let mut envelope = harness_contract::outcome::DeliveryEnvelope {
+            envelope_id: "delivery-truth".to_string(),
+            revision: 7,
+            objective_id: "goal-truth".to_string(),
+            pipeline_status: harness_contract::outcome::PipelineStatus::Completed,
+            delivery_status: harness_contract::outcome::DeliveryStatus::Satisfied,
+            branch_terminals: vec![DeliveryBranchTerminal {
+                branch_id: "research-team".to_string(),
+                execution_id: Some("run-1".to_string()),
+                status: DeliveryBranchStatus::Completed,
+                result_ref: Some("result-1".to_string()),
+                failure_ref: None,
+            }],
+            verified_receipts: Vec::new(),
+            verified_artifacts: Vec::new(),
+            verified_effects: Vec::new(),
+            workspace_materializations: vec![WorkspaceMaterializationReceipt {
+                receipt_id: "materialization:graph:node".to_string(),
+                source_execution_id: "graph".to_string(),
+                source_node_id: "research-team".to_string(),
+                source_result_ref: "result-1".to_string(),
+                target_path: "reports/final.md".to_string(),
+                artifact_kind: "report".to_string(),
+                before_sha256: None,
+                sha256: "sha256:abcd".to_string(),
+                bytes: 42,
+                write_effect_id: "write-1".to_string(),
+                reread_verified: true,
+                materialized_at_ms: 1,
+            }],
+            coverage: Default::default(),
+            unresolved: Vec::new(),
+            conflicts: Vec::new(),
+            cancellation: None,
+            user_answer_contract: Default::default(),
+            created_at_ms: 1,
+        };
+        let findings = delivery_truth_contradictions(
+            "没有任何团队执行，也没有生成任何文件，任务未完成。",
+            &envelope,
+        );
+        assert_eq!(findings.len(), 3);
+
+        envelope.user_answer_contract.format =
+            harness_contract::outcome::UserAnswerFormat::StrictJson;
+        let fallback = runtime_verified_delivery_fallback(&envelope);
+        let json: serde_json::Value = serde_json::from_str(&fallback).unwrap();
+        assert_eq!(json["delivery_status"], "satisfied");
+        assert_eq!(json["workspace_materializations"][0]["path"], "reports/final.md");
     }
 
     #[test]
