@@ -258,8 +258,9 @@ impl SessionHistoryReader {
         session_id: &str,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
+        let query = history_literal_query(query)?;
         self.repository
-            .search_messages(query, Some(session_id), limit.clamp(1, 100))
+            .search_messages(&query, Some(session_id), limit.clamp(1, 100))
             .await
     }
 
@@ -277,8 +278,9 @@ impl SessionHistoryReader {
         if session_ids.is_empty() {
             return Ok(Vec::new());
         }
+        let query = history_literal_query(query)?;
         self.repository
-            .search_messages_in_sessions(query, session_ids, limit.clamp(1, 100))
+            .search_messages_in_sessions(&query, session_ids, limit.clamp(1, 100))
             .await
     }
 
@@ -296,6 +298,28 @@ impl SessionHistoryReader {
             .session_domain_events_page(session_id, from_sequence, limit.clamp(1, 4_096))
             .await
     }
+}
+
+/// Convert a model/user natural-language history query into backend-portable
+/// literal terms. SQLite FTS5 otherwise treats punctuation such as `-` as
+/// query syntax (`sci-ml` becomes a subtraction/column expression), while
+/// Postgres websearch syntax has a different operator grammar. The raw store
+/// search APIs remain available to trusted callers that intentionally use a
+/// backend's advanced query language.
+fn history_literal_query(input: &str) -> Result<String> {
+    let terms = input
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .take(32)
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return Err(crate::SessionError::InvalidArgument(
+            "session history search query must contain at least one term".to_string(),
+        ));
+    }
+    Ok(terms.join(" OR "))
 }
 
 fn session_metadata(record: &SessionRecord) -> serde_json::Value {
@@ -389,6 +413,34 @@ mod tests {
         assert!(related
             .iter()
             .all(|message| message.session_id != "unrelated"));
+    }
+
+    #[tokio::test]
+    async fn natural_language_search_quotes_fts_operator_punctuation() {
+        let store = UnifiedSessionStore::open_in_memory().expect("session store");
+        store
+            .create_session(&session_record("current"))
+            .await
+            .expect("session");
+        store
+            .insert_message(&message(
+                "current",
+                0,
+                "sci-ml-materials report on equivariant methods",
+            ))
+            .await
+            .expect("message");
+
+        let selected = store
+            .history_reader()
+            .search_messages(
+                "sci-ml-materials report equivariant methods research",
+                "current",
+                10,
+            )
+            .await
+            .expect("hyphenated natural-language search must not become FTS syntax");
+        assert_eq!(selected.len(), 1);
     }
 
     #[tokio::test]
