@@ -193,6 +193,8 @@ pub fn compile_orchestration_with_capacity(
         request.collaboration_semantic_intent.as_ref(),
     ) {
         program.semantic_intent = Some(semantic_intent.clone());
+        program.approval_policy_digest =
+            request.execution_policy_digest.clone().unwrap_or_default();
     }
     graph.orchestration = Some(ExecutionOrchestrationMetadata {
         mutation_id: proposal.mutation_id.clone(),
@@ -296,6 +298,7 @@ pub(crate) fn collaboration_program_from_proposal(
     let derived = CollaborationProgram {
         program_id: format!("collaboration-program:{}", proposal.mutation_id),
         revision: 1,
+        approval_policy_digest: String::new(),
         required_team_count: u16::try_from(instances.iter().filter(|team| team.required).count())
             .map_err(|_| {
             OrchestrationCompileError::InvalidProposal(

@@ -337,6 +337,13 @@ fn merge_collaboration_program(
         *current = Some(delta);
         return Ok(());
     };
+    if !delta.approval_policy_digest.is_empty()
+        && delta.approval_policy_digest != program.approval_policy_digest
+    {
+        return Err(ExecutionCommitError::InvalidReplan(
+            "collaboration revision cannot change its immutable approval policy digest".to_string(),
+        ));
+    }
 
     let existing_ids = program
         .team_instances

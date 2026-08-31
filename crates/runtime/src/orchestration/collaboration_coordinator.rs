@@ -241,6 +241,7 @@ pub(crate) fn compile_collaboration_intent_patch(
         }),
         collaboration_intent: None,
         collaboration_semantic_intent: None,
+        execution_policy_digest: None,
         tool_inventory: None,
         control: None,
         template_proposal: None,
@@ -1187,8 +1188,16 @@ fn terminal_experience_episode(
                     let roles = &team.roles;
                     harness_contract::evolution::SemanticWorkstreamShape {
                         ordinal: ordinal.min(u16::MAX as usize) as u16,
-                        multiplicity_min: 1,
-                        multiplicity_max: 1,
+                        multiplicity_min: roles
+                            .iter()
+                            .map(|role| role.cardinality_min)
+                            .fold(0u16, u16::saturating_add)
+                            .max(1),
+                        multiplicity_max: roles
+                            .iter()
+                            .map(|role| role.cardinality_max)
+                            .fold(0u16, u16::saturating_add)
+                            .max(1),
                         required_capability_ids: roles
                             .iter()
                             .flat_map(|role| role.required_capabilities.clone())
@@ -1201,11 +1210,11 @@ fn terminal_experience_episode(
                             .iter()
                             .flat_map(|role| role.required_tools.clone())
                             .collect(),
-                        acceptance_kinds: Vec::new(),
-                        result_field_shapes: roles
+                        acceptance_kinds: roles
                             .iter()
-                            .flat_map(|role| role.output_artifacts.clone())
+                            .flat_map(|role| role.acceptance_kinds.clone())
                             .collect(),
+                        result_field_shapes: team.result_field_shapes.clone(),
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1226,6 +1235,10 @@ fn terminal_experience_episode(
     let mut result_shapes = workstream_shapes
         .iter()
         .flat_map(|shape| shape.result_field_shapes.clone())
+        .collect::<Vec<_>>();
+    let mut acceptance_kinds = workstream_shapes
+        .iter()
+        .flat_map(|shape| shape.acceptance_kinds.clone())
         .collect::<Vec<_>>();
     let workstream_ordinals = intent
         .map(|intent| {
@@ -1280,7 +1293,7 @@ fn terminal_experience_episode(
         required_capability_ids: std::mem::take(&mut capability_ids),
         required_skill_ids: std::mem::take(&mut skill_ids),
         required_tool_capabilities: std::mem::take(&mut tool_ids),
-        acceptance_kinds: Vec::new(),
+        acceptance_kinds: std::mem::take(&mut acceptance_kinds),
         result_field_shapes: std::mem::take(&mut result_shapes),
     }
     .normalized();
@@ -1301,7 +1314,7 @@ fn terminal_experience_episode(
                 })
         })
         .collect::<Vec<_>>();
-    let evidence_refs = terminal_evidence
+    let mut evidence_refs = terminal_evidence
         .iter()
         .map(|reference| {
             // Evidence identifiers are opaque runtime references.  Retain
@@ -1311,17 +1324,22 @@ fn terminal_experience_episode(
             format!("evidence:sha256:{:x}", Sha256::digest(reference.as_bytes()))
         })
         .collect::<Vec<_>>();
-    let required = program
+    evidence_refs.sort();
+    evidence_refs.dedup();
+    let required_instance_ids = program
         .team_instances
         .iter()
         .filter(|team| team.required)
-        .count() as u32;
+        .map(|team| team.instance_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let required = required_instance_ids.len() as u32;
     let satisfied = program
         .control
         .obligations
         .iter()
         .filter(|obligation| {
-            obligation.state == TeamAdmissionState::Admitted
+            required_instance_ids.contains(obligation.instance_id.as_str())
+                && obligation.state == TeamAdmissionState::Admitted
                 && obligation.terminal.as_ref().is_some_and(|terminal| {
                     terminal.node_status
                         == harness_contract::execution_graph::ExecutionNodeStatus::Completed
@@ -1345,13 +1363,20 @@ fn terminal_experience_episode(
         .edges
         .iter()
         .all(|edge| edge.state == harness_contract::execution_graph::CrossTeamEdgeState::Claimed);
-    let durable_terminal_evidence = program.control.obligations.iter().all(|obligation| {
-        obligation.terminal.as_ref().is_some_and(|terminal| {
-            terminal
-                .evidence_refs
-                .iter()
-                .all(|reference| reference.is_durable())
-        })
+    let durable_terminal_evidence = required_instance_ids.iter().all(|instance_id| {
+        program
+            .control
+            .obligations
+            .iter()
+            .find(|obligation| obligation.instance_id == *instance_id)
+            .and_then(|obligation| obligation.terminal.as_ref())
+            .is_some_and(|terminal| {
+                !terminal.evidence_refs.is_empty()
+                    && terminal
+                        .evidence_refs
+                        .iter()
+                        .all(|reference| reference.is_durable())
+            })
     });
     let has_safe_evidence_refs = !evidence_refs.is_empty();
     let hash_reference = |value: &str| {
@@ -1409,31 +1434,39 @@ fn terminal_experience_episode(
             .resource_ledger
             .capacity_profile_digest
             .clone(),
-        approval_policy_digest: String::new(),
+        approval_policy_digest: program.approval_policy_digest.clone(),
         semantic_signature: signature,
-        outcome: match program.control.lifecycle {
-            CollaborationProgramLifecycle::Completed => {
-                harness_contract::evolution::CollaborationExperienceOutcome::Completed
+        outcome: if intent.is_none()
+            || intent.is_some_and(|value| value.intent_digest.trim().is_empty())
+        {
+            harness_contract::evolution::CollaborationExperienceOutcome::IntentGap
+        } else if intent.is_some_and(|value| value.binding_digest.trim().is_empty()) {
+            harness_contract::evolution::CollaborationExperienceOutcome::BindingGap
+        } else {
+            match program.control.lifecycle {
+                CollaborationProgramLifecycle::Completed => {
+                    harness_contract::evolution::CollaborationExperienceOutcome::Completed
+                }
+                CollaborationProgramLifecycle::Partial => {
+                    harness_contract::evolution::CollaborationExperienceOutcome::Partial
+                }
+                CollaborationProgramLifecycle::Cancelled => {
+                    harness_contract::evolution::CollaborationExperienceOutcome::Cancelled
+                }
+                CollaborationProgramLifecycle::Blocked
+                    if program.control.obligations.iter().any(|obligation| {
+                        obligation.reason_kind.as_deref().is_some_and(|reason| {
+                            reason.contains("rejected") || reason.contains("policy")
+                        })
+                    }) =>
+                {
+                    harness_contract::evolution::CollaborationExperienceOutcome::Denied
+                }
+                CollaborationProgramLifecycle::Blocked => {
+                    harness_contract::evolution::CollaborationExperienceOutcome::BindingGap
+                }
+                _ => harness_contract::evolution::CollaborationExperienceOutcome::Failed,
             }
-            CollaborationProgramLifecycle::Partial => {
-                harness_contract::evolution::CollaborationExperienceOutcome::Partial
-            }
-            CollaborationProgramLifecycle::Cancelled => {
-                harness_contract::evolution::CollaborationExperienceOutcome::Cancelled
-            }
-            CollaborationProgramLifecycle::Blocked
-                if program.control.obligations.iter().any(|obligation| {
-                    obligation.reason_kind.as_deref().is_some_and(|reason| {
-                        reason.contains("rejected") || reason.contains("policy")
-                    })
-                }) =>
-            {
-                harness_contract::evolution::CollaborationExperienceOutcome::Denied
-            }
-            CollaborationProgramLifecycle::Blocked => {
-                harness_contract::evolution::CollaborationExperienceOutcome::BindingGap
-            }
-            _ => harness_contract::evolution::CollaborationExperienceOutcome::Failed,
         },
         evidence_refs,
         coverage: harness_contract::evolution::CollaborationEvidenceCoverage {
@@ -1451,7 +1484,19 @@ fn terminal_experience_episode(
                 && durable_terminal_evidence
                 && has_safe_evidence_refs,
         },
-        latency_ms: 0,
+        latency_ms: program
+            .control
+            .obligations
+            .iter()
+            .filter_map(|obligation| {
+                obligation
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| terminal.finished_at_ms)
+            })
+            .max()
+            .unwrap_or_default()
+            .saturating_sub(program.control.resource_ledger.admitted_at_ms),
         resource_summary: harness_contract::evolution::CollaborationResourceSummary {
             parallel_demand: program.control.resource_ledger.parallel_demand,
             context_reservation_tokens: program.control.resource_ledger.context_reservation_tokens,
@@ -1893,6 +1938,7 @@ fn admission_control(
             output_reservation_tokens,
             parallel_demand: u16::try_from(parallel_demand).unwrap_or(u16::MAX).max(1),
             deadline_at_ms,
+            admitted_at_ms: crate::tool_invocation::now_ms(),
             confidence_basis_points: 10_000,
             revision: program.revision,
             capacity_profile_id: capacity_snapshot.profile_id,
@@ -1946,6 +1992,7 @@ mod tests {
         let program = CollaborationProgram {
             program_id: "program-review".to_string(),
             revision: 2,
+            approval_policy_digest: "sha256:policy".to_string(),
             required_team_count: 3,
             team_instances: vec![
                 harness_contract::execution_graph::CollaborationTeamInstance {
@@ -2022,6 +2069,7 @@ mod tests {
         let program = CollaborationProgram {
             program_id: "program-split".to_string(),
             revision: 4,
+            approval_policy_digest: "sha256:policy".to_string(),
             required_team_count: 2,
             team_instances: vec![
                 CollaborationTeamInstance {
@@ -2147,6 +2195,7 @@ mod tests {
             collaboration_program: Some(CollaborationProgram {
                 program_id: "program-fan-in".to_string(),
                 revision: 1,
+                approval_policy_digest: "sha256:policy".to_string(),
                 required_team_count: 3,
                 team_instances: vec![
                     CollaborationTeamInstance {
@@ -2462,6 +2511,7 @@ mod tests {
             collaboration_program: Some(CollaborationProgram {
                 program_id: "terminal-episode-program".to_string(),
                 revision: 1,
+                approval_policy_digest: "sha256:approval".to_string(),
                 required_team_count: 1,
                 team_instances: vec![CollaborationTeamInstance {
                     instance_id: "team:1".to_string(),
@@ -2470,7 +2520,41 @@ mod tests {
                 }],
                 edges: Vec::new(),
                 semantic_node_instances: std::collections::BTreeMap::new(),
-                semantic_intent: None,
+                semantic_intent: Some(
+                    harness_contract::execution_graph::CollaborationSemanticIntentSnapshot {
+                        schema_version: 2,
+                        decision_id: "decision:terminal-episode".to_string(),
+                        intent_digest: "sha256:intent".to_string(),
+                        origin: harness_contract::execution_graph::CollaborationIntentOrigin::UserDirectedTurnScoped,
+                        lifecycle: harness_contract::execution_graph::CollaborationIntentLifecycle::TurnScoped,
+                        source_session_ref: "session:terminal-episode".to_string(),
+                        source_turn_ref: "turn:terminal-episode".to_string(),
+                        compiler_revision: "semantic-v2".to_string(),
+                        binding_digest: "sha256:binding".to_string(),
+                        teams: vec![harness_contract::execution_graph::CollaborationSemanticTeamSnapshot {
+                            workstream_id: "team".to_string(),
+                            team_key: "terminal-team".to_string(),
+                            display_name: Some("display-only".to_string()),
+                            roles: vec![harness_contract::execution_graph::CollaborationSemanticRoleSnapshot {
+                                role_id: "research".to_string(),
+                                display_name: Some("display-only-role".to_string()),
+                                responsibility: "collect evidence".to_string(),
+                                required_capabilities: vec!["read".to_string()],
+                                required_skills: vec!["skill.audit".to_string()],
+                                required_tools: vec!["workspace.read".to_string()],
+                                cardinality_min: 2,
+                                cardinality_max: 3,
+                                acceptance_kinds: vec!["evidence_ref".to_string()],
+                                input_artifacts: Vec::new(),
+                                output_artifacts: vec!["report".to_string()],
+                            }],
+                            dependencies: Vec::new(),
+                            result_field_shapes: vec!["summary".to_string(), "evidence".to_string()],
+                        }],
+                        ai_composed: true,
+                        published_template_ref: None,
+                    },
+                ),
                 control: CollaborationProgramControlState {
                     lifecycle: CollaborationProgramLifecycle::Completed,
                     obligations: vec![TeamAdmissionObligation {
@@ -2496,7 +2580,7 @@ mod tests {
                                     "workspace",
                                 ),
                             ],
-                            finished_at_ms: 1,
+                            finished_at_ms: 11,
                         }),
                         reservation: TeamAdmissionResourceReservation {
                             context_reservation_tokens: 1,
@@ -2510,6 +2594,7 @@ mod tests {
                         output_reservation_tokens: 1,
                         parallel_demand: 1,
                         deadline_at_ms: 1,
+                        admitted_at_ms: 1,
                         confidence_basis_points: 10_000,
                         revision: 1,
                         capacity_profile_id: "fixture".to_string(),
@@ -2562,9 +2647,64 @@ mod tests {
                 .expect("episode payload");
         assert!(episode.coverage.reusable);
         assert!(episode.is_pattern_eligible());
+        assert_eq!(episode.approval_policy_digest, "sha256:approval");
+        assert_eq!(episode.latency_ms, 10);
+        assert_eq!(
+            episode.semantic_signature.workstream_shapes[0].multiplicity_min,
+            2
+        );
+        assert_eq!(
+            episode.semantic_signature.workstream_shapes[0].multiplicity_max,
+            3
+        );
+        assert_eq!(
+            episode.semantic_signature.workstream_shapes[0].acceptance_kinds,
+            vec!["evidence_ref"]
+        );
+        assert_eq!(
+            episode.semantic_signature.workstream_shapes[0].result_field_shapes,
+            vec!["evidence", "summary"]
+        );
+        let encoded = serde_json::to_string(&episode.semantic_signature).expect("signature");
+        assert!(!encoded.contains("display-only"));
         assert!(episode
             .evidence_refs
             .iter()
             .all(|reference| reference.starts_with("evidence:sha256:")));
+
+        let mut optional_program = graph
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.clone())
+            .expect("program");
+        optional_program
+            .team_instances
+            .push(CollaborationTeamInstance {
+                instance_id: "team:optional".to_string(),
+                semantic_node_id: "team".to_string(),
+                required: false,
+            });
+        let mut optional_obligation = optional_program.control.obligations[0].clone();
+        optional_obligation.instance_id = "team:optional".to_string();
+        optional_program
+            .control
+            .obligations
+            .push(optional_obligation);
+        let optional_episode =
+            terminal_experience_episode(&graph, &optional_program, "fixture-salt");
+        assert_eq!(optional_episode.coverage.required_obligation_count, 1);
+        assert_eq!(optional_episode.coverage.satisfied_obligation_count, 1);
+        assert!(optional_episode.coverage.reusable);
+
+        let mut missing_required_evidence = optional_program;
+        missing_required_evidence.control.obligations[0]
+            .terminal
+            .as_mut()
+            .expect("terminal")
+            .evidence_refs
+            .clear();
+        let missing_evidence_episode =
+            terminal_experience_episode(&graph, &missing_required_evidence, "fixture-salt");
+        assert!(!missing_evidence_episode.coverage.reusable);
     }
 }

@@ -261,6 +261,7 @@ fn proposal(nodes: Vec<GraphSemanticNode>) -> RuntimeOrchestrationCommand {
         ephemeral_team_templates: Default::default(),
         collaboration_intent: None,
         collaboration_semantic_intent: None,
+        execution_policy_digest: None,
         tool_inventory: None,
 
         input_disposition: None,
@@ -451,6 +452,21 @@ async fn v2_semantic_decision_admits_an_exact_turn_scoped_team_snapshot() {
     std::fs::write(&source, "// deterministic orchestration evidence fixture")
         .expect("source fixture");
     ensure_test_mission(&services);
+    let execution_policy = harness_contract::policy::SessionExecutionPolicy::from_profile(
+        harness_contract::policy::AutonomyProfileId::Autonomous,
+        1,
+        harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+    );
+    let expected_policy_digest = harness_contract::policy::ExecutionPolicyBinding::bind(
+        "session-v621",
+        &execution_policy,
+        PermissionMode::ReadOnly,
+    )
+    .policy_digest;
+    services.publish_session_execution_policy(
+        "session-v621",
+        crate::permissions::SessionExecutionPolicyControl::from_policy(execution_policy),
+    );
     let mut request = proposal(Vec::new());
     request.collaboration_intent = Some(ModelCollaborationControlDecisionV2 {
         schema_version: 2,
@@ -546,6 +562,7 @@ async fn v2_semantic_decision_admits_an_exact_turn_scoped_team_snapshot() {
         .as_ref()
         .expect("semantic provenance");
     assert_eq!(intent.decision_id, "runtime-v2-semantic-admission");
+    assert_eq!(program.approval_policy_digest, expected_policy_digest);
     assert!(intent.ai_composed);
     assert_eq!(intent.teams[0].roles.len(), 2);
 }
@@ -1306,6 +1323,7 @@ fn failed_team_requirement_projects_a_typed_program_diagnostic() {
         collaboration_program: Some(CollaborationProgram {
             program_id: "program-terminal".to_string(),
             revision: 1,
+            approval_policy_digest: "sha256:policy".to_string(),
             required_team_count: 1,
             team_instances: vec![CollaborationTeamInstance {
                 instance_id: "audit:1".to_string(),

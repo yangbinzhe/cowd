@@ -1055,6 +1055,11 @@ pub struct ProgramResourceLedger {
     pub output_reservation_tokens: u64,
     pub parallel_demand: u16,
     pub deadline_at_ms: u64,
+    /// Admission timestamp used only for terminal latency accounting. It is
+    /// frozen with the graph before registration and never refreshed by
+    /// streaming progress or projection replay.
+    #[serde(default)]
+    pub admitted_at_ms: u64,
     pub confidence_basis_points: u16,
     pub revision: u64,
     /// Immutable profile identity captured at collaboration admission. Empty
@@ -1156,10 +1161,20 @@ pub struct CollaborationSemanticRoleSnapshot {
     pub required_skills: Vec<String>,
     #[serde(default)]
     pub required_tools: Vec<String>,
+    #[serde(default = "default_semantic_cardinality")]
+    pub cardinality_min: u16,
+    #[serde(default = "default_semantic_cardinality")]
+    pub cardinality_max: u16,
+    #[serde(default)]
+    pub acceptance_kinds: Vec<String>,
     #[serde(default)]
     pub input_artifacts: Vec<String>,
     #[serde(default)]
     pub output_artifacts: Vec<String>,
+}
+
+const fn default_semantic_cardinality() -> u16 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1171,6 +1186,8 @@ pub struct CollaborationSemanticTeamSnapshot {
     pub roles: Vec<CollaborationSemanticRoleSnapshot>,
     #[serde(default)]
     pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub result_field_shapes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1199,6 +1216,11 @@ pub struct CollaborationSemanticIntentSnapshot {
 pub struct CollaborationProgram {
     pub program_id: String,
     pub revision: u64,
+    /// Immutable digest of the Session execution/approval policy bound when
+    /// this Program was compiled. Historical Programs decode with an empty
+    /// digest and remain auditable but cannot support reusable experience.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub approval_policy_digest: String,
     pub required_team_count: u16,
     #[serde(default)]
     pub team_instances: Vec<CollaborationTeamInstance>,
@@ -1346,6 +1368,7 @@ impl CollaborationProgram {
                 || intent.compiler_revision.trim().is_empty()
                 || intent.binding_digest.trim().is_empty()
                 || intent.teams.is_empty()
+                || self.approval_policy_digest.trim().is_empty()
             {
                 return Err("collaboration semantic intent provenance is incomplete".to_string());
             }
@@ -2069,6 +2092,7 @@ mod dependency_policy_tests {
         let valid = CollaborationProgram {
             program_id: "program-1".to_string(),
             revision: 1,
+            approval_policy_digest: String::new(),
             required_team_count: 2,
             team_instances: vec![
                 CollaborationTeamInstance {
@@ -2113,6 +2137,7 @@ mod dependency_policy_tests {
         let mut mapped = CollaborationProgram {
             program_id: "program-2".to_string(),
             revision: 1,
+            approval_policy_digest: String::new(),
             required_team_count: 2,
             team_instances: vec![
                 CollaborationTeamInstance {
@@ -2154,6 +2179,7 @@ mod dependency_policy_tests {
         let mut program = CollaborationProgram {
             program_id: "program-control".to_string(),
             revision: 7,
+            approval_policy_digest: String::new(),
             required_team_count: 1,
             team_instances: vec![CollaborationTeamInstance {
                 instance_id: "research:1".to_string(),
@@ -2184,6 +2210,7 @@ mod dependency_policy_tests {
                     output_reservation_tokens: 1_000,
                     parallel_demand: 1,
                     deadline_at_ms: 123,
+                    admitted_at_ms: 1,
                     confidence_basis_points: 8_000,
                     revision: 7,
                     capacity_profile_id: String::new(),

@@ -3004,6 +3004,7 @@
                     harness_contract::execution_graph::CollaborationProgram {
                         program_id: "program-1".to_string(),
                         revision: 1,
+                        approval_policy_digest: "sha256:policy".to_string(),
                         required_team_count: 2,
                         team_instances: vec![
                             harness_contract::execution_graph::CollaborationTeamInstance {

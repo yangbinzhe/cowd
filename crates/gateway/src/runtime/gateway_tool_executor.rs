@@ -4782,6 +4782,7 @@ mod tests {
             ephemeral_team_templates: Default::default(),
             collaboration_intent: None,
             collaboration_semantic_intent: None,
+            execution_policy_digest: None,
             tool_inventory: None,
 
             input_disposition: None,

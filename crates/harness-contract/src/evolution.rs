@@ -90,6 +90,7 @@ impl CollaborationSemanticSignature {
         self.workstream_shapes.sort_by_key(|shape| shape.ordinal);
         for (ordinal, workstream) in self.workstream_shapes.iter_mut().enumerate() {
             workstream.ordinal = ordinal.min(u16::MAX as usize) as u16;
+            workstream.multiplicity_min = workstream.multiplicity_min.max(1);
             if workstream.multiplicity_max < workstream.multiplicity_min {
                 workstream.multiplicity_max = workstream.multiplicity_min;
             }
@@ -202,7 +203,13 @@ impl CollaborationExperienceEpisode {
             && self.coverage.required_obligation_count > 0
             && self.coverage.required_obligation_count == self.coverage.satisfied_obligation_count
             && self.coverage.coverage_basis_points == 10_000
+            && !self.session_ref_hash.trim().is_empty()
             && !self.turn_ref_hash.trim().is_empty()
+            && !self.intent_digest.trim().is_empty()
+            && !self.binding_digest.trim().is_empty()
+            && !self.capacity_profile_digest.trim().is_empty()
+            && !self.approval_policy_digest.trim().is_empty()
+            && self.completed_at_ms > 0
             && !self.evidence_refs.is_empty()
             && self.evidence_refs.len() <= MAX_COLLABORATION_EPISODE_EVIDENCE_REFS
             && self
@@ -272,6 +279,10 @@ impl CollaborationSemanticPattern {
     #[must_use]
     pub fn is_actionable(&self) -> bool {
         self.schema_version == COLLABORATION_PATTERN_SCHEMA_VERSION
+            && matches!(
+                self.lifecycle,
+                SemanticPatternLifecycle::Advisory | SemanticPatternLifecycle::CandidateCreated
+            )
             && self.qualifying_episode_ids.len() >= MINIMUM_PATTERN_DISTINCT_TURNS
             && self.distinct_turn_ref_hashes.len() >= MINIMUM_PATTERN_DISTINCT_TURNS
             && self.support_count as usize == self.qualifying_episode_ids.len()
@@ -432,6 +443,30 @@ mod tests {
     }
 
     #[test]
+    fn collaboration_signature_captures_cardinality_acceptance_and_result_shape() {
+        let baseline = signature().normalized();
+        let baseline_digest = baseline.digest();
+
+        let mut cardinality = baseline.clone();
+        cardinality.workstream_shapes[0].multiplicity_max = 3;
+        assert_ne!(baseline_digest, cardinality.digest());
+
+        let mut acceptance = baseline.clone();
+        acceptance.workstream_shapes[0]
+            .acceptance_kinds
+            .push("schema".to_string());
+        acceptance.acceptance_kinds.push("schema".to_string());
+        assert_ne!(baseline_digest, acceptance.digest());
+
+        let mut result = baseline.clone();
+        result.workstream_shapes[0]
+            .result_field_shapes
+            .push("confidence".to_string());
+        result.result_field_shapes.push("confidence".to_string());
+        assert_ne!(baseline_digest, result.digest());
+    }
+
+    #[test]
     fn terminal_episode_id_and_eligibility_are_idempotent() {
         let episode = CollaborationExperienceEpisode {
             schema_version: COLLABORATION_EXPERIENCE_SCHEMA_VERSION,
@@ -475,6 +510,16 @@ mod tests {
         );
         retry.coverage.satisfied_obligation_count = 1;
         assert!(!retry.is_pattern_eligible());
+
+        let mut missing_policy = episode.clone();
+        missing_policy.approval_policy_digest.clear();
+        assert!(!missing_policy.is_pattern_eligible());
+        let mut missing_capacity = episode.clone();
+        missing_capacity.capacity_profile_digest.clear();
+        assert!(!missing_capacity.is_pattern_eligible());
+        let mut missing_session = episode;
+        missing_session.session_ref_hash.clear();
+        assert!(!missing_session.is_pattern_eligible());
     }
 
     #[test]
@@ -523,6 +568,12 @@ mod tests {
         let mut duplicate_episode = pattern;
         duplicate_episode.qualifying_episode_ids.pop();
         duplicate_episode.support_count = 2;
+        assert!(!duplicate_episode.is_actionable());
+        duplicate_episode.qualifying_episode_ids.push(
+            CollaborationExperienceEpisode::deterministic_id("program-c", 1),
+        );
+        duplicate_episode.support_count = 3;
+        duplicate_episode.lifecycle = SemanticPatternLifecycle::Withdrawn;
         assert!(!duplicate_episode.is_actionable());
     }
 

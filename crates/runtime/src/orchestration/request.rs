@@ -176,6 +176,10 @@ pub struct RuntimeOrchestrationCommand {
     /// Program when graph compilation succeeds and is never model writable.
     #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
     pub collaboration_semantic_intent: Option<CollaborationSemanticIntentSnapshot>,
+    /// Runtime-derived digest of the exact Session execution/approval policy
+    /// governing this Program admission. Model JSON cannot provide it.
+    #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
+    pub execution_policy_digest: Option<String>,
     /// Gateway-attested, permission-cropped ToolHost inventory used to turn
     /// semantic role capabilities into an immutable executable allowlist.
     #[serde(default, skip_serializing_if = "Option::is_none", skip_deserializing)]
@@ -218,6 +222,7 @@ impl RuntimeOrchestrationCommand {
             template_proposal: input.template_proposal,
             collaboration_intent: None,
             collaboration_semantic_intent: None,
+            execution_policy_digest: None,
             tool_inventory: None,
             ephemeral_team_templates: BTreeMap::new(),
             control: input.control,
@@ -309,11 +314,13 @@ mod tool_inventory_tests {
             "catalog_revision": 999,
             "available_tools": ["write_file"]
         });
+        value["execution_policy_digest"] = serde_json::json!("sha256:forged");
 
         let decoded: RuntimeOrchestrationCommand =
             serde_json::from_value(value).expect("deserialize command");
 
         assert!(decoded.tool_inventory.is_none());
+        assert!(decoded.execution_policy_digest.is_none());
     }
 }
 

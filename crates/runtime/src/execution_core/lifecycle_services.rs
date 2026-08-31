@@ -372,6 +372,40 @@ impl RuntimeServices {
 
     /// Read-only advisory patterns derived from terminal collaboration episodes.
     /// Runtime never treats this projection as an executable selector.
+    pub fn collaboration_experience_episodes(
+        &self,
+        limit: usize,
+    ) -> Result<
+        Vec<harness_contract::evolution::CollaborationExperienceEpisode>,
+        RuntimeServicesError,
+    > {
+        let events = self
+            .event_store
+            .replay_scope_kind(
+                RuntimeEventScope::Evolution,
+                "evolution.collaboration_experience.recorded.v1",
+            )
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+        let mut latest = BTreeMap::new();
+        for event in events {
+            let Some(episode) = event.payload.get("episode").and_then(|value| {
+                serde_json::from_value::<
+                    harness_contract::evolution::CollaborationExperienceEpisode,
+                >(value.clone())
+                .ok()
+            }) else {
+                continue;
+            };
+            latest.insert(episode.episode_id.clone(), episode);
+        }
+        let mut episodes = latest.into_values().collect::<Vec<_>>();
+        episodes.sort_by(|left, right| right.completed_at_ms.cmp(&left.completed_at_ms));
+        episodes.truncate(limit);
+        Ok(episodes)
+    }
+
+    /// Read-only advisory patterns derived from terminal collaboration episodes.
+    /// Runtime never treats this projection as an executable selector.
     pub fn collaboration_semantic_patterns(
         &self,
         limit: usize,
@@ -619,6 +653,28 @@ impl RuntimeServices {
                 episode_ids,
                 aggregate_digest,
             } => {
+                let published_baseline_exists = match &intent.subject {
+                    crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => self
+                        .definition_registry
+                        .agents()
+                        .release_assignments(&revision_ref.definition_id)
+                        .map_err(DefinitionRegistryError::Agent)?
+                        .iter()
+                        .any(harness_contract::agent::ReleaseAssignment::is_active_stable),
+                    crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => self
+                        .definition_registry
+                        .teams()
+                        .release_assignments(&revision_ref.template_id)
+                        .map_err(DefinitionRegistryError::Team)?
+                        .iter()
+                        .any(crate::team_definition::TeamReleaseAssignment::is_active_stable),
+                };
+                if published_baseline_exists {
+                    return Err(RuntimeServicesError::Invariant(
+                        "episode evaluation baseline is forbidden when an active Stable baseline exists"
+                            .to_string(),
+                    ));
+                }
                 let distinct = episode_ids
                     .iter()
                     .collect::<std::collections::BTreeSet<_>>();
@@ -645,6 +701,28 @@ impl RuntimeServices {
                 let requested_ids = episode_ids
                     .iter()
                     .collect::<std::collections::BTreeSet<_>>();
+                let selected_episodes = self
+                    .collaboration_experience_episodes(usize::MAX)?
+                    .into_iter()
+                    .filter(|episode| requested_ids.contains(&episode.episode_id))
+                    .collect::<Vec<_>>();
+                let selected_turns = selected_episodes
+                    .iter()
+                    .map(|episode| episode.turn_ref_hash.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if selected_episodes.len() != requested_ids.len()
+                    || selected_turns.len()
+                        < harness_contract::evolution::MINIMUM_PATTERN_DISTINCT_TURNS
+                    || selected_episodes.iter().any(|episode| {
+                        !episode.is_pattern_eligible()
+                            || episode.semantic_signature.digest() != *semantic_signature_digest
+                    })
+                {
+                    return Err(RuntimeServicesError::Invariant(
+                        "episode evaluation baseline is not backed by eligible episodes from three distinct Turns"
+                            .to_string(),
+                    ));
+                }
                 let pattern_exists = self
                     .collaboration_semantic_patterns(usize::MAX)?
                     .into_iter()

@@ -702,6 +702,9 @@ fn compile_team(
             required_capabilities: canonical_set(&role.required_capabilities),
             required_skills: canonical_set(&role.required_skills),
             required_tools: canonical_set(&role.required_tools),
+            cardinality_min: role.cardinality.min,
+            cardinality_max: role.cardinality.max,
+            acceptance_kinds: canonical_acceptance_kinds(&role.acceptance),
             input_artifacts: canonical_set(&role.input_artifacts),
             output_artifacts: canonical_set(&role.output_artifacts),
         });
@@ -729,7 +732,7 @@ fn compile_team(
             role_display_names: Vec::new(),
             roles,
             dependencies: dependencies_for_template,
-            result_fields,
+            result_fields: result_fields.clone(),
             evidence_required: team.result.evidence_required,
             instructions: if team.instructions.trim().is_empty() {
                 format!("# AI composed team\n\n{}\n", workstream_id)
@@ -751,6 +754,7 @@ fn compile_team(
                     )
                 })
                 .collect(),
+            result_field_shapes: canonical_set(&result_fields),
         },
         resolved_bindings,
     })
@@ -1400,6 +1404,23 @@ fn canonical_tool_refs(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn canonical_acceptance_kinds(values: &[ModelSemanticAcceptanceCriterion]) -> Vec<String> {
+    canonical_set(
+        &values
+            .iter()
+            .map(|criterion| match criterion {
+                ModelSemanticAcceptanceCriterion::Artifact { .. } => "artifact",
+                ModelSemanticAcceptanceCriterion::EvidenceScope { .. } => "evidence_scope",
+                ModelSemanticAcceptanceCriterion::StructuredField { .. } => "structured_field",
+                ModelSemanticAcceptanceCriterion::TerminalFact { .. } => "terminal_fact",
+                ModelSemanticAcceptanceCriterion::CommittedEffect { .. } => "committed_effect",
+                ModelSemanticAcceptanceCriterion::IndependentReview { .. } => "independent_review",
+            })
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn capability_allowed_by_ceiling(ceiling: PermissionMode, capability: &str) -> bool {
     harness_contract::orchestration::model_collaboration_capabilities_for_permission(ceiling)
         .contains(&capability)
@@ -1764,6 +1785,22 @@ mod tests {
                 .display_name
                 .as_deref(),
             Some("任意名称 A")
+        );
+        assert_eq!(
+            compiled.semantic_intent.teams[0].roles[0].cardinality_min,
+            1
+        );
+        assert_eq!(
+            compiled.semantic_intent.teams[0].roles[0].cardinality_max,
+            1
+        );
+        assert_eq!(
+            compiled.semantic_intent.teams[0].roles[0].acceptance_kinds,
+            vec!["artifact", "evidence_scope"]
+        );
+        assert_eq!(
+            compiled.semantic_intent.teams[0].result_field_shapes,
+            vec!["evidence", "summary"]
         );
         let proposal: TeamTemplateProposal =
             serde_json::from_value(compiled.template_proposal["teams"][0]["template"].clone())

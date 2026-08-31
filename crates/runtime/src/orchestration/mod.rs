@@ -239,6 +239,18 @@ async fn submit_runtime_orchestration_request_with_mode(
     submission_mode: OrchestrationSubmissionMode,
 ) -> RuntimeOrchestrationResult {
     let submission_started_at = std::time::Instant::now();
+    if request.execution_policy_digest.is_none() {
+        request.execution_policy_digest = request.session_id.as_deref().and_then(|session_id| {
+            services.session_execution_policy(session_id).map(|policy| {
+                harness_contract::policy::ExecutionPolicyBinding::bind(
+                    session_id,
+                    &policy,
+                    request.constraints.permission_ceiling,
+                )
+                .policy_digest
+            })
+        });
+    }
     if let Some(intent) = request.collaboration_intent.take() {
         let decision_id = intent.decision_id.clone();
         let workstream_count = intent.workstreams.len();

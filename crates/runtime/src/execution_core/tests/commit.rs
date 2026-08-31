@@ -688,6 +688,7 @@ fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
     let mut current = Some(CollaborationProgram {
         program_id: "program-root".to_string(),
         revision: 1,
+        approval_policy_digest: "sha256:policy".to_string(),
         required_team_count: 1,
         team_instances: vec![CollaborationTeamInstance {
             instance_id: "research:1".to_string(),
@@ -720,6 +721,7 @@ fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
                 output_reservation_tokens: 50,
                 parallel_demand: 1,
                 deadline_at_ms: 1000,
+                admitted_at_ms: 1,
                 confidence_basis_points: 10_000,
                 revision: 1,
                 capacity_profile_id: String::new(),
@@ -736,6 +738,7 @@ fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
     let delta = CollaborationProgram {
         program_id: "ignored-delta-id".to_string(),
         revision: 1,
+        approval_policy_digest: "sha256:policy".to_string(),
         required_team_count: 1,
         team_instances: vec![CollaborationTeamInstance {
             instance_id: "review:1".to_string(),
@@ -777,6 +780,7 @@ fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
                 output_reservation_tokens: 30,
                 parallel_demand: 1,
                 deadline_at_ms: 2000,
+                admitted_at_ms: 1,
                 confidence_basis_points: 10_000,
                 revision: 1,
                 capacity_profile_id: String::new(),
@@ -790,6 +794,20 @@ fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
         },
         semantic_intent: None,
     };
+    let mut policy_drift = delta.clone();
+    policy_drift.approval_policy_digest = "sha256:other-policy".to_string();
+    assert!(matches!(
+        merge_collaboration_program(&mut current, Some(policy_drift)),
+        Err(ExecutionCommitError::InvalidReplan(message))
+            if message.contains("immutable approval policy digest")
+    ));
+    assert_eq!(
+        current
+            .as_ref()
+            .expect("current program survives rejected drift")
+            .revision,
+        1
+    );
     merge_collaboration_program(&mut current, Some(delta)).expect("merge additive revision");
     let program = current.expect("program");
     assert_eq!(program.program_id, "program-root");
@@ -871,6 +889,7 @@ fn cross_team_edge_delivery_and_claim_are_fenced_by_node_attempts() {
         collaboration_program: Some(CollaborationProgram {
             program_id: "program-cross-team".to_string(),
             revision: 1,
+            approval_policy_digest: "sha256:policy".to_string(),
             required_team_count: 2,
             team_instances: vec![
                 CollaborationTeamInstance {
@@ -1107,6 +1126,7 @@ fn retirement_cancels_only_a_confirmed_unstarted_team_and_revises_program_atomic
         collaboration_program: Some(CollaborationProgram {
             program_id: "program-retire-team".to_string(),
             revision: 1,
+            approval_policy_digest: "sha256:policy".to_string(),
             required_team_count: 2,
             team_instances: vec![
                 CollaborationTeamInstance {
@@ -1187,6 +1207,7 @@ fn retirement_cancels_only_a_confirmed_unstarted_team_and_revises_program_atomic
             output_reservation_tokens: 25,
             parallel_demand: 2,
             deadline_at_ms: 1,
+            admitted_at_ms: 1,
             confidence_basis_points: 10_000,
             revision: 1,
             capacity_profile_id: String::new(),
@@ -1286,6 +1307,7 @@ fn retirement_cancels_only_a_confirmed_unstarted_team_and_revises_program_atomic
     let replacement_program = CollaborationProgram {
         program_id: "program-retire-team".to_string(),
         revision: 1,
+        approval_policy_digest: "sha256:policy".to_string(),
         required_team_count: 1,
         team_instances: vec![CollaborationTeamInstance {
             instance_id: "replacement:1".to_string(),
@@ -1421,6 +1443,7 @@ fn objective_narrowing_rewrites_only_a_planned_team_request_atomically() {
         collaboration_program: Some(CollaborationProgram {
             program_id: "program-narrow-objective".to_string(),
             revision: 1,
+            approval_policy_digest: "sha256:policy".to_string(),
             required_team_count: 1,
             team_instances: vec![CollaborationTeamInstance {
                 instance_id: "research:1".to_string(),
@@ -1648,6 +1671,7 @@ fn terminal_producer_without_required_cross_team_facts_blocks_edge_durably() {
         collaboration_program: Some(CollaborationProgram {
             program_id: "program-cross-team-blocked".to_string(),
             revision: 1,
+            approval_policy_digest: "sha256:policy".to_string(),
             required_team_count: 2,
             team_instances: vec![
                 CollaborationTeamInstance {

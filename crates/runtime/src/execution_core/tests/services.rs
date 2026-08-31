@@ -35,6 +35,101 @@ impl crate::EvolutionEvalRunner for ReadinessOnlyEvolutionEvalRunner {
     }
 }
 
+fn approved_evolution_proposal(services: &RuntimeServices, suffix: &str) -> String {
+    let signal = services
+        .record_evolution_signal(crate::EvolutionSignal::eval_failure(
+            format!("episode-baseline-{suffix}"),
+            vec![harness_contract::reality::EvidenceRef::observed(
+                "test",
+                format!("episode-baseline-{suffix}"),
+            )],
+        ))
+        .expect("evolution signal");
+    let proposal = services
+        .create_evolution_lifecycle(vec![signal.signal_id])
+        .expect("evolution proposal")
+        .proposal;
+    let principal = crate::security::test_human_interactive_principal();
+    let digest = services
+        .evolution_proposal_decision_digest(&proposal.proposal_id, "approved")
+        .expect("proposal decision digest");
+    let lease = crate::security::test_verified_decision_lease(
+        &format!("evolution-proposal:{}", proposal.proposal_id),
+        "proposal.decision.approved",
+        &format!("evolution.proposal:{}", proposal.proposal_id),
+        &digest,
+    );
+    services
+        .decide_evolution_proposal(&principal, &lease, &proposal.proposal_id, "approved")
+        .expect("proposal approval");
+    proposal.proposal_id
+}
+
+fn episode_baseline_signature() -> harness_contract::evolution::CollaborationSemanticSignature {
+    harness_contract::evolution::CollaborationSemanticSignature {
+        normalizer_revision: 1,
+        workstream_shapes: Vec::new(),
+        dependency_shapes: Vec::new(),
+        required_capability_ids: vec!["read".to_string()],
+        required_skill_ids: Vec::new(),
+        required_tool_capabilities: Vec::new(),
+        acceptance_kinds: vec!["evidence".to_string()],
+        result_field_shapes: vec!["summary".to_string()],
+    }
+    .normalized()
+}
+
+fn append_episode_baseline_fixture(
+    services: &RuntimeServices,
+    program_id: &str,
+    turn_ref_hash: &str,
+) -> String {
+    let episode_id = harness_contract::evolution::CollaborationExperienceEpisode::deterministic_id(
+        program_id, 1,
+    );
+    let episode = harness_contract::evolution::CollaborationExperienceEpisode {
+        schema_version: harness_contract::evolution::COLLABORATION_EXPERIENCE_SCHEMA_VERSION,
+        episode_id: episode_id.clone(),
+        session_ref_hash: "sha256:session".to_string(),
+        turn_ref_hash: turn_ref_hash.to_string(),
+        program_id: program_id.to_string(),
+        program_revision: 1,
+        intent_digest: "sha256:intent".to_string(),
+        binding_digest: "sha256:binding".to_string(),
+        capacity_profile_digest: "sha256:capacity".to_string(),
+        approval_policy_digest: "sha256:approval".to_string(),
+        semantic_signature: episode_baseline_signature(),
+        outcome: harness_contract::evolution::CollaborationExperienceOutcome::Completed,
+        evidence_refs: vec![format!("evidence:sha256:{program_id}")],
+        coverage: harness_contract::evolution::CollaborationEvidenceCoverage {
+            required_obligation_count: 1,
+            satisfied_obligation_count: 1,
+            coverage_basis_points: 10_000,
+            reusable: true,
+        },
+        latency_ms: 1,
+        resource_summary: harness_contract::evolution::CollaborationResourceSummary {
+            parallel_demand: 1,
+            context_reservation_tokens: 1,
+            output_reservation_tokens: 1,
+        },
+        completed_at_ms: 1,
+    };
+    services
+        .event_store()
+        .append(crate::RuntimeEventInput {
+            stream_id: format!("evolution:experience:{episode_id}"),
+            scope: crate::RuntimeEventScope::Evolution,
+            kind: "evolution.collaboration_experience.recorded.v1".to_string(),
+            status: Some("eligible".to_string()),
+            actor: Some("test".to_string()),
+            refs: Vec::new(),
+            payload: serde_json::json!({"episode": episode}),
+        })
+        .expect("episode fixture");
+    episode_id
+}
+
 #[test]
 fn builder_rejects_a_clean_but_unaddressable_build_identity() {
     let invalid = harness_contract::outcome::RuntimeBuildIdentity::new(
@@ -86,6 +181,103 @@ fn in_memory_services_reclaim_their_filesystem_state() {
         !root.exists(),
         "dropping the final RuntimeServices owner must remove {root:?}"
     );
+}
+
+#[test]
+fn episode_baseline_cannot_bypass_an_active_stable_release() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let published = services
+        .agent_runtime()
+        .catalog()
+        .all()
+        .into_iter()
+        .next()
+        .expect("bootstrap catalog has an active Stable Agent");
+    let proposal_id = approved_evolution_proposal(&services, "published-baseline");
+    let signature_digest = episode_baseline_signature().digest();
+    let episode_ids = vec![
+        "experience:one".to_string(),
+        "experience:two".to_string(),
+        "experience:three".to_string(),
+    ];
+    let aggregate_digest = harness_contract::evolution::collaboration_episode_set_digest(
+        &signature_digest,
+        &episode_ids,
+    );
+    let error = services
+        .register_evolution_candidate(crate::EvolutionCandidateIntent {
+            candidate_id: "candidate-episode-stable-bypass".to_string(),
+            proposal_id,
+            subject: crate::EvolutionCandidateSubject::AgentDefinition {
+                revision_ref: published.definition_ref,
+            },
+            evaluation_baseline: crate::EvolutionEvaluationBaseline::EpisodeSet {
+                semantic_signature_digest: signature_digest,
+                episode_ids,
+                aggregate_digest,
+            },
+            source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                "test",
+                "episode-stable-bypass",
+            )],
+            canary_policy: Default::default(),
+        })
+        .expect_err("an EpisodeSet cannot replace an existing Stable baseline");
+    assert!(matches!(
+        error,
+        RuntimeServicesError::Invariant(message)
+            if message.contains("forbidden when an active Stable baseline exists")
+    ));
+}
+
+#[test]
+fn episode_baseline_requires_three_distinct_durable_turns() {
+    let services = RuntimeServices::in_memory().expect("runtime services");
+    let proposal_id = approved_evolution_proposal(&services, "duplicate-turns");
+    let episode_ids = ["one", "two", "three"]
+        .into_iter()
+        .map(|suffix| {
+            append_episode_baseline_fixture(
+                &services,
+                &format!("program-{suffix}"),
+                "sha256:the-same-turn",
+            )
+        })
+        .collect::<Vec<_>>();
+    let signature_digest = episode_baseline_signature().digest();
+    let aggregate_digest = harness_contract::evolution::collaboration_episode_set_digest(
+        &signature_digest,
+        &episode_ids,
+    );
+    let definition_id = AgentDefinitionId::new(
+        DefinitionScope::Workspace,
+        "cowd/episode-without-published-baseline",
+    )
+    .expect("definition id");
+    let revision_ref = harness_contract::agent::AgentDefinitionRevisionRef::new(definition_id, 1)
+        .expect("revision ref");
+    let error = services
+        .register_evolution_candidate(crate::EvolutionCandidateIntent {
+            candidate_id: "candidate-episode-duplicate-turns".to_string(),
+            proposal_id,
+            subject: crate::EvolutionCandidateSubject::AgentDefinition { revision_ref },
+            evaluation_baseline: crate::EvolutionEvaluationBaseline::EpisodeSet {
+                semantic_signature_digest: signature_digest,
+                episode_ids,
+                aggregate_digest,
+            },
+            source_evidence_refs: vec![harness_contract::reality::EvidenceRef::observed(
+                "test",
+                "episode-duplicate-turns",
+            )],
+            canary_policy: Default::default(),
+        })
+        .expect_err("three episode ids from one Turn are not a reusable baseline");
+    assert!(matches!(
+        error,
+        RuntimeServicesError::Invariant(message)
+            if message.contains("eligible episodes from three distinct Turns")
+    ));
 }
 
 #[test]
