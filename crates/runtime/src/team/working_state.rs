@@ -25,6 +25,42 @@ pub enum TeamWorkingStateKind {
     Blocker,
     UserIntervention,
     Artifact,
+    Proposal,
+    Question,
+    Response,
+    Resolution,
+}
+
+/// Bounded discussion metadata layered on the semantic Team event stream.
+/// Message content remains `summary`; this structure provides reply and
+/// resolution causality without storing private reasoning traces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamWorkingStateThread {
+    pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_entry_id: Option<String>,
+    #[serde(default)]
+    pub response_required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolves_entry_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamWorkingStateCursor {
+    pub team_id: String,
+    pub graph_id: String,
+    pub agent_instance_id: String,
+    pub through_revision: u64,
+    pub cursor_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeamWorkingStateAcknowledgeRequest {
+    pub graph_id: String,
+    pub node_id: String,
+    pub through_revision: u64,
+    pub expected_cursor_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -73,6 +109,8 @@ pub struct TeamWorkingStateEntry {
     pub source_generation: u64,
     #[serde(default)]
     pub visibility: TeamWorkingStateVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<TeamWorkingStateThread>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +136,8 @@ pub struct TeamWorkingStatePublishRequest {
     pub artifact_refs: Vec<String>,
     #[serde(default)]
     pub visibility: TeamWorkingStateVisibility,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<TeamWorkingStateThread>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -473,6 +513,7 @@ pub(crate) fn terminal_working_state_event(
             .as_ref()
             .map_or(graph.revision, |metadata| metadata.source_generation),
         visibility: TeamWorkingStateVisibility::Team,
+        thread: None,
     };
     let identity = &packet.assignment.execution_identity;
     let mut event_refs = vec![
@@ -616,6 +657,7 @@ mod tests {
             revision: 1,
             source_generation: 1,
             visibility: TeamWorkingStateVisibility::Team,
+            thread: None,
         }
     }
 

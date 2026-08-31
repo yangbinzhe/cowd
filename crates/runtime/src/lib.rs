@@ -807,8 +807,10 @@ pub use team_projection::{
 pub use team_result_reducer::TeamResultReducer;
 pub use team_runtime::TeamRuntime;
 pub use team_working_state::{
-    FocusOverlapAssessment, TeamWorkingState, TeamWorkingStateEntry, TeamWorkingStateKind,
-    TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest, TeamWorkingStateVisibility,
+    FocusOverlapAssessment, TeamWorkingState, TeamWorkingStateAcknowledgeRequest,
+    TeamWorkingStateCursor, TeamWorkingStateEntry, TeamWorkingStateKind,
+    TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest, TeamWorkingStateThread,
+    TeamWorkingStateVisibility,
 };
 pub use tool_execution_plane::{
     ToolExecutionAdmission, ToolExecutionPlane, ToolExecutionPlaneError, ToolExecutionPlaneStats,

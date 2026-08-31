@@ -39,15 +39,27 @@ pub struct ExecutionNodeProjection {
     pub usage: ExecutionUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<ExecutionWorkProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_state: Option<super::ExecutionWorkRuntimeState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionWorkProjection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_work_id: Option<String>,
     pub role: ExecutionWorkRole,
     pub required: bool,
     pub dependency: ExecutionDependencyPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancellation_group: Option<String>,
+    #[serde(default)]
+    pub eligibility: super::ExecutionWorkEligibility,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_artifact_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_artifact_kinds: Vec<String>,
+    #[serde(default)]
+    pub review_policy: super::ExecutionWorkReviewPolicy,
     pub expected_input_tokens: u64,
     pub expected_output_tokens: u64,
     pub expected_duration_ms: u64,
@@ -57,10 +69,15 @@ pub struct ExecutionWorkProjection {
 impl From<&ExecutionWorkContract> for ExecutionWorkProjection {
     fn from(work: &ExecutionWorkContract) -> Self {
         Self {
+            collaboration_work_id: work.collaboration_work_id.clone(),
             role: work.role,
             required: work.required,
             dependency: work.dependency.clone(),
             cancellation_group: work.cancellation_group.clone(),
+            eligibility: work.eligibility.clone(),
+            input_artifact_refs: work.input_artifact_refs.clone(),
+            output_artifact_kinds: work.output_artifact_kinds.clone(),
+            review_policy: work.review_policy.clone(),
             expected_input_tokens: work.expected_input_tokens,
             expected_output_tokens: work.expected_output_tokens,
             expected_duration_ms: work.expected_duration_ms,
@@ -157,6 +174,10 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                         .unwrap_or_default(),
                     usage: result.map(|value| value.usage.clone()).unwrap_or_default(),
                     work: node.work.as_ref().map(ExecutionWorkProjection::from),
+                    work_state: node
+                        .work
+                        .as_ref()
+                        .map(|_| graph.work_states.get(&node.id).cloned().unwrap_or_default()),
                 }
             })
             .collect(),

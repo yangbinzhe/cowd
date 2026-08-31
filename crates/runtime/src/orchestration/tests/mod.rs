@@ -1333,6 +1333,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         refs: vec!["evidence:test:v621".to_string()],
         artifact_refs: vec!["artifact:test:v621".to_string()],
         visibility: crate::TeamWorkingStateVisibility::Team,
+        thread: None,
     };
     let committed = services
         .team_runtime()
@@ -1378,17 +1379,87 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .expect("read after committed revision");
     assert!(after.entries.is_empty());
 
+    let question = services
+        .team_runtime()
+        .publish_working_state(crate::TeamWorkingStatePublishRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[0].clone(),
+            expected_revision: 1,
+            kind: crate::TeamWorkingStateKind::Question,
+            summary: "Can the peer independently verify source coverage?".to_string(),
+            refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            visibility: crate::TeamWorkingStateVisibility::Team,
+            thread: Some(crate::TeamWorkingStateThread {
+                thread_id: "coverage-review".to_string(),
+                reply_to_entry_id: None,
+                response_required: true,
+                resolves_entry_ids: Vec::new(),
+            }),
+        })
+        .await
+        .expect("publish question");
+    let question_id = question
+        .entries
+        .iter()
+        .find(|entry| entry.kind == crate::TeamWorkingStateKind::Question)
+        .expect("question entry")
+        .entry_id
+        .clone();
+    services
+        .team_runtime()
+        .publish_working_state(crate::TeamWorkingStatePublishRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[1].clone(),
+            expected_revision: 2,
+            kind: crate::TeamWorkingStateKind::Response,
+            summary: "Peer coverage check completed against the durable evidence.".to_string(),
+            refs: vec!["evidence:test:v621".to_string()],
+            artifact_refs: Vec::new(),
+            visibility: crate::TeamWorkingStateVisibility::Team,
+            thread: Some(crate::TeamWorkingStateThread {
+                thread_id: "coverage-review".to_string(),
+                reply_to_entry_id: Some(question_id),
+                response_required: false,
+                resolves_entry_ids: Vec::new(),
+            }),
+        })
+        .await
+        .expect("peer response");
+    let unread = services
+        .team_runtime()
+        .read_working_state_from_cursor(registered.id.clone(), agent_nodes[1].clone())
+        .expect("offline peer replays committed inbox");
+    assert_eq!(unread.entries.len(), 3);
+    let cursor = services
+        .team_runtime()
+        .acknowledge_working_state(crate::TeamWorkingStateAcknowledgeRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[1].clone(),
+            through_revision: unread.board_revision,
+            expected_cursor_revision: 0,
+        })
+        .expect("advance durable peer cursor");
+    assert_eq!(cursor.through_revision, 3);
+    assert!(services
+        .team_runtime()
+        .read_working_state_from_cursor(registered.id.clone(), agent_nodes[1].clone())
+        .expect("cursor suppresses acknowledged messages")
+        .entries
+        .is_empty());
+
     let private_reasoning = services
         .team_runtime()
         .publish_working_state(crate::TeamWorkingStatePublishRequest {
             graph_id: registered.id,
             node_id: agent_nodes[0].clone(),
-            expected_revision: 1,
+            expected_revision: 3,
             kind: crate::TeamWorkingStateKind::Finding,
             summary: "raw chain-of-thought must remain private".to_string(),
             refs: Vec::new(),
             artifact_refs: Vec::new(),
             visibility: crate::TeamWorkingStateVisibility::Private,
+            thread: None,
         })
         .await
         .expect_err("private reasoning trace must be rejected");

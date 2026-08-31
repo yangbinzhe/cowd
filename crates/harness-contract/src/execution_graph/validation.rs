@@ -28,6 +28,12 @@ pub enum ExecutionGraphValidationError {
     InvalidDependencyPolicy { node_id: String, reason: String },
     #[error("optional execution node `{node_id}` may own a critical or mutating effect")]
     OptionalEffectOwner { node_id: String },
+    #[error("execution node `{node_id}` has invalid work contract: {reason}")]
+    InvalidWorkContract { node_id: String, reason: String },
+    #[error("duplicate collaboration work id `{0}`")]
+    DuplicateWorkId(String),
+    #[error("work runtime state references missing or non-work node `{0}`")]
+    InvalidWorkStateNode(String),
 }
 
 pub fn validate_execution_graph(
@@ -37,6 +43,7 @@ pub fn validate_execution_graph(
         return Err(ExecutionGraphValidationError::EmptyObjective);
     }
     let mut ids = BTreeSet::new();
+    let mut work_ids = BTreeSet::new();
     for node in &graph.nodes {
         if !ids.insert(node.id.clone()) {
             return Err(ExecutionGraphValidationError::DuplicateNode(
@@ -55,6 +62,60 @@ pub fn validate_execution_graph(
         }
         if node.kind == ExecutionNodeKind::Timer {
             return Err(ExecutionGraphValidationError::TimerUnavailable);
+        }
+        if let Some(work) = &node.work {
+            if let Some(work_id) = &work.collaboration_work_id {
+                if work_id.trim().is_empty() {
+                    return Err(ExecutionGraphValidationError::InvalidWorkContract {
+                        node_id: node.id.clone(),
+                        reason: "collaboration_work_id is empty".to_string(),
+                    });
+                }
+                if !work_ids.insert(work_id.clone()) {
+                    return Err(ExecutionGraphValidationError::DuplicateWorkId(
+                        work_id.clone(),
+                    ));
+                }
+            }
+            let invalid_value = work
+                .eligibility
+                .allowed_agent_instance_ids
+                .iter()
+                .chain(work.eligibility.allowed_role_ids.iter())
+                .chain(work.eligibility.required_capabilities.iter())
+                .chain(work.input_artifact_refs.iter())
+                .chain(work.output_artifact_kinds.iter())
+                .any(|value| value.trim().is_empty());
+            if invalid_value {
+                return Err(ExecutionGraphValidationError::InvalidWorkContract {
+                    node_id: node.id.clone(),
+                    reason: "eligibility and artifact contract values must be non-empty"
+                        .to_string(),
+                });
+            }
+            if matches!(
+                work.review_policy,
+                super::ExecutionWorkReviewPolicy::Peer {
+                    minimum_reviewers: 0,
+                    ..
+                }
+            ) {
+                return Err(ExecutionGraphValidationError::InvalidWorkContract {
+                    node_id: node.id.clone(),
+                    reason: "peer review requires at least one reviewer".to_string(),
+                });
+            }
+        }
+    }
+    for node_id in graph.work_states.keys() {
+        if !graph
+            .nodes
+            .iter()
+            .any(|node| node.id == *node_id && node.work.is_some())
+        {
+            return Err(ExecutionGraphValidationError::InvalidWorkStateNode(
+                node_id.clone(),
+            ));
         }
     }
     if let Some(orchestration) = &graph.orchestration {

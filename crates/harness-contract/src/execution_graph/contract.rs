@@ -34,6 +34,72 @@ pub enum ExecutionWorkRole {
     Verify,
 }
 
+/// Runtime-verifiable eligibility for an offered work item. Empty lists mean
+/// no additional restriction at that dimension; identity is still attested
+/// by the Runtime control port before a command reaches the graph owner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionWorkEligibility {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_agent_instance_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_role_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecutionWorkReviewPolicy {
+    #[default]
+    None,
+    Peer {
+        minimum_reviewers: u16,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        eligible_role_ids: Vec<String>,
+    },
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionWorkRuntimeStatus {
+    #[default]
+    Offered,
+    Claimed,
+    Submitted,
+    Accepted,
+    Challenged,
+}
+
+/// Fenced ownership receipt. The token changes after expiry/reclaim so a late
+/// worker can never submit, release, or heartbeat somebody else's lease.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionWorkClaim {
+    pub claimant_instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant_role_id: Option<String>,
+    pub claim_token: String,
+    pub claimed_at_ms: u64,
+    pub heartbeat_at_ms: u64,
+    pub lease_expires_at_ms: u64,
+    pub graph_revision: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionWorkRuntimeState {
+    #[serde(default)]
+    pub status: ExecutionWorkRuntimeStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ExecutionWorkClaim>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub review_findings: Vec<String>,
+    #[serde(default)]
+    pub revision: u64,
+}
+
 /// A typed dependency predicate. It consumes only Runtime-attested terminal
 /// facts; it must not degrade into a presentation boolean or an arbitrary
 /// evidence count.
@@ -98,6 +164,10 @@ impl ExecutionDependencyPolicy {
 /// evidence stay behind governed Runtime ports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionWorkContract {
+    /// Stable collaboration-level identity. Node id remains the physical graph
+    /// identity and is used when this optional semantic id is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_work_id: Option<String>,
     pub role: ExecutionWorkRole,
     #[serde(default = "default_required_work")]
     pub required: bool,
@@ -107,6 +177,14 @@ pub struct ExecutionWorkContract {
     pub cancellation_group: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub eligibility: ExecutionWorkEligibility,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_artifact_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_artifact_kinds: Vec<String>,
+    #[serde(default)]
+    pub review_policy: ExecutionWorkReviewPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_view_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,11 +211,16 @@ impl ExecutionWorkContract {
     #[must_use]
     pub fn new(role: ExecutionWorkRole) -> Self {
         Self {
+            collaboration_work_id: None,
             role,
             required: true,
             dependency: ExecutionDependencyPolicy::All,
             cancellation_group: None,
             required_evidence_refs: Vec::new(),
+            eligibility: ExecutionWorkEligibility::default(),
+            input_artifact_refs: Vec::new(),
+            output_artifact_kinds: Vec::new(),
+            review_policy: ExecutionWorkReviewPolicy::None,
             context_view_ref: None,
             model_profile: None,
             reasoning_effort: None,
@@ -1575,6 +1658,10 @@ pub struct ExecutionGraph {
     pub edges: Vec<ExecutionEdge>,
     pub node_statuses: BTreeMap<String, ExecutionNodeStatus>,
     pub node_results: BTreeMap<String, ExecutionNodeResult>,
+    /// Mutable marketplace state keyed by physical node id. Missing entries
+    /// in legacy graphs decode as implicit `offered` for nodes with work.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub work_states: BTreeMap<String, ExecutionWorkRuntimeState>,
     pub recovery_cursor: ExecutionRecoveryCursor,
     /// Durable fact packet produced by the Runtime finally reducer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1600,6 +1687,7 @@ impl ExecutionGraph {
             edges: Vec::new(),
             node_statuses: BTreeMap::new(),
             node_results: BTreeMap::new(),
+            work_states: BTreeMap::new(),
             recovery_cursor: ExecutionRecoveryCursor::default(),
             delivery_envelope: None,
             terminal_presentation: None,
@@ -1637,6 +1725,51 @@ pub enum ExecutionGraphCommand {
         expected_revision: u64,
         node_id: String,
         reason: String,
+    },
+    OfferWork {
+        expected_revision: u64,
+        node_id: String,
+    },
+    ClaimWork {
+        expected_revision: u64,
+        node_id: String,
+        claimant_instance_id: String,
+        claimant_role_id: Option<String>,
+        #[serde(default)]
+        claimant_capabilities: Vec<String>,
+        claimed_at_ms: u64,
+        lease_expires_at_ms: u64,
+    },
+    HeartbeatWork {
+        expected_revision: u64,
+        node_id: String,
+        claim_token: String,
+        heartbeat_at_ms: u64,
+        lease_expires_at_ms: u64,
+    },
+    ReleaseWork {
+        expected_revision: u64,
+        node_id: String,
+        claim_token: String,
+        reason: String,
+    },
+    SubmitWork {
+        expected_revision: u64,
+        node_id: String,
+        claim_token: String,
+        submitted_at_ms: u64,
+        submission_ref: String,
+    },
+    AcceptWork {
+        expected_revision: u64,
+        node_id: String,
+        reviewer_instance_id: String,
+    },
+    ChallengeWork {
+        expected_revision: u64,
+        node_id: String,
+        reviewer_instance_id: String,
+        finding: String,
     },
     SubmitApproval {
         expected_revision: u64,

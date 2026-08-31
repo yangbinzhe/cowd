@@ -19,7 +19,8 @@ use crate::{
     RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeExecutionSupervisor,
     RuntimeTransactionEventInput, TaskRuntimePort, TeamInstantiation, TeamProjection,
     TeamProjectionCursor, TeamProjectionPage, TeamProjectionReader, TeamWorkingState,
-    TeamWorkingStateEntry, TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest,
+    TeamWorkingStateAcknowledgeRequest, TeamWorkingStateCursor, TeamWorkingStateEntry,
+    TeamWorkingStateKind, TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest,
     TeamWorkingStateVisibility,
 };
 
@@ -718,6 +719,41 @@ impl TeamRuntime {
                 request.expected_revision
             ));
         }
+        if let Some(thread) = &request.thread {
+            if thread.thread_id.trim().is_empty() {
+                return Err("team discussion thread id is empty".to_string());
+            }
+            let current = self.working_state_for_graph(team_id, &request.graph_id)?;
+            if thread.reply_to_entry_id.as_ref().is_some_and(|entry_id| {
+                !current.entries.iter().any(|entry| {
+                    entry.entry_id == *entry_id
+                        && entry
+                            .thread
+                            .as_ref()
+                            .is_some_and(|parent| parent.thread_id == thread.thread_id)
+                })
+            }) {
+                return Err(
+                    "team discussion reply target is missing or belongs to another thread"
+                        .to_string(),
+                );
+            }
+            if thread.resolves_entry_ids.iter().any(|entry_id| {
+                !current
+                    .entries
+                    .iter()
+                    .any(|entry| entry.entry_id == *entry_id)
+            }) {
+                return Err("team discussion resolution references a missing entry".to_string());
+            }
+            if request.kind == TeamWorkingStateKind::Resolution
+                && thread.resolves_entry_ids.is_empty()
+            {
+                return Err(
+                    "team discussion resolution must resolve at least one entry".to_string()
+                );
+            }
+        }
         let mut refs = request
             .refs
             .into_iter()
@@ -761,6 +797,7 @@ impl TeamRuntime {
                 .as_ref()
                 .map_or(graph.revision, |metadata| metadata.source_generation),
             visibility: request.visibility,
+            thread: request.thread,
         };
         self.event_store
             .append_transaction(AppendTransactionRequest {
@@ -853,6 +890,134 @@ impl TeamRuntime {
                     .is_none_or(|revision| entry.revision == revision)
         });
         Ok(state)
+    }
+
+    /// Read from the caller's durable inbox cursor. Offline/non-running peers
+    /// replay the same committed semantic messages when they next reach a
+    /// safe Runtime checkpoint; no process-local mailbox is involved.
+    pub fn read_working_state_from_cursor(
+        &self,
+        graph_id: String,
+        node_id: String,
+    ) -> Result<TeamWorkingState, String> {
+        let cursor = self.working_state_cursor(&graph_id, &node_id)?;
+        self.read_working_state(TeamWorkingStateReadRequest {
+            graph_id,
+            node_id,
+            after_revision: Some(cursor.through_revision),
+            exact_revision: None,
+        })
+    }
+
+    pub fn working_state_cursor(
+        &self,
+        graph_id: &str,
+        node_id: &str,
+    ) -> Result<TeamWorkingStateCursor, String> {
+        let (_, packet) = self.bound_team_packet(graph_id, node_id)?;
+        let team_id = packet
+            .team_id()
+            .ok_or_else(|| "team cursor requires a Team-bound Agent".to_string())?;
+        let instance_id = packet
+            .binding
+            .as_ref()
+            .ok_or_else(|| "team cursor requires an immutable Agent Binding".to_string())?
+            .instance
+            .instance_id
+            .clone();
+        let stream_id = format!("team-working-state-cursor:{team_id}:{instance_id}");
+        let events = self
+            .event_store
+            .list_stream(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let mut cursor = events
+            .last()
+            .and_then(|event| {
+                serde_json::from_value::<TeamWorkingStateCursor>(event.payload.clone()).ok()
+            })
+            .unwrap_or(TeamWorkingStateCursor {
+                team_id: team_id.to_string(),
+                graph_id: graph_id.to_string(),
+                agent_instance_id: instance_id,
+                through_revision: 0,
+                cursor_revision: 0,
+            });
+        cursor.cursor_revision = events.last().map_or(0, |event| event.sequence);
+        Ok(cursor)
+    }
+
+    pub fn acknowledge_working_state(
+        &self,
+        request: TeamWorkingStateAcknowledgeRequest,
+    ) -> Result<TeamWorkingStateCursor, String> {
+        let (_, packet) = self.bound_team_packet(&request.graph_id, &request.node_id)?;
+        let team_id = packet
+            .team_id()
+            .ok_or_else(|| "team cursor requires a Team-bound Agent".to_string())?;
+        let binding = packet
+            .binding
+            .as_ref()
+            .ok_or_else(|| "team cursor requires an immutable Agent Binding".to_string())?;
+        let current = self.working_state_cursor(&request.graph_id, &request.node_id)?;
+        let board = self.working_state_for_graph(team_id, &request.graph_id)?;
+        if current.cursor_revision != request.expected_cursor_revision {
+            return Err(format!(
+                "team cursor revision mismatch: expected {}, actual {}",
+                request.expected_cursor_revision, current.cursor_revision
+            ));
+        }
+        if request.through_revision < current.through_revision
+            || request.through_revision > board.board_revision
+        {
+            return Err(format!(
+                "team cursor must advance monotonically within board revision {}",
+                board.board_revision
+            ));
+        }
+        let stream_id = format!(
+            "team-working-state-cursor:{team_id}:{}",
+            binding.instance.instance_id
+        );
+        let cursor = TeamWorkingStateCursor {
+            team_id: team_id.to_string(),
+            graph_id: request.graph_id.clone(),
+            agent_instance_id: binding.instance.instance_id.clone(),
+            through_revision: request.through_revision,
+            cursor_revision: current.cursor_revision.saturating_add(1),
+        };
+        self.event_store
+            .append_transaction(AppendTransactionRequest {
+                transaction_id: format!(
+                    "team-cursor:{}:{}:{}",
+                    team_id, binding.instance.instance_id, request.through_revision
+                ),
+                expected_streams: vec![ExpectedStreamRevision {
+                    stream_id: stream_id.clone(),
+                    expected_revision: current.cursor_revision,
+                }],
+                events: vec![RuntimeTransactionEventInput {
+                    event: RuntimeEventInput {
+                        stream_id,
+                        scope: RuntimeEventScope::Team,
+                        kind: "team.working_state.cursor_advanced.v1".to_string(),
+                        status: Some("committed".to_string()),
+                        actor: Some(binding.instance.instance_id.clone()),
+                        refs: vec![RuntimeEventRef {
+                            kind: "execution_graph".to_string(),
+                            id: request.graph_id,
+                        }],
+                        payload: serde_json::to_value(&cursor)
+                            .map_err(|error| error.to_string())?,
+                    },
+                    idempotency_key: Some(format!(
+                        "team-cursor:{}:{}:{}",
+                        team_id, binding.instance.instance_id, request.through_revision
+                    )),
+                    schema_version: 1,
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(cursor)
     }
 
     fn bound_team_packet(

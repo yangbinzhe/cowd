@@ -597,6 +597,22 @@ fn semantic_replan_is_revision_checked_idempotent_and_atomic() {
         },
     );
     let registered = service.register_graph(graph).expect("register graph").graph;
+
+    assert!(matches!(
+        service.apply_command(
+            &registered,
+            &ExecutionGraphCommand::ClaimWork {
+                expected_revision: registered.revision,
+                node_id: "agent-node".to_string(),
+                claimant_instance_id: "ineligible".to_string(),
+                claimant_role_id: Some("writer".to_string()),
+                claimant_capabilities: Vec::new(),
+                claimed_at_ms: 90,
+                lease_expires_at_ms: 190,
+            }
+        ),
+        Err(ExecutionCommitError::InvalidCommand(_))
+    ));
     let mut added =
         ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "bounded-payload");
     added.id = "agent-node-2".to_string();
@@ -1932,4 +1948,262 @@ fn typed_child_receipt_fails_closed_for_wrong_attempt_child_or_correlation() {
         ),
         Err(ExecutionCommitError::InvalidCommand(_))
     ));
+}
+
+#[test]
+fn work_marketplace_claims_are_cas_fenced_lease_bound_and_replayable() {
+    use harness_contract::execution_graph::{
+        ExecutionGraphCommand, ExecutionWorkContract, ExecutionWorkEligibility, ExecutionWorkRole,
+        ExecutionWorkRuntimeStatus,
+    };
+
+    let store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("store"));
+    let service = ExecutionCommitService::new(Arc::clone(&store));
+    let mut graph = agent_task_graph();
+    graph.nodes[0].work = Some(ExecutionWorkContract {
+        collaboration_work_id: Some("research:evidence-lane".to_string()),
+        eligibility: ExecutionWorkEligibility {
+            allowed_role_ids: vec!["researcher".to_string()],
+            required_capabilities: vec!["web_research".to_string()],
+            ..Default::default()
+        },
+        output_artifact_kinds: vec!["research_note".to_string()],
+        ..ExecutionWorkContract::new(ExecutionWorkRole::EvidenceAnalyze)
+    });
+    let registered = service.register_graph(graph).expect("register graph").graph;
+
+    let claim_a = service
+        .apply_command(
+            &registered,
+            &ExecutionGraphCommand::ClaimWork {
+                expected_revision: registered.revision,
+                node_id: "agent-node".to_string(),
+                claimant_instance_id: "agent-a".to_string(),
+                claimant_role_id: Some("researcher".to_string()),
+                claimant_capabilities: vec!["web_research".to_string()],
+                claimed_at_ms: 100,
+                lease_expires_at_ms: 200,
+            },
+        )
+        .expect("eligible claimant owns offered work")
+        .graph;
+    let token_a = claim_a.work_states["agent-node"]
+        .claim
+        .as_ref()
+        .expect("claim")
+        .claim_token
+        .clone();
+    assert!(matches!(
+        service.apply_command(
+            &claim_a,
+            &ExecutionGraphCommand::HeartbeatWork {
+                expected_revision: claim_a.revision,
+                node_id: "agent-node".to_string(),
+                claim_token: "forged".to_string(),
+                heartbeat_at_ms: 120,
+                lease_expires_at_ms: 220,
+            }
+        ),
+        Err(ExecutionCommitError::InvalidCommand(_))
+    ));
+
+    let concurrent_claim = service.apply_command(
+        &registered,
+        &ExecutionGraphCommand::ClaimWork {
+            expected_revision: registered.revision,
+            node_id: "agent-node".to_string(),
+            claimant_instance_id: "agent-b".to_string(),
+            claimant_role_id: Some("researcher".to_string()),
+            claimant_capabilities: vec!["web_research".to_string()],
+            claimed_at_ms: 110,
+            lease_expires_at_ms: 210,
+        },
+    );
+    assert!(matches!(
+        concurrent_claim,
+        Err(ExecutionCommitError::StaleRevision { .. }) | Err(ExecutionCommitError::EventStore(_))
+    ));
+    let after_race = super::super::state_store::ExecutionGraphStateStore::new(Arc::clone(&store))
+        .load(&registered.id)
+        .expect("load winning claim");
+    assert_eq!(
+        after_race.work_states["agent-node"]
+            .claim
+            .as_ref()
+            .expect("winning claim")
+            .claimant_instance_id,
+        "agent-a"
+    );
+    assert!(matches!(
+        service.apply_command(
+            &claim_a,
+            &ExecutionGraphCommand::ClaimWork {
+                expected_revision: claim_a.revision,
+                node_id: "agent-node".to_string(),
+                claimant_instance_id: "agent-b".to_string(),
+                claimant_role_id: Some("researcher".to_string()),
+                claimant_capabilities: vec!["web_research".to_string()],
+                claimed_at_ms: 150,
+                lease_expires_at_ms: 250,
+            }
+        ),
+        Err(ExecutionCommitError::InvalidCommand(_))
+    ));
+
+    let claim_b = service
+        .apply_command(
+            &claim_a,
+            &ExecutionGraphCommand::ClaimWork {
+                expected_revision: claim_a.revision,
+                node_id: "agent-node".to_string(),
+                claimant_instance_id: "agent-b".to_string(),
+                claimant_role_id: Some("researcher".to_string()),
+                claimant_capabilities: vec!["web_research".to_string()],
+                claimed_at_ms: 200,
+                lease_expires_at_ms: 300,
+            },
+        )
+        .expect("expired claim can be reclaimed")
+        .graph;
+    let token_b = claim_b.work_states["agent-node"]
+        .claim
+        .as_ref()
+        .expect("claim")
+        .claim_token
+        .clone();
+    assert_ne!(token_a, token_b);
+    assert!(matches!(
+        service.apply_command(
+            &claim_b,
+            &ExecutionGraphCommand::ReleaseWork {
+                expected_revision: claim_b.revision,
+                node_id: "agent-node".to_string(),
+                claim_token: token_a,
+                reason: "late worker".to_string(),
+            }
+        ),
+        Err(ExecutionCommitError::InvalidCommand(_))
+    ));
+
+    let submitted = service
+        .apply_command(
+            &claim_b,
+            &ExecutionGraphCommand::SubmitWork {
+                expected_revision: claim_b.revision,
+                node_id: "agent-node".to_string(),
+                claim_token: token_b,
+                submitted_at_ms: 250,
+                submission_ref: "artifact://research-note".to_string(),
+            },
+        )
+        .expect("lease owner submits")
+        .graph;
+    assert!(matches!(
+        service.apply_command(
+            &submitted,
+            &ExecutionGraphCommand::AcceptWork {
+                expected_revision: submitted.revision,
+                node_id: "agent-node".to_string(),
+                reviewer_instance_id: "agent-b".to_string(),
+            }
+        ),
+        Err(ExecutionCommitError::InvalidCommand(_))
+    ));
+    let challenged = service
+        .apply_command(
+            &submitted,
+            &ExecutionGraphCommand::ChallengeWork {
+                expected_revision: submitted.revision,
+                node_id: "agent-node".to_string(),
+                reviewer_instance_id: "reviewer".to_string(),
+                finding: "source coverage is incomplete".to_string(),
+            },
+        )
+        .expect("independent reviewer challenges")
+        .graph;
+    assert_eq!(
+        challenged.work_states["agent-node"].status,
+        ExecutionWorkRuntimeStatus::Challenged
+    );
+
+    let claim_c = service
+        .apply_command(
+            &challenged,
+            &ExecutionGraphCommand::ClaimWork {
+                expected_revision: challenged.revision,
+                node_id: "agent-node".to_string(),
+                claimant_instance_id: "agent-c".to_string(),
+                claimant_role_id: Some("researcher".to_string()),
+                claimant_capabilities: vec!["web_research".to_string()],
+                claimed_at_ms: 310,
+                lease_expires_at_ms: 410,
+            },
+        )
+        .expect("challenged work returns to marketplace")
+        .graph;
+    let token_c = claim_c.work_states["agent-node"]
+        .claim
+        .as_ref()
+        .expect("claim")
+        .claim_token
+        .clone();
+    let resubmitted = service
+        .apply_command(
+            &claim_c,
+            &ExecutionGraphCommand::SubmitWork {
+                expected_revision: claim_c.revision,
+                node_id: "agent-node".to_string(),
+                claim_token: token_c,
+                submitted_at_ms: 350,
+                submission_ref: "artifact://research-note-v2".to_string(),
+            },
+        )
+        .expect("reworked submission")
+        .graph;
+    let accepted = service
+        .apply_command(
+            &resubmitted,
+            &ExecutionGraphCommand::AcceptWork {
+                expected_revision: resubmitted.revision,
+                node_id: "agent-node".to_string(),
+                reviewer_instance_id: "reviewer".to_string(),
+            },
+        )
+        .expect("independent acceptance")
+        .graph;
+    assert_eq!(
+        accepted.work_states["agent-node"].status,
+        ExecutionWorkRuntimeStatus::Accepted
+    );
+
+    let replayed = super::super::state_store::ExecutionGraphStateStore::new(store)
+        .load(&accepted.id)
+        .expect("replay graph");
+    assert_eq!(replayed.work_states, accepted.work_states);
+}
+
+#[test]
+fn legacy_graph_without_work_runtime_state_decodes_as_implicit_offer() {
+    let mut graph = agent_task_graph();
+    graph.nodes[0].work = Some(
+        harness_contract::execution_graph::ExecutionWorkContract::new(
+            harness_contract::execution_graph::ExecutionWorkRole::EvidenceAnalyze,
+        ),
+    );
+    let mut encoded = serde_json::to_value(graph).expect("encode graph");
+    encoded
+        .as_object_mut()
+        .expect("graph object")
+        .remove("work_states");
+    let decoded: ExecutionGraph = serde_json::from_value(encoded).expect("legacy graph decodes");
+    assert!(decoded.work_states.is_empty());
+    let projection = harness_contract::execution_graph::project_execution_graph(&decoded);
+    assert_eq!(
+        projection.nodes[0]
+            .work_state
+            .as_ref()
+            .expect("implicit offer")
+            .status,
+        harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Offered
+    );
 }

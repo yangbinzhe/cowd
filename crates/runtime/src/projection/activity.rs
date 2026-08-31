@@ -1918,6 +1918,7 @@ mod tests {
                 ..ExecutionUsage::default()
             },
             work: None,
+            work_state: None,
         };
         let effect = effect_summary(&node).expect("effect summary");
         assert_eq!(effect.applied, 1);
@@ -1949,15 +1950,21 @@ mod tests {
             evidence_refs: Vec::new(),
             usage: Default::default(),
             work: Some(harness_contract::execution_graph::ExecutionWorkProjection {
+                collaboration_work_id: None,
                 role: harness_contract::execution_graph::ExecutionWorkRole::Verify,
                 required,
                 dependency: Default::default(),
                 cancellation_group: None,
+                eligibility: Default::default(),
+                input_artifact_refs: Vec::new(),
+                output_artifact_kinds: Vec::new(),
+                review_policy: Default::default(),
                 expected_input_tokens: 0,
                 expected_output_tokens: 0,
                 expected_duration_ms: 0,
                 scheduling_priority: 0,
             }),
+            work_state: Some(Default::default()),
         }
     }
 

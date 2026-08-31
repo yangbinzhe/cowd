@@ -151,6 +151,7 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 edges: Vec::new(),
                 node_statuses: BTreeMap::new(),
                 node_results: BTreeMap::new(),
+                work_states: BTreeMap::new(),
                 recovery_cursor: ExecutionRecoveryCursor::default(),
             },
             role_nodes: BTreeMap::new(),

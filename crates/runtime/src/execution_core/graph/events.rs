@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use harness_contract::execution_graph::{
     ExecutionEdge, ExecutionGraph, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
     ExecutionOrchestrationMetadata, ExecutionParentBinding, ExecutionRecoveryCursor,
-    ExecutionServiceClass,
+    ExecutionServiceClass, ExecutionWorkRuntimeState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +52,10 @@ pub struct ExecutionGraphDelta {
     pub node_result_updates: BTreeMap<String, ExecutionNodeResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_node_results: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub work_state_updates: BTreeMap<String, ExecutionWorkRuntimeState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_work_states: Vec<String>,
     pub recovery_cursor: ExecutionRecoveryCursor,
 }
 
@@ -126,6 +130,18 @@ impl ExecutionGraphDelta {
                 .filter(|id| !next.node_results.contains_key(*id))
                 .cloned()
                 .collect(),
+            work_state_updates: next
+                .work_states
+                .iter()
+                .filter(|(id, state)| previous.work_states.get(*id) != Some(*state))
+                .map(|(id, state)| (id.clone(), state.clone()))
+                .collect(),
+            removed_work_states: previous
+                .work_states
+                .keys()
+                .filter(|id| !next.work_states.contains_key(*id))
+                .cloned()
+                .collect(),
             recovery_cursor: next.recovery_cursor.clone(),
         }
     }
@@ -182,6 +198,10 @@ impl ExecutionGraphDelta {
             graph.node_results.remove(id);
         }
         graph.node_results.extend(self.node_result_updates.clone());
+        for id in &self.removed_work_states {
+            graph.work_states.remove(id);
+        }
+        graph.work_states.extend(self.work_state_updates.clone());
         graph.recovery_cursor = self.recovery_cursor.clone();
         graph.revision = self.revision;
         Ok(())
@@ -234,6 +254,12 @@ impl ExecutionGraphDelta {
                     .iter()
                     .map(String::len)
                     .sum::<usize>(),
+            )
+            .saturating_add(
+                self.removed_work_states
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>(),
             );
         for node in &self.added_nodes {
             bytes = bytes
@@ -271,6 +297,19 @@ impl ExecutionGraphDelta {
                 bytes = bytes
                     .saturating_add(failure.kind.len())
                     .saturating_add(failure.message.len());
+            }
+        }
+        for (node_id, state) in &self.work_state_updates {
+            bytes = bytes
+                .saturating_add(node_id.len())
+                .saturating_add(std::mem::size_of_val(state))
+                .saturating_add(state.submission_ref.as_ref().map_or(0, String::len))
+                .saturating_add(state.review_findings.iter().map(String::len).sum::<usize>());
+            if let Some(claim) = &state.claim {
+                bytes = bytes
+                    .saturating_add(claim.claimant_instance_id.len())
+                    .saturating_add(claim.claimant_role_id.as_ref().map_or(0, String::len))
+                    .saturating_add(claim.claim_token.len());
             }
         }
         u64::try_from(bytes).unwrap_or(u64::MAX)

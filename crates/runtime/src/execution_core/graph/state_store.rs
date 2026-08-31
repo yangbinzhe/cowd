@@ -353,6 +353,10 @@ impl ExecutionGraphStateStore {
                             .work
                             .as_ref()
                             .map(harness_contract::execution_graph::ExecutionWorkProjection::from),
+                        work_state: node
+                            .work
+                            .as_ref()
+                            .map(|_| graph.work_states.get(&node.id).cloned().unwrap_or_default()),
                     }
                 })
                 .collect(),

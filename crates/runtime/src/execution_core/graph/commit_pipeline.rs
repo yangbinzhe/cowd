@@ -648,6 +648,27 @@ pub(super) fn command_revision(command: &ExecutionGraphCommand) -> u64 {
         | ExecutionGraphCommand::CancelNode {
             expected_revision, ..
         }
+        | ExecutionGraphCommand::OfferWork {
+            expected_revision, ..
+        }
+        | ExecutionGraphCommand::ClaimWork {
+            expected_revision, ..
+        }
+        | ExecutionGraphCommand::HeartbeatWork {
+            expected_revision, ..
+        }
+        | ExecutionGraphCommand::ReleaseWork {
+            expected_revision, ..
+        }
+        | ExecutionGraphCommand::SubmitWork {
+            expected_revision, ..
+        }
+        | ExecutionGraphCommand::AcceptWork {
+            expected_revision, ..
+        }
+        | ExecutionGraphCommand::ChallengeWork {
+            expected_revision, ..
+        }
         | ExecutionGraphCommand::SubmitApproval {
             expected_revision, ..
         }
@@ -692,6 +713,13 @@ pub(super) fn command_metadata(command: &ExecutionGraphCommand) -> (&'static str
         ExecutionGraphCommand::Resume { .. } => ("resume", None),
         ExecutionGraphCommand::Cancel { reason, .. } => ("cancel", Some(reason)),
         ExecutionGraphCommand::CancelNode { reason, .. } => ("cancel_node", Some(reason)),
+        ExecutionGraphCommand::OfferWork { .. } => ("offer_work", None),
+        ExecutionGraphCommand::ClaimWork { .. } => ("claim_work", None),
+        ExecutionGraphCommand::HeartbeatWork { .. } => ("heartbeat_work", None),
+        ExecutionGraphCommand::ReleaseWork { reason, .. } => ("release_work", Some(reason)),
+        ExecutionGraphCommand::SubmitWork { .. } => ("submit_work", None),
+        ExecutionGraphCommand::AcceptWork { .. } => ("accept_work", None),
+        ExecutionGraphCommand::ChallengeWork { finding, .. } => ("challenge_work", Some(finding)),
         ExecutionGraphCommand::SubmitApproval { .. } => ("submit_approval", None),
         ExecutionGraphCommand::ResolveExternal { .. } => ("resolve_external", None),
         ExecutionGraphCommand::ResolveChildExecution { .. } => ("resolve_child_execution", None),

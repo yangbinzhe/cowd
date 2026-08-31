@@ -5,7 +5,8 @@ use harness_contract::agent::AgentTaskPacket;
 use harness_contract::execution_graph::{
     apply_node_transition, validate_execution_graph, ExecutionEdge, ExecutionGraph,
     ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec,
-    ExecutionNodeStatus, ExecutionTransitionError,
+    ExecutionNodeStatus, ExecutionTransitionError, ExecutionWorkClaim, ExecutionWorkRuntimeState,
+    ExecutionWorkRuntimeStatus,
 };
 use harness_contract::tool::{ToolEffectDescriptor, ToolEffectKind, ToolIdempotency};
 use serde_json::json;
@@ -96,6 +97,121 @@ pub struct DurableAgentToolReceipt {
     pub effect_kind: ToolEffectKind,
     pub authorized_scopes: Vec<String>,
     pub outcome: crate::RuntimeToolExecutionOutcome,
+}
+
+fn work_contract<'a>(
+    graph: &'a ExecutionGraph,
+    node_id: &str,
+) -> Result<&'a harness_contract::execution_graph::ExecutionWorkContract, ExecutionCommitError> {
+    graph
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .and_then(|node| node.work.as_ref())
+        .ok_or_else(|| {
+            ExecutionCommitError::InvalidCommand(format!(
+                "work node `{node_id}` does not exist or has no work contract"
+            ))
+        })
+}
+
+fn validate_work_claimant(
+    node_id: &str,
+    work: &harness_contract::execution_graph::ExecutionWorkContract,
+    claimant_instance_id: &str,
+    claimant_role_id: Option<&str>,
+    claimant_capabilities: &[String],
+) -> Result<(), ExecutionCommitError> {
+    if claimant_instance_id.trim().is_empty() {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "work `{node_id}` claimant identity is empty"
+        )));
+    }
+    if !work.eligibility.allowed_agent_instance_ids.is_empty()
+        && !work
+            .eligibility
+            .allowed_agent_instance_ids
+            .iter()
+            .any(|id| id == claimant_instance_id)
+    {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "claimant `{claimant_instance_id}` is not eligible for work `{node_id}`"
+        )));
+    }
+    if !work.eligibility.allowed_role_ids.is_empty()
+        && claimant_role_id.is_none_or(|role| {
+            !work
+                .eligibility
+                .allowed_role_ids
+                .iter()
+                .any(|allowed| allowed == role)
+        })
+    {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "claimant role is not eligible for work `{node_id}`"
+        )));
+    }
+    if work
+        .eligibility
+        .required_capabilities
+        .iter()
+        .any(|required| {
+            !claimant_capabilities
+                .iter()
+                .any(|actual| actual == required)
+        })
+    {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "claimant lacks a required capability for work `{node_id}`"
+        )));
+    }
+    Ok(())
+}
+
+fn claimed_work_state_mut<'a>(
+    graph: &'a mut ExecutionGraph,
+    node_id: &str,
+    claim_token: &str,
+) -> Result<&'a mut ExecutionWorkRuntimeState, ExecutionCommitError> {
+    let state = graph.work_states.get_mut(node_id).ok_or_else(|| {
+        ExecutionCommitError::InvalidCommand(format!("work `{node_id}` has no runtime state"))
+    })?;
+    if state.status != ExecutionWorkRuntimeStatus::Claimed
+        || state
+            .claim
+            .as_ref()
+            .is_none_or(|claim| claim.claim_token != claim_token)
+    {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "work `{node_id}` claim token is stale or does not own the current lease"
+        )));
+    }
+    Ok(state)
+}
+
+fn validate_reviewer(
+    graph: &ExecutionGraph,
+    node_id: &str,
+    reviewer_instance_id: &str,
+) -> Result<(), ExecutionCommitError> {
+    if reviewer_instance_id.trim().is_empty() {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "work `{node_id}` reviewer identity is empty"
+        )));
+    }
+    let state = graph.work_states.get(node_id).ok_or_else(|| {
+        ExecutionCommitError::InvalidCommand(format!("work `{node_id}` has no runtime state"))
+    })?;
+    if state
+        .claim
+        .as_ref()
+        .is_some_and(|claim| claim.claimant_instance_id == reviewer_instance_id)
+    {
+        return Err(ExecutionCommitError::InvalidCommand(format!(
+            "work `{node_id}` claimant cannot review its own submission"
+        )));
+    }
+    Ok(())
 }
 
 /// Merge an additive semantic revision into the graph-owned collaboration
@@ -1343,6 +1459,179 @@ impl ExecutionCommitService {
                 if !status.is_terminal() {
                     *status = ExecutionNodeStatus::Cancelled;
                 }
+            }
+            ExecutionGraphCommand::OfferWork { node_id, .. } => {
+                work_contract(&next, node_id)?;
+                if next.work_states.contains_key(node_id) {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` is already offered"
+                    )));
+                }
+                next.work_states
+                    .insert(node_id.clone(), ExecutionWorkRuntimeState::default());
+            }
+            ExecutionGraphCommand::ClaimWork {
+                node_id,
+                claimant_instance_id,
+                claimant_role_id,
+                claimant_capabilities,
+                claimed_at_ms,
+                lease_expires_at_ms,
+                ..
+            } => {
+                let contract = work_contract(&next, node_id)?.clone();
+                validate_work_claimant(
+                    node_id,
+                    &contract,
+                    claimant_instance_id,
+                    claimant_role_id.as_deref(),
+                    claimant_capabilities,
+                )?;
+                if *lease_expires_at_ms <= *claimed_at_ms {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` claim lease must expire after claim time"
+                    )));
+                }
+                let state = next.work_states.entry(node_id.clone()).or_default();
+                let reclaimable = match state.status {
+                    ExecutionWorkRuntimeStatus::Offered
+                    | ExecutionWorkRuntimeStatus::Challenged => true,
+                    ExecutionWorkRuntimeStatus::Claimed => state
+                        .claim
+                        .as_ref()
+                        .is_some_and(|claim| claim.lease_expires_at_ms <= *claimed_at_ms),
+                    ExecutionWorkRuntimeStatus::Submitted
+                    | ExecutionWorkRuntimeStatus::Accepted => false,
+                };
+                if !reclaimable {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` is not claimable from {:?}",
+                        state.status
+                    )));
+                }
+                let token_seed = format!(
+                    "{}:{node_id}:{}:{claimant_instance_id}:{claimed_at_ms}:{lease_expires_at_ms}",
+                    graph.id,
+                    graph.revision.saturating_add(1)
+                );
+                let claim_token = format!("{:x}", Sha256::digest(token_seed.as_bytes()));
+                state.status = ExecutionWorkRuntimeStatus::Claimed;
+                state.claim = Some(ExecutionWorkClaim {
+                    claimant_instance_id: claimant_instance_id.clone(),
+                    claimant_role_id: claimant_role_id.clone(),
+                    claim_token,
+                    claimed_at_ms: *claimed_at_ms,
+                    heartbeat_at_ms: *claimed_at_ms,
+                    lease_expires_at_ms: *lease_expires_at_ms,
+                    graph_revision: graph.revision.saturating_add(1),
+                });
+                state.submission_ref = None;
+                state.revision = state.revision.saturating_add(1);
+            }
+            ExecutionGraphCommand::HeartbeatWork {
+                node_id,
+                claim_token,
+                heartbeat_at_ms,
+                lease_expires_at_ms,
+                ..
+            } => {
+                let state = claimed_work_state_mut(&mut next, node_id, claim_token)?;
+                let claim = state.claim.as_mut().expect("claimed state has claim");
+                if *heartbeat_at_ms > claim.lease_expires_at_ms
+                    || *heartbeat_at_ms < claim.heartbeat_at_ms
+                    || *lease_expires_at_ms <= *heartbeat_at_ms
+                    || *lease_expires_at_ms < claim.lease_expires_at_ms
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` heartbeat has an expired or non-monotonic lease"
+                    )));
+                }
+                claim.heartbeat_at_ms = *heartbeat_at_ms;
+                claim.lease_expires_at_ms = *lease_expires_at_ms;
+                state.revision = state.revision.saturating_add(1);
+            }
+            ExecutionGraphCommand::ReleaseWork {
+                node_id,
+                claim_token,
+                ..
+            } => {
+                let state = claimed_work_state_mut(&mut next, node_id, claim_token)?;
+                state.status = ExecutionWorkRuntimeStatus::Offered;
+                state.claim = None;
+                state.submission_ref = None;
+                state.revision = state.revision.saturating_add(1);
+            }
+            ExecutionGraphCommand::SubmitWork {
+                node_id,
+                claim_token,
+                submitted_at_ms,
+                submission_ref,
+                ..
+            } => {
+                if submission_ref.trim().is_empty() {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` submission reference is empty"
+                    )));
+                }
+                let state = claimed_work_state_mut(&mut next, node_id, claim_token)?;
+                let claim = state.claim.as_ref().expect("claimed state has claim");
+                if *submitted_at_ms < claim.claimed_at_ms
+                    || *submitted_at_ms > claim.lease_expires_at_ms
+                {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` submission is outside its fenced lease"
+                    )));
+                }
+                state.status = ExecutionWorkRuntimeStatus::Submitted;
+                state.submission_ref = Some(submission_ref.clone());
+                state.revision = state.revision.saturating_add(1);
+            }
+            ExecutionGraphCommand::AcceptWork {
+                node_id,
+                reviewer_instance_id,
+                ..
+            } => {
+                validate_reviewer(&next, node_id, reviewer_instance_id)?;
+                let state = next.work_states.get_mut(node_id).ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` has no runtime state"
+                    ))
+                })?;
+                if state.status != ExecutionWorkRuntimeStatus::Submitted {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` can only be accepted after submission"
+                    )));
+                }
+                state.status = ExecutionWorkRuntimeStatus::Accepted;
+                state.revision = state.revision.saturating_add(1);
+            }
+            ExecutionGraphCommand::ChallengeWork {
+                node_id,
+                reviewer_instance_id,
+                finding,
+                ..
+            } => {
+                validate_reviewer(&next, node_id, reviewer_instance_id)?;
+                let finding = finding.trim();
+                if finding.is_empty() || finding.chars().count() > 4_000 {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` challenge must contain 1..4000 characters"
+                    )));
+                }
+                let state = next.work_states.get_mut(node_id).ok_or_else(|| {
+                    ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` has no runtime state"
+                    ))
+                })?;
+                if state.status != ExecutionWorkRuntimeStatus::Submitted {
+                    return Err(ExecutionCommitError::InvalidCommand(format!(
+                        "work `{node_id}` can only be challenged after submission"
+                    )));
+                }
+                state.status = ExecutionWorkRuntimeStatus::Challenged;
+                state.claim = None;
+                state.review_findings.push(finding.to_string());
+                state.revision = state.revision.saturating_add(1);
             }
             ExecutionGraphCommand::Start { .. } => {}
             ExecutionGraphCommand::SubmitApproval {
