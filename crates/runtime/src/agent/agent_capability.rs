@@ -43,6 +43,9 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
     // The board is an internal, binding-scoped semantic exchange. Runtime
     // rejects callers that are not Team Agent nodes.
     allowed_tools.insert("team_board".to_string());
+    // Bounded graph work discovery and mutation are attested by the current
+    // immutable Agent Binding; no identity field is accepted from the model.
+    allowed_tools.insert("collaboration_control".to_string());
     // A managed Team Agent may request (but never create) one bounded
     // escalation through its already-bound parent Collaboration Program.
     // The tool attests the caller and derives all runtime fences, so exposing

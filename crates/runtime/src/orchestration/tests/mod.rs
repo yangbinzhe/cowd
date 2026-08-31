@@ -1287,7 +1287,20 @@ fn failed_team_requirement_projects_a_typed_program_diagnostic() {
 async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
     let services = RuntimeServices::in_memory().expect("runtime services");
     ensure_test_mission(&services);
-    let team = parallel_research_team("team", Vec::new());
+    let mut team = parallel_research_team("team", Vec::new());
+    let synthesis_focus = team.focuses.pop().expect("synthesis focus");
+    team.focuses = (0..4)
+        .map(|index| SemanticFocus {
+            focus_id: format!("team-research-{index}"),
+            role_id: "researcher".to_string(),
+            objective: format!("collect independent bounded source evidence lane {index}"),
+            resource_scopes: Vec::new(),
+            evidence_responsibilities: vec![format!("source evidence lane {index}")],
+            output_contract: Vec::new(),
+            output_acceptance: Vec::new(),
+        })
+        .chain(std::iter::once(synthesis_focus))
+        .collect();
     let mut request = proposal(vec![team]);
     request.strategy_binding = Some(harness_contract::team::TeamStrategyBinding {
         decision_id: "decision-v621".to_string(),
@@ -1323,7 +1336,58 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
         .map(|node| node.id.clone())
         .collect::<Vec<_>>();
-    assert!(agent_nodes.len() >= 2);
+    assert!(agent_nodes.len() >= 5);
+    let claim_request = |node_id: String| crate::CollaborationControlRequest {
+        graph_id: registered.id.clone(),
+        node_id: node_id.clone(),
+        operation: crate::CollaborationControlOperation::Claim,
+        expected_revision: Some(registered.revision),
+        expected_work_revision: Some(0),
+        work_node_id: Some(node_id),
+        claim_token: None,
+        lease_duration_ms: Some(60_000),
+        submission_ref: None,
+        finding: None,
+    };
+    let (claim_0, claim_1, claim_2, claim_3) = tokio::join!(
+        services
+            .team_runtime()
+            .apply_collaboration_control(claim_request(agent_nodes[0].clone())),
+        services
+            .team_runtime()
+            .apply_collaboration_control(claim_request(agent_nodes[1].clone())),
+        services
+            .team_runtime()
+            .apply_collaboration_control(claim_request(agent_nodes[2].clone())),
+        services
+            .team_runtime()
+            .apply_collaboration_control(claim_request(agent_nodes[3].clone())),
+    );
+    assert!(claim_0.is_ok(), "first claim: {claim_0:?}");
+    assert!(claim_1.is_ok(), "second claim: {claim_1:?}");
+    assert!(claim_2.is_ok(), "third claim: {claim_2:?}");
+    assert!(claim_3.is_ok(), "fourth claim: {claim_3:?}");
+    let claimed_graph = services
+        .graph_state_store()
+        .load(&registered.id)
+        .expect("claimed Team graph");
+    assert_eq!(
+        claimed_graph
+            .work_states
+            .values()
+            .filter(|state| {
+                state.status
+                    == harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Claimed
+            })
+            .count(),
+        4
+    );
+    let stale_work = services
+        .team_runtime()
+        .apply_collaboration_control(claim_request(agent_nodes[0].clone()))
+        .await
+        .expect_err("stale per-work revision must be rejected");
+    assert!(stale_work.contains("work revision mismatch"));
     let publish = crate::TeamWorkingStatePublishRequest {
         graph_id: registered.id.clone(),
         node_id: agent_nodes[0].clone(),

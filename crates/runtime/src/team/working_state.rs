@@ -63,6 +63,43 @@ pub struct TeamWorkingStateAcknowledgeRequest {
     pub expected_cursor_revision: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationControlOperation {
+    Inspect,
+    Claim,
+    Heartbeat,
+    Release,
+    Submit,
+    Accept,
+    Challenge,
+}
+
+/// Semantic Agent request. Graph/team/claimant/reviewer authority is never
+/// accepted from this payload; TeamRuntime derives it from `graph_id/node_id`
+/// and the immutable AgentTaskPacket Binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollaborationControlRequest {
+    pub graph_id: String,
+    pub node_id: String,
+    pub operation: CollaborationControlOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_work_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finding: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamWorkingStateVisibility {
@@ -511,7 +548,9 @@ pub(crate) fn terminal_working_state_event(
         source_generation: graph
             .orchestration
             .as_ref()
-            .map_or(graph.revision, |metadata| metadata.source_generation),
+            .map(|metadata| metadata.source_generation)
+            .or_else(|| graph.lineage.as_ref().map(|lineage| lineage.generation))
+            .unwrap_or(1),
         visibility: TeamWorkingStateVisibility::Team,
         thread: None,
     };

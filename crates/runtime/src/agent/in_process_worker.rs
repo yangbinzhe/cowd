@@ -405,16 +405,83 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // refs below remain the capability ceiling; this worker never scans
         // package directories or falls back to an empty production profile.
         let skill_catalog = services.skill_catalog();
+        // Claim the exact assigned work at the Runtime safe checkpoint before
+        // provider execution. Independent nodes use per-work CAS and retry
+        // unrelated graph-stream contention, so a large Team does not spend
+        // an extra provider round bidding or serialize on a stale root rev.
+        if packet.team_id().is_some() {
+            let graph = services
+                .graph_state_store()
+                .load(packet.graph_id())
+                .map_err(|error| format!("load Team work marketplace: {error}"))?;
+            if graph
+                .nodes
+                .iter()
+                .any(|node| node.id == packet.node_id() && node.work.is_some())
+            {
+                let state = graph.work_states.get(packet.node_id());
+                let already_owned =
+                    state
+                        .and_then(|state| state.claim.as_ref())
+                        .is_some_and(|claim| {
+                            claim.claimant_instance_id == binding.instance.instance_id
+                        });
+                if !already_owned
+                    && state.is_none_or(|state| {
+                        matches!(
+                            state.status,
+                            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Offered
+                                | harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged
+                        )
+                    })
+                {
+                    services
+                        .team_runtime()
+                        .apply_collaboration_control(crate::CollaborationControlRequest {
+                            graph_id: packet.graph_id().to_string(),
+                            node_id: packet.node_id().to_string(),
+                            operation: crate::CollaborationControlOperation::Claim,
+                            expected_revision: Some(graph.revision),
+                            expected_work_revision: Some(
+                                state.map_or(0, |state| state.revision),
+                            ),
+                            work_node_id: Some(packet.node_id().to_string()),
+                            claim_token: None,
+                            lease_duration_ms: Some(300_000),
+                            submission_ref: None,
+                            finding: None,
+                        })
+                        .await
+                        .map_err(|error| format!("claim assigned Team work: {error}"))?;
+                }
+            }
+        }
         let external_context_items = if binding.data_lease.team_working_state_visible {
-            services
+            let unread = services
                 .team_runtime()
-                .read_working_state(crate::TeamWorkingStateReadRequest {
-                    graph_id: packet.graph_id().to_string(),
-                    node_id: packet.node_id().to_string(),
-                    after_revision: None,
-                    exact_revision: None,
-                })
-                .ok()
+                .read_working_state_from_cursor(
+                    packet.graph_id().to_string(),
+                    packet.node_id().to_string(),
+                )
+                .ok();
+            let cursor = services
+                .team_runtime()
+                .working_state_cursor(packet.graph_id(), packet.node_id())
+                .ok();
+            if let (Some(state), Some(cursor)) = (unread.as_ref(), cursor) {
+                if state.board_revision > cursor.through_revision {
+                    services
+                        .team_runtime()
+                        .acknowledge_working_state(crate::TeamWorkingStateAcknowledgeRequest {
+                            graph_id: packet.graph_id().to_string(),
+                            node_id: packet.node_id().to_string(),
+                            through_revision: state.board_revision,
+                            expected_cursor_revision: cursor.cursor_revision,
+                        })
+                        .map_err(|error| format!("advance Team inbox cursor: {error}"))?;
+                }
+            }
+            unread
                 .filter(|state| !state.entries.is_empty())
                 .map(|state| {
                     let team_id = state.team_id.clone();
@@ -1322,7 +1389,10 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         // "has no ToolHost implementation adapter".
         if matches!(
             tool_name,
-            "team_board" | "evidence_retrieve" | "request_collaboration_escalation"
+            "team_board"
+                | "collaboration_control"
+                | "evidence_retrieve"
+                | "request_collaboration_escalation"
         ) {
             if !self.allowed_tools.contains(tool_name) {
                 return Err(ToolError::new(
@@ -1392,7 +1462,10 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
         if tool_name == "checkpoint_create"
             || matches!(
                 tool_name,
-                "team_board" | "evidence_retrieve" | "request_collaboration_escalation"
+                "team_board"
+                    | "collaboration_control"
+                    | "evidence_retrieve"
+                    | "request_collaboration_escalation"
             )
         {
             return self

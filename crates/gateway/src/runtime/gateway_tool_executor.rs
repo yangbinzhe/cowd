@@ -181,6 +181,21 @@ struct TeamBoardToolRequest {
     visibility: runtime::TeamWorkingStateVisibility,
     after_revision: Option<u64>,
     exact_revision: Option<u64>,
+    #[serde(default)]
+    thread: Option<runtime::TeamWorkingStateThread>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CollaborationControlToolRequest {
+    operation: runtime::CollaborationControlOperation,
+    expected_revision: Option<u64>,
+    expected_work_revision: Option<u64>,
+    work_node_id: Option<String>,
+    claim_token: Option<String>,
+    lease_duration_ms: Option<u64>,
+    submission_ref: Option<String>,
+    finding: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +272,7 @@ fn is_gateway_runtime_control_tool(tool_name: &str) -> bool {
             | "runtime_orchestrate"
             | "submit_collaboration_decision"
             | "request_collaboration_escalation"
+            | "collaboration_control"
             | "mcp_tool"
             | "list_mcp_resources_tool"
             | "read_mcp_resource_tool"
@@ -661,6 +677,7 @@ impl GatewayToolExecutor {
                             refs: input.refs,
                             artifact_refs: input.artifact_refs,
                             visibility: input.visibility,
+                            thread: input.thread,
                         })
                         .await
                 }
@@ -678,6 +695,36 @@ impl GatewayToolExecutor {
             }
             .map_err(ToolError::new)?;
             return serde_json::to_string_pretty(&state)
+                .map_err(|error| ToolError::new(error.to_string()));
+        }
+        if tool_name == "collaboration_control" {
+            let input: CollaborationControlToolRequest = serde_json::from_value(value)
+                .map_err(|error| self.input_contract_error(tool_name, error))?;
+            let parent = binding.parent_execution.ok_or_else(|| {
+                ToolError::new(
+                    "collaboration_control requires an immutable managed Agent parent binding",
+                )
+            })?;
+            let services = self.runtime_services.get().cloned().ok_or_else(|| {
+                ToolError::new("collaboration_control requires the workspace RuntimeServices")
+            })?;
+            let receipt = services
+                .team_runtime()
+                .apply_collaboration_control(runtime::CollaborationControlRequest {
+                    graph_id: parent.execution_id.clone(),
+                    node_id: parent.node_id.clone(),
+                    operation: input.operation,
+                    expected_revision: input.expected_revision,
+                    expected_work_revision: input.expected_work_revision,
+                    work_node_id: input.work_node_id,
+                    claim_token: input.claim_token,
+                    lease_duration_ms: input.lease_duration_ms,
+                    submission_ref: input.submission_ref,
+                    finding: input.finding,
+                })
+                .await
+                .map_err(ToolError::new)?;
+            return serde_json::to_string_pretty(&receipt)
                 .map_err(|error| ToolError::new(error.to_string()));
         }
         if tool_name == "evidence_retrieve" {
@@ -1705,7 +1752,11 @@ impl GatewayToolExecutor {
             .available_tool_names()
             .into_iter()
             .filter(|name| {
-                !is_gateway_runtime_control_tool(name) || name == "request_collaboration_escalation"
+                !is_gateway_runtime_control_tool(name)
+                    || matches!(
+                        name.as_str(),
+                        "request_collaboration_escalation" | "collaboration_control" | "team_board"
+                    )
             })
             .filter(|name| self.tool_permission_mode(name) == Some(ToolPermissionMode::ReadOnly))
             .collect::<Vec<_>>();
@@ -3066,6 +3117,28 @@ mod tests {
         assert!(!orchestration_tool_protocol_failed(Admitted, "blocked"));
         assert!(!orchestration_tool_protocol_failed(Admitted, "failed"));
         assert!(!orchestration_tool_protocol_failed(Inspection, "inspected"));
+    }
+
+    #[test]
+    fn collaboration_control_rejects_model_supplied_identity_and_scope() {
+        let valid = serde_json::from_value::<CollaborationControlToolRequest>(json!({
+            "operation": "claim",
+            "expected_revision": 7,
+            "expected_work_revision": 0,
+            "work_node_id": "work-a",
+            "lease_duration_ms": 60000
+        }))
+        .expect("semantic control payload");
+        assert_eq!(valid.expected_work_revision, Some(0));
+
+        for forbidden in ["agent_instance_id", "role_id", "team_id", "graph_id"] {
+            let mut payload = json!({"operation":"inspect"});
+            payload[forbidden] = json!("forged");
+            assert!(
+                serde_json::from_value::<CollaborationControlToolRequest>(payload).is_err(),
+                "model supplied `{forbidden}` must fail closed"
+            );
+        }
     }
 
     #[test]

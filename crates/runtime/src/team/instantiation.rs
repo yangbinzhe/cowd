@@ -781,6 +781,25 @@ impl TeamInstantiationService {
                 node.acceptance.criteria = packet.acceptance.clone();
                 node.acceptance.required = packet.required_acceptance.clone();
                 node.resource_scopes = packet.resource_scopes.clone();
+                node.work = Some(harness_contract::execution_graph::ExecutionWorkContract {
+                    collaboration_work_id: Some(format!(
+                        "{}:{}:{}",
+                        request.team_id, role.role_id, focus_partition.focus_id
+                    )),
+                    eligibility: harness_contract::execution_graph::ExecutionWorkEligibility {
+                        allowed_agent_instance_ids: vec![agent_binding
+                            .instance
+                            .instance_id
+                            .clone()],
+                        allowed_role_ids: vec![role.role_id.clone()],
+                        required_capabilities: Vec::new(),
+                    },
+                    input_artifact_refs: request.upstream_artifact_refs.clone(),
+                    output_artifact_kinds: focus_partition.output_contract.clone(),
+                    ..harness_contract::execution_graph::ExecutionWorkContract::new(
+                        harness_contract::execution_graph::ExecutionWorkRole::EvidenceAnalyze,
+                    )
+                });
                 graph.nodes.push(node);
                 slots_by_role
                     .entry(role.role_id.clone())
@@ -2013,6 +2032,8 @@ fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<Stri
             // and Team exchange do not widen a resource lease.
             "context_retrieve"
             | "tool_search"
+            | "team_board"
+            | "collaboration_control"
             | "evidence_retrieve"
             | "request_collaboration_escalation" => true,
             // Capability expansion must add an explicit resource classification
@@ -2099,6 +2120,7 @@ mod acceptance_contract_tests {
             "write_file".to_string(),
             "context_retrieve".to_string(),
             "team_board".to_string(),
+            "collaboration_control".to_string(),
             "evidence_retrieve".to_string(),
         ];
         let cropped = crop_tools_to_resource_lease(&tools, &["network:*".to_string()]);
@@ -2108,6 +2130,8 @@ mod acceptance_contract_tests {
                 "web_search".to_string(),
                 "web_fetch".to_string(),
                 "context_retrieve".to_string(),
+                "team_board".to_string(),
+                "collaboration_control".to_string(),
                 "evidence_retrieve".to_string(),
             ]
         );
@@ -2152,11 +2176,17 @@ mod acceptance_contract_tests {
             "glob_search".to_string(),
             "grep_search".to_string(),
             "team_board".to_string(),
+            "collaboration_control".to_string(),
             "evidence_retrieve".to_string(),
         ];
         assert_eq!(
             crop_tools_to_resource_lease(&tools, &["read:crates/runtime/Cargo.toml".to_string()]),
-            vec!["read_file".to_string(), "evidence_retrieve".to_string()]
+            vec![
+                "read_file".to_string(),
+                "team_board".to_string(),
+                "collaboration_control".to_string(),
+                "evidence_retrieve".to_string()
+            ]
         );
     }
 

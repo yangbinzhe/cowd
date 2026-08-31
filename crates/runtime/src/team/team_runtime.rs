@@ -13,15 +13,16 @@ use harness_contract::{
 
 use crate::execution_core::ExecutionStateStoreError;
 use crate::{
-    AgentRuntime, AppendTransactionRequest, EvolutionGovernanceService, ExecutionGraphHostReceipt,
-    ExecutionGraphStateStore, ExpectedStreamRevision, LegacyTeamImportReport,
-    LegacyTeamProfileMigrationReport, MissionRuntime, RuntimeDefinitionRegistry, RuntimeEventInput,
-    RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, RuntimeExecutionSupervisor,
-    RuntimeTransactionEventInput, TaskRuntimePort, TeamInstantiation, TeamProjection,
-    TeamProjectionCursor, TeamProjectionPage, TeamProjectionReader, TeamWorkingState,
-    TeamWorkingStateAcknowledgeRequest, TeamWorkingStateCursor, TeamWorkingStateEntry,
-    TeamWorkingStateKind, TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest,
-    TeamWorkingStateVisibility,
+    AgentRuntime, AppendTransactionRequest, CollaborationControlOperation,
+    CollaborationControlRequest, EvolutionGovernanceService, ExecutionGraphHost,
+    ExecutionGraphHostReceipt, ExecutionGraphStateStore, ExpectedStreamRevision,
+    LegacyTeamImportReport, LegacyTeamProfileMigrationReport, MissionRuntime,
+    RuntimeDefinitionRegistry, RuntimeEventInput, RuntimeEventRef, RuntimeEventScope,
+    RuntimeEventStore, RuntimeExecutionSupervisor, RuntimeTransactionEventInput, TaskRuntimePort,
+    TeamInstantiation, TeamProjection, TeamProjectionCursor, TeamProjectionPage,
+    TeamProjectionReader, TeamWorkingState, TeamWorkingStateAcknowledgeRequest,
+    TeamWorkingStateCursor, TeamWorkingStateEntry, TeamWorkingStateKind,
+    TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest, TeamWorkingStateVisibility,
 };
 
 pub struct TeamRuntime {
@@ -624,6 +625,201 @@ impl TeamRuntime {
         self.projection.project(graph_id)
     }
 
+    /// Binding-attested Agent autonomy facade. The model supplies only a
+    /// semantic operation and revision/token fence; Runtime derives identity,
+    /// role, capabilities and current time from the canonical Team packet.
+    pub async fn apply_collaboration_control(
+        &self,
+        request: CollaborationControlRequest,
+    ) -> Result<serde_json::Value, String> {
+        let (graph, packet) = self.bound_team_packet(&request.graph_id, &request.node_id)?;
+        let binding = packet.binding.as_ref().ok_or_else(|| {
+            "collaboration control requires an immutable Agent Binding".to_string()
+        })?;
+        let role_id = packet
+            .team_role_assignment()
+            .map(|role| role.identity.role_id.clone());
+        if request.operation == CollaborationControlOperation::Inspect {
+            return self
+                .execution
+                .graph_projection(&graph.id)
+                .await
+                .map(|projection| {
+                    serde_json::json!({
+                        "operation": "inspect",
+                        "attested_agent_instance_id": binding.instance.instance_id,
+                        "graph": projection,
+                    })
+                })
+                .map_err(|error| error.to_string());
+        }
+        let expected_work_revision = request.expected_work_revision.ok_or_else(|| {
+            "collaboration control mutation requires expected_work_revision".to_string()
+        })?;
+        let work_node_id = request
+            .work_node_id
+            .unwrap_or_else(|| request.node_id.clone());
+        if !graph.nodes.iter().any(|node| node.id == work_node_id) {
+            return Err(format!(
+                "collaboration control work node `{work_node_id}` is outside Team graph `{}`",
+                graph.id
+            ));
+        }
+        let mut receipt = None;
+        // Unrelated work items share one durable graph stream. Retry only when
+        // that stream advanced while this exact work item's semantic revision
+        // remained unchanged. This preserves stale-work rejection and makes
+        // independent claims work-conserving instead of globally conflicting.
+        for _ in 0..16 {
+            let current = self
+                .graphs
+                .load_async(graph.id.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            if request
+                .expected_revision
+                .is_some_and(|hint| hint > current.revision)
+            {
+                return Err(format!(
+                    "collaboration control graph revision {} is ahead of current {}",
+                    request.expected_revision.unwrap_or_default(),
+                    current.revision
+                ));
+            }
+            let observed_work_revision = current
+                .work_states
+                .get(&work_node_id)
+                .map_or(0, |state| state.revision);
+            if observed_work_revision != expected_work_revision {
+                return Err(format!(
+                    "collaboration work revision mismatch for `{work_node_id}`: expected {expected_work_revision}, actual {observed_work_revision}"
+                ));
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let command = match request.operation {
+                CollaborationControlOperation::Inspect => unreachable!(),
+                CollaborationControlOperation::Claim => {
+                    let lease_duration_ms = request.lease_duration_ms.unwrap_or(60_000);
+                    if !(5_000..=300_000).contains(&lease_duration_ms) {
+                        return Err(
+                            "collaboration claim lease_duration_ms must be within 5000..300000"
+                                .to_string(),
+                        );
+                    }
+                    harness_contract::execution_graph::ExecutionGraphCommand::ClaimWork {
+                        expected_revision: current.revision,
+                        node_id: work_node_id.clone(),
+                        claimant_instance_id: binding.instance.instance_id.clone(),
+                        claimant_role_id: role_id.clone(),
+                        claimant_capabilities: packet.allowed_tools.clone(),
+                        claimed_at_ms: now_ms,
+                        lease_expires_at_ms: now_ms.saturating_add(lease_duration_ms),
+                    }
+                }
+                CollaborationControlOperation::Heartbeat => {
+                    let lease_duration_ms = request.lease_duration_ms.unwrap_or(60_000);
+                    if !(5_000..=300_000).contains(&lease_duration_ms) {
+                        return Err(
+                            "collaboration heartbeat lease_duration_ms must be within 5000..300000"
+                                .to_string(),
+                        );
+                    }
+                    harness_contract::execution_graph::ExecutionGraphCommand::HeartbeatWork {
+                        expected_revision: current.revision,
+                        node_id: work_node_id.clone(),
+                        claim_token: request.claim_token.clone().ok_or_else(|| {
+                            "collaboration heartbeat requires claim_token".to_string()
+                        })?,
+                        heartbeat_at_ms: now_ms,
+                        lease_expires_at_ms: now_ms.saturating_add(lease_duration_ms),
+                    }
+                }
+                CollaborationControlOperation::Release => {
+                    harness_contract::execution_graph::ExecutionGraphCommand::ReleaseWork {
+                        expected_revision: current.revision,
+                        node_id: work_node_id.clone(),
+                        claim_token: request.claim_token.clone().ok_or_else(|| {
+                            "collaboration release requires claim_token".to_string()
+                        })?,
+                        reason: request
+                            .finding
+                            .clone()
+                            .unwrap_or_else(|| "released by Agent".to_string()),
+                    }
+                }
+                CollaborationControlOperation::Submit => {
+                    harness_contract::execution_graph::ExecutionGraphCommand::SubmitWork {
+                        expected_revision: current.revision,
+                        node_id: work_node_id.clone(),
+                        claim_token: request.claim_token.clone().ok_or_else(|| {
+                            "collaboration submit requires claim_token".to_string()
+                        })?,
+                        submitted_at_ms: now_ms,
+                        submission_ref: request.submission_ref.clone().ok_or_else(|| {
+                            "collaboration submit requires submission_ref".to_string()
+                        })?,
+                    }
+                }
+                CollaborationControlOperation::Accept => {
+                    harness_contract::execution_graph::ExecutionGraphCommand::AcceptWork {
+                        expected_revision: current.revision,
+                        node_id: work_node_id.clone(),
+                        reviewer_instance_id: binding.instance.instance_id.clone(),
+                    }
+                }
+                CollaborationControlOperation::Challenge => {
+                    harness_contract::execution_graph::ExecutionGraphCommand::ChallengeWork {
+                        expected_revision: current.revision,
+                        node_id: work_node_id.clone(),
+                        reviewer_instance_id: binding.instance.instance_id.clone(),
+                        finding: request.finding.clone().ok_or_else(|| {
+                            "collaboration challenge requires finding".to_string()
+                        })?,
+                    }
+                }
+            };
+            match self.execution.command_graph(&graph.id, command).await {
+                Ok(committed) => {
+                    receipt = Some(committed);
+                    break;
+                }
+                Err(error) => {
+                    let fresh = self
+                        .graphs
+                        .load_async(graph.id.clone())
+                        .await
+                        .map_err(|load_error| load_error.to_string())?;
+                    let fresh_work_revision = fresh
+                        .work_states
+                        .get(&work_node_id)
+                        .map_or(0, |state| state.revision);
+                    if fresh.revision <= current.revision
+                        || fresh_work_revision != expected_work_revision
+                    {
+                        return Err(error.to_string());
+                    }
+                }
+            }
+        }
+        let receipt = receipt.ok_or_else(|| {
+            format!("collaboration control contention budget exhausted for `{work_node_id}`")
+        })?;
+        let projection = self
+            .execution
+            .graph_projection(&graph.id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({
+            "operation": request.operation,
+            "attested_agent_instance_id": binding.instance.instance_id,
+            "accepted_revision": receipt.accepted_revision,
+            "graph": projection,
+        }))
+    }
+
     /// Rebuild the team-local collaboration projection from events committed
     /// atomically with graph transitions. The graph itself still owns node
     /// status and topology; this view contains only shareable semantics.
@@ -795,7 +991,9 @@ impl TeamRuntime {
             source_generation: graph
                 .orchestration
                 .as_ref()
-                .map_or(graph.revision, |metadata| metadata.source_generation),
+                .map(|metadata| metadata.source_generation)
+                .or_else(|| graph.lineage.as_ref().map(|lineage| lineage.generation))
+                .unwrap_or(1),
             visibility: request.visibility,
             thread: request.thread,
         };

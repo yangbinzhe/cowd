@@ -412,7 +412,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
                     "expected_revision": { "type": "integer", "minimum": 0 },
                     "kind": {
                         "type": "string",
-                        "enum": ["finding", "evidence", "decision", "conflict", "unresolved", "blocker", "user_intervention", "artifact"]
+                        "enum": ["finding", "evidence", "decision", "conflict", "unresolved", "blocker", "user_intervention", "artifact", "proposal", "question", "response", "resolution"]
                     },
                     "summary": { "type": "string" },
                     "refs": { "type": "array", "items": { "type": "string" } },
@@ -420,6 +420,17 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
                     "visibility": { "type": "string", "enum": ["team", "role", "private"] },
                     "after_revision": { "type": "integer", "minimum": 0 },
                     "exact_revision": { "type": "integer", "minimum": 1 }
+                    ,"thread": {
+                        "type": "object",
+                        "properties": {
+                            "thread_id": { "type": "string", "minLength": 1 },
+                            "reply_to_entry_id": { "type": "string", "minLength": 1 },
+                            "response_required": { "type": "boolean", "default": false },
+                            "resolves_entry_ids": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["thread_id"],
+                        "additionalProperties": false
+                    }
                 },
                 "required": ["operation"],
                 "additionalProperties": false
@@ -428,6 +439,32 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
             // mutation and must carry a signed WorkspaceWrite authorization.
             required_permission: ToolPermissionMode::ReadOnly,
             effect_resolver: runtime_effect_resolver("runtime.team_board"),
+        },
+        RuntimeToolDefinition {
+            name: "collaboration_control".to_string(),
+            description: Some(
+                "Inspect the Team work marketplace or claim, heartbeat, release, submit, accept, and challenge a bounded work item. Runtime derives Agent identity, role, capabilities, Team graph and clock from the immutable binding; callers can provide only semantic action and revision/token fences. Use inspect before a mutation and use the returned current revision and claim token."
+                    .to_string(),
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "operation": { "type": "string", "enum": ["inspect", "claim", "heartbeat", "release", "submit", "accept", "challenge"] },
+                    "expected_revision": { "type": "integer", "minimum": 0 },
+                    "expected_work_revision": { "type": "integer", "minimum": 0, "description": "Per-work CAS fence returned by inspect; required for mutations and allows unrelated work items to commit concurrently." },
+                    "work_node_id": { "type": "string", "minLength": 1 },
+                    "claim_token": { "type": "string", "minLength": 1 },
+                    "lease_duration_ms": { "type": "integer", "minimum": 5000, "maximum": 300000 },
+                    "submission_ref": { "type": "string", "minLength": 1 },
+                    "finding": { "type": "string", "minLength": 1, "maxLength": 4000 }
+                },
+                "required": ["operation"],
+                "additionalProperties": false
+            }),
+            required_permission: ToolPermissionMode::ReadOnly,
+            // Internal graph-control request: Runtime attests the Agent and
+            // applies per-work CAS. It grants no workspace/external effect.
+            effect_resolver: runtime_effect_resolver("runtime.collaboration_escalation"),
         },
         RuntimeToolDefinition {
             name: "evidence_retrieve".to_string(),
@@ -728,6 +765,21 @@ mod tests {
             .description
             .as_deref()
             .is_some_and(|description| description.contains("not MCP resources")));
+
+        let collaboration_control = tools
+            .iter()
+            .find(|tool| tool.name == "collaboration_control")
+            .expect("binding-attested collaboration control tool");
+        assert_eq!(
+            collaboration_control.required_permission,
+            ToolPermissionMode::ReadOnly
+        );
+        let control_schema = collaboration_control.input_schema.to_string();
+        assert!(control_schema.contains("expected_work_revision"));
+        assert!(!control_schema.contains("agent_instance_id"));
+        assert!(!control_schema.contains("team_id"));
+        assert!(!control_schema.contains("graph_id"));
+        assert!(!control_schema.contains("role_id"));
 
         let orchestration_tool = tools
             .iter()
