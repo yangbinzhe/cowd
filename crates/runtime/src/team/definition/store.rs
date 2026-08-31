@@ -392,9 +392,14 @@ where
         Ok(revisions)
     }
 
-    /// Enumerate registered, scope-qualified Team Template identities. The
-    /// store validates every manifest and rejects scope confusion or symlink
-    /// traversal so callers never recreate Gateway's legacy shadow scan.
+    /// Enumerate registered, scope-qualified Team Template identities from
+    /// their immutable integrity carriers.
+    ///
+    /// Identity discovery deliberately does not deserialize `team.yaml`.
+    /// Historical manifests can predate the current contract, and one such
+    /// non-runnable revision must not prevent the registry from discovering
+    /// unrelated valid Templates. Exact resolution still deserializes,
+    /// validates and digest-checks the selected manifest before it can run.
     pub fn list_template_ids(
         &self,
     ) -> Result<Vec<TeamTemplateDefinitionId>, TeamDefinitionStoreError> {
@@ -405,24 +410,34 @@ where
             DefinitionScope::Workspace,
         ] {
             let root = self.layout.root_for_scope(scope)?.join(TEAMS_DIRECTORY);
-            let mut manifests = Vec::new();
-            collect_manifest_files(&root, MANIFEST_FILE_NAME, &mut manifests)?;
-            for manifest_path in manifests {
-                let manifest: TeamTemplateManifest =
-                    serde_yaml::from_slice(&read_file(&manifest_path)?)
-                        .map_err(TeamDefinitionStoreError::deserialize)?;
-                manifest
+            let mut integrity_paths = Vec::new();
+            collect_manifest_files(&root, INTEGRITY_FILE_NAME, &mut integrity_paths)?;
+            for integrity_path in integrity_paths {
+                let integrity: RevisionIntegrity = self.read_json(&integrity_path)?;
+                integrity
+                    .revision_ref
                     .validate()
                     .map_err(TeamDefinitionStoreError::contract)?;
-                if manifest.template_id.scope() != scope {
+                if integrity.revision_ref.template_id.scope() != scope {
                     return Err(TeamDefinitionStoreError::InvalidImport(format!(
-                        "manifest `{}` declares scope `{}` under `{}` root",
-                        manifest_path.display(),
-                        manifest.template_id.scope().as_str(),
+                        "integrity record `{}` declares scope `{}` under `{}` root",
+                        integrity_path.display(),
+                        integrity.revision_ref.template_id.scope().as_str(),
                         scope.as_str(),
                     )));
                 }
-                ids.insert(manifest.template_id.as_str().to_string());
+                validate_sha256("content_digest", &integrity.content_digest)
+                    .map_err(TeamDefinitionStoreError::contract)?;
+                let expected_directory = self.revision_dir(&integrity.revision_ref)?;
+                if integrity_path.parent() != Some(expected_directory.as_path()) {
+                    return Err(TeamDefinitionStoreError::InvalidImport(format!(
+                        "integrity record `{}` does not match revision identity `{}` revision {}",
+                        integrity_path.display(),
+                        integrity.revision_ref.template_id.as_str(),
+                        integrity.revision_ref.revision,
+                    )));
+                }
+                ids.insert(integrity.revision_ref.template_id.as_str().to_string());
             }
         }
         ids.into_iter()
@@ -1021,6 +1036,36 @@ mod tests {
         assert!(matches!(
             store.store_revision(changed, markdown()),
             Err(TeamDefinitionStoreError::RevisionConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn identity_discovery_does_not_require_current_manifest_schema() {
+        let temp = TempDir::new().unwrap();
+        let store = store(&temp);
+        let initial = manifest(DefinitionScope::Workspace, 1, RevisionLifecycle::Published);
+        let template_id = initial.template_id.clone();
+        let stored = store.store_revision(initial, markdown()).unwrap();
+        let manifest_path = store
+            .revision_dir(&stored.revision.revision_ref)
+            .unwrap()
+            .join(MANIFEST_FILE_NAME);
+        let legacy_yaml = fs::read_to_string(&manifest_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("behavior:"))
+            .filter(|line| !line.trim_start().starts_with("- kind: terminal_candidate"))
+            .filter(|line| !line.trim_start().starts_with("required: true"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&manifest_path, legacy_yaml).unwrap();
+
+        assert_eq!(store.list_template_ids().unwrap(), vec![template_id]);
+        assert!(matches!(
+            store.read_revision(&stored.revision.revision_ref),
+            Err(TeamDefinitionStoreError::Deserialize(_))
+                | Err(TeamDefinitionStoreError::Contract(_))
         ));
     }
 

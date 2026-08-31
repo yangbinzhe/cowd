@@ -389,14 +389,26 @@ impl RuntimeDefinitionRegistry {
     ) -> Result<Vec<RuntimeTeamTemplateCatalogEntry>, DefinitionRegistryError> {
         let mut entries = Vec::new();
         for template_id in self.teams().list_template_ids()? {
-            let resolved =
-                match self.resolve_team(&template_id, RevisionSelector::LatestApprovedStable) {
-                    Ok(resolved) => resolved,
-                    Err(DefinitionRegistryError::Team(
-                        TeamDefinitionStoreError::UnresolvablePointer(_, _),
-                    )) => continue,
-                    Err(error) => return Err(error),
-                };
+            let resolved = match self
+                .resolve_team(&template_id, RevisionSelector::LatestApprovedStable)
+            {
+                Ok(resolved) => resolved,
+                Err(DefinitionRegistryError::Team(
+                    TeamDefinitionStoreError::UnresolvablePointer(_, _),
+                )) => continue,
+                Err(error)
+                    if template_id.scope() != harness_contract::agent::DefinitionScope::Builtin
+                        && is_isolatable_custom_team_catalog_error(&error) =>
+                {
+                    tracing::warn!(
+                        template_id = template_id.as_str(),
+                        error = %error,
+                        "excluding non-runnable custom Team Template from catalog projection"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let manifest = &resolved.revision.manifest;
             entries.push(RuntimeTeamTemplateCatalogEntry {
                 revision_ref: resolved.revision.revision_ref,
@@ -611,6 +623,20 @@ impl RuntimeDefinitionRegistry {
     }
 }
 
+fn is_isolatable_custom_team_catalog_error(error: &DefinitionRegistryError) -> bool {
+    matches!(
+        error,
+        DefinitionRegistryError::Team(
+            TeamDefinitionStoreError::Deserialize(_)
+                | TeamDefinitionStoreError::Contract(_)
+                | TeamDefinitionStoreError::RevisionNotFound { .. }
+                | TeamDefinitionStoreError::CorruptRevision { .. }
+                | TeamDefinitionStoreError::DigestMismatch { .. }
+                | TeamDefinitionStoreError::ReleaseDigestMismatch
+        )
+    )
+}
+
 fn agent_catalog_entry(
     revision: &harness_contract::agent::AgentDefinitionRevision,
 ) -> AgentCatalogEntry {
@@ -815,6 +841,21 @@ mod tests {
         template_id
     }
 
+    fn remove_first_role_behavior(path: &Path) {
+        let mut manifest: serde_yaml::Value =
+            serde_yaml::from_slice(&std::fs::read(path).expect("team manifest"))
+                .expect("valid team yaml");
+        manifest["roles"][0]
+            .as_mapping_mut()
+            .expect("first role mapping")
+            .remove(serde_yaml::Value::String("behavior".to_string()));
+        std::fs::write(
+            path,
+            serde_yaml::to_string(&manifest).expect("legacy team yaml"),
+        )
+        .expect("rewrite test fixture");
+    }
+
     #[test]
     fn agent_and_team_revisions_use_separate_subtrees_under_one_registered_root() {
         let (temporary, registry) = registry();
@@ -912,6 +953,45 @@ mod tests {
         );
         assert_eq!(entry.role_count, 1);
         assert_eq!(entry.roles[0].role_id, "reviewer");
+    }
+
+    #[test]
+    fn runnable_team_catalog_isolates_legacy_custom_manifest_without_inference() {
+        let (temporary, registry) = registry();
+        let reviewer = publish_reviewer(&registry);
+        let template = publish_team(&registry, reviewer);
+        let manifest_path = temporary
+            .path()
+            .join("workspace/.cowd/definitions/teams/cowd/review-team/revisions/1/team.yaml");
+        remove_first_role_behavior(&manifest_path);
+
+        assert!(
+            registry
+                .resolve_team(&template, RevisionSelector::LatestApprovedStable)
+                .is_err(),
+            "explicit resolution must keep legacy behavior-less manifests fail-closed"
+        );
+        let catalog = registry
+            .runnable_team_catalog()
+            .expect("one invalid custom manifest must not poison valid catalog entries");
+        assert!(catalog
+            .iter()
+            .all(|entry| entry.revision_ref.template_id != template));
+        assert!(catalog.iter().any(|entry| {
+            entry.revision_ref.template_id.as_str() == "builtin/cowd/direct-executor"
+        }));
+    }
+
+    #[test]
+    fn runnable_team_catalog_keeps_builtin_manifest_corruption_fatal() {
+        let (temporary, registry) = registry();
+        remove_first_role_behavior(
+            &temporary
+                .path()
+                .join("bundle/definitions/teams/cowd/direct-executor/revisions/3/team.yaml"),
+        );
+
+        assert!(registry.runnable_team_catalog().is_err());
     }
 
     #[test]
