@@ -140,6 +140,16 @@ fn materialize_delta_operations(
             || event.kind.contains("replan")
             || event.kind.contains("lineage")
     });
+    // Root snapshots include the complete durable descendant lineage. Child
+    // graph commits do not increment the root graph revision, so a child
+    // change must replace the inclusive activities instead of being
+    // misaddressed as a root-node upsert.
+    let descendant_changed = events.iter().any(|event| {
+        scope
+            .descendant_graphs
+            .iter()
+            .any(|descendant| super::activity::event_belongs_to_graph(event, descendant))
+    });
     let affected_node_ids = events
         .iter()
         .filter(|event| event.scope == RuntimeEventScope::ExecutionNode)
@@ -235,7 +245,10 @@ fn materialize_delta_operations(
     }
 
     if graph_changed || !events.is_empty() {
-        if topology_changed {
+        operations.push(ProjectionOperation::ReplaceConcurrency {
+            concurrency: super::snapshot::execution_concurrency(services, graph, scope),
+        });
+        if topology_changed || descendant_changed {
             let (activities, relations) =
                 super::activity::project_execution_activities(services, scope, graph, full);
             operations.push(ProjectionOperation::ReplaceActivities {

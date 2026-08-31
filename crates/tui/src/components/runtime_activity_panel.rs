@@ -82,6 +82,9 @@ pub struct RuntimeActivityPanel {
     execution_work_expected_ms: u64,
     execution_work_actual_ms: u64,
     execution_work_speedup_bp: Option<u32>,
+    concurrency_root: String,
+    concurrency_inclusive: String,
+    concurrency_resources: String,
     projection_run_count: usize,
     projection_tool_count: usize,
     projection_skill_count: usize,
@@ -173,7 +176,48 @@ impl RuntimeActivityPanel {
         self.execution_work_expected_ms = 0;
         self.execution_work_actual_ms = 0;
         self.execution_work_speedup_bp = None;
+        self.concurrency_root.clear();
+        self.concurrency_inclusive.clear();
+        self.concurrency_resources.clear();
         if let Some(projection) = app.execution.latest_execution_projection.as_ref() {
+            let root = &projection.concurrency.root;
+            let inclusive = &projection.concurrency.inclusive;
+            self.concurrency_root = format!(
+                "ready {} running {} waiting {} total {}",
+                root.ready,
+                root.running,
+                root.waiting_input
+                    .saturating_add(root.waiting_approval)
+                    .saturating_add(root.waiting_external),
+                root.total
+            );
+            self.concurrency_inclusive = format!(
+                "ready {} running {} waiting {} total {}",
+                inclusive.ready,
+                inclusive.running,
+                inclusive
+                    .waiting_input
+                    .saturating_add(inclusive.waiting_approval)
+                    .saturating_add(inclusive.waiting_external),
+                inclusive.total
+            );
+            self.concurrency_resources = projection
+                .concurrency
+                .resources
+                .iter()
+                .map(|resource| {
+                    format!(
+                        "{} {}/{} q{} {:.1}% ({})",
+                        resource.kind,
+                        resource.active_leases,
+                        resource.effective_limit,
+                        resource.queued_waiters,
+                        f64::from(resource.utilization_basis_points) / 100.0,
+                        resource.scope
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
             if let Some(work) = projection.graph.work.as_ref() {
                 self.execution_work_width = work.width;
                 self.execution_work_depth = work.depth;
@@ -830,6 +874,24 @@ impl Component for RuntimeActivityPanel {
                 ),
             ]));
         }
+        if !self.concurrency_root.is_empty() || !self.concurrency_inclusive.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("Concurrency:", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(
+                        " root [{}] inclusive [{}]",
+                        self.concurrency_root, self.concurrency_inclusive
+                    ),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+            if !self.concurrency_resources.is_empty() {
+                lines.push(Line::styled(
+                    format!("  capacity {}", self.concurrency_resources),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+        }
         if self.projection_run_count > 0
             || self.projection_tool_count > 0
             || self.projection_selected_count > 0
@@ -1116,6 +1178,7 @@ fn canonical_activity_tree(projection: &crate::protocol::ExecutionProjection) ->
     let mut activities = projection.activities.iter().collect::<Vec<_>>();
     activities.sort_by_key(|activity| (activity.sequence, activity.commit_cursor));
     let mut rendered_agents = BTreeSet::new();
+    let mut rendered_discussions = BTreeSet::new();
     let mut lines = Vec::new();
 
     for team in activities
@@ -1136,6 +1199,18 @@ fn canonical_activity_tree(projection: &crate::protocol::ExecutionProjection) ->
                 agent.status
             ));
         }
+        for discussion in activities.iter().copied().filter(|activity| {
+            activity.kind == ExecutionActivityKind::Discussion
+                && canonical_parent_id(projection, activity)
+                    .is_some_and(|parent| parent == team.activity_id)
+        }) {
+            rendered_discussions.insert(discussion.activity_id.as_str());
+            lines.push(format!(
+                "    Discussion {} [{}]",
+                activity_label(discussion),
+                discussion.status
+            ));
+        }
     }
 
     for agent in activities.iter().copied().filter(|activity| {
@@ -1146,6 +1221,16 @@ fn canonical_activity_tree(projection: &crate::protocol::ExecutionProjection) ->
             "  Agent {} [{}]",
             activity_label(agent),
             agent.status
+        ));
+    }
+    for discussion in activities.iter().copied().filter(|activity| {
+        activity.kind == ExecutionActivityKind::Discussion
+            && !rendered_discussions.contains(activity.activity_id.as_str())
+    }) {
+        lines.push(format!(
+            "  Discussion {} [{}]",
+            activity_label(discussion),
+            discussion.status
         ));
     }
     lines
@@ -1320,6 +1405,7 @@ mod tests {
             graph: harness_contract::execution_graph::project_execution_graph(
                 &harness_contract::execution_graph::ExecutionGraph::new("strategy"),
             ),
+            concurrency: Default::default(),
             child_executions: Vec::new(),
             activities: Vec::new(),
             activity_relations: Vec::new(),

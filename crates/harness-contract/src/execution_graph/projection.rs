@@ -21,6 +21,22 @@ pub struct ExecutionNodeProjection {
     /// governed evidence or activity projections.
     #[serde(default)]
     pub payload_ref: String,
+    /// Runtime-derived public organizational identity. These fields are
+    /// projected before the private payload is replaced by its opaque ref, so
+    /// a Surface never has to parse prompts or machine node ids to discover
+    /// admitted Teams and Agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
     #[serde(default)]
     pub acceptance: ExecutionAcceptance,
     #[serde(default)]
@@ -154,6 +170,7 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
             .iter()
             .map(|node| {
                 let result = graph.node_results.get(&node.id);
+                let identity = public_node_identity(node);
                 ExecutionNodeProjection {
                     node_id: node.id.clone(),
                     kind: node.kind,
@@ -164,6 +181,12 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                         .unwrap_or(ExecutionNodeStatus::Planned),
                     executor_kind: node.executor_kind.clone(),
                     payload_ref: public_payload_ref(&node.id),
+                    team_run_id: identity.team_run_id,
+                    agent_instance_id: identity.agent_instance_id,
+                    agent_run_id: identity.agent_run_id,
+                    role_id: identity.role_id,
+                    focus_id: identity.focus_id,
+                    display_label: identity.display_label,
                     acceptance: node.acceptance.clone(),
                     resource_scopes: node.resource_scopes.clone(),
                     result_ref: result.and_then(|value| value.result_ref.clone()),
@@ -206,6 +229,72 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
 
 fn public_payload_ref(node_id: &str) -> String {
     format!("execution-payload:{node_id}")
+}
+
+#[derive(Default)]
+struct PublicNodeIdentity {
+    team_run_id: Option<String>,
+    agent_instance_id: Option<String>,
+    agent_run_id: Option<String>,
+    role_id: Option<String>,
+    focus_id: Option<String>,
+    display_label: Option<String>,
+}
+
+fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
+    if node.kind == ExecutionNodeKind::AgentTask {
+        if let Ok(packet) = serde_json::from_str::<crate::agent::AgentTaskPacket>(&node.payload_ref)
+        {
+            let role_id = Some(packet.assignment.role_id.clone());
+            let focus_id = packet
+                .team_role_identity
+                .as_ref()
+                .map(|identity| identity.focus_id.clone());
+            let display_label = focus_id
+                .as_ref()
+                .map(|focus| format!("{} · {focus}", packet.assignment.role_id))
+                .or_else(|| role_id.clone());
+            return PublicNodeIdentity {
+                team_run_id: packet.assignment.team_run_id.clone(),
+                agent_instance_id: Some(packet.assignment.instance_id.clone()),
+                agent_run_id: Some(packet.assignment.run_id.clone()),
+                role_id,
+                focus_id,
+                display_label,
+            };
+        }
+        if let Ok(intent) = serde_json::from_str::<crate::agent::AgentTaskIntent>(&node.payload_ref)
+        {
+            let role_id = intent
+                .team_role_identity
+                .as_ref()
+                .map(|identity| identity.role_id.clone());
+            let focus_id = intent
+                .team_role_identity
+                .as_ref()
+                .map(|identity| identity.focus_id.clone());
+            return PublicNodeIdentity {
+                team_run_id: intent.team_id,
+                agent_run_id: Some(intent.run_id),
+                role_id: role_id.clone(),
+                focus_id: focus_id.clone(),
+                display_label: role_id.or(focus_id),
+                ..PublicNodeIdentity::default()
+            };
+        }
+    }
+    if node.kind == ExecutionNodeKind::Subgraph {
+        if let Ok(request) =
+            serde_json::from_str::<crate::team::TeamInstantiationRequest>(&node.payload_ref)
+        {
+            return PublicNodeIdentity {
+                team_run_id: Some(request.team_id),
+                display_label: request.display_name.or_else(|| Some(request.objective)),
+                ..PublicNodeIdentity::default()
+            };
+        }
+    }
+    PublicNodeIdentity::default()
 }
 
 #[must_use]

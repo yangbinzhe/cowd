@@ -162,6 +162,7 @@ fn execution_projection_owner_rejects_lower_revision_for_same_execution() {
         graph: harness_contract::execution_graph::project_execution_graph(&ExecutionGraph::new(
             objective,
         )),
+        concurrency: Default::default(),
         child_executions: Vec::new(),
         activities: Vec::new(),
         activity_relations: Vec::new(),
@@ -251,6 +252,7 @@ fn execution_projection_without_live_facts_cannot_reuse_previous_execution_value
         graph: harness_contract::execution_graph::project_execution_graph(&ExecutionGraph::new(
             "new execution"
         ),),
+        concurrency: Default::default(),
         child_executions: Vec::new(),
         activities: Vec::new(),
         activity_relations: Vec::new(),
@@ -1037,6 +1039,7 @@ fn dropped_abort_then_projection_resync_clears_orphaned_root_preview() {
         graph: harness_contract::execution_graph::project_execution_graph(&ExecutionGraph::new(
             "recover dropped abort"
         ),),
+        concurrency: Default::default(),
         child_executions: Vec::new(),
         activities: Vec::new(),
         activity_relations: Vec::new(),

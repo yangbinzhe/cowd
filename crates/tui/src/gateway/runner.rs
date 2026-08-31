@@ -4163,6 +4163,7 @@ mod tests {
                 turn_id: None,
                 strategy: None,
                 graph: project_execution_graph(&ExecutionGraph::new("stale REST snapshot")),
+                concurrency: Default::default(),
                 child_executions: Vec::new(),
                 activities: Vec::new(),
                 activity_relations: Vec::new(),

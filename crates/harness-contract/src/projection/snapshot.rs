@@ -411,6 +411,43 @@ pub struct ExecutionLatencyProjection {
     pub provider_active_stream_ms: u64,
 }
 
+/// Exact node-state counts for either the queried root graph or its complete
+/// durable descendant lineage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionConcurrencyCountsProjection {
+    pub total: u64,
+    pub planned: u64,
+    pub ready: u64,
+    pub running: u64,
+    pub waiting_input: u64,
+    pub waiting_approval: u64,
+    pub waiting_external: u64,
+    pub paused: u64,
+    pub blocked: u64,
+    pub terminal: u64,
+}
+
+/// Process-global capacity facts from the sole Runtime resource owner. The
+/// scope is explicit so a Surface cannot mislabel global leases as belonging
+/// only to the selected root execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionResourceCapacityProjection {
+    pub kind: String,
+    pub effective_limit: u64,
+    pub active_leases: u64,
+    pub queued_waiters: u64,
+    pub utilization_basis_points: u16,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ExecutionConcurrencyProjection {
+    pub root: ExecutionConcurrencyCountsProjection,
+    pub inclusive: ExecutionConcurrencyCountsProjection,
+    #[serde(default)]
+    pub resources: Vec<ExecutionResourceCapacityProjection>,
+}
+
 /// Runtime-owned, current-turn facts.  It is an additive field on the
 /// existing execution projection so older surface clients remain compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -706,6 +743,8 @@ pub struct ExecutionProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategy: Option<StrategyDecisionProjection>,
     pub graph: ExecutionGraphProjection,
+    #[serde(default)]
+    pub concurrency: ExecutionConcurrencyProjection,
     #[serde(default)]
     pub child_executions: Vec<ChildExecutionProjection>,
     #[serde(default)]

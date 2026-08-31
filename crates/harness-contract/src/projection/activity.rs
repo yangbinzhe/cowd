@@ -13,6 +13,10 @@ pub enum ExecutionActivityKind {
     Goal,
     Team,
     Agent,
+    /// Bounded semantic Team working-state entry (finding, question,
+    /// challenge, response, decision or resolution). This never contains a
+    /// private reasoning trace.
+    Discussion,
     Skill,
     Model,
     /// Provider-approved public reasoning summary. Private chain-of-thought
@@ -176,6 +180,22 @@ pub struct ExecutionActivityProjection {
     /// Typed acceptance summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance_summary: Option<AcceptanceSummaryProjection>,
+    /// Sanitized graph-work marketplace state. Claim tokens and private
+    /// submission payloads never cross the projection boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimant_role_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_lease_expires_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_artifact_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_artifact_kinds: Vec<String>,
     /// Safe explanation for a waiting, warning, blocked, failed or cancelled
     /// status. Surfaces must not derive this from raw evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]

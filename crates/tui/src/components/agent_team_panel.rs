@@ -8,7 +8,8 @@
 //   - Composite reputation scores (when available)
 //   - Keyboard navigation (j/k/↑/↓, Enter detail, Tab toggle)
 //
-// Data source: `App::delegate_tasks` and runtime execution graph summaries.
+// Data source: the canonical Runtime execution projection. Legacy delegated
+// task summaries are used only when no projection has materialized yet.
 // Reputation scores are read from each AgentInfo's optional field and
 // formatted via `ReputationScore::composite()`.
 
@@ -134,11 +135,27 @@ impl AgentTeamPanel {
     pub fn sync_from_app(&mut self, app: &App) {
         let prev_len = self.agents.len();
         self.agents = app
-            .workbench
-            .delegate_tasks
-            .iter()
-            .map(delegate_task_to_agent)
-            .collect();
+            .execution
+            .latest_execution_projection
+            .as_ref()
+            .map(|projection| {
+                projection
+                    .activities
+                    .iter()
+                    .filter(|activity| {
+                        activity.kind == harness_contract::projection::ExecutionActivityKind::Agent
+                    })
+                    .map(projection_activity_to_agent)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|agents| !agents.is_empty())
+            .unwrap_or_else(|| {
+                app.workbench
+                    .delegate_tasks
+                    .iter()
+                    .map(delegate_task_to_agent)
+                    .collect()
+            });
         if self.agents.len() != prev_len {
             self.detail_idx = None;
         }
@@ -519,6 +536,46 @@ fn delegate_task_to_agent(task: &DelegateTask) -> AgentInfo {
         status,
         registered_at_ms: 0,
         last_heartbeat_ms: 0,
+        reputation: None,
+    }
+}
+
+fn projection_activity_to_agent(
+    activity: &harness_contract::projection::ExecutionActivityProjection,
+) -> AgentInfo {
+    let status = match activity.status.to_ascii_lowercase().as_str() {
+        "running" | "starting" | "started" => AgentStatus::Busy,
+        "ready" | "queued" => AgentStatus::Active,
+        "planned" | "waiting" | "waiting_input" | "waiting_approval" | "waiting_external"
+        | "paused" | "completed" | "complete" | "succeeded" => AgentStatus::Idle,
+        "failed" | "error" | "blocked" | "cancelled" | "rejected" => AgentStatus::Offline,
+        _ => AgentStatus::Active,
+    };
+    let mut capabilities = activity.definition_refs.clone();
+    capabilities.extend(activity.output_artifact_kinds.iter().cloned());
+    if let Some(work_status) = activity.work_status.as_deref() {
+        capabilities.push(format!("work:{work_status}"));
+    }
+    capabilities.sort();
+    capabilities.dedup();
+    AgentInfo {
+        agent_id: activity
+            .agent_instance_id
+            .clone()
+            .or_else(|| activity.agent_run_id.clone())
+            .unwrap_or_else(|| activity.activity_id.clone()),
+        role: activity
+            .display_label
+            .clone()
+            .or_else(|| activity.claimant_role_id.clone())
+            .unwrap_or_else(|| "Agent".to_string()),
+        capabilities,
+        status,
+        registered_at_ms: activity.started_at_ms.unwrap_or_default(),
+        last_heartbeat_ms: activity
+            .completed_at_ms
+            .or(activity.started_at_ms)
+            .unwrap_or_default(),
         reputation: None,
     }
 }

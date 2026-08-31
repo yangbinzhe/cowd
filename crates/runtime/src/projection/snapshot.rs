@@ -83,6 +83,7 @@ async fn snapshot_with_graph(
     let terminal_presentation = graph.terminal_presentation.clone();
     let cancellation_receipt =
         latest_cancellation_receipt(services, session_id.as_deref(), execution_id);
+    let concurrency = execution_concurrency(services, &graph, &scope);
 
     Ok(ExecutionProjection {
         schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
@@ -100,6 +101,7 @@ async fn snapshot_with_graph(
         activity_relations,
         strategy,
         graph,
+        concurrency,
         child_executions: scope.child_executions,
         goals: scope.goals,
         agents: scope.agents,
@@ -120,6 +122,91 @@ async fn snapshot_with_graph(
         cancellation_receipt,
         available_commands: available_commands(services, execution_id, context).await?,
     })
+}
+
+pub(super) fn execution_concurrency(
+    services: &RuntimeServices,
+    graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+    scope: &ExecutionProjectionScope,
+) -> ExecutionConcurrencyProjection {
+    let root = concurrency_counts(&graph.nodes);
+    let mut inclusive = root.clone();
+    for descendant in &scope.descendant_graphs {
+        accumulate_concurrency_counts(&mut inclusive, &descendant.nodes);
+    }
+    let mut resources = services
+        .resource_manager()
+        .snapshots()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|snapshot| {
+            let utilization_basis_points = if snapshot.effective_limit == 0 {
+                0
+            } else {
+                u16::try_from(
+                    snapshot
+                        .active_leases
+                        .saturating_mul(10_000)
+                        .saturating_div(snapshot.effective_limit),
+                )
+                .unwrap_or(10_000)
+                .min(10_000)
+            };
+            ExecutionResourceCapacityProjection {
+                kind: format!("{:?}", snapshot.kind).to_ascii_lowercase(),
+                effective_limit: snapshot.effective_limit as u64,
+                active_leases: snapshot.active_leases as u64,
+                queued_waiters: snapshot.queued_waiters as u64,
+                utilization_basis_points,
+                scope: "process_global".to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    resources.sort_by(|left, right| left.kind.cmp(&right.kind));
+    ExecutionConcurrencyProjection {
+        root,
+        inclusive,
+        resources,
+    }
+}
+
+fn concurrency_counts(
+    nodes: &[harness_contract::execution_graph::ExecutionNodeProjection],
+) -> ExecutionConcurrencyCountsProjection {
+    let mut counts = ExecutionConcurrencyCountsProjection::default();
+    accumulate_concurrency_counts(&mut counts, nodes);
+    counts
+}
+
+fn accumulate_concurrency_counts(
+    counts: &mut ExecutionConcurrencyCountsProjection,
+    nodes: &[harness_contract::execution_graph::ExecutionNodeProjection],
+) {
+    counts.total = counts.total.saturating_add(nodes.len() as u64);
+    for node in nodes {
+        match node.status {
+            ExecutionNodeStatus::Planned => counts.planned = counts.planned.saturating_add(1),
+            ExecutionNodeStatus::Ready => counts.ready = counts.ready.saturating_add(1),
+            ExecutionNodeStatus::Running => counts.running = counts.running.saturating_add(1),
+            ExecutionNodeStatus::WaitingInput => {
+                counts.waiting_input = counts.waiting_input.saturating_add(1);
+            }
+            ExecutionNodeStatus::WaitingApproval => {
+                counts.waiting_approval = counts.waiting_approval.saturating_add(1);
+            }
+            ExecutionNodeStatus::WaitingExternal => {
+                counts.waiting_external = counts.waiting_external.saturating_add(1);
+            }
+            ExecutionNodeStatus::Paused => counts.paused = counts.paused.saturating_add(1),
+            ExecutionNodeStatus::Blocked => counts.blocked = counts.blocked.saturating_add(1),
+            status if status.is_terminal() => {
+                counts.terminal = counts.terminal.saturating_add(1);
+            }
+            ExecutionNodeStatus::Failed
+            | ExecutionNodeStatus::Completed
+            | ExecutionNodeStatus::Cancelled => unreachable!("terminal status matched above"),
+        }
+    }
 }
 
 fn latest_cancellation_receipt(

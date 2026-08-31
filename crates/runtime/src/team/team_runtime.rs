@@ -997,6 +997,61 @@ impl TeamRuntime {
             visibility: request.visibility,
             thread: request.thread,
         };
+        let agent_activity_id = format!("activity:execution:{}:node:{}", graph.id, request.node_id);
+        let discussion_event = RuntimeEventInput {
+            stream_id: stream_id.clone(),
+            scope: RuntimeEventScope::Team,
+            kind: "team.working_state.appended.v1".to_string(),
+            status: Some("committed".to_string()),
+            actor: Some(binding.instance.instance_id.clone()),
+            refs: vec![
+                RuntimeEventRef {
+                    kind: "team_run".to_string(),
+                    id: team_id.to_string(),
+                },
+                RuntimeEventRef {
+                    kind: "execution_graph".to_string(),
+                    id: graph.id.clone(),
+                },
+                RuntimeEventRef {
+                    kind: "execution_node".to_string(),
+                    id: request.node_id.clone(),
+                },
+            ],
+            payload: serde_json::to_value(entry).map_err(|error| error.to_string())?,
+        }
+        .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+            root_execution_id: graph.id.clone(),
+            session_id: packet.assignment.session_id.clone(),
+            turn_id: graph
+                .lineage
+                .as_ref()
+                .map(|lineage| lineage.turn_id.clone())
+                .unwrap_or_else(|| packet.assignment.run_id.clone()),
+            root_task_id: packet.assignment.root_task_id.clone(),
+            task_id: packet.assignment.task_id.clone(),
+            activity_id: format!("activity:execution:{}:discussion:{entry_id}", graph.id),
+            node_id: Some(request.node_id.clone()),
+            parent_activity_id: Some(agent_activity_id.clone()),
+            initiator_activity_id: Some(agent_activity_id),
+            team_run_id: Some(team_id.to_string()),
+            agent_instance_id: Some(binding.instance.instance_id.clone()),
+            agent_run_id: Some(packet.assignment.run_id.clone()),
+            skill_id: None,
+            skill_revision: None,
+            skill_activation_id: None,
+            tool_contract_id: None,
+            tool_call_id: None,
+            approval_id: None,
+            parallel_group_id: None,
+            revision: current_revision.saturating_add(1),
+            fence: graph.revision.max(1),
+            generation: graph
+                .lineage
+                .as_ref()
+                .map_or(1, |lineage| lineage.generation),
+        })
+        .map_err(|error| error.to_string())?;
         self.event_store
             .append_transaction(AppendTransactionRequest {
                 transaction_id: format!("team-board:{entry_id}"),
@@ -1005,28 +1060,7 @@ impl TeamRuntime {
                     expected_revision: current_revision,
                 }],
                 events: vec![RuntimeTransactionEventInput {
-                    event: RuntimeEventInput {
-                        stream_id,
-                        scope: RuntimeEventScope::Team,
-                        kind: "team.working_state.appended.v1".to_string(),
-                        status: Some("committed".to_string()),
-                        actor: Some(binding.instance.instance_id.clone()),
-                        refs: vec![
-                            RuntimeEventRef {
-                                kind: "team_run".to_string(),
-                                id: team_id.to_string(),
-                            },
-                            RuntimeEventRef {
-                                kind: "execution_graph".to_string(),
-                                id: graph.id.clone(),
-                            },
-                            RuntimeEventRef {
-                                kind: "execution_node".to_string(),
-                                id: request.node_id,
-                            },
-                        ],
-                        payload: serde_json::to_value(entry).map_err(|error| error.to_string())?,
-                    },
+                    event: discussion_event,
                     idempotency_key: Some(entry_id),
                     schema_version: 1,
                 }],

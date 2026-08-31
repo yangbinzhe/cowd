@@ -10,10 +10,12 @@ use harness_contract::core::MeasureProvenance;
 use harness_contract::execution_graph::{ExecutionGraphCommand, ExecutionNodeStatus};
 use harness_contract::projection::{
     AdmissionProjection, AdmissionProjectionStatus, ChildExecutionProjection, EvidenceProjection,
-    ExecutionCommandKind, ExecutionCommandReceipt, ExecutionCommandRequest, ExecutionProjection,
-    OutcomeProjection, OutcomeQualityProjection, ProjectionCommandAvailability, ProjectionDelta,
-    ProjectionDetailScope, ProjectionEntity, ProjectionEntityCollection, ProjectionEntityPayload,
-    ProjectionOperation, ProjectionQueryContext, ProjectionResyncReason, ProjectionSourceHealth,
+    ExecutionCommandKind, ExecutionCommandReceipt, ExecutionCommandRequest,
+    ExecutionConcurrencyCountsProjection, ExecutionConcurrencyProjection, ExecutionProjection,
+    ExecutionResourceCapacityProjection, OutcomeProjection, OutcomeQualityProjection,
+    ProjectionCommandAvailability, ProjectionDelta, ProjectionDetailScope, ProjectionEntity,
+    ProjectionEntityCollection, ProjectionEntityPayload, ProjectionOperation,
+    ProjectionQueryContext, ProjectionResyncReason, ProjectionSourceHealth,
     StrategyActualProjection, StrategyActualStatus, StrategyDecisionProjection,
     StrategyEvidenceScopeProjection, StrategyProofStatus, StrategyTransitionProjection,
     EXECUTION_PROJECTION_REDUCER_VERSION, EXECUTION_PROJECTION_SCHEMA_VERSION,
@@ -1213,13 +1215,100 @@ mod tests {
             .iter()
             .any(|activity| { activity.scope.execution_id == sibling_id }));
 
-        let delta = delta(&services, &parent_id, 0, 0, &context(&services)).expect("lineage delta");
-        assert!(delta.operations.iter().any(|operation| {
+        let lineage_delta =
+            delta(&services, &parent_id, 0, 0, &context(&services)).expect("lineage delta");
+        assert!(lineage_delta.operations.iter().any(|operation| {
             matches!(
                 operation,
                 ProjectionOperation::UpsertChildExecution { child }
                     if child.execution_id == child_id
             )
+        }));
+
+        services
+            .event_store()
+            .append(
+                crate::RuntimeEventInput {
+                    stream_id: "team-working-state:team-lineage".to_string(),
+                    scope: RuntimeEventScope::Team,
+                    kind: "team.working_state.appended.v1".to_string(),
+                    status: Some("committed".to_string()),
+                    actor: Some("reviewer-lineage".to_string()),
+                    refs: vec![crate::RuntimeEventRef {
+                        kind: "execution_graph".to_string(),
+                        id: child_id.clone(),
+                    }],
+                    payload: serde_json::json!({
+                        "entry_id": "discussion-lineage-1",
+                        "team_id": "team-lineage",
+                        "graph_id": child_id,
+                        "node_id": "reviewer-lineage-node",
+                        "producer_instance_id": "reviewer-lineage",
+                        "kind": "challenge",
+                        "summary": "independent evidence is required",
+                        "refs": [],
+                        "artifact_refs": [],
+                        "boundary": "bounded semantic checkpoint",
+                        "confidence_milli": 1000,
+                        "graph_revision": 1,
+                        "revision": 1,
+                        "source_generation": 1,
+                        "visibility": "team"
+                    }),
+                }
+                .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
+                    root_execution_id: child_id.clone(),
+                    session_id: "lineage-session".to_string(),
+                    turn_id: "lineage-turn".to_string(),
+                    root_task_id: "lineage-task".to_string(),
+                    task_id: "lineage-task".to_string(),
+                    activity_id: format!(
+                        "activity:execution:{child_id}:discussion:discussion-lineage-1"
+                    ),
+                    node_id: Some("reviewer-lineage-node".to_string()),
+                    parent_activity_id: Some(format!("activity:execution:{child_id}")),
+                    initiator_activity_id: Some(format!("activity:execution:{child_id}")),
+                    team_run_id: Some("team-lineage".to_string()),
+                    agent_instance_id: Some("reviewer-lineage".to_string()),
+                    agent_run_id: Some("reviewer-lineage-run".to_string()),
+                    skill_id: None,
+                    skill_revision: None,
+                    skill_activation_id: None,
+                    tool_contract_id: None,
+                    tool_call_id: None,
+                    approval_id: None,
+                    parallel_group_id: None,
+                    revision: 1,
+                    fence: 1,
+                    generation: 1,
+                })
+                .expect("discussion activity binding"),
+            )
+            .expect("child discussion commits");
+        let child_delta = delta(
+            &services,
+            &parent_id,
+            projection.revision,
+            projection.cursor,
+            &context(&services),
+        )
+        .expect("child activity delta");
+        assert!(child_delta.operations.iter().any(|operation| {
+            matches!(operation, ProjectionOperation::ReplaceActivities { .. })
+        }));
+        let reduced =
+            harness_contract::projection::reduce_projection_delta(&projection, &child_delta)
+                .expect("child delta applies");
+        let refreshed = snapshot(&services, &parent_id, &context(&services))
+            .await
+            .expect("refreshed parent projection");
+        assert_eq!(
+            reduced, refreshed,
+            "one child delta must equal a full resync"
+        );
+        assert!(reduced.activities.iter().any(|activity| {
+            activity.kind == harness_contract::projection::ExecutionActivityKind::Discussion
+                && activity.team_run_id.as_deref() == Some("team-lineage")
         }));
     }
 
@@ -1259,6 +1348,7 @@ mod tests {
                 status: "running".to_string(),
                 objective: "live delegated work".to_string(),
             }],
+            descendant_graphs: Vec::new(),
         };
 
         assert_eq!(live_team_topology(&scope), Some((team_id, team_graph_id)));

@@ -690,6 +690,7 @@ mod tests {
             graph: harness_contract::execution_graph::project_execution_graph(
                 &ExecutionGraph::new("test"),
             ),
+            concurrency: Default::default(),
             child_executions: Vec::new(),
             activities: Vec::new(),
             activity_relations: Vec::new(),

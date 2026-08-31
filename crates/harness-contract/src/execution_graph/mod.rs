@@ -82,6 +82,82 @@ mod tests {
     }
 
     #[test]
+    fn projection_keeps_public_team_identity_before_payload_redaction() {
+        use crate::agent::DefinitionScope;
+        use crate::context::ParentExecutionBudget;
+        use crate::policy::PermissionMode;
+        use crate::team::{
+            TeamInstantiationRequest, TeamSelectionMode, TeamTemplateDefinitionId,
+            TeamTemplateSelector,
+        };
+
+        let request = TeamInstantiationRequest {
+            request_id: "request-public-team".to_string(),
+            team_id: "team-run-public".to_string(),
+            mission_id: "mission-public".to_string(),
+            lineage: ExecutionGraphLineage {
+                session_id: "session-public".to_string(),
+                turn_id: "turn-public".to_string(),
+                root_task_id: "task-public".to_string(),
+                task_id: "task-public".to_string(),
+                generation: 1,
+            },
+            parent_execution: None,
+            selection_mode: TeamSelectionMode::Explicit,
+            strategy_binding: None,
+            template_selector: TeamTemplateSelector::LatestStable {
+                template_id: TeamTemplateDefinitionId::new(
+                    DefinitionScope::Builtin,
+                    "cowd/execute-review",
+                )
+                .expect("template id"),
+            },
+            objective: "independent review".to_string(),
+            acceptance: vec!["review receipt".to_string()],
+            risk: None,
+            role_binding_overrides: Vec::new(),
+            display_name: Some("Independent review team".to_string()),
+            role_display_overrides: Vec::new(),
+            cardinality_overrides: Vec::new(),
+            focus_partition_plans: Vec::new(),
+            requires_managed_collaboration_escalation: false,
+            permission_ceiling: PermissionMode::ReadOnly,
+            model_lease: "deepseek".to_string(),
+            execution_budget: ParentExecutionBudget::new(
+                "budget-public-team",
+                65_536,
+                u64::MAX,
+                8,
+                1,
+            ),
+            deadline_at_ms: u64::MAX,
+            managed_invocation: None,
+            resource_scopes: vec!["read:.".to_string()],
+            allow_whole_workspace_scope: true,
+            upstream_evidence_refs: Vec::new(),
+            upstream_artifact_refs: Vec::new(),
+            upstream_result_context: Vec::new(),
+            execution_capacity: None,
+        };
+        let mut team = node("team-node", ExecutionNodeKind::Subgraph);
+        team.executor_kind = "team_subgraph".to_string();
+        team.payload_ref = serde_json::to_string(&request).expect("team request");
+        let mut graph = ExecutionGraph::new("public topology");
+        graph.nodes.push(team);
+
+        let projected = &project_execution_graph(&graph).nodes[0];
+        assert_eq!(projected.payload_ref, "execution-payload:team-node");
+        assert_eq!(projected.team_run_id.as_deref(), Some("team-run-public"));
+        assert_eq!(
+            projected.display_label.as_deref(),
+            Some("Independent review team")
+        );
+        let encoded = serde_json::to_string(projected).expect("projection json");
+        assert!(!encoded.contains("budget-public-team"));
+        assert!(!encoded.contains("review receipt"));
+    }
+
+    #[test]
     fn rejects_dependency_cycles() {
         let mut graph = ExecutionGraph::new("cycle must fail");
         graph.nodes = vec![

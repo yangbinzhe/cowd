@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphProjection, ExecutionNodeProjection,
-};
+use harness_contract::execution_graph::{ExecutionGraph, ExecutionGraphProjection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -317,69 +315,9 @@ impl ExecutionGraphStateStore {
         graph_id: &str,
     ) -> Result<ExecutionGraphProjection, ExecutionStateStoreError> {
         let graph = self.load(graph_id)?;
-        Ok(ExecutionGraphProjection {
-            graph_id: graph.id.clone(),
-            revision: graph.revision,
-            objective: graph.objective.clone(),
-            service_class: graph.service_class,
-            parent_execution: graph.parent_execution.clone(),
-            lineage: graph.lineage.clone(),
-            orchestration: graph.orchestration.clone(),
-            delivery_envelope: graph.delivery_envelope.clone(),
-            terminal_presentation: graph.terminal_presentation.clone(),
-            nodes: graph
-                .nodes
-                .iter()
-                .map(|node| {
-                    let result = graph.node_results.get(&node.id);
-                    ExecutionNodeProjection {
-                        node_id: node.id.clone(),
-                        kind: node.kind,
-                        status: graph.node_statuses[&node.id],
-                        executor_kind: node.executor_kind.clone(),
-                        payload_ref: format!("execution-payload:{}", node.id),
-                        acceptance: node.acceptance.clone(),
-                        resource_scopes: node.resource_scopes.clone(),
-                        result_ref: result.and_then(|result| result.result_ref.clone()),
-                        summary: result.and_then(|result| result.summary.clone()),
-                        failure: result.and_then(|result| result.failure.clone()),
-                        evidence_refs: result
-                            .map(|result| result.evidence_refs.clone())
-                            .unwrap_or_default(),
-                        usage: result
-                            .map(|result| result.usage.clone())
-                            .unwrap_or_default(),
-                        work: node
-                            .work
-                            .as_ref()
-                            .map(harness_contract::execution_graph::ExecutionWorkProjection::from),
-                        work_state: node
-                            .work
-                            .as_ref()
-                            .map(|_| graph.work_states.get(&node.id).cloned().unwrap_or_default()),
-                    }
-                })
-                .collect(),
-            edges: graph
-                .edges
-                .iter()
-                .map(
-                    |edge| harness_contract::execution_graph::ExecutionEdgeProjection {
-                        from: edge.from.clone(),
-                        to: edge.to.clone(),
-                        kind: edge.kind,
-                    },
-                )
-                .collect(),
-            commit_cursor: graph.recovery_cursor.commit_cursor,
-            terminal_result_ref: graph
-                .nodes
-                .iter()
-                .rev()
-                .filter_map(|node| graph.node_results.get(&node.id))
-                .find_map(|result| result.result_ref.clone()),
-            work: harness_contract::execution_graph::project_work_graph(&graph),
-        })
+        Ok(harness_contract::execution_graph::project_execution_graph(
+            &graph,
+        ))
     }
 
     pub async fn projection_async(

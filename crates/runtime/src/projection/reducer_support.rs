@@ -152,6 +152,10 @@ pub(super) struct ExecutionProjectionScope {
     pub(super) approvals: Vec<ProjectionEntity>,
     pub(super) interventions: Vec<ProjectionEntity>,
     pub(super) child_executions: Vec<ChildExecutionProjection>,
+    /// Canonical descendant graph projections used only by the Runtime
+    /// reducer to materialize one inclusive Team/Agent activity tree. This is
+    /// not serialized as a second public graph owner.
+    pub(super) descendant_graphs: Vec<harness_contract::execution_graph::ExecutionGraphProjection>,
 }
 
 impl ExecutionProjectionScope {
@@ -161,7 +165,7 @@ impl ExecutionProjectionScope {
         graph: &harness_contract::execution_graph::ExecutionGraphProjection,
         full: bool,
     ) -> Result<Self, RuntimeServicesError> {
-        let (execution_ids, child_executions, node_ids) =
+        let (execution_ids, child_executions, node_ids, descendant_graphs) =
             execution_lineage(services, execution_id, graph)?;
 
         let agent_snapshots = services.agent_runtime().list_for_graphs(&execution_ids);
@@ -367,6 +371,7 @@ impl ExecutionProjectionScope {
             approvals,
             interventions,
             child_executions,
+            descendant_graphs,
         })
     }
 
@@ -534,6 +539,7 @@ pub(super) fn execution_lineage(
         BTreeSet<String>,
         Vec<ChildExecutionProjection>,
         BTreeSet<String>,
+        Vec<harness_contract::execution_graph::ExecutionGraphProjection>,
     ),
     RuntimeServicesError,
 > {
@@ -585,10 +591,11 @@ pub(super) fn execution_lineage(
         .iter()
         .map(|node| node.node_id.clone())
         .collect::<BTreeSet<_>>();
-    for graph in lineage_graphs {
-        node_ids.extend(graph.nodes.into_iter().map(|node| node.node_id));
+    for graph in &lineage_graphs {
+        node_ids.extend(graph.nodes.iter().map(|node| node.node_id.clone()));
     }
-    Ok((execution_ids, child_executions, node_ids))
+    lineage_graphs.sort_by(|left, right| left.graph_id.cmp(&right.graph_id));
+    Ok((execution_ids, child_executions, node_ids, lineage_graphs))
 }
 
 pub(super) fn graph_status(
@@ -639,6 +646,7 @@ mod tests {
             approvals: Vec::new(),
             interventions: Vec::new(),
             child_executions: Vec::new(),
+            descendant_graphs: Vec::new(),
         }
     }
 

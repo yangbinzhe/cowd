@@ -5,8 +5,9 @@ use thiserror::Error;
 
 use super::{
     ChildExecutionProjection, ExecutionActivityProjection, ExecutionActivityRelation,
-    ExecutionLiveState, ExecutionProjection, ProjectionCommandAvailability, ProjectionDetailScope,
-    ProjectionEntity, StrategyDecisionProjection, EXECUTION_PROJECTION_REDUCER_VERSION,
+    ExecutionConcurrencyProjection, ExecutionLiveState, ExecutionProjection,
+    ProjectionCommandAvailability, ProjectionDetailScope, ProjectionEntity,
+    StrategyDecisionProjection, EXECUTION_PROJECTION_REDUCER_VERSION,
     EXECUTION_PROJECTION_SCHEMA_VERSION,
 };
 use crate::execution_graph::{
@@ -101,6 +102,12 @@ pub enum ProjectionOperation {
     ReplaceActivities {
         activities: Vec<ExecutionActivityProjection>,
         relations: Vec<ExecutionActivityRelation>,
+    },
+    /// Replaces the exact root/inclusive concurrency and process-capacity
+    /// snapshot. It is one operation so a Surface never combines counts from
+    /// different durable cursors.
+    ReplaceConcurrency {
+        concurrency: ExecutionConcurrencyProjection,
     },
     UpsertActivity {
         activity: ExecutionActivityProjection,
@@ -313,6 +320,9 @@ fn apply_operation(
         } => {
             projection.activities.clone_from(activities);
             projection.activity_relations.clone_from(relations);
+        }
+        ProjectionOperation::ReplaceConcurrency { concurrency } => {
+            projection.concurrency.clone_from(concurrency);
         }
         ProjectionOperation::UpsertActivity { activity } => {
             upsert_by_key(&mut projection.activities, activity.clone(), |value| {
