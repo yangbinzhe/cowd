@@ -1388,8 +1388,21 @@ async fn run_completion_pump(
         };
 
         let available = DEFAULT_MAX_ACTIVE_NODES_PER_GRAPH.saturating_sub(active_nodes.len());
-        for node in snapshot.ready.into_iter().take(available) {
-            let node_id = node.id.clone();
+        let ready = snapshot
+            .ready
+            .into_iter()
+            .take(available)
+            .collect::<Vec<_>>();
+        let prepared = match runner.prepare_ready_wave(graph_id, ready).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                active_nodes.abort_all();
+                while active_nodes.join_next().await.is_some() {}
+                return DriverOutcome::Failed(error.to_string());
+            }
+        };
+        for prepared in prepared {
+            let node_id = prepared.node.id.clone();
             if !in_flight.insert(node_id.clone()) {
                 continue;
             }
@@ -1401,7 +1414,9 @@ async fn run_completion_pump(
                 let graph_id_for_panic = graph_id.clone();
                 let node_id_for_panic = node_id.clone();
                 let executed = AssertUnwindSafe(async move {
-                    runner.execute_pump_node(&graph_id, node, progress).await
+                    runner
+                        .execute_prepared_pump_node(&graph_id, prepared, progress)
+                        .await
                 })
                 .catch_unwind()
                 .await;
@@ -1445,6 +1460,42 @@ async fn run_completion_pump(
                 match joined {
                     Ok((node_id, Ok(()))) => {
                         in_flight.remove(&node_id);
+                        // A durable terminal wave wakes many sibling tasks at
+                        // once. Drain them before re-projecting the same graph;
+                        // otherwise N completed siblings cause N identical
+                        // state-store reads after their single atomic commit.
+                        let mut resource_deferred = false;
+                        while let Some(joined) = active_nodes.try_join_next() {
+                            match joined {
+                                Ok((node_id, Ok(()))) => {
+                                    in_flight.remove(&node_id);
+                                }
+                                Ok((node_id, Err(error))) => {
+                                    in_flight.remove(&node_id);
+                                    if matches!(error, ExecutionRunnerError::ResourceDeferred { .. }) {
+                                        resource_deferred = true;
+                                    } else if !matches!(
+                                        error,
+                                        ExecutionRunnerError::NodeMissing(_)
+                                            | ExecutionRunnerError::CommandSuperseded { .. }
+                                    ) {
+                                        active_nodes.abort_all();
+                                        while active_nodes.join_next().await.is_some() {}
+                                        return DriverOutcome::Failed(error.to_string());
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        graph_id,
+                                        error = %error,
+                                        "execution node task failed to join"
+                                    );
+                                }
+                            }
+                        }
+                        if resource_deferred {
+                            runner.wait_for_resource_change().await;
+                        }
                     }
                     Ok((node_id, Err(error))) => {
                         in_flight.remove(&node_id);
@@ -1637,6 +1688,7 @@ mod completion_pump_tests {
         slow_finished: AtomicBool,
         successor_started_before_slow_finished: AtomicBool,
         calls: Mutex<Vec<String>>,
+        poll_started_at: Mutex<Vec<std::time::Instant>>,
     }
 
     impl PumpTestExecutor {
@@ -1649,6 +1701,7 @@ mod completion_pump_tests {
                 slow_finished: AtomicBool::new(false),
                 successor_started_before_slow_finished: AtomicBool::new(false),
                 calls: Mutex::new(Vec::new()),
+                poll_started_at: Mutex::new(Vec::new()),
             }
         }
 
@@ -1705,6 +1758,10 @@ mod completion_pump_tests {
                     finished_at_ms: 1,
                 }));
             }
+            self.poll_started_at
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
             let running = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_running.fetch_max(running, Ordering::SeqCst);
             tokio::time::sleep(
@@ -1750,6 +1807,14 @@ mod completion_pump_tests {
     }
 
     fn test_supervisor(executor: Arc<PumpTestExecutor>) -> RuntimeExecutionSupervisor {
+        test_supervisor_with_capacity(executor, 8, 2)
+    }
+
+    fn test_supervisor_with_capacity(
+        executor: Arc<PumpTestExecutor>,
+        resource_capacity: usize,
+        active_nodes_per_graph: usize,
+    ) -> RuntimeExecutionSupervisor {
         let event_store = Arc::new(RuntimeEventStore::try_open_in_memory().expect("event store"));
         let registry = Arc::new(NodeExecutorRegistry::new());
         registry.register(executor).expect("register executor");
@@ -1768,15 +1833,18 @@ mod completion_pump_tests {
             Arc::new(ExecutionResourceManager::new([
                 (
                     ExecutionResourceKind::Provider,
-                    ResourceQuota::new(1, 4, 8).expect("provider quota"),
+                    ResourceQuota::new(1, resource_capacity, resource_capacity)
+                        .expect("provider quota"),
                 ),
                 (
                     ExecutionResourceKind::Agent,
-                    ResourceQuota::new(1, 4, 8).expect("agent quota"),
+                    ResourceQuota::new(1, resource_capacity, resource_capacity)
+                        .expect("agent quota"),
                 ),
                 (
                     ExecutionResourceKind::Tool,
-                    ResourceQuota::new(1, 4, 8).expect("tool quota"),
+                    ResourceQuota::new(1, resource_capacity, resource_capacity)
+                        .expect("tool quota"),
                 ),
             ])),
             Arc::new(ScopeLockManager::new()),
@@ -1784,7 +1852,12 @@ mod completion_pump_tests {
             workspace_id,
             std::env::temp_dir(),
         );
-        RuntimeExecutionSupervisor::with_limits(Arc::new(runner), 16, 2, Duration::from_secs(2))
+        RuntimeExecutionSupervisor::with_limits(
+            Arc::new(runner),
+            16,
+            active_nodes_per_graph,
+            Duration::from_secs(2),
+        )
     }
 
     #[tokio::test]
@@ -1854,6 +1927,88 @@ mod completion_pump_tests {
         assert!(
             executor.max_running.load(Ordering::SeqCst) > 1,
             "independent ready nodes must overlap"
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_pump_saturates_sixty_four_independent_work_items() {
+        let executor =
+            Arc::new(PumpTestExecutor::new((0..64).map(|index| {
+                (format!("parallel-64-{index}"), Duration::from_millis(75))
+            })));
+        let supervisor = test_supervisor_with_capacity(Arc::clone(&executor), 64, 64);
+        let mut graph = ExecutionGraph::new("64 independent work items");
+        graph.id = "completion-pump-64".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes = (0..64)
+            .map(|index| test_node(&format!("parallel-64-{index}")))
+            .collect();
+
+        let started = std::time::Instant::now();
+        let (_, report) = supervisor
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .expect("64-work graph completes");
+
+        assert_eq!(report.completed, 64);
+        assert_eq!(executor.max_running.load(Ordering::SeqCst), 64);
+        let mut dispatch_latencies = executor
+            .poll_started_at
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|observed| observed.duration_since(started))
+            .collect::<Vec<_>>();
+        dispatch_latencies.sort_unstable();
+        assert!(
+            dispatch_latencies[60] < Duration::from_millis(250),
+            "dispatch p95 must stay below 250ms, observed {:?}",
+            dispatch_latencies[60]
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "64 independent 75ms work items must execute as one saturated wave"
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completion_pump_keeps_mixed_ready_utilization_above_ninety_percent() {
+        const READY: usize = 58;
+        const CAPACITY: usize = 64;
+        let executor =
+            Arc::new(PumpTestExecutor::new((0..READY).map(|index| {
+                (format!("mixed-{index}"), Duration::from_millis(75))
+            })));
+        let supervisor = test_supervisor_with_capacity(Arc::clone(&executor), CAPACITY, CAPACITY);
+        let mut graph = ExecutionGraph::new("mixed ready utilization");
+        graph.id = "completion-pump-mixed-utilization".to_string();
+        crate::test_support::attach_execution_graph_lineage(&mut graph);
+        graph.nodes = (0..READY)
+            .map(|index| test_node(&format!("mixed-{index}")))
+            .collect();
+
+        let (_, report) = supervisor
+            .submit_and_wait(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .expect("mixed-utilization graph completes");
+
+        assert_eq!(report.completed, READY);
+        let peak = executor.max_running.load(Ordering::SeqCst);
+        assert!(
+            peak * 100 >= CAPACITY * 90,
+            "ready work must use at least 90% of capacity: peak={peak}, capacity={CAPACITY}"
         );
         supervisor.shutdown().await;
     }

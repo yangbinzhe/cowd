@@ -548,7 +548,8 @@ fn project_single_execution_activities_from_events(
     for edge in &graph.edges {
         let kind = match edge.kind {
             ExecutionEdgeKind::DependsOn => ActivityRelationKind::DependsOn,
-            ExecutionEdgeKind::CrossTeamHandoff => ActivityRelationKind::DependsOn,
+            ExecutionEdgeKind::CrossTeamHandoff => ActivityRelationKind::ContributesTo,
+            ExecutionEdgeKind::ArtifactRequires => ActivityRelationKind::DependsOn,
             ExecutionEdgeKind::Verifies => ActivityRelationKind::ContributesTo,
             ExecutionEdgeKind::Produces => ActivityRelationKind::Produced,
         };

@@ -31,6 +31,49 @@ use commit_pipeline::*;
 
 const MAX_TOOL_EFFECT_RECEIPT_CHARS: usize = 16 * 1024;
 
+fn execution_effect_intent_event(
+    ticket: &super::registry::NodeExecutionTicket,
+) -> Result<RuntimeTransactionEventInput, serde_json::Error> {
+    Ok(RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: format!("execution-effect:{}", ticket.idempotency_key),
+            scope: RuntimeEventScope::ExecutionNode,
+            kind: "execution.effect.intent".to_string(),
+            status: Some("inflight".to_string()),
+            actor: Some(ticket.executor_kind.clone()),
+            refs: vec![RuntimeEventRef {
+                kind: "execution_node".to_string(),
+                id: ticket.node_id.clone(),
+            }],
+            payload: serde_json::to_value(ticket)?,
+        },
+        idempotency_key: Some(format!("{}:intent", ticket.idempotency_key)),
+        schema_version: 1,
+    })
+}
+
+fn execution_effect_receipt_event(
+    ticket: &super::registry::NodeExecutionTicket,
+    outcome: &super::registry::NodeExecutionOutcome,
+) -> Result<RuntimeTransactionEventInput, serde_json::Error> {
+    Ok(RuntimeTransactionEventInput {
+        event: RuntimeEventInput {
+            stream_id: format!("execution-effect:{}", ticket.idempotency_key),
+            scope: RuntimeEventScope::ExecutionNode,
+            kind: "execution.effect.receipt".to_string(),
+            status: Some("completed".to_string()),
+            actor: Some(ticket.executor_kind.clone()),
+            refs: vec![RuntimeEventRef {
+                kind: "execution_node".to_string(),
+                id: ticket.node_id.clone(),
+            }],
+            payload: serde_json::to_value(outcome)?,
+        },
+        idempotency_key: Some(format!("{}:receipt", ticket.idempotency_key)),
+        schema_version: 1,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum ExecutionCommitError {
     #[error(transparent)]
@@ -61,6 +104,12 @@ pub enum ExecutionCommitError {
     BlockingTask(String),
     #[error("execution graph replan is invalid: {0}")]
     InvalidReplan(String),
+}
+
+pub(crate) struct ExecutionTerminalCommit {
+    pub(crate) node_id: String,
+    pub(crate) outcome: super::registry::NodeExecutionOutcome,
+    pub(crate) effect_ticket: Option<super::registry::NodeExecutionTicket>,
 }
 
 #[cfg(test)]
@@ -637,6 +686,25 @@ impl ExecutionCommitService {
         &self,
         ticket: &super::registry::NodeExecutionTicket,
     ) -> Result<ExecutionEffectState, ExecutionCommitError> {
+        let state = self.inspect_execution_effect(ticket)?;
+        if state != ExecutionEffectState::Fresh {
+            return Ok(state);
+        }
+        let stream_id = format!("execution-effect:{}", ticket.idempotency_key);
+        let revision = self.event_store.stream_revision(&stream_id)?;
+        self.event_store.append_batch_if_revision(
+            stream_id,
+            revision,
+            format!("{}:intent", ticket.idempotency_key),
+            vec![execution_effect_intent_event(ticket)?],
+        )?;
+        Ok(ExecutionEffectState::Fresh)
+    }
+
+    pub(crate) fn inspect_execution_effect(
+        &self,
+        ticket: &super::registry::NodeExecutionTicket,
+    ) -> Result<ExecutionEffectState, ExecutionCommitError> {
         let stream_id = format!("execution-effect:{}", ticket.idempotency_key);
         if let Some(receipt) = self
             .event_store
@@ -653,28 +721,6 @@ impl ExecutionCommitService {
         {
             return Ok(ExecutionEffectState::Uncertain);
         }
-        let revision = self.event_store.stream_revision(&stream_id)?;
-        self.event_store.append_batch_if_revision(
-            stream_id.clone(),
-            revision,
-            format!("{}:intent", ticket.idempotency_key),
-            vec![RuntimeTransactionEventInput {
-                event: RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::ExecutionNode,
-                    kind: "execution.effect.intent".to_string(),
-                    status: Some("inflight".to_string()),
-                    actor: Some(ticket.executor_kind.clone()),
-                    refs: vec![RuntimeEventRef {
-                        kind: "execution_node".to_string(),
-                        id: ticket.node_id.clone(),
-                    }],
-                    payload: serde_json::to_value(ticket)?,
-                },
-                idempotency_key: Some(format!("{}:intent", ticket.idempotency_key)),
-                schema_version: 1,
-            }],
-        )?;
         Ok(ExecutionEffectState::Fresh)
     }
 
@@ -686,25 +732,10 @@ impl ExecutionCommitService {
         let stream_id = format!("execution-effect:{}", ticket.idempotency_key);
         let revision = self.event_store.stream_revision(&stream_id)?;
         self.event_store.append_batch_if_revision(
-            stream_id.clone(),
+            stream_id,
             revision,
             format!("{}:receipt", ticket.idempotency_key),
-            vec![RuntimeTransactionEventInput {
-                event: RuntimeEventInput {
-                    stream_id,
-                    scope: RuntimeEventScope::ExecutionNode,
-                    kind: "execution.effect.receipt".to_string(),
-                    status: Some("completed".to_string()),
-                    actor: Some(ticket.executor_kind.clone()),
-                    refs: vec![RuntimeEventRef {
-                        kind: "execution_node".to_string(),
-                        id: ticket.node_id.clone(),
-                    }],
-                    payload: serde_json::to_value(outcome)?,
-                },
-                idempotency_key: Some(format!("{}:receipt", ticket.idempotency_key)),
-                schema_version: 1,
-            }],
+            vec![execution_effect_receipt_event(ticket, outcome)?],
         )?;
         Ok(())
     }
@@ -1001,6 +1032,194 @@ impl ExecutionCommitService {
     ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
         let service = self.clone();
         tokio::task::spawn_blocking(move || service.bind_and_start_node(&graph, &node_id, binding))
+            .await
+            .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
+    }
+
+    /// Durably starts one scheduler wave in a single graph revision.
+    ///
+    /// Resource leases and executor tickets are acquired before this boundary.
+    /// Committing the whole independent wave atomically avoids turning the
+    /// graph event stream into a per-node dispatch lock while preserving an
+    /// exact recovery binding for every Running node.
+    pub fn bind_and_start_nodes(
+        &self,
+        graph: &ExecutionGraph,
+        bindings: BTreeMap<String, ExecutionNodeBinding>,
+        effect_tickets: Vec<super::registry::NodeExecutionTicket>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        if bindings.is_empty() {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "cannot start an empty execution wave".to_string(),
+            ));
+        }
+        let mut next = graph.clone();
+        let mut node_events = Vec::with_capacity(bindings.len());
+        for (node_id, binding) in &bindings {
+            let from = *next
+                .node_statuses
+                .get(node_id)
+                .ok_or_else(|| ExecutionTransitionError::NodeNotFound(node_id.clone()))?;
+            next = apply_node_transition(
+                &next,
+                next.revision,
+                node_id,
+                ExecutionNodeStatus::Running,
+                None,
+            )?;
+            *next
+                .recovery_cursor
+                .node_attempts
+                .entry(node_id.clone())
+                .or_default() = binding.attempt;
+            node_events.push((node_id.clone(), from));
+        }
+        // A wave is one atomic graph mutation even though the contract helper
+        // validates each node transition independently above.
+        next.revision = graph.revision.saturating_add(1);
+        let mut domain_events = node_events
+            .into_iter()
+            .map(|(node_id, from)| {
+                node_transition_event(&next, &node_id, from, ExecutionNodeStatus::Running, None)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        domain_events.extend(
+            effect_tickets
+                .iter()
+                .map(execution_effect_intent_event)
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let graph_event = ExecutionGraphEvent::NodesStarted {
+            bindings,
+            delta: ExecutionGraphDelta::between(graph, &next),
+        };
+        self.append_graph_event(
+            &next,
+            graph.revision,
+            format!("{}:wave:{}:started", graph.id, next.revision),
+            graph_event,
+            domain_events,
+        )
+    }
+
+    pub async fn bind_and_start_nodes_async(
+        &self,
+        graph: ExecutionGraph,
+        bindings: BTreeMap<String, ExecutionNodeBinding>,
+        effect_tickets: Vec<super::registry::NodeExecutionTicket>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.bind_and_start_nodes(&graph, bindings, effect_tickets)
+        })
+        .await
+        .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
+    }
+
+    /// Commits a set of independently completed Running nodes in one graph
+    /// revision together with their effect receipts and domain events.
+    pub(crate) fn transition_nodes(
+        &self,
+        graph: &ExecutionGraph,
+        transitions: Vec<ExecutionTerminalCommit>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        if transitions.is_empty() {
+            return Err(ExecutionCommitError::InvalidCommand(
+                "cannot commit an empty terminal wave".to_string(),
+            ));
+        }
+        for transition in &transitions {
+            validate_executor_domain_events(&transition.outcome.domain_events)?;
+        }
+        let mut next = graph.clone();
+        let mut transition_facts = Vec::with_capacity(transitions.len());
+        for transition in &transitions {
+            if transition.outcome.replan.is_some()
+                || transition.outcome.delivery_envelope.is_some()
+                || transition.outcome.terminal_presentation.is_some()
+            {
+                return Err(ExecutionCommitError::InvalidCommand(format!(
+                    "node `{}` carries a non-batchable terminal mutation",
+                    transition.node_id
+                )));
+            }
+            let from = *next.node_statuses.get(&transition.node_id).ok_or_else(|| {
+                ExecutionTransitionError::NodeNotFound(transition.node_id.clone())
+            })?;
+            next = apply_node_transition(
+                &next,
+                next.revision,
+                &transition.node_id,
+                transition.outcome.result.status,
+                Some(transition.outcome.result.clone()),
+            )?;
+            if transition.outcome.result.status.is_terminal() {
+                record_terminal_cross_team_edge_deliveries(&mut next, &transition.node_id)?;
+            }
+            transition_facts.push((
+                transition.node_id.clone(),
+                from,
+                transition.outcome.result.status,
+            ));
+        }
+        next.revision = graph.revision.saturating_add(1);
+        let mut domain_events = Vec::new();
+        for (transition, (node_id, from, to)) in transitions.iter().zip(transition_facts.iter()) {
+            domain_events.push(node_transition_event(
+                &next,
+                node_id,
+                *from,
+                *to,
+                Some(transition.outcome.result.clone()),
+            )?);
+            domain_events.extend(transition.outcome.domain_events.clone());
+            if let Some(working_state) = crate::team_working_state::terminal_working_state_event(
+                &next,
+                node_id,
+                *to,
+                next.node_results.get(node_id),
+            ) {
+                domain_events.push(working_state);
+            }
+            if let Some(candidate) = crate::knowledge_candidate_projector::team_terminal_candidate(
+                &next,
+                node_id,
+                *to,
+                next.node_results.get(node_id),
+            ) {
+                domain_events.push(
+                    crate::knowledge_candidate_projector::candidate_proposal_event(candidate)
+                        .map_err(ExecutionCommitError::InvalidCommand)?,
+                );
+            }
+            if let Some(ticket) = &transition.effect_ticket {
+                domain_events.push(execution_effect_receipt_event(ticket, &transition.outcome)?);
+            }
+        }
+        let node_ids = transitions
+            .iter()
+            .map(|transition| transition.node_id.clone())
+            .collect::<Vec<_>>();
+        let graph_event = ExecutionGraphEvent::NodesTransitioned {
+            node_ids,
+            delta: ExecutionGraphDelta::between(graph, &next),
+        };
+        self.append_graph_event(
+            &next,
+            graph.revision,
+            format!("{}:wave:{}:terminal", graph.id, next.revision),
+            graph_event,
+            domain_events,
+        )
+    }
+
+    pub(crate) async fn transition_nodes_async(
+        &self,
+        graph: ExecutionGraph,
+        transitions: Vec<ExecutionTerminalCommit>,
+    ) -> Result<ExecutionCommitReceipt, ExecutionCommitError> {
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.transition_nodes(&graph, transitions))
             .await
             .map_err(|error| ExecutionCommitError::BlockingTask(error.to_string()))?
     }

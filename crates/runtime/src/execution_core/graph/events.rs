@@ -335,6 +335,14 @@ pub enum ExecutionGraphEvent {
         binding: Option<ExecutionNodeBinding>,
         delta: ExecutionGraphDelta,
     },
+    NodesStarted {
+        bindings: BTreeMap<String, ExecutionNodeBinding>,
+        delta: ExecutionGraphDelta,
+    },
+    NodesTransitioned {
+        node_ids: Vec<String>,
+        delta: ExecutionGraphDelta,
+    },
     NodeTransitionedAndReplanned {
         node_id: String,
         from: ExecutionNodeStatus,
@@ -368,6 +376,8 @@ impl ExecutionGraphEvent {
             Self::Planned { .. } => "execution_graph.planned",
             Self::Checkpoint { .. } => "execution_graph.checkpoint",
             Self::NodeTransitioned { .. } => "execution_graph.node_transitioned",
+            Self::NodesStarted { .. } => "execution_graph.nodes_started",
+            Self::NodesTransitioned { .. } => "execution_graph.nodes_transitioned",
             Self::NodeTransitionedAndReplanned { .. } => {
                 "execution_graph.node_transitioned_and_replanned"
             }
@@ -381,6 +391,8 @@ impl ExecutionGraphEvent {
         match self {
             Self::Planned { graph } | Self::Checkpoint { graph, .. } => Ok(graph.clone()),
             Self::NodeTransitioned { delta, .. }
+            | Self::NodesStarted { delta, .. }
+            | Self::NodesTransitioned { delta, .. }
             | Self::NodeTransitionedAndReplanned { delta, .. }
             | Self::CommandApplied { delta, .. }
             | Self::Replanned { delta, .. }
@@ -420,6 +432,26 @@ impl ExecutionGraphEvent {
                         .len()
                         .saturating_add(value.ticket_idempotency_key.len())
                 }))
+                .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
+            Self::NodesStarted { bindings, delta } => std::mem::size_of::<Self>()
+                .saturating_add(
+                    bindings
+                        .iter()
+                        .map(|(node_id, binding)| {
+                            node_id.len()
+                                + binding.executor_kind.len()
+                                + binding.ticket_idempotency_key.len()
+                                + binding
+                                    .resource_lease_refs
+                                    .iter()
+                                    .map(String::len)
+                                    .sum::<usize>()
+                        })
+                        .sum::<usize>(),
+                )
+                .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
+            Self::NodesTransitioned { node_ids, delta } => std::mem::size_of::<Self>()
+                .saturating_add(node_ids.iter().map(String::len).sum::<usize>())
                 .saturating_add(usize::try_from(delta.estimated_bytes()).unwrap_or(usize::MAX)),
             Self::NodeTransitionedAndReplanned {
                 node_id,

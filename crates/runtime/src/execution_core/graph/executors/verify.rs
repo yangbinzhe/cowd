@@ -89,7 +89,7 @@ impl NodeExecutor for VerifyNodeExecutor {
                     && matches!(
                         edge.kind,
                         ExecutionEdgeKind::DependsOn
-                            | ExecutionEdgeKind::CrossTeamHandoff
+                            | ExecutionEdgeKind::ArtifactRequires
                             | ExecutionEdgeKind::Produces
                             | ExecutionEdgeKind::Verifies
                     )

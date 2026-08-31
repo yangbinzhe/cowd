@@ -144,7 +144,7 @@ pub fn compile_turn_scoped_intent(
         )
         .into());
     }
-    let cross_workstream_consumers = validate_cross_workstream_artifact_dataflow(decision)?;
+    let cross_workstream_dataflow = validate_cross_workstream_artifact_dataflow(decision)?;
     let lineage = request.lineage.as_ref().ok_or_else(|| {
         IntentCompilerError::Diagnostic(CollaborationCompileDiagnostic::validation(
             "collaboration_turn_lineage_missing",
@@ -182,7 +182,8 @@ pub fn compile_turn_scoped_intent(
             workstream_index,
             &workstream.workstream_id,
             &workstream.team,
-            cross_workstream_consumers
+            cross_workstream_dataflow
+                .consumer_roles
                 .get(&workstream.workstream_id)
                 .cloned()
                 .unwrap_or_default(),
@@ -258,7 +259,13 @@ pub fn compile_turn_scoped_intent(
             target_session_id: None,
             output_artifacts: canonical_set(&workstream.output_artifacts),
             evidence_contract,
-            required_evidence_refs: Vec::new(),
+            required_evidence_refs: cross_workstream_dataflow
+                .input_artifacts
+                .get(&workstream.workstream_id)
+                .into_iter()
+                .flatten()
+                .map(|artifact| format!("artifact_kind:{artifact}"))
+                .collect(),
             resource_scopes: Vec::new(),
             required: true,
             dependency: Default::default(),
@@ -304,9 +311,15 @@ pub fn compile_turn_scoped_intent(
 /// Program identity is admitted. Local role-to-role artifacts remain owned by
 /// the Team dependency compiler; only inputs without a local producer need a
 /// workstream dependency and become cross-Team consumption behavior.
+#[derive(Debug, Default)]
+struct CrossWorkstreamArtifactDataflow {
+    consumer_roles: BTreeMap<String, BTreeSet<String>>,
+    input_artifacts: BTreeMap<String, BTreeSet<String>>,
+}
+
 fn validate_cross_workstream_artifact_dataflow(
     decision: &ModelCollaborationControlDecisionV2,
-) -> Result<BTreeMap<String, BTreeSet<String>>, IntentCompilerError> {
+) -> Result<CrossWorkstreamArtifactDataflow, IntentCompilerError> {
     let mut workstreams = BTreeMap::new();
     for (index, workstream) in decision.workstreams.iter().enumerate() {
         let id = workstream.workstream_id.trim();
@@ -326,7 +339,7 @@ fn validate_cross_workstream_artifact_dataflow(
         }
     }
 
-    let mut consumers = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut dataflow = CrossWorkstreamArtifactDataflow::default();
     for (workstream_index, workstream) in decision.workstreams.iter().enumerate() {
         let mut predecessor_outputs = BTreeSet::new();
         for dependency in canonical_set(&workstream.depends_on) {
@@ -392,13 +405,19 @@ fn validate_cross_workstream_artifact_dataflow(
                 ];
                 return Err(diagnostic.into());
             }
-            consumers
+            dataflow
+                .consumer_roles
                 .entry(workstream.workstream_id.clone())
                 .or_default()
                 .insert(role.role_id.clone());
+            dataflow
+                .input_artifacts
+                .entry(workstream.workstream_id.clone())
+                .or_default()
+                .extend(cross_inputs);
         }
     }
-    Ok(consumers)
+    Ok(dataflow)
 }
 
 /// Evidence scopes become root-node resource leases.  Reject a malformed or
@@ -1515,6 +1534,10 @@ mod tests {
         assert_eq!(
             role["acceptance"],
             serde_json::json!(["artifact:final_recommendation"])
+        );
+        assert_eq!(
+            compiled.proposal.nodes[1].required_evidence_refs,
+            vec!["artifact_kind:summary".to_string()]
         );
     }
 

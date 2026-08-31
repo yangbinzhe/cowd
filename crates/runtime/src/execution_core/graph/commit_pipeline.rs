@@ -467,9 +467,12 @@ pub(super) fn retire_program_instances_for_semantic_replan(
         .map(|(_, node_id)| node_id.as_str())
         .collect::<BTreeSet<_>>();
     graph.edges.retain(|edge| {
-        !(edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::CrossTeamHandoff
-            && (retired_node_set.contains(edge.from.as_str())
-                || retired_node_set.contains(edge.to.as_str())))
+        !(matches!(
+            edge.kind,
+            harness_contract::execution_graph::ExecutionEdgeKind::CrossTeamHandoff
+                | harness_contract::execution_graph::ExecutionEdgeKind::ArtifactRequires
+        ) && (retired_node_set.contains(edge.from.as_str())
+            || retired_node_set.contains(edge.to.as_str())))
     });
     if let Some(metadata) = graph.orchestration.as_mut() {
         metadata
@@ -895,10 +898,17 @@ pub(super) fn apply_cross_team_edge_patch(
             && physical_node_for_team_instance(&candidate, &edge.to)
                 .is_ok_and(|to| to == old_to_node)
     });
+    let old_pair_was_hard_artifact_dependency = graph.edges.iter().any(|edge| {
+        edge.kind == ExecutionEdgeKind::ArtifactRequires
+            && edge.from == old_from_node
+            && edge.to == old_to_node
+    });
     if !old_pair_still_exists {
         graph.edges.retain(|edge| {
-            !(edge.kind == ExecutionEdgeKind::CrossTeamHandoff
-                && edge.from == old_from_node
+            !(matches!(
+                edge.kind,
+                ExecutionEdgeKind::CrossTeamHandoff | ExecutionEdgeKind::ArtifactRequires
+            ) && edge.from == old_from_node
                 && edge.to == old_to_node)
         });
     }
@@ -908,9 +918,22 @@ pub(super) fn apply_cross_team_edge_patch(
             && edge.to == new_to_node
     }) {
         graph.edges.push(ExecutionEdge {
+            from: new_from_node.clone(),
+            to: new_to_node.clone(),
+            kind: ExecutionEdgeKind::CrossTeamHandoff,
+        });
+    }
+    if old_pair_was_hard_artifact_dependency
+        && !graph.edges.iter().any(|edge| {
+            edge.kind == ExecutionEdgeKind::ArtifactRequires
+                && edge.from == new_from_node
+                && edge.to == new_to_node
+        })
+    {
+        graph.edges.push(ExecutionEdge {
             from: new_from_node,
             to: new_to_node,
-            kind: ExecutionEdgeKind::CrossTeamHandoff,
+            kind: ExecutionEdgeKind::ArtifactRequires,
         });
     }
     graph
@@ -1077,8 +1100,10 @@ pub(super) fn apply_collaboration_team_retirement(
         .node_statuses
         .insert(retired_node_id.clone(), ExecutionNodeStatus::Cancelled);
     graph.edges.retain(|edge| {
-        !(edge.kind == ExecutionEdgeKind::CrossTeamHandoff
-            && (edge.from == retired_node_id || edge.to == retired_node_id))
+        !(matches!(
+            edge.kind,
+            ExecutionEdgeKind::CrossTeamHandoff | ExecutionEdgeKind::ArtifactRequires
+        ) && (edge.from == retired_node_id || edge.to == retired_node_id))
     });
     if let Some(orchestration) = graph.orchestration.as_mut() {
         orchestration

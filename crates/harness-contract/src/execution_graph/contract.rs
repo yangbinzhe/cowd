@@ -1418,11 +1418,12 @@ impl ExecutionNodeStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionEdgeKind {
     DependsOn,
-    /// A typed cross-Team relation. It has the same scheduler dependency
-    /// semantics as `DependsOn`, but keeps its ownership distinct so a live
-    /// Program patch can replace only its own handoff without touching an
-    /// ordinary graph dependency.
+    /// Organizational cross-Team relation owned by CollaborationProgram.
+    /// It is not itself a scheduler barrier: only `ArtifactRequires` may
+    /// block the concrete consumer that declared a hard input contract.
     CrossTeamHandoff,
+    /// Physical readiness edge for a typed artifact/evidence consumer.
+    ArtifactRequires,
     Verifies,
     Produces,
 }
@@ -1430,7 +1431,7 @@ pub enum ExecutionEdgeKind {
 impl ExecutionEdgeKind {
     #[must_use]
     pub const fn is_dependency(self) -> bool {
-        matches!(self, Self::DependsOn | Self::CrossTeamHandoff)
+        matches!(self, Self::DependsOn | Self::ArtifactRequires)
     }
 }
 

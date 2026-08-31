@@ -496,11 +496,21 @@ pub fn compile_graph_mutation(
                         .iter()
                         .find(|node| node.node_id == *dependency)
                         .map(|node| node.recipe);
+                    let edge_kind = semantic_dependency_edge_kind(semantic.recipe, producer_recipe);
                     edges.push(ExecutionEdge {
                         from: provider.clone(),
                         to: consumer.clone(),
-                        kind: semantic_dependency_edge_kind(semantic.recipe, producer_recipe),
+                        kind: edge_kind,
                     });
+                    if edge_kind == ExecutionEdgeKind::CrossTeamHandoff
+                        && !semantic.required_evidence_refs.is_empty()
+                    {
+                        edges.push(ExecutionEdge {
+                            from: provider.clone(),
+                            to: consumer.clone(),
+                            kind: ExecutionEdgeKind::ArtifactRequires,
+                        });
+                    }
                     if proposal
                         .nodes
                         .iter()
@@ -618,10 +628,7 @@ fn default_cross_team_dependency(
     required_evidence_refs: &[String],
     predecessor_count: usize,
 ) -> ExecutionDependencyPolicy {
-    if dependency != ExecutionDependencyPolicy::All
-        || !required_evidence_refs.is_empty()
-        || predecessor_count == 0
-    {
+    if dependency != ExecutionDependencyPolicy::All || predecessor_count == 0 {
         return dependency;
     }
     if recipe == CapabilityRecipeId::Review {
@@ -646,7 +653,7 @@ fn default_cross_team_dependency(
             cancel_remaining: false,
         };
     }
-    if recipe == CapabilityRecipeId::Team {
+    if recipe == CapabilityRecipeId::Team && !required_evidence_refs.is_empty() {
         return ExecutionDependencyPolicy::EvidenceReady {
             predicate: DependencyPredicate::EvidenceReady {
                 minimum: u16::try_from(predecessor_count).unwrap_or(u16::MAX),
@@ -1679,5 +1686,26 @@ mod tests {
             ),
             ExecutionEdgeKind::DependsOn
         );
+        assert!(!ExecutionEdgeKind::CrossTeamHandoff.is_dependency());
+        assert!(ExecutionEdgeKind::ArtifactRequires.is_dependency());
+
+        assert_eq!(
+            default_cross_team_dependency(
+                CapabilityRecipeId::Team,
+                ExecutionDependencyPolicy::All,
+                &[],
+                1,
+            ),
+            ExecutionDependencyPolicy::All
+        );
+        assert!(matches!(
+            default_cross_team_dependency(
+                CapabilityRecipeId::Team,
+                ExecutionDependencyPolicy::All,
+                &["artifact_kind:summary".to_string()],
+                1,
+            ),
+            ExecutionDependencyPolicy::EvidenceReady { .. }
+        ));
     }
 }

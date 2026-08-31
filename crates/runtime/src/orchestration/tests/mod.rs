@@ -1079,7 +1079,8 @@ fn semantic_compiler_materializes_three_teams_and_a_review_team() {
             .iter()
             .filter(|edge| edge.kind.is_dependency())
             .count(),
-        3
+        0,
+        "organizational Team relations without typed input artifacts must not serialize execution"
     );
     assert_eq!(
         compiled
