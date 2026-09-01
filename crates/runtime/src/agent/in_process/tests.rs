@@ -2716,6 +2716,9 @@ fn runtime_default_autonomous_proposal_is_identity_stable_and_parallel_safe() {
     let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
     node.id = "node".to_string();
     graph.nodes.push(node);
+    let mut peer = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+    peer.id = "peer".to_string();
+    graph.nodes.push(peer);
     let packet = test_agent_packet(Vec::new());
 
     let first = runtime_default_autonomous_proposal_request(&graph, &packet);
@@ -2736,13 +2739,43 @@ fn runtime_default_autonomous_proposal_is_identity_stable_and_parallel_safe() {
         first_proposal.idempotency_key,
         later_proposal.idempotency_key
     );
+    assert!(first_proposal
+        .idempotency_key
+        .starts_with("autonomy:sha256:"));
+    assert!(first_proposal.idempotency_key.ends_with(":follow-up-v1"));
+    assert!(first_proposal.idempotency_key.chars().count() <= 160);
     assert_eq!(
         first_proposal.idempotency_key,
-        "autonomy:team-graph:stable:agent:follow-up-v1"
+        autonomous_proposal_idempotency_key("team-graph:stable", "agent")
     );
     assert_eq!(first_proposal.role, ExecutionWorkRole::CrossCheck);
     assert_eq!(
-        first_proposal.output_artifact_kinds,
-        vec!["autonomous_cross_check".to_string()]
+        first_proposal.output_artifact_kinds.as_slice(),
+        ["autonomous_cross_check"]
+    );
+
+    let mut long_graph = graph;
+    long_graph.id = format!("runtime-team:{}", "graph-segment:".repeat(24));
+    let mut long_packet = packet;
+    long_packet.assignment.instance_id = format!("instance:{}", "agent-role-segment:".repeat(24));
+    let long_request = runtime_default_autonomous_proposal_request(&long_graph, &long_packet);
+    let long_key = &long_request
+        .proposal
+        .as_ref()
+        .expect("long Runtime default proposal")
+        .idempotency_key;
+    assert!(long_graph.id.len() + long_packet.agent_id().len() > 160);
+    assert!(long_key.chars().count() <= 160);
+    assert_ne!(long_key, &first_proposal.idempotency_key);
+    assert_ne!(
+        long_key,
+        &autonomous_proposal_idempotency_key(&long_graph.id, "another-agent")
+    );
+
+    let model_action = missing_required_proposal_action(&long_graph, &long_packet, true)
+        .expect("long designated Agent proposal action");
+    assert_eq!(
+        model_action.pointer("/mutation_template/proposal/idempotency_key"),
+        Some(&serde_json::Value::String(long_key.clone()))
     );
 }

@@ -123,3 +123,52 @@ Deterministic evidence completed before the candidate commit:
 The amended architecture and audited implementation sequence are recorded in
 `docs/architecture/autonomous-collaboration-convergence-v0.9.713.md`. No further
 paid run is permitted until those repairs have a clean deterministic commit.
+
+## Candidate-4 failed-run evidence
+
+- Report: `target/acceptance/real-qwen/runs/v0.9.713-1788241345-mission-harness-deep/report.json`
+- Session: `69c4e0f4-a08a-4d95-8501-88f1c85fd302`
+- Candidate: `fd42d60668c56ce6d8f126d6f0b11eeec8e71c64`, clean at launch.
+- Provider/model: only `deepseek/deepseek-v4-flash`; 136 model rounds, 175
+  native tool calls and 5,281,707 live canonical tokens; no fallback, auth,
+  quota or overload failure was observed.
+- The observer retained 747 changed records from 673,049,106 received bytes,
+  kept a monotonic cursor, drained messages and timeline, detected no stall and
+  passed observation integrity. The root payload remains the dominant traffic
+  source and is retained as a separately measured optimization concern.
+- Three Teams and twelve Agents materialized. Six first-wave Agents ran
+  concurrently, dependency completion immediately activated successors, and
+  the fourth Team correctly remained ineligible after its required handoff
+  predecessors failed. Six Agents completed before the common failure chain.
+- Exact root cause: both autonomous proposal producers embedded the full
+  compositional graph id and Agent instance id in the idempotency key. Real
+  identities exceeded the `TeamRuntime` 160-character contract, so a model
+  omission followed by the governed Runtime default failed with
+  `collaboration proposal idempotency_key must contain 1..160 characters`.
+  Downstream Agents and Team D then blocked fail-closed as designed.
+- Report gate: 17/19. Durable response, requested-model identity, typed output,
+  persisted presentation, observer integrity and actor cleanup passed; terminal
+  collaboration and the aggregate scenario capability gate failed.
+
+The accepted repair is one domain-separated, length-delimited SHA-256 helper
+shared by the model-visible mutation template and Runtime default request. It
+produces a fixed-length key below the collaboration-control limit while
+preserving stable replay identity and distinguishing every graph/Agent pair.
+No second paid run is permitted until the long production-identity regression,
+full Runtime/Gateway suites and a new clean candidate commit pass.
+
+Candidate-4 correction deterministic evidence:
+
+- Long production-identity regression: passed, including shared model/default
+  key, bounded length, stable replay and graph/Agent identity separation.
+- Runtime: 1997 passed, 0 failed, 3 ignored; all integration targets passed.
+- Gateway: 813 passed, 0 failed, 13 ignored; both integration targets passed.
+- Runtime all-target check, architecture boundary scan, formatting and diff
+  checks: passed.
+- Runtime library Clippy exited successfully with the recorded repository
+  warning baseline; no changed line introduced a diagnostic or suppression.
+- Backend version gate: passed for `0.9.713`.
+
+The correction is now eligible for a clean candidate commit and one replacement
+DeepSeek acceptance. The preceding failed run is retained as falsification
+evidence and cannot be promoted as release success.

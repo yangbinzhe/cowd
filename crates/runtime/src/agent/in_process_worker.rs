@@ -1472,6 +1472,21 @@ fn first_designated_proposer_instance_id(
         .map(|packet| packet.assignment.instance_id)
 }
 
+/// Builds the stable identity fence shared by the model-visible proposal
+/// template and Runtime's governed fallback. Graph and Agent identifiers are
+/// intentionally hashed because production Team identities are compositional
+/// and may exceed the collaboration-control contract's 160-character limit.
+/// Length prefixes keep the digest input unambiguous across identity pairs.
+fn autonomous_proposal_idempotency_key(graph_id: &str, agent_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"cowd.autonomy.follow-up.v1\0");
+    digest.update((graph_id.len() as u64).to_be_bytes());
+    digest.update(graph_id.as_bytes());
+    digest.update((agent_id.len() as u64).to_be_bytes());
+    digest.update(agent_id.as_bytes());
+    format!("autonomy:sha256:{:x}:follow-up-v1", digest.finalize())
+}
+
 fn missing_required_proposal_action(
     graph: &harness_contract::execution_graph::ExecutionGraph,
     packet: &AgentTaskPacket,
@@ -1499,7 +1514,7 @@ fn missing_required_proposal_action(
             "operation": "propose_work",
             "expected_work_revision": 0,
             "proposal": {
-                "idempotency_key": format!("autonomy:{}:{}:follow-up-v1", graph.id, agent_id),
+                "idempotency_key": autonomous_proposal_idempotency_key(&graph.id, agent_id),
                 "objective": "Formulate one concrete evidence-backed follow-up inside your Team charter for a different eligible peer",
                 "role": "cross_check",
                 "output_artifact_kinds": ["autonomous_cross_check"]
@@ -1569,7 +1584,7 @@ fn runtime_default_autonomous_proposal_request(
         submission_ref: None,
         finding: None,
         proposal: Some(crate::CollaborationWorkProposal {
-            idempotency_key: format!("autonomy:{}:{agent_id}:follow-up-v1", graph.id),
+            idempotency_key: autonomous_proposal_idempotency_key(&graph.id, agent_id),
             objective: "Perform one bounded, evidence-backed cross-check inside this Team charter and publish the result for independent peer review".to_string(),
             role: harness_contract::execution_graph::ExecutionWorkRole::CrossCheck,
             required_capabilities: Vec::new(),

@@ -189,3 +189,31 @@ apart from its existing timeout cancellation path. The plan is rejected if an
 implementation introduces a second market store, bypasses `TeamRuntime`, marks
 unreviewed work accepted, weakens required work, or treats polling heartbeat as
 business progress.
+
+## Candidate-4 identity-boundary correction
+
+The clean `fd42d606` run proved that the default proposal architecture was
+correctly owned and fail-closed, but its idempotency identity serialization was
+not valid for production-length graph and Agent identifiers. Concatenating two
+unbounded compositional ids violates the existing 160-character
+`TeamRuntime` input contract before idempotent replay can occur. This is a
+framework boundary bug, not a provider-compliance or scheduling failure.
+
+The correction has one owner and no compatibility branch:
+
+1. `autonomous_proposal_idempotency_key(graph_id, agent_id)` hashes a
+   domain-separated, length-delimited pair with SHA-256 and emits
+   `autonomy:sha256:<digest>:follow-up-v1`.
+2. The model-visible mutation template and governed Runtime fallback call that
+   same helper; they cannot drift to different replay identities.
+3. Regression coverage uses identities whose former concatenation exceeds 160
+   characters, asserts the bounded/stable key, asserts changed graph or Agent
+   identity changes the key, and asserts both proposal paths expose the same
+   value.
+4. The existing `TeamRuntime` limit remains strict. Truncation, lossy prefixes,
+   random UUIDs and bypassing collaboration control are forbidden because they
+   weaken collision safety, replay stability or authority.
+
+The correction is accepted because its fixed output is below the validated
+boundary, the hash input is unambiguous, all mutations still pass through
+`TeamRuntime`, and it changes neither market semantics nor scheduling policy.
