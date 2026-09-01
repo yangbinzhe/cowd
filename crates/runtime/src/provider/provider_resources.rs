@@ -11,6 +11,12 @@ const TOKEN_PRESSURE_PER_REQUEST: usize = 256;
 // Requests near a 1M context therefore consume several ordinary slots instead
 // of being treated like short prompts.
 const TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT: usize = 32;
+// Adaptive contraction must still leave enough non-interactive capacity for
+// several delegated provider calls to make progress. Interactive reserve is
+// protection for a root turn, not permission to starve every Team Agent.
+const MIN_DEGRADED_FOREGROUND_REQUESTS: usize = 4;
+const ORDINARY_SLOTS_PER_MAX_TOKEN_REQUEST: usize =
+    TOKEN_PRESSURE_PER_REQUEST.div_ceil(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,10 +46,18 @@ impl ProviderQuotaPolicy {
     pub fn validate(self, context: &str) -> Result<Self, String> {
         ResourceQuota::new(self.minimum, self.target, self.maximum)
             .map_err(|error| format!("{context}: {error}"))?;
-        if self.interactive_reserve > self.maximum {
+        if self.interactive_reserve >= self.minimum {
             return Err(format!(
-                "{context}: interactive reserve {} exceeds maximum {}",
-                self.interactive_reserve, self.maximum
+                "{context}: interactive reserve {} must remain below adaptive minimum {}",
+                self.interactive_reserve, self.minimum
+            ));
+        }
+        if self.maximum.saturating_sub(self.interactive_reserve)
+            < ORDINARY_SLOTS_PER_MAX_TOKEN_REQUEST
+        {
+            return Err(format!(
+                "{context}: maximum {} minus interactive reserve {} must leave at least {} ordinary slots for one maximum token-pressure request",
+                self.maximum, self.interactive_reserve, ORDINARY_SLOTS_PER_MAX_TOKEN_REQUEST
             ));
         }
         Ok(self)
@@ -90,8 +104,8 @@ pub struct ProviderResourceConfig {
 impl Default for ProviderResourceConfig {
     fn default() -> Self {
         Self {
-            global: ProviderQuotaPolicy::new(8, 64, 256, 8),
-            fallback: ProviderQuotaPolicy::new(4, 32, 128, 8),
+            global: ProviderQuotaPolicy::new(12, 64, 256, 8),
+            fallback: ProviderQuotaPolicy::new(12, 32, 128, 8),
             accounts: BTreeMap::new(),
             models: BTreeMap::new(),
             max_output_tokens_override: std::env::var("COWD_MAX_OUTPUT_TOKENS")
@@ -241,27 +255,33 @@ pub struct ProviderResourceGeneration {
 
 fn default_model_policy(model: &str, fallback: ProviderQuotaPolicy) -> ProviderQuotaPolicy {
     match model.trim().to_ascii_lowercase().as_str() {
-        "deepseek-v4-flash" => ProviderQuotaPolicy::new(8, 64, 256, 16),
-        "deepseek-v4-pro" => ProviderQuotaPolicy::new(4, 32, 128, 8),
+        "deepseek-v4-flash" => ProviderQuotaPolicy::new(20, 64, 256, 16),
+        "deepseek-v4-pro" => ProviderQuotaPolicy::new(12, 32, 128, 8),
         _ => fallback,
     }
 }
 
 fn token_pressure_policy(account: ProviderQuotaPolicy) -> ProviderQuotaPolicy {
-    ProviderQuotaPolicy::new(
-        account
-            .minimum
-            .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT),
-        account
-            .target
-            .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT),
-        account
-            .maximum
-            .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT),
-        account
-            .interactive_reserve
-            .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT),
-    )
+    let maximum = account
+        .maximum
+        .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT);
+    let reserve = account
+        .interactive_reserve
+        .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT);
+    let degraded_progress_floor = reserve
+        .saturating_add(MIN_DEGRADED_FOREGROUND_REQUESTS.saturating_mul(TOKEN_PRESSURE_PER_REQUEST))
+        .min(maximum);
+    let minimum = account
+        .minimum
+        .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT)
+        .max(degraded_progress_floor)
+        .min(maximum);
+    let target = account
+        .target
+        .saturating_mul(TOKEN_PRESSURE_UNITS_PER_CONCURRENCY_SLOT)
+        .max(minimum)
+        .min(maximum);
+    ProviderQuotaPolicy::new(minimum, target, maximum, reserve)
 }
 
 fn insert_resource(
@@ -284,8 +304,20 @@ mod tests {
     #[test]
     fn deepseek_defaults_distinguish_pro_and_flash() {
         let config = ProviderResourceConfig::default();
+        config.validate().expect("default provider resources");
         assert_eq!(config.policy_for_model("deepseek-v4-pro").target, 32);
         assert_eq!(config.policy_for_model("deepseek-v4-flash").target, 64);
+        assert_eq!(
+            config.global.minimum - config.global.interactive_reserve,
+            MIN_DEGRADED_FOREGROUND_REQUESTS
+        );
+        assert_eq!(
+            config.policy_for_model("deepseek-v4-flash").minimum
+                - config
+                    .policy_for_model("deepseek-v4-flash")
+                    .interactive_reserve,
+            MIN_DEGRADED_FOREGROUND_REQUESTS
+        );
         assert_eq!(
             config.policy_for_model("unknown").target,
             config.fallback.target
@@ -301,8 +333,13 @@ mod tests {
             matches!(kind, ExecutionResourceKind::ProviderTokenPool(account) if account == "deepseek")
                 && *weight == TOKEN_PRESSURE_PER_REQUEST
         }));
-        let pressure = token_pressure_policy(ProviderQuotaPolicy::new(4, 32, 128, 8));
+        let pressure = token_pressure_policy(ProviderQuotaPolicy::new(12, 32, 128, 8));
         assert_eq!(pressure.maximum, 4_096);
+        assert_eq!(
+            pressure.minimum - pressure.interactive_reserve,
+            MIN_DEGRADED_FOREGROUND_REQUESTS * TOKEN_PRESSURE_PER_REQUEST,
+            "adaptive token-pressure floor must retain four maximum-context foreground requests"
+        );
         assert_eq!(
             pressure.maximum / TOKEN_PRESSURE_PER_REQUEST,
             16,
@@ -314,13 +351,13 @@ mod tests {
     fn configured_accounts_and_models_use_the_public_flattened_shape() {
         let config: ProviderResourceConfig = serde_json::from_value(serde_json::json!({
             "global": {
-                "minimum": 8,
+                "minimum": 12,
                 "target": 64,
                 "maximum": 256,
                 "interactiveReserve": 8
             },
             "fallback": {
-                "minimum": 4,
+                "minimum": 12,
                 "target": 32,
                 "maximum": 128,
                 "interactiveReserve": 8
@@ -328,7 +365,7 @@ mod tests {
             "accounts": {
                 "deepseek-main": {
                     "providerNames": ["deepseek"],
-                    "minimum": 8,
+                    "minimum": 12,
                     "target": 64,
                     "maximum": 256,
                     "interactiveReserve": 8
@@ -337,7 +374,7 @@ mod tests {
             "models": {
                 "deepseek-v4-pro": {
                     "account": "deepseek-main",
-                    "minimum": 4,
+                    "minimum": 12,
                     "target": 32,
                     "maximum": 128,
                     "interactiveReserve": 8
@@ -351,5 +388,89 @@ mod tests {
             "deepseek-main"
         );
         assert_eq!(config.policy_for_model("deepseek-v4-pro").target, 32);
+    }
+
+    #[test]
+    fn validation_rejects_provider_policies_that_can_starve_foreground_work() {
+        let error = ProviderQuotaPolicy::new(8, 64, 256, 8)
+            .validate("provider")
+            .expect_err("reserve equal to adaptive minimum must fail");
+        assert!(error.contains("must remain below adaptive minimum"));
+
+        let error = ProviderQuotaPolicy::new(9, 12, 15, 8)
+            .validate("provider")
+            .expect_err("maximum must admit a maximum token-pressure request");
+        assert!(error.contains("must leave at least 8 ordinary slots"));
+    }
+
+    #[tokio::test]
+    async fn degraded_default_hierarchy_admits_four_max_pressure_agents_and_one_interactive_turn() {
+        use crate::execution_core::graph::{
+            ExecutionResourceManager, ExecutionServiceClass, ResourceAdmissionDecision,
+            ResourceAdmissionRequest,
+        };
+
+        let config = ProviderResourceConfig::default();
+        let account = "deepseek".to_string();
+        let model = "deepseek-v4-flash".to_string();
+        let token_policy = token_pressure_policy(config.global);
+        let policies = [
+            (ExecutionResourceKind::Provider, config.global),
+            (
+                ExecutionResourceKind::ProviderAccount(account.clone()),
+                config.global,
+            ),
+            (
+                ExecutionResourceKind::ProviderModel(model.clone()),
+                config.policy_for_model(&model),
+            ),
+            (
+                ExecutionResourceKind::ProviderTokenPool(account.clone()),
+                token_policy,
+            ),
+        ];
+        let degraded_quotas = policies.iter().map(|(kind, policy)| {
+            (
+                kind.clone(),
+                ResourceQuota::new(policy.minimum, policy.minimum, policy.maximum)
+                    .expect("degraded quota"),
+            )
+        });
+        let reserves = policies
+            .iter()
+            .map(|(kind, policy)| (kind.clone(), policy.interactive_reserve));
+        let manager = ExecutionResourceManager::new(degraded_quotas.clone());
+        manager
+            .reconcile_quotas(degraded_quotas, reserves)
+            .expect("degraded provider generation");
+        let demands = config.admission_demands("deepseek", &model, u64::MAX);
+
+        let mut leases = Vec::new();
+        for _ in 0..MIN_DEGRADED_FOREGROUND_REQUESTS {
+            let decision = manager
+                .admit(ResourceAdmissionRequest::new(
+                    ExecutionServiceClass::Foreground,
+                    demands.clone(),
+                ))
+                .await
+                .expect("foreground admission");
+            let ResourceAdmissionDecision::Granted { lease, .. } = decision else {
+                panic!("degraded defaults must preserve foreground progress");
+            };
+            leases.push(lease);
+        }
+
+        let interactive = manager
+            .admit(ResourceAdmissionRequest::new(
+                ExecutionServiceClass::Interactive,
+                demands,
+            ))
+            .await
+            .expect("interactive admission");
+        assert!(matches!(
+            interactive,
+            ResourceAdmissionDecision::Granted { .. }
+        ));
+        assert_eq!(leases.len(), MIN_DEGRADED_FOREGROUND_REQUESTS);
     }
 }

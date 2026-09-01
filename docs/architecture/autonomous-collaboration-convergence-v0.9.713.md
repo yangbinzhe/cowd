@@ -217,3 +217,41 @@ The correction has one owner and no compatibility branch:
 The correction is accepted because its fixed output is below the validated
 boundary, the hash input is unambiguous, all mutations still pass through
 `TeamRuntime`, and it changes neither market semantics nor scheduling policy.
+
+## Candidate-5 provider-capacity correction
+
+The clean `a5f58fdb` run proved the identity correction in the real path: six
+Agents completed, serial successors started after their predecessors, and no
+proposal-key validation failed. It also exposed a provider-resource invariant
+violation that deterministic saturation at the initial target could not see.
+
+After provider failures, the adaptive manager legally contracted the global,
+account and Flash model effective limits to `8`, while their interactive
+reserves were respectively `8`, `8` and `16`. Non-interactive capacity is
+defined as `effective_limit - interactive_reserve`, so every delegated
+Foreground request became permanently inadmissible even with zero active
+leases. The token pool contracted to `256` with a reserve of `256`, producing
+the same zero-progress state. Its 30-second admission deadline was also below
+the observed 69-second provider service p95 and 176-second maximum. This is a
+Runtime policy deadlock, not provider quota, authentication or model failure.
+
+The accepted correction preserves generic resource-manager semantics and has
+three provider-owned parts:
+
+1. Every provider quota must keep `interactive_reserve < minimum` and must
+   leave enough maximum headroom for one maximum token-pressure request.
+   Defaults retain four ordinary Foreground slots at adaptive minimum: global
+   and fallback `12/8`, Flash `20/16`, Pro `12/8`.
+2. Provider token-pressure derivation raises its adaptive minimum to the
+   smaller of maximum capacity or reserve plus four maximum-pressure requests.
+   It never lowers target or maximum and cannot overflow quota ordering.
+3. Interactive requests retain a 30-second admission deadline because they own
+   the reserve. Foreground, Background and Maintenance provider requests use a
+   bounded 300-second deadline, while turn cancellation remains authoritative.
+
+The correction is rejected if it weakens the generic interactive reserve,
+disables adaptive contraction, adds evaluator-only capacity, retries committed
+provider effects, or treats a longer bounded queue wait as a provider call
+timeout. Regression gates must cover invalid starvation policies, all default
+provider layers, four maximum-pressure requests at the degraded token floor,
+and service-class admission deadlines before another paid run.

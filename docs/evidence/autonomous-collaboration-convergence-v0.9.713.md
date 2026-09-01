@@ -172,3 +172,66 @@ Candidate-4 correction deterministic evidence:
 The correction is now eligible for a clean candidate commit and one replacement
 DeepSeek acceptance. The preceding failed run is retained as falsification
 evidence and cannot be promoted as release success.
+
+## Candidate-5 failed-run evidence
+
+- Report: `target/acceptance/real-qwen/runs/v0.9.713-1788243369-mission-harness-deep/report.json`
+- Session: `1e561a89-a8ed-46bf-b34f-eb26f47b4c85`
+- Candidate: `a5f58fdb18eb7b2e77e2c4a5e2abd9c192e7f529`, clean at launch.
+- Provider/model: only `deepseek/deepseek-v4-flash`; 108 model rounds,
+  2,564,094 live canonical tokens and no provider fallback.
+- Report gate: 17/19. All deterministic, evidence, observation, model-identity
+  and packaging gates passed; only live collaboration completion and its
+  aggregate capability gate failed.
+- The fixed proposal identity was exercised successfully: A1/A2, B1/B2 and
+  C1/C2 completed and dependency convergence activated the second wave. No
+  idempotency boundary error occurred.
+- A3, B3 and C3 then failed independently after provider admission waited
+  30,001 ms and returned `DeadlineExpired`; their successors and Team D blocked
+  fail-closed. Six completed Agents and persisted C1 artifacts were retained.
+- At failure, provider global, DeepSeek account and Flash model adaptive limits
+  had contracted to `8` with reserves `8`, `8` and `16`; the token pool was
+  `256/256`. There were zero active leases, one queued waiter, 69,351 ms service
+  p95 and 176,044 ms maximum. Thus the waiter had no non-interactive capacity
+  and a deadline shorter than measured provider service.
+- The root attempted two bounded recovery revisions and reported the terminal
+  failure instead of claiming completion. Those revisions were rejected for a
+  missing turn-scoped Team template and did not alter committed Team evidence.
+
+The accepted provider-capacity correction is specified in the architecture
+record. No replacement paid run is permitted until starvation-policy, token
+floor and service-class deadline regressions plus full deterministic gates pass
+on a new clean candidate commit.
+
+Candidate-5 correction deterministic evidence:
+
+- Provider starvation regression: default global, account, Flash model and
+  token-pool resources were forced to their adaptive minima; four concurrent
+  maximum-pressure Foreground bundles and a subsequent Interactive bundle were
+  atomically granted.
+- Invalid policies with `interactiveReserve >= minimum`, or with insufficient
+  maximum headroom for one maximum token-pressure request, fail validation.
+- Interactive admission remains 30 seconds; every delegated service class is
+  covered by the bounded 300-second deadline regression.
+- Runtime: 2000 passed, 0 failed, 3 ignored; all integration targets passed.
+- Gateway: 813 passed, 0 failed, 13 ignored; both integration targets passed.
+  The first run correctly rejected the installed legacy `8/8` and `4/8`
+  provider policy; after migrating that active configuration to `12/8`, its
+  three config consumers and the complete Gateway suite passed. One unrelated
+  concurrent current-directory assertion also passed alone and in the full
+  rerun.
+- Harness Contract: 205 passed, 0 failed. Harness Eval: 144 passed, 0 failed.
+- Runtime all-target check, architecture boundary scan, backend `0.9.713`
+  version gate, formatting and diff checks: passed. Runtime Clippy exited zero
+  with only its documented pre-existing warning baseline and no diagnostic on
+  a changed line.
+- Release execution saturation: 64/64 independent nodes overlapped and
+  completed in 0.22 seconds.
+- Release projection probes passed: steady paired mean 105,868 microseconds
+  versus 109,602 baseline (p95 66 versus 70, p99 172 versus 176); active
+  catch-up mean 587,813 microseconds versus 579,148 baseline (p95 74 versus 71,
+  p99 262 versus 263). Every declared bound passed.
+
+The correction is eligible for the integrated workspace compile gate, a clean
+candidate commit and one replacement DeepSeek acceptance. The release status
+remains pending until that immutable report passes all 19 gates.

@@ -2,6 +2,24 @@
 
 use super::*;
 
+const INTERACTIVE_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 30_000;
+const DELEGATED_PROVIDER_ADMISSION_TIMEOUT_MS: u64 = 300_000;
+
+const fn provider_admission_timeout_ms(
+    service_class: crate::execution_core::graph::ExecutionServiceClass,
+) -> u64 {
+    match service_class {
+        crate::execution_core::graph::ExecutionServiceClass::Interactive => {
+            INTERACTIVE_PROVIDER_ADMISSION_TIMEOUT_MS
+        }
+        crate::execution_core::graph::ExecutionServiceClass::Foreground
+        | crate::execution_core::graph::ExecutionServiceClass::Background
+        | crate::execution_core::graph::ExecutionServiceClass::Maintenance => {
+            DELEGATED_PROVIDER_ADMISSION_TIMEOUT_MS
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct TurnProviderState {
     pub(super) tool_exposure: TurnToolExposureMetrics,
@@ -757,7 +775,10 @@ where
                 demands,
             )
             .with_parent_class_ceiling(self.execution_service_class)
-            .with_deadline_at_ms(now_ms().saturating_add(30_000))
+            .with_deadline_at_ms(
+                now_ms()
+                    .saturating_add(provider_admission_timeout_ms(self.execution_service_class)),
+            )
             .with_fairness_key(format!("session:{}", self.session_id()));
             let acquire = manager.admit(admission);
             let lease = tokio::select! {
@@ -1629,5 +1650,27 @@ where
             });
         }
         Err(last_error.unwrap_or_else(|| RuntimeError::new("all provider fallbacks exhausted")))
+    }
+}
+
+#[cfg(test)]
+mod provider_admission_tests {
+    use super::*;
+
+    #[test]
+    fn delegated_provider_waits_cover_slow_parallel_service_without_delaying_interactive_turns() {
+        use crate::execution_core::graph::ExecutionServiceClass;
+
+        assert_eq!(
+            provider_admission_timeout_ms(ExecutionServiceClass::Interactive),
+            30_000
+        );
+        for class in [
+            ExecutionServiceClass::Foreground,
+            ExecutionServiceClass::Background,
+            ExecutionServiceClass::Maintenance,
+        ] {
+            assert_eq!(provider_admission_timeout_ms(class), 300_000);
+        }
     }
 }

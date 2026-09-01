@@ -56,12 +56,12 @@ runtime:
   resources:
     provider:
       global:
-        minimum: 8
+        minimum: 12
         target: 64
         maximum: 256
         interactiveReserve: 8
       fallback:
-        minimum: 4
+        minimum: 12
         target: 32
         maximum: 128
         interactiveReserve: 8
