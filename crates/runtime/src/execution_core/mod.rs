@@ -51,6 +51,7 @@ pub use hot_state::{
 };
 pub use model_affordance::{
     runtime_execution_guidance_prompt, runtime_execution_guidance_prompt_with_tool_exposure,
+    runtime_execution_guidance_prompt_with_tool_exposure_mode,
 };
 pub use model_work::{
     ImmutableWorkKey, InFlightCoalescer, ModelWorkCompileError, ModelWorkEstimate,

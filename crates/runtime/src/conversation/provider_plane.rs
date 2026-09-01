@@ -1151,12 +1151,18 @@ where
             user_input,
             &decision.strategy.understanding,
         );
+        // A small model window cannot afford repeating the full deferred
+        // catalog contract on every continuation. Keep the callable schema
+        // and authority invariants, while compacting duplicated discovery
+        // prose only under measured pressure.
+        let compact_runtime_guidance = collection_budget <= 32_768;
         let apply_runtime_controls = |prompt: &mut PromptAssembly| {
             prompt.push_runtime_context(crate::evidence_planner::evidence_plan_prompt(&evidence));
             prompt.push_runtime_context(
-                crate::execution_core::runtime_execution_guidance_prompt_with_tool_exposure(
+                crate::execution_core::runtime_execution_guidance_prompt_with_tool_exposure_mode(
                     &decision,
                     Some(&exposure.projection(0)),
+                    compact_runtime_guidance,
                 ),
             );
             if let Some(activated_ids) = discovery_activation_notice.as_ref() {
