@@ -38,7 +38,8 @@ Manual targets:
   lark-live
   live-provider
   memory-performance
-  runtime-projection-performance
+	  runtime-projection-performance
+	  runtime-execution-performance
   memory-degraded
   postgres-contract
   public-search-live
@@ -286,6 +287,9 @@ run_manual() {
       ;;
     runtime-projection-performance)
       run_step manual_runtime_projection_performance bash scripts/test/runtime-projection-performance.sh
+      ;;
+    runtime-execution-performance)
+      run_step manual_runtime_execution_performance bash scripts/test/runtime-execution-performance.sh
       ;;
     memory-degraded)
       run_step manual_memory_degraded bash scripts/manual/memory-degraded.sh

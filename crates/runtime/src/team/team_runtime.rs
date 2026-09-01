@@ -38,6 +38,44 @@ pub struct TeamRuntime {
     missions: Arc<MissionRuntime>,
 }
 
+const MIN_COLLABORATION_LEASE_MS: u64 = 5_000;
+const DEFAULT_COLLABORATION_LEASE_MS: u64 = 900_000;
+const MAX_COLLABORATION_LEASE_MS: u64 = 3_600_000;
+
+fn agent_node_is_actionable(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    node_id: &str,
+) -> bool {
+    use harness_contract::execution_graph::ExecutionNodeStatus;
+
+    match graph.node_statuses.get(node_id) {
+        Some(ExecutionNodeStatus::Ready | ExecutionNodeStatus::Running) => true,
+        Some(ExecutionNodeStatus::Planned) => graph
+            .edges
+            .iter()
+            .filter(|edge| edge.to == node_id && edge.kind.is_dependency())
+            .all(|edge| {
+                graph.node_statuses.get(&edge.from) == Some(&ExecutionNodeStatus::Completed)
+            }),
+        _ => false,
+    }
+}
+
+fn effective_collaboration_lease_ms(
+    requested: Option<u64>,
+    expected_duration_ms: u64,
+) -> Result<u64, String> {
+    let requested = requested.unwrap_or(DEFAULT_COLLABORATION_LEASE_MS);
+    if !(MIN_COLLABORATION_LEASE_MS..=MAX_COLLABORATION_LEASE_MS).contains(&requested) {
+        return Err(format!(
+            "collaboration lease_duration_ms must be within {MIN_COLLABORATION_LEASE_MS}..{MAX_COLLABORATION_LEASE_MS}"
+        ));
+    }
+    Ok(requested
+        .max(expected_duration_ms)
+        .clamp(MIN_COLLABORATION_LEASE_MS, MAX_COLLABORATION_LEASE_MS))
+}
+
 /// Return the collaboration market as a bounded, action-first control view.
 ///
 /// The public graph projection is intentionally rich enough for operators and
@@ -57,16 +95,18 @@ fn collaboration_control_view(
 ) -> serde_json::Value {
     use harness_contract::execution_graph::ExecutionWorkRuntimeStatus;
 
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
     let active_peers = graph
         .nodes
         .iter()
         .filter(|node| {
             node.id != caller_node_id
                 && node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-                && graph
-                    .node_statuses
-                    .get(&node.id)
-                    .is_some_and(|status| !status.is_terminal())
+                && agent_node_is_actionable(graph, &node.id)
         })
         .filter_map(|node| {
             serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
@@ -117,12 +157,21 @@ fn collaboration_control_view(
                 .as_ref()
                 .is_some_and(|claim| claim.claimant_instance_id == caller_instance_id);
             let proposed_by_caller = work.proposed_by.as_deref() == Some(caller_instance_id);
+            let claim_expired = state
+                .claim
+                .as_ref()
+                .is_some_and(|claim| claim.lease_expires_at_ms <= now_ms);
             let mut next_actions = Vec::new();
             match state.status {
                 ExecutionWorkRuntimeStatus::Offered | ExecutionWorkRuntimeStatus::Challenged => {
                     if !proposed_by_caller && !already_bid {
                         next_actions.push("bid");
                     }
+                    if !proposed_by_caller && already_bid {
+                        next_actions.push("claim");
+                    }
+                }
+                ExecutionWorkRuntimeStatus::Claimed if claim_expired => {
                     if !proposed_by_caller && already_bid {
                         next_actions.push("claim");
                     }
@@ -160,7 +209,7 @@ fn collaboration_control_view(
             "rule": "Use each work item's work_revision as expected_work_revision. Agent-proposed work requires bid before claim; only the claim owner receives claim_token; a different peer must accept or challenge a submission.",
             "propose_work": {"operation": "propose_work", "expected_work_revision": 0, "proposal": {"idempotency_key": "stable-key", "objective": "bounded objective", "role": "cross_check", "output_artifact_kinds": ["cross_check"]}},
             "bid": {"operation": "bid", "work_node_id": "<id>", "expected_work_revision": "<revision>", "rationale": "bounded rationale", "estimated_cost": 0},
-            "claim": {"operation": "claim", "work_node_id": "<id>", "expected_work_revision": "<revision>", "lease_duration_ms": 300000},
+            "claim": {"operation": "claim", "work_node_id": "<id>", "expected_work_revision": "<revision>", "lease_duration_ms": DEFAULT_COLLABORATION_LEASE_MS},
             "submit": {"operation": "submit", "work_node_id": "<id>", "expected_work_revision": "<revision>", "claim_token": "<owner-token>", "submission_ref": "team-board:<entry_id>"},
             "review": {"operation": "accept|challenge", "work_node_id": "<id>", "expected_work_revision": "<revision>"}
         },
@@ -849,10 +898,7 @@ impl TeamRuntime {
             let eligible_peer_exists = graph.nodes.iter().any(|node| {
                 node.id != request.node_id
                     && node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-                    && graph
-                        .node_statuses
-                        .get(&node.id)
-                        .is_some_and(|status| !status.is_terminal())
+                    && agent_node_is_actionable(&graph, &node.id)
                     && serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).is_ok_and(
                         |candidate| {
                             proposal.required_capabilities.iter().all(|required| {
@@ -1061,13 +1107,21 @@ impl TeamRuntime {
                     }
                 }
                 CollaborationControlOperation::Claim => {
-                    let lease_duration_ms = request.lease_duration_ms.unwrap_or(300_000);
-                    if !(5_000..=300_000).contains(&lease_duration_ms) {
-                        return Err(
-                            "collaboration claim lease_duration_ms must be within 5000..300000"
-                                .to_string(),
-                        );
-                    }
+                    let expected_duration_ms = current
+                        .autonomous_work
+                        .get(&work_node_id)
+                        .or_else(|| {
+                            current
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == work_node_id)
+                                .and_then(|node| node.work.as_ref())
+                        })
+                        .map_or(0, |work| work.expected_duration_ms);
+                    let lease_duration_ms = effective_collaboration_lease_ms(
+                        request.lease_duration_ms,
+                        expected_duration_ms,
+                    )?;
                     harness_contract::execution_graph::ExecutionGraphCommand::ClaimWork {
                         expected_revision: current.revision,
                         node_id: work_node_id.clone(),
@@ -1079,13 +1133,21 @@ impl TeamRuntime {
                     }
                 }
                 CollaborationControlOperation::Heartbeat => {
-                    let lease_duration_ms = request.lease_duration_ms.unwrap_or(300_000);
-                    if !(5_000..=300_000).contains(&lease_duration_ms) {
-                        return Err(
-                            "collaboration heartbeat lease_duration_ms must be within 5000..300000"
-                                .to_string(),
-                        );
-                    }
+                    let expected_duration_ms = current
+                        .autonomous_work
+                        .get(&work_node_id)
+                        .or_else(|| {
+                            current
+                                .nodes
+                                .iter()
+                                .find(|node| node.id == work_node_id)
+                                .and_then(|node| node.work.as_ref())
+                        })
+                        .map_or(0, |work| work.expected_duration_ms);
+                    let lease_duration_ms = effective_collaboration_lease_ms(
+                        request.lease_duration_ms,
+                        expected_duration_ms,
+                    )?;
                     harness_contract::execution_graph::ExecutionGraphCommand::HeartbeatWork {
                         expected_revision: current.revision,
                         node_id: work_node_id.clone(),
@@ -1772,5 +1834,58 @@ impl TeamRuntime {
             })).collect::<Vec<_>>(),
             "quarantined": quarantined,
         })
+    }
+}
+
+#[cfg(test)]
+mod collaboration_market_tests {
+    use harness_contract::execution_graph::{
+        ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+        ExecutionNodeStatus,
+    };
+
+    use super::{agent_node_is_actionable, effective_collaboration_lease_ms};
+
+    #[test]
+    fn planned_successors_are_not_advertised_as_actionable_peers() {
+        let mut graph = ExecutionGraph::new("serial Team");
+        let mut planned = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        planned.id = "planned-peer".to_string();
+        graph.nodes.push(planned);
+        let mut predecessor =
+            ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        predecessor.id = "active-predecessor".to_string();
+        graph.nodes.push(predecessor);
+        graph.edges.push(ExecutionEdge {
+            from: "active-predecessor".to_string(),
+            to: "planned-peer".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        graph
+            .node_statuses
+            .insert("planned-peer".to_string(), ExecutionNodeStatus::Planned);
+        graph.node_statuses.insert(
+            "active-predecessor".to_string(),
+            ExecutionNodeStatus::Running,
+        );
+
+        assert!(!agent_node_is_actionable(&graph, "planned-peer"));
+        graph
+            .node_statuses
+            .insert("planned-peer".to_string(), ExecutionNodeStatus::Ready);
+        assert!(agent_node_is_actionable(&graph, "planned-peer"));
+    }
+
+    #[test]
+    fn collaboration_lease_covers_the_declared_work_duration() {
+        assert_eq!(
+            effective_collaboration_lease_ms(Some(60_000), 900_000).expect("lease"),
+            900_000
+        );
+        assert_eq!(
+            effective_collaboration_lease_ms(None, 30_000).expect("default lease"),
+            900_000
+        );
+        assert!(effective_collaboration_lease_ms(Some(3_600_001), 1).is_err());
     }
 }

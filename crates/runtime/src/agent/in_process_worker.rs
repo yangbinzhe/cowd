@@ -1345,6 +1345,10 @@ fn agent_autonomy_checkpoint(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
     let mut actions = Vec::new();
     for (work_id, work) in &graph.autonomous_work {
         let Some(state) = graph.work_states.get(work_id) else {
@@ -1375,6 +1379,10 @@ fn agent_autonomy_checkpoint(
         let already_reviewed = state.reviews.iter().any(|review| {
             review.reviewer_instance_id == agent_id && review.submission_ref == current_submission
         });
+        let claim_expired = state
+            .claim
+            .as_ref()
+            .is_some_and(|claim| claim.lease_expires_at_ms <= now_ms);
         let (action, private_claim_token) = match state.status {
             harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Offered
             | harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged
@@ -1385,6 +1393,17 @@ fn agent_autonomy_checkpoint(
                     .iter()
                     .any(|bid| bid.bidder_instance_id == agent_id);
                 (if has_bid { "claim" } else { "bid_then_claim" }, None)
+            }
+            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Claimed
+                if eligible
+                    && claim_expired
+                    && work.proposed_by.as_deref() != Some(agent_id)
+                    && state
+                        .bids
+                        .iter()
+                        .any(|bid| bid.bidder_instance_id == agent_id) =>
+            {
+                ("reclaim_then_execute_publish_submit", None)
             }
             harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Claimed
                 if state
@@ -1861,7 +1880,15 @@ impl ScopedRuntimeToolExecutor {
                     "Runtime checkpoint requires a bounded Team write scope",
                 ));
             }
-            object.insert("paths".to_string(), serde_json::json!(paths));
+            if paths.iter().any(|path| path == ".") {
+                // checkpoint_create defines an omitted/empty path set as a
+                // whole-workspace snapshot. Passing the lexical root `.` is
+                // rejected by its traversal guard, even though `write:.` is
+                // the valid Team authority for that same workspace.
+                object.remove("paths");
+            } else {
+                object.insert("paths".to_string(), serde_json::json!(paths));
+            }
         }
         Ok(serde_json::Value::Object(object))
     }
@@ -3360,7 +3387,7 @@ fn derive_receipt_backed_satisfied_criteria(
 fn packet_upstream_change_receipts(
     packet: &AgentTaskPacket,
 ) -> Vec<harness_contract::agent::AgentChangeReceipt> {
-    let mut changes = packet
+    let changes = packet
         .evidence_refs
         .iter()
         .filter_map(|evidence| {
@@ -3375,14 +3402,48 @@ fn packet_upstream_change_receipts(
                 .flatten()
         })
         .collect::<Vec<_>>();
-    changes.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.write_sequence.cmp(&right.write_sequence))
-            .then_with(|| left.after_sha256.cmp(&right.after_sha256))
-    });
-    changes.dedup();
-    changes
+    let mut by_path = BTreeMap::<String, Vec<harness_contract::agent::AgentChangeReceipt>>::new();
+    for change in changes {
+        by_path.entry(change.path.clone()).or_default().push(change);
+    }
+    let mut terminal = Vec::new();
+    for (_, mut receipts) in by_path {
+        receipts.sort_by(|left, right| {
+            left.write_sequence
+                .cmp(&right.write_sequence)
+                .then_with(|| left.after_sha256.cmp(&right.after_sha256))
+        });
+        receipts.dedup();
+        let candidates = receipts
+            .iter()
+            .filter(|candidate| {
+                !receipts.iter().any(|successor| {
+                    successor.before_sha256.as_deref() == Some(candidate.after_sha256.as_str())
+                        && successor.after_sha256 != candidate.after_sha256
+                })
+            })
+            .collect::<Vec<_>>();
+        let digest = candidates
+            .first()
+            .map(|change| change.after_sha256.as_str());
+        if digest.is_none()
+            || candidates
+                .iter()
+                .any(|change| Some(change.after_sha256.as_str()) != digest)
+        {
+            // A divergent terminal must fail UpstreamReview acceptance, not
+            // be guessed from lexical receipt order.
+            return Vec::new();
+        }
+        if let Some(change) = candidates
+            .into_iter()
+            .max_by_key(|change| change.write_sequence)
+        {
+            terminal.push(change.clone());
+        }
+    }
+    terminal.sort_by(|left, right| left.path.cmp(&right.path));
+    terminal
 }
 
 fn produced_runtime_evidence(

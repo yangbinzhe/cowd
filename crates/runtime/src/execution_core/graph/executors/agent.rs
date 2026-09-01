@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use async_trait::async_trait;
@@ -170,7 +171,6 @@ impl NodeExecutor for AgentTaskExecutor {
                 })
                 .map(|edge| edge.from.clone())
                 .collect::<Vec<_>>();
-            let mut upstream_changes = Vec::new();
             for predecessor_id in predecessor_ids {
                 if graph.node_statuses.get(&predecessor_id) != Some(&ExecutionNodeStatus::Completed)
                 {
@@ -196,11 +196,16 @@ impl NodeExecutor for AgentTaskExecutor {
                         .filter(|evidence| evidence.is_durable())
                         .cloned(),
                 );
-                upstream_changes.extend(predecessor.evidence_refs.iter().filter_map(|evidence| {
-                    (evidence.evidence_ref.ref_type == "runtime_change")
-                        .then(|| evidence.evidence_ref.id.clone())
-                }));
             }
+            let terminal_change_evidence = terminal_runtime_change_evidence(&packet.evidence_refs)
+                .map_err(|reason| NodeExecutorError::Poll {
+                    node_id: ticket.node_id.clone(),
+                    reason,
+                })?;
+            packet
+                .evidence_refs
+                .retain(|evidence| evidence.evidence_ref.ref_type != "runtime_change");
+            packet.evidence_refs.extend(terminal_change_evidence);
             packet.evidence_refs.sort_by(|left, right| {
                 left.evidence_ref
                     .ref_type
@@ -210,10 +215,11 @@ impl NodeExecutor for AgentTaskExecutor {
             packet
                 .evidence_refs
                 .dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
-            upstream_changes.sort();
-            upstream_changes.dedup();
             if let Some(resolver) = self.path_identity_resolver.get() {
-                for encoded in &upstream_changes {
+                for encoded in packet.evidence_refs.iter().filter_map(|evidence| {
+                    (evidence.evidence_ref.ref_type == "runtime_change")
+                        .then_some(evidence.evidence_ref.id.as_str())
+                }) {
                     let Ok(change) = serde_json::from_str::<
                         harness_contract::agent::AgentChangeReceipt,
                     >(encoded) else {
@@ -437,6 +443,79 @@ impl NodeExecutor for AgentTaskExecutor {
             backend.cancellation_finalized(&packet);
         }
     }
+}
+
+/// Collapse an append-only sequence of Runtime write receipts to one
+/// causally-terminal receipt per path before handing evidence to a successor.
+/// Historical writes remain durable on the predecessor result, but requiring
+/// a successor to verify every historical digest makes all but the final one
+/// impossible by construction.
+fn terminal_runtime_change_evidence(
+    evidence_refs: &[harness_contract::context::EvidenceAccessRef],
+) -> Result<Vec<harness_contract::context::EvidenceAccessRef>, String> {
+    use harness_contract::agent::AgentChangeReceipt;
+
+    let mut by_path = BTreeMap::<
+        String,
+        Vec<(
+            AgentChangeReceipt,
+            harness_contract::context::EvidenceAccessRef,
+        )>,
+    >::new();
+    for evidence in evidence_refs
+        .iter()
+        .filter(|evidence| evidence.evidence_ref.ref_type == "runtime_change")
+    {
+        let Ok(change) = serde_json::from_str::<AgentChangeReceipt>(&evidence.evidence_ref.id)
+        else {
+            // Legacy opaque runtime_change references cannot mint a digest
+            // obligation. Preserve compatibility by omitting them from the
+            // successor packet; the predecessor still owns the raw fact.
+            continue;
+        };
+        by_path
+            .entry(change.path.clone())
+            .or_default()
+            .push((change, evidence.clone()));
+    }
+
+    let mut terminal = Vec::new();
+    for (path, mut receipts) in by_path {
+        receipts.sort_by(|(left, _), (right, _)| {
+            left.write_sequence
+                .cmp(&right.write_sequence)
+                .then_with(|| left.after_sha256.cmp(&right.after_sha256))
+        });
+        receipts.dedup_by(|(left, _), (right, _)| left == right);
+        let terminal_candidates = receipts
+            .iter()
+            .filter(|(candidate, _)| {
+                !receipts.iter().any(|(successor, _)| {
+                    successor.before_sha256.as_deref() == Some(candidate.after_sha256.as_str())
+                        && successor.after_sha256 != candidate.after_sha256
+                })
+            })
+            .collect::<Vec<_>>();
+        let terminal_digest = terminal_candidates
+            .first()
+            .map(|(change, _)| change.after_sha256.as_str());
+        if terminal_digest.is_none()
+            || terminal_candidates
+                .iter()
+                .any(|(change, _)| Some(change.after_sha256.as_str()) != terminal_digest)
+        {
+            return Err(format!(
+                "conflicting terminal Runtime changes for upstream path `{path}`"
+            ));
+        }
+        let (_, evidence) = terminal_candidates
+            .into_iter()
+            .max_by_key(|(change, _)| change.write_sequence)
+            .expect("terminal digest was present");
+        terminal.push(evidence.clone());
+    }
+    terminal.sort_by(|left, right| left.evidence_ref.id.cmp(&right.evidence_ref.id));
+    Ok(terminal)
 }
 
 fn agent_execution_usage(
@@ -714,6 +793,70 @@ mod tests {
             "runtime-event:execution-node:graph-1:node-1"
         );
         assert_eq!(reference.visibility_scope, "session:session-1");
+    }
+
+    fn change_evidence(
+        path: &str,
+        before_sha256: Option<&str>,
+        after_sha256: &str,
+        write_sequence: u64,
+    ) -> harness_contract::context::EvidenceAccessRef {
+        let packet = task();
+        durable_terminal_fact_ref(
+            &packet,
+            "runtime_change",
+            serde_json::to_string(&harness_contract::agent::AgentChangeReceipt {
+                path: path.to_string(),
+                before_sha256: before_sha256.map(str::to_string),
+                after_sha256: after_sha256.to_string(),
+                write_sequence,
+            })
+            .expect("change receipt"),
+            "application/vnd.cowd.runtime-change+json",
+        )
+    }
+
+    #[test]
+    fn successor_receives_only_the_causally_terminal_write_per_path() {
+        let initial = "1".repeat(64);
+        let intermediate = "2".repeat(64);
+        let terminal_digest = "3".repeat(64);
+        let other = "4".repeat(64);
+        let evidence = vec![
+            change_evidence("src/report.rs", Some(&initial), &intermediate, 2),
+            change_evidence("src/report.rs", Some(&intermediate), &terminal_digest, 7),
+            change_evidence("src/other.rs", None, &other, 1),
+        ];
+
+        let selected = terminal_runtime_change_evidence(&evidence).expect("terminal receipts");
+        assert_eq!(selected.len(), 2);
+        let changes = selected
+            .iter()
+            .map(|reference| {
+                serde_json::from_str::<harness_contract::agent::AgentChangeReceipt>(
+                    &reference.evidence_ref.id,
+                )
+                .expect("selected receipt")
+            })
+            .collect::<Vec<_>>();
+        assert!(changes.iter().any(|change| {
+            change.path == "src/report.rs" && change.after_sha256 == terminal_digest
+        }));
+        assert!(!changes
+            .iter()
+            .any(|change| change.after_sha256 == intermediate));
+    }
+
+    #[test]
+    fn conflicting_terminal_writes_fail_closed() {
+        let evidence = vec![
+            change_evidence("src/report.rs", None, &"a".repeat(64), 1),
+            change_evidence("src/report.rs", None, &"b".repeat(64), 2),
+        ];
+
+        let error = terminal_runtime_change_evidence(&evidence)
+            .expect_err("divergent terminals must not be guessed");
+        assert!(error.contains("conflicting terminal Runtime changes"));
     }
 
     #[test]

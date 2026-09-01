@@ -1943,7 +1943,7 @@ mod completion_pump_tests {
     }
 
     #[tokio::test]
-    #[ignore = "wall-clock performance gate; run isolated with --ignored --test-threads=1"]
+    #[ignore = "scripts/test/runtime-execution-performance.sh"]
     async fn completion_pump_saturates_sixty_four_independent_work_items() {
         let executor =
             Arc::new(PumpTestExecutor::new((0..64).map(|index| {

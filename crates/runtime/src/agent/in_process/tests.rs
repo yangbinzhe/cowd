@@ -389,6 +389,44 @@ fn upstream_change_receipt_is_recovered_from_durable_evidence_binding() {
 }
 
 #[test]
+fn upstream_change_receipt_uses_the_final_digest_after_repeated_writes() {
+    let changes = [
+        harness_contract::agent::AgentChangeReceipt {
+            path: "fixtures/target.txt".to_string(),
+            before_sha256: Some("before".to_string()),
+            after_sha256: "intermediate".to_string(),
+            write_sequence: 3,
+        },
+        harness_contract::agent::AgentChangeReceipt {
+            path: "fixtures/target.txt".to_string(),
+            before_sha256: Some("intermediate".to_string()),
+            after_sha256: "terminal".to_string(),
+            write_sequence: 8,
+        },
+    ];
+    let evidence = changes
+        .iter()
+        .map(|change| {
+            let encoded = serde_json::to_string(change).expect("change receipt JSON");
+            harness_contract::context::EvidenceAccessRef::durable(
+                harness_contract::context::EvidenceRef::observed("runtime_change", encoded),
+                "sha256:change",
+                1,
+                "application/json",
+                "artifact://art_worker_change",
+                "session:session",
+            )
+        })
+        .collect();
+    let packet = test_agent_packet(evidence);
+
+    assert_eq!(
+        packet_upstream_change_receipts(&packet),
+        vec![changes[1].clone()]
+    );
+}
+
+#[test]
 fn explicit_empty_risk_list_is_a_materialized_review_result() {
     use harness_contract::team::TeamStructuredOutputField;
 
@@ -1673,6 +1711,45 @@ async fn scoped_executor_routes_hidden_checkpoint_for_runtime_guard_only() {
             .expect("bounded checkpoint input")["paths"],
         serde_json::json!(["fixtures/target.txt"])
     );
+}
+
+#[test]
+fn root_write_scope_compiles_to_the_checkpoint_whole_workspace_form() {
+    let executor = ScopedRuntimeToolExecutor {
+        host: Arc::new(NoopRuntimeExecutionHost),
+        allowed_tools: BTreeSet::new(),
+        session_id: "session".to_string(),
+        sandbox_posture: harness_contract::policy::SandboxPosture::WorkspaceWriteSandbox,
+        policy_revision: 1,
+        memory_context: memory::MemoryTurnContext::new("session", "agent"),
+        model_lease: "model".to_string(),
+        execution_id: "graph".to_string(),
+        node_id: "node".to_string(),
+        attempt: 1,
+        workspace_root: std::path::PathBuf::from("/workspace"),
+        path_identity_resolver: Arc::new(
+            crate::path_identity::WorkspacePathIdentityResolver::discover(
+                &std::env::current_dir().expect("current directory"),
+            )
+            .expect("path identities"),
+        ),
+        scope_locks: Arc::new(ScopeLockManager::new()),
+        commit_service: None,
+        resource_scopes: Some(vec!["write:.".to_string()]),
+        managed_invocation: None,
+        next_receipt_sequence: AtomicU64::new(0),
+        receipts: Mutex::new(Vec::new()),
+        provider_model_obligations: Vec::new(),
+    };
+
+    let input = executor
+        .internal_checkpoint_input(serde_json::json!({
+            "label": "guard",
+            "paths": ["model-must-not-control-this"]
+        }))
+        .expect("whole-workspace checkpoint input");
+    assert_eq!(input.get("label"), Some(&serde_json::json!("guard")));
+    assert!(input.get("paths").is_none());
 }
 
 #[test]

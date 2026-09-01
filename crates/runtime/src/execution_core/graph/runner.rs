@@ -6,8 +6,8 @@ use std::time::Duration;
 use harness_contract::acceptance::{AcceptanceEvaluation, AcceptanceVerdict, TerminalFactKind};
 use harness_contract::context::{EvidenceAccessRef, EvidenceRef};
 use harness_contract::execution_graph::{
-    validate_execution_graph, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
-    ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeStatus,
+    validate_execution_graph, ExecutionFailure, ExecutionGraph, ExecutionGraphCommand,
+    ExecutionGraphValidationError, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeStatus,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2280,6 +2280,33 @@ impl ExecutionGraphRunner {
                 let waits_for_autonomous_work = node
                     .is_some_and(|node| autonomous_work_blocks_terminal(&graph, node.kind, target));
                 if waits_for_autonomous_work {
+                    if autonomous_work_is_orphaned(&graph) {
+                        graph = self
+                            .commit_service
+                            .transition_node_async(
+                                graph,
+                                node_id,
+                                ExecutionNodeStatus::Failed,
+                                Some(ExecutionNodeResult {
+                                    status: ExecutionNodeStatus::Failed,
+                                    result_ref: None,
+                                    summary: None,
+                                    evidence_refs: Vec::new(),
+                                    failure: Some(ExecutionFailure {
+                                        kind: "autonomous_work_orphaned".to_string(),
+                                        message: "required autonomous collaboration work remained unresolved after every Team Agent became terminal".to_string(),
+                                        retryable: false,
+                                        evidence_refs: Vec::new(),
+                                    }),
+                                    usage: Default::default(),
+                                    finished_at_ms: now_ms(),
+                                }),
+                                Vec::new(),
+                            )
+                            .await?
+                            .graph;
+                        changed = true;
+                    }
                     continue;
                 }
                 if let Some(target) = target {
@@ -2318,6 +2345,27 @@ fn autonomous_work_blocks_terminal(
                         != harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted
                 })
         })
+}
+
+fn autonomous_work_is_orphaned(graph: &ExecutionGraph) -> bool {
+    let unresolved_required_work = graph.autonomous_work.iter().any(|(work_id, work)| {
+        work.required
+            && graph.work_states.get(work_id).is_none_or(|state| {
+                state.status
+                    != harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted
+            })
+    });
+    unresolved_required_work
+        && graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+            .all(|node| {
+                graph
+                    .node_statuses
+                    .get(&node.id)
+                    .is_some_and(|status| status.is_terminal())
+            })
 }
 
 /// One predecessor lane carrying both its durable lifecycle status and its
@@ -3039,9 +3087,9 @@ mod dependency_policy_tests {
     };
 
     use super::{
-        aggregate_team_leaf_usage, autonomous_work_blocks_terminal, dependency_predecessors,
-        dependency_target, quorum_tail_cancellations, team_child_terminal_result,
-        verified_predecessor_status, DependencyPredecessor,
+        aggregate_team_leaf_usage, autonomous_work_blocks_terminal, autonomous_work_is_orphaned,
+        dependency_predecessors, dependency_target, quorum_tail_cancellations,
+        team_child_terminal_result, verified_predecessor_status, DependencyPredecessor,
     };
 
     fn predecessor(status: ExecutionNodeStatus) -> DependencyPredecessor<'static> {
@@ -3079,6 +3127,35 @@ mod dependency_policy_tests {
             ExecutionNodeKind::Synthesize,
             Some(ExecutionNodeStatus::Ready),
         ));
+    }
+
+    #[test]
+    fn unresolved_required_work_becomes_orphaned_only_after_all_agents_are_terminal() {
+        let mut graph = ExecutionGraph::new("autonomous orphan convergence");
+        let mut work = ExecutionWorkContract::new(ExecutionWorkRole::CrossCheck);
+        work.collaboration_work_id = Some("agent-work-a".to_string());
+        work.proposed_by = Some("agent-a".to_string());
+        graph
+            .autonomous_work
+            .insert("agent-work-a".to_string(), work);
+        let mut agent = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        agent.id = "agent-a".to_string();
+        graph.nodes.push(agent);
+        graph
+            .node_statuses
+            .insert("agent-a".to_string(), ExecutionNodeStatus::Running);
+
+        assert!(!autonomous_work_is_orphaned(&graph));
+        graph
+            .node_statuses
+            .insert("agent-a".to_string(), ExecutionNodeStatus::Completed);
+        assert!(autonomous_work_is_orphaned(&graph));
+        graph
+            .work_states
+            .entry("agent-work-a".to_string())
+            .or_default()
+            .status = ExecutionWorkRuntimeStatus::Accepted;
+        assert!(!autonomous_work_is_orphaned(&graph));
     }
 
     #[test]

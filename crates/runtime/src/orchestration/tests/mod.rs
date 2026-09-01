@@ -1405,11 +1405,33 @@ async fn assert_compact_collaboration_market(
         .expect("compact collaboration market inspect");
     assert!(inspect.get("graph").is_none());
     assert!(inspect.pointer("/action_guide/propose_work").is_some());
+    let graph = services
+        .graph_state_store()
+        .load(graph_id)
+        .expect("Team graph for market assertion");
+    let expected_active_peers = agent_nodes
+        .iter()
+        .skip(1)
+        .filter(|node_id| {
+            use harness_contract::execution_graph::ExecutionNodeStatus;
+            match graph.node_statuses.get(*node_id) {
+                Some(ExecutionNodeStatus::Ready | ExecutionNodeStatus::Running) => true,
+                Some(ExecutionNodeStatus::Planned) => graph
+                    .edges
+                    .iter()
+                    .filter(|edge| edge.to == **node_id && edge.kind.is_dependency())
+                    .all(|edge| {
+                        graph.node_statuses.get(&edge.from) == Some(&ExecutionNodeStatus::Completed)
+                    }),
+                _ => false,
+            }
+        })
+        .count();
     assert_eq!(
         inspect
             .pointer("/marketplace/active_peer_count")
             .and_then(serde_json::Value::as_u64),
-        Some((agent_nodes.len() - 1) as u64)
+        Some(expected_active_peers as u64)
     );
     let inspect_json = serde_json::to_string_pretty(&inspect).expect("serialize market inspect");
     assert!(

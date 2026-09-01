@@ -1,7 +1,7 @@
 version: 2
-release_version: 0.9.711
-release_authority: docs/architecture/capability-modular-governance-v0.9.711.md
-release_evidence: docs/evidence/capability-modular-governance-v0.9.711.md
+release_version: 0.9.713
+release_authority: docs/architecture/autonomous-collaboration-convergence-v0.9.713.md
+release_evidence: docs/evidence/autonomous-collaboration-convergence-v0.9.713.md
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh
@@ -95,6 +95,9 @@ ignored_tests:
   runtime_projection_performance:
     marker: scripts/test/runtime-projection-performance.sh
     runner: scripts/validate.sh manual runtime-projection-performance
+  runtime_execution_performance:
+    marker: scripts/test/runtime-execution-performance.sh
+    runner: scripts/validate.sh manual runtime-execution-performance
   architecture_performance:
     marker: tests/performance-v0.9.711/run.sh
     runner: tests/performance-v0.9.711/run.sh candidate
@@ -146,6 +149,8 @@ manual_suites:
     capability: memory.performance
   - path: scripts/test/runtime-projection-performance.sh
     capability: runtime.projection.performance
+  - path: scripts/test/runtime-execution-performance.sh
+    capability: runtime.execution.parallel_saturation
   - path: scripts/test/lark-live.sh
     capability: lark.skill_and_cli.live
   - path: scripts/test/public-search-live.sh

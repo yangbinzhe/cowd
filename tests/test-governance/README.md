@@ -1,6 +1,6 @@
 # Cowd Test Governance
 
-当前治理版本：`0.9.711`
+当前治理版本：`0.9.713`
 
 测试入口统一由 [scripts/test/README.md](../../scripts/test/README.md) 维护。日常、
 提交前和封版依次使用：
@@ -17,7 +17,7 @@ scripts/validate.sh full-regression
 - 不允许用函数名、源码空格、文件布局、历史版本号或测试数量证明业务能力。
 - 新测试如果与现有测试覆盖同一故障，应替换或合并现有测试。
 - 会修改进程全局 env/cwd/provider/session 的测试只进入 `serial-global`。
-- live provider、真实 Lark、真实 PostgreSQL、人工 TUI、视觉和探索性检查显式进入 manual/nightly。
+- live provider、真实 Lark、真实 PostgreSQL、Runtime wall-clock 性能、人工 TUI、视觉和探索性检查显式进入 manual/nightly。
 - 所有 `#[ignore]` 必须能从唯一入口运行，不能成为永久不可达测试。
 - 测试统计必须是静态扫描；运行时通过数和耗时从真实回归报告获取。
 

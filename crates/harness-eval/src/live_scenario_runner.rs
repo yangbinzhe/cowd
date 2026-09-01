@@ -1514,7 +1514,12 @@ impl LiveScenarioRunner {
                     continue;
                 }
             }
-            let path = format!("/api/runtime/executions/{execution_id}?detail_scope=full");
+            // Acceptance consumes public graph topology, work state, bounded
+            // activities and terminal evidence refs. Those are all present in
+            // Summary. Full entity/model-event detail can exceed megabytes
+            // and changes on every graph revision, so polling it multiplied a
+            // single 16-Agent run into roughly a gigabyte of observation I/O.
+            let path = format!("/api/runtime/executions/{execution_id}?detail_scope=summary");
             let response = self.get_json(&path);
             trace.push(bounded_projection_trace_entry(&path, &response));
             let Ok(projection) = response else {
