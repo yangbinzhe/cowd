@@ -1573,6 +1573,8 @@
             model_context_window: None,
             hook_progress_reporter: None,
             external_context_items: Vec::new(),
+            immutable_user_prefix: Vec::new(),
+            cache_cohort_user_prefix: Vec::new(),
             skill_profiles: Vec::new(),
             agent_skill_profile: AgentSkillProfile::default(),
             skill_prompt_assets: Vec::new(),

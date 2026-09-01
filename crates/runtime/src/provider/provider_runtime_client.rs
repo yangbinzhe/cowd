@@ -324,6 +324,9 @@ struct CompiledToolSchema {
 
 #[derive(Debug, Default)]
 struct ProviderPromptHistory {
+    /// Frozen user-role prefix. Changing it invalidates this local append-only
+    /// journal even when the conversational transcript itself is unchanged.
+    immutable_prefix: Vec<InputMessage>,
     session_history: Vec<InputMessage>,
     /// Exact model-visible messages sent on the last request, including each
     /// Runtime capsule before the Provider output it governed.
@@ -917,6 +920,7 @@ impl ProviderRuntimeClient {
         let messages = self.provider_input_messages(&request);
         let system = request.prompt.wire_system_text();
         let cache_cohort_system = request.prompt.cache_cohort_system_text();
+        let cache_cohort_user_prefix = request.prompt.cache_cohort_user_prefix_messages();
         debug_assert!(
             system
                 .as_deref()
@@ -1044,6 +1048,7 @@ impl ProviderRuntimeClient {
                     messages,
                     system,
                     cache_cohort_system,
+                    cache_cohort_user_prefix,
                     active_tools,
                     tool_choice,
                     request
@@ -1093,6 +1098,13 @@ impl ProviderRuntimeClient {
 impl ProviderRuntimeClient {
     fn provider_input_messages(&self, request: &ApiRequest) -> Vec<InputMessage> {
         let history = convert_messages(request.messages.iter());
+        let immutable_prefix = request
+            .prompt
+            .cache_cohort_user_prefix_messages()
+            .into_iter()
+            .chain(request.prompt.immutable_user_prefix_messages())
+            .map(InputMessage::user_text)
+            .collect::<Vec<_>>();
         let context = request
             .prompt
             .contextual_messages()
@@ -1103,15 +1115,22 @@ impl ProviderRuntimeClient {
             .prompt_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        compile_provider_input_messages(&mut state, history, context)
+        compile_provider_input_messages(&mut state, immutable_prefix, history, context)
     }
 }
 
 fn compile_provider_input_messages(
     state: &mut ProviderPromptHistory,
+    immutable_prefix: Vec<InputMessage>,
     history: Vec<InputMessage>,
     context: Vec<InputMessage>,
 ) -> Vec<InputMessage> {
+    if immutable_prefix != state.immutable_prefix {
+        state.generation = state.generation.saturating_add(1);
+        state.session_history.clear();
+        state.wire_messages.clear();
+        state.last_request_context.clear();
+    }
     let append_only = history.starts_with(&state.session_history);
     let history_unchanged = history == state.session_history;
     let context_unchanged = context == state.last_request_context;
@@ -1121,6 +1140,9 @@ fn compile_provider_input_messages(
         state.generation = state.generation.saturating_add(1);
         Vec::new()
     };
+    if wire.is_empty() {
+        wire.extend(immutable_prefix.iter().cloned());
+    }
     if append_only {
         wire.extend_from_slice(&history[state.session_history.len()..]);
     } else {
@@ -1133,6 +1155,7 @@ fn compile_provider_input_messages(
         wire.extend(context.iter().cloned());
     }
     state.session_history = history;
+    state.immutable_prefix = immutable_prefix;
     state.wire_messages.clone_from(&wire);
     state.last_request_context = context;
     wire
@@ -1144,6 +1167,7 @@ async fn forward_provider_attempt(
     messages: Vec<InputMessage>,
     system: Option<String>,
     cache_cohort_system: Option<String>,
+    cache_cohort_user_prefix: Vec<String>,
     active_tools: Vec<ToolDefinition>,
     tool_choice: Option<ToolChoice>,
     max_tokens: u32,
@@ -1204,6 +1228,7 @@ async fn forward_provider_attempt(
         &wire_request,
         security_domain,
         cache_cohort_system.as_deref(),
+        &cache_cohort_user_prefix,
     );
     let cache_behavior = ProviderCapabilityProfile::prompt_cache_behavior(&entry.model);
     let warmup = transport_pool
@@ -1348,6 +1373,7 @@ fn provider_cache_material(
     wire: &provider::ProviderWireRequest,
     security_domain: &str,
     cache_cohort_system: Option<&str>,
+    cache_cohort_user_prefix: &[String],
 ) -> (String, Vec<u8>) {
     let mut properties = wire.body.clone();
     let prompt_value = properties
@@ -1397,6 +1423,8 @@ fn provider_cache_material(
     // system message for OpenAI-compatible transports; providers with a
     // separate system field already carry it in `properties`.
     let stable_cohort_sha256 = format!("sha256:{:x}", Sha256::digest(stable_cohort_bytes));
+    let user_prefix_bytes = serde_json::to_vec(cache_cohort_user_prefix).unwrap_or_default();
+    let user_prefix_sha256 = format!("sha256:{:x}", Sha256::digest(user_prefix_bytes));
     let identity = serde_json::json!({
         "provider": context.profile.provider_name,
         "base_url": context.profile.base_url,
@@ -1408,6 +1436,7 @@ fn provider_cache_material(
         "cache_sensitive_properties": properties,
         "tool_schema_sha256": wire.tool_schema_sha256,
         "stable_cohort_sha256": stable_cohort_sha256,
+        "user_prefix_sha256": user_prefix_sha256,
     });
     let identity_bytes = serde_json::to_vec(&identity).unwrap_or_default();
     let cache_identity_sha256 = format!("sha256:{:x}", Sha256::digest(identity_bytes));
@@ -2112,18 +2141,21 @@ mod tests {
             &wire("shared-program", "agent-a"),
             "session-a",
             None,
+            &[],
         );
         let (agent_b, _) = provider_cache_material(
             &context,
             &wire("shared-program", "agent-b"),
             "session-a",
             None,
+            &[],
         );
         let (other_program, _) = provider_cache_material(
             &context,
             &wire("other-program", "agent-b"),
             "session-a",
             None,
+            &[],
         );
         assert_eq!(agent_a, agent_b);
         assert_ne!(agent_a, other_program);
@@ -2133,6 +2165,7 @@ mod tests {
                 &wire("shared-program", "agent-a"),
                 "session-a",
                 None,
+                &[],
             );
             assert_eq!(identity, agent_a);
             assert_eq!(canonical, agent_a_canonical);
@@ -2181,14 +2214,24 @@ mod tests {
             &wire("shared-program\nagent-a"),
             "session-a",
             Some("shared-program"),
+            &["shared-package".to_string()],
         );
         let (agent_b, _) = provider_cache_material(
             &context,
             &wire("shared-program\nagent-b"),
             "session-a",
             Some("shared-program"),
+            &["shared-package".to_string()],
         );
         assert_eq!(agent_a, agent_b);
+        let (other_package, _) = provider_cache_material(
+            &context,
+            &wire("shared-program\nagent-b"),
+            "session-a",
+            Some("shared-program"),
+            &["other-package".to_string()],
+        );
+        assert_ne!(agent_a, other_package);
     }
 
     #[test]
@@ -2205,8 +2248,12 @@ mod tests {
             .map(provider::InputMessage::user_text)
             .collect::<Vec<_>>();
         let mut state = ProviderPromptHistory::default();
-        let messages =
-            compile_provider_input_messages(&mut state, history.clone(), context.clone());
+        let messages = compile_provider_input_messages(
+            &mut state,
+            Vec::new(),
+            history.clone(),
+            context.clone(),
+        );
         assert_eq!(messages.len(), 2);
         assert!(matches!(
             messages[0].content.as_slice(),
@@ -2218,7 +2265,12 @@ mod tests {
         ));
         assert_eq!(prompt.wire_system_text().as_deref(), Some("stable-system"));
 
-        let retry = compile_provider_input_messages(&mut state, history.clone(), context.clone());
+        let retry = compile_provider_input_messages(
+            &mut state,
+            Vec::new(),
+            history.clone(),
+            context.clone(),
+        );
         assert_eq!(
             retry, messages,
             "an identical retry must not duplicate context"
@@ -2233,6 +2285,7 @@ mod tests {
         });
         let continuation = compile_provider_input_messages(
             &mut state,
+            Vec::new(),
             extended_history,
             vec![provider::InputMessage::user_text("runtime-clock-b")],
         );
@@ -2245,6 +2298,59 @@ mod tests {
         assert!(matches!(
             continuation[3].content.as_slice(),
             [InputContentBlock::Text { text }] if text == "runtime-clock-b"
+        ));
+    }
+
+    #[test]
+    fn immutable_user_prefix_precedes_private_history_and_resets_on_change() {
+        let prefix = vec![
+            provider::InputMessage::user_text("shared-team-context"),
+            provider::InputMessage::user_text("private-role-brief"),
+        ];
+        let history = vec![provider::InputMessage::user_text("role-a objective")];
+        let mut state = ProviderPromptHistory::default();
+        let first = compile_provider_input_messages(
+            &mut state,
+            prefix.clone(),
+            history.clone(),
+            Vec::new(),
+        );
+        assert_eq!(first.len(), 3);
+        assert!(matches!(
+            first[0].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "shared-team-context"
+        ));
+        assert!(matches!(
+            first[1].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "private-role-brief"
+        ));
+        assert!(matches!(
+            first[2].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "role-a objective"
+        ));
+
+        let retry = compile_provider_input_messages(
+            &mut state,
+            prefix.clone(),
+            history.clone(),
+            Vec::new(),
+        );
+        assert_eq!(retry, first, "exact retry keeps the frozen prefix");
+
+        let changed = compile_provider_input_messages(
+            &mut state,
+            vec![provider::InputMessage::user_text("other-team-context")],
+            history,
+            Vec::new(),
+        );
+        assert_eq!(
+            changed.len(),
+            2,
+            "changed package resets prior wire history"
+        );
+        assert!(matches!(
+            changed[0].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "other-team-context"
         ));
     }
 

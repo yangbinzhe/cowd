@@ -1,7 +1,7 @@
 version: 2
-release_version: 0.9.714
-release_authority: docs/architecture/provider-prompt-cache-hardening-v0.9.714.md
-release_evidence: docs/evidence/provider-prompt-cache-hardening-v0.9.714.md
+release_version: 0.9.715
+release_authority: docs/architecture/provider-cache-economics-v0.9.715.md
+release_evidence: docs/evidence/provider-cache-economics-v0.9.715.md
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh

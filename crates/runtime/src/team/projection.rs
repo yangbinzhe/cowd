@@ -609,6 +609,7 @@ mod tests {
             acceptance: Vec::new(),
             team_role_identity: intent.team_role_identity.clone(),
             team_role: Some(frozen_role("implementer")),
+            cohort_prompt_package: None,
             constraints: intent.constraints,
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),

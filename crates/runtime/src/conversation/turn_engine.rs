@@ -233,6 +233,8 @@ where
             context_profile: std::sync::Mutex::new(ContextProfile::MainTurn),
             runtime_control_policy,
             external_context_items: std::sync::Mutex::new(Vec::new()),
+            immutable_user_prefix: std::sync::Mutex::new(Vec::new()),
+            cache_cohort_user_prefix: std::sync::Mutex::new(Vec::new()),
             next_model_context_items: std::sync::Mutex::new(Vec::new()),
             next_model_text_only: AtomicBool::new(false),
             next_model_tool_allowlist: std::sync::Mutex::new(None),

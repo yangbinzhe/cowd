@@ -104,6 +104,8 @@ where
             runtime = runtime.with_hook_progress_reporter(reporter);
         }
         runtime = runtime.with_cowd_event_bus(CowdEventBus::new());
+        runtime.set_cache_cohort_user_prefix(config.cache_cohort_user_prefix);
+        runtime.set_immutable_user_prefix(config.immutable_user_prefix);
         for item in config.external_context_items {
             runtime.push_external_context_item(item);
         }

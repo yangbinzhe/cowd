@@ -91,6 +91,7 @@ impl PreparedRequestCompiler {
 
         let fixed_input_tokens = prompt
             .trusted_system_token_estimate()
+            .saturating_add(prompt.immutable_user_prefix_token_estimate())
             .saturating_add(history.weight().tokens)
             .saturating_add(inventory.tool_schema_tokens);
         cache.push_front(CachedRequestBasis {

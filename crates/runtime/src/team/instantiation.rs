@@ -17,7 +17,8 @@ use crate::{
     EvolutionReleaseAssignment, RuntimeDefinitionRegistry,
 };
 use harness_contract::agent::{
-    AgentDefinitionRevisionRef, AgentTaskIntent, AgentTaskPacket, RevisionSelector,
+    AgentDefinitionRevisionRef, AgentTaskIntent, AgentTaskPacket, CohortPromptPackage,
+    CohortPromptPacket, RevisionSelector,
 };
 use harness_contract::context::ChildExecutionBudgetReservation;
 use harness_contract::execution_graph::{
@@ -40,6 +41,67 @@ use harness_contract::team::{
 /// only a non-operational representability maximum.
 const MAX_TEAM_GRAPH_AGENT_NODES: usize = crate::MAX_REPRESENTABLE_TEAM_AGENT_NODES;
 pub(crate) const DEFAULT_PARENT_EXECUTION_TOKEN_BUDGET: u64 = 65_536;
+
+/// Compile only facts that Team admission already grants to every role.  This
+/// becomes a user-role immutable prefix after the exact Team binding digest is
+/// known; it is not a second context discovery path.
+fn team_cohort_prompt_packets(request: &TeamInstantiationRequest) -> Vec<CohortPromptPacket> {
+    let mut packets = vec![CohortPromptPacket {
+        source: "team_admission.objective".to_string(),
+        content: format!("## Team objective\n{}", request.objective.trim()),
+        evidence_refs: Vec::new(),
+    }];
+    if !request.acceptance.is_empty() {
+        packets.push(CohortPromptPacket {
+            source: "team_admission.acceptance".to_string(),
+            content: format!(
+                "## Shared acceptance\n{}",
+                request
+                    .acceptance
+                    .iter()
+                    .map(|criterion| format!("- {criterion}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            evidence_refs: Vec::new(),
+        });
+    }
+    if !request.upstream_result_context.is_empty() {
+        packets.push(CohortPromptPacket {
+            source: "team_admission.upstream_results".to_string(),
+            content: format!(
+                "## Runtime-materialized upstream results\n{}",
+                request.upstream_result_context.join("\n\n")
+            ),
+            evidence_refs: request
+                .upstream_evidence_refs
+                .iter()
+                .map(|reference| reference.evidence_ref.id.clone())
+                .collect(),
+        });
+    } else if !request.upstream_artifact_refs.is_empty()
+        || !request.upstream_evidence_refs.is_empty()
+    {
+        packets.push(CohortPromptPacket {
+            source: "team_admission.upstream_refs".to_string(),
+            content: format!(
+                "## Runtime-attested upstream references\n{}",
+                request
+                    .upstream_artifact_refs
+                    .iter()
+                    .map(|reference| format!("- artifact: {reference}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            evidence_refs: request
+                .upstream_evidence_refs
+                .iter()
+                .map(|reference| reference.evidence_ref.id.clone())
+                .collect(),
+        });
+    }
+    packets
+}
 
 pub(crate) fn bounded_parent_execution_budget(
     budget_id: impl Into<String>,
@@ -561,8 +623,12 @@ impl TeamInstantiationService {
                         .permission_ceiling
                         .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
                 );
-                let objective_context =
-                    bounded_objective_context(requires_managed_collaboration_escalation);
+                let role_shared_baseline = focus_partition
+                    .shared_baseline
+                    .iter()
+                    .filter(|baseline| !request.upstream_result_context.contains(*baseline))
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let intent = AgentTaskIntent {
                     selected_agent_id: Some(definition_ref.definition_id.as_str().to_string()),
                     definition_ref: Some(definition_ref.clone()),
@@ -593,14 +659,13 @@ impl TeamInstantiationService {
                     attempt: 1,
                     expected_graph_revision: 0,
                     objective: format!(
-                        "## Parent objective (context only)\n{}\n\nParent-level orchestration directives are owned by Runtime. Do not claim that this Agent created, observed, or completed Teams or peer roles. Report only this bounded role's verified work.\n\n## Team role\nRole: {}\nResponsibility: {}\nFocus: {}\nBoundary: {}\nEvidence responsibility: {}\nShared baseline: {}\nOutput contract: {}\n{}Complete only this bounded focus and state evidence plus unresolved items explicitly.",
-                        objective_context,
+                        "## Team role\nThe immutable Team objective, shared acceptance, and any Runtime-attested upstream context are supplied separately before this private role objective. Parent-level orchestration directives are owned by Runtime. Do not claim that this Agent created, observed, or completed Teams or peer roles. Report only this bounded role's verified work.\n\nRole: {}\nResponsibility: {}\nFocus: {}\nBoundary: {}\nEvidence responsibility: {}\nShared baseline: {}\nOutput contract: {}\n{}Complete only this bounded focus and state evidence plus unresolved items explicitly.",
                         role.role_id,
                         role.responsibility,
                         focus_partition.focus_id,
                         focus_partition.boundary,
                         focus_partition.evidence_responsibility,
-                        focus_partition.shared_baseline.join("; "),
+                        role_shared_baseline.join("; "),
                         focus_partition.output_contract.join(", "),
                         if upstream_only_consumer {
                             "Use only the canonical upstream results attached by Runtime. Those attached results are already authenticated and sufficient for this bounded synthesis: produce the requested conclusion now. No workspace, network, capability-discovery, tool-search, context-retrieval, or evidence-retrieval operation is authorized; do not request, simulate, or describe one, and do not say that you need to inspect access/capabilities/evidence before answering. Runtime-owned team_board and collaboration_control remain authorized solely for bounded Team exchange and required work review: use their native contracts when a Runtime autonomy checkpoint requires a protocol action, but never treat them as source reacquisition. Your success criterion is this Team's bounded Focus only. Peer Teams are outside your visibility and authority: never claim that another Team is missing, failed, incomplete, or needs to be rerun, and never judge whether the parent objective is complete. Return only this Team's positive verified conclusion plus genuine gaps inside this Team's own attached upstream results.\n"
@@ -929,6 +994,7 @@ impl TeamInstantiationService {
             &role_slots,
             request.strategy_binding.as_ref(),
         )?;
+        let cohort_packets = team_cohort_prompt_packets(&request);
         // Phase C: freeze the immutable human-facing display identity into
         // every Team-slot Binding before the graph is persisted. The display
         // is compiled from the same frozen Team role snapshot and never
@@ -946,9 +1012,9 @@ impl TeamInstantiationService {
             let mut packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
                 .map_err(|error| format!("decode Team role packet for display: {error}"))?;
             let agent_id = packet.agent_id().to_string();
-            let Some(agent_binding) = packet.binding.as_mut() else {
+            if packet.binding.is_none() {
                 continue;
-            };
+            }
             let role_slot_id = packet
                 .team_role_identity
                 .as_ref()
@@ -972,6 +1038,16 @@ impl TeamInstantiationService {
                 identity,
                 behavior: role.behavior.clone(),
             });
+            packet.cohort_prompt_package = Some(CohortPromptPackage::for_team_binding(
+                packet.assignment.session_id.clone(),
+                request.team_id.clone(),
+                binding.binding_digest.clone(),
+                cohort_packets.clone(),
+            ));
+            packet
+                .validate_cohort_prompt_package()
+                .map_err(|error| format!("validate Team cohort prompt package: {error}"))?;
+            let agent_binding = packet.binding.as_mut().expect("checked above");
             let role_display_name = request
                 .role_display_overrides
                 .iter()
@@ -2009,6 +2085,7 @@ fn bounded_slot_resource_scopes(team_scopes: &[String], focus_refs: &[String]) -
     scopes
 }
 
+#[cfg(test)]
 fn bounded_objective_context(requires_managed_collaboration_escalation: bool) -> String {
     let mut context = "Runtime intentionally withholds the parent cross-Team objective from delegated Team roles. Evaluate only this role's bounded Focus, resource scopes, acceptance contract, and canonical upstream results."
         .to_string();

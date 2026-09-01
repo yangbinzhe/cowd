@@ -146,6 +146,8 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
             Box::new(GatewayHookProgressReporter) as Box<dyn runtime::HookProgressReporter>
         }),
         external_context_items: vec![workspace_item, capability_item],
+        immutable_user_prefix: Vec::new(),
+        cache_cohort_user_prefix: Vec::new(),
         skill_profiles: skill_catalog.profiles(),
         agent_skill_profile: default_runtime_agent_skill_profile(),
         skill_prompt_assets: skill_catalog.prompt_assets(),

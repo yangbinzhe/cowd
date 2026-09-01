@@ -267,6 +267,11 @@ where
     pub model_context_window: Option<u32>,
     pub hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     pub external_context_items: Vec<ContextItem>,
+    /// Immutable user-role context compiled into a frozen delegated packet.
+    /// It is deliberately separate from dynamic external context items.
+    pub immutable_user_prefix: Vec<String>,
+    /// Shared immutable user context for the exact Provider cache cohort.
+    pub cache_cohort_user_prefix: Vec<String>,
     pub skill_profiles: Vec<SkillCapabilityProfile>,
     pub agent_skill_profile: AgentSkillProfile,
     pub skill_prompt_assets: Vec<crate::RuntimeSkillPromptAsset>,

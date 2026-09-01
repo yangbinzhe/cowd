@@ -406,6 +406,7 @@ mod tests {
             acceptance: Vec::new(),
             team_role_identity: None,
             team_role: None,
+            cohort_prompt_package: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),

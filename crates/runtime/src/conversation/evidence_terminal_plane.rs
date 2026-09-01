@@ -853,7 +853,10 @@ where
         }
         let mut memory_tokens = 0u64;
         let mut handoff_tokens = 0u64;
-        let mut contextual_tokens = request.prompt.runtime_context_token_estimate();
+        let mut contextual_tokens = request
+            .prompt
+            .runtime_context_token_estimate()
+            .saturating_add(request.prompt.immutable_user_prefix_token_estimate());
         for packet in &request.prompt.contextual_packets {
             let tokens =
                 crate::context_ledger::estimate_text_tokens(&packet.render_for_user_context());

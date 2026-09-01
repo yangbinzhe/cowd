@@ -49,6 +49,38 @@ where
         }
     }
 
+    pub(crate) fn set_immutable_user_prefix(&self, messages: Vec<String>) {
+        if let Ok(mut guard) = self.immutable_user_prefix.lock() {
+            *guard = messages
+                .into_iter()
+                .filter(|message| !message.trim().is_empty())
+                .collect();
+        }
+    }
+
+    fn immutable_user_prefix(&self) -> Vec<String> {
+        self.immutable_user_prefix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn set_cache_cohort_user_prefix(&self, messages: Vec<String>) {
+        if let Ok(mut guard) = self.cache_cohort_user_prefix.lock() {
+            *guard = messages
+                .into_iter()
+                .filter(|message| !message.trim().is_empty())
+                .collect();
+        }
+    }
+
+    fn cache_cohort_user_prefix(&self) -> Vec<String> {
+        self.cache_cohort_user_prefix
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Bind an absolute model-step ceiling supplied by the Runtime owner.
     /// This is not model-visible prompt text and cannot be raised by a
     /// delegated provider response.
@@ -1128,7 +1160,9 @@ where
             None,
         );
         self.remember_context_governance_report(report).await;
-        let prompt = Self::provider_prompt_from_envelope(&envelope);
+        let mut prompt = Self::provider_prompt_from_envelope(&envelope);
+        prompt.set_cache_cohort_user_prefix(self.cache_cohort_user_prefix());
+        prompt.set_immutable_user_prefix(self.immutable_user_prefix());
         self.remember_context_envelope(envelope).await;
         prompt
     }

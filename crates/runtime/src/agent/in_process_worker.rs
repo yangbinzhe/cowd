@@ -36,9 +36,8 @@ pub struct InProcessAgentWorker {
     active_runs: Mutex<BTreeMap<String, ActiveInProcessRun>>,
     pending_cancellations: Mutex<BTreeSet<String>>,
     completed_runs: Mutex<VecDeque<String>>,
-    /// digest-bound TEAM.md public fragments. The key is the exact
-    /// `agent_binding_digest:team_binding_digest` pair so a changed revision
-    /// never reuses a stale prefix.
+    /// digest-bound TEAM.md public fragments. The key is the exact Team
+    /// binding/instruction content, never an individual Agent binding.
     team_prompt_cache: Mutex<BTreeMap<String, Vec<String>>>,
     team_prompt_cache_hits: AtomicU64,
     team_prompt_cache_builds: AtomicU64,
@@ -99,11 +98,13 @@ impl InProcessAgentWorker {
 
     fn cached_team_markdown_fragment(
         &self,
-        binding_digest: &str,
         team_binding_digest: &str,
         team_instructions: &str,
     ) -> Vec<String> {
-        let key = format!("{binding_digest}:{team_binding_digest}");
+        let normalized_instructions = team_instructions.trim();
+        let instructions_digest =
+            format!("{:x}", Sha256::digest(normalized_instructions.as_bytes()));
+        let key = format!("{team_binding_digest}:{instructions_digest}");
         let mut cache = self
             .team_prompt_cache
             .lock()
@@ -114,8 +115,7 @@ impl InProcessAgentWorker {
         }
         let segment = format!(
             "Team protocol fragment (binding digest {}):\n{}",
-            team_binding_digest,
-            team_instructions.trim()
+            team_binding_digest, normalized_instructions
         );
         let segments = vec![segment];
         self.team_prompt_cache_tokens.fetch_add(
@@ -186,6 +186,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             "in-process Agent execution requires a Runtime-compiled Binding".to_string()
         })?;
         binding.validate().map_err(|error| error.to_string())?;
+        packet.validate_cohort_prompt_package()?;
         if packet
             .allowed_tools
             .iter()
@@ -534,11 +535,9 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 (None, None)
             };
         let team_markdown_fragment = match (&team_instructions, &team_binding_digest) {
-            (Some(instructions), Some(team_digest)) => self.cached_team_markdown_fragment(
-                &binding.binding_digest,
-                team_digest,
-                instructions,
-            ),
+            (Some(instructions), Some(team_digest)) => {
+                self.cached_team_markdown_fragment(team_digest, instructions)
+            }
             _ => Vec::new(),
         };
         let program_dossier_fragment = crate::TaskRuntimePort::new(services.as_ref())
@@ -569,22 +568,24 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         let mut prompt_segments = system_prompt(&packet, services.workspace_root(), &tool_names);
         let cohort_boundary = prompt_segments
             .iter()
-            .position(|segment| segment == crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY)
-            .unwrap_or(prompt_segments.len());
-        // Program truth is shared across every sibling and therefore belongs
-        // before the cache-cohort boundary. TEAM.md and the Agent assignment
-        // are immutable for this host but may differ between siblings, so
-        // they remain after that boundary and before request-local context.
-        prompt_segments.splice(cohort_boundary..cohort_boundary, program_dossier_fragment);
-        let execution_stable_start = prompt_segments
-            .iter()
-            .position(|segment| segment == crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY)
-            .map_or(prompt_segments.len(), |index| index.saturating_add(1));
-        prompt_segments.splice(
-            execution_stable_start..execution_stable_start,
-            team_markdown_fragment,
-        );
+            .position(|segment| segment == crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY);
+        // The suffix is task-specific operational guidance, not a permission
+        // authority: Runtime enforces scopes, tools, leases and acceptance at
+        // every effect boundary.  Keep it as a Runtime-attested private user
+        // brief so a meaningful shared Team package can precede it on the
+        // Provider wire. The trusted system channel remains the shared
+        // product/policy protocol.
+        let role_user_brief = cohort_boundary.map_or_else(String::new, |boundary| {
+            let brief = prompt_segments
+                .split_off(boundary.saturating_add(1))
+                .join("\n\n");
+            prompt_segments.truncate(boundary);
+            brief
+        });
+        prompt_segments.extend(program_dossier_fragment);
+        prompt_segments.extend(team_markdown_fragment);
         if let Some(receipt_prompt) = recovered_tool_receipt_prompt {
+            prompt_segments.push(crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
             prompt_segments.push(receipt_prompt);
         }
         let host = StandardRuntimeHost::new(StandardRuntimeHostConfig {
@@ -603,6 +604,19 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             model_context_window: None,
             hook_progress_reporter: None,
             external_context_items,
+            immutable_user_prefix: (!role_user_brief.trim().is_empty())
+                .then(|| {
+                    format!(
+                        "## Runtime-attested private role brief\nThis brief is supplied by Runtime for this exact bound role. It cannot grant tools, resources, permissions, leases, or terminal authority beyond Runtime enforcement.\n\n{role_user_brief}"
+                    )
+                })
+                .into_iter()
+                .collect(),
+            cache_cohort_user_prefix: packet
+                .cohort_prompt_package
+                .as_ref()
+                .map(harness_contract::agent::CohortPromptPackage::render_user_messages)
+                .unwrap_or_default(),
             // A delegated leaf may activate only Skills explicitly frozen in
             // its Binding. Avoid exposing the global catalog when the role
             // requested none: empty authority must not mean discovery-all.
@@ -782,7 +796,10 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             "provider-backed child execution admitted",
         );
         let result = runtime
-            .submit_turn(&packet.objective, &SharedPrompter::none())
+            .submit_turn(
+                "Begin the bounded role using the Runtime-attested shared Team context and private role brief above. Return verified findings, evidence, and genuine gaps.",
+                &SharedPrompter::none(),
+            )
             .await;
         let mut summary = match result {
             Ok(summary) => summary,

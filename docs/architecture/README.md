@@ -3,10 +3,11 @@
 ## 运行时
 
 Provider 请求缓存与成本治理的下一版本实施权威：
-[`provider-prompt-cache-hardening-v0.9.714.md`](provider-prompt-cache-hardening-v0.9.714.md)。
-该方案以真实 Provider 计费口径定义全程 `>=90%` 门禁，并覆盖稳定前缀、工具 schema
-纪元、多 Agent cache cohort/冷启动单飞、完整高价值上下文优先、append-only journal、
-自适应无损降级、压缩和失败恢复；稳态可比负载另设 `>=99%` 结构复用门而不伪报冷启动。
+[`provider-cache-economics-v0.9.715.md`](provider-cache-economics-v0.9.715.md)。它以 Provider
+原始 usage、可审计的请求分段和安全共享 package 定义分层目标：高复用同域 cohort 的真实
+冷启动输入命中 `>=90%`，低复用任务优化绝对成本与并发而不靠填充伪造比例。此前
+[`provider-cache-economics-v0.9.715.md`](provider-cache-economics-v0.9.715.md)
+保留为历史设计和已交付功能的证据，不再作为未完成 SLO 的验收权威。
 
 ```text
 Surface（TUI / WebUI / Connector）

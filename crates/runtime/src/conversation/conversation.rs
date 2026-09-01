@@ -3632,6 +3632,11 @@ pub struct ConversationRuntime<C, T> {
     runtime_control_policy: RuntimeControlPolicy,
     /// Runtime-owned context supplied by outer orchestration layers.
     external_context_items: std::sync::Mutex<Vec<ContextItem>>,
+    /// Immutable user-role prefix supplied only by a frozen delegated packet.
+    /// Dynamic context remains in the regular per-turn tail.
+    immutable_user_prefix: std::sync::Mutex<Vec<String>>,
+    /// Shared immutable user context for the exact Team cache cohort.
+    cache_cohort_user_prefix: std::sync::Mutex<Vec<String>>,
     /// One-shot instructions injected by an owner checkpoint for exactly the
     /// next provider request. They become part of that request's durable
     /// context envelope, but never mutate the user transcript or leak into

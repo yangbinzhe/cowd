@@ -131,6 +131,7 @@ fn test_agent_packet(
         acceptance: Vec::new(),
         team_role_identity: None,
         team_role: None,
+        cohort_prompt_package: None,
         constraints: Vec::new(),
         context_refs: Vec::new(),
         evidence_refs,
@@ -152,6 +153,31 @@ fn test_agent_packet(
         managed_invocation: None,
         idempotency_key: "key".into(),
     }
+}
+
+#[test]
+fn task_specific_role_brief_is_after_the_shared_system_boundary() {
+    let first = test_agent_packet(Vec::new());
+    let mut second = first.clone();
+    second.objective = "independently audit the alternate design".to_string();
+    second.resource_scopes = vec!["read:crates/runtime".to_string()];
+
+    let first_segments = system_prompt(&first, std::path::Path::new("/workspace"), &[]);
+    let second_segments = system_prompt(&second, std::path::Path::new("/workspace"), &[]);
+    let boundary = first_segments
+        .iter()
+        .position(|segment| segment == crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY)
+        .expect("delegated prompt carries the extraction boundary");
+    assert_eq!(
+        first_segments[..boundary],
+        second_segments[..boundary],
+        "role-private objective and resource scope must not fragment the shared system prefix"
+    );
+    assert_ne!(
+        first_segments[boundary + 1..],
+        second_segments[boundary + 1..],
+        "the extracted suffix remains a private Runtime-attested role brief"
+    );
 }
 
 #[test]
@@ -2118,6 +2144,7 @@ fn durable_audits_are_promoted_to_agent_evidence_refs() {
         acceptance: Vec::new(),
         team_role_identity: None,
         team_role: None,
+        cohort_prompt_package: None,
         constraints: Vec::new(),
         context_refs: Vec::new(),
         evidence_refs: vec![harness_contract::context::EvidenceAccessRef::durable(
@@ -2448,6 +2475,7 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
         acceptance: Vec::new(),
         team_role_identity: None,
         team_role: None,
+        cohort_prompt_package: None,
         constraints: Vec::new(),
         context_refs: Vec::new(),
         evidence_refs: Vec::new(),
@@ -2519,7 +2547,7 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
 #[test]
 fn team_markdown_fragment_cache_is_digest_bound_and_counts_metrics() {
     let worker = InProcessAgentWorker::new(std::sync::Weak::new());
-    let first = worker.cached_team_markdown_fragment("binding-a", "team-a", "# Team\n\nReview.");
+    let first = worker.cached_team_markdown_fragment("team-a", "# Team\n\nReview.");
     assert!(first[0].contains("binding digest team-a"));
     assert_eq!(worker.team_prompt_cache_stats().0, 0);
     assert_eq!(worker.team_prompt_cache_stats().1, 1);
@@ -2528,21 +2556,21 @@ fn team_markdown_fragment_cache_is_digest_bound_and_counts_metrics() {
         "token increment is recorded"
     );
 
-    let second = worker.cached_team_markdown_fragment("binding-a", "team-a", "# Team\n\nReview.");
+    let second = worker.cached_team_markdown_fragment("team-a", "# Team\n\nReview.");
     assert_eq!(first, second);
     assert_eq!(
         worker.team_prompt_cache_stats().0,
         1,
-        "same digest pair is a cache hit"
+        "same Team binding and instructions are a cache hit"
     );
     assert_eq!(worker.team_prompt_cache_stats().1, 1);
 
-    worker.cached_team_markdown_fragment("binding-a", "team-b", "# Team\n\nReview.");
-    worker.cached_team_markdown_fragment("binding-b", "team-a", "# Team\n\nReview.");
+    worker.cached_team_markdown_fragment("team-b", "# Team\n\nReview.");
+    worker.cached_team_markdown_fragment("team-a", "# Team\n\nChanged.");
     assert_eq!(
         worker.team_prompt_cache_stats().1,
         3,
-        "any digest change rebuilds the prefix; no stale prefix is reused"
+        "Team binding or normalized instruction changes rebuild; Agent binding does not split reuse"
     );
 }
 

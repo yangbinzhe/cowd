@@ -167,6 +167,17 @@ fn explicit_template_creates_bound_non_overlapping_role_slots() {
             .binding
             .as_ref()
             .expect("AgentTask must carry its Binding");
+        let package = packet
+            .cohort_prompt_package
+            .as_ref()
+            .expect("Team AgentTask must carry a frozen shared prompt package");
+        packet
+            .validate_cohort_prompt_package()
+            .expect("package must be bound to this Team packet");
+        assert!(package
+            .render_user_messages()
+            .iter()
+            .any(|message| message.contains("Investigate independent architecture options")));
         let upstream_only = packet
             .constraints
             .iter()
@@ -247,7 +258,14 @@ fn model_selected_focuses_activate_only_declared_template_roles() {
         .find(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
         .and_then(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok())
         .expect("explicit-focus AgentTask packet must decode");
-    assert!(packet.objective.contains("EXPLICIT_FOCUS_UPSTREAM_TAIL"));
+    assert!(!packet.objective.contains("EXPLICIT_FOCUS_UPSTREAM_TAIL"));
+    let package = packet
+        .cohort_prompt_package
+        .expect("Team packet must freeze shared upstream context");
+    assert!(package
+        .render_user_messages()
+        .iter()
+        .any(|message| message.contains("EXPLICIT_FOCUS_UPSTREAM_TAIL")));
 }
 
 #[test]
@@ -283,9 +301,18 @@ fn runtime_upstream_context_reaches_default_focus_agent_packets_losslessly() {
 
     assert!(!packets.is_empty());
     assert!(packets.iter().all(|packet| {
-        packet.objective.contains("COMPLETE_UPSTREAM_TAIL")
-            && packet.objective.contains("Verified predecessor artifacts")
-            && !packet.objective.contains("upstream result truncated")
+        !packet.objective.contains("COMPLETE_UPSTREAM_TAIL")
+            && packet
+                .cohort_prompt_package
+                .as_ref()
+                .map(harness_contract::agent::CohortPromptPackage::render_user_messages)
+                .is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message.contains("COMPLETE_UPSTREAM_TAIL")
+                            && message.contains("Verified predecessor artifacts")
+                            && !message.contains("upstream result truncated")
+                    })
+                })
     }));
 }
 

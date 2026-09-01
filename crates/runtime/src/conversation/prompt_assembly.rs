@@ -82,6 +82,14 @@ pub struct PromptAssembly {
     /// cohort. Remaining trusted segments are immutable for this execution
     /// but may differ between sibling Agents.
     pub(crate) cache_cohort_segment_count: usize,
+    /// Immutable user-role data shared by one exact Provider cache cohort.
+    /// It is emitted before private role instructions without becoming system
+    /// policy.
+    pub(crate) cache_cohort_user_prefix: Vec<String>,
+    /// Immutable but role-private user brief supplied by a frozen packet.
+    /// It follows the cohort prefix and therefore cannot cross a Team role
+    /// boundary while still staying before the private transcript.
+    pub(crate) immutable_user_prefix: Vec<String>,
     /// Runtime-attested request-local context. These fragments are emitted
     /// after the append-only conversation history so they cannot invalidate
     /// that history's Provider prefix.
@@ -111,6 +119,8 @@ impl PromptAssembly {
         Self {
             trusted_system: stable,
             cache_cohort_segment_count,
+            cache_cohort_user_prefix: Vec::new(),
+            immutable_user_prefix: Vec::new(),
             runtime_context: runtime,
             contextual_packets: Vec::new(),
         }
@@ -128,6 +138,8 @@ impl PromptAssembly {
         Self {
             trusted_system,
             cache_cohort_segment_count,
+            cache_cohort_user_prefix: Vec::new(),
+            immutable_user_prefix: Vec::new(),
             runtime_context: Vec::new(),
             contextual_packets: Vec::new(),
         }
@@ -143,6 +155,30 @@ impl PromptAssembly {
         if !segment.trim().is_empty() {
             self.runtime_context.push(segment);
         }
+    }
+
+    pub(crate) fn set_immutable_user_prefix(&mut self, messages: Vec<String>) {
+        self.immutable_user_prefix = messages
+            .into_iter()
+            .filter(|message| !message.trim().is_empty())
+            .collect();
+    }
+
+    pub(crate) fn set_cache_cohort_user_prefix(&mut self, messages: Vec<String>) {
+        self.cache_cohort_user_prefix = messages
+            .into_iter()
+            .filter(|message| !message.trim().is_empty())
+            .collect();
+    }
+
+    #[must_use]
+    pub(crate) fn cache_cohort_user_prefix_messages(&self) -> Vec<String> {
+        self.cache_cohort_user_prefix.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn immutable_user_prefix_messages(&self) -> Vec<String> {
+        self.immutable_user_prefix.clone()
     }
 
     pub(crate) fn push_context_item(&mut self, item: &ContextItem) {
@@ -235,6 +271,16 @@ impl PromptAssembly {
     pub fn estimated_chars(&self) -> usize {
         self.trusted_system.iter().map(String::len).sum::<usize>()
             + self
+                .cache_cohort_user_prefix
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+            + self
+                .immutable_user_prefix
+                .iter()
+                .map(String::len)
+                .sum::<usize>()
+            + self
                 .runtime_context
                 .iter()
                 .map(|context| render_runtime_context(context).len())
@@ -259,6 +305,15 @@ impl PromptAssembly {
             .map(|context| {
                 crate::context_ledger::estimate_text_tokens(&render_runtime_context(context))
             })
+            .sum()
+    }
+
+    #[must_use]
+    pub fn immutable_user_prefix_token_estimate(&self) -> u64 {
+        self.cache_cohort_user_prefix
+            .iter()
+            .chain(self.immutable_user_prefix.iter())
+            .map(|message| crate::context_ledger::estimate_text_tokens(message))
             .sum()
     }
 
@@ -294,6 +349,8 @@ impl PromptAssembly {
         let mut packed = Self {
             trusted_system: self.trusted_system.clone(),
             cache_cohort_segment_count: self.cache_cohort_segment_count,
+            cache_cohort_user_prefix: self.cache_cohort_user_prefix.clone(),
+            immutable_user_prefix: self.immutable_user_prefix.clone(),
             runtime_context: self.runtime_context.clone(),
             contextual_packets: Vec::new(),
         };

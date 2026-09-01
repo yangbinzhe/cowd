@@ -811,6 +811,7 @@ impl AgentBindingSnapshot {
                 .requires_managed_collaboration_escalation,
             team_role_identity,
             team_role: None,
+            cohort_prompt_package: None,
             acceptance: intent.acceptance,
             constraints: intent.constraints,
             context_refs: intent.context_refs,

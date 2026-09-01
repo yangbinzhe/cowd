@@ -619,6 +619,7 @@ fn validate_packet(packet: &AgentTaskPacket) -> Result<(), String> {
     packet
         .validate_team_role_binding()
         .map_err(str::to_string)?;
+    packet.validate_cohort_prompt_package()?;
     packet.budget_lease.validate().map_err(str::to_string)?;
     if packet.budget_lease.deadline_at_ms != packet.deadline_at_ms {
         return Err("AgentTaskPacket deadline differs from its parent execution budget".into());
@@ -656,6 +657,7 @@ mod tests {
             acceptance: vec!["reviewed".into()],
             team_role_identity: None,
             team_role: None,
+            cohort_prompt_package: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
             evidence_refs: Vec::new(),
