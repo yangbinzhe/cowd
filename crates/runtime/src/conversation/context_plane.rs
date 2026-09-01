@@ -1604,7 +1604,7 @@ where
         // adaptive envelope margin so the provider preflight cannot reject a
         // continuation after Runtime has admitted it.
         let safety_margin_tokens = if context_window_tokens <= 32_768 {
-            (context_window_tokens / 8).clamp(1_024, 4_096)
+            (context_window_tokens / 5).clamp(2_048, 4_096)
         } else {
             (context_window_tokens / 100).clamp(128, 2_048)
         };
