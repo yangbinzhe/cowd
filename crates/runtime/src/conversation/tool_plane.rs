@@ -640,6 +640,8 @@ where
                 let is_evidence_retrieve = tool_name == "evidence_retrieve";
                 let demand = task.resource_demand.clone();
                 let plane = Arc::clone(&self.tool_execution_plane);
+                let executor_owns_durable_effect =
+                    self.tool_executor.owns_durable_tool_effect(tool_name);
                 let effect_request = crate::RuntimeToolExecutionRequest {
                     governed_plan_id: plan_id.to_string(),
                     governed_plan_revision: plan_revision,
@@ -675,19 +677,27 @@ where
                         callback
                     })),
                 };
-                let effect_commit = self.runtime_event_store.as_ref().map(|store| {
-                    crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(store))
-                });
-                let effect_state = match effect_commit.as_ref() {
-                    Some(commit) => commit
+                let effect_commit = (!executor_owns_durable_effect)
+                    .then(|| {
+                        self.runtime_event_store.as_ref().map(|store| {
+                            crate::execution_core::graph::ExecutionCommitService::new(Arc::clone(
+                                store,
+                            ))
+                        })
+                    })
+                    .flatten();
+                let effect_state = match (executor_owns_durable_effect, effect_commit.as_ref()) {
+                    (true, _) => crate::execution_core::graph::ToolEffectState::NotRequired,
+                    (false, Some(commit)) => commit
                         .begin_tool_effect(&effect_request, &task.effect)
                         .map_err(|error| RuntimeError::new(error.to_string()))?,
-                    None if task.effect.effect_kind
-                        == harness_contract::tool::ToolEffectKind::Read =>
+                    (false, None)
+                        if task.effect.effect_kind
+                            == harness_contract::tool::ToolEffectKind::Read =>
                     {
                         crate::execution_core::graph::ToolEffectState::NotRequired
                     }
-                    None => {
+                    (false, None) => {
                         return Err(RuntimeError::new(
                             "mutation tool execution requires the durable Runtime effect ledger",
                         ));
@@ -802,7 +812,7 @@ where
                     ),
                 };
                 let output = output_draft.model_text().to_string();
-                if execute_fresh {
+                if execute_fresh && !executor_owns_durable_effect {
                     self.verify_session_execution_fence(
                         crate::SessionExecutionFencePhase::ToolCommit,
                     )

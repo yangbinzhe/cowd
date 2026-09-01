@@ -1465,23 +1465,33 @@ fn collaboration_comparison_uses_public_child_team_evidence_not_root_metrics() {
 fn live_timeout_is_complexity_aware_and_not_default_capped() {
     let direct = LiveScenarioTimeout::direct().with_cap(None);
     let team = LiveScenarioTimeout::team().with_cap(None);
-    assert!(team.max_wait > direct.max_wait);
+    assert!(team.nominal_wait > direct.nominal_wait);
+    assert!(team.absolute_wait > direct.absolute_wait);
 
     let capped = team.with_cap(Some(Duration::from_secs(600)));
-    assert_eq!(capped.max_wait, Duration::from_secs(600));
+    assert_eq!(capped.nominal_wait, Duration::from_secs(600));
+    assert_eq!(capped.absolute_wait, Duration::from_secs(600));
     assert_eq!(capped.inactivity_wait, Duration::from_secs(600));
 
     // An accidentally tiny operator cap cannot make the team scenario
     // fail before it has had one normal progress window.
     assert_eq!(
-        team.with_cap(Some(Duration::from_secs(30))).max_wait,
-        team.max_wait
+        team.with_cap(Some(Duration::from_secs(30))).absolute_wait,
+        team.absolute_wait
     );
+
+    let sixteen = LiveScenarioTimeout::large_scale(16);
+    let twenty_four = LiveScenarioTimeout::large_scale(24);
+    assert!(sixteen.absolute_wait > sixteen.nominal_wait);
+    assert!(twenty_four.absolute_wait > sixteen.absolute_wait);
 }
 
 #[test]
 fn first_provider_response_uses_the_full_complexity_deadline() {
     let team = LiveScenarioTimeout::team();
+    assert!(!team.should_abort_for_no_progress(Duration::from_secs(1_799), 0));
+    assert!(team.should_abort_for_no_progress(Duration::from_secs(1_800), 0));
+    assert!(!team.should_abort_for_no_progress(Duration::from_secs(1_800), 1));
     assert!(
         !team.should_abort_for_inactivity(Duration::from_secs(181), Duration::from_secs(181), 0,),
         "a submitted user message is not provider progress"

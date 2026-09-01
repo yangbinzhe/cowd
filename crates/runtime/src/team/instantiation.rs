@@ -2012,6 +2012,12 @@ fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<Stri
                 && std::path::Path::new(path).extension().is_some()
         });
     let workspace_write = scopes.iter().any(|scope| scope.starts_with("write:"));
+    let whole_workspace_sandbox = scopes.iter().any(|scope| {
+        matches!(
+            scope.trim(),
+            "read:." | "read:./" | "write:." | "write:./" | "workspace:."
+        )
+    });
     tools
         .iter()
         .filter(|tool| match tool.as_str() {
@@ -2019,6 +2025,11 @@ fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<Stri
             "read_file" => workspace_read,
             "grep_search" | "glob_search" => workspace_read && !exact_file_read,
             "write_file" | "edit_file" | "bash" => workspace_write,
+            // execute_code is the only process tool delegated to Team
+            // Agents. Its registered descriptor proves a kernel-hardened,
+            // read-only, no-network workspace sandbox. Exact file/directory
+            // leases must not silently widen to that whole-workspace view.
+            "execute_code" => whole_workspace_sandbox,
             // Context continuity, discovery over the already-cropped catalog,
             // and Team exchange do not widen a resource lease.
             "context_retrieve"
@@ -2142,6 +2153,7 @@ mod acceptance_contract_tests {
             "write_file".to_string(),
             "edit_file".to_string(),
             "bash".to_string(),
+            "execute_code".to_string(),
             "unclassified_extension".to_string(),
         ];
         assert_eq!(
@@ -2156,6 +2168,17 @@ mod acceptance_contract_tests {
                 "write_file".to_string(),
                 "edit_file".to_string(),
                 "bash".to_string(),
+            ]
+        );
+        assert_eq!(
+            crop_tools_to_resource_lease(&tools, &["write:.".to_string()]),
+            vec![
+                "read_file".to_string(),
+                "grep_search".to_string(),
+                "write_file".to_string(),
+                "edit_file".to_string(),
+                "bash".to_string(),
+                "execute_code".to_string(),
             ]
         );
     }

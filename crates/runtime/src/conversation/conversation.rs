@@ -2531,6 +2531,15 @@ pub trait ToolExecutor: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Whether this executor is the sole durable intent/receipt owner for the
+    /// concrete tool. The conversation plane owns effects by default. A
+    /// scoped delegated executor may override this when it must normalize the
+    /// input and persist typed evidence at a narrower authority boundary.
+    /// Exactly one layer may return true for an invocation.
+    fn owns_durable_tool_effect(&self, _tool_name: &str) -> bool {
+        false
+    }
+
     /// Validate provider-supplied input before Runtime publishes the ToolUse
     /// block, negotiates permission, or reserves execution capacity.
     /// Production executors bind this check to their pinned catalog; the

@@ -1265,7 +1265,9 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
                 .expect("path identities"),
         ),
         scope_locks: Arc::new(ScopeLockManager::new()),
-        commit_service: None,
+        commit_service: Some(crate::execution_core::graph::ExecutionCommitService::new(
+            Arc::new(crate::RuntimeEventStore::try_open_in_memory().expect("effect ledger")),
+        )),
         resource_scopes: Some(scopes),
         managed_invocation: None,
         next_receipt_sequence: AtomicU64::new(0),
@@ -1274,7 +1276,10 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
     };
     let input = r#"{"language":"python","code":"print(1)"}"#;
 
-    build(vec!["read:.".to_string()])
+    let whole_workspace = build(vec!["read:.".to_string()]);
+    assert!(whole_workspace.owns_durable_tool_effect("execute_code"));
+    assert!(!whole_workspace.owns_durable_tool_effect("team_board"));
+    whole_workspace
         .enforce_resource_ceiling("execute_code", input)
         .expect("whole-workspace read lease admits the read-only sandbox");
     assert!(build(vec!["read:src".to_string()])

@@ -171,7 +171,7 @@ fn autonomous_deepseek_spec() -> Result<LiveScenarioSpec, String> {
             minimum_discussions: if scale == 24 { 12 } else { 8 },
             output_path: AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,
         },
-        timeout: LiveScenarioTimeout::large_scale(),
+        timeout: LiveScenarioTimeout::large_scale(scale),
     })
 }
 
@@ -856,7 +856,7 @@ impl LiveScenarioRunner {
                     minimum_claimed_cross_team_edges: 5,
                     evidence_profile: ArchitectureEvidenceProfile::LargeScaleIndependentReview,
                 },
-                timeout: LiveScenarioTimeout::large_scale(),
+                timeout: LiveScenarioTimeout::large_scale(12),
             });
         }
         if autonomous_deepseek_scenario_enabled() {
@@ -1289,15 +1289,30 @@ impl LiveScenarioRunner {
             if since_progress >= Duration::from_secs(30) {
                 observer.mark_quiet();
             }
-            if elapsed >= timeout.max_wait {
+            if elapsed >= timeout.absolute_wait {
                 observer.mark_stalled();
                 return Err(format!(
-                    "timed out after {}ms waiting for a durable assistant message; maximum scenario wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
+                    "timed out after {}ms waiting for a durable assistant message; absolute scenario safety wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
                     elapsed.as_millis(),
-                    timeout.max_wait.as_millis(),
+                    timeout.absolute_wait.as_millis(),
                     observer.phase(),
                     observer.last_active_phase(),
                     observer.progress_observations(),
+                    observer.next_message_sequence(),
+                    observer.timeline_cursor().unwrap_or("-"),
+                ));
+            }
+            if timeout
+                .should_abort_for_no_progress(elapsed, observer.progress_observations() as usize)
+            {
+                observer.mark_stalled();
+                return Err(format!(
+                    "no durable execution progress before the nominal scenario wait elapsed after {}ms; nominal wait={}ms, absolute safety wait={}ms, phase={}, last_active_phase={}, message_cursor={}, timeline_cursor={}",
+                    elapsed.as_millis(),
+                    timeout.nominal_wait.as_millis(),
+                    timeout.absolute_wait.as_millis(),
+                    observer.phase(),
+                    observer.last_active_phase(),
                     observer.next_message_sequence(),
                     observer.timeline_cursor().unwrap_or("-"),
                 ));
@@ -1309,11 +1324,12 @@ impl LiveScenarioRunner {
             ) {
                 observer.mark_stalled();
                 return Err(format!(
-                    "no durable execution progress for {}ms after {}ms; inactivity window={}ms, maximum scenario wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
+                    "no durable execution progress for {}ms after {}ms; inactivity window={}ms, nominal wait={}ms, absolute safety wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
                     since_progress.as_millis(),
                     elapsed.as_millis(),
                     timeout.inactivity_wait.as_millis(),
-                    timeout.max_wait.as_millis(),
+                    timeout.nominal_wait.as_millis(),
+                    timeout.absolute_wait.as_millis(),
                     observer.phase(),
                     observer.last_active_phase(),
                     observer.progress_observations(),
@@ -1358,7 +1374,7 @@ impl LiveScenarioRunner {
         &self,
         execution_id: &str,
     ) -> Result<RootExecutionObservation, String> {
-        let path = format!("/api/runtime/executions/{execution_id}");
+        let path = format!("/api/runtime/executions/{execution_id}?detail_scope=summary");
         match self.get_json(&path) {
             Ok(projection) => {
                 let response_body_bytes = serde_json::to_vec(&projection)
@@ -1603,7 +1619,17 @@ impl LiveScenarioRunner {
                 };
             }
 
-            if scenario_started.elapsed() >= timeout.max_wait {
+            let scenario_elapsed = scenario_started.elapsed();
+            let since_progress = Duration::from_millis(
+                observer.since_last_progress_ms(scenario_elapsed.as_millis() as u64),
+            );
+            if scenario_elapsed >= timeout.absolute_wait
+                || timeout.should_abort_for_inactivity(
+                    scenario_elapsed,
+                    since_progress,
+                    observer.progress_observations() as usize,
+                )
+            {
                 return DescendantTeamWait {
                     timeline,
                     projections,
@@ -1612,7 +1638,12 @@ impl LiveScenarioRunner {
                         "required": true,
                         "elapsed_ms": wait_started.elapsed().as_millis(),
                         "observations": observations,
-                        "terminal_reason": "scenario_max_wait_elapsed_while_team_descendants_running",
+                        "terminal_reason": if scenario_elapsed >= timeout.absolute_wait {
+                            "scenario_absolute_wait_elapsed_while_team_descendants_running"
+                        } else {
+                            "scenario_inactivity_wait_elapsed_while_team_descendants_running"
+                        },
+                        "since_last_progress_ms": since_progress.as_millis(),
                         "team_health": health.to_value(),
                     }),
                 };
@@ -2000,14 +2031,16 @@ struct LiveScenarioSpec {
 }
 
 /// Evaluation-side waiting policy. The Runtime never receives this value and
-/// therefore cannot use it as a business-finalization deadline. A durable
-/// progress observation resets only the inactivity window; the bounded maximum
-/// protects the isolated test process from a provider outage or hung Gateway.
+/// therefore cannot use it as a business-finalization deadline. A scenario
+/// with no progress stops at its nominal wait. Once durable
+/// progress exists, each observation renews the inactivity window up to an
+/// absolute safety ceiling. The Runtime never sees any of these values.
 #[derive(Clone, Copy)]
 struct LiveScenarioTimeout {
     initial_wait: Duration,
     inactivity_wait: Duration,
-    max_wait: Duration,
+    nominal_wait: Duration,
+    absolute_wait: Duration,
 }
 
 impl LiveScenarioTimeout {
@@ -2015,7 +2048,8 @@ impl LiveScenarioTimeout {
         Self {
             initial_wait: Duration::from_secs(45),
             inactivity_wait: Duration::from_secs(45),
-            max_wait: Duration::from_secs(120),
+            nominal_wait: Duration::from_secs(120),
+            absolute_wait: Duration::from_secs(240),
         }
     }
 
@@ -2023,7 +2057,8 @@ impl LiveScenarioTimeout {
         Self {
             initial_wait: Duration::from_secs(90),
             inactivity_wait: Duration::from_secs(75),
-            max_wait: Duration::from_secs(300),
+            nominal_wait: Duration::from_secs(300),
+            absolute_wait: Duration::from_secs(600),
         }
     }
 
@@ -2035,15 +2070,24 @@ impl LiveScenarioTimeout {
             // process; the Runtime retains its own provider-progress policy.
             initial_wait: Duration::from_secs(360),
             inactivity_wait: Duration::from_secs(600),
-            max_wait: Duration::from_secs(1_800),
+            nominal_wait: Duration::from_secs(1_800),
+            absolute_wait: Duration::from_secs(3_600),
         }
     }
 
-    const fn large_scale() -> Self {
+    const fn large_scale(agent_count: usize) -> Self {
+        // A real provider-backed Agent step can legitimately take around
+        // three minutes including tool and durable commit work. Derive the
+        // hard ceiling from declared topology instead of using the former
+        // fixed 30-minute cutoff. Independent branches still finish earlier;
+        // this is only the isolated evaluator's last-resort kill switch.
+        let derived = 900_u64.saturating_add((agent_count as u64).saturating_mul(180));
+        let topology_ceiling_secs = if derived < 1_800 { 1_800 } else { derived };
         Self {
             initial_wait: Duration::from_secs(360),
             inactivity_wait: Duration::from_secs(480),
-            max_wait: Duration::from_secs(1_800),
+            nominal_wait: Duration::from_secs(1_800),
+            absolute_wait: Duration::from_secs(topology_ceiling_secs),
         }
     }
 
@@ -2060,7 +2104,8 @@ impl LiveScenarioTimeout {
         Self {
             initial_wait: self.initial_wait,
             inactivity_wait: self.inactivity_wait.min(cap),
-            max_wait: self.max_wait.min(cap),
+            nominal_wait: self.nominal_wait.min(cap),
+            absolute_wait: self.absolute_wait.min(cap),
         }
     }
 
@@ -2076,7 +2121,8 @@ impl LiveScenarioTimeout {
         json!({
             "initial_wait_ms": self.initial_wait.as_millis(),
             "inactivity_wait_ms": self.inactivity_wait.as_millis(),
-            "max_wait_ms": self.max_wait.as_millis(),
+            "nominal_wait_ms": self.nominal_wait.as_millis(),
+            "absolute_wait_ms": self.absolute_wait.as_millis(),
             "elapsed_ms": elapsed.as_millis(),
             "since_last_progress_ms": since_progress.as_millis(),
             "progress_observations": progress_observations,
@@ -2084,6 +2130,10 @@ impl LiveScenarioTimeout {
             "phase": phase,
             "last_active_phase": last_active_phase,
         })
+    }
+
+    fn should_abort_for_no_progress(self, elapsed: Duration, progress_observations: usize) -> bool {
+        progress_observations == 0 && elapsed >= self.nominal_wait
     }
 
     fn should_abort_for_inactivity(

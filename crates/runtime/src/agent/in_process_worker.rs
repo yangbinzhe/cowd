@@ -1666,6 +1666,19 @@ impl ToolExecutor for ScopedRuntimeToolExecutor {
             .collect()
     }
 
+    fn owns_durable_tool_effect(&self, tool_name: &str) -> bool {
+        self.commit_service.is_some()
+            && self.allowed_tools.contains(tool_name)
+            && !matches!(
+                tool_name,
+                "tool_search"
+                    | "team_board"
+                    | "collaboration_control"
+                    | "evidence_retrieve"
+                    | "request_collaboration_escalation"
+            )
+    }
+
     fn model_delivery_requirement(
         &self,
         tool_name: &str,
