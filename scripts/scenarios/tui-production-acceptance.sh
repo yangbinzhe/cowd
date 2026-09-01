@@ -680,7 +680,7 @@ wait_message "$SESSION_A" "TUI_ACCEPTANCE-SLOW-END" \
   || fail "slow streaming response did not complete"
 wait_capture writer 'TUI_ACCEPTANCE-SLOW-END' slow-complete \
   || fail "slow streaming completion was not rendered"
-wait_capture writer 'ctx[[:space:]]+[[:digit:].]+k?[[:space:]]+/16[.]4k' slow-complete-metrics \
+wait_capture writer 'ctx[[:space:]]+[[:digit:].]+k?[[:space:]]+/32[.]8k' slow-complete-metrics \
   || fail "canonical execution metrics did not reach a stable terminal render"
 capture_utf8 writer slow-complete-utf8 \
   || fail "slow completion UTF-8 transcript could not be captured"
