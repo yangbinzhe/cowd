@@ -26,7 +26,7 @@ pub const EXACT_FILE_EVIDENCE_GUIDANCE: &str = "For a file resource, evidence_sc
 /// Typed distinction between delivery-only dependencies and independent
 /// verification. Keep this separate so every model-facing surface can repeat
 /// it without relying on role names or natural-language responsibility text.
-pub const INDEPENDENT_REVIEW_GUIDANCE: &str = "A successor that must independently verify a predecessor must use a local dependency with kind `review_of`; `handoff` and `aggregate` mean upstream consumption/synthesis and do not authorize independent evidence reacquisition. If an `independent_review` acceptance criterion is supplied, its `subject_role_id` must name the same local `review_of` predecessor.";
+pub const INDEPENDENT_REVIEW_GUIDANCE: &str = "A successor that must independently verify a predecessor must use a local dependency with kind `review_of`; this authorizes independent evaluation of the authenticated predecessor artifact. Fresh workspace or network evidence reacquisition additionally requires a concrete `evidence_scope`; without one the reviewer is a zero-tool consumer. `handoff` and `aggregate` mean upstream consumption/synthesis, not independent review. If an `independent_review` acceptance criterion is supplied, its `subject_role_id` must name the same local `review_of` predecessor.";
 
 /// Capability identifiers a semantic role may request under an authenticated
 /// permission ceiling. Runtime's compiler and model-facing instruction share
@@ -904,6 +904,7 @@ mod tests {
         assert!(EXACT_FILE_EVIDENCE_GUIDANCE.contains("whole-file content through EOF"));
         assert!(EXACT_FILE_EVIDENCE_GUIDANCE.contains("numLines=totalLines"));
         assert!(INDEPENDENT_REVIEW_GUIDANCE.contains("kind `review_of`"));
-        assert!(INDEPENDENT_REVIEW_GUIDANCE.contains("do not authorize"));
+        assert!(INDEPENDENT_REVIEW_GUIDANCE.contains("concrete `evidence_scope`"));
+        assert!(INDEPENDENT_REVIEW_GUIDANCE.contains("zero-tool consumer"));
     }
 }

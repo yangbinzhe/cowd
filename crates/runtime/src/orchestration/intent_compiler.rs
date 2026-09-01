@@ -646,6 +646,19 @@ fn compile_team(
             cross_workstream_consumers.contains(&role.role_id),
             terminal_owns_workstream_evidence,
         );
+        let upstream_only = behavior_is_upstream_only(&behavior);
+        if upstream_only && !role.required_tools.is_empty() {
+            let mut diagnostic = CollaborationCompileDiagnostic::validation(
+                "upstream_only_role_declares_tools",
+                format!("workstreams[{workstream_index}].team.roles[{index}].required_tools"),
+            );
+            diagnostic.semantic_ids = vec![role.role_id.clone()];
+            diagnostic.allowed_repairs = vec![
+                "remove_required_tools_and_consume_the_authenticated_upstream_artifact".to_string(),
+                "add_a_concrete_evidence_scope_when_fresh_reacquisition_is_required".to_string(),
+            ];
+            return Err(diagnostic.into());
+        }
         // `output_artifacts` are not merely dependency-routing labels for a
         // terminal role.  They are the Team's promised terminal result
         // schema, so they must lower into that role's Runtime-verifiable
@@ -677,10 +690,21 @@ fn compile_team(
             acceptance,
             input_artifacts: canonical_set(&role.input_artifacts),
             output_artifacts: canonical_set(&role.output_artifacts),
-            allowed_tool_contract_refs: selected
-                .executable_tools
-                .clone()
-                .unwrap_or_else(|| canonical_tool_refs(&role.required_tools)),
+            // Agent Definitions expose their complete immutable executable
+            // allowlist. That profile-level inventory is not a model request
+            // for every role to invoke tools. An upstream-only consumer has
+            // no fresh evidence obligation, so compile it to an explicit
+            // zero-tool contract instead of forwarding the profile inventory
+            // and making the later instantiator reject an otherwise valid
+            // handoff/review graph.
+            allowed_tool_contract_refs: if upstream_only {
+                Vec::new()
+            } else {
+                selected
+                    .executable_tools
+                    .clone()
+                    .unwrap_or_else(|| canonical_tool_refs(&role.required_tools))
+            },
             allowed_skill_refs: canonical_set(&role.required_skills),
             behavior,
         });
@@ -1114,6 +1138,23 @@ fn derive_behavior(
         behavior.push(RoleBehaviorFacet::ReacquireEvidence { required: false });
     }
     behavior
+}
+
+fn behavior_is_upstream_only(behavior: &[RoleBehaviorFacet]) -> bool {
+    let consumes_upstream = behavior.iter().any(|facet| {
+        matches!(
+            facet,
+            RoleBehaviorFacet::UpstreamConsumption { required: true }
+                | RoleBehaviorFacet::Reducer { .. }
+        )
+    });
+    let reacquires = behavior.iter().any(|facet| {
+        matches!(
+            facet,
+            RoleBehaviorFacet::ReacquireEvidence { required: true }
+        )
+    });
+    consumes_upstream && !reacquires
 }
 
 fn terminal_role_id(
@@ -1775,6 +1816,50 @@ mod tests {
         assert!(reviewer["behavior"]
             .as_array()
             .is_some_and(|facets| facets.iter().any(|facet| facet["kind"] == "verification")));
+        assert_eq!(
+            reviewer["allowed_tool_contract_refs"],
+            serde_json::json!([]),
+            "a review_of role without a fresh evidence scope consumes the authenticated predecessor artifact and must not inherit its Agent profile's generic tool inventory"
+        );
+
+        let proposal: TeamTemplateProposal =
+            serde_json::from_value(compiled.template_proposal["teams"][0]["template"].clone())
+                .expect("compiled review template");
+        let candidate = crate::team_template_candidate::TemplateCandidateCompiler::compile(
+            services.definition_registry().as_ref(),
+            &proposal,
+            PermissionMode::ReadOnly,
+        )
+        .expect("the zero-tool review contract remains instantiable");
+        assert!(candidate.manifest.roles[1]
+            .task_contract
+            .allowed_tool_contract_refs
+            .is_empty());
+    }
+
+    #[test]
+    fn upstream_only_review_rejects_explicit_tool_requests_with_a_repair() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut invalid = decision();
+        invalid.workstreams[0].team.roles[1].acceptance.push(
+            ModelSemanticAcceptanceCriterion::IndependentReview {
+                subject_role_id: "任意取证角色".to_string(),
+            },
+        );
+        invalid.workstreams[0].team.roles[1].required_tools = vec!["read_file".to_string()];
+        invalid.workstreams[0].team.dependencies[0].kind =
+            ModelCollaborationDependencyKind::ReviewOf;
+
+        let error = compile_turn_scoped_intent(&request(), &invalid, &services)
+            .expect_err("an upstream-only review cannot explicitly request tools");
+        let IntentCompilerError::Diagnostic(diagnostic) = error else {
+            panic!("expected semantic diagnostic");
+        };
+        assert_eq!(diagnostic.code, "upstream_only_role_declares_tools");
+        assert!(diagnostic.allowed_repairs.contains(
+            &"add_a_concrete_evidence_scope_when_fresh_reacquisition_is_required".to_string()
+        ));
     }
 
     #[test]
@@ -1852,16 +1937,18 @@ mod tests {
             serde_json::from_value(compiled.template_proposal["teams"][0]["template"].clone())
                 .expect("compiled template proposal");
 
-        for role in proposal.roles {
-            assert_eq!(
-                role.allowed_tool_contract_refs,
-                vec![
-                    "context_retrieve".to_string(),
-                    "read_file".to_string(),
-                    "team_board".to_string(),
-                ]
-            );
-        }
+        assert_eq!(
+            proposal.roles[0].allowed_tool_contract_refs,
+            vec![
+                "context_retrieve".to_string(),
+                "read_file".to_string(),
+                "team_board".to_string(),
+            ]
+        );
+        assert!(
+            proposal.roles[1].allowed_tool_contract_refs.is_empty(),
+            "a profile inventory must be frozen only into roles with a fresh tool obligation"
+        );
     }
 
     #[test]
