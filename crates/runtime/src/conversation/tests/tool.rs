@@ -586,6 +586,49 @@
             .is_none(),
             "bounded recovery still cannot manufacture fixed evidence"
         );
+        let receipts = vec![serde_json::json!({
+            "sequence": 7,
+            "tool_call_id": "write-html",
+            "tool": "write_file",
+            "evidence_ref": "tool://write-html-receipt",
+            "paths": ["group-theory-ai-autonomous-evaluation.html"],
+        })];
+        let receipt_closed = normalized_receipt_backed_terminal_after_recovery(
+            "## summary\nPublished and verified the final HTML artifact.",
+            &[
+                "digest_receipt".into(),
+                "evidence".into(),
+                "html_artifact".into(),
+                "summary".into(),
+                "unresolved".into(),
+            ],
+            &receipts,
+        )
+        .expect("actual Runtime receipts close a presentation-only evidence carrier gap");
+        let receipt_closed = serde_json::from_str::<serde_json::Value>(&receipt_closed)
+            .expect("receipt-backed carrier");
+        assert_eq!(
+            receipt_closed["evidence"][0]["evidence_ref"],
+            "tool://write-html-receipt"
+        );
+        assert_eq!(
+            receipt_closed["html_artifact"]["status"],
+            "runtime_receipt_backed"
+        );
+        assert_eq!(
+            receipt_closed["digest_receipt"]["receipts"][0]["tool"],
+            "write_file"
+        );
+        assert_eq!(
+            receipt_closed["unresolved"][0]["no_empty_state_inferred"],
+            true
+        );
+        assert!(normalized_receipt_backed_terminal_after_recovery(
+            "## summary\nNo checked receipt.",
+            &["evidence".into(), "summary".into()],
+            &[],
+        )
+        .is_none());
         for invalid in ["", "<tool_call>{}</tool_call>", "```tool_use\n{}\n```"] {
             assert!(
                 normalized_terminal_after_bounded_recovery(
@@ -685,6 +728,15 @@
             workspace.path(),
         )
         .is_none());
+    }
+
+    #[test]
+    fn tool_receipt_projection_preserves_runtime_attested_sha256() {
+        let digest = "a".repeat(64);
+        let output = format!(
+            "Tool completed. Evidence: tool://write-ref. {{\"file\":{{\"filePath\":\"report.html\",\"sha256\":\"{digest}\",\"byteLength\":42}}}}"
+        );
+        assert_eq!(tool_receipt_sha256_digests(&output), vec![digest]);
     }
 
     #[derive(Clone)]
@@ -1289,6 +1341,9 @@
                         before_sha256: Some("b".repeat(64)),
                         after_sha256: "c".repeat(64),
                         write_sequence: 1,
+                        bytes: None,
+                        reread_sequence: None,
+                        reread_evidence_ref: None,
                     }]
                 })
                 .unwrap_or_default();

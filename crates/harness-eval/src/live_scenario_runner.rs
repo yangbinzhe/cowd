@@ -263,6 +263,15 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) 
     if spec_id == "live_tool_evidence" {
         resource_scopes.push("read:Cargo.toml");
     }
+    if spec_id == AUTONOMOUS_DEEPSEEK_SCENARIO_ID {
+        // The final publisher and the root terminal verifier share one exact
+        // artifact contract. Granting the child write indirectly while the
+        // root lacks the matching read made a successfully written artifact
+        // fail during the final reread. Keep the lease exact; do not broaden
+        // this isolated evaluation workspace to read/write `.`.
+        resource_scopes.push("read:group-theory-ai-autonomous-evaluation.html");
+        resource_scopes.push("write:group-theory-ai-autonomous-evaluation.html");
+    }
     let control = json!({
         "corpus_id": "live-scenarios-v1",
         "workspace_fixture": "none",
@@ -3410,6 +3419,30 @@ fn projected_team_health(projections: &[Value]) -> ProjectedTeamHealth {
                 .and_then(Value::as_str)
                 .unwrap_or("unidentified-agent");
             let status = projected_status(agent).unwrap_or("unknown");
+            agents.insert(id.to_string(), status.to_string());
+        }
+        // Summary projections intentionally omit mutable Agent-store detail,
+        // but the canonical graph retains Runtime-derived public Agent
+        // identity and status on every AgentTask node. Terminal acceptance
+        // must not turn 16 completed managed Agents into zero merely because
+        // their process-local display snapshots have already retired.
+        for node in projection
+            .pointer("/graph/nodes")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|node| node.get("kind").and_then(Value::as_str) == Some("agent_task"))
+        {
+            let id = node
+                .get("agent_instance_id")
+                .or_else(|| node.get("agent_run_id"))
+                .or_else(|| node.get("node_id"))
+                .and_then(Value::as_str)
+                .unwrap_or("unidentified-agent-node");
+            let status = node
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             agents.insert(id.to_string(), status.to_string());
         }
         for team in projection

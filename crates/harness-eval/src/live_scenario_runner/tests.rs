@@ -321,6 +321,29 @@ fn live_prompt_carries_an_explicit_shared_provider_token_lease() {
             "read:Cargo.toml"
         ])
     );
+
+    let autonomous = controlled_live_prompt(
+        AUTONOMOUS_DEEPSEEK_SCENARIO_ID,
+        "run autonomous collaboration".to_string(),
+        5_000_000,
+    );
+    let (autonomous_header, _) = autonomous.split_once('\n').expect("control header");
+    let autonomous_control: Value = serde_json::from_str(
+        autonomous_header
+            .strip_prefix("COWD_EVAL_CONTROL ")
+            .expect("typed evaluation prefix"),
+    )
+    .expect("autonomous control JSON");
+    assert_eq!(
+        autonomous_control["resource_scopes"],
+        json!([
+            "provider",
+            "provider_account",
+            "provider_token_pool",
+            "read:group-theory-ai-autonomous-evaluation.html",
+            "write:group-theory-ai-autonomous-evaluation.html"
+        ])
+    );
 }
 
 #[test]
@@ -987,6 +1010,23 @@ fn projected_team_health_uses_child_team_task_displays() {
     assert_eq!(health.completed_teams, 1);
     assert_eq!(health.agent_count, 4);
     assert_eq!(health.completed_agents, 4);
+}
+
+#[test]
+fn projected_team_health_recovers_terminal_agents_from_summary_graph_nodes() {
+    let health = projected_team_health(&[json!({
+        "agents": [],
+        "teams": [{"id": "team-1", "status": "completed"}],
+        "graph": {"nodes": [
+            {"node_id": "node-1", "kind": "agent_task", "agent_instance_id": "agent-1", "status": "completed"},
+            {"node_id": "node-2", "kind": "agent_task", "agent_instance_id": "agent-2", "status": "completed"},
+            {"node_id": "verify", "kind": "verify", "status": "completed"}
+        ]}
+    })]);
+
+    assert!(health.satisfies(1));
+    assert_eq!(health.agent_count, 2);
+    assert_eq!(health.completed_agents, 2);
 }
 
 #[test]

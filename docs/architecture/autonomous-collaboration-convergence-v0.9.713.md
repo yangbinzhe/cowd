@@ -12,9 +12,10 @@ convention. A valid execution must satisfy five coupled invariants:
 2. `write:.` maps to the checkpoint subsystem's canonical whole-workspace
    representation (an omitted path list). A model-supplied path list cannot
    narrow or redirect this Runtime-owned guard.
-3. A proposal is admitted only when another eligible Agent is actionable now:
-   Ready, Running, or Planned with every dependency completed. A dependency-
-   blocked Planned Agent is not market capacity.
+3. A proposal is admitted only when another eligible Agent is runnable now or
+   remains reachable later in the admitted dependency topology. This permits a
+   serial Team to hand work to its next role, while any Failed/Cancelled
+   ancestor makes that future capacity ineligible.
 4. Claim leases cover at least the work contract's declared duration, bounded
    by a 5-second minimum and 1-hour maximum. Expired claims advertise reclaim,
    never heartbeat or submit. The agent checkpoint carries the same rule.
@@ -22,6 +23,28 @@ convention. A valid execution must satisfy five coupled invariants:
    can still act. If every Agent is terminal, the reducer commits a typed
    `autonomous_work_orphaned` failure instead of leaving a forever-running
    graph.
+6. A Team whose frozen instructions explicitly require
+   `collaboration_control propose_work` turns that statement into a Runtime
+   checkpoint obligation. The topological first half of its Agents (2/4 or
+   3/6) must each author one proposal; omission after three bounded
+   continuations fails loudly instead of being accepted as prose completion.
+7. The first topological proposer's work must receive one independent
+   challenge before acceptance. Runtime supplies revision-fenced actions, but
+   the Agents still bid, claim, execute, publish, submit, challenge, revise and
+   accept through native tools.
+8. A Focus role whose business receipts and exact scopes are already satisfied
+   cannot be downgraded solely because its model omitted presentation keys.
+   After bounded recovery, Runtime may copy actual ToolHost receipts into the
+   evidence carrier and wrap custom artifacts; missing disclosure fields remain
+   explicit unknowns and are never fabricated as empty lists.
+9. A direct Agent workspace write becomes a delivery materialization only when
+   a later read observes the same digest and a positive byte length. This
+   produces the same typed `WorkspaceMaterializationReceipt` consumed by root
+   delivery and evaluation.
+10. `detail_scope=summary` is a bounded transport contract: it preserves public
+    Team/Agent identity, topology, lifecycle, numeric usage and work-market
+    receipts while cropping lossless result bodies, acceptance observations and
+    private path lists behind durable references.
 
 The live evaluator uses Summary projections for revision polling. Full
 projections remain available for one-shot failure diagnostics, but are not a
@@ -47,7 +70,16 @@ these owners.
 - repeated writes select only the causally terminal digest;
 - divergent final writes are rejected;
 - bounded and root checkpoint scopes compile to their canonical forms;
-- serial dependency successors are not advertised as active peers;
+- serial dependency successors are advertised as future schedulable peers but
+  never as currently active peers;
+- failed dependency ancestry is never proposal capacity;
+- explicit 4-Agent and 6-Agent market contracts require respectively two and
+  three topological proposers;
+- first-proposal challenge/revision/review is revision fenced;
+- receipt-backed terminal normalization never invents evidence or empty risk
+  declarations;
+- Agent write/read-back truth produces one typed delivery materialization;
+- Summary graph payloads are bounded without losing terminal Agent identity;
 - a requested short lease expands to the declared task duration;
 - unresolved work is not orphaned while any Agent is active and is orphaned
   after all Agents become terminal;

@@ -318,7 +318,7 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
         });
         branch_terminals.push(DeliveryBranchTerminal {
             branch_id: node.id.clone(),
-            execution_id,
+            execution_id: execution_id.clone(),
             status: branch_status,
             result_ref: result_ref.clone(),
             failure_ref,
@@ -362,8 +362,9 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
                         source_execution_id: Some(node.id.clone()),
                     });
                     applied_writes.insert((node.id.clone(), receipt.path.clone()));
+                    let write_effect_id = stable_effect_id(&node.id, &receipt.path);
                     verified_effects.push(VerifiedDeliveryEffect {
-                        effect_id: stable_effect_id(&node.id, &receipt.path),
+                        effect_id: write_effect_id.clone(),
                         kind: "workspace_write".to_string(),
                         status: VerifiedEffectStatus::Applied,
                         receipt_ref: Some(format!(
@@ -372,6 +373,52 @@ fn build_delivery_envelope(graph: &ExecutionGraph) -> DeliveryEnvelope {
                         )),
                         source_execution_id: Some(node.id.clone()),
                     });
+                    if let (Some(bytes), Some(reread_sequence), Some(reread_evidence_ref)) = (
+                        receipt.bytes,
+                        receipt.reread_sequence,
+                        receipt.reread_evidence_ref.as_deref(),
+                    ) {
+                        if bytes == 0
+                            || reread_sequence <= receipt.write_sequence
+                            || reread_evidence_ref.trim().is_empty()
+                        {
+                            continue;
+                        }
+                        let receipt_id = format!(
+                            "agent-materialization:{}:{}",
+                            node.id, receipt.write_sequence
+                        );
+                        verified_receipts.push(VerifiedDeliveryReference {
+                            reference_id: receipt_id.clone(),
+                            kind: "workspace_materialization".to_string(),
+                            source_execution_id: execution_id.clone(),
+                        });
+                        workspace_materializations.push(
+                            harness_contract::outcome::WorkspaceMaterializationReceipt {
+                                receipt_id,
+                                source_execution_id: execution_id
+                                    .clone()
+                                    .unwrap_or_else(|| graph.id.clone()),
+                                source_node_id: node.id.clone(),
+                                source_result_ref: result_ref.clone().unwrap_or_else(|| {
+                                    format!("execution-node:{}:result", node.id)
+                                }),
+                                target_path: receipt.path.clone(),
+                                artifact_kind: "agent_workspace_output".to_string(),
+                                before_sha256: receipt.before_sha256.clone(),
+                                sha256: receipt.after_sha256.clone(),
+                                bytes,
+                                write_effect_id,
+                                reread_verified: true,
+                                materialized_at_ms: result.finished_at_ms,
+                            },
+                        );
+                        verified_artifacts.push(VerifiedDeliveryReference {
+                            reference_id: reread_evidence_ref.to_string(),
+                            kind: "workspace_reread".to_string(),
+                            source_execution_id: execution_id.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1501,6 +1548,9 @@ mod tests {
             before_sha256: None,
             after_sha256: "sha256:abcd".to_string(),
             write_sequence: 1,
+            bytes: None,
+            reread_sequence: None,
+            reread_evidence_ref: None,
         };
         let mut usage = ExecutionUsage::default();
         usage.runtime_write_attempt_paths = vec!["reports/final.md".to_string()];
@@ -1540,5 +1590,52 @@ mod tests {
             .verified_artifacts
             .iter()
             .any(|artifact| artifact.reference_id == "workspace://reports/final.md"));
+    }
+
+    #[test]
+    fn agent_write_plus_distinct_reread_becomes_delivery_materialization() {
+        let mut graph = ExecutionGraph::new("publisher Team delivery");
+        add_evidence_branch(&mut graph, "publisher", "published", false);
+        let change = harness_contract::agent::AgentChangeReceipt {
+            path: "group-theory-ai-autonomous-evaluation.html".to_string(),
+            before_sha256: None,
+            after_sha256: "d".repeat(64),
+            write_sequence: 7,
+            bytes: Some(56_262),
+            reread_sequence: Some(8),
+            reread_evidence_ref: Some("event://publisher/read-back".to_string()),
+        };
+        graph
+            .node_results
+            .get_mut("publisher")
+            .expect("publisher result")
+            .evidence_refs
+            .push(EvidenceAccessRef::durable(
+                EvidenceRef::observed(
+                    "runtime_change",
+                    serde_json::to_string(&change).expect("change receipt"),
+                ),
+                "e".repeat(64),
+                512,
+                "application/json",
+                "event://publisher/write".to_string(),
+                "team:fixture",
+            ));
+
+        let envelope = build_delivery_envelope(&graph);
+
+        assert_eq!(envelope.workspace_materializations.len(), 1);
+        let receipt = &envelope.workspace_materializations[0];
+        assert_eq!(
+            receipt.target_path,
+            "group-theory-ai-autonomous-evaluation.html"
+        );
+        assert_eq!(receipt.sha256, "d".repeat(64));
+        assert_eq!(receipt.bytes, 56_262);
+        assert!(receipt.reread_verified);
+        assert!(envelope.verified_artifacts.iter().any(|artifact| {
+            artifact.reference_id == "event://publisher/read-back"
+                && artifact.kind == "workspace_reread"
+        }));
     }
 }

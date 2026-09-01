@@ -4126,6 +4126,81 @@ pub(super) fn normalized_terminal_after_bounded_recovery(
         .flatten()
 }
 
+/// Close a transport-only terminal gap from actual ToolHost receipts.
+///
+/// This is deliberately narrower than ordinary presentation normalization:
+/// it is called only after the bounded zero-tool recovery and only after the
+/// Focus acceptance reducer has no pending scope. The receipt objects are
+/// copied verbatim from successful tool-result messages. Runtime therefore
+/// supplies a missing `evidence` carrier without inventing evidence, wraps
+/// custom artifact fields with the same durable receipts, and records omitted
+/// disclosure fields as explicit unknowns rather than false empty arrays.
+pub(super) fn normalized_receipt_backed_terminal_after_recovery(
+    candidate: &str,
+    required: &[String],
+    receipts: &[serde_json::Value],
+) -> Option<String> {
+    if receipts.is_empty() {
+        return None;
+    }
+    let body = candidate.trim();
+    if body.is_empty()
+        || body.starts_with("<synthesized_terminal")
+        || body.contains("<tool_call>")
+        || body.contains("```tool_use")
+        || body.contains("<function=")
+    {
+        return None;
+    }
+    let mut object =
+        crate::agent_in_process_worker::structured_agent_output_for_fields(body, required)
+            .unwrap_or_default();
+    for field in required {
+        if !missing_required_structured_field_from_object(&object, field) {
+            continue;
+        }
+        let value = match field.as_str() {
+            "evidence" => serde_json::Value::Array(receipts.to_vec()),
+            "risks" | "unresolved" | "unresolved_or_risks" => serde_json::json!([{
+                "kind": "runtime_presentation_gap",
+                "status": "provider_omitted_after_bounded_recovery",
+                "field": field,
+                "no_empty_state_inferred": true,
+                "receipt_backed_business_work_completed": true,
+            }]),
+            "key_decisions" => return None,
+            "findings" => object
+                .get("summary")
+                .filter(|value| structured_field_is_materialized(Some(value)))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
+            "summary" => object
+                .get("findings")
+                .filter(|value| structured_field_is_materialized(Some(value)))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
+            field if narrative_terminal_field_is_safe(field) => {
+                serde_json::Value::String(body.to_string())
+            }
+            // A Runtime-declared custom artifact name has no universal JSON
+            // schema. Preserve the provider-authored terminal and attach the
+            // exact successful receipts rather than fabricating a digest or
+            // artifact claim from prose.
+            _ => serde_json::json!({
+                "status": "runtime_receipt_backed",
+                "provider_terminal": body,
+                "receipts": receipts,
+            }),
+        };
+        object.insert(field.clone(), value);
+    }
+    required
+        .iter()
+        .all(|field| !missing_required_structured_field_from_object(&object, field))
+        .then(|| serde_json::to_string(&object).ok())
+        .flatten()
+}
+
 pub(super) fn fixed_team_terminal_field(field: &str) -> bool {
     matches!(
         field,
@@ -4261,11 +4336,49 @@ pub(super) fn runtime_tool_receipt_evidence(
                     "tool": tool_name,
                     "evidence_ref": evidence_ref,
                     "paths": tool_receipt_workspace_paths(output, workspace_root),
+                    "sha256": tool_receipt_sha256_digests(output),
                 }))
             }
             _ => None,
         })
         .collect()
+}
+
+pub(super) fn tool_receipt_sha256_digests(output: &str) -> Vec<String> {
+    let Some(object_start) = output.find('{') else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&output[object_start..]) else {
+        return Vec::new();
+    };
+    fn collect(value: &serde_json::Value, output: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "sha256" | "observedRevisionOrDigest") {
+                        if let Some(digest) = value.as_str().filter(|digest| {
+                            let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+                            hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        }) {
+                            output.push(digest.to_string());
+                        }
+                    }
+                    collect(value, output);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, output);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut digests = Vec::new();
+    collect(&value, &mut digests);
+    digests.sort();
+    digests.dedup();
+    digests
 }
 
 pub(super) fn tool_receipt_workspace_paths(

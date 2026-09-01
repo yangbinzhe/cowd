@@ -1583,6 +1583,14 @@ where
                             && !reasoning_only_response
                             && !text.trim().is_empty()
                         {
+                            let receipt_evidence = if state.structured_output_replans > 0 {
+                                runtime_tool_receipt_evidence(
+                                    &state.tool_results,
+                                    self.services.workspace_root(),
+                                )
+                            } else {
+                                Vec::new()
+                            };
                             let normalized = normalized_team_terminal_candidate(
                                 &text,
                                 &state.focus_required_output_fields,
@@ -1593,6 +1601,17 @@ where
                                         normalized_declared_custom_terminal_after_recovery(
                                             &text,
                                             &state.focus_required_output_fields,
+                                        )
+                                    })
+                                    .flatten()
+                            })
+                            .or_else(|| {
+                                (state.structured_output_replans > 0)
+                                    .then(|| {
+                                        normalized_receipt_backed_terminal_after_recovery(
+                                            &text,
+                                            &state.focus_required_output_fields,
+                                            &receipt_evidence,
                                         )
                                     })
                                     .flatten()

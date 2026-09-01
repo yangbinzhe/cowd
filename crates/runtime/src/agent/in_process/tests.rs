@@ -101,6 +101,7 @@ fn scoped_receipt(
                 )])
             }),
         after_digests: BTreeMap::from([(path.to_string(), after.map(str::to_string))]),
+        observed_bytes: BTreeMap::new(),
         observed_evidence: Vec::new(),
     }
 }
@@ -209,6 +210,7 @@ fn change_and_source_verification_require_digest_delta_and_post_write_read() {
     let ungrounded = materialized_change_receipts(&write_then_read)
         .pop()
         .expect("digest changed");
+    assert_eq!(ungrounded.reread_sequence, Some(2));
     assert!(!has_matching_pre_write_evidence(
         &ungrounded,
         &write_then_read
@@ -218,6 +220,12 @@ fn change_and_source_verification_require_digest_delta_and_post_write_read() {
         &write_then_read,
         true
     ));
+    assert_eq!(
+        tool_output_byte_length(
+            r#"Tool completed. Evidence: tool://read. {"file":{"filePath":"src/lib.rs","byteLength":56262}}"#
+        ),
+        Some(56_262)
+    );
 
     let mut verified = read_before_write;
     verified.push(scoped_receipt(
@@ -278,6 +286,9 @@ fn upstream_review_matches_normalized_receipt_path_and_its_digest_key() {
         before_sha256: Some("before".to_string()),
         after_sha256: "after".to_string(),
         write_sequence: 3,
+        bytes: None,
+        reread_sequence: None,
+        reread_evidence_ref: None,
     };
     let receipt = ScopedToolExecutionReceipt {
         sequence: 1,
@@ -296,6 +307,7 @@ fn upstream_review_matches_normalized_receipt_path_and_its_digest_key() {
             "./fixtures/auto-strategy-write/target.txt".to_string(),
             Some("after".to_string()),
         )]),
+        observed_bytes: BTreeMap::new(),
         observed_evidence: Vec::new(),
     };
 
@@ -373,6 +385,9 @@ fn upstream_change_receipt_is_recovered_from_durable_evidence_binding() {
         before_sha256: Some("before".to_string()),
         after_sha256: "after".to_string(),
         write_sequence: 3,
+        bytes: None,
+        reread_sequence: None,
+        reread_evidence_ref: None,
     };
     let encoded = serde_json::to_string(&change).expect("change receipt JSON");
     let evidence = harness_contract::context::EvidenceAccessRef::durable(
@@ -396,12 +411,18 @@ fn upstream_change_receipt_uses_the_final_digest_after_repeated_writes() {
             before_sha256: Some("before".to_string()),
             after_sha256: "intermediate".to_string(),
             write_sequence: 3,
+            bytes: None,
+            reread_sequence: None,
+            reread_evidence_ref: None,
         },
         harness_contract::agent::AgentChangeReceipt {
             path: "fixtures/target.txt".to_string(),
             before_sha256: Some("intermediate".to_string()),
             after_sha256: "terminal".to_string(),
             write_sequence: 8,
+            bytes: None,
+            reread_sequence: None,
+            reread_evidence_ref: None,
         },
     ];
     let evidence = changes
@@ -756,6 +777,7 @@ async fn managed_escalation_recovery_is_bound_and_durably_receipted() {
             paths: vec!["crates/runtime/src/lib.rs".to_string()],
             prior_states: BTreeMap::new(),
             after_digests: BTreeMap::new(),
+            observed_bytes: BTreeMap::new(),
             observed_evidence: vec![source_evidence],
         }]),
         provider_model_obligations: Vec::new(),
@@ -2200,6 +2222,7 @@ fn exact_acceptance_evidence_requires_a_complete_model_receipt() {
         paths: vec!["src/lib.rs".to_string()],
         prior_states: BTreeMap::new(),
         after_digests: BTreeMap::new(),
+        observed_bytes: BTreeMap::new(),
         observed_evidence: vec![observed.clone()],
     };
     let required = RequiredAcceptance {
@@ -2597,4 +2620,52 @@ fn recovered_receipt_context_is_bounded_and_explicitly_fences_tools() {
     assert!(prompt.contains("committed output"));
     assert!(prompt.contains("Do not call tools"));
     assert!(prompt.contains("ToolHost receipts"));
+}
+
+#[test]
+fn autonomous_proposer_selection_follows_team_topology_not_node_sort_order() {
+    use harness_contract::execution_graph::{
+        ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
+    };
+
+    let mut graph = ExecutionGraph::new("serial autonomous Team");
+    for id in ["node", "a-successor", "z-final"] {
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+        node.id = id.to_string();
+        graph.nodes.push(node);
+    }
+    graph.edges.push(ExecutionEdge {
+        from: "node".to_string(),
+        to: "a-successor".to_string(),
+        kind: ExecutionEdgeKind::DependsOn,
+    });
+    graph.edges.push(ExecutionEdge {
+        from: "a-successor".to_string(),
+        to: "z-final".to_string(),
+        kind: ExecutionEdgeKind::DependsOn,
+    });
+
+    assert_eq!(
+        topological_agent_node_ids(&graph),
+        vec!["node", "a-successor", "z-final"]
+    );
+    assert_eq!(
+        designated_autonomous_proposer_nodes(&graph),
+        vec!["node", "a-successor"]
+    );
+    let packet = test_agent_packet(Vec::new());
+    let action = missing_required_proposal_action(&graph, &packet, true)
+        .expect("first topological Agent must propose");
+    assert_eq!(action["action"], "propose_work");
+    assert_eq!(
+        action.pointer("/mutation_template/operation"),
+        Some(&serde_json::Value::String("propose_work".to_string()))
+    );
+
+    let mut work = harness_contract::execution_graph::ExecutionWorkContract::new(
+        harness_contract::execution_graph::ExecutionWorkRole::CrossCheck,
+    );
+    work.proposed_by = Some(packet.agent_id().to_string());
+    graph.autonomous_work.insert("work-1".to_string(), work);
+    assert!(missing_required_proposal_action(&graph, &packet, true).is_none());
 }

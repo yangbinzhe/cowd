@@ -84,6 +84,11 @@ async fn snapshot_with_graph(
     let cancellation_receipt =
         latest_cancellation_receipt(services, session_id.as_deref(), execution_id);
     let concurrency = execution_concurrency(services, &graph, &scope);
+    let graph = if full {
+        graph
+    } else {
+        summary_graph_projection(graph)
+    };
 
     Ok(ExecutionProjection {
         schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
@@ -122,6 +127,112 @@ async fn snapshot_with_graph(
         cancellation_receipt,
         available_commands: available_commands(services, execution_id, context).await?,
     })
+}
+
+const SUMMARY_OBJECTIVE_CHARS: usize = 1_024;
+const SUMMARY_NODE_CHARS: usize = 1_024;
+const SUMMARY_WORK_CHARS: usize = 512;
+const SUMMARY_FAILURE_CHARS: usize = 512;
+const SUMMARY_STATE_ENTRIES: usize = 64;
+pub(super) const SUMMARY_EVIDENCE_REFS: usize = 32;
+
+/// Turn an execution graph into a bounded status/topology projection.
+///
+/// `ProjectionDetailScope::Summary` is a transport contract, not just a hint
+/// for related entities. Keeping lossless node results and acceptance
+/// observations here made a single lineage poll return megabytes while the
+/// same response still omitted the public Agent identities an operator needs.
+/// Full semantic outputs remain addressable through their durable result and
+/// evidence references; Summary retains identities, topology, lifecycle,
+/// numeric usage and the bounded collaboration-market receipts used by live
+/// control surfaces.
+pub(super) fn summary_graph_projection(
+    mut graph: harness_contract::execution_graph::ExecutionGraphProjection,
+) -> harness_contract::execution_graph::ExecutionGraphProjection {
+    graph.objective = bounded_summary_text(&graph.objective, SUMMARY_OBJECTIVE_CHARS);
+    for node in &mut graph.nodes {
+        node.acceptance = Default::default();
+        node.resource_scopes.truncate(SUMMARY_EVIDENCE_REFS);
+        node.evidence_refs.truncate(SUMMARY_EVIDENCE_REFS);
+        node.summary = node
+            .summary
+            .as_deref()
+            .map(|value| bounded_summary_text(value, SUMMARY_NODE_CHARS));
+        if let Some(failure) = node.failure.as_mut() {
+            failure.message = bounded_summary_text(&failure.message, SUMMARY_FAILURE_CHARS);
+            failure.evidence_refs.truncate(SUMMARY_EVIDENCE_REFS);
+        }
+        node.usage.required_acceptance = Default::default();
+        node.usage.observed_acceptance = Default::default();
+        node.usage.acceptance_evaluation = None;
+        node.usage.runtime_write_attempt_paths.clear();
+        node.usage.runtime_observed_resource_scopes.clear();
+        if let Some(work) = node.work.as_mut() {
+            bound_work_projection(work);
+        }
+        if let Some(state) = node.work_state.as_mut() {
+            bound_work_state(state);
+        }
+    }
+    for item in &mut graph.autonomous_work {
+        bound_work_projection(&mut item.work);
+        bound_work_state(&mut item.state);
+    }
+    graph
+}
+
+fn bound_work_projection(work: &mut harness_contract::execution_graph::ExecutionWorkProjection) {
+    work.objective = work
+        .objective
+        .as_deref()
+        .map(|value| bounded_summary_text(value, SUMMARY_WORK_CHARS));
+    work.proposal_evidence_refs.truncate(SUMMARY_EVIDENCE_REFS);
+    work.input_artifact_refs.truncate(SUMMARY_EVIDENCE_REFS);
+    work.output_artifact_kinds.truncate(SUMMARY_EVIDENCE_REFS);
+    work.eligibility
+        .allowed_agent_instance_ids
+        .truncate(SUMMARY_STATE_ENTRIES);
+    work.eligibility
+        .allowed_role_ids
+        .truncate(SUMMARY_STATE_ENTRIES);
+    work.eligibility
+        .required_capabilities
+        .truncate(SUMMARY_STATE_ENTRIES);
+    if let harness_contract::execution_graph::ExecutionWorkReviewPolicy::Peer {
+        eligible_role_ids,
+        ..
+    } = &mut work.review_policy
+    {
+        eligible_role_ids.truncate(SUMMARY_STATE_ENTRIES);
+    }
+}
+
+fn bound_work_state(state: &mut harness_contract::execution_graph::ExecutionWorkRuntimeState) {
+    state.review_findings.truncate(SUMMARY_STATE_ENTRIES);
+    for finding in &mut state.review_findings {
+        *finding = bounded_summary_text(finding, SUMMARY_WORK_CHARS);
+    }
+    state.reviews.truncate(SUMMARY_STATE_ENTRIES);
+    for review in &mut state.reviews {
+        review.finding = review
+            .finding
+            .as_deref()
+            .map(|value| bounded_summary_text(value, SUMMARY_WORK_CHARS));
+    }
+    state.bids.truncate(SUMMARY_STATE_ENTRIES);
+    for bid in &mut state.bids {
+        bid.rationale = bounded_summary_text(&bid.rationale, SUMMARY_WORK_CHARS);
+    }
+}
+
+fn bounded_summary_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        value.to_string()
+    } else {
+        let mut bounded = value.chars().take(max_chars).collect::<String>();
+        bounded.push('…');
+        bounded
+    }
 }
 
 pub(super) fn execution_concurrency(

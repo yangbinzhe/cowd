@@ -800,6 +800,28 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 }
             }
         }
+        if team_requires_autonomous_market(&services, packet.graph_id())? {
+            let graph = services
+                .graph_state_store()
+                .load(packet.graph_id())
+                .map_err(|error| format!("verify Agent autonomy contract: {error}"))?;
+            if missing_required_proposal_action(&graph, &packet, true).is_some() {
+                let error = format!(
+                    "Agent `{}` omitted its required autonomous proposal after three bounded checkpoints",
+                    packet.agent_id()
+                );
+                let _ = services.agent_runtime().record_progress(
+                    packet.agent_id(),
+                    "agent.autonomy.contract_failed",
+                    &error,
+                );
+                services.fail_live_execution(packet.run_id(), error.clone());
+                drop(runtime);
+                drop(child_execution_scope);
+                drop(active_run_cleanup);
+                return Err(error);
+            }
+        }
         let (has_successful_escalation, has_source_evidence) = {
             let receipts = tool_executor
                 .receipts
@@ -1250,6 +1272,7 @@ struct ScopedToolExecutionReceipt {
     paths: Vec<String>,
     prior_states: BTreeMap<String, harness_contract::context::WorkspacePriorState>,
     after_digests: BTreeMap<String, Option<String>>,
+    observed_bytes: BTreeMap<String, u64>,
     observed_evidence: Vec<harness_contract::context::ObservedEvidence>,
 }
 
@@ -1259,6 +1282,11 @@ fn scoped_receipt_from_durable(
     let mut paths = Vec::new();
     let mut prior_states = BTreeMap::new();
     let mut after_digests = BTreeMap::new();
+    let output_bytes = receipt
+        .outcome
+        .output
+        .as_deref()
+        .and_then(tool_output_byte_length);
     for evidence in &receipt.outcome.observed_evidence {
         let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
             &evidence.target
@@ -1275,6 +1303,13 @@ fn scoped_receipt_from_durable(
         after_digests.insert(path, scope.path.observed_revision_or_digest.clone());
     }
     paths.sort();
+    let observed_bytes = if paths.len() == 1 {
+        output_bytes
+            .map(|bytes| BTreeMap::from([(paths[0].clone(), bytes)]))
+            .unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    };
     ScopedToolExecutionReceipt {
         sequence: receipt.sequence,
         provider_invocation_id: None,
@@ -1284,8 +1319,25 @@ fn scoped_receipt_from_durable(
         paths,
         prior_states,
         after_digests,
+        observed_bytes,
         observed_evidence: receipt.outcome.observed_evidence,
     }
+}
+
+fn tool_output_byte_length(output: &str) -> Option<u64> {
+    let start = output.find('{')?;
+    let value = serde_json::from_str::<serde_json::Value>(&output[start..]).ok()?;
+    fn find(value: &serde_json::Value) -> Option<u64> {
+        match value {
+            serde_json::Value::Object(object) => object
+                .get("byteLength")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| object.values().find_map(find)),
+            serde_json::Value::Array(values) => values.iter().find_map(find),
+            _ => None,
+        }
+    }
+    find(&value)
 }
 
 /// Bound, Runtime-attested recovery context for a delegated attempt that
@@ -1317,6 +1369,146 @@ fn recovered_agent_tool_receipt_prompt(
     ))
 }
 
+const REQUIRED_AUTONOMOUS_MARKET_MARKER: &str = "collaboration_control propose_work";
+
+fn team_requires_autonomous_market(
+    services: &Arc<RuntimeServices>,
+    graph_id: &str,
+) -> Result<bool, String> {
+    Ok(
+        crate::team_binding::load_binding(services.event_store().as_ref(), graph_id)?.is_some_and(
+            |binding| {
+                binding
+                    .team_instructions
+                    .to_ascii_lowercase()
+                    .contains(REQUIRED_AUTONOMOUS_MARKET_MARKER)
+            },
+        ),
+    )
+}
+
+/// Stable topological order for managed Agent nodes. Node ids are used only
+/// as a deterministic tie-breaker between actually parallel roles; dependency
+/// order remains authoritative for serial Teams.
+fn topological_agent_node_ids(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+) -> Vec<String> {
+    use harness_contract::execution_graph::ExecutionNodeKind;
+
+    let agent_ids = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut indegree = agent_ids
+        .iter()
+        .map(|node_id| (node_id.clone(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = BTreeMap::<String, Vec<String>>::new();
+    for edge in graph.edges.iter().filter(|edge| edge.kind.is_dependency()) {
+        if agent_ids.contains(&edge.from) && agent_ids.contains(&edge.to) {
+            *indegree.entry(edge.to.clone()).or_default() += 1;
+            outgoing
+                .entry(edge.from.clone())
+                .or_default()
+                .push(edge.to.clone());
+        }
+    }
+    for successors in outgoing.values_mut() {
+        successors.sort();
+        successors.dedup();
+    }
+    let mut ready = indegree
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(node_id, _)| node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(agent_ids.len());
+    while let Some(node_id) = ready.pop_first() {
+        ordered.push(node_id.clone());
+        for successor in outgoing.get(&node_id).into_iter().flatten() {
+            let Some(degree) = indegree.get_mut(successor) else {
+                continue;
+            };
+            *degree = degree.saturating_sub(1);
+            if *degree == 0 {
+                ready.insert(successor.clone());
+            }
+        }
+    }
+    if ordered.len() != agent_ids.len() {
+        let remaining = agent_ids
+            .into_iter()
+            .filter(|node_id| !ordered.contains(node_id))
+            .collect::<Vec<_>>();
+        ordered.extend(remaining);
+    }
+    ordered
+}
+
+fn designated_autonomous_proposer_nodes(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+) -> Vec<String> {
+    let ordered = topological_agent_node_ids(graph);
+    // Current autonomous evaluation contracts require half of each Team to
+    // originate follow-up work (2/4 and 3/6). Keep at least one downstream
+    // peer outside the proposer set so every required proposal is executable.
+    let count = ordered
+        .len()
+        .div_ceil(2)
+        .min(ordered.len().saturating_sub(1));
+    ordered.into_iter().take(count).collect()
+}
+
+fn first_designated_proposer_instance_id(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+) -> Option<String> {
+    let node_id = designated_autonomous_proposer_nodes(graph)
+        .into_iter()
+        .next()?;
+    let node = graph.nodes.iter().find(|node| node.id == node_id)?;
+    serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+        .ok()
+        .map(|packet| packet.assignment.instance_id)
+}
+
+fn missing_required_proposal_action(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    packet: &AgentTaskPacket,
+    market_required: bool,
+) -> Option<serde_json::Value> {
+    if !market_required
+        || !designated_autonomous_proposer_nodes(graph)
+            .iter()
+            .any(|node_id| node_id == packet.node_id())
+    {
+        return None;
+    }
+    let agent_id = packet.agent_id();
+    if graph
+        .autonomous_work
+        .values()
+        .any(|work| work.proposed_by.as_deref() == Some(agent_id))
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "action": "propose_work",
+        "reason": "Team contract requires two topologically early Agents to create one bounded follow-up each",
+        "mutation_template": {
+            "operation": "propose_work",
+            "expected_work_revision": 0,
+            "proposal": {
+                "idempotency_key": format!("autonomy:{}:{}:follow-up-v1", graph.id, agent_id),
+                "objective": "Formulate one concrete evidence-backed follow-up inside your Team charter for a different eligible peer",
+                "role": "cross_check",
+                "output_artifact_kinds": ["autonomous_cross_check"]
+            }
+        }
+    }))
+}
+
 fn agent_autonomy_checkpoint(
     services: &Arc<RuntimeServices>,
     packet: &AgentTaskPacket,
@@ -1336,6 +1528,7 @@ fn agent_autonomy_checkpoint(
         .graph_state_store()
         .load(packet.graph_id())
         .map_err(|error| format!("load Agent autonomy checkpoint: {error}"))?;
+    let market_required = team_requires_autonomous_market(services, packet.graph_id())?;
     let agent_id = binding.instance.instance_id.as_str();
     let role_id = packet
         .team_role_assignment()
@@ -1350,6 +1543,12 @@ fn agent_autonomy_checkpoint(
         .unwrap_or_default()
         .as_millis() as u64;
     let mut actions = Vec::new();
+    if let Some(action) = missing_required_proposal_action(&graph, packet, market_required) {
+        actions.push(action);
+    }
+    let challenge_proposer = market_required
+        .then(|| first_designated_proposer_instance_id(&graph))
+        .flatten();
     for (work_id, work) in &graph.autonomous_work {
         let Some(state) = graph.work_states.get(work_id) else {
             continue;
@@ -1378,6 +1577,10 @@ fn agent_autonomy_checkpoint(
         let current_submission = state.submission_ref.as_deref().unwrap_or_default();
         let already_reviewed = state.reviews.iter().any(|review| {
             review.reviewer_instance_id == agent_id && review.submission_ref == current_submission
+        });
+        let has_challenge = state.reviews.iter().any(|review| {
+            review.verdict
+                == harness_contract::execution_graph::ExecutionWorkReviewVerdict::Challenge
         });
         let claim_expired = state
             .claim
@@ -1421,14 +1624,49 @@ fn agent_autonomy_checkpoint(
                     .claim
                     .as_ref()
                     .is_some_and(|claim| claim.claimant_instance_id != agent_id)
+                    && work.proposed_by.as_deref() != Some(agent_id)
                     && !already_reviewed =>
             {
-                ("accept_or_challenge", None)
+                if !has_challenge && work.proposed_by == challenge_proposer {
+                    ("challenge", None)
+                } else {
+                    ("accept", None)
+                }
             }
             _ if work.proposed_by.as_deref() == Some(agent_id) => {
                 ("coordinate_and_reinspect", None)
             }
             _ => continue,
+        };
+        let mutation_template = match action {
+            "challenge" => serde_json::json!({
+                "operation": "challenge",
+                "work_node_id": work_id,
+                "expected_work_revision": state.revision,
+                "finding": "Independently revise this first proposal against another Team artifact before acceptance"
+            }),
+            "accept" => serde_json::json!({
+                "operation": "accept",
+                "work_node_id": work_id,
+                "expected_work_revision": state.revision
+            }),
+            "bid_then_claim" => serde_json::json!({
+                "steps": [
+                    {
+                        "operation": "bid",
+                        "work_node_id": work_id,
+                        "expected_work_revision": state.revision,
+                        "rationale": "State one bounded capability-based reason",
+                        "estimated_cost": 0
+                    },
+                    {
+                        "operation": "claim",
+                        "work_node_id": work_id,
+                        "expected_work_revision": "use work_revision returned by bid"
+                    }
+                ]
+            }),
+            _ => serde_json::Value::Null,
         };
         actions.push(serde_json::json!({
             "work_id": work_id,
@@ -1440,6 +1678,7 @@ fn agent_autonomy_checkpoint(
             "claim_token": private_claim_token,
             "submission_ref": state.submission_ref,
             "latest_challenge": state.review_findings.last(),
+            "mutation_template": mutation_template,
         }));
         if actions.len() >= 16 {
             break;
@@ -2176,6 +2415,7 @@ impl ScopedRuntimeToolExecutor {
                 paths: Vec::new(),
                 prior_states: BTreeMap::new(),
                 after_digests: BTreeMap::new(),
+                observed_bytes: BTreeMap::new(),
                 observed_evidence: outcome.observed_evidence.clone(),
             });
         Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
@@ -2604,6 +2844,14 @@ impl ScopedRuntimeToolExecutor {
                         (path.clone(), digest)
                     })
                     .collect::<BTreeMap<_, _>>();
+                let output = outcome.output.unwrap_or_default();
+                let observed_bytes = if requested.paths.len() == 1 {
+                    tool_output_byte_length(&output)
+                        .map(|bytes| BTreeMap::from([(requested.paths[0].clone(), bytes)]))
+                        .unwrap_or_default()
+                } else {
+                    BTreeMap::new()
+                };
                 self.receipts
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2616,9 +2864,10 @@ impl ScopedRuntimeToolExecutor {
                         paths: requested.paths,
                         prior_states,
                         after_digests,
+                        observed_bytes,
                         observed_evidence,
                     });
-                Ok(outcome.output.unwrap_or_default())
+                Ok(output)
             }
             RuntimeToolExecutionStatus::BlockedPermission => Err(ToolError::new(
                 outcome
@@ -3504,11 +3753,59 @@ fn materialized_change_receipts(
                 };
                 let after = receipt.after_digests.get(path).cloned().flatten()?;
                 (before.as_deref() != Some(after.as_str())).then(|| {
+                    let reread = receipts.iter().find(|candidate| {
+                        candidate.sequence > receipt.sequence
+                            && candidate.effect_kind == harness_contract::tool::ToolEffectKind::Read
+                            && candidate.paths.iter().any(|candidate_path| {
+                                path_within_scope(candidate_path, path)
+                                    && path_within_scope(path, candidate_path)
+                                    && candidate
+                                        .after_digests
+                                        .get(candidate_path)
+                                        .and_then(|digest| digest.as_deref())
+                                        == Some(after.as_str())
+                            })
+                    });
+                    let bytes = reread.and_then(|candidate| {
+                        candidate.paths.iter().find_map(|candidate_path| {
+                            (path_within_scope(candidate_path, path)
+                                && path_within_scope(path, candidate_path))
+                            .then(|| candidate.observed_bytes.get(candidate_path).copied())
+                            .flatten()
+                        })
+                    });
+                    let reread_evidence_ref = reread.and_then(|candidate| {
+                        candidate.observed_evidence.iter().find_map(|evidence| {
+                            let matches_path = match &evidence.target {
+                                harness_contract::context::EvidenceTargetIdentity::Workspace {
+                                    scope,
+                                } => {
+                                    path_within_scope(&scope.path.workspace_relative_path, path)
+                                        && path_within_scope(
+                                            path,
+                                            &scope.path.workspace_relative_path,
+                                        )
+                                }
+                                _ => false,
+                            };
+                            matches_path
+                                .then(|| {
+                                    evidence
+                                        .evidence_ref
+                                        .as_ref()
+                                        .map(|reference| reference.retrieval_selector.clone())
+                                })
+                                .flatten()
+                        })
+                    });
                     harness_contract::agent::AgentChangeReceipt {
                         path: path.clone(),
                         before_sha256: before,
                         after_sha256: after,
                         write_sequence: receipt.sequence,
+                        bytes,
+                        reread_sequence: reread.map(|candidate| candidate.sequence),
+                        reread_evidence_ref,
                     }
                 })
             })

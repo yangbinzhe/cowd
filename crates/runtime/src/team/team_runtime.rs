@@ -61,6 +61,51 @@ fn agent_node_is_actionable(
     }
 }
 
+/// True when an Agent is either runnable now or remains reachable later in
+/// the admitted Team topology. Proposal admission must use this broader
+/// predicate: requiring a peer to be concurrently Ready made valid serial
+/// Teams incapable of creating work for their next role. Failed/cancelled
+/// dependency ancestry still fails closed, so a proposal cannot target an
+/// orphan that the scheduler can never start.
+fn agent_node_is_future_schedulable(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    node_id: &str,
+) -> bool {
+    use harness_contract::execution_graph::ExecutionNodeStatus;
+
+    if !matches!(
+        graph.node_statuses.get(node_id),
+        Some(
+            ExecutionNodeStatus::Planned
+                | ExecutionNodeStatus::Ready
+                | ExecutionNodeStatus::Running
+        )
+    ) {
+        return false;
+    }
+    let mut pending = vec![node_id];
+    let mut visited = BTreeSet::new();
+    while let Some(current) = pending.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        for dependency in graph
+            .edges
+            .iter()
+            .filter(|edge| edge.to == current && edge.kind.is_dependency())
+        {
+            if matches!(
+                graph.node_statuses.get(&dependency.from),
+                Some(ExecutionNodeStatus::Failed | ExecutionNodeStatus::Cancelled)
+            ) {
+                return false;
+            }
+            pending.push(dependency.from.as_str());
+        }
+    }
+    true
+}
+
 fn effective_collaboration_lease_ms(
     requested: Option<u64>,
     expected_duration_ms: u64,
@@ -100,13 +145,13 @@ fn collaboration_control_view(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let active_peers = graph
+    let eligible_peers = graph
         .nodes
         .iter()
         .filter(|node| {
             node.id != caller_node_id
                 && node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-                && agent_node_is_actionable(graph, &node.id)
+                && agent_node_is_future_schedulable(graph, &node.id)
         })
         .filter_map(|node| {
             serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
@@ -117,6 +162,7 @@ fn collaboration_control_view(
                         "instance_id": packet.assignment.instance_id,
                         "role_id": packet.assignment.role_id,
                         "capabilities": packet.allowed_tools,
+                        "availability": if agent_node_is_actionable(graph, &node.id) { "active" } else { "future" },
                     })
                 })
         })
@@ -138,6 +184,13 @@ fn collaboration_control_view(
                 "required": work.required,
             }))
         })
+        .collect::<Vec<_>>();
+    let active_peers = eligible_peers
+        .iter()
+        .filter(|peer| {
+            peer.get("availability").and_then(serde_json::Value::as_str) == Some("active")
+        })
+        .cloned()
         .collect::<Vec<_>>();
 
     let autonomous_work = graph
@@ -221,11 +274,15 @@ fn collaboration_control_view(
         "graph_revision": graph.revision,
         "idempotent_replay": idempotent_replay,
         "marketplace": {
+            // Backward-compatible now-runnable view plus the broader future
+            // schedulable view used for proposal admission.
             "active_peer_count": active_peers.len(),
             "active_peers": active_peers,
+            "eligible_peer_count": eligible_peers.len(),
+            "eligible_peers": eligible_peers,
             "assigned_work": assigned_work,
             "autonomous_work": autonomous_work,
-            "can_propose_work": !active_peers.is_empty(),
+            "can_propose_work": !eligible_peers.is_empty(),
         },
         "operation": operation,
     })
@@ -898,7 +955,7 @@ impl TeamRuntime {
             let eligible_peer_exists = graph.nodes.iter().any(|node| {
                 node.id != request.node_id
                     && node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-                    && agent_node_is_actionable(&graph, &node.id)
+                    && agent_node_is_future_schedulable(&graph, &node.id)
                     && serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).is_ok_and(
                         |candidate| {
                             proposal.required_capabilities.iter().all(|required| {
@@ -909,7 +966,7 @@ impl TeamRuntime {
             });
             if !eligible_peer_exists {
                 return Err(
-                    "collaboration proposal has no other active eligible Agent in this Team"
+                    "collaboration proposal has no other schedulable eligible Agent in this Team"
                         .to_string(),
                 );
             }
@@ -1844,7 +1901,10 @@ mod collaboration_market_tests {
         ExecutionNodeStatus,
     };
 
-    use super::{agent_node_is_actionable, effective_collaboration_lease_ms};
+    use super::{
+        agent_node_is_actionable, agent_node_is_future_schedulable,
+        effective_collaboration_lease_ms,
+    };
 
     #[test]
     fn planned_successors_are_not_advertised_as_actionable_peers() {
@@ -1870,10 +1930,42 @@ mod collaboration_market_tests {
         );
 
         assert!(!agent_node_is_actionable(&graph, "planned-peer"));
+        assert!(agent_node_is_future_schedulable(&graph, "planned-peer"));
         graph
             .node_statuses
             .insert("planned-peer".to_string(), ExecutionNodeStatus::Ready);
         assert!(agent_node_is_actionable(&graph, "planned-peer"));
+    }
+
+    #[test]
+    fn future_peer_rejects_irrecoverable_dependency_ancestry() {
+        let mut graph = ExecutionGraph::new("failed serial Team");
+        for id in ["failed-root", "planned-middle", "planned-peer"] {
+            let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+            node.id = id.to_string();
+            graph.nodes.push(node);
+        }
+        graph.edges.push(ExecutionEdge {
+            from: "failed-root".to_string(),
+            to: "planned-middle".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        graph.edges.push(ExecutionEdge {
+            from: "planned-middle".to_string(),
+            to: "planned-peer".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        });
+        graph
+            .node_statuses
+            .insert("failed-root".to_string(), ExecutionNodeStatus::Failed);
+        graph
+            .node_statuses
+            .insert("planned-middle".to_string(), ExecutionNodeStatus::Planned);
+        graph
+            .node_statuses
+            .insert("planned-peer".to_string(), ExecutionNodeStatus::Planned);
+
+        assert!(!agent_node_is_future_schedulable(&graph, "planned-peer"));
     }
 
     #[test]

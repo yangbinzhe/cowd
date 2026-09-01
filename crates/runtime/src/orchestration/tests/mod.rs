@@ -112,6 +112,9 @@ fn committed_change_paths_accept_only_typed_runtime_receipts() {
         before_sha256: None,
         after_sha256: "sha256:after".to_string(),
         write_sequence: 7,
+        bytes: None,
+        reread_sequence: None,
+        reread_evidence_ref: None,
     };
     let valid = harness_contract::context::EvidenceAccessRef::unavailable(
         harness_contract::context::EvidenceRef::observed(

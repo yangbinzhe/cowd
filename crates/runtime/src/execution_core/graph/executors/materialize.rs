@@ -349,6 +349,9 @@ impl NodeExecutor for MaterializeNodeExecutor {
             before_sha256,
             after_sha256: reread_sha256.clone(),
             write_sequence: u64::from(ticket.attempt),
+            bytes: Some(reread.len() as u64),
+            reread_sequence: Some(u64::from(ticket.attempt)),
+            reread_evidence_ref: Some(receipt.receipt_id.clone()),
         };
         let change_json = serde_json::to_string(&change).unwrap_or_default();
         let receipt_json =

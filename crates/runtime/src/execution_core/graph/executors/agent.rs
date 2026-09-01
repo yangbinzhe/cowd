@@ -810,6 +810,9 @@ mod tests {
                 before_sha256: before_sha256.map(str::to_string),
                 after_sha256: after_sha256.to_string(),
                 write_sequence,
+                bytes: None,
+                reread_sequence: None,
+                reread_evidence_ref: None,
             })
             .expect("change receipt"),
             "application/vnd.cowd.runtime-change+json",

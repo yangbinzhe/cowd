@@ -912,6 +912,9 @@ impl crate::AgentRuntimeBackend for CompletedAgentBackend {
                     before_sha256: Some("b".repeat(64)),
                     after_sha256: "a".repeat(64),
                     write_sequence: 1,
+                    bytes: None,
+                    reread_sequence: None,
+                    reread_evidence_ref: None,
                 }]
             })
             .unwrap_or_default();

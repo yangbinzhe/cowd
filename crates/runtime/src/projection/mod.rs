@@ -716,8 +716,9 @@ mod tests {
     use super::*;
     use harness_contract::{
         execution_graph::{
-            ExecutionGraph, ExecutionGraphLineage, ExecutionNodeKind, ExecutionNodeSpec,
-            ExecutionNodeStatus, ExecutionParentBinding,
+            project_execution_graph, ExecutionFailure, ExecutionGraph, ExecutionGraphLineage,
+            ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeSpec, ExecutionNodeStatus,
+            ExecutionParentBinding, ExecutionUsage,
         },
         goal::{AcceptanceCriterion, AcceptanceStatus, GoalCompletion, GoalContract},
         task::{TaskCreateCommand, TaskSpec},
@@ -790,6 +791,77 @@ mod tests {
         assert_eq!(projected["nested"]["note"], "[redacted]");
         assert_eq!(projected["nested"]["max_tokens"], 4096);
         assert!(!truncated);
+    }
+
+    #[test]
+    fn summary_graph_is_bounded_without_losing_public_node_identity_or_usage() {
+        let mut graph = ExecutionGraph::new("O".repeat(8_000));
+        let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "managed-agent", "{}");
+        node.resource_scopes = (0..100).map(|index| format!("read:item-{index}")).collect();
+        let node_id = node.id.clone();
+        graph.nodes.push(node);
+        graph
+            .node_statuses
+            .insert(node_id.clone(), ExecutionNodeStatus::Completed);
+        let mut usage = ExecutionUsage {
+            input_tokens: 12_345,
+            output_tokens: 6_789,
+            tool_calls: 7,
+            ..ExecutionUsage::default()
+        };
+        usage.required_acceptance.criteria = vec!["C".repeat(8_000)];
+        usage.observed_acceptance.satisfied_criteria = vec!["C".repeat(8_000)];
+        usage.runtime_write_attempt_paths = vec!["private/output".to_string()];
+        graph.node_results.insert(
+            node_id,
+            ExecutionNodeResult {
+                status: ExecutionNodeStatus::Completed,
+                result_ref: Some("execution-result:summary".to_string()),
+                summary: Some("S".repeat(8_000)),
+                evidence_refs: Vec::new(),
+                failure: Some(ExecutionFailure {
+                    kind: "presentation".to_string(),
+                    message: "F".repeat(8_000),
+                    retryable: false,
+                    evidence_refs: Vec::new(),
+                }),
+                usage,
+                finished_at_ms: 1,
+            },
+        );
+
+        let mut full = project_execution_graph(&graph);
+        full.nodes[0].team_run_id = Some("team-summary".to_string());
+        full.nodes[0].agent_run_id = Some("agent-run-summary".to_string());
+        full.nodes[0].role_id = Some("reviewer".to_string());
+        let summary = summary_graph_projection(full.clone());
+        let node = &summary.nodes[0];
+
+        assert_eq!(node.status, ExecutionNodeStatus::Completed);
+        assert_eq!(node.team_run_id.as_deref(), Some("team-summary"));
+        assert_eq!(node.agent_run_id.as_deref(), Some("agent-run-summary"));
+        assert_eq!(node.role_id.as_deref(), Some("reviewer"));
+        assert_eq!(node.usage.input_tokens, 12_345);
+        assert_eq!(node.usage.output_tokens, 6_789);
+        assert_eq!(node.usage.tool_calls, 7);
+        assert!(node.usage.required_acceptance.is_empty());
+        assert!(node.usage.observed_acceptance.is_empty());
+        assert!(node.usage.runtime_write_attempt_paths.is_empty());
+        assert!(node
+            .summary
+            .as_ref()
+            .is_some_and(|value| value.chars().count() <= 1_025));
+        assert!(node
+            .failure
+            .as_ref()
+            .is_some_and(|failure| failure.message.chars().count() <= 513));
+        assert_eq!(node.resource_scopes.len(), SUMMARY_EVIDENCE_REFS);
+        assert!(
+            serde_json::to_vec(&summary)
+                .expect("summary serializes")
+                .len()
+                < serde_json::to_vec(&full).expect("full serializes").len() / 3
+        );
     }
 
     #[test]

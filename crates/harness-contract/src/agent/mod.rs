@@ -458,6 +458,15 @@ pub struct AgentChangeReceipt {
     pub before_sha256: Option<String>,
     pub after_sha256: String,
     pub write_sequence: u64,
+    /// Exact file size observed by the later read-back receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Sequence of the distinct read whose digest matched `after_sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reread_sequence: Option<u64>,
+    /// Durable evidence selector for that read-back observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reread_evidence_ref: Option<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -892,6 +901,9 @@ mod tests {
             before_sha256: Some("a".repeat(64)),
             after_sha256: "b".repeat(64),
             write_sequence: 2,
+            bytes: None,
+            reread_sequence: None,
+            reread_evidence_ref: None,
         });
         let round_trip: AgentReturnPacket = serde_json::from_value(
             serde_json::to_value(&returned).expect("encode additive receipt"),
