@@ -69,7 +69,11 @@ function responseFor(messages, tools, system) {
     // Runtime context packets deliberately use provider-user role so they
     // cannot gain system authority. They are not durable human turns and must
     // not inflate the fixture's causal-history assertion.
-    .filter((text) => !text.startsWith("## Runtime context data\n"));
+    .filter(
+      (text) =>
+        !text.startsWith("## Runtime context data\n") &&
+        !text.startsWith("## Runtime-attested turn context\n"),
+    );
   const latest = userMessages.at(-1) ?? "";
   const prior = userMessages.slice(0, -1).join("\n");
   const allUserText = userMessages.join("\n");

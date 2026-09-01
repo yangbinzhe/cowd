@@ -1191,6 +1191,7 @@ user_texts = [
     for item in turn2["messages"]
     if item.get("role") == "user"
     and not item.get("text", "").startswith("## Runtime context data\n")
+    and not item.get("text", "").startswith("## Runtime-attested turn context\n")
 ]
 assert len(user_texts) == 2, f"turn 2 provider user history is not exact: {user_texts}"
 assert nonce in user_texts[0], "turn 1 nonce missing from provider history"
