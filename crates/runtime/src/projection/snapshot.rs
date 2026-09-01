@@ -72,6 +72,11 @@ async fn snapshot_with_graph(
     let recovery = related_event_entities(services, &scope, "recovery", full, |event| {
         event.scope == RuntimeEventScope::Recovery || event.kind.contains("recovery")
     });
+    let graph = if full {
+        graph
+    } else {
+        summary_graph_projection(graph)
+    };
     let (activities, activity_relations) = activity::project_execution_activities_from_events(
         services,
         &scope,
@@ -84,13 +89,7 @@ async fn snapshot_with_graph(
     let cancellation_receipt =
         latest_cancellation_receipt(services, session_id.as_deref(), execution_id);
     let concurrency = execution_concurrency(services, &graph, &scope);
-    let graph = if full {
-        graph
-    } else {
-        summary_graph_projection(graph)
-    };
-
-    Ok(ExecutionProjection {
+    let mut projection = ExecutionProjection {
         schema_version: EXECUTION_PROJECTION_SCHEMA_VERSION,
         execution_id: execution_id.to_string(),
         revision: graph.revision,
@@ -126,7 +125,11 @@ async fn snapshot_with_graph(
         terminal_presentation,
         cancellation_receipt,
         available_commands: available_commands(services, execution_id, context).await?,
-    })
+    };
+    if !full {
+        bound_summary_projection_collections(&mut projection);
+    }
+    Ok(projection)
 }
 
 const SUMMARY_OBJECTIVE_CHARS: usize = 1_024;
@@ -135,6 +138,7 @@ const SUMMARY_WORK_CHARS: usize = 512;
 const SUMMARY_FAILURE_CHARS: usize = 512;
 const SUMMARY_STATE_ENTRIES: usize = 64;
 pub(super) const SUMMARY_EVIDENCE_REFS: usize = 32;
+const SUMMARY_ENTITY_LIMIT: usize = 128;
 
 /// Turn an execution graph into a bounded status/topology projection.
 ///
@@ -233,6 +237,67 @@ fn bounded_summary_text(value: &str, max_chars: usize) -> String {
         bounded.push('…');
         bounded
     }
+}
+
+fn bound_summary_projection_collections(projection: &mut ExecutionProjection) {
+    for entities in [
+        &mut projection.goals,
+        &mut projection.approvals,
+        &mut projection.admissions,
+        &mut projection.outcomes,
+        &mut projection.interventions,
+        &mut projection.usage,
+        &mut projection.context,
+        &mut projection.evidence,
+        &mut projection.health,
+        &mut projection.recovery,
+    ] {
+        bound_summary_entities(entities);
+    }
+    // Agent, Team and relation identities are the control-plane purpose of a
+    // Summary projection and therefore remain complete. Their human text and
+    // public refs are still bounded independently of population size.
+    for entities in [
+        &mut projection.agents,
+        &mut projection.teams,
+        &mut projection.relations,
+    ] {
+        for entity in entities.iter_mut() {
+            bound_summary_entity(entity);
+        }
+    }
+}
+
+fn bound_summary_entities(entities: &mut Vec<ProjectionEntity>) {
+    for entity in entities.iter_mut() {
+        bound_summary_entity(entity);
+    }
+    if entities.len() > SUMMARY_ENTITY_LIMIT {
+        entities.sort_by(|left, right| {
+            left.revision
+                .cmp(&right.revision)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        entities.drain(..entities.len() - SUMMARY_ENTITY_LIMIT);
+    }
+}
+
+fn bound_summary_entity(entity: &mut ProjectionEntity) {
+    entity.id = bounded_summary_text(&entity.id, 512);
+    entity.kind = bounded_summary_text(&entity.kind, 128);
+    entity.status = entity
+        .status
+        .as_deref()
+        .map(|value| bounded_summary_text(value, 128));
+    entity.summary = entity
+        .summary
+        .as_deref()
+        .map(|value| bounded_summary_text(value, SUMMARY_WORK_CHARS));
+    entity.evidence_refs.truncate(SUMMARY_EVIDENCE_REFS);
+    for reference in &mut entity.evidence_refs {
+        *reference = bounded_summary_text(reference, 512);
+    }
+    entity.detail = None;
 }
 
 pub(super) fn execution_concurrency(

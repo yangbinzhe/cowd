@@ -57,24 +57,25 @@ Changed dependency cone:
 Deterministic evidence completed before the candidate commit:
 
 - `cargo fmt --all --check` and `git diff --check`: passed.
-- Runtime: 1993 passed, 0 failed, 3 ignored.
+- Runtime: 1997 passed, 0 failed, 3 ignored.
 - Gateway: 813 passed, 0 failed, 13 ignored.
 - Harness Contract: 205 passed, 0 failed.
 - Harness Eval: 144 passed, 0 failed.
 - Release-mode Runtime execution saturation: 64 independent work items passed
   through the canonical single-test runner in 0.21 seconds.
-- Release-mode projection probes passed: steady paired mean 105,926 µs versus
-  108,188 µs baseline, active catch-up mean 582,517 µs versus 571,695 µs
-  baseline, with p95/p99 inside the declared bounds.
+- Release-mode projection probes passed: steady paired mean 106,250 µs versus
+  109,005 µs baseline (p95 66 versus 69, p99 171 versus 174), active catch-up
+  mean 584,337 µs versus 573,985 µs baseline (p95 73 versus 70, p99 258 versus
+  259), with every declared bound satisfied.
 - Focused causal-terminal receipt, conflict rejection, root checkpoint,
   actionable-peer, duration-aware lease, orphan detection and Team-board market
   tests passed.
 - Architecture boundary scan and backend `0.9.713` version gate passed.
-- Strict workspace-wide Clippy remains blocked by pre-existing Provider and
-  contract baseline lints (large error/enum variants and existing style
-  lints). A no-dependency changed-file audit found and removed the new
-  topological `expect` and recovery readability warning; no Clippy suppression
-  or unrelated API rewrite was introduced.
+- `cargo check -p runtime --all-targets` passed. `cargo clippy -p runtime --lib
+  --no-deps` exited successfully with the repository's pre-existing warning
+  baseline (large error/enum variants and existing style lints); no diagnostic
+  was introduced by a changed line, no Clippy suppression was added, and no
+  unrelated API rewrite was introduced.
 
 ## Residual gates
 
@@ -87,3 +88,38 @@ Deterministic evidence completed before the candidate commit:
 - run final governance/version/install gates, clean local build/install caches,
   install `0.9.713`, and create the local annotated `v0.9.713` tag in both
   repositories without pushing.
+
+## Candidate-3 failed-run evidence
+
+- Report: `target/acceptance/real-qwen/runs/v0.9.713-1788236592-mission-harness-deep/report.json`
+- Session: `da55b632-4c09-4e75-a6d9-6ce280ac4ac1`
+- Candidate: `3976d58ed502b3fdd4cf30bf55f09390d7594378`
+- Provider/model: only `deepseek-v4-flash`; no provider fallback was observed.
+- Runtime cursor/revision at stall: `4875` / root Mission revision `66`.
+- Team B completed 4/4 Agents. Team C completed 4/4 Agents and really executed
+  proposal, bid, claim, workspace mutation, experiment and independent source
+  review. Team A had one completed, one failed and two dependency-blocked
+  Agents. Team D never became eligible because A did not close.
+- Team A failure was exact and bounded: its designated Agent omitted the
+  required proposal after three checkpoints, and Runtime converted that
+  omission into a fatal Agent error rather than applying an identity-attested
+  idempotent bootstrap default.
+- Team C terminal facts prove two unresolved required market items: one was
+  still `claimed`, one was still `offered`, while all four Agent nodes were
+  terminal and Verify/Synthesize stayed Planned. The last reviewer explicitly
+  reported that its continuation function-call contract was empty, so it could
+  not bid or claim and did not simulate the mutation.
+- The evaluator correctly declared inactivity after 480,169 ms without durable
+  progress. It retained 422 actual progress observations and detected a stall;
+  the test was not restarted.
+- Observation cost remained unacceptable: 1,373,758,422 bytes received,
+  including 1,347,169,507 root projection bytes across only 81 Summary probes.
+  This proves activity reduction still consumed uncropped root/descendant graph
+  summaries even though the final graph field itself was bounded.
+- One malformed 21,559-byte OpenAI-compatible DeepSeek tool-call frame was
+  rejected by Runtime and the remaining independent work continued. It is a
+  recovered provider-transport incident, not the terminal cause.
+
+The amended architecture and audited implementation sequence are recorded in
+`docs/architecture/autonomous-collaboration-convergence-v0.9.713.md`. No further
+paid run is permitted until those repairs have a clean deterministic commit.

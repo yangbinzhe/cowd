@@ -544,6 +544,20 @@ impl ExecutionGraphRunner {
         })
     }
 
+    /// A terminal node commit is itself the durable wake-up boundary. Reduce
+    /// dependencies before executor cleanup so a lost process-local notify or
+    /// a slow `after_commit` hook cannot strand Verify/Synthesize behind an
+    /// already-terminal Agent wave. This also commits typed orphan failure as
+    /// soon as every Agent is terminal and required autonomous work remains.
+    async fn converge_after_terminal_commit(
+        &self,
+        graph_id: &str,
+    ) -> Result<(), ExecutionRunnerError> {
+        let graph = self.state_store.load_async(graph_id).await?;
+        self.advance_dependencies(graph).await?;
+        Ok(())
+    }
+
     pub(crate) async fn current_report(
         &self,
         graph_id: &str,
@@ -1015,8 +1029,31 @@ impl ExecutionGraphRunner {
                     for response in superseded_responses {
                         let _ = response.send(TerminalCommitDisposition::Superseded);
                     }
+                    drop(coordination);
                     match commit {
                         Ok(()) => {
+                            // One durable terminal wave has one convergence
+                            // owner. Running this in every sibling waiter
+                            // turns an O(1) atomic commit into O(width) graph
+                            // reloads and serial dependency reductions.
+                            let convergence = if admitted_responses.is_empty() {
+                                Ok(())
+                            } else {
+                                self.converge_after_terminal_commit(graph_id).await
+                            };
+                            if let Err(error) = convergence {
+                                let reason = error.to_string();
+                                for response in admitted_responses {
+                                    let _ = response
+                                        .send(TerminalCommitDisposition::Failed(reason.clone()));
+                                }
+                                return receiver.await.map_err(|_| {
+                                    ExecutionRunnerError::Driver(
+                                        "terminal wave convergence failed before returning a disposition"
+                                            .to_string(),
+                                    )
+                                });
+                            }
                             for response in admitted_responses {
                                 let _ = response.send(TerminalCommitDisposition::Committed);
                             }
@@ -1031,6 +1068,7 @@ impl ExecutionGraphRunner {
                     }
                 }
                 Err(error) => {
+                    drop(coordination);
                     let reason = error.to_string();
                     for pending in pending {
                         let _ = pending
@@ -1039,7 +1077,6 @@ impl ExecutionGraphRunner {
                     }
                 }
             }
-            drop(coordination);
         }
         receiver.await.map_err(|_| {
             ExecutionRunnerError::Driver(
@@ -1073,12 +1110,14 @@ impl ExecutionGraphRunner {
             }) => {
                 self.terminalize_deadline_node(graph_id, &node_id, deadline_at_ms)
                     .await?;
+                self.converge_after_terminal_commit(graph_id).await?;
                 durable_progress.notify_one();
                 return Ok(());
             }
             Err(ExecutionRunnerError::Resource { node_id, reason }) => {
                 self.block_unstarted_resource_node(graph_id, &node_id, reason)
                     .await?;
+                self.converge_after_terminal_commit(graph_id).await?;
                 durable_progress.notify_one();
                 return Ok(());
             }
@@ -1088,6 +1127,7 @@ impl ExecutionGraphRunner {
                     let node_id = executor_error_node_id(&error).to_string();
                     self.isolate_node_failure(graph_id, &node_id, error.to_string())
                         .await?;
+                    self.converge_after_terminal_commit(graph_id).await?;
                     durable_progress.notify_one();
                     return Ok(());
                 }
@@ -1113,6 +1153,8 @@ impl ExecutionGraphRunner {
                             Vec::new(),
                         )
                         .await?;
+                    drop(_coordination);
+                    self.converge_after_terminal_commit(graph_id).await?;
                     durable_progress.notify_one();
                 }
                 // A Pause/Cancel command may have superseded the executor while
@@ -1317,13 +1359,14 @@ impl ExecutionGraphRunner {
                     .remove(&(graph_id.to_string(), node_id.clone()));
                 return Err(error.into());
             }
-            durable_progress.notify_one();
             self.active
                 .lock()
                 .await
                 .get(&(graph_id.to_string(), node_id.clone()))
                 .map(|active| (Arc::clone(&active.executor), active.ticket.clone()))
         };
+        self.converge_after_terminal_commit(graph_id).await?;
+        durable_progress.notify_one();
         if let Some((executor, ticket)) = committed_executor {
             let after_commit = executor.after_commit(&ticket).await;
             if deadline_terminal {
@@ -2286,9 +2329,9 @@ impl ExecutionGraphRunner {
                             .transition_node_async(
                                 graph,
                                 node_id,
-                                ExecutionNodeStatus::Failed,
+                                ExecutionNodeStatus::Blocked,
                                 Some(ExecutionNodeResult {
-                                    status: ExecutionNodeStatus::Failed,
+                                    status: ExecutionNodeStatus::Blocked,
                                     result_ref: None,
                                     summary: None,
                                     evidence_refs: Vec::new(),

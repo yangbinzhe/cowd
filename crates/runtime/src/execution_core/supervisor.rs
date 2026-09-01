@@ -1449,7 +1449,19 @@ async fn run_completion_pump(
         }
 
         if active_nodes.is_empty() {
-            return DriverOutcome::Completed(snapshot.report);
+            match runner.terminal_report(graph_id).await {
+                Ok(Some(report)) => return DriverOutcome::Completed(report),
+                Ok(None) if snapshot.report.waiting > 0 => {
+                    return DriverOutcome::Completed(snapshot.report);
+                }
+                Ok(None) => {
+                    return DriverOutcome::Failed(format!(
+                        "execution graph `{graph_id}` quiesced with no active or ready node while durable nodes remained non-terminal at revision {}",
+                        snapshot.report.revision
+                    ));
+                }
+                Err(error) => return DriverOutcome::Failed(error.to_string()),
+            }
         }
 
         tokio::select! {

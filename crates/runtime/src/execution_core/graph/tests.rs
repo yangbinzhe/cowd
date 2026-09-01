@@ -959,6 +959,77 @@ async fn resource_pressure_keeps_a_ready_graph_pump_alive_until_a_lease_releases
 }
 
 #[tokio::test]
+async fn terminal_agent_wave_immediately_orphans_unfinished_autonomous_work() {
+    let (registry, state, commits) = harness();
+    registry
+        .register(Arc::new(TestExecutor::new(Vec::new(), Duration::ZERO)))
+        .expect("test executor");
+    let runner = test_runner(registry, state.clone(), commits);
+    let mut graph = test_graph("terminal Agent wave closes orphaned autonomous work");
+    graph.id = "terminal-agent-wave-orphan-convergence".to_string();
+    let deadline_at_ms = crate::tool_invocation::now_ms().saturating_add(5_000);
+    for id in ["agent-a", "agent-b"] {
+        let mut agent = node(id);
+        agent.kind = ExecutionNodeKind::AgentTask;
+        agent.payload_ref = agent_intent_payload(&graph.id, id, deadline_at_ms);
+        graph.nodes.push(agent);
+    }
+    let mut verify = node("verify");
+    verify.kind = ExecutionNodeKind::Verify;
+    graph.nodes.push(verify);
+    graph.edges.extend([
+        ExecutionEdge {
+            from: "agent-a".to_string(),
+            to: "verify".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+        ExecutionEdge {
+            from: "agent-b".to_string(),
+            to: "verify".to_string(),
+            kind: ExecutionEdgeKind::DependsOn,
+        },
+    ]);
+    let mut autonomous = ExecutionWorkContract::new(ExecutionWorkRole::CrossCheck);
+    autonomous.collaboration_work_id = Some("agent-work:unfinished".to_string());
+    autonomous.objective = Some("perform an unfinished peer cross-check".to_string());
+    autonomous.proposed_by = Some("agent-a-instance".to_string());
+    autonomous.output_artifact_kinds = vec!["autonomous_cross_check".to_string()];
+    graph
+        .autonomous_work
+        .insert("agent-work:unfinished".to_string(), autonomous);
+    graph.work_states.insert(
+        "agent-work:unfinished".to_string(),
+        harness_contract::execution_graph::ExecutionWorkRuntimeState::default(),
+    );
+
+    let report = runner
+        .start(graph)
+        .await
+        .expect("graph reaches terminal truth");
+    assert_eq!(report.completed, 2);
+    assert_eq!(report.blocked, 1);
+    let terminal = state
+        .load("terminal-agent-wave-orphan-convergence")
+        .expect("terminal graph");
+    assert_eq!(
+        terminal.node_statuses["verify"],
+        ExecutionNodeStatus::Blocked
+    );
+    assert_eq!(
+        terminal.node_results["verify"]
+            .failure
+            .as_ref()
+            .expect("typed orphan failure")
+            .kind,
+        "autonomous_work_orphaned"
+    );
+    assert!(terminal
+        .node_statuses
+        .values()
+        .all(|status| status.is_terminal()));
+}
+
+#[tokio::test]
 async fn continuation_retry_returns_the_existing_root_to_the_execution_runner() {
     let (registry, state, commits) = harness();
     registry

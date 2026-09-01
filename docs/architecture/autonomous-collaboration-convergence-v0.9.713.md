@@ -3,7 +3,7 @@
 ## Decision
 
 Autonomous Team work is a Runtime state-machine obligation, not a prompt-only
-convention. A valid execution must satisfy five coupled invariants:
+convention. A valid execution must satisfy ten coupled invariants:
 
 1. A successor receives one causally terminal `runtime_change` receipt per
    workspace path. Historical writes remain on the predecessor result but do
@@ -20,14 +20,17 @@ convention. A valid execution must satisfy five coupled invariants:
    by a 5-second minimum and 1-hour maximum. Expired claims advertise reclaim,
    never heartbeat or submit. The agent checkpoint carries the same rule.
 5. Required autonomous work may block terminal reducers only while a Team Agent
-   can still act. If every Agent is terminal, the reducer commits a typed
+   can still act. If every Agent is terminal, the reducer moves the unstarted
+   terminal reducer to the legal `Blocked` state with a typed
    `autonomous_work_orphaned` failure instead of leaving a forever-running
-   graph.
+   graph or violating the graph state machine with `Planned -> Failed`.
 6. A Team whose frozen instructions explicitly require
    `collaboration_control propose_work` turns that statement into a Runtime
    checkpoint obligation. The topological first half of its Agents (2/4 or
-   3/6) must each author one proposal; omission after three bounded
-   continuations fails loudly instead of being accepted as prose completion.
+   3/6) must each author one proposal. After three bounded native-tool
+   opportunities, Runtime commits one identity-attested idempotent bootstrap
+   proposal if the model still omitted it; only failure of that governed
+   mutation fails the Agent.
 7. The first topological proposer's work must receive one independent
    challenge before acceptance. Runtime supplies revision-fenced actions, but
    the Agents still bid, claim, execute, publish, submit, challenge, revise and
@@ -95,3 +98,94 @@ these owners.
 The real-provider run occurs once, only after deterministic gates and a clean
 candidate commit. Installation, cache cleanup and the local annotated tag occur
 only after that immutable report passes. No remote push is part of this phase.
+
+## Candidate-3 incident and amended closure design
+
+The clean `3976d58e` candidate falsified three assumptions in the preceding
+design. The immutable report is
+`target/acceptance/real-qwen/runs/v0.9.713-1788236592-mission-harness-deep/report.json`
+and the retained Gateway event store ends at commit cursor `4875`.
+
+1. A checkpoint prompt is not actionable merely because the Agent Binding
+   allows `collaboration_control`. Dynamic exposure can leave a continuation
+   with an empty native function-call contract. A checkpoint that contains a
+   market mutation must install a one-request governed tool overlay and require
+   one real native action. The overlay is restricted to tools already present
+   in the immutable Binding; it cannot elevate authority.
+2. Failing a designated proposer after three prompts makes model protocol
+   compliance a graph-liveness dependency. After the bounded model opportunity,
+   Runtime must apply exactly one identity-derived, idempotent default proposal
+   when another schedulable peer exists. The proposal contains no invented
+   evidence or research conclusion and still goes through `TeamRuntime` CAS,
+   eligibility and Binding checks. Failure of that mutation remains fatal.
+3. Dependency and orphan convergence cannot depend only on a later scheduler
+   wake-up. Every successful terminal wave must run the dependency reducer
+   before executor cleanup, and a completion pump may not return while there is
+   no active/ready node but the durable graph remains non-terminal. Required
+   autonomous work with all Agent nodes terminal must therefore commit a legal
+   terminal `Blocked` transition carrying `autonomous_work_orphaned` in the
+   same convergence cycle.
+4. Summary graph cropping after activity construction is too late. The root
+   and every descendant graph must be cropped before activity reduction, and
+   high-frequency model/tool/runtime activity collections must have stable
+   newest-first limits. Team, Agent, execution, verification and autonomous
+   work identities remain complete. Lossless details stay behind the existing
+   activity detail and Full projection authorities.
+
+`coordinate_and_reinspect` is observational state, not a required action. It
+must not keep a proposer in bounded continuation rounds while only a future
+peer can advance the work. Bounded continuations stop as soon as no mutation is
+currently executable by the bound Agent.
+
+### Audited ownership and non-regression rules
+
+| Concern | Sole owner | Required behavior | Forbidden shortcut |
+| --- | --- | --- | --- |
+| Checkpoint tool availability | `ConversationRuntime` one-request overlay, requested by `AgentTaskExecutor` | expose only Binding-allowed schemas and require a real call when a mutation is pending | prompt text claiming a tool is available |
+| Default proposal | `TeamRuntime::apply_collaboration_control` | derive actor/role/capability from the immutable packet; stable idempotency key; normal CAS and peer eligibility | direct graph mutation or model-authored identity |
+| Market semantics | Agent plus `TeamRuntime` | model remains responsible for evidence, execution, submission and peer verdicts; Runtime default covers only the required bootstrap proposal | fabricated submission, review, finding or evidence |
+| Terminal convergence | `ExecutionGraphRunner` | repump dependencies immediately after terminal commit; block orphaned required work with a typed failure; never return a non-terminal quiescent report | illegal `Planned -> Failed` transition or evaluator-side cancellation presented as completion |
+| Summary transport | Runtime projection reducer | complete control-plane identity/topology with bounded noisy detail | evaluator-specific response rewriting |
+
+The source audit found an existing safe API for every authorized mutation:
+`require_next_model_tool_action` accepts only the current catalog subset;
+`apply_collaboration_control` derives identity from the bound packet and already
+implements proposal idempotency; `advance_dependencies` already owns typed
+orphan failure. The implementation therefore extends these owners and adds no
+parallel state store, compatibility path or evaluator mutation.
+
+### Unambiguous implementation sequence
+
+1. Replace the string checkpoint result with a typed plan carrying prompt,
+   actionable flag and Binding-cropped tool ids. Require a provider tool action
+   only for an actionable plan. Remove non-actionable proposer coordination
+   from the mutation list.
+2. Replace the post-checkpoint proposer failure with an async helper that
+   reloads graph truth, applies the stable default proposal through
+   `TeamRuntime`, records `agent.autonomy.runtime_default_applied`, reloads and
+   verifies the postcondition, and fails closed on any remaining omission.
+3. Add post-terminal dependency convergence to batched and non-batched success
+   paths plus isolated failure paths. Add a quiescent non-terminal guard to the
+   supervisor completion pump.
+4. Crop the root and descendant graphs before activity projection. Bound noisy
+   activity/entity collections without dropping Team/Agent/work identities or
+   numeric graph usage.
+5. Add focused tests for required tool exposure, default-proposal identity and
+   replay, non-designated/no-market exclusion, serial future-peer eligibility,
+   actual runner orphan convergence, non-terminal quiescence rejection and a
+   byte-bounded 16-Agent Summary projection.
+6. Run focused suites, then full Runtime/Gateway/Harness Contract/Harness Eval,
+   formatting, diff, architecture, version, governance and performance gates.
+   Commit only a clean deterministic candidate. Only then run one new isolated
+   DeepSeek acceptance and monitor it to a real terminal.
+
+### Audit verdict
+
+The plan is accepted for implementation because all mutations preserve a
+single durable owner, all defaults are idempotent and identity-attested, model
+evidence is never synthesized, terminal failure remains fail-closed, Full
+projection semantics remain unchanged, and the evaluator remains read-only
+apart from its existing timeout cancellation path. The plan is rejected if an
+implementation introduces a second market store, bypasses `TeamRuntime`, marks
+unreviewed work accepted, weakens required work, or treats polling heartbeat as
+business progress.

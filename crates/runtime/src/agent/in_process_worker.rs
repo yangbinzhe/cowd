@@ -785,8 +785,11 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     "durable Team work requires a bounded continuation; round={checkpoint_round}"
                 ),
             );
+            if checkpoint.requires_tool_action {
+                runtime.require_next_model_tool_action(checkpoint.tool_ids.clone());
+            }
             let continuation = runtime
-                .submit_turn(&checkpoint, &SharedPrompter::none())
+                .submit_turn(&checkpoint.prompt, &SharedPrompter::none())
                 .await;
             match continuation {
                 Ok(updated) => summary = updated,
@@ -800,27 +803,17 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 }
             }
         }
-        if team_requires_autonomous_market(&services, packet.graph_id())? {
-            let graph = services
-                .graph_state_store()
-                .load(packet.graph_id())
-                .map_err(|error| format!("verify Agent autonomy contract: {error}"))?;
-            if missing_required_proposal_action(&graph, &packet, true).is_some() {
-                let error = format!(
-                    "Agent `{}` omitted its required autonomous proposal after three bounded checkpoints",
-                    packet.agent_id()
-                );
-                let _ = services.agent_runtime().record_progress(
-                    packet.agent_id(),
-                    "agent.autonomy.contract_failed",
-                    &error,
-                );
-                services.fail_live_execution(packet.run_id(), error.clone());
-                drop(runtime);
-                drop(child_execution_scope);
-                drop(active_run_cleanup);
-                return Err(error);
-            }
+        if let Err(error) = ensure_required_autonomous_proposal(&services, &packet).await {
+            let _ = services.agent_runtime().record_progress(
+                packet.agent_id(),
+                "agent.autonomy.contract_failed",
+                &error,
+            );
+            services.fail_live_execution(packet.run_id(), error.clone());
+            drop(runtime);
+            drop(child_execution_scope);
+            drop(active_run_cleanup);
+            return Err(error);
         }
         let (has_successful_escalation, has_source_evidence) = {
             let receipts = tool_executor
@@ -1371,6 +1364,12 @@ fn recovered_agent_tool_receipt_prompt(
 
 const REQUIRED_AUTONOMOUS_MARKET_MARKER: &str = "collaboration_control propose_work";
 
+struct AgentAutonomyCheckpoint {
+    prompt: String,
+    tool_ids: Vec<String>,
+    requires_tool_action: bool,
+}
+
 fn team_requires_autonomous_market(
     services: &Arc<RuntimeServices>,
     graph_id: &str,
@@ -1509,10 +1508,107 @@ fn missing_required_proposal_action(
     }))
 }
 
+async fn ensure_required_autonomous_proposal(
+    services: &Arc<RuntimeServices>,
+    packet: &AgentTaskPacket,
+) -> Result<(), String> {
+    if !team_requires_autonomous_market(services, packet.graph_id())? {
+        return Ok(());
+    }
+    let graph = services
+        .graph_state_store()
+        .load(packet.graph_id())
+        .map_err(|error| format!("verify Agent autonomy contract: {error}"))?;
+    if missing_required_proposal_action(&graph, packet, true).is_none() {
+        return Ok(());
+    }
+    let agent_id = packet.agent_id();
+    services
+        .team_runtime()
+        .apply_collaboration_control(runtime_default_autonomous_proposal_request(&graph, packet))
+        .await
+        .map_err(|error| {
+            format!(
+                "Agent `{agent_id}` omitted its required autonomous proposal and the governed Runtime default failed: {error}"
+            )
+        })?;
+    let graph = services
+        .graph_state_store()
+        .load(packet.graph_id())
+        .map_err(|error| format!("verify Runtime default autonomous proposal: {error}"))?;
+    if missing_required_proposal_action(&graph, packet, true).is_some() {
+        return Err(format!(
+            "Agent `{agent_id}` still lacks its required autonomous proposal after the governed Runtime default"
+        ));
+    }
+    let _ = services.agent_runtime().record_progress(
+        agent_id,
+        "agent.autonomy.runtime_default_applied",
+        "Runtime committed one identity-attested idempotent proposal after the bounded model checkpoints omitted it",
+    );
+    Ok(())
+}
+
+fn runtime_default_autonomous_proposal_request(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+    packet: &AgentTaskPacket,
+) -> crate::CollaborationControlRequest {
+    let agent_id = packet.agent_id();
+    crate::CollaborationControlRequest {
+        graph_id: graph.id.clone(),
+        node_id: packet.node_id().to_string(),
+        operation: crate::CollaborationControlOperation::ProposeWork,
+        // Proposal ids are independently idempotent. Avoid a graph-wide CAS
+        // here so parallel peer activity cannot turn a safe bootstrap default
+        // into a false Agent failure between the preceding read and commit.
+        expected_revision: None,
+        expected_work_revision: Some(0),
+        work_node_id: None,
+        claim_token: None,
+        lease_duration_ms: None,
+        submission_ref: None,
+        finding: None,
+        proposal: Some(crate::CollaborationWorkProposal {
+            idempotency_key: format!("autonomy:{}:{agent_id}:follow-up-v1", graph.id),
+            objective: "Perform one bounded, evidence-backed cross-check inside this Team charter and publish the result for independent peer review".to_string(),
+            role: harness_contract::execution_graph::ExecutionWorkRole::CrossCheck,
+            required_capabilities: Vec::new(),
+            input_artifact_refs: Vec::new(),
+            output_artifact_kinds: vec!["autonomous_cross_check".to_string()],
+            evidence_refs: Vec::new(),
+            expected_input_tokens: 0,
+            expected_output_tokens: 0,
+            expected_duration_ms: 0,
+            scheduling_priority: 64,
+        }),
+        rationale: None,
+        estimated_cost: None,
+    }
+}
+
+fn autonomy_checkpoint_tool_plan(
+    packet: &AgentTaskPacket,
+    requires_tool_action: bool,
+    requires_execution_tools: bool,
+) -> Vec<String> {
+    if !requires_tool_action {
+        Vec::new()
+    } else if requires_execution_tools {
+        packet
+            .allowed_tools
+            .iter()
+            .filter(|tool| tool.as_str() != "tool_search")
+            .cloned()
+            .collect()
+    } else {
+        vec!["collaboration_control".to_string()]
+    }
+}
+
 fn agent_autonomy_checkpoint(
     services: &Arc<RuntimeServices>,
     packet: &AgentTaskPacket,
-) -> Result<Option<String>, String> {
+) -> Result<Option<AgentAutonomyCheckpoint>, String> {
     let Some(binding) = packet.binding.as_ref() else {
         return Ok(None);
     };
@@ -1543,6 +1639,7 @@ fn agent_autonomy_checkpoint(
         .unwrap_or_default()
         .as_millis() as u64;
     let mut actions = Vec::new();
+    let mut requires_execution_tools = false;
     if let Some(action) = missing_required_proposal_action(&graph, packet, market_required) {
         actions.push(action);
     }
@@ -1633,11 +1730,17 @@ fn agent_autonomy_checkpoint(
                     ("accept", None)
                 }
             }
-            _ if work.proposed_by.as_deref() == Some(agent_id) => {
-                ("coordinate_and_reinspect", None)
-            }
+            // A proposer cannot advance work that only a future peer may bid,
+            // claim or review. Keep that state visible through the board and
+            // graph, but do not turn it into a fake required action that burns
+            // every bounded continuation round.
+            _ if work.proposed_by.as_deref() == Some(agent_id) => continue,
             _ => continue,
         };
+        requires_execution_tools |= matches!(
+            action,
+            "execute_publish_submit" | "reclaim_then_execute_publish_submit"
+        );
         let mutation_template = match action {
             "challenge" => serde_json::json!({
                 "operation": "challenge",
@@ -1731,9 +1834,16 @@ fn agent_autonomy_checkpoint(
         "unread_team_entries": unread_entries,
     }))
     .map_err(|error| format!("serialize Agent autonomy checkpoint: {error}"))?;
-    Ok(Some(format!(
-        "Runtime safe checkpoint committed after your prior model round. Resolve the actionable work and peer entries below using the native collaboration tools before returning. Do not invent identities, revisions, claim tokens, artifacts, sources, or completion. Do not create another proposal merely to prolong the loop. Preserve the substance and evidence of your earlier result and return a complete updated terminal answer after the checkpoint is closed.\n\n{checkpoint}"
-    )))
+    let requires_tool_action = !actions.is_empty();
+    let tool_ids =
+        autonomy_checkpoint_tool_plan(packet, requires_tool_action, requires_execution_tools);
+    Ok(Some(AgentAutonomyCheckpoint {
+        prompt: format!(
+            "Runtime safe checkpoint committed after your prior model round. Resolve the actionable work and peer entries below using the native collaboration tools before returning. Do not invent identities, revisions, claim tokens, artifacts, sources, or completion. Do not create another proposal merely to prolong the loop. Preserve the substance and evidence of your earlier result and return a complete updated terminal answer after the checkpoint is closed.\n\n{checkpoint}"
+        ),
+        tool_ids,
+        requires_tool_action,
+    }))
 }
 
 #[async_trait::async_trait]

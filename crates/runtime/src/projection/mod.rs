@@ -865,6 +865,108 @@ mod tests {
     }
 
     #[test]
+    fn summary_activity_reduction_crops_graph_payload_before_materialization() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        let mut graph = ExecutionGraph::new("O".repeat(1_000_000));
+        graph.id = "projection-crop-before-reduce".to_string();
+        for index in 0..16 {
+            let mut node =
+                ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "managed-agent", "{}");
+            node.id = format!("agent-{index}");
+            let mut work = harness_contract::execution_graph::ExecutionWorkContract::new(
+                harness_contract::execution_graph::ExecutionWorkRole::CrossCheck,
+            );
+            work.input_artifact_refs = (0..1_000)
+                .map(|item| format!("artifact://agent-{index}/{item}/{}", "I".repeat(512)))
+                .collect();
+            work.output_artifact_kinds = (0..1_000)
+                .map(|item| format!("output-{item}-{}", "K".repeat(512)))
+                .collect();
+            node.work = Some(work);
+            graph.nodes.push(node.clone());
+            graph
+                .node_statuses
+                .insert(node.id.clone(), ExecutionNodeStatus::Completed);
+            graph.node_results.insert(
+                node.id.clone(),
+                ExecutionNodeResult {
+                    status: ExecutionNodeStatus::Completed,
+                    result_ref: Some(format!("artifact://agent-{index}")),
+                    summary: Some("S".repeat(1_000_000)),
+                    evidence_refs: Vec::new(),
+                    failure: None,
+                    usage: ExecutionUsage::default(),
+                    finished_at_ms: index + 1,
+                },
+            );
+        }
+        let projection = project_execution_graph(&graph);
+        let scope = ExecutionProjectionScope {
+            session_id: None,
+            mission_id: None,
+            task_id: None,
+            turn_id: None,
+            execution_ids: BTreeSet::from([graph.id.clone()]),
+            node_ids: graph.nodes.iter().map(|node| node.id.clone()).collect(),
+            entity_ids: BTreeSet::new(),
+            goals: Vec::new(),
+            agents: Vec::new(),
+            teams: Vec::new(),
+            relations: Vec::new(),
+            approvals: Vec::new(),
+            interventions: Vec::new(),
+            child_executions: Vec::new(),
+            descendant_graphs: Vec::new(),
+        };
+
+        let (full, _) = activity::project_execution_activities_from_events(
+            &services,
+            &scope,
+            &projection,
+            Vec::new(),
+            true,
+        );
+        let (summary, _) = activity::project_execution_activities_from_events(
+            &services,
+            &scope,
+            &projection,
+            Vec::new(),
+            false,
+        );
+        assert!(
+            (0..16).all(|index| summary
+                .iter()
+                .any(|activity| activity.node_id.as_deref() == Some(&format!("agent-{index}")))),
+            "every Agent node identity must stay visible"
+        );
+        assert!(summary.iter().all(|activity| {
+            activity
+                .public_summary
+                .as_deref()
+                .is_none_or(|value| value.chars().count() <= 513)
+                && activity
+                    .result_summary
+                    .as_deref()
+                    .is_none_or(|value| value.chars().count() <= 1_025)
+        }));
+        let full_bytes = serde_json::to_vec(&full)
+            .expect("full activities serialize")
+            .len();
+        let summary_bytes = serde_json::to_vec(&summary)
+            .expect("summary activities serialize")
+            .len();
+        assert!(
+            full_bytes > 8_000_000,
+            "fixture must retain a materially oversized full projection; got {full_bytes} bytes"
+        );
+        assert!(
+            summary_bytes < 1_024_000,
+            "Summary must be bounded before activity materialization; got {summary_bytes} bytes"
+        );
+        assert!(summary_bytes < full_bytes / 10);
+    }
+
+    #[test]
     fn explicit_negative_strategy_warning_projects_as_cost_not_benefit() {
         let warning =
             "explicit Team request has negative estimated lift; surface must show the cost warning";

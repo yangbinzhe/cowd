@@ -2654,6 +2654,7 @@ fn autonomous_proposer_selection_follows_team_topology_not_node_sort_order() {
         vec!["node", "a-successor"]
     );
     let packet = test_agent_packet(Vec::new());
+    assert!(missing_required_proposal_action(&graph, &packet, false).is_none());
     let action = missing_required_proposal_action(&graph, &packet, true)
         .expect("first topological Agent must propose");
     assert_eq!(action["action"], "propose_work");
@@ -2662,10 +2663,86 @@ fn autonomous_proposer_selection_follows_team_topology_not_node_sort_order() {
         Some(&serde_json::Value::String("propose_work".to_string()))
     );
 
+    let mut non_designated = packet.clone();
+    non_designated.assignment.node_id = "z-final".to_string();
+    assert!(missing_required_proposal_action(&graph, &non_designated, true).is_none());
+
     let mut work = harness_contract::execution_graph::ExecutionWorkContract::new(
         harness_contract::execution_graph::ExecutionWorkRole::CrossCheck,
     );
     work.proposed_by = Some(packet.agent_id().to_string());
     graph.autonomous_work.insert("work-1".to_string(), work);
     assert!(missing_required_proposal_action(&graph, &packet, true).is_none());
+}
+
+#[test]
+fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
+    let mut packet = test_agent_packet(Vec::new());
+    packet.allowed_tools = vec![
+        "tool_search".to_string(),
+        "collaboration_control".to_string(),
+        "team_board".to_string(),
+        "read_file".to_string(),
+        "write_file".to_string(),
+    ];
+
+    assert!(autonomy_checkpoint_tool_plan(&packet, false, false).is_empty());
+    assert_eq!(
+        autonomy_checkpoint_tool_plan(&packet, true, false),
+        vec!["collaboration_control".to_string()]
+    );
+    let execution = autonomy_checkpoint_tool_plan(&packet, true, true);
+    assert_eq!(
+        execution,
+        vec![
+            "collaboration_control".to_string(),
+            "team_board".to_string(),
+            "read_file".to_string(),
+            "write_file".to_string(),
+        ]
+    );
+    assert!(!execution.iter().any(|tool| tool == "tool_search"));
+}
+
+#[test]
+fn runtime_default_autonomous_proposal_is_identity_stable_and_parallel_safe() {
+    use harness_contract::execution_graph::{
+        ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionWorkRole,
+    };
+
+    let mut graph = ExecutionGraph::new("runtime autonomy default");
+    graph.id = "team-graph:stable".to_string();
+    graph.revision = 42;
+    let mut node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
+    node.id = "node".to_string();
+    graph.nodes.push(node);
+    let packet = test_agent_packet(Vec::new());
+
+    let first = runtime_default_autonomous_proposal_request(&graph, &packet);
+    graph.revision = 99;
+    let after_parallel_commit = runtime_default_autonomous_proposal_request(&graph, &packet);
+    assert_eq!(first.expected_revision, None);
+    assert_eq!(after_parallel_commit.expected_revision, None);
+    assert_eq!(first.expected_work_revision, Some(0));
+    assert!(matches!(
+        first.operation,
+        crate::CollaborationControlOperation::ProposeWork
+    ));
+    let first_proposal = first.proposal.expect("Runtime default proposal");
+    let later_proposal = after_parallel_commit
+        .proposal
+        .expect("same Runtime default proposal");
+    assert_eq!(
+        first_proposal.idempotency_key,
+        later_proposal.idempotency_key
+    );
+    assert_eq!(
+        first_proposal.idempotency_key,
+        "autonomy:team-graph:stable:agent:follow-up-v1"
+    );
+    assert_eq!(first_proposal.role, ExecutionWorkRole::CrossCheck);
+    assert_eq!(
+        first_proposal.output_artifact_kinds,
+        vec!["autonomous_cross_check".to_string()]
+    );
 }

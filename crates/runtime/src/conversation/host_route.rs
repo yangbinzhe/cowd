@@ -241,6 +241,20 @@ where
         );
     }
 
+    /// Require one governed native-tool action on the next provider request.
+    ///
+    /// The host remains the owner of the conversation runtime between turns;
+    /// delegated Agent lifecycle checkpoints therefore cross this narrow host
+    /// boundary instead of reaching into the provider plane directly. The
+    /// allowlist and `tool_choice=required` fence are consumed exactly once by
+    /// `ConversationRuntime` and normal dynamic exposure resumes afterwards.
+    pub(crate) fn require_next_model_tool_action(
+        &self,
+        tool_ids: impl IntoIterator<Item = String>,
+    ) {
+        self.runtime_ref().require_next_model_tool_action(tool_ids);
+    }
+
     pub fn inject_resume_context(&self, packet: ResumeContextPacket) {
         self.runtime_ref().inject_resume_context(packet);
     }

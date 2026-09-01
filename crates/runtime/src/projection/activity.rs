@@ -11,7 +11,7 @@ use harness_contract::projection::{
 };
 
 use super::reducer_support::ExecutionProjectionScope;
-use super::snapshot::{safe_public_ref, safe_public_text};
+use super::snapshot::{safe_public_ref, safe_public_text, summary_graph_projection};
 use crate::{DurableRuntimeEvent, RuntimeEventScope, RuntimeServices};
 
 pub(super) fn project_execution_activities(
@@ -42,13 +42,21 @@ pub(super) fn project_execution_activities_from_events(
     Vec<ExecutionActivityProjection>,
     Vec<ExecutionActivityRelation>,
 ) {
-    let mut graphs = vec![graph.clone()];
+    let project_graph = |graph: ExecutionGraphProjection| {
+        if include_audit_only {
+            graph
+        } else {
+            summary_graph_projection(graph)
+        }
+    };
+    let mut graphs = vec![project_graph(graph.clone())];
     graphs.extend(
         scope
             .execution_ids
             .iter()
             .filter(|execution_id| execution_id.as_str() != graph.graph_id)
-            .filter_map(|execution_id| services.graph_state_store().projection(execution_id).ok()),
+            .filter_map(|execution_id| services.graph_state_store().projection(execution_id).ok())
+            .map(project_graph),
     );
     graphs.sort_by_key(|candidate| {
         (
@@ -133,7 +141,82 @@ pub(super) fn project_execution_activities_from_events(
             activity.activity_id.clone(),
         )
     });
-    (activities, relations.into_values().collect())
+    if !include_audit_only {
+        bound_summary_activities(&mut activities);
+    }
+    let retained_ids = activities
+        .iter()
+        .map(|activity| activity.activity_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let relations = relations
+        .into_values()
+        .filter(|relation| {
+            retained_ids.contains(relation.from_activity_id.as_str())
+                && retained_ids.contains(relation.to_activity_id.as_str())
+        })
+        .collect();
+    (activities, relations)
+}
+
+const SUMMARY_AUXILIARY_ACTIVITY_LIMIT: usize = 128;
+
+fn bound_summary_activities(activities: &mut Vec<ExecutionActivityProjection>) {
+    let core = |kind: ExecutionActivityKind| {
+        matches!(
+            kind,
+            ExecutionActivityKind::Execution
+                | ExecutionActivityKind::Team
+                | ExecutionActivityKind::Agent
+                | ExecutionActivityKind::Approval
+                | ExecutionActivityKind::Verify
+                | ExecutionActivityKind::Artifact
+                | ExecutionActivityKind::Outcome
+                | ExecutionActivityKind::Recovery
+        )
+    };
+    let auxiliary_count = activities
+        .iter()
+        .filter(|activity| !core(activity.kind))
+        .count();
+    let skip_auxiliary = auxiliary_count.saturating_sub(SUMMARY_AUXILIARY_ACTIVITY_LIMIT);
+    let mut skipped = 0_usize;
+    activities.retain(|activity| {
+        if core(activity.kind) || skipped >= skip_auxiliary {
+            true
+        } else {
+            skipped = skipped.saturating_add(1);
+            false
+        }
+    });
+    for activity in activities {
+        activity.display_label = activity
+            .display_label
+            .as_deref()
+            .map(|value| crop(value, 256));
+        activity.status_reason = activity
+            .status_reason
+            .as_deref()
+            .map(|value| crop(value, 512));
+        activity.public_summary = activity
+            .public_summary
+            .as_deref()
+            .map(|value| crop(value, 512));
+        activity.result_summary = activity
+            .result_summary
+            .as_deref()
+            .map(|value| crop(value, 1_024));
+        activity.causal_parent_ids.truncate(64);
+        activity.dependency_ids.truncate(64);
+        activity.blocked_by_activity_ids.truncate(64);
+        activity.input_artifact_refs.truncate(32);
+        activity.output_artifact_kinds.truncate(32);
+        activity.artifact_refs.truncate(32);
+        activity.evidence_refs.truncate(32);
+        activity.definition_refs.truncate(32);
+        if let Some(effect) = activity.effect_summary.as_mut() {
+            effect.paths.truncate(32);
+        }
+    }
 }
 
 fn project_single_execution_activities_from_events(
