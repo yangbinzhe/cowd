@@ -1,6 +1,6 @@
 # Provider Prompt Cache Hardening v0.9.714 Evidence
 
-Release status: pending
+Release status: passed
 
 ## Scope
 
@@ -69,7 +69,9 @@ requests, add padding, or omit evidence to manufacture a higher ratio.
   generation models contain no Bailian-native model and preserve the Qwen
   Token Plan provider.
 
-The status remains pending until the final Core release binary is installed,
-the service is restarted without evaluator-only environment overrides, the
-installed smoke passes, both repositories are committed and the final release
-gate is rerun. The release tag must not point at this pending state.
+The final Core release binary reports clean commit `8babdc58`, and its SHA-256
+matches the installed binary. The service was restarted after removing all
+evaluator-only environment overrides; Gateway OpenAPI and installed WebUI both
+report `0.9.714`. The installed browser gate was rerun against that service and
+passed. The implementation commits exist in both repositories; final
+governance, tag and remote-ref verification close the release record.
