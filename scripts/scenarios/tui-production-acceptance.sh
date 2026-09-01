@@ -475,7 +475,7 @@ pass "binary reports version $EXPECTED_VERSION from commit ${EXPECTED_GIT_SHA:0:
 cat >"$CONFIG_HOME/config.yaml" <<EOF
 model: "$MODEL"
 model_context_windows:
-  $MODEL: 16384
+  $MODEL: 32768
 providers:
   tui_acceptance:
     base_url: "http://127.0.0.1:$PROVIDER_PORT/v1"
@@ -797,7 +797,7 @@ def fmt_tokens(value):
 
 assert live["status"] == "complete", live
 assert usage["model"] == expected_model, usage
-assert usage["window_tokens"] == 16_384, usage
+assert usage["window_tokens"] == 32_768, usage
 assert usage["window_source"] == "configured", usage
 assert usage["input_source"] == "provider_actual", usage
 used = int(usage["input_tokens"])
