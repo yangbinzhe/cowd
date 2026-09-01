@@ -1598,7 +1598,16 @@ where
         // payload itself is accounted separately from fixed wire framing.
         let protocol_overhead_tokens =
             128u64.saturating_add(u64::from(inventory.tool_count as u32).saturating_mul(12));
-        let safety_margin_tokens = (context_window_tokens / 100).clamp(128, 2_048);
+        // Serialized provider envelopes (message wrappers, tool schemas and
+        // choice fields) are proportionally expensive on small windows and
+        // are not represented by the text-only estimator. Reserve an
+        // adaptive envelope margin so the provider preflight cannot reject a
+        // continuation after Runtime has admitted it.
+        let safety_margin_tokens = if context_window_tokens <= 32_768 {
+            (context_window_tokens / 8).clamp(1_024, 4_096)
+        } else {
+            (context_window_tokens / 100).clamp(128, 2_048)
+        };
         let prepared = self.request_compiler.prepare(
             prompt,
             messages,

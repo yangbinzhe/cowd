@@ -54,12 +54,21 @@ impl ProviderOutputBudget {
             .min(window / 2)
             .min(scaled_preferred);
         let scaled_floor = (window / 64).clamp(MIN_OUTPUT_FLOOR_TOKENS, MAX_OUTPUT_FLOOR_TOKENS);
-        let floor_output_tokens = preferred_output_tokens.min(scaled_floor);
         let available_output_tokens = window
             .saturating_sub(inputs.fixed_input_tokens)
             .saturating_sub(inputs.required_input_tokens)
             .saturating_sub(inputs.protocol_overhead_tokens)
             .saturating_sub(inputs.safety_margin_tokens);
+        // Under a small remaining capacity, a fixed 4K continuation floor can
+        // reject a request that still has a viable short response. Lower only
+        // the executability floor (not the preferred lease) so the caller can
+        // use every token that actually remains, while large windows retain
+        // the normal quality floor.
+        let floor_output_tokens = if available_output_tokens < MIN_PREFERRED_OUTPUT_TOKENS {
+            MIN_OUTPUT_FLOOR_TOKENS
+        } else {
+            preferred_output_tokens.min(scaled_floor)
+        };
         let executable = available_output_tokens >= floor_output_tokens;
         Self {
             preferred_output_tokens,
