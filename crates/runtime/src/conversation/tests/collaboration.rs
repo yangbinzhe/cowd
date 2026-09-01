@@ -227,6 +227,29 @@
     }
 
     #[test]
+    fn pending_input_disposition_preempts_root_collaboration_and_stale_constraints() {
+        let priority = next_model_control_plane_priority(2, true);
+        assert_eq!(
+            priority,
+            NextModelControlPlanePriority::InputDisposition { slot_count: 2 }
+        );
+        assert_ne!(priority, NextModelControlPlanePriority::RootCollaboration);
+        assert_ne!(priority, NextModelControlPlanePriority::ExistingConstraint);
+    }
+
+    #[test]
+    fn root_collaboration_resumes_after_pending_input_disposition_clears() {
+        assert_eq!(
+            next_model_control_plane_priority(0, true),
+            NextModelControlPlanePriority::RootCollaboration
+        );
+        assert_eq!(
+            next_model_control_plane_priority(0, false),
+            NextModelControlPlanePriority::ExistingConstraint
+        );
+    }
+
+    #[test]
     fn root_collaboration_instruction_makes_team_cardinality_and_custom_role_boundary_explicit() {
         let instruction = root_collaboration_decision_instruction(
             3,
@@ -1237,9 +1260,10 @@
         assert_eq!(item.authority, ContextAuthority::System);
         assert_eq!(item.visibility, ContextVisibility::Private);
         assert_eq!(item.evidence, vec!["tool_call:read-runtime"]);
-        assert!(item.content.contains("crates/runtime/src/lib.rs"));
-        assert!(item.content.contains("pub mod conversation;"));
-        assert!(item.content.contains("actual committed, role-local"));
+        assert!(item.content.contains("immediately preceding native tool-result"));
+        assert!(!item.content.contains("crates/runtime/src/lib.rs"));
+        assert!(!item.content.contains("pub mod conversation;"));
+        assert!(item.content.len() < 1_000);
         assert!(item.content.contains("[findings]"));
         assert!(item
             .content
@@ -1269,6 +1293,73 @@
         assert!(digest.contains("receipt-39"));
         assert!(digest.contains("COMPLETE_RECEIPT_39"));
         assert_eq!(digest.matches("### Receipt ").count(), 40);
+    }
+
+    #[test]
+    fn terminal_evidence_history_keeps_only_exact_native_pairs() {
+        let assistant_messages = vec![ConversationMessage::assistant(vec![
+            ContentBlock::Text {
+                text: "exploratory prose must be stripped".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "read-1".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"src/lib.rs"}"#.to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "unpaired".to_string(),
+                name: "read_file".to_string(),
+                input: r#"{"path":"missing"}"#.to_string(),
+            },
+        ])];
+        let result_messages = vec![ConversationMessage::tool_result(
+            "read-1",
+            "read_file",
+            "exact receipt",
+            false,
+        )];
+
+        let history = terminal_evidence_history(&assistant_messages, &result_messages);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, crate::MessageRole::Assistant);
+        assert_eq!(history[1].role, crate::MessageRole::Tool);
+        assert!(matches!(
+            history[0].blocks.as_slice(),
+            [ContentBlock::ToolUse { id, .. }] if id == "read-1"
+        ));
+        assert!(matches!(
+            history[1].blocks.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, output, .. }]
+                if tool_use_id == "read-1" && output == "exact receipt"
+        ));
+    }
+
+    #[test]
+    fn terminal_evidence_history_pairs_runtime_prefetched_receipts() {
+        let result_messages = vec![ConversationMessage::tool_result(
+            "runtime-focus-verify-0-0",
+            "read_file",
+            "runtime-prefetched exact receipt",
+            false,
+        )];
+
+        let history = terminal_evidence_history(&[], &result_messages);
+
+        assert_eq!(history.len(), 2);
+        assert!(matches!(
+            history[0].blocks.as_slice(),
+            [ContentBlock::ToolUse { id, name, input }]
+                if id == "runtime-focus-verify-0-0"
+                    && name == "read_file"
+                    && input == r#"{"runtime_evidence_replay":true}"#
+        ));
+        assert!(matches!(
+            history[1].blocks.as_slice(),
+            [ContentBlock::ToolResult { tool_use_id, output, .. }]
+                if tool_use_id == "runtime-focus-verify-0-0"
+                    && output == "runtime-prefetched exact receipt"
+        ));
     }
 
     #[test]

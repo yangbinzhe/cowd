@@ -19,10 +19,11 @@ use super::{
     resolve_tui_model, response_to_events, runtime_capability_context_item,
     semantic_checkpoint_resume_context_packet, session_db_resume_context_packet,
     slash_command_completion_candidates_with_sessions, status_context, strip_ansi_for_tui,
-    suggestions::format_unknown_slash_command, truncate_for_banner, try_resolve_bare_skill_prompt,
-    validate_no_args, workspace_context_item, write_mcp_server_fixture, CliAction, CliOutputFormat,
-    GatewayAction, GatewayToolExecutor, GitWorkspaceSummary, LocalHelpTopic, StatusUsage,
-    DEFAULT_MODEL_ALIAS, LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
+    suggestions::format_unknown_slash_command, systemd_lifecycle_eligible, truncate_for_banner,
+    try_resolve_bare_skill_prompt, validate_no_args, workspace_context_item,
+    write_mcp_server_fixture, CliAction, CliOutputFormat, GatewayAction, GatewayToolExecutor,
+    GitWorkspaceSummary, LocalHelpTopic, StatusUsage, DEFAULT_MODEL_ALIAS,
+    LATEST_SESSION_REFERENCE, NON_EXECUTABLE_SLASH_COMMANDS, SHARED_RT,
 };
 
 #[test]
@@ -32,6 +33,15 @@ fn managed_gateway_bounds_glibc_arenas_without_overriding_operator_policy() {
         gateway_allocator_arena_limit(Some(std::ffi::OsString::from("4"))),
         None
     );
+}
+
+#[test]
+fn installed_gateway_lifecycle_uses_loaded_user_service_only_for_default_home() {
+    assert!(systemd_lifecycle_eligible(false, false, Some("loaded\n")));
+    assert!(!systemd_lifecycle_eligible(true, false, Some("loaded")));
+    assert!(!systemd_lifecycle_eligible(false, true, Some("loaded")));
+    assert!(!systemd_lifecycle_eligible(false, false, Some("not-found")));
+    assert!(!systemd_lifecycle_eligible(false, false, None));
 }
 use crate::command::slash::{resume_supported_slash_commands, SlashCommand};
 use crate::provider_crate::{ApiError, MessageResponse, OutputContentBlock, Usage};

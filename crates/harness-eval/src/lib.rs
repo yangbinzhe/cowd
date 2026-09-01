@@ -31,6 +31,7 @@ mod live_scenario_observer;
 mod live_scenario_runner;
 mod measurement;
 mod paired_performance;
+mod provider_cache_calibration;
 mod provider_rounds;
 mod real_provider_runner;
 mod report;
@@ -57,6 +58,9 @@ pub use evolution::{
 };
 pub use live_scenario_runner::run_live_gateway_scenarios;
 pub use paired_performance::{run_paired_performance, PairedPerformanceOptions};
+pub use provider_cache_calibration::{
+    run_provider_cache_calibration, ProviderCacheCalibrationOptions,
+};
 pub use report::{
     evaluate_report_gate, CapabilityResult, ExecutionTrace, HarnessEvalLevel,
     HarnessEvalReportDetail, HarnessEvalReportGate, HarnessEvalReportGateItem,

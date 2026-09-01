@@ -54,13 +54,14 @@ where
         }
         let prefetched_review_calls = {
             let mut state = self.state.lock().await;
-            let reviewer_prefetch = should_prefetch_focus_verification(
-                state.first_model_step,
-                state.bounded_evidence_role,
-                state.focus_verification_prefetched,
-                &state.focus_acceptance_pending_scopes,
-                self.services.workspace_root(),
-            );
+            let reviewer_prefetch = state.pending_disposition_inputs.is_empty()
+                && should_prefetch_focus_verification(
+                    state.first_model_step,
+                    state.bounded_evidence_role,
+                    state.focus_verification_prefetched,
+                    &state.focus_acceptance_pending_scopes,
+                    self.services.workspace_root(),
+                );
             let calls = reviewer_prefetch
                 .then(|| {
                     focus_verification_tool_calls(
@@ -105,12 +106,21 @@ where
             clean_terminal_evidence,
             provider_retry_fenced,
             pending_next_model_context,
+            pending_disposition_inputs,
         ) = {
             let mut state = self.state.lock().await;
+            let pending_disposition_inputs = state.pending_disposition_inputs.clone();
             let first = state.first_model_step;
             state.first_model_step = false;
             let mut clean_terminal_synthesis =
                 std::mem::take(&mut state.clean_terminal_synthesis_next);
+            if !pending_disposition_inputs.is_empty() {
+                // A terminal candidate produced for the pre-update topology is
+                // stale. Discard it and let the post-disposition graph decide
+                // whether a fresh synthesis is still appropriate.
+                clean_terminal_synthesis = false;
+                state.clean_terminal_synthesis_attempted = false;
+            }
             if !clean_terminal_synthesis
                 && !state.clean_terminal_synthesis_attempted
                 && state.successful_tool_calls > 0
@@ -120,23 +130,36 @@ where
                 clean_terminal_synthesis = true;
             }
             let clean_terminal_evidence = clean_terminal_synthesis.then(|| {
-                let mut evidence = terminal_evidence_digest(&state.tool_results);
-                let early_receipt_messages = state
+                let mut result_messages = state.tool_results.clone();
+                let mut assistant_messages = state.assistant_messages.clone();
+                let early_receipts = state
                     .early_tool_receipts
                     .values()
-                    .map(early_tool_receipt_message)
                     .collect::<Vec<_>>();
-                let early_evidence = terminal_evidence_digest(&early_receipt_messages);
-                if !early_evidence.is_empty() {
-                    if !evidence.is_empty() {
-                        evidence.push_str("\n\n");
+                for receipt in early_receipts {
+                    result_messages.push(early_tool_receipt_message(receipt));
+                    let already_present = assistant_messages.iter().any(|message| {
+                        message.blocks.iter().any(|block| {
+                            matches!(block, ContentBlock::ToolUse { id, .. } if id == &receipt.call.id)
+                        })
+                    });
+                    if !already_present {
+                        assistant_messages.push(ConversationMessage::assistant(vec![
+                            ContentBlock::ToolUse {
+                                id: receipt.call.id.clone(),
+                                name: receipt.call.name.clone(),
+                                input: receipt.call.input.clone(),
+                            },
+                        ]));
                     }
-                    evidence.push_str(&early_evidence);
                 }
-                evidence
+                let digest = terminal_evidence_digest(&result_messages);
+                let history = terminal_evidence_history(&assistant_messages, &result_messages);
+                (digest, history)
             });
             let made_progress = std::mem::take(&mut state.last_verified_progress);
-            let intervention = if clean_terminal_synthesis {
+            let intervention = if clean_terminal_synthesis || !pending_disposition_inputs.is_empty()
+            {
                 None
             } else {
                 match crate::execution_core::SafetyFusePolicy::evaluate(
@@ -194,6 +217,7 @@ where
                 clean_terminal_evidence,
                 state.tool_receipts_observed > 0,
                 pending_next_model_context,
+                pending_disposition_inputs,
             )
         };
         if let Some((intervention, observation)) = fuse_intervention {
@@ -274,7 +298,42 @@ where
                 })
             }
         };
-        if let Some((required_team_count, local_phase, required_workspace_evidence_scopes)) =
+        let control_plane_priority = next_model_control_plane_priority(
+            pending_disposition_inputs.len(),
+            required_control_plane.is_some(),
+        );
+        if let NextModelControlPlanePriority::InputDisposition { slot_count } =
+            control_plane_priority
+        {
+            runtime.require_next_model_named_tool_action(
+                harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID,
+            );
+            runtime.require_next_model_reasoning_effort("none");
+            let (session_id, turn_id) = {
+                let state = self.state.lock().await;
+                (state.session_id.clone(), state.turn_id.clone())
+            };
+            if let Some(guidance) = crate::turn_inbox::checkpoint_guidance(
+                TurnInputCheckpoint::BeforeProviderRequest,
+                &pending_disposition_inputs,
+            ) {
+                let mut item = ContextItem::new(
+                    format!("runtime-input-disposition:{session_id}:{turn_id}"),
+                    ContextSourceKind::Task,
+                    ContextRole::Instruction,
+                    format!(
+                        "Runtime control-plane priority: route all {slot_count} pending input slot(s) before any collaboration submission, terminal response, or ordinary tool call. {guidance}"
+                    ),
+                );
+                item.authority = ContextAuthority::System;
+                item.visibility = ContextVisibility::Private;
+                item.evidence = pending_disposition_inputs
+                    .iter()
+                    .map(|record| format!("session_input:{}", record.envelope.input_id.as_str()))
+                    .collect();
+                runtime.push_next_model_context_item(item);
+            }
+        } else if let Some((required_team_count, local_phase, required_workspace_evidence_scopes)) =
             required_control_plane
         {
             let (session_id, turn_id) = {
@@ -358,7 +417,11 @@ where
                 detail: Some("requesting model".to_string()),
             });
         }
-        if !clean_terminal_synthesis {
+        if matches!(
+            control_plane_priority,
+            NextModelControlPlanePriority::ExistingConstraint
+        ) && !clean_terminal_synthesis
+        {
             if force_text_only_response {
                 runtime.require_next_model_final_response();
             } else if let Some(tool_ids) = force_tool_allowlist {
@@ -419,7 +482,14 @@ where
             runtime
                 .execute_clean_terminal_synthesis(
                     &content,
-                    clean_terminal_evidence.as_deref().unwrap_or_default(),
+                    clean_terminal_evidence
+                        .as_ref()
+                        .map(|(digest, _)| digest.as_str())
+                        .unwrap_or_default(),
+                    clean_terminal_evidence
+                        .as_ref()
+                        .map(|(_, history)| history.clone())
+                        .unwrap_or_default(),
                 )
                 .await
         } else {
@@ -784,6 +854,9 @@ where
                     }
                     state.pending_disposition_inputs.clear();
                     state.input_disposition_repairs = 0;
+                    state.clean_terminal_synthesis_next = false;
+                    state.clean_terminal_synthesis_attempted = false;
+                    state.last_verified_progress = true;
                     for receipt in &applied_receipts {
                         if matches!(
                             receipt.action,
@@ -3699,10 +3772,15 @@ where
                 state.pending_next_model_context.push(item);
             }
             // Evidence acquisition has completed. The next request is a
-            // deterministic contract reduction, so it should not spend another
-            // deep reasoning pass or reopen tool exploration.
+            // deterministic contract reduction. Use the isolated terminal
+            // request instead of replaying the exploratory assistant/tool-call
+            // transcript: every committed receipt remains present exactly once,
+            // while provider-private reasoning, tool schemas, and stale protocol
+            // turns cannot inflate the reduction request.
             state.force_text_only_next_model = true;
             state.force_reasoning_effort_next_model = Some("none".to_string());
+            state.clean_terminal_synthesis_attempted = true;
+            state.clean_terminal_synthesis_next = true;
         }
         state.last_verified_progress = !new_observed_fingerprints.is_empty();
         let verified_evidence_refs = if state.last_verified_progress {

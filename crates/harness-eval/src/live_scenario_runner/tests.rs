@@ -1362,6 +1362,8 @@ fn scenario_metrics_sum_only_canonical_token_usage_records() {
 
     assert_eq!(metrics["input_tokens"], 17);
     assert_eq!(metrics["output_tokens"], 16);
+    assert_eq!(metrics["cache_creation_input_tokens"], 2);
+    assert_eq!(metrics["cache_read_input_tokens"], 7);
     assert_eq!(metrics["cache_tokens"], 9);
     assert_eq!(metrics["total_tokens"], 42);
     assert_eq!(metrics["token_usage_records"], 2);
@@ -1369,6 +1371,65 @@ fn scenario_metrics_sum_only_canonical_token_usage_records() {
     assert_eq!(metrics["model_rounds"], 2);
     assert_eq!(metrics["first_token_latency_ms"], 125);
     assert_eq!(metrics["wall_tokens_per_second"], 42.5);
+}
+
+#[test]
+fn scenario_metrics_prefer_unique_provider_attempt_outcomes_and_exact_prefix_evidence() {
+    let packed = |request_id: &str, prompt: u64, reusable: u64, cold: bool| {
+        json!({
+            "kind": "context.provider_request_packed",
+            "payload": {
+                "type": "ProviderRequestPacked",
+                "request_id": request_id,
+                "model": "deepseek-v4-flash",
+                "cache_identity_sha256": "cohort-a",
+                "model_visible_prompt_bytes": prompt,
+                "reusable_prefix_bytes": reusable,
+                "exact_prefix_extension": reusable > 0,
+                "cache_cold_leader": cold,
+                "waited_for_cache_warmup": !cold
+            }
+        })
+    };
+    let outcome = |request_id: &str, miss: u64, read: u64| {
+        json!({
+            "kind": "context.provider_attempt_outcome",
+            "payload": {
+                "type": "ProviderAttemptOutcome",
+                "request_id": request_id,
+                "terminal_status": "completed",
+                "usage_status": "known",
+                "usage": {
+                    "input_tokens": miss,
+                    "output_tokens": 2,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": read
+                }
+            }
+        })
+    };
+    let first_outcome = outcome("request-1", 100, 0);
+    let timeline = json!({
+        "session_events": [
+            packed("request-1", 1000, 0, true),
+            first_outcome.clone(),
+            packed("request-2", 1100, 1000, false),
+            outcome("request-2", 10, 90),
+            first_outcome
+        ],
+        "team_session": {"runtime_run_count": 2},
+        "token_speed": {"token_usage": [{"input": 9999, "output": 9999}]}
+    });
+    let metrics = scenario_metrics(&timeline, &[], Duration::from_secs(1));
+
+    assert_eq!(metrics["input_tokens"], 110);
+    assert_eq!(metrics["cache_read_input_tokens"], 90);
+    assert_eq!(metrics["provider_attempt_count"], 2);
+    assert_eq!(metrics["provider_attempt_usage_unknown_count"], 0);
+    assert_eq!(metrics["cache_cold_leader_count"], 1);
+    assert_eq!(metrics["cache_waiter_count"], 1);
+    assert_eq!(metrics["structural_reuse_ratio_bp"], 4_761);
+    assert_eq!(metrics["warm_structural_reuse_ratio_bp"], 9_090);
 }
 
 #[test]
@@ -1401,6 +1462,8 @@ fn scenario_metrics_aggregate_deduplicated_root_and_child_graph_usage() {
 
     assert_eq!(metrics["input_tokens"], 34);
     assert_eq!(metrics["output_tokens"], 13);
+    assert_eq!(metrics["cache_creation_input_tokens"], 0);
+    assert_eq!(metrics["cache_read_input_tokens"], 4);
     assert_eq!(metrics["cache_tokens"], 4);
     assert_eq!(metrics["tool_calls"], 1);
     assert_eq!(metrics["model_rounds"], 2);

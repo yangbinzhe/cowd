@@ -263,6 +263,58 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     let live = report.get("live_gateway_scenarios").unwrap_or(&Value::Null);
     let live_provider_rounds = live_gateway_provider_rounds(live);
     let live_total_tokens = live_gateway_total_tokens(live);
+    let cache = trace.get("provider_cache").unwrap_or(&Value::Null);
+    let fallback_miss = trace
+        .pointer("/total_usage/input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let fallback_creation = trace
+        .pointer("/total_usage/cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let fallback_read = trace
+        .pointer("/total_usage/cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let fallback_prompt = fallback_miss
+        .saturating_add(fallback_creation)
+        .saturating_add(fallback_read);
+    let cache_prompt_tokens = cache
+        .get("provider_prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(fallback_prompt);
+    let cache_hit_ratio_bp = cache
+        .get("cache_hit_ratio_bp")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            (cache_prompt_tokens > 0)
+                .then(|| fallback_read.saturating_mul(10_000) / cache_prompt_tokens)
+                .unwrap_or(0)
+        });
+    let cache_usage_known = cache
+        .get("usage_known")
+        .and_then(Value::as_bool)
+        .unwrap_or(cache_prompt_tokens > 0);
+    let structural_prompt_bytes = cache
+        .get("model_visible_prompt_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let structural_reuse_ratio_bp = cache
+        .get("structural_reuse_ratio_bp")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let warm_provider_prompt_tokens = cache
+        .get("warm_provider_prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let warm_cache_hit_ratio_bp = cache
+        .get("warm_cache_hit_ratio_bp")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let warm_structural_reuse_ratio_bp = cache
+        .get("warm_structural_reuse_ratio_bp")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
 
     let mut items = Vec::new();
     items.push(HarnessEvalReportGateItem::new(
@@ -448,6 +500,48 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
             live_provider_rounds
         ),
         "deep/real reports may not claim real model evidence with zero provider rounds",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "real_provider_cache_usage_known",
+        !real_model_claimed || cache_usage_known,
+        true,
+        format!(
+            "real_model_claimed={real_model_claimed}, prompt_tokens={cache_prompt_tokens}, usage_known={cache_usage_known}"
+        ),
+        "persist canonical hit/miss usage for every real Provider run",
+    ));
+    let cache_slo_applicable =
+        real_model_claimed && runtime_provider_rounds(trace).max(live_provider_rounds) >= 3;
+    items.push(HarnessEvalReportGateItem::new(
+        "real_provider_cache_cold_inclusive_90pct",
+        !cache_slo_applicable || cache_hit_ratio_bp >= 9_000,
+        true,
+        format!(
+            "applicable={cache_slo_applicable}, cache_hit_ratio_bp={cache_hit_ratio_bp}, prompt_tokens={cache_prompt_tokens}"
+        ),
+        "fix request prefix layout and cold-cohort coordination before deep paid acceptance",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "real_provider_cache_structure_95pct",
+        !cache_slo_applicable
+            || (structural_prompt_bytes > 0 && structural_reuse_ratio_bp >= 9_500),
+        true,
+        format!(
+            "applicable={cache_slo_applicable}, structural_reuse_ratio_bp={structural_reuse_ratio_bp}, prompt_bytes={structural_prompt_bytes}"
+        ),
+        "preserve exact model-visible prefixes and persist request-level wire evidence",
+    ));
+    items.push(HarnessEvalReportGateItem::new(
+        "real_provider_cache_warm_95pct",
+        !cache_slo_applicable
+            || (warm_provider_prompt_tokens > 0
+                && warm_cache_hit_ratio_bp >= 9_500
+                && warm_structural_reuse_ratio_bp >= 9_500),
+        true,
+        format!(
+            "applicable={cache_slo_applicable}, warm_cache_hit_ratio_bp={warm_cache_hit_ratio_bp}, warm_structural_reuse_ratio_bp={warm_structural_reuse_ratio_bp}, warm_prompt_tokens={warm_provider_prompt_tokens}"
+        ),
+        "keep warm requests append-only and investigate Provider cache-unit misses",
     ));
     push_manifest_gate_item(&mut items, evidence_manifest, real_model_claimed);
 
@@ -866,6 +960,48 @@ mod gate_tests {
             "passed"
         );
         assert_eq!(item("token_usage_nonzero_or_estimated").status, "passed");
+    }
+
+    #[test]
+    fn real_multi_round_cache_gate_uses_cold_inclusive_provider_denominator() {
+        let mut report = real_manifest_report(
+            "0123456789abcdef0123456789abcdef01234567",
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "clean",
+        );
+        report["execution_trace"] = json!({
+            "provider_rounds": 3,
+            "total_usage": {
+                "input_tokens": 10,
+                "output_tokens": 1,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 90,
+                "total_tokens": 101,
+                "usage_source": "provider_event"
+            },
+            "provider_cache": {
+                "provider_prompt_tokens": 100,
+                "cache_hit_ratio_bp": 9000,
+                "usage_known": true,
+                "model_visible_prompt_bytes": 10000,
+                "structural_reuse_ratio_bp": 9500,
+                "warm_provider_prompt_tokens": 80,
+                "warm_cache_hit_ratio_bp": 9500,
+                "warm_structural_reuse_ratio_bp": 9900
+            }
+        });
+        let passed = evaluate_report_gate(&report);
+        assert_eq!(
+            gate_item(&passed, "real_provider_cache_cold_inclusive_90pct").status,
+            "passed"
+        );
+
+        report["execution_trace"]["provider_cache"]["cache_hit_ratio_bp"] = json!(8_999);
+        let failed = evaluate_report_gate(&report);
+        assert_eq!(
+            gate_item(&failed, "real_provider_cache_cold_inclusive_90pct").status,
+            "failed"
+        );
     }
 
     #[test]

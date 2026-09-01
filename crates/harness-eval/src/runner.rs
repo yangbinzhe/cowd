@@ -275,6 +275,8 @@ pub fn run_eval_controlled(
         live_gateway_provider_evidence(live_gateway_scenario_details.as_ref());
     let mut execution_usage = merge_usage(&usage, &live_provider_evidence.usage);
     let mut execution_provider_rounds = live_provider_evidence.provider_rounds;
+    let mut execution_usage_unknown_attempts = live_provider_evidence.usage_unknown_attempts;
+    let execution_cache_structure = live_provider_evidence.structure;
     let mut execution_rounds = live_provider_evidence.rounds;
     let report_reviewer_requested = report_reviewer_requested();
     if let Some(live) = &live_gateway_scenarios {
@@ -354,6 +356,12 @@ pub fn run_eval_controlled(
             "runtime_actions": runtime_actions,
             "tool_calls": tool_calls,
             "total_usage": execution_usage,
+            "provider_cache": provider_cache_evidence(
+                &execution_usage,
+                execution_provider_rounds,
+                execution_usage_unknown_attempts,
+                &execution_cache_structure,
+            ),
             "rounds": execution_rounds,
             "tool_call_log": tool_call_log,
             "runtime_action_log": runtime_action_log
@@ -399,11 +407,21 @@ pub fn run_eval_controlled(
             execution_rounds.extend(rounds.iter().cloned());
         }
         execution_provider_rounds = execution_provider_rounds.saturating_add(provider_round_count);
+        if provider_review.usage.total_tokens == 0 {
+            execution_usage_unknown_attempts =
+                execution_usage_unknown_attempts.saturating_add(provider_round_count as u64);
+        }
         execution_usage = merge_usage(&execution_usage, &provider_review.usage);
         report["execution_trace"]["rounds"] = Value::Array(execution_rounds);
         report["execution_trace"]["provider_rounds"] = json!(execution_provider_rounds);
         report["execution_trace"]["total_usage"] =
             serde_json::to_value(&execution_usage).map_err(|error| error.to_string())?;
+        report["execution_trace"]["provider_cache"] = provider_cache_evidence(
+            &execution_usage,
+            execution_provider_rounds,
+            execution_usage_unknown_attempts,
+            &execution_cache_structure,
+        );
         report["provider_round_details"] = provider_round_details;
         report["ai_reviewer"] = json!({
             "status": provider_review.status,
@@ -510,7 +528,22 @@ fn live_gateway_scenario_summary(details: &Value) -> Value {
 struct LiveGatewayProviderEvidence {
     usage: HarnessEvalUsageSummary,
     provider_rounds: usize,
+    usage_unknown_attempts: u64,
+    structure: ProviderCacheStructureEvidence,
     rounds: Vec<Value>,
+}
+
+#[derive(Default)]
+struct ProviderCacheStructureEvidence {
+    prompt_bytes: u64,
+    reusable_prefix_bytes: u64,
+    warm_prompt_bytes: u64,
+    warm_reusable_prefix_bytes: u64,
+    warm_input_miss_tokens: u64,
+    warm_cache_creation_input_tokens: u64,
+    warm_cache_read_input_tokens: u64,
+    cold_leaders: u64,
+    waiters: u64,
 }
 
 fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProviderEvidence {
@@ -536,15 +569,51 @@ fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProvide
         let metrics = scenario.get("metrics").unwrap_or(&Value::Null);
         let input_tokens = json_u32(metrics.get("input_tokens"));
         let output_tokens = json_u32(metrics.get("output_tokens"));
-        let cache_tokens = json_u32(metrics.get("cache_tokens"));
+        let cache_creation_tokens = json_u32(metrics.get("cache_creation_input_tokens"));
+        let explicit_cache_read = metrics.get("cache_read_input_tokens");
+        let cache_read_tokens = explicit_cache_read
+            .map(|value| json_u32(Some(value)))
+            .unwrap_or_else(|| json_u32(metrics.get("cache_tokens")));
         let total_tokens = json_u32(metrics.get("total_tokens"));
         let model_rounds = json_u32(metrics.get("model_rounds"));
+        evidence.usage_unknown_attempts = evidence.usage_unknown_attempts.saturating_add(
+            metrics
+                .get("usage_unknown_attempts")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+        );
+        macro_rules! add_structure {
+            ($field:ident, $key:literal) => {
+                evidence.structure.$field = evidence.structure.$field.saturating_add(
+                    metrics
+                        .get($key)
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                );
+            };
+        }
+        add_structure!(prompt_bytes, "model_visible_prompt_bytes");
+        add_structure!(reusable_prefix_bytes, "reusable_prefix_bytes");
+        add_structure!(warm_prompt_bytes, "warm_model_visible_prompt_bytes");
+        add_structure!(warm_reusable_prefix_bytes, "warm_reusable_prefix_bytes");
+        add_structure!(warm_input_miss_tokens, "warm_input_miss_tokens");
+        add_structure!(
+            warm_cache_creation_input_tokens,
+            "warm_cache_creation_input_tokens"
+        );
+        add_structure!(warm_cache_read_input_tokens, "warm_cache_read_input_tokens");
+        add_structure!(cold_leaders, "cache_cold_leader_count");
+        add_structure!(waiters, "cache_waiter_count");
         evidence.usage.input_tokens = evidence.usage.input_tokens.saturating_add(input_tokens);
         evidence.usage.output_tokens = evidence.usage.output_tokens.saturating_add(output_tokens);
+        evidence.usage.cache_creation_input_tokens = evidence
+            .usage
+            .cache_creation_input_tokens
+            .saturating_add(cache_creation_tokens);
         evidence.usage.cache_read_input_tokens = evidence
             .usage
             .cache_read_input_tokens
-            .saturating_add(cache_tokens);
+            .saturating_add(cache_read_tokens);
         evidence.usage.total_tokens =
             evidence
                 .usage
@@ -554,7 +623,8 @@ fn live_gateway_provider_evidence(details: Option<&Value>) -> LiveGatewayProvide
                 } else {
                     input_tokens
                         .saturating_add(output_tokens)
-                        .saturating_add(cache_tokens)
+                        .saturating_add(cache_creation_tokens)
+                        .saturating_add(cache_read_tokens)
                 });
         evidence.provider_rounds = evidence
             .provider_rounds
@@ -596,6 +666,61 @@ fn merge_usage(
         total_tokens: left.total_tokens.saturating_add(right.total_tokens),
         usage_source: format!("{}+{}", left.usage_source, right.usage_source),
     }
+}
+
+fn provider_cache_evidence(
+    usage: &HarnessEvalUsageSummary,
+    provider_rounds: usize,
+    usage_unknown_attempts: u64,
+    structure: &ProviderCacheStructureEvidence,
+) -> Value {
+    let miss = u64::from(usage.input_tokens);
+    let creation = u64::from(usage.cache_creation_input_tokens);
+    let read = u64::from(usage.cache_read_input_tokens);
+    let prompt = miss.saturating_add(creation).saturating_add(read);
+    let ratio = if prompt == 0 {
+        0
+    } else {
+        (read.saturating_mul(10_000) / prompt).min(10_000)
+    };
+    let structural_ratio = ratio_u64_bp(structure.reusable_prefix_bytes, structure.prompt_bytes);
+    let warm_structural_ratio = ratio_u64_bp(
+        structure.warm_reusable_prefix_bytes,
+        structure.warm_prompt_bytes,
+    );
+    let warm_prompt_tokens = structure
+        .warm_input_miss_tokens
+        .saturating_add(structure.warm_cache_creation_input_tokens)
+        .saturating_add(structure.warm_cache_read_input_tokens);
+    let warm_cache_ratio = ratio_u64_bp(structure.warm_cache_read_input_tokens, warm_prompt_tokens);
+    json!({
+        "schema_version": 1,
+        "input_miss_tokens": miss,
+        "cache_creation_input_tokens": creation,
+        "cache_read_input_tokens": read,
+        "provider_prompt_tokens": prompt,
+        "cache_hit_ratio_bp": ratio,
+        "provider_rounds": provider_rounds,
+        "usage_known": (provider_rounds == 0 || prompt > 0) && usage_unknown_attempts == 0,
+        "usage_unknown_attempts": usage_unknown_attempts,
+        "structural_reuse_ratio_bp": structural_ratio,
+        "warm_structural_reuse_ratio_bp": warm_structural_ratio,
+        "warm_cache_hit_ratio_bp": warm_cache_ratio,
+        "model_visible_prompt_bytes": structure.prompt_bytes,
+        "reusable_prefix_bytes": structure.reusable_prefix_bytes,
+        "warm_provider_prompt_tokens": warm_prompt_tokens,
+        "cache_cold_leader_count": structure.cold_leaders,
+        "cache_waiter_count": structure.waiters,
+        "cold_inclusive": true,
+        "source": usage.usage_source,
+    })
+}
+
+fn ratio_u64_bp(numerator: u64, denominator: u64) -> u64 {
+    (denominator > 0)
+        .then(|| numerator.saturating_mul(10_000) / denominator)
+        .unwrap_or_default()
+        .min(10_000)
 }
 
 fn json_u32(value: Option<&Value>) -> u32 {

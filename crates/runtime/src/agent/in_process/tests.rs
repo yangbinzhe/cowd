@@ -2296,8 +2296,6 @@ async fn send_input_enters_the_live_child_turn_inbox() {
             cancellation: crate::CancellationToken::new(),
             session_id: "child-session".into(),
             input_stream: stream.clone(),
-            completion: Arc::new(tokio::sync::Notify::new()),
-            completed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         },
     );
     worker
@@ -2327,26 +2325,20 @@ async fn send_input_enters_the_live_child_turn_inbox() {
 }
 
 #[tokio::test]
-async fn cancel_waits_for_cleanup_and_completed_tombstone_is_race_safe() {
+async fn cancel_acknowledges_delivery_before_cleanup_and_tombstones_are_race_safe() {
     let worker = Arc::new(InProcessAgentWorker::new(Weak::new()));
     let cancellation = crate::CancellationToken::new();
-    let completion = Arc::new(tokio::sync::Notify::new());
-    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     worker.active_runs.lock().unwrap().insert(
         "run-cancel".into(),
         ActiveInProcessRun {
             cancellation: cancellation.clone(),
             session_id: "child-session".into(),
             input_stream: crate::SessionInputStream::new("child-session"),
-            completion: Arc::clone(&completion),
-            completed: Arc::clone(&completed),
         },
     );
     let cleanup = ActiveRunCleanup {
         worker: worker.as_ref(),
         run_id: "run-cancel".into(),
-        completion,
-        completed,
     };
     let handle = AgentRunHandle {
         run_id: "run-cancel".into(),
@@ -2369,12 +2361,22 @@ async fn cancel_waits_for_cleanup_and_completed_tombstone_is_race_safe() {
         tokio::spawn(async move { worker.command(&handle, &request).await })
     };
     cancellation.cancelled().await;
-    drop(cleanup);
     tokio::time::timeout(std::time::Duration::from_secs(1), cancel)
         .await
-        .expect("cancel returns after cleanup")
+        .expect("cancel acknowledges without waiting for cleanup")
         .expect("cancel task joins")
         .expect("cancel is accepted");
+    assert!(worker
+        .active_runs
+        .lock()
+        .unwrap()
+        .contains_key("run-cancel"));
+    assert!(worker
+        .pending_cancellations
+        .lock()
+        .unwrap()
+        .contains("run-cancel"));
+    drop(cleanup);
     assert!(worker.active_runs.lock().unwrap().is_empty());
     assert!(worker.pending_cancellations.lock().unwrap().is_empty());
     assert!(worker.run_completed("run-cancel"));
@@ -2391,63 +2393,25 @@ async fn cancel_waits_for_cleanup_and_completed_tombstone_is_race_safe() {
     .expect("completed cancellation is idempotent");
     assert!(worker.pending_cancellations.lock().unwrap().is_empty());
 
-    // Dropping a command future while it is waiting for an active run (or
-    // immediately after observing a completion tombstone) must also
-    // release its pending entry; no worker cleanup may still be available
-    // to do that on its behalf.
-    let aborted_token = crate::CancellationToken::new();
-    let aborted_completion = Arc::new(tokio::sync::Notify::new());
-    let aborted_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    worker.active_runs.lock().unwrap().insert(
-        "run-aborted-command".into(),
-        ActiveInProcessRun {
-            cancellation: aborted_token.clone(),
-            session_id: "child-session".into(),
-            input_stream: crate::SessionInputStream::new("child-session"),
-            completion: Arc::clone(&aborted_completion),
-            completed: Arc::clone(&aborted_completed),
-        },
+    // A snapshot without a live backend handle must not be acknowledged as
+    // cancelled. It can be a restored orphan and no execution owner exists to
+    // observe an admission tombstone.
+    let pending_handle = AgentRunHandle {
+        run_id: "run-admission-race".into(),
+        agent_id: "agent-admission-race".into(),
+        ..handle
+    };
+    let missing = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        worker.command(&pending_handle, &request),
+    )
+    .await
+    .expect("missing-handle cancel is non-blocking");
+    assert_eq!(
+        missing,
+        Err(harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend)
     );
-    let aborted_cleanup = ActiveRunCleanup {
-        worker: worker.as_ref(),
-        run_id: "run-aborted-command".into(),
-        completion: aborted_completion,
-        completed: aborted_completed,
-    };
-    let aborted_handle = AgentRunHandle {
-        run_id: "run-aborted-command".into(),
-        agent_id: "agent-aborted-command".into(),
-        ..handle.clone()
-    };
-    let aborted = {
-        let worker = Arc::clone(&worker);
-        let request = request.clone();
-        tokio::spawn(async move { worker.command(&aborted_handle, &request).await })
-    };
-    aborted_token.cancelled().await;
-    aborted.abort();
-    let _ = aborted.await;
-    assert!(
-        worker.pending_cancellations.lock().unwrap().is_empty(),
-        "PendingCancellationOwner must clean a dropped command future"
-    );
-    drop(aborted_cleanup);
-
-    worker.record_completed_run("run-completed-abort-window");
-    worker
-        .pending_cancellations
-        .lock()
-        .unwrap()
-        .insert("run-completed-abort-window".into());
-    let completed_window_owner = PendingCancellationOwner {
-        pending: &worker.pending_cancellations,
-        run_id: "run-completed-abort-window".into(),
-    };
-    drop(completed_window_owner);
-    assert!(
-        worker.pending_cancellations.lock().unwrap().is_empty(),
-        "an abort between pending insertion and tombstone inspection must be leak-free"
-    );
+    assert!(worker.pending_cancellations.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2505,7 +2469,23 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
         managed_invocation: None,
         idempotency_key: "key".into(),
     };
-    let prompt = system_prompt(&packet, std::path::Path::new("/workspace"), &[]).join("\n");
+    let prompt_segments = system_prompt(&packet, std::path::Path::new("/workspace"), &[]);
+    let cohort_boundary = prompt_segments
+        .iter()
+        .position(|segment| segment == crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY)
+        .expect("cache cohort boundary");
+    let dynamic_boundary = prompt_segments
+        .iter()
+        .position(|segment| segment == crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+        .expect("dynamic boundary");
+    let objective = prompt_segments
+        .iter()
+        .position(|segment| segment.starts_with("Objective:"))
+        .expect("immutable objective");
+    assert!(cohort_boundary < objective);
+    assert!(objective < dynamic_boundary);
+    assert_eq!(dynamic_boundary, prompt_segments.len() - 1);
+    let prompt = prompt_segments.join("\n");
     assert!(prompt.contains("Never write simulated tool syntax"));
     assert!(prompt.contains("If no native tool is authorized, answer directly"));
     assert!(!prompt.contains("## Runtime clock"));

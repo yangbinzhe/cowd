@@ -152,6 +152,45 @@
     }
 
     #[test]
+    fn context_envelope_preserves_cache_cohort_boundary_for_provider_rebuild() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new(),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec![
+                "shared protocol".to_string(),
+                crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY.to_string(),
+                "role-specific immutable assignment".to_string(),
+                crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            ],
+        )
+        .without_memory();
+        let canonical = PromptAssembly::new(runtime.system_prompt.clone());
+        let envelope = runtime.build_context_envelope(
+            "perform the delegated role",
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            runtime.context_budget_tokens(),
+        );
+
+        assert_eq!(
+            envelope.assembled.cache_cohort_segment_count,
+            canonical.cache_cohort_segment_count()
+        );
+        let rebuilt = ConversationRuntime::<MockApi, StaticToolExecutor>::
+            provider_prompt_from_envelope(&envelope);
+        assert_eq!(
+            rebuilt.cache_cohort_system_text(),
+            canonical.cache_cohort_system_text()
+        );
+        let wire = rebuilt.wire_system_text().expect("provider system text");
+        assert!(wire.contains("role-specific immutable assignment"));
+        assert!(!wire.contains(crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY));
+    }
+
+    #[test]
     fn context_budget_defaults_to_seventy_percent_of_model_window() {
         assert_eq!(resolve_context_budget_tokens(1_000_000, 7_000), 700_000);
         assert_eq!(resolve_context_budget_tokens(128_000, 7_000), 89_600);
@@ -935,6 +974,7 @@
             if let Some(system) = request.prompt.trusted_system_text() {
                 captured.push(system);
             }
+            captured.extend(request.prompt.contextual_messages());
             self.request_messages.lock().unwrap().push(captured);
             let request = self
                 .requests
@@ -1090,6 +1130,12 @@
                     name: "custom-reader".to_string(),
                     input: r#"{"path":"README.md"}"#.to_string(),
                 }),
+                Ok(AssistantEvent::Usage(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 10,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 50,
+                })),
                 Ok(AssistantEvent::MessageStop),
             ]))
         }
@@ -1124,6 +1170,8 @@
             panic!("activated frame must preserve the provider tool call");
         };
         assert_eq!(calls[0].name, "custom_reader");
+        assert_eq!(runtime.usage().turns(), 1);
+        assert_eq!(runtime.usage().cumulative_usage().total_tokens(), 160);
     }
 
     #[tokio::test]
@@ -2104,13 +2152,10 @@
         );
         let result = rt.prepare_reality_context("test").await;
         assert_eq!(result.trusted_system[0], "test prompt");
-        assert!(
-            result
-                .trusted_system
-                .get(1)
-                .is_some_and(|line| line.contains("profile:MainTurn")),
-            "without memory manager, returns stable head followed by runtime header"
-        );
+        assert!(result
+            .runtime_context
+            .iter()
+            .any(|line| line.contains("profile:MainTurn")));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2130,9 +2175,12 @@
             .expect("context envelope should be recorded");
 
         assert_eq!(prompt.trusted_system[0], "stable system");
-        assert!(prompt.trusted_system[1].contains("profile:MainTurn"));
         assert!(prompt
-            .trusted_system
+            .runtime_context
+            .iter()
+            .any(|line| line.contains("profile:MainTurn")));
+        assert!(prompt
+            .runtime_context
             .iter()
             .any(|segment| segment.contains("context_governance_report_id:")));
         assert_eq!(envelope.intent, "remember this");
@@ -2434,7 +2482,7 @@
         // bounded sections, so this must remain a semantic budget assertion.
         assert_eq!(prompt.trusted_system[0], "system prompt");
         assert!(prompt
-            .trusted_system
+            .runtime_context
             .iter()
             .any(|segment| segment.contains("profile:MainTurn")));
         assert!(!rendered_prompt(&prompt).contains("<memory_context>"));

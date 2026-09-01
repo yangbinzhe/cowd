@@ -227,6 +227,11 @@ pub(crate) use entry::env_entry::resolve_tui_model;
 #[cfg(test)]
 pub(crate) use entry::env_entry::{default_permission_mode, parse_permission_mode_arg};
 #[cfg(test)]
+pub(crate) use entry::gateway_lifecycle_entry::systemd_lifecycle_eligible;
+use entry::gateway_lifecycle_entry::{
+    run_user_gateway_service_action, user_gateway_service_is_loaded, wait_for_managed_gateway_start,
+};
+#[cfg(test)]
 pub(crate) use entry::local_command_entry::print_help_to;
 #[cfg(test)]
 pub(crate) use entry::local_command_entry::{
@@ -804,6 +809,13 @@ fn run_gateway_action(
                 println!("Gateway is already running");
                 return Ok(());
             }
+            if user_gateway_service_is_loaded() {
+                run_user_gateway_service_action("start")?;
+                let status = wait_for_managed_gateway_start(Duration::from_secs(30))?;
+                println!("Gateway started (pid: {})", status.pid);
+                tracing::info!(pid = status.pid, "managed Gateway service started");
+                return Ok(());
+            }
             setup_sigchld_handler();
             let exe =
                 std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
@@ -816,7 +828,11 @@ fn run_gateway_action(
             Ok(())
         }
         GatewayAction::Stop => {
-            server::stop_server().map_err(|e| e.to_string())?;
+            if user_gateway_service_is_loaded() {
+                run_user_gateway_service_action("stop")?;
+            } else {
+                server::stop_server().map_err(|e| e.to_string())?;
+            }
             println!("Gateway stopped");
             tracing::info!("gateway stopped");
             Ok(())
@@ -917,6 +933,13 @@ fn run_gateway_action(
             Ok(())
         }
         GatewayAction::Restart => {
+            if user_gateway_service_is_loaded() {
+                run_user_gateway_service_action("restart")?;
+                let status = wait_for_managed_gateway_start(Duration::from_secs(30))?;
+                println!("Gateway restarted (pid: {})", status.pid);
+                tracing::info!(pid = status.pid, "managed Gateway service restarted");
+                return Ok(());
+            }
             setup_sigchld_handler();
             server::stop_server().map_err(|e| e.to_string())?;
             tracing::info!("gateway restart: stopped, re-spawning");

@@ -234,10 +234,18 @@ impl SkillActivationEngine {
         let invocation_evidence = selected_invocation
             .as_ref()
             .map(|invocation| invocation.to_evidence("selected_for_runtime"));
-        let activation =
+        let mut activation =
             SkillActivationRecord::new(input.session_id, input.turn_index, input.query, candidates)
                 .with_invocation_evidence(invocation_evidence.clone())
                 .with_structured_dependencies(structured_dependencies.clone());
+        // Candidate discovery and executable selection are different facts.
+        // SkillActivationRecord historically picked the highest profile
+        // candidate again, which could project a false `selected` Skill even
+        // when the selector deliberately rejected generic token overlap.
+        activation.selected = selection
+            .selected
+            .as_ref()
+            .map(|selected| selected.skill_id.clone());
 
         SkillActivationDecision {
             activation,
@@ -292,6 +300,7 @@ impl SkillSelector {
     #[must_use]
     pub fn select(input: SkillSelectionInput) -> SkillSelectionResult {
         let query_terms = query_terms(&input.query);
+        let query_lower = input.query.to_ascii_lowercase();
         let visible_refs = visible_skill_refs(&input.agent_profile);
         let adapter_ceiling = &input.agent_profile.adapter_ceiling;
         let mut candidates = input
@@ -316,10 +325,16 @@ impl SkillSelector {
                 let mut reasons = Vec::new();
                 let name_lower = skill.name.to_ascii_lowercase();
                 let id_lower = skill.skill_id.to_ascii_lowercase();
+                let direct_identity_match = query_lower.contains(&id_lower)
+                    || (!name_lower.is_empty() && query_lower.contains(&name_lower));
+                if direct_identity_match {
+                    score += 8;
+                    reasons.push(format!("identity:{}", skill.skill_id));
+                }
                 for term in &query_terms {
                     if name_lower.contains(term) || id_lower.contains(term) {
-                        score += 8;
-                        reasons.push(format!("name:{term}"));
+                        score += 2;
+                        reasons.push(format!("name_term:{term}"));
                     }
                     for summary in &skill.inspection_summary {
                         if summary.to_ascii_lowercase().contains(term) {
@@ -354,13 +369,18 @@ impl SkillSelector {
                 .cmp(&left.score)
                 .then_with(|| left.name.cmp(&right.name))
         });
-        // A single generic summary-token match (for example `runtime` or
-        // `agent`) is discovery evidence, not authorization to inject an
-        // entire Skill prompt. Selection requires either an explicit visible
-        // grant or a direct name/id match.
+        // Generic token overlap (for example `runtime` or `agent`) is useful
+        // discovery evidence, not authorization to inject an entire Skill
+        // prompt. Selection requires an explicit visible grant or the full
+        // skill id/name phrase in the query.
         let selected = candidates
             .first()
             .filter(|candidate| candidate.score >= MIN_SKILL_SELECTION_SCORE)
+            .filter(|candidate| {
+                candidate.reasons.iter().any(|reason| {
+                    reason == "agent_profile.visible" || reason.starts_with("identity:")
+                })
+            })
             .cloned();
         SkillSelectionResult {
             selected,
@@ -713,5 +733,57 @@ mod tests {
 
         assert!(result.selected.is_none());
         assert_eq!(result.candidates[0].score, 2);
+    }
+
+    #[test]
+    fn generic_agent_term_does_not_activate_agent_reach() {
+        let mut candidate = profile(
+            "agent-reach",
+            "Agent Reach",
+            vec![SkillAdapterKind::PromptOnly],
+        );
+        candidate.inspection_summary = vec!["research content from the internet".to_string()];
+
+        let result = SkillSelector::select(SkillSelectionInput {
+            query: "请让多个 Agent 分析本地源码并输出报告".to_string(),
+            agent_profile: AgentSkillProfile::default(),
+            available_skills: vec![candidate],
+        });
+
+        assert!(result.selected.is_none());
+        assert!(result.candidates[0]
+            .reasons
+            .iter()
+            .any(|reason| reason == "name_term:agent"));
+        assert!(!result.candidates[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("identity:")));
+    }
+
+    #[test]
+    fn activation_record_does_not_reselect_a_discovery_only_candidate() {
+        let candidate = profile(
+            "agent-reach",
+            "Agent Reach",
+            vec![SkillAdapterKind::PromptOnly],
+        );
+
+        let decision = SkillActivationEngine::activate(SkillActivationInput {
+            session_id: "session-1".to_string(),
+            turn_index: 6,
+            query: "multiple Agent local source review".to_string(),
+            capability_refs: Vec::new(),
+            available_profiles: vec![candidate],
+            agent_profile: AgentSkillProfile::default(),
+        });
+
+        assert!(decision.selection.selected.is_none());
+        assert!(decision.selected_invocation.is_none());
+        assert!(decision.activation.selected.is_none());
+        assert!(decision.activation.candidates.iter().any(|candidate| {
+            candidate.name == "agent-reach"
+                && candidate.source == RuntimeSkillCandidateSource::Profile
+        }));
     }
 }

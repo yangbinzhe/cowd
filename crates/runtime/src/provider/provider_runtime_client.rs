@@ -9,12 +9,14 @@ use std::time::Instant;
 use harness_contract::tool::ToolExposureProjection;
 use model_protocol::provider_capability::{CapabilityState, ProviderCapabilityProfile};
 use model_protocol::provider_config::{ParallelToolCallsMode, ProviderProtocol};
+use model_protocol::usage::TokenUsage;
 use provider::{
     ApiError, ContentBlockDelta, ImageSource, InputContentBlock, InputMessage, MessageRequest,
     MessageResponse, OutputContentBlock, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
     ToolDefinition, ToolResultContentBlock,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ApiClient, ApiClientStream, ApiRequest, AssistantEvent, ContentBlock, ConversationMessage,
@@ -260,6 +262,15 @@ pub struct ProviderRequestEvidenceContext {
 pub struct ProviderWireEvidence {
     pub request_context: ProviderRequestContext,
     pub wire_request: provider::ProviderWireRequest,
+    pub prefix_observation: crate::ProviderWirePrefixObservation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderAttemptOutcomeEvidence {
+    pub request_id: String,
+    pub logical_attempt: u32,
+    pub terminal_status: String,
+    pub usage: Option<TokenUsage>,
 }
 
 #[async_trait::async_trait]
@@ -268,6 +279,12 @@ pub trait ProviderWireEvidenceWriter: Send + Sync {
         &self,
         context: &ProviderRequestEvidenceContext,
         evidence: ProviderWireEvidence,
+    ) -> Result<(), RuntimeError>;
+
+    async fn persist_outcome(
+        &self,
+        context: &ProviderRequestEvidenceContext,
+        outcome: ProviderAttemptOutcomeEvidence,
     ) -> Result<(), RuntimeError>;
 }
 
@@ -280,6 +297,11 @@ pub struct ProviderRuntimeClient {
     tool_exposure: Option<ToolExposureProjection>,
     tool_choice_required: bool,
     tool_choice_required_tool_name: Option<String>,
+    /// Delegated hosts receive an already capability/resource-cropped tool
+    /// catalog. Keeping that bounded schema stable across logical exposure
+    /// overlays preserves Provider prefixes; Runtime still owns and validates
+    /// the narrower per-request execution lease.
+    stable_tool_schema: bool,
     reasoning_effort: Option<String>,
     emit_output: bool,
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
@@ -288,14 +310,26 @@ pub struct ProviderRuntimeClient {
     tool_schema_cache_hits: Arc<AtomicU64>,
     execution_supervisor: Option<std::sync::Weak<crate::RuntimeExecutionSupervisor>>,
     provider_wire_evidence_writer: Option<Arc<dyn ProviderWireEvidenceWriter>>,
+    prompt_history: Arc<std::sync::Mutex<ProviderPromptHistory>>,
 }
 
 #[derive(Clone)]
 struct CompiledToolSchema {
-    catalog_revision: u64,
-    exposure_revision: u64,
+    /// Digest of the actual model-visible tool identities. Control-plane
+    /// revisions and reasons are evidence, not Provider cache identity.
+    exposure_digest: u64,
     tools: Arc<[ToolDefinition]>,
     inventory: ProviderContextInventory,
+}
+
+#[derive(Debug, Default)]
+struct ProviderPromptHistory {
+    session_history: Vec<InputMessage>,
+    /// Exact model-visible messages sent on the last request, including each
+    /// Runtime capsule before the Provider output it governed.
+    wire_messages: Vec<InputMessage>,
+    last_request_context: Vec<InputMessage>,
+    generation: u64,
 }
 
 #[cfg(test)]
@@ -444,6 +478,7 @@ impl ProviderRuntimeClient {
             tool_exposure: None,
             tool_choice_required: false,
             tool_choice_required_tool_name: None,
+            stable_tool_schema: false,
             reasoning_effort: None,
             emit_output: false,
             stream_callback: None,
@@ -452,6 +487,7 @@ impl ProviderRuntimeClient {
             tool_schema_cache_hits: Arc::new(AtomicU64::new(0)),
             execution_supervisor: None,
             provider_wire_evidence_writer: None,
+            prompt_history: Arc::new(std::sync::Mutex::new(ProviderPromptHistory::default())),
         })
     }
 
@@ -585,9 +621,6 @@ impl ProviderRuntimeClient {
             return;
         }
         self.tool_exposure = Some(projection);
-        if let Ok(mut cache) = self.tool_schema_cache.lock() {
-            *cache = None;
-        }
     }
 
     pub fn configure_tool_choice_required(&mut self, required: bool) {
@@ -602,8 +635,18 @@ impl ProviderRuntimeClient {
         self.tool_choice_required_tool_name = required.then_some(required_tool_name).flatten();
     }
 
+    #[must_use]
+    pub(crate) fn with_stable_tool_schema(mut self, stable: bool) -> Self {
+        self.stable_tool_schema = stable;
+        self
+    }
+
     fn active_tool_definitions(&self) -> Vec<ToolDefinition> {
-        tool_definitions_for_exposure(&self.tool_definitions, self.tool_exposure.as_ref())
+        if self.stable_tool_schema {
+            self.tool_definitions.clone()
+        } else {
+            tool_definitions_for_exposure(&self.tool_definitions, self.tool_exposure.as_ref())
+        }
     }
 
     fn compiled_tool_schema(&self) -> CompiledToolSchema {
@@ -616,17 +659,24 @@ impl ProviderRuntimeClient {
             .as_ref()
             .map_or(0, |projection| projection.exposure_revision);
         let provider_registry_revision = self.registry.revision();
+        let exposure_digest = if self.stable_tool_schema {
+            tool_definition_identity_digest(&self.tool_definitions)
+        } else {
+            tool_exposure_digest(self.tool_exposure.as_ref())
+        };
         let mut cache = self
             .tool_schema_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(compiled) = cache.as_ref().filter(|compiled| {
-            compiled.catalog_revision == catalog_revision
-                && compiled.exposure_revision == exposure_revision
+            compiled.exposure_digest == exposure_digest
                 && compiled.inventory.provider_registry_revision == provider_registry_revision
         }) {
             self.tool_schema_cache_hits.fetch_add(1, Ordering::Relaxed);
-            return compiled.clone();
+            let mut reused = compiled.clone();
+            reused.inventory.catalog_revision = catalog_revision;
+            reused.inventory.exposure_revision = exposure_revision;
+            return reused;
         }
         let tools: Arc<[ToolDefinition]> = self.active_tool_definitions().into();
         let schema_json = serde_json::to_vec(tools.as_ref()).unwrap_or_default();
@@ -641,8 +691,7 @@ impl ProviderRuntimeClient {
             provider_registry_revision,
         };
         let compiled = CompiledToolSchema {
-            catalog_revision,
-            exposure_revision,
+            exposure_digest,
             tools,
             inventory,
         };
@@ -659,6 +708,42 @@ impl ProviderRuntimeClient {
             cache_hits: self.tool_schema_cache_hits.load(Ordering::Relaxed),
         }
     }
+}
+
+fn tool_exposure_digest(exposure: Option<&ToolExposureProjection>) -> u64 {
+    let Some(exposure) = exposure else {
+        return model_protocol::fingerprint::stable_hash_bytes(b"no-tools");
+    };
+    let ids = exposure
+        .bootstrap_ids
+        .iter()
+        .chain(exposure.active_ids.iter())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut canonical = String::new();
+    for id in ids {
+        canonical.push_str(&id.len().to_string());
+        canonical.push(':');
+        canonical.push_str(id);
+        canonical.push('\n');
+    }
+    model_protocol::fingerprint::stable_hash_bytes(canonical.as_bytes())
+}
+
+fn tool_definition_identity_digest(definitions: &[ToolDefinition]) -> u64 {
+    let mut ids = definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut canonical = String::new();
+    for id in ids {
+        canonical.push_str(&id.len().to_string());
+        canonical.push(':');
+        canonical.push_str(id);
+        canonical.push('\n');
+    }
+    model_protocol::fingerprint::stable_hash_bytes(canonical.as_bytes())
 }
 
 fn tool_definitions_for_exposure(
@@ -829,14 +914,9 @@ impl ProviderRuntimeClient {
         request: ApiRequest,
         provider_snapshot: ProviderRegistrySnapshot,
     ) -> ApiClientStream<'_> {
-        let mut messages = request
-            .prompt
-            .contextual_messages()
-            .into_iter()
-            .map(InputMessage::user_text)
-            .collect::<Vec<_>>();
-        messages.extend(convert_messages(request.messages.iter()));
+        let messages = self.provider_input_messages(&request);
         let system = request.prompt.wire_system_text();
+        let cache_cohort_system = request.prompt.cache_cohort_system_text();
         debug_assert!(
             system
                 .as_deref()
@@ -963,6 +1043,7 @@ impl ProviderRuntimeClient {
                     entry,
                     messages,
                     system,
+                    cache_cohort_system,
                     active_tools,
                     tool_choice,
                     request
@@ -1009,11 +1090,60 @@ impl ProviderRuntimeClient {
     }
 }
 
+impl ProviderRuntimeClient {
+    fn provider_input_messages(&self, request: &ApiRequest) -> Vec<InputMessage> {
+        let history = convert_messages(request.messages.iter());
+        let context = request
+            .prompt
+            .contextual_messages()
+            .into_iter()
+            .map(InputMessage::user_text)
+            .collect::<Vec<_>>();
+        let mut state = self
+            .prompt_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        compile_provider_input_messages(&mut state, history, context)
+    }
+}
+
+fn compile_provider_input_messages(
+    state: &mut ProviderPromptHistory,
+    history: Vec<InputMessage>,
+    context: Vec<InputMessage>,
+) -> Vec<InputMessage> {
+    let append_only = history.starts_with(&state.session_history);
+    let history_unchanged = history == state.session_history;
+    let context_unchanged = context == state.last_request_context;
+    let mut wire = if append_only {
+        state.wire_messages.clone()
+    } else {
+        state.generation = state.generation.saturating_add(1);
+        Vec::new()
+    };
+    if append_only {
+        wire.extend_from_slice(&history[state.session_history.len()..]);
+    } else {
+        wire.extend_from_slice(&history);
+    }
+    // An identical retry remains byte-identical. Once Provider output extends
+    // SessionHistory, append the current capsule after that output even when
+    // the capsule itself did not change.
+    if !history_unchanged || !context_unchanged || wire.is_empty() {
+        wire.extend(context.iter().cloned());
+    }
+    state.session_history = history;
+    state.wire_messages.clone_from(&wire);
+    state.last_request_context = context;
+    wire
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_provider_attempt(
     entry: ProviderEntry,
     messages: Vec<InputMessage>,
     system: Option<String>,
+    cache_cohort_system: Option<String>,
     active_tools: Vec<ToolDefinition>,
     tool_choice: Option<ToolChoice>,
     max_tokens: u32,
@@ -1027,7 +1157,6 @@ async fn forward_provider_attempt(
     transport_activity: provider::TransportActivity,
     sender: tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
 ) {
-    let _request_guard = transport_pool.begin_request();
     let request_context = &entry.request_context;
     tracing::debug!(
         provider_request_id = %request_context.request_id,
@@ -1045,6 +1174,7 @@ async fn forward_provider_attempt(
         context_window_limit: Some(context_window_limit),
         messages,
         system,
+        system_cache_prefix: cache_cohort_system.clone(),
         tools: (!active_tools.is_empty()).then_some(active_tools),
         tool_choice,
         parallel_tool_calls: entry.request_context.profile.effective_parallel_tool_calls,
@@ -1053,24 +1183,54 @@ async fn forward_provider_attempt(
         temperature: evaluation_request_temperature(),
         ..Default::default()
     };
+    let wire_request = match entry.client.wire_request(&message_request) {
+        Ok(wire_request) => wire_request,
+        Err(error) => {
+            let _ = sender
+                .send(Err(RuntimeError::new(format!(
+                    "provider wire evidence could not be generated: {error}"
+                ))))
+                .await;
+            return;
+        }
+    };
+    let security_domain = evidence_context
+        .as_ref()
+        .map_or(entry.request_context.request_id.as_str(), |context| {
+            context.session_id.as_str()
+        });
+    let (cache_identity_sha256, canonical_prompt) = provider_cache_material(
+        &entry.request_context,
+        &wire_request,
+        security_domain,
+        cache_cohort_system.as_deref(),
+    );
+    let cache_behavior = ProviderCapabilityProfile::prompt_cache_behavior(&entry.model);
+    let warmup = transport_pool
+        .acquire_cache_warmup(
+            &cache_identity_sha256,
+            &canonical_prompt,
+            std::time::Duration::from_millis(cache_behavior.persistence_barrier_ms),
+            cache_behavior.requires_common_prefix_discovery,
+        )
+        .await;
+    let mut prefix_observation = transport_pool.observe_prompt_prefix(
+        cache_identity_sha256,
+        entry.request_context.request_id.clone(),
+        canonical_prompt,
+    );
+    prefix_observation.cold_leader = warmup.is_first_request_leader();
+    prefix_observation.common_prefix_leader = warmup.is_common_prefix_leader();
+    prefix_observation.warmup_bypassed_low_reuse = warmup.bypassed_low_reuse;
+    prefix_observation.waited_for_warmup = warmup.waited;
     if let (Some(context), Some(writer)) = (evidence_context.as_ref(), evidence_writer.as_ref()) {
-        let wire_request = match entry.client.wire_request(&message_request) {
-            Ok(wire_request) => wire_request,
-            Err(error) => {
-                let _ = sender
-                    .send(Err(RuntimeError::new(format!(
-                        "provider wire evidence could not be generated: {error}"
-                    ))))
-                    .await;
-                return;
-            }
-        };
         if let Err(error) = writer
             .persist(
                 context,
                 ProviderWireEvidence {
                     request_context: entry.request_context.clone(),
                     wire_request,
+                    prefix_observation,
                 },
             )
             .await
@@ -1079,7 +1239,9 @@ async fn forward_provider_attempt(
             return;
         }
     }
-    if let Err(error) = forward_provider_stream(
+    let request_guard = transport_pool.begin_request();
+    let mut attempt_usage = None;
+    let stream_result = forward_provider_stream(
         &entry.client,
         &message_request,
         &entry.model,
@@ -1088,9 +1250,52 @@ async fn forward_provider_attempt(
         stream_callback,
         transport_activity,
         &sender,
+        &mut attempt_usage,
     )
-    .await
-    {
+    .await;
+    // Provider transport capacity is unrelated to disk-cache persistence.
+    // Release it before the bounded cohort barrier so different cache keys
+    // and already-warm traffic keep their full concurrency.
+    drop(request_guard);
+    if let (Some(context), Some(writer)) = (evidence_context.as_ref(), evidence_writer.as_ref()) {
+        let terminal_status = match &stream_result {
+            Ok(ForwardedProviderStream::Completed) => "completed",
+            Ok(ForwardedProviderStream::ConsumerDropped) => "consumer_dropped",
+            Err(_) => "failed",
+        };
+        if let Err(error) = writer
+            .persist_outcome(
+                context,
+                ProviderAttemptOutcomeEvidence {
+                    request_id: entry.request_context.request_id.clone(),
+                    logical_attempt: context.attempt,
+                    terminal_status: terminal_status.to_string(),
+                    usage: attempt_usage,
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                request_id = %entry.request_context.request_id,
+                error = %error,
+                "provider attempt outcome evidence could not be persisted"
+            );
+        }
+    }
+    // A dropped Runtime consumer is not evidence that the Provider completed
+    // the cold request and committed its prefix.  Publishing Warm here would
+    // let followers stampede into a cache entry that may never have existed.
+    let provider_completed = matches!(stream_result, Ok(ForwardedProviderStream::Completed));
+    // `MessageStop` is the Runtime consumer's terminal boundary. Publishing
+    // it before the Provider outcome and cache-persistence barrier are
+    // committed lets the consumer drop this stream and abort the producer in
+    // that narrow window, which rolls a successfully primed cache cohort back
+    // to Cold. Keep terminal publication last. A consumer cancellation before
+    // this point still drops the sender and correctly prevents false warming.
+    if !commit_provider_cache_before_terminal(warmup, provider_completed, &sender).await {
+        return;
+    }
+    if let Err(error) = stream_result {
         tracing::warn!(
             model = %entry.model,
             error = %error,
@@ -1125,6 +1330,88 @@ async fn forward_provider_attempt(
             ))
             .await;
     }
+}
+
+async fn commit_provider_cache_before_terminal(
+    mut warmup: crate::provider_transport_pool::ProviderCacheWarmupGuard,
+    provider_completed: bool,
+    sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
+) -> bool {
+    warmup
+        .finish_after_persistence_barrier(provider_completed)
+        .await;
+    !provider_completed || sender.send(Ok(AssistantEvent::MessageStop)).await.is_ok()
+}
+
+fn provider_cache_material(
+    context: &ProviderRequestContext,
+    wire: &provider::ProviderWireRequest,
+    security_domain: &str,
+    cache_cohort_system: Option<&str>,
+) -> (String, Vec<u8>) {
+    let mut properties = wire.body.clone();
+    let prompt_value = properties
+        .as_object_mut()
+        .map(|object| {
+            let prompt = object
+                .remove("messages")
+                .or_else(|| object.remove("input"))
+                .unwrap_or(serde_json::Value::Null);
+            for transport_or_output_key in [
+                "max_tokens",
+                "max_completion_tokens",
+                "max_output_tokens",
+                "stream",
+                "stream_options",
+            ] {
+                object.remove(transport_or_output_key);
+            }
+            prompt
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let mut canonical_prompt = Vec::new();
+    let wire_stable_cohort_bytes = if let Some(items) = prompt_value.as_array() {
+        let first = items
+            .first()
+            .map(|item| serde_json::to_vec(item).unwrap_or_default())
+            .unwrap_or_default();
+        for item in items {
+            let encoded = serde_json::to_vec(item).unwrap_or_default();
+            canonical_prompt.extend_from_slice(encoded.len().to_string().as_bytes());
+            canonical_prompt.push(b':');
+            canonical_prompt.extend_from_slice(&encoded);
+            canonical_prompt.push(b'\n');
+        }
+        first
+    } else {
+        canonical_prompt = serde_json::to_vec(&prompt_value).unwrap_or_default();
+        canonical_prompt.clone()
+    };
+    let stable_cohort_bytes = cache_cohort_system
+        .map(str::as_bytes)
+        .unwrap_or(wire_stable_cohort_bytes.as_slice());
+    // Singleflight is scoped to the immutable leading cohort, not merely to
+    // provider/model/schema. Otherwise two unrelated cold prompts could share
+    // one coordinator key: the first would publish Warm even though it built
+    // no reusable prefix for the second. The first wire item is the stable
+    // system message for OpenAI-compatible transports; providers with a
+    // separate system field already carry it in `properties`.
+    let stable_cohort_sha256 = format!("sha256:{:x}", Sha256::digest(stable_cohort_bytes));
+    let identity = serde_json::json!({
+        "provider": context.profile.provider_name,
+        "base_url": context.profile.base_url,
+        "model": context.profile.model,
+        "protocol": wire.protocol,
+        "endpoint": wire.endpoint,
+        "transport_fingerprint": context.transport_fingerprint.0,
+        "security_domain": security_domain,
+        "cache_sensitive_properties": properties,
+        "tool_schema_sha256": wire.tool_schema_sha256,
+        "stable_cohort_sha256": stable_cohort_sha256,
+    });
+    let identity_bytes = serde_json::to_vec(&identity).unwrap_or_default();
+    let cache_identity_sha256 = format!("sha256:{:x}", Sha256::digest(identity_bytes));
+    (cache_identity_sha256, canonical_prompt)
 }
 
 fn provider_account_fenced_message(provider_account: &str) -> String {
@@ -1186,6 +1473,7 @@ async fn forward_provider_stream(
     stream_callback: Option<tokio::sync::mpsc::Sender<crate::CowdEvent>>,
     transport_activity: provider::TransportActivity,
     sender: &tokio::sync::mpsc::Sender<Result<AssistantEvent, RuntimeError>>,
+    attempt_usage: &mut Option<TokenUsage>,
 ) -> Result<ForwardedProviderStream, ProviderStreamError> {
     let mut stream = client
         .stream_message(message_request)
@@ -1381,9 +1669,11 @@ async fn forward_provider_stream(
                 {
                     return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
+                let usage = delta.usage.token_usage();
+                *attempt_usage = Some(usage);
                 if !forward_event(
                     sender,
-                    AssistantEvent::Usage(delta.usage.token_usage()),
+                    AssistantEvent::Usage(usage),
                     emit_output,
                     &stream_callback,
                     &mut emitted,
@@ -1406,17 +1696,9 @@ async fn forward_provider_stream(
                     return Ok(ForwardedProviderStream::ConsumerDropped);
                 }
                 saw_stop = true;
-                if !forward_event(
-                    sender,
-                    AssistantEvent::MessageStop,
-                    emit_output,
-                    &stream_callback,
-                    &mut emitted,
-                )
-                .await
-                {
-                    return Ok(ForwardedProviderStream::ConsumerDropped);
-                }
+                // Runtime terminal publication is deliberately delayed until
+                // the caller commits attempt evidence and Provider cache
+                // persistence. See `forward_provider_attempt`.
             }
         }
     }
@@ -1453,7 +1735,9 @@ async fn forward_provider_stream(
         })
         .await
         .map_err(|error| ProviderStreamError { error })?;
+    *attempt_usage = Some(response.usage.token_usage());
     let mut events = response_to_events(response);
+    events.retain(|event| !matches!(event, AssistantEvent::MessageStop));
     events.insert(
         0,
         AssistantEvent::ProviderModel {
@@ -1763,9 +2047,11 @@ fn response_to_events(response: MessageResponse) -> Vec<AssistantEvent> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_provider_entry, forward_text_delta, provider_attempt, provider_tool_choice,
-        provider_tool_choice_for_required_tool, push_provider_output_block,
-        request_reasoning_effort, tool_definitions_for_exposure,
+        build_provider_entry, commit_provider_cache_before_terminal,
+        compile_provider_input_messages, forward_text_delta, provider_attempt,
+        provider_cache_material, provider_tool_choice, provider_tool_choice_for_required_tool,
+        push_provider_output_block, request_reasoning_effort, tool_definitions_for_exposure,
+        ProviderPromptHistory, ProviderRequestContext, ResolvedProviderProfile,
     };
     use crate::config::{ProviderConfig, ProvidersConfig};
     use crate::{
@@ -1775,7 +2061,7 @@ mod tests {
     use futures::StreamExt;
     use harness_contract::tool::ToolExposureProjection;
     use model_protocol::provider_capability::{CapabilityState, ProviderCapabilityProfile};
-    use provider::{OutputContentBlock, ToolChoice, ToolDefinition};
+    use provider::{InputContentBlock, OutputContentBlock, ToolChoice, ToolDefinition};
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{
@@ -1783,6 +2069,184 @@ mod tests {
         Arc,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn cache_cohort_identity_tracks_stable_first_item_but_not_dynamic_tail() {
+        let context = ProviderRequestContext {
+            request_id: "request-a".to_string(),
+            profile: ResolvedProviderProfile {
+                registry_revision: 1,
+                provider_name: "deepseek".to_string(),
+                model: "deepseek-v4-flash".to_string(),
+                base_url: Some("https://api.deepseek.com".to_string()),
+                protocol: Some("openai".to_string()),
+                parallel_tool_calls_mode:
+                    model_protocol::provider_config::ParallelToolCallsMode::Auto,
+                effective_parallel_tool_calls: Some(true),
+                effective_early_tool_start: false,
+                model_capabilities: Vec::new(),
+                capabilities: ProviderCapabilityProfile::unknown(),
+            },
+            transport_fingerprint: crate::TransportProfileFingerprint(1),
+            attempt: 1,
+        };
+        let wire = |stable: &str, tail: &str| provider::ProviderWireRequest {
+            method: "POST".to_string(),
+            endpoint: "/chat/completions".to_string(),
+            protocol: "openai".to_string(),
+            headers: Vec::new(),
+            body: json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "system", "content": stable},
+                    {"role": "user", "content": tail}
+                ],
+                "stream": true,
+                "max_tokens": 100
+            }),
+            body_sha256: "body".to_string(),
+            tool_schema_sha256: None,
+        };
+        let (agent_a, agent_a_canonical) = provider_cache_material(
+            &context,
+            &wire("shared-program", "agent-a"),
+            "session-a",
+            None,
+        );
+        let (agent_b, _) = provider_cache_material(
+            &context,
+            &wire("shared-program", "agent-b"),
+            "session-a",
+            None,
+        );
+        let (other_program, _) = provider_cache_material(
+            &context,
+            &wire("other-program", "agent-b"),
+            "session-a",
+            None,
+        );
+        assert_eq!(agent_a, agent_b);
+        assert_ne!(agent_a, other_program);
+        for _ in 0..1_000 {
+            let (identity, canonical) = provider_cache_material(
+                &context,
+                &wire("shared-program", "agent-a"),
+                "session-a",
+                None,
+            );
+            assert_eq!(identity, agent_a);
+            assert_eq!(canonical, agent_a_canonical);
+        }
+    }
+
+    #[test]
+    fn explicit_cache_cohort_groups_execution_specific_stable_system_suffixes() {
+        let context = ProviderRequestContext {
+            request_id: "request-a".to_string(),
+            profile: ResolvedProviderProfile {
+                registry_revision: 1,
+                provider_name: "deepseek".to_string(),
+                model: "deepseek-v4-flash".to_string(),
+                base_url: Some("https://api.deepseek.com".to_string()),
+                protocol: Some("openai".to_string()),
+                parallel_tool_calls_mode:
+                    model_protocol::provider_config::ParallelToolCallsMode::Auto,
+                effective_parallel_tool_calls: Some(true),
+                effective_early_tool_start: false,
+                model_capabilities: Vec::new(),
+                capabilities: ProviderCapabilityProfile::unknown(),
+            },
+            transport_fingerprint: crate::TransportProfileFingerprint(1),
+            attempt: 1,
+        };
+        let wire = |system: &str| provider::ProviderWireRequest {
+            method: "POST".to_string(),
+            endpoint: "/chat/completions".to_string(),
+            protocol: "openai".to_string(),
+            headers: Vec::new(),
+            body: json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": "task"}
+                ],
+                "stream": true,
+                "max_tokens": 100
+            }),
+            body_sha256: "body".to_string(),
+            tool_schema_sha256: None,
+        };
+        let (agent_a, _) = provider_cache_material(
+            &context,
+            &wire("shared-program\nagent-a"),
+            "session-a",
+            Some("shared-program"),
+        );
+        let (agent_b, _) = provider_cache_material(
+            &context,
+            &wire("shared-program\nagent-b"),
+            "session-a",
+            Some("shared-program"),
+        );
+        assert_eq!(agent_a, agent_b);
+    }
+
+    #[test]
+    fn request_local_context_is_appended_after_exact_history() {
+        let prompt = PromptAssembly::new(vec![
+            "stable-system".to_string(),
+            crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string(),
+            "runtime-clock-a".to_string(),
+        ]);
+        let history = vec![provider::InputMessage::user_text("history-entry")];
+        let context = prompt
+            .contextual_messages()
+            .into_iter()
+            .map(provider::InputMessage::user_text)
+            .collect::<Vec<_>>();
+        let mut state = ProviderPromptHistory::default();
+        let messages =
+            compile_provider_input_messages(&mut state, history.clone(), context.clone());
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "history-entry"
+        ));
+        assert!(matches!(
+            messages[1].content.as_slice(),
+            [InputContentBlock::Text { text }] if text.contains("runtime-clock-a")
+        ));
+        assert_eq!(prompt.wire_system_text().as_deref(), Some("stable-system"));
+
+        let retry = compile_provider_input_messages(&mut state, history.clone(), context.clone());
+        assert_eq!(
+            retry, messages,
+            "an identical retry must not duplicate context"
+        );
+
+        let mut extended_history = history;
+        extended_history.push(provider::InputMessage {
+            role: "assistant".to_string(),
+            content: vec![InputContentBlock::Text {
+                text: "provider-output".to_string(),
+            }],
+        });
+        let continuation = compile_provider_input_messages(
+            &mut state,
+            extended_history,
+            vec![provider::InputMessage::user_text("runtime-clock-b")],
+        );
+        assert_eq!(continuation.len(), 4);
+        assert_eq!(continuation[..2], messages);
+        assert!(matches!(
+            continuation[2].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "provider-output"
+        ));
+        assert!(matches!(
+            continuation[3].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "runtime-clock-b"
+        ));
+    }
 
     #[test]
     fn incomplete_provider_stream_is_never_promoted_to_terminal_success() {
@@ -1795,6 +2259,50 @@ mod tests {
         assert!(error
             .to_string()
             .contains("provider stream ended before terminal message_stop"));
+    }
+
+    #[tokio::test]
+    async fn runtime_message_stop_is_published_only_after_cache_warm_commit() {
+        let pool = Arc::new(ProviderTransportPool::new(2));
+        let leader = pool
+            .acquire_cache_warmup(
+                "terminal-order",
+                b"shared|agent-a",
+                std::time::Duration::from_millis(25),
+                true,
+            )
+            .await;
+        assert!(leader.is_leader());
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let terminal = tokio::spawn(async move {
+            commit_provider_cache_before_terminal(leader, true, &sender).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv())
+                .await
+                .expect("terminal publication"),
+            Some(Ok(AssistantEvent::MessageStop))
+        ));
+        assert!(terminal.await.expect("terminal task"));
+
+        let extension = pool
+            .acquire_cache_warmup(
+                "terminal-order",
+                b"shared|agent-a|next",
+                std::time::Duration::ZERO,
+                true,
+            )
+            .await;
+        assert!(
+            !extension.is_leader(),
+            "warm commit must survive stream drop"
+        );
     }
 
     #[test]
@@ -2185,7 +2693,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_schema_cache_invalidates_only_on_relevant_revisions() {
+    fn tool_schema_cache_uses_model_visible_content_not_control_revision() {
         let providers = |base_url: &str| ProvidersConfig {
             providers: HashMap::from([(
                 "test".to_string(),
@@ -2235,8 +2743,29 @@ mod tests {
 
         client.configure_tool_exposure(exposure(&[], &["read_file"], 2));
         let exposure_recompiled = client.compiled_tool_schema();
-        assert_eq!(exposure_recompiled.exposure_revision, 2);
-        assert_eq!(client.tool_schema_cache_stats().compilations, 3);
+        assert_eq!(exposure_recompiled.inventory.exposure_revision, 2);
+        assert_eq!(client.tool_schema_cache_stats().compilations, 2);
+        assert_eq!(client.tool_schema_cache_stats().cache_hits, 2);
+
+        let mut delegated = ProviderRuntimeClient::new(
+            Arc::clone(&registry),
+            "primary".to_string(),
+            vec![tool("read_file"), tool("write_file")],
+        )
+        .unwrap()
+        .with_stable_tool_schema(true);
+        delegated.configure_tool_exposure(exposure(&[], &["read_file"], 1));
+        let read_overlay = delegated.compiled_tool_schema();
+        delegated.configure_tool_exposure(exposure(&[], &[], 2));
+        let terminal_overlay = delegated.compiled_tool_schema();
+        assert_eq!(read_overlay.inventory.tool_count, 2);
+        assert_eq!(terminal_overlay.inventory.tool_count, 2);
+        assert_eq!(
+            read_overlay.inventory.schema_fingerprint,
+            terminal_overlay.inventory.schema_fingerprint
+        );
+        assert_eq!(delegated.tool_schema_cache_stats().compilations, 1);
+        assert_eq!(delegated.tool_schema_cache_stats().cache_hits, 1);
     }
 
     #[test]

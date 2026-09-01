@@ -7,8 +7,6 @@ use crate::{HistoryView, PromptAssembly, ProviderContextInventory};
 struct RequestCompilationKey {
     context_fingerprint: u64,
     history_revision: u64,
-    tool_catalog_revision: u64,
-    tool_exposure_revision: u64,
     tool_schema_fingerprint: u64,
     permission_fingerprint: u64,
     provider_registry_revision: u64,
@@ -64,8 +62,6 @@ impl PreparedRequestCompiler {
         let key = RequestCompilationKey {
             context_fingerprint: prompt.revision_fingerprint(),
             history_revision: history.cursor().revision,
-            tool_catalog_revision: inventory.catalog_revision,
-            tool_exposure_revision: inventory.exposure_revision,
             tool_schema_fingerprint: inventory.schema_fingerprint,
             permission_fingerprint,
             provider_registry_revision: inventory.provider_registry_revision,
@@ -132,7 +128,7 @@ mod tests {
     use crate::{ConversationMessage, SessionHistory, SessionHistoryConfig};
 
     #[test]
-    fn cache_invalidates_on_each_revision_dimension() {
+    fn cache_uses_model_visible_schema_digest_not_control_revisions() {
         let compiler = PreparedRequestCompiler::new(16);
         let prompt = PromptAssembly::new(vec!["system".to_string()]);
         let mut session_history = SessionHistory::new(SessionHistoryConfig::default());
@@ -157,7 +153,7 @@ mod tests {
                 .cache_hit
         );
         assert!(
-            !compiler
+            compiler
                 .prepare(
                     &prompt,
                     &history,
@@ -204,7 +200,7 @@ mod tests {
                 .cache_hit
         );
         assert!(
-            !compiler
+            compiler
                 .prepare(
                     &prompt,
                     &history,
@@ -245,7 +241,7 @@ mod tests {
                 )
                 .cache_hit
         );
-        assert_eq!(compiler.stats().cache_hits, 1);
-        assert_eq!(compiler.stats().compilations, 9);
+        assert_eq!(compiler.stats().cache_hits, 3);
+        assert_eq!(compiler.stats().compilations, 7);
     }
 }

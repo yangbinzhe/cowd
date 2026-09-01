@@ -12,9 +12,9 @@ use crate::execution_core::graph::executors::{
     AgentTaskExecutor, SynthesizeNodeExecutor, VerifyNodeExecutor,
 };
 use crate::{
-    resolve_agent_capability, AgentBindingCompiler, AgentCapabilityRequest,
-    EvolutionCandidateSubject, EvolutionGovernanceService, EvolutionReleaseAssignment,
-    RuntimeDefinitionRegistry,
+    bind_agent_capability_to_host, resolve_agent_capability, AgentBindingCompiler,
+    AgentCapabilityRequest, EvolutionCandidateSubject, EvolutionGovernanceService,
+    EvolutionReleaseAssignment, RuntimeDefinitionRegistry,
 };
 use harness_contract::agent::{
     AgentDefinitionRevisionRef, AgentTaskIntent, AgentTaskPacket, RevisionSelector,
@@ -445,8 +445,12 @@ impl TeamInstantiationService {
                 .capability_contract
                 .skill_refs
                 .clone();
+            // A Definition's Skill inventory is an authority ceiling, not a
+            // request to inject every Skill into every role. Empty semantic
+            // requirements therefore mean no Skill grant (least privilege),
+            // exactly like an empty role Tool contract.
             let role_allowed_skills = if role.task_contract.allowed_skill_refs.is_empty() {
-                declared_skills
+                Vec::new()
             } else {
                 let declared = declared_skills.into_iter().collect::<BTreeSet<_>>();
                 let required = role
@@ -537,6 +541,12 @@ impl TeamInstantiationService {
                     instance_allowed_tools
                         .retain(|tool| tool != "request_collaboration_escalation");
                 }
+                validate_effect_capability_fulfillment(
+                    &capability,
+                    &resource_scopes,
+                    &instance_allowed_tools,
+                    upstream_only_consumer,
+                )?;
                 let acceptance_contract = team_acceptance_contract(
                     &slot_acceptance,
                     &resource_scopes,
@@ -2071,6 +2081,29 @@ fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<Stri
         .collect()
 }
 
+fn validate_effect_capability_fulfillment(
+    capability: &crate::ResolvedAgentCapability,
+    resource_scopes: &[String],
+    tools: &[String],
+    upstream_only_consumer: bool,
+) -> Result<(), String> {
+    if upstream_only_consumer {
+        return Ok(());
+    }
+    let final_tools = tools.iter().cloned().collect::<BTreeSet<_>>();
+    let binding = bind_agent_capability_to_host(capability, &final_tools);
+    if binding.missing_capabilities.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "role `{}` effect capability is not executable after Team resource cropping: capabilities=[{}], required_tool_alternatives=[{}], resource_scopes=[{}]",
+        capability.role_id,
+        binding.missing_capabilities.join(","),
+        binding.missing_tool_alternatives.join(","),
+        resource_scopes.join(","),
+    ))
+}
+
 fn slot_budget_lease(
     request: &TeamInstantiationRequest,
     node_id: &str,
@@ -2122,6 +2155,36 @@ fn validate_finite_team_budget_capacity(
 #[cfg(test)]
 mod acceptance_contract_tests {
     use super::*;
+
+    #[test]
+    fn effect_capability_must_survive_final_resource_cropping() {
+        let network = resolve_agent_capability(AgentCapabilityRequest {
+            role_id: "network-researcher".to_string(),
+            allowed_capabilities: vec![
+                "read".to_string(),
+                "search".to_string(),
+                "network".to_string(),
+            ],
+            evidence_duties: Vec::new(),
+        });
+        let missing = validate_effect_capability_fulfillment(
+            &network,
+            &["read:.".to_string()],
+            &["read_file".to_string(), "tool_search".to_string()],
+            false,
+        )
+        .expect_err("network label without a physical network tool must fail before execution");
+        assert!(missing.contains("capabilities=[network]"));
+        assert!(missing.contains("web_search"));
+
+        validate_effect_capability_fulfillment(
+            &network,
+            &["network:*".to_string()],
+            &["web_search".to_string(), "tool_search".to_string()],
+            false,
+        )
+        .expect("network scope and physical tool close the capability contract");
+    }
 
     #[test]
     fn four_agent_initial_targets_cover_but_never_multiply_parent_budget() {

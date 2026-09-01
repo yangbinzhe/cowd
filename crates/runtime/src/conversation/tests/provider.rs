@@ -164,11 +164,29 @@
                 body_sha256: "sha256-body".to_string(),
                 tool_schema_sha256: Some("sha256-tools".to_string()),
             },
+            prefix_observation: crate::ProviderWirePrefixObservation::default(),
         };
 
         crate::ProviderWireEvidenceWriter::persist(&writer, &context, evidence)
             .await
             .unwrap();
+        crate::ProviderWireEvidenceWriter::persist_outcome(
+            &writer,
+            &context,
+            crate::ProviderAttemptOutcomeEvidence {
+                request_id: "request-provider-evidence".to_string(),
+                logical_attempt: 7,
+                terminal_status: "completed".to_string(),
+                usage: Some(model_protocol::usage::TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    cache_creation_input_tokens: 2,
+                    cache_read_input_tokens: 5,
+                }),
+            },
+        )
+        .await
+        .unwrap();
 
         let events = session_store
             .session_domain_events_page(&session_id, 0, 10)
@@ -179,7 +197,7 @@
             .iter()
             .find(|event| event.kind == "context.provider_request_packed")
             .expect("provider request evidence event");
-        assert_eq!(packed.payload["schema_version"], 2);
+        assert_eq!(packed.payload["schema_version"], 3);
         assert!(packed.payload.get("body").is_none());
         let artifact: harness_contract::context::ArtifactRef =
             serde_json::from_value(packed.payload["artifact"].clone()).unwrap();
@@ -194,6 +212,14 @@
         );
         assert_eq!(body["provider_request"]["request_context"]["attempt"], 7);
         assert_eq!(artifacts.stats().unwrap().pins, 1);
+        let outcome = events
+            .events
+            .iter()
+            .find(|event| event.kind == "context.provider_attempt_outcome")
+            .expect("provider attempt outcome event");
+        assert_eq!(outcome.payload["request_id"], "request-provider-evidence");
+        assert_eq!(outcome.payload["usage_status"], "known");
+        assert_eq!(outcome.payload["cache_hit_ratio_bp"], 5_000);
     }
 
     #[test]
@@ -2242,7 +2268,11 @@
         runtime.set_active_model("private-model");
 
         let error = runtime
-            .execute_clean_terminal_synthesis("give a concise answer", "checked evidence")
+            .execute_clean_terminal_synthesis(
+                "give a concise answer",
+                "checked evidence",
+                Vec::new(),
+            )
             .await
             .expect_err("clean terminal must not retry after its provider attempt");
         assert!(error.to_string().contains("maximum context length"));

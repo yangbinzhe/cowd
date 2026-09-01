@@ -3333,7 +3333,7 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
         evidence: crate::ProviderWireEvidence,
     ) -> Result<(), RuntimeError> {
         let payload = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "session_id": context.session_id,
             "request_sequence": context.request_sequence,
             "request_compiler_cache_hit": context.request_compiler_cache_hit,
@@ -3376,12 +3376,23 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
             crate::RuntimeSessionEventKind::ProviderRequestPacked,
             serde_json::json!({
                 "type": "ProviderRequestPacked",
-                "schema_version": 2,
+                "schema_version": 3,
                 "request_sequence": context.request_sequence,
                 "request_id": evidence.request_context.request_id,
                 "model": evidence.request_context.profile.model,
                 "protocol": evidence.wire_request.protocol,
                 "body_sha256": evidence.wire_request.body_sha256,
+                "cache_identity_sha256": evidence.prefix_observation.cache_identity_sha256,
+                "prefix_predecessor_request_id": evidence.prefix_observation.predecessor_request_id,
+                "model_visible_prompt_bytes": evidence.prefix_observation.prompt_bytes,
+                "reusable_prefix_bytes": evidence.prefix_observation.reusable_prefix_bytes,
+                "structural_reuse_ratio_bp": evidence.prefix_observation.structural_reuse_ratio_bp,
+                "exact_prefix_extension": evidence.prefix_observation.exact_extension,
+                "prefix_invalidation_reason": evidence.prefix_observation.invalidation_reason,
+                "cache_cold_leader": evidence.prefix_observation.cold_leader,
+                "cache_common_prefix_leader": evidence.prefix_observation.common_prefix_leader,
+                "cache_warmup_bypassed_low_reuse": evidence.prefix_observation.warmup_bypassed_low_reuse,
+                "waited_for_cache_warmup": evidence.prefix_observation.waited_for_warmup,
                 "artifact": artifact.clone(),
             }),
             now_ms(),
@@ -3432,6 +3443,52 @@ impl crate::ProviderWireEvidenceWriter for SessionProviderWireEvidenceWriter {
                 "provider evidence retained an extra staging pin"
             );
         }
+        Ok(())
+    }
+
+    async fn persist_outcome(
+        &self,
+        context: &crate::ProviderRequestEvidenceContext,
+        outcome: crate::ProviderAttemptOutcomeEvidence,
+    ) -> Result<(), RuntimeError> {
+        let usage_known = outcome.usage.is_some();
+        let cache_hit_ratio_bp = outcome
+            .usage
+            .map(model_protocol::usage::TokenUsage::cache_hit_ratio_bp);
+        let usage = outcome.usage.map(|usage| {
+            serde_json::json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": usage.cache_read_input_tokens,
+            })
+        });
+        let event = crate::RuntimeSessionEvent::new(
+            context.session_id.clone(),
+            context.request_sequence,
+            crate::RuntimeSessionEventKind::ProviderAttemptOutcome,
+            serde_json::json!({
+                "type": "ProviderAttemptOutcome",
+                "schema_version": 1,
+                "request_sequence": context.request_sequence,
+                "request_id": outcome.request_id,
+                "logical_attempt": outcome.logical_attempt,
+                "terminal_status": outcome.terminal_status,
+                "usage_status": if usage_known { "known" } else { "unknown" },
+                "usage": usage,
+                "cache_hit_ratio_bp": cache_hit_ratio_bp,
+            }),
+            now_ms(),
+        )
+        .with_status(if usage_known {
+            "observed"
+        } else {
+            "usage_unknown"
+        });
+        self.session_port
+            .append_event(&event)
+            .await
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
         Ok(())
     }
 }
@@ -3631,6 +3688,9 @@ pub struct ConversationRuntime<C, T> {
     /// normal model step must be able to restore the catalog rather than be
     /// rejected as an older projection by the provider client.
     tool_exposure_revision: AtomicU64,
+    /// Digest of the last model-visible tool-id set. Reasons and catalog
+    /// observations may change without creating a new Provider schema epoch.
+    tool_exposure_digest: AtomicU64,
     request_compiler: crate::PreparedRequestCompiler,
     /// Actual Provider wire-prefix and native-cache evidence for the active turn.
     turn_stable_prefix_metrics: std::sync::Mutex<TurnStablePrefixMetrics>,

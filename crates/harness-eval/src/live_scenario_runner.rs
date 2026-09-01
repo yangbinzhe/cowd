@@ -1766,6 +1766,18 @@ fn aggregate_scenario_metrics(scenarios: &[Value]) -> Value {
     json!({
         "input_tokens": total("input_tokens"),
         "output_tokens": total("output_tokens"),
+        "cache_creation_input_tokens": total("cache_creation_input_tokens"),
+        "cache_read_input_tokens": total("cache_read_input_tokens"),
+        "model_visible_prompt_bytes": total("model_visible_prompt_bytes"),
+        "reusable_prefix_bytes": total("reusable_prefix_bytes"),
+        "warm_model_visible_prompt_bytes": total("warm_model_visible_prompt_bytes"),
+        "warm_reusable_prefix_bytes": total("warm_reusable_prefix_bytes"),
+        "warm_input_miss_tokens": total("warm_input_miss_tokens"),
+        "warm_cache_creation_input_tokens": total("warm_cache_creation_input_tokens"),
+        "warm_cache_read_input_tokens": total("warm_cache_read_input_tokens"),
+        "cache_cold_leader_count": total("cache_cold_leader_count"),
+        "cache_waiter_count": total("cache_waiter_count"),
+        "provider_attempt_usage_unknown_count": total("provider_attempt_usage_unknown_count"),
         "cache_tokens": total("cache_tokens"),
         "total_tokens": total("total_tokens"),
         "model_rounds": total("model_rounds"),
@@ -1805,16 +1817,21 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
 }
 
 fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) -> Value {
+    let provider_attempts = provider_attempt_metrics(timeline);
     let graph_usage = execution_graph_usage_metrics(projections);
     let timeline_usage = token_usage_metrics(timeline);
-    let usage = if graph_usage.record_count > 0 {
+    let usage = if provider_attempts.usage.provider_usage_records > 0 {
+        provider_attempts.usage.clone()
+    } else if graph_usage.record_count > 0 {
         graph_usage
     } else {
         timeline_usage
     };
     let input_tokens = usage.input_tokens;
     let output_tokens = usage.output_tokens;
-    let cache_tokens = usage.cache_tokens;
+    let cache_creation_input_tokens = usage.cache_creation_input_tokens;
+    let cache_read_input_tokens = usage.cache_read_input_tokens;
+    let cache_tokens = cache_creation_input_tokens.saturating_add(cache_read_input_tokens);
     let timeline_tool_calls = timeline
         .pointer("/tool_summary/count")
         .and_then(Value::as_u64)
@@ -1870,6 +1887,11 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
         })
         .unwrap_or_default();
     let model_rounds = usage.model_rounds.max(timeline_model_rounds);
+    let usage_unknown_attempts = if provider_attempts.attempt_count > 0 {
+        provider_attempts.usage_unknown_count
+    } else {
+        model_rounds.saturating_sub(usage.provider_usage_records)
+    };
     let telemetry = timeline
         .pointer("/token_speed/model_telemetry")
         .cloned()
@@ -1888,12 +1910,16 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
     let output_tokens_per_second =
         (elapsed_ms > 0).then(|| output_tokens.saturating_mul(1_000) as f64 / elapsed_ms as f64);
     let autonomy = autonomy_metrics(projections, AUTONOMOUS_DEEPSEEK_OUTPUT_PATH);
-    json!({
+    let mut metrics = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
         "cache_tokens": cache_tokens,
         "total_tokens": input_tokens.saturating_add(output_tokens).saturating_add(cache_tokens),
         "token_usage_records": usage.record_count,
+        "provider_usage_records": usage.provider_usage_records,
+        "usage_unknown_attempts": usage_unknown_attempts,
         "model_rounds": model_rounds,
         "effective_models": usage.models.into_iter().collect::<Vec<_>>(),
         "tool_calls": tool_calls,
@@ -1921,18 +1947,263 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
         "first_token_latency_ms": first_token_latency_ms,
         "wall_tokens_per_second": wall_tokens_per_second.or(output_tokens_per_second),
         "active_tokens_per_second": active_tokens_per_second,
-    })
+    });
+    if let Some(object) = metrics.as_object_mut() {
+        object.extend([
+            (
+                "provider_attempt_count".to_string(),
+                json!(provider_attempts.attempt_count),
+            ),
+            (
+                "provider_attempt_usage_unknown_count".to_string(),
+                json!(provider_attempts.usage_unknown_count),
+            ),
+            (
+                "provider_cache_identity_count".to_string(),
+                json!(provider_attempts.cache_identities.len()),
+            ),
+            (
+                "cache_cold_leader_count".to_string(),
+                json!(provider_attempts.cold_leaders),
+            ),
+            (
+                "cache_waiter_count".to_string(),
+                json!(provider_attempts.waiters),
+            ),
+            (
+                "structural_reuse_ratio_bp".to_string(),
+                json!(provider_attempts.structural_ratio_bp()),
+            ),
+            (
+                "warm_structural_reuse_ratio_bp".to_string(),
+                json!(provider_attempts.warm_structural_ratio_bp()),
+            ),
+            (
+                "model_visible_prompt_bytes".to_string(),
+                json!(provider_attempts.prompt_bytes),
+            ),
+            (
+                "reusable_prefix_bytes".to_string(),
+                json!(provider_attempts.reusable_prefix_bytes),
+            ),
+            (
+                "warm_model_visible_prompt_bytes".to_string(),
+                json!(provider_attempts.warm_prompt_bytes),
+            ),
+            (
+                "warm_reusable_prefix_bytes".to_string(),
+                json!(provider_attempts.warm_reusable_prefix_bytes),
+            ),
+            (
+                "warm_input_miss_tokens".to_string(),
+                json!(provider_attempts.warm_input_miss_tokens),
+            ),
+            (
+                "warm_cache_creation_input_tokens".to_string(),
+                json!(provider_attempts.warm_cache_creation_input_tokens),
+            ),
+            (
+                "warm_cache_read_input_tokens".to_string(),
+                json!(provider_attempts.warm_cache_read_input_tokens),
+            ),
+            (
+                "warm_cache_hit_ratio_bp".to_string(),
+                json!(provider_attempts.warm_cache_ratio_bp()),
+            ),
+            (
+                "exact_prefix_extension_count".to_string(),
+                json!(provider_attempts.exact_extensions),
+            ),
+        ]);
+    }
+    metrics
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ScenarioTokenUsage {
     models: BTreeSet<String>,
     input_tokens: u64,
     output_tokens: u64,
-    cache_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
     tool_calls: u64,
     model_rounds: u64,
     record_count: u64,
+    provider_usage_records: u64,
+}
+
+#[derive(Default)]
+struct ProviderAttemptMetrics {
+    usage: ScenarioTokenUsage,
+    attempt_count: u64,
+    usage_unknown_count: u64,
+    cache_identities: BTreeSet<String>,
+    cold_leaders: u64,
+    waiters: u64,
+    exact_extensions: u64,
+    prompt_bytes: u64,
+    reusable_prefix_bytes: u64,
+    warm_prompt_bytes: u64,
+    warm_reusable_prefix_bytes: u64,
+    warm_input_miss_tokens: u64,
+    warm_cache_creation_input_tokens: u64,
+    warm_cache_read_input_tokens: u64,
+}
+
+impl ProviderAttemptMetrics {
+    fn structural_ratio_bp(&self) -> u64 {
+        ratio_bp(self.reusable_prefix_bytes, self.prompt_bytes)
+    }
+
+    fn warm_structural_ratio_bp(&self) -> u64 {
+        ratio_bp(self.warm_reusable_prefix_bytes, self.warm_prompt_bytes)
+    }
+
+    fn warm_cache_ratio_bp(&self) -> u64 {
+        ratio_bp(
+            self.warm_cache_read_input_tokens,
+            self.warm_input_miss_tokens
+                .saturating_add(self.warm_cache_creation_input_tokens)
+                .saturating_add(self.warm_cache_read_input_tokens),
+        )
+    }
+}
+
+fn ratio_bp(numerator: u64, denominator: u64) -> u64 {
+    (denominator > 0)
+        .then(|| numerator.saturating_mul(10_000) / denominator)
+        .unwrap_or_default()
+        .min(10_000)
+}
+
+/// Runtime persists exact request and terminal usage as separate events with
+/// the same request id. Collect them recursively because the public timeline
+/// groups root and child Session events into multiple causal sections. A map
+/// deduplicates pagination/replay copies, making physical Provider attempts
+/// the only additive token source.
+fn provider_attempt_metrics(timeline: &Value) -> ProviderAttemptMetrics {
+    let mut packed = BTreeMap::<String, Value>::new();
+    let mut outcomes = BTreeMap::<String, Value>::new();
+    collect_provider_attempt_events(timeline, &mut packed, &mut outcomes);
+    let mut metrics = ProviderAttemptMetrics::default();
+    metrics.attempt_count = outcomes.len() as u64;
+    for (request_id, outcome) in outcomes {
+        let usage = outcome.get("usage").unwrap_or(&Value::Null);
+        let usage_known = outcome.get("usage_status").and_then(Value::as_str) == Some("known")
+            && usage.is_object();
+        if !usage_known {
+            metrics.usage_unknown_count = metrics.usage_unknown_count.saturating_add(1);
+            continue;
+        }
+        metrics.usage.input_tokens = metrics
+            .usage
+            .input_tokens
+            .saturating_add(value_u64(usage, &["input_tokens"]));
+        metrics.usage.output_tokens = metrics
+            .usage
+            .output_tokens
+            .saturating_add(value_u64(usage, &["output_tokens"]));
+        metrics.usage.cache_creation_input_tokens = metrics
+            .usage
+            .cache_creation_input_tokens
+            .saturating_add(value_u64(usage, &["cache_creation_input_tokens"]));
+        metrics.usage.cache_read_input_tokens = metrics
+            .usage
+            .cache_read_input_tokens
+            .saturating_add(value_u64(usage, &["cache_read_input_tokens"]));
+        metrics.usage.record_count = metrics.usage.record_count.saturating_add(1);
+        metrics.usage.provider_usage_records =
+            metrics.usage.provider_usage_records.saturating_add(1);
+        if outcome.get("terminal_status").and_then(Value::as_str) == Some("completed") {
+            metrics.usage.model_rounds = metrics.usage.model_rounds.saturating_add(1);
+        }
+        if let Some(request) = packed.get(&request_id) {
+            if let Some(model) = request.get("model").and_then(Value::as_str) {
+                metrics.usage.models.insert(model.to_string());
+            }
+            if request.get("cache_cold_leader").and_then(Value::as_bool) != Some(true) {
+                metrics.warm_input_miss_tokens = metrics
+                    .warm_input_miss_tokens
+                    .saturating_add(value_u64(usage, &["input_tokens"]));
+                metrics.warm_cache_creation_input_tokens = metrics
+                    .warm_cache_creation_input_tokens
+                    .saturating_add(value_u64(usage, &["cache_creation_input_tokens"]));
+                metrics.warm_cache_read_input_tokens = metrics
+                    .warm_cache_read_input_tokens
+                    .saturating_add(value_u64(usage, &["cache_read_input_tokens"]));
+            }
+        }
+    }
+    for request in packed.into_values() {
+        if let Some(identity) = request.get("cache_identity_sha256").and_then(Value::as_str) {
+            metrics.cache_identities.insert(identity.to_string());
+        }
+        let prompt = value_u64(&request, &["model_visible_prompt_bytes"]);
+        let reusable = value_u64(&request, &["reusable_prefix_bytes"]);
+        metrics.prompt_bytes = metrics.prompt_bytes.saturating_add(prompt);
+        metrics.reusable_prefix_bytes = metrics.reusable_prefix_bytes.saturating_add(reusable);
+        let cold = request.get("cache_cold_leader").and_then(Value::as_bool) == Some(true);
+        if cold {
+            metrics.cold_leaders = metrics.cold_leaders.saturating_add(1);
+        } else {
+            metrics.warm_prompt_bytes = metrics.warm_prompt_bytes.saturating_add(prompt);
+            metrics.warm_reusable_prefix_bytes =
+                metrics.warm_reusable_prefix_bytes.saturating_add(reusable);
+        }
+        if request
+            .get("waited_for_cache_warmup")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            metrics.waiters = metrics.waiters.saturating_add(1);
+        }
+        if request
+            .get("exact_prefix_extension")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            metrics.exact_extensions = metrics.exact_extensions.saturating_add(1);
+        }
+    }
+    metrics
+}
+
+fn collect_provider_attempt_events(
+    value: &Value,
+    packed: &mut BTreeMap<String, Value>,
+    outcomes: &mut BTreeMap<String, Value>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_provider_attempt_events(item, packed, outcomes);
+            }
+        }
+        Value::Object(object) => {
+            let kind = object.get("kind").and_then(Value::as_str);
+            let payload = object.get("payload").unwrap_or(value);
+            let payload_type = payload.get("type").and_then(Value::as_str);
+            if matches!(
+                (kind, payload_type),
+                (Some("context.provider_request_packed"), _) | (_, Some("ProviderRequestPacked"))
+            ) {
+                if let Some(request_id) = payload.get("request_id").and_then(Value::as_str) {
+                    packed.insert(request_id.to_string(), payload.clone());
+                }
+            } else if matches!(
+                (kind, payload_type),
+                (Some("context.provider_attempt_outcome"), _) | (_, Some("ProviderAttemptOutcome"))
+            ) {
+                if let Some(request_id) = payload.get("request_id").and_then(Value::as_str) {
+                    outcomes.insert(request_id.to_string(), payload.clone());
+                }
+            }
+            for child in object.values() {
+                collect_provider_attempt_events(child, packed, outcomes);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Summarize physical leaf usage across the canonical root and all durable
@@ -1978,18 +2249,29 @@ fn execution_graph_usage_metrics(projections: &[Value]) -> ScenarioTokenUsage {
             let output_tokens = (kind == "inline_model")
                 .then(|| value_u64(node_usage, &["output_tokens"]))
                 .unwrap_or_default();
-            let cache_tokens = (kind == "inline_model")
+            let cache_read_input_tokens = (kind == "inline_model")
                 .then(|| value_u64(node_usage, &["cached_tokens"]))
                 .unwrap_or_default();
             let tool_calls = (kind == "tool_batch")
                 .then(|| value_u64(node_usage, &["tool_calls"]))
                 .unwrap_or_default();
-            if input_tokens > 0 || output_tokens > 0 || cache_tokens > 0 || tool_calls > 0 {
+            if input_tokens > 0
+                || output_tokens > 0
+                || cache_read_input_tokens > 0
+                || tool_calls > 0
+            {
                 usage.record_count = usage.record_count.saturating_add(1);
+            }
+            if kind == "inline_model"
+                && (input_tokens > 0 || output_tokens > 0 || cache_read_input_tokens > 0)
+            {
+                usage.provider_usage_records = usage.provider_usage_records.saturating_add(1);
             }
             usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
             usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
-            usage.cache_tokens = usage.cache_tokens.saturating_add(cache_tokens);
+            usage.cache_read_input_tokens = usage
+                .cache_read_input_tokens
+                .saturating_add(cache_read_input_tokens);
             usage.tool_calls = usage.tool_calls.saturating_add(tool_calls);
             if kind == "inline_model"
                 && node.get("status").and_then(Value::as_str) == Some("completed")
@@ -2018,18 +2300,21 @@ fn token_usage_metrics(timeline: &Value) -> ScenarioTokenUsage {
             usage.output_tokens = usage
                 .output_tokens
                 .saturating_add(value_u64(record, &["output", "output_tokens"]));
-            usage.cache_tokens = usage.cache_tokens.saturating_add(value_u64(
-                record,
-                &[
-                    "cache_create",
-                    "cache_read",
-                    "cache_create_tokens",
-                    "cache_read_tokens",
-                ],
-            ));
+            usage.cache_creation_input_tokens = usage
+                .cache_creation_input_tokens
+                .saturating_add(value_u64(record, &["cache_create", "cache_create_tokens"]));
+            usage.cache_read_input_tokens = usage
+                .cache_read_input_tokens
+                .saturating_add(value_u64(record, &["cache_read", "cache_read_tokens"]));
             usage.tool_calls = usage
                 .tool_calls
                 .saturating_add(value_u64(record, &["tool_calls"]));
+            if value_u64(record, &["input", "input_tokens"]) > 0
+                || value_u64(record, &["output", "output_tokens"]) > 0
+                || value_u64(record, &["cache_read", "cache_read_tokens"]) > 0
+            {
+                usage.provider_usage_records = usage.provider_usage_records.saturating_add(1);
+            }
             usage
         })
 }

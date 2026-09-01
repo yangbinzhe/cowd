@@ -134,10 +134,19 @@ pub struct ModelRoleDependency {
 #[serde(deny_unknown_fields)]
 pub struct ModelTeamResultIntent {
     #[serde(default)]
+    #[schemars(
+        description = "Authoritative Team-level terminal artifact contract. Runtime deterministically lowers these artifacts into the unique terminal role; do not duplicate them there unless they are also local dependency outputs."
+    )]
     pub required_artifacts: Vec<String>,
     #[serde(default)]
+    #[schemars(
+        description = "When true, Runtime adds the structured terminal artifact named `evidence` to the Team result and lowers it into the unique terminal role. This is a result field, not a fresh evidence-scope permission."
+    )]
     pub evidence_required: bool,
     #[serde(default)]
+    #[schemars(
+        description = "When true, the Team must have one unambiguous terminal role that synthesizes the authoritative result contract."
+    )]
     pub synthesis_required: bool,
 }
 

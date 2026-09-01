@@ -125,6 +125,34 @@ fn append_runtime_input(
 
 #[test]
 #[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
+fn postgres_usage_summary_decodes_bigint_aggregates() {
+    let _guard = postgres_test_guard();
+    let store = real_store();
+    clear_isolated_store(&store);
+    let session_id = unique_id("usage-summary");
+    let mut record = session(&session_id);
+    record.platform = "webui".to_string();
+    record.model = Some("deepseek-v4-flash".to_string());
+    record.message_count = 7;
+    record.input_tokens = 12_345;
+    record.output_tokens = 678;
+    store.create_session(&record).expect("create usage Session");
+
+    let usage = store
+        .session_usage_summary(10)
+        .expect("decode PostgreSQL usage aggregates");
+    assert_eq!(usage.session_count, 1);
+    assert_eq!(usage.message_count, 7);
+    assert_eq!(usage.input_tokens, 12_345);
+    assert_eq!(usage.output_tokens, 678);
+    assert_eq!(usage.by_platform["webui"].input_tokens, 12_345);
+    assert_eq!(usage.by_model["deepseek-v4-flash"].output_tokens, 678);
+    assert_eq!(usage.recent_sessions.len(), 1);
+    assert_eq!(usage.recent_sessions[0].session_id, session_id);
+}
+
+#[test]
+#[ignore = "requires an isolated COWD_TEST_POSTGRES_URL"]
 fn postgres_reads_selected_context_ranges_with_one_query() {
     let _guard = postgres_test_guard();
     let store = real_store();

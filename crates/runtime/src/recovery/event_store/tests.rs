@@ -25,6 +25,46 @@ fn projection_work_class_is_nested_and_never_leaks_to_foreground_callers() {
 }
 
 #[test]
+fn foreground_commit_clock_excludes_projection_writes() {
+    let store = RuntimeEventStore::try_open_in_memory().unwrap();
+    assert!(store
+        .foreground_quiet_remaining(Duration::from_secs(1))
+        .is_zero());
+
+    store
+        .append(input(
+            "session:foreground",
+            RuntimeEventScope::Session,
+            "session.foreground",
+        ))
+        .unwrap();
+    let foreground_mark = store
+        .last_foreground_commit_ms
+        .load(std::sync::atomic::Ordering::Acquire);
+    assert!(foreground_mark > 0);
+    assert!(!store
+        .foreground_quiet_remaining(Duration::from_secs(1))
+        .is_zero());
+
+    store.run_projection_work(RuntimeProjectionWorkClass::Background, || {
+        store
+            .append(input(
+                "evolution:background",
+                RuntimeEventScope::Evolution,
+                "evolution.projected",
+            ))
+            .unwrap();
+    });
+    assert_eq!(
+        store
+            .last_foreground_commit_ms
+            .load(std::sync::atomic::Ordering::Acquire),
+        foreground_mark,
+        "projection output cannot keep its own foreground quiet gate busy"
+    );
+}
+
+#[test]
 fn background_projection_connections_wait_briefly_for_sqlite_writer_handoff() {
     let store = SqliteRuntimeEventStore::try_open_in_memory().unwrap();
     let work_class = RuntimeEventStore::try_open_in_memory().unwrap();

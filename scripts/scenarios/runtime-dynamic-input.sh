@@ -245,7 +245,18 @@ start_gateway() {
     "$BIN" gateway run >>"$GATEWAY_LOG" 2>&1 &
   GATEWAY_PID=$!
   for _ in {1..240}; do
-    if auth_curl -fsS "$BASE_URL/readyz" 2>/dev/null | rg -q '"ready":true'; then
+    # Isolated scenario storage intentionally uses the local fallback and has
+    # no bundled WebUI. Those optional degradations make the aggregate
+    # `/readyz` status 503 even when every required runtime component is ready.
+    # Gate on the nested required-component health status instead of masking a
+    # real startup failure or requiring production-only optional services.
+    if auth_curl -sS "$BASE_URL/readyz" 2>/dev/null | python3 -c \
+      'import json,sys
+try:
+    value=json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if value.get("health", {}).get("status") in {"healthy", "ready"} else 1)'; then
       return 0
     fi
     kill -0 "$GATEWAY_PID" >/dev/null 2>&1 || return 1

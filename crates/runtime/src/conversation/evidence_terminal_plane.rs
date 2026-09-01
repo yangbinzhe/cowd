@@ -798,6 +798,7 @@ where
             .prompt
             .trusted_system
             .iter()
+            .chain(request.prompt.runtime_context.iter())
             .filter(|fragment| {
                 fragment.starts_with("## Runtime evidence plan")
                     || fragment.starts_with("## Runtime execution decision")
@@ -852,7 +853,7 @@ where
         }
         let mut memory_tokens = 0u64;
         let mut handoff_tokens = 0u64;
-        let mut contextual_tokens = 0u64;
+        let mut contextual_tokens = request.prompt.runtime_context_token_estimate();
         for packet in &request.prompt.contextual_packets {
             let tokens =
                 crate::context_ledger::estimate_text_tokens(&packet.render_for_user_context());

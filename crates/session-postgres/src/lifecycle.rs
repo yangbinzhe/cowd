@@ -731,8 +731,9 @@ impl PostgresSessionStore {
             .map_err(storage_error)?;
         let totals = connection
             .query_one(
-                "SELECT COUNT(*),COALESCE(SUM(message_count),0),
-                        COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0)
+                "SELECT COUNT(*),COALESCE(SUM(message_count),0)::BIGINT,
+                        COALESCE(SUM(input_tokens),0)::BIGINT,
+                        COALESCE(SUM(output_tokens),0)::BIGINT
                    FROM session_records
                   WHERE status NOT IN ('deleted','deleting')",
                 &[],
@@ -746,8 +747,9 @@ impl PostgresSessionStore {
                     .query(
                         &format!(
                             "SELECT COALESCE(NULLIF(BTRIM({column}),''),'unknown'),COUNT(*),
-                                COALESCE(SUM(message_count),0),COALESCE(SUM(input_tokens),0),
-                                COALESCE(SUM(output_tokens),0)
+                                COALESCE(SUM(message_count),0)::BIGINT,
+                                COALESCE(SUM(input_tokens),0)::BIGINT,
+                                COALESCE(SUM(output_tokens),0)::BIGINT
                            FROM session_records
                           WHERE status NOT IN ('deleted','deleting')
                           GROUP BY 1 ORDER BY 1"

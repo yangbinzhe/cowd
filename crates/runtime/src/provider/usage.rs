@@ -46,18 +46,12 @@ impl UsageTracker {
         self.cumulative
     }
 
-    /// Cache hit ratio in basis points (0..=10000) over billed input tokens.
+    /// Cache hit ratio in basis points (0..=10000) over all Provider prompt
+    /// input. The normalized uncached input is part of the denominator.
     /// `0` means no cacheable input was observed yet.
     #[must_use]
     pub fn cache_hit_ratio_bp(&self) -> u32 {
-        let read = u64::from(self.cumulative.cache_read_input_tokens);
-        let creation = u64::from(self.cumulative.cache_creation_input_tokens);
-        let billed = read.saturating_add(creation);
-        if billed == 0 {
-            0
-        } else {
-            u32::try_from(read.saturating_mul(10_000) / billed).unwrap_or(0)
-        }
+        self.cumulative.cache_hit_ratio_bp()
     }
 
     /// Tokens served from provider cache across the whole session.
@@ -112,7 +106,7 @@ mod tests {
             cache_creation_input_tokens: 2,
             cache_read_input_tokens: 8,
         });
-        assert_eq!(tracker.cache_hit_ratio_bp(), 8_000);
+        assert_eq!(tracker.cache_hit_ratio_bp(), 4_444);
         assert_eq!(tracker.cache_saved_tokens(), 8);
 
         let empty = UsageTracker::new();

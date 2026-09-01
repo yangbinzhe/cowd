@@ -646,7 +646,7 @@ pub use profile::{Profile, ProfileManager, ProfileMeta};
 pub use prompt::{
     load_system_prompt, prepend_bullets, runtime_clock_section, ContextFile, CowdIdentityContract,
     ProjectContext, PromptBuildError, SystemPromptBuilder, COWD_IDENTITY_CONTRACT_VERSION,
-    SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
+    SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY, SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
 };
 pub use prompt_assembly::{PromptAssembly, PromptContextPacket};
 pub use provider::{detect_provider_kind, model_context_window_with_overrides, ProviderKind};
@@ -663,15 +663,16 @@ pub use provider_resources::{
     ProviderResourceGeneration,
 };
 pub use provider_runtime_client::{
-    push_provider_output_block, ProviderClientTemplateCache, ProviderClientTemplateCacheStats,
-    ProviderControlCompletion, ProviderOutputContentBlock, ProviderRequestEvidenceContext,
-    ProviderRuntimeClient, ProviderToolDefinition, ProviderWireEvidence,
-    ProviderWireEvidenceWriter,
+    push_provider_output_block, ProviderAttemptOutcomeEvidence, ProviderClientTemplateCache,
+    ProviderClientTemplateCacheStats, ProviderControlCompletion, ProviderOutputContentBlock,
+    ProviderRequestEvidenceContext, ProviderRuntimeClient, ProviderToolDefinition,
+    ProviderWireEvidence, ProviderWireEvidenceWriter,
 };
 pub use provider_runtime_client::{ProviderRequestContext, ResolvedProviderProfile};
 pub use provider_transport_policy::ProviderTransportPolicy;
 pub use provider_transport_pool::{
-    ProviderTransportPool, ProviderTransportPoolStats, TransportProfileFingerprint,
+    ProviderTransportPool, ProviderTransportPoolStats, ProviderWirePrefixObservation,
+    TransportProfileFingerprint,
 };
 pub use reality_decision::{
     RealityContextBudgetPlan, RealityFactPlan, RealityFactPlanItem, RealityKnowledgeDecision,

@@ -1,8 +1,9 @@
 use harness_eval::{
     default_report_root, run_auto_strategy_paired, run_certification_manifest, run_eval,
-    run_paired_performance, terminal_gate_report_with_report, write_auto_strategy_report,
-    AutoStrategyPairedOptions, HarnessEvalLevel, HarnessEvalReportStore, HarnessEvalRunnerOptions,
-    PairedPerformanceOptions,
+    run_paired_performance, run_provider_cache_calibration, terminal_gate_report_with_report,
+    write_auto_strategy_report, AutoStrategyPairedOptions, HarnessEvalLevel,
+    HarnessEvalReportStore, HarnessEvalRunnerOptions, PairedPerformanceOptions,
+    ProviderCacheCalibrationOptions,
 };
 use std::{path::PathBuf, time::Duration};
 
@@ -26,6 +27,21 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     match args.first().map(String::as_str) {
+        Some("provider-cache-calibration") => {
+            let output = PathBuf::from(required_option(&args[1..], "--output")?);
+            let report = run_provider_cache_calibration(ProviderCacheCalibrationOptions {
+                model: required_option(&args[1..], "--provider")?,
+                stable_context: PathBuf::from(required_option(&args[1..], "--stable-context")?),
+                output: output.clone(),
+                allow_real_model: args.iter().any(|value| value == "--allow-real-model"),
+            })?;
+            println!("provider-cache-calibration-report: {}", output.display());
+            println!(
+                "warm-provider-cache-ratio-bp: {}",
+                report["summary"]["warm_provider_cache_ratio_bp"]
+            );
+            return Ok(());
+        }
         Some("auto-strategy-paired") => {
             let output = PathBuf::from(required_option(&args[1..], "--output")?);
             let repetitions = option_value(&args[1..], "--repetitions")
@@ -274,7 +290,7 @@ fn run() -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--min-pairs 5] [--pairs 20] [--target-relative-ci-half-width-bp 500] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]\n  harness-eval certify --manifest <path> --output <dir>"
+        "Usage:\n  harness-eval quick [--budget low]\n  harness-eval full [--budget full]\n  harness-eval deep-real --provider <model> --budget full --allow-real-model\n  harness-eval provider-cache-calibration --provider <deepseek-model> --stable-context <path> --output <path> --allow-real-model\n  harness-eval auto-strategy-paired --provider <model> --judge-model <model> --output <path> --allow-real-model [--direct-url http://127.0.0.1:18652] [--parallel-url http://127.0.0.1:18653] [--auto-url http://127.0.0.1:18654] [--repetitions 3] (set COWD_AUTO_STRATEGY_DIAGNOSTIC_TASK_ID for a non-claiming frozen-task diagnostic)\n  harness-eval paired-performance --baseline-url <url> --candidate-url <url> --provider <model> --output <path> [--min-pairs 5] [--pairs 20] [--target-relative-ci-half-width-bp 500] [--timeout-secs 600] [--poll-interval-ms 20]\n  harness-eval review-report --run-dir <dir> [--provider <model>] [--allow-real-model]\n  harness-eval terminal-gate [--evidence-dir <dir>] [--report-json <path>]\n  harness-eval certify --manifest <path> --output <dir>"
     );
 }
 

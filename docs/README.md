@@ -4,7 +4,7 @@ Cowd 是一套运行时内核 + 多表面（TUI/WebUI/外部连接器）的工�
 
 ## 当前能力收口要点
 
-- 编排契约：`runtime_capabilities` 暴露模板角色目录与最小合法提案示例；`can_execute_now` 改为对推荐提案做真实 preflight（含租约 pattern 冲突检测）；`route_input` 明确 unsupported；ceiling 修复项从拒绝 findings 拆分为 adjustments；拒绝信息带 `lease_pattern_available` 与可执行恢复提示。
+- 编排契约：`runtime_capabilities` 暴露模板角色目录与最小合法提案示例；`can_execute_now` 对推荐提案做真实 preflight（含租约 pattern 冲突检测）；`route_input` 仅在 Runtime 明确暴露的运行中输入检查点启用并优先于旧拓扑控制动作；ceiling 修复项从拒绝 findings 拆分为 adjustments；拒绝信息带 `lease_pattern_available` 与可执行恢复提示。
 - 前端交互：用户/系统消息可复制；每个最终结果可一键 fork 新 session（store 级防抖）；发布强制浏览器 smoke + dist 静态引用完整性；CI 新增 e2e。
 - 权限与安全：网络域策略并入配置（env 优先、config 兜底），非法值启动拒绝（fail-closed Deny）；bash 只读判定全链取最高风险。
 - 存储：新增进程级 SQLite 池计数（`memory::sqlite_pool_instance_count`），`cowd storage cleanup --sqlite-residuals` 引用感知归档；doctor 同步报告池数。

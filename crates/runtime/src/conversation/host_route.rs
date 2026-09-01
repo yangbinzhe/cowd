@@ -41,6 +41,7 @@ where
                 active_model.clone(),
                 config.tool_definitions,
             )?
+            .with_stable_tool_schema(config.execution_role.is_delegated_leaf())
             .with_execution_supervisor(services.execution_supervisor())
             .with_emit_output(config.emit_output)
             .with_stream_callback(config.stream_callback.clone()),

@@ -7,8 +7,11 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex as StdMutex, OnceLock,
+};
+use std::time::{Duration, Instant};
 
 use rusqlite::{
     params, params_from_iter, types::Value as SqliteValue, Connection, OptionalExtension,
@@ -66,6 +69,10 @@ use sqlite::{validate_migration_snapshot, SqliteRuntimeEventStore};
 pub struct RuntimeEventStore {
     backend: Arc<dyn RuntimeEventStoreBackend>,
     commit_signal: tokio::sync::watch::Sender<u64>,
+    /// Monotonic time of the latest non-projection commit. Maintenance lanes
+    /// use this signal to yield during a foreground burst without reducing
+    /// their idle catch-up throughput or starving indefinitely.
+    last_foreground_commit_ms: AtomicU64,
     /// Per-stream serialization for the read-revision-then-append window.
     /// One stream (for example `session:<id>`) is written by many Runtime
     /// tasks (model events, early-tool authorizations, approval grants), so
@@ -131,6 +138,7 @@ impl RuntimeEventStore {
         Self {
             backend,
             commit_signal,
+            last_foreground_commit_ms: AtomicU64::new(0),
             stream_locks: StdMutex::new(std::collections::HashMap::new()),
         }
     }
@@ -296,9 +304,23 @@ impl RuntimeEventStore {
     }
 
     fn publish_commit(&self, cursor: u64) {
+        if Self::current_projection_work_class().is_none() {
+            self.last_foreground_commit_ms
+                .store(monotonic_elapsed_ms(), Ordering::Release);
+        }
         if cursor > *self.commit_signal.borrow() {
             self.commit_signal.send_replace(cursor);
         }
+    }
+
+    pub(crate) fn foreground_quiet_remaining(&self, quiet_period: Duration) -> Duration {
+        let last = self.last_foreground_commit_ms.load(Ordering::Acquire);
+        if last == 0 {
+            return Duration::ZERO;
+        }
+        let quiet_ms = u64::try_from(quiet_period.as_millis()).unwrap_or(u64::MAX);
+        let elapsed_ms = monotonic_elapsed_ms().saturating_sub(last);
+        Duration::from_millis(quiet_ms.saturating_sub(elapsed_ms))
     }
 
     pub fn events_after_cursor(
@@ -808,6 +830,18 @@ impl RuntimeEventStore {
         }
         Ok(())
     }
+}
+
+fn monotonic_elapsed_ms() -> u64 {
+    static PROCESS_CLOCK: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(
+        PROCESS_CLOCK
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+    .saturating_add(1)
 }
 
 #[cfg(test)]

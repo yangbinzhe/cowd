@@ -246,6 +246,31 @@ if ! install -m 0500 "${LAUNCHER_BUILD_BIN}" "${LAUNCHER_TMP}"; then
 fi
 mv -f "${LAUNCHER_TMP}" "${INSTALL_DIR}/managed-worker-launcher"
 LAUNCHER_BIN="${INSTALL_DIR}/managed-worker-launcher"
+LAUNCHER_DIGEST="sha256:$(sha256sum "${LAUNCHER_BIN}" | awk '{print $1}')"
+
+# APP-enabled installations pin the launcher digest fail-closed. Replacing the
+# launcher without atomically updating that pin makes an otherwise successful
+# upgrade enter a systemd restart loop. Only update a configuration that
+# explicitly points at this exact install target; custom launcher paths remain
+# operator-owned.
+CONFIG_FILE="${CONFIG_DIR}/config.yaml"
+if [ -f "${CONFIG_FILE}" ] \
+    && grep -Fqx "    path: ${LAUNCHER_BIN}" "${CONFIG_FILE}"; then
+    CONFIG_TMP="$(mktemp "${CONFIG_DIR}/.config.launcher-digest.XXXXXX")"
+    if ! LAUNCHER_PATH="${LAUNCHER_BIN}" \
+        LAUNCHER_DIGEST="${LAUNCHER_DIGEST}" \
+        perl -0pe '
+          my $path = quotemeta($ENV{LAUNCHER_PATH});
+          my $digest = $ENV{LAUNCHER_DIGEST};
+          s{(?m)^(\s*launcher:\n\s*path:\s*$path\s*\n\s*sha256:\s*)\S+}{$1$digest}
+            or die "could not update the configured managed-worker-launcher digest\\n";
+        ' "${CONFIG_FILE}" >"${CONFIG_TMP}"; then
+        rm -f "${CONFIG_TMP}"
+        exit 1
+    fi
+    chmod --reference="${CONFIG_FILE}" "${CONFIG_TMP}"
+    mv -f "${CONFIG_TMP}" "${CONFIG_FILE}"
+fi
 
 cat >"${INSTALL_DIR}/install.json" <<EOF
 {
@@ -253,6 +278,7 @@ cat >"${INSTALL_DIR}/install.json" <<EOF
   "install_root": "${INSTALL_DIR}",
   "binary": "${COWD_BIN}",
   "managed_worker_launcher": "${LAUNCHER_BIN}",
+  "managed_worker_launcher_sha256": "${LAUNCHER_DIGEST}",
   "profile": "${BUILD_PROFILE}",
   "source_root": "${SCRIPT_DIR}",
   "installed_at": "$(date -Iseconds)"

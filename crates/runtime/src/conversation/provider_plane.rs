@@ -100,27 +100,39 @@ where
     }
 
     fn configure_terminal_tool_exposure(&mut self, reason: &str) {
-        let revision = self
-            .tool_exposure_revision
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1);
         let discovery = self.discover_tools_with_metrics();
-        self.api_client.configure_tool_exposure(
-            ToolExposureState {
-                catalog_revision: discovery.catalog_revision,
-                bootstrap: Default::default(),
-                active: Default::default(),
-                deferred: discovery
-                    .descriptors
-                    .iter()
-                    .map(|descriptor| descriptor.canonical_id.clone())
-                    .collect(),
-                reason: reason.to_string(),
-                revision,
-                fallback_full: false,
-            }
-            .projection(0),
-        );
+        let mut exposure = ToolExposureState {
+            catalog_revision: discovery.catalog_revision,
+            bootstrap: Default::default(),
+            active: Default::default(),
+            deferred: discovery
+                .descriptors
+                .iter()
+                .map(|descriptor| descriptor.canonical_id.clone())
+                .collect(),
+            reason: reason.to_string(),
+            revision: 0,
+            fallback_full: false,
+        };
+        self.stamp_tool_exposure_revision(&mut exposure);
+        self.api_client
+            .configure_tool_exposure(exposure.projection(0));
+    }
+
+    fn stamp_tool_exposure_revision(&self, exposure: &mut ToolExposureState) {
+        let digest = model_protocol::fingerprint::hash_serializable(&(
+            &exposure.bootstrap,
+            &exposure.active,
+            exposure.fallback_full,
+        ));
+        let previous = self.tool_exposure_digest.swap(digest, Ordering::SeqCst);
+        exposure.revision = if previous == digest && previous != 0 {
+            self.tool_exposure_revision.load(Ordering::SeqCst).max(1)
+        } else {
+            self.tool_exposure_revision
+                .fetch_add(1, Ordering::SeqCst)
+                .saturating_add(1)
+        };
     }
 
     fn pack_timed_provider_attempt(
@@ -217,13 +229,15 @@ where
 
     /// Run one clean, zero-tool synthesis request from the original objective
     /// and already-committed evidence receipts. Unlike the normal continuation
-    /// path, this request carries no exploratory assistant/tool-call history,
-    /// so a provider that became stuck repeating its prior tool protocol gets
-    /// one bounded opportunity to convert evidence into a deliverable.
+    /// path, this request carries only the minimal paired ToolUse/ToolResult
+    /// evidence history, not exploratory text or failed continuation state.
+    /// This lets Runtime prove ProviderModel observation without reintroducing
+    /// the loop-inducing transcript.
     pub(crate) async fn execute_clean_terminal_synthesis(
         &mut self,
         objective: &str,
         evidence: &str,
+        evidence_history: Vec<ConversationMessage>,
     ) -> Result<ModelStepResult, RuntimeError> {
         // This owner creates an isolated reduction request directly rather
         // than passing through `execute_model_step`, so it must apply the
@@ -231,15 +245,22 @@ where
         // providers may spend the terminal budget on private reasoning and
         // produce no user-visible answer after evidence has been committed.
         self.require_next_model_reasoning_effort("none");
-        let evidence = if evidence.trim().is_empty() {
-            "No checked tool receipt was available; give an honest bounded answer and name the missing evidence."
+        let evidence_instruction = if evidence_history.is_empty() {
+            let evidence = if evidence.trim().is_empty() {
+                "No checked tool receipt was available; give an honest bounded answer and name the missing evidence."
+            } else {
+                evidence
+            };
+            format!("Checked evidence receipt fallback:\n{evidence}\n\n")
         } else {
-            evidence
+            "The preceding Runtime-paired native ToolResult messages are the checked evidence receipts.\n\n"
+                .to_string()
         };
-        let messages: HistoryView = vec![ConversationMessage::user_text(format!(
-            "Original objective:\n{objective}\n\nChecked evidence receipts:\n{evidence}\n\nReturn the final answer now."
-        ))]
-        .into();
+        let mut messages = evidence_history;
+        messages.push(ConversationMessage::user_text(format!(
+            "Original objective:\n{objective}\n\n{evidence_instruction}Return the final answer now."
+        )));
+        let messages: HistoryView = messages.into();
         self.execute_terminal_provider_step(
             objective,
             "## Clean terminal synthesis\n\
@@ -273,8 +294,8 @@ where
         self.configure_terminal_tool_exposure(exposure_reason);
 
         let mut prompt = PromptAssembly::new(self.system_prompt.clone());
-        prompt.push_trusted_system(crate::prompt::runtime_clock_section());
-        prompt.push_trusted_system(system_section);
+        prompt.push_runtime_context(crate::prompt::runtime_clock_section());
+        prompt.push_runtime_context(system_section);
         let inventory = self.api_client.context_inventory();
         let mut last_error = None;
         let mut models_tried = Vec::new();
@@ -909,7 +930,6 @@ where
             .lock()
             .ok()
             .and_then(|mut tool_name| tool_name.take());
-        let tool_activation_ceiling = one_shot_tool_allowlist.clone();
         let one_shot_reasoning_effort = self
             .next_model_reasoning_effort
             .lock()
@@ -917,6 +937,16 @@ where
             .and_then(|mut effort| effort.take());
         let explicitly_forbids_tool_use =
             harness_contract::strategy::prompt_explicitly_forbids_tool_use(user_input);
+        // Stable delegated wire schemas may intentionally include tools that
+        // are outside this request's logical exposure. A terminal or
+        // user-forbidden tool boundary must therefore carry an explicit empty
+        // activation ceiling instead of treating hidden schemas as eligible
+        // deferred calls.
+        let tool_activation_ceiling = if text_only_response || explicitly_forbids_tool_use {
+            Some(BTreeSet::new())
+        } else {
+            one_shot_tool_allowlist.clone()
+        };
         let discovery_activation_notice = if text_only_response || explicitly_forbids_tool_use {
             None
         } else {
@@ -1057,10 +1087,7 @@ where
         } else {
             exposure
         };
-        exposure.revision = self
-            .tool_exposure_revision
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1);
+        self.stamp_tool_exposure_revision(&mut exposure);
         // A text-only checkpoint is a one-request overlay. Keep the normal
         // catalog state for discovery/projection, while still sending an
         // explicit empty schema set for this provider request.
@@ -1125,26 +1152,26 @@ where
             &decision.strategy.understanding,
         );
         let apply_runtime_controls = |prompt: &mut PromptAssembly| {
-            prompt.push_trusted_system(crate::evidence_planner::evidence_plan_prompt(&evidence));
-            prompt.push_trusted_system(
+            prompt.push_runtime_context(crate::evidence_planner::evidence_plan_prompt(&evidence));
+            prompt.push_runtime_context(
                 crate::execution_core::runtime_execution_guidance_prompt_with_tool_exposure(
                     &decision,
                     Some(&exposure.projection(0)),
                 ),
             );
             if let Some(activated_ids) = discovery_activation_notice.as_ref() {
-                prompt.push_trusted_system(format!(
+                prompt.push_runtime_context(format!(
                     "## Tool discovery handoff\nThis is the immediate automatic continuation of the same user turn. tool_search already completed successfully and is intentionally unavailable for this request. Newly activated native function schemas: [{}]. Continue the original task now by invoking the relevant activated schema directly when evidence or action is still required. Do not ask the user to resend the request and do not claim that a new user turn is needed.",
                     activated_ids.iter().cloned().collect::<Vec<_>>().join(", ")
                 ));
             }
             if text_only_response {
-                prompt.push_trusted_system(
+                prompt.push_runtime_context(
                     "## Terminal response boundary\nThis request is a text-only terminal checkpoint. The executable tool set for this request is empty, regardless of any earlier capability inventory or historical tool receipts in the context. Do not emit native function calls, simulated tool markup, JSON commands, new plans, or more work. Use only retained evidence receipts to produce the best final answer now. State unresolved facts explicitly instead of performing another search.".to_string(),
                 );
             }
             if explicitly_forbids_tool_use {
-                prompt.push_trusted_system(
+                prompt.push_runtime_context(
                     "## User-selected execution boundary\nThe user explicitly prohibited tool calls for this request. The executable tool set is empty. Answer from the supplied prompt and retained conversation evidence only; do not emit native function calls, simulated tool markup, or JSON commands.".to_string(),
                 );
             }
@@ -1501,15 +1528,15 @@ where
                 // source receipt, before they can meet a required escalation.
                 // Unknown, unhealthy, or overlay-denied names still fail
                 // closed before any assistant transcript is published.
-                self.reconcile_provider_context_usage(usage);
-                self.usage_tracker.record(usage);
-                if let Some(callback) = &self.tool_callback {
-                    callback.on_usage(&usage);
-                }
                 if denied_by_overlay.is_empty() && activated.len() == unexposed_tool_names.len() {
                     // Fall through and execute the parsed calls. Activation
                     // remains durable for subsequent provider requests.
                 } else {
+                    self.reconcile_provider_context_usage(usage);
+                    self.usage_tracker.record(usage);
+                    if let Some(callback) = &self.tool_callback {
+                        callback.on_usage(&usage);
+                    }
                     return Err(
                         RuntimeError::with_provider_failure_metadata(
                             format!(

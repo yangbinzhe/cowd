@@ -1003,6 +1003,7 @@
                         .prompt
                         .trusted_system
                         .iter()
+                        .chain(request.prompt.runtime_context.iter())
                         .any(|fragment| fragment.contains("Terminal response boundary")),
                     Ordering::SeqCst,
                 );
@@ -1020,6 +1021,7 @@
                     .prompt
                     .trusted_system
                     .iter()
+                    .chain(request.prompt.runtime_context.iter())
                     .chain(
                         request
                             .prompt
@@ -1099,6 +1101,7 @@
                 .prompt
                 .trusted_system
                 .iter()
+                .chain(request.prompt.runtime_context.iter())
                 .any(|fragment| fragment.contains("Clean terminal synthesis"));
             if clean_terminal {
                 self.saw_clean_terminal_prompt.store(true, Ordering::SeqCst);
@@ -1139,6 +1142,7 @@
                 .prompt
                 .trusted_system
                 .iter()
+                .chain(request.prompt.runtime_context.iter())
                 .any(|fragment| fragment.contains("Clean terminal synthesis"));
             if clean_terminal {
                 self.saw_clean_terminal_prompt.store(true, Ordering::SeqCst);

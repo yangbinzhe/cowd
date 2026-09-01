@@ -1609,8 +1609,18 @@ mod tests {
         };
         let first = router_a.route_pending_with(&executor, 1).await.unwrap();
         assert_eq!(first.receipts[0].status, "blocked_ack");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let second = router_b.route_pending_with(&executor, 1).await.unwrap();
+        let reclaim_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let second = loop {
+            let candidate = router_b.route_pending_with(&executor, 1).await.unwrap();
+            if candidate.materialized == 1 {
+                break candidate;
+            }
+            assert!(
+                tokio::time::Instant::now() < reclaim_deadline,
+                "expired committed ingress was not reclaimed before the bounded deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         assert_eq!(second.materialized, 1);
         assert_eq!(executor.executions.load(Ordering::SeqCst), 2);
         assert_eq!(executor.side_effects.load(Ordering::SeqCst), 1);

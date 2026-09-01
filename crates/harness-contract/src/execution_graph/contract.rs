@@ -1557,8 +1557,9 @@ impl ExecutionNodeStatus {
 pub enum ExecutionEdgeKind {
     DependsOn,
     /// Organizational cross-Team relation owned by CollaborationProgram.
-    /// It is not itself a scheduler barrier: only `ArtifactRequires` may
-    /// block the concrete consumer that declared a hard input contract.
+    /// It is not itself a scheduler barrier. Runtime compilation emits a
+    /// companion `ArtifactRequires` edge for every executable Team-to-Team
+    /// dependency so the concrete consumer cannot outrun durable delivery.
     CrossTeamHandoff,
     /// Physical readiness edge for a typed artifact/evidence consumer.
     ArtifactRequires,

@@ -601,18 +601,35 @@ fn semantic_compile_rejection_does_not_invent_a_generic_graph_proposal_error() {
                     evidence_required: false,
                     synthesis_required: true,
                 },
-                roles: vec![ModelRoleIntent {
-                    role_id: "reviewer".to_string(),
-                    display_name: None,
-                    responsibility: "review evidence".to_string(),
-                    required_capabilities: vec!["read".to_string()],
-                    required_skills: Vec::new(),
-                    required_tools: Vec::new(),
-                    cardinality: Default::default(),
-                    acceptance: Vec::new(),
-                    input_artifacts: Vec::new(),
-                    output_artifacts: vec!["evidence".to_string()],
-                }],
+                // Two topology sinks and neither explicitly owns `summary`:
+                // unlike the unique-sink case, Runtime cannot safely choose
+                // terminal ownership and must fail closed.
+                roles: vec![
+                    ModelRoleIntent {
+                        role_id: "reviewer-a".to_string(),
+                        display_name: None,
+                        responsibility: "review evidence A".to_string(),
+                        required_capabilities: vec!["read".to_string()],
+                        required_skills: Vec::new(),
+                        required_tools: Vec::new(),
+                        cardinality: Default::default(),
+                        acceptance: Vec::new(),
+                        input_artifacts: Vec::new(),
+                        output_artifacts: vec!["evidence-a".to_string()],
+                    },
+                    ModelRoleIntent {
+                        role_id: "reviewer-b".to_string(),
+                        display_name: None,
+                        responsibility: "review evidence B".to_string(),
+                        required_capabilities: vec!["read".to_string()],
+                        required_skills: Vec::new(),
+                        required_tools: Vec::new(),
+                        cardinality: Default::default(),
+                        acceptance: Vec::new(),
+                        input_artifacts: Vec::new(),
+                        output_artifacts: vec!["evidence-b".to_string()],
+                    },
+                ],
                 dependencies: Vec::new(),
             },
         }],
@@ -1175,8 +1192,19 @@ fn semantic_compiler_materializes_three_teams_and_a_review_team() {
             .iter()
             .filter(|edge| edge.kind.is_dependency())
             .count(),
-        0,
-        "organizational Team relations without typed input artifacts must not serialize execution"
+        3,
+        "each cross-Team handoff needs a physical readiness barrier; independent producers remain parallel while the consumer waits"
+    );
+    assert_eq!(
+        compiled
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.kind == harness_contract::execution_graph::ExecutionEdgeKind::ArtifactRequires
+            })
+            .count(),
+        3
     );
     assert_eq!(
         compiled

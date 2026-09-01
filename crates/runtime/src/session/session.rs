@@ -1351,13 +1351,7 @@ fn usage_to_json(usage: TokenUsage) -> JsonValue {
         "cache_read_input_tokens".to_string(),
         JsonValue::Number(i64::from(usage.cache_read_input_tokens)),
     );
-    let billed_input = u64::from(usage.cache_read_input_tokens)
-        .saturating_add(u64::from(usage.cache_creation_input_tokens));
-    let cache_hit_ratio_bp = if billed_input == 0 {
-        0
-    } else {
-        (u64::from(usage.cache_read_input_tokens).saturating_mul(10_000) / billed_input) as i64
-    };
+    let cache_hit_ratio_bp = i64::from(usage.cache_hit_ratio_bp());
     object.insert(
         "cache_hit_ratio_bp".to_string(),
         JsonValue::Number(cache_hit_ratio_bp),
@@ -1639,6 +1633,11 @@ mod tests {
 
     #[test]
     fn canonical_session_message_seals_private_provider_transcript() {
+        // Provider transcript key resolution reads COWD_CONFIG_HOME. Other
+        // prompt/config tests temporarily change that process-global value;
+        // share the crate-wide test lock so sealing and hydration cannot pick
+        // keys from two different temporary homes under parallel execution.
+        let _env_guard = crate::test_env_lock();
         let private_reasoning = "private-provider-reasoning";
         let provider_signature = "provider-reasoning-signature";
         let message = ConversationMessage::assistant(vec![

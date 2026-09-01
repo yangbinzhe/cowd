@@ -463,9 +463,9 @@ pub fn orchestration_lessons() -> Vec<Value> {
             "source": "orchestration validator"
         }),
         json!({
-            "failure": "calling route_input as if it were supported",
-            "correction": "route_input is unsupported; available operations are inspect, propose, propose_template, revise, control",
-            "source": "runtime_orchestrate contract"
+            "failure": "calling route_input outside a Runtime-mandated pending-input checkpoint",
+            "correction": "route_input is a Runtime-owned active-Turn control path. Call it exactly once only when Runtime explicitly exposes and requires runtime_orchestrate for labelled input_slot values; otherwise use inspect, propose, propose_template, revise, or control",
+            "source": "turn inbox and runtime_orchestrate contract"
         }),
         json!({
             "failure": "proposing a Team before reading the capability catalog",

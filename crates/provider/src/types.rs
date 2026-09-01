@@ -60,6 +60,15 @@ pub struct MessageRequest {
     pub messages: Vec<InputMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
+    /// Exact immutable leading portion of `system` shared by a cache cohort.
+    ///
+    /// This is transport-local metadata. OpenAI-compatible adapters emit it as
+    /// a standalone first system message and place the execution-specific
+    /// suffix in a second system message, preserving a byte-identical provider
+    /// prefix across sibling agents. Protocols with a scalar system field keep
+    /// serializing `system` unchanged.
+    #[serde(skip)]
+    pub system_cache_prefix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
     #[serde(skip_serializing_if = "Option::is_none")]

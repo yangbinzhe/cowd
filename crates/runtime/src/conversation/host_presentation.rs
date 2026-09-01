@@ -2409,6 +2409,90 @@ pub(super) fn terminal_evidence_digest(messages: &[ConversationMessage]) -> Stri
     rendered.trim().to_string()
 }
 
+/// Build the smallest provider-valid history that proves checked tool
+/// receipts were actually exposed to the terminal synthesis model.
+///
+/// A ToolResult cannot be sent on its own: strict transports require the
+/// preceding assistant ToolUse with the same invocation id. Retaining the
+/// complete exploratory transcript would defeat clean terminal synthesis and
+/// prompt caching, so this projection keeps only exact pairs and strips all
+/// text and thinking blocks.
+pub(super) fn terminal_evidence_history(
+    assistant_messages: &[ConversationMessage],
+    result_messages: &[ConversationMessage],
+) -> Vec<ConversationMessage> {
+    let mut results_by_id = BTreeMap::<String, Vec<ContentBlock>>::new();
+    let mut result_order = Vec::new();
+    for message in result_messages {
+        for block in &message.blocks {
+            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                if !results_by_id.contains_key(tool_use_id) {
+                    result_order.push(tool_use_id.clone());
+                }
+                results_by_id
+                    .entry(tool_use_id.clone())
+                    .or_default()
+                    .push(block.clone());
+            }
+        }
+    }
+
+    let mut history = Vec::new();
+    let mut emitted = BTreeSet::new();
+    for message in assistant_messages {
+        for block in &message.blocks {
+            let ContentBlock::ToolUse { id, .. } = block else {
+                continue;
+            };
+            let Some(results) = results_by_id.get(id) else {
+                continue;
+            };
+            if !emitted.insert(id.clone()) {
+                continue;
+            }
+            history.push(ConversationMessage::assistant(vec![block.clone()]));
+            history.push(ConversationMessage {
+                role: crate::MessageRole::Tool,
+                blocks: results.clone(),
+                usage: None,
+            });
+        }
+    }
+    // Runtime may proactively prefetch exact evidence before a model step.
+    // Such a receipt has no assistant-authored ToolUse, but strict provider
+    // protocols still require a paired historical call carrier. Emit an
+    // explicitly Runtime-labelled synthetic carrier; the ToolResult bytes,
+    // invocation id and tool name remain exact and are what the observation
+    // ledger verifies after a valid provider response.
+    for id in result_order {
+        if !emitted.insert(id.clone()) {
+            continue;
+        }
+        let Some(results) = results_by_id.get(&id) else {
+            continue;
+        };
+        let Some(tool_name) = results.iter().find_map(|block| match block {
+            ContentBlock::ToolResult { tool_name, .. } => Some(tool_name.clone()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        history.push(ConversationMessage::assistant(vec![
+            ContentBlock::ToolUse {
+                id,
+                name: tool_name,
+                input: r#"{"runtime_evidence_replay":true}"#.to_string(),
+            },
+        ]));
+        history.push(ConversationMessage {
+            role: crate::MessageRole::Tool,
+            blocks: results.clone(),
+            usage: None,
+        });
+    }
+    history
+}
+
 pub(super) fn focus_synthesis_evidence_context_item(
     node_id: &str,
     calls: &[ModelToolCall],
@@ -2427,11 +2511,12 @@ pub(super) fn focus_synthesis_evidence_context_item(
         format!(
             "## Runtime-verified Focus evidence\n\
              The Focus acceptance scopes for this delegated role are complete. \
-             The receipts below are the actual committed, role-local tool results. \
+             The immediately preceding native tool-result messages are the actual committed, role-local receipts. \
              Use their source paths and content to cover every required terminal presentation field \
              [{required_fields}]. Native structured output, JSON, Markdown headings, and `Field: value` labels are accepted. \
              Do not claim that source evidence is unavailable, do not invoke more tools, and do not \
-             substitute prose for the committed receipt facts.\n\n{evidence}"
+             substitute prose for the committed receipt facts. Runtime deliberately references those receipts here \
+             instead of copying their full content into a second context packet."
         ),
     );
     item.authority = ContextAuthority::System;

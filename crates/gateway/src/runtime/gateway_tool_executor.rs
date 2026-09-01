@@ -884,7 +884,7 @@ impl GatewayToolExecutor {
                 == harness_contract::orchestration::RuntimeOrchestrationOperation::RouteInput
             {
                 return Err(ToolError::new(
-                    "runtime_orchestrate route_input is unsupported (fail-closed); available operations: inspect, propose, revise, control",
+                    "runtime_orchestrate route_input is Runtime-owned and must be intercepted by the active-Turn input-disposition host before Gateway tool execution",
                 ));
             }
             let leased_decision = self

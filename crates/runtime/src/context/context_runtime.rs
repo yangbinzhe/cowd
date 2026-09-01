@@ -489,7 +489,9 @@ pub struct ContextCacheStabilityReport {
     pub stable_head_reusable: bool,
     pub runtime_header_changed: bool,
     pub dynamic_tail_changed: bool,
-    pub prompt_cache_friendly: bool,
+    /// Equality of this ContextEnvelope's three fragment classes only. This
+    /// is never a Provider cache claim; exact wire evidence owns that truth.
+    pub context_fragments_identical: bool,
     pub reason: String,
 }
 
@@ -664,6 +666,10 @@ pub struct RuntimeContextGovernanceReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssembledContext {
     pub stable_head: Vec<String>,
+    /// Number of leading stable segments that form the shared Provider cache
+    /// cohort. This survives ContextEnvelope assembly so role-specific stable
+    /// suffixes cannot accidentally become cache identity.
+    pub cache_cohort_segment_count: usize,
     pub runtime_header: Vec<String>,
     pub dynamic_tail: Vec<String>,
 }
@@ -710,6 +716,7 @@ pub const CONTEXT_RENDER_FORMATTER_VERSION: u32 = 2;
 pub struct ContextRenderManifest {
     pub formatter_version: u32,
     pub stable_head: Vec<String>,
+    pub cache_cohort_segment_count: usize,
     pub runtime_header: Vec<String>,
     pub dynamic_tail_source: String,
 }
@@ -753,6 +760,7 @@ impl From<&ContextEnvelope> for PersistedContextEnvelope {
             render_manifest: ContextRenderManifest {
                 formatter_version: CONTEXT_RENDER_FORMATTER_VERSION,
                 stable_head: envelope.assembled.stable_head.clone(),
+                cache_cohort_segment_count: envelope.assembled.cache_cohort_segment_count,
                 runtime_header: envelope.assembled.runtime_header.clone(),
                 dynamic_tail_source: "selected".to_string(),
             },
@@ -835,6 +843,17 @@ impl ContextRuntimeKernel {
     }
 
     pub fn build_envelope(request: ContextEnvelopeRequest) -> ContextEnvelope {
+        let cache_cohort_segment_count = request.stable_head.len();
+        Self::build_envelope_with_cache_cohort(request, cache_cohort_segment_count)
+    }
+
+    /// Build an envelope while preserving the cache-cohort split already
+    /// established by PromptAssembly. Generic callers use the complete stable
+    /// head as one cohort through `build_envelope`.
+    pub(crate) fn build_envelope_with_cache_cohort(
+        request: ContextEnvelopeRequest,
+        cache_cohort_segment_count: usize,
+    ) -> ContextEnvelope {
         let profile = request.profile;
         let static_tokens = request
             .stable_head
@@ -874,6 +893,7 @@ impl ContextRuntimeKernel {
             ((used_tokens.saturating_mul(10_000)) / request.total_budget_tokens).min(10_000) as u16
         };
         let assembled = AssembledContext {
+            cache_cohort_segment_count: cache_cohort_segment_count.min(request.stable_head.len()),
             stable_head: request.stable_head,
             runtime_header: request.runtime_header,
             dynamic_tail,
@@ -1121,13 +1141,18 @@ impl ContextRuntimeKernel {
         next: &ContextEnvelope,
     ) -> ContextCacheStabilityReport {
         let comparison = Self::compare_stable_head(previous, next);
-        let prompt_cache_friendly = comparison.reusable;
+        // An equal stable head alone proves only a small local fragment. It
+        // cannot certify a Provider prefix when request-local header or tail
+        // bytes changed. Exact wire evidence owns the positive claim.
+        let context_fragments_identical = comparison.reusable
+            && !comparison.runtime_header_changed
+            && !comparison.dynamic_tail_changed;
         let reason = if !comparison.reusable {
             "stable head changed; provider prompt cache cannot safely reuse the prefix"
         } else if comparison.runtime_header_changed {
-            "stable head is reusable; runtime header changed because identity or mode changed"
+            "stable head is equal, but runtime header changed; only exact wire-prefix evidence can prove Provider reuse"
         } else if comparison.dynamic_tail_changed {
-            "stable head and runtime header are reusable; only dynamic tail changed"
+            "stable head and runtime header are equal, but dynamic tail changed; full Provider reuse is not proven"
         } else {
             "stable head, runtime header, and dynamic tail are unchanged"
         }
@@ -1138,7 +1163,7 @@ impl ContextRuntimeKernel {
             stable_head_reusable: comparison.reusable,
             runtime_header_changed: comparison.runtime_header_changed,
             dynamic_tail_changed: comparison.dynamic_tail_changed,
-            prompt_cache_friendly,
+            context_fragments_identical,
             reason,
         }
     }
@@ -1318,16 +1343,20 @@ impl ContextRuntimeKernel {
         identity.task_id = parent.identity.task_id.clone();
         identity.team_id = parent.identity.team_id.clone();
         let runtime_header = Self::runtime_header(&identity, ContextProfile::SubAgent);
-        let envelope = Self::build_envelope(ContextEnvelopeRequest {
-            identity,
-            profile: ContextProfile::SubAgent,
-            intent: parent.intent.clone(),
-            stable_head: parent.assembled.stable_head.clone(),
-            runtime_header,
-            dynamic_items,
-            omitted: isolated_omissions.clone(),
-            total_budget_tokens: lease.max_tokens.max(1),
-        });
+        let cache_cohort_segment_count = parent.assembled.cache_cohort_segment_count;
+        let envelope = Self::build_envelope_with_cache_cohort(
+            ContextEnvelopeRequest {
+                identity,
+                profile: ContextProfile::SubAgent,
+                intent: parent.intent.clone(),
+                stable_head: parent.assembled.stable_head.clone(),
+                runtime_header,
+                dynamic_items,
+                omitted: isolated_omissions.clone(),
+                total_budget_tokens: lease.max_tokens.max(1),
+            },
+            cache_cohort_segment_count,
+        );
         AgentContextView {
             child_agent_id: lease.child_agent_id,
             parent_agent_id: lease.parent_agent_id,
@@ -2757,7 +2786,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_stability_report_marks_dynamic_only_changes_cache_friendly() {
+    fn cache_stability_report_does_not_promote_stable_head_to_full_wire_proof() {
         let a = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory alpha"));
         let b = ContextRuntimeKernel::build_envelope(request_with_dynamic("memory beta"));
 
@@ -2766,7 +2795,7 @@ mod tests {
         assert!(report.stable_head_reusable);
         assert!(!report.runtime_header_changed);
         assert!(report.dynamic_tail_changed);
-        assert!(report.prompt_cache_friendly);
+        assert!(!report.context_fragments_identical);
         assert!(report.reason.contains("dynamic tail"));
     }
 
@@ -3393,6 +3422,10 @@ mod tests {
 
         assert_eq!(persisted.selected, envelope.selected);
         assert_eq!(persisted.render_manifest.dynamic_tail_source, "selected");
+        assert_eq!(
+            persisted.render_manifest.cache_cohort_segment_count,
+            envelope.assembled.cache_cohort_segment_count
+        );
         assert_eq!(
             persisted.render_manifest.formatter_version,
             CONTEXT_RENDER_FORMATTER_VERSION

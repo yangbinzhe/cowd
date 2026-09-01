@@ -17,11 +17,33 @@ use crate::orchestration::{
     CapabilityRecipeId, GraphSemanticNode, RuntimeOrchestrationCommand, SemanticFocus,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum TeamAuthorityProfile {
-    WorkspaceRead,
-    ExternalResearch,
-    WorkspaceWrite,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct TeamAuthorityProfile {
+    requires_workspace_write: bool,
+    uses_external_network: bool,
+}
+
+impl TeamAuthorityProfile {
+    const fn workspace_read() -> Self {
+        Self {
+            requires_workspace_write: false,
+            uses_external_network: false,
+        }
+    }
+
+    const fn external_research() -> Self {
+        Self {
+            requires_workspace_write: false,
+            uses_external_network: true,
+        }
+    }
+
+    const fn workspace_write() -> Self {
+        Self {
+            requires_workspace_write: true,
+            uses_external_network: false,
+        }
+    }
 }
 
 /// Canonical semantic contract for one Runtime-owned node in an explicit
@@ -96,17 +118,26 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
-    let ephemeral_write_nodes = request
+    let ephemeral_authority_profiles = request
         .ephemeral_team_templates
         .iter()
-        .filter(|(_, snapshot)| {
-            snapshot.revision.manifest.roles.iter().any(|role| {
-                role.grant_ceiling
-                    .contains(&harness_contract::agent::AgentCapability::Write)
-            })
+        .map(|(node_id, snapshot)| {
+            let roles = &snapshot.revision.manifest.roles;
+            (
+                node_id.clone(),
+                TeamAuthorityProfile {
+                    requires_workspace_write: roles.iter().any(|role| {
+                        role.grant_ceiling
+                            .contains(&harness_contract::agent::AgentCapability::Write)
+                    }),
+                    uses_external_network: roles.iter().any(|role| {
+                        role.grant_ceiling
+                            .contains(&harness_contract::agent::AgentCapability::Network)
+                    }),
+                },
+            )
         })
-        .map(|(node_id, _)| node_id.clone())
-        .collect::<BTreeSet<_>>();
+        .collect::<BTreeMap<_, _>>();
     let Some(proposal) = request.proposal.as_mut() else {
         return;
     };
@@ -150,9 +181,7 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
                     node,
                     requires_write,
                     understanding.requires_external_facts,
-                    ephemeral_team_nodes
-                        .contains(&node.node_id)
-                        .then_some(ephemeral_write_nodes.contains(&node.node_id)),
+                    ephemeral_authority_profiles.get(&node.node_id).copied(),
                 )
             });
             if node.recipe == CapabilityRecipeId::Team {
@@ -183,15 +212,16 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
                 .filter(|candidate| **candidate == Some(profile))
                 .count();
             let team_position = profile_positions.entry(profile).or_default();
-            let node_requires_write = profile == TeamAuthorityProfile::WorkspaceWrite;
-            let node_uses_external = profile == TeamAuthorityProfile::ExternalResearch;
+            let node_requires_write = profile.requires_workspace_write;
+            let node_uses_external = profile.uses_external_network;
             let template = node
                 .template
                 .as_deref()
                 .unwrap_or_default()
                 .trim_start_matches("builtin/");
             let direct_explicit_research = explicit_team
-                && profile == TeamAuthorityProfile::WorkspaceRead
+                && !node_requires_write
+                && !node_uses_external
                 && template == "cowd/direct-executor"
                 && profile_count > 1;
             // User/workspace templates own their role topology. Runtime
@@ -393,7 +423,7 @@ pub(crate) fn bind_semantic_resource_authority_with_understanding(
 }
 
 fn custom_team_resource_scopes(
-    declared_scopes: Vec<String>,
+    mut declared_scopes: Vec<String>,
     uses_external: bool,
     workspace_root: &Path,
     intent: &str,
@@ -401,23 +431,33 @@ fn custom_team_resource_scopes(
     requires_write: bool,
     explicit_team: bool,
 ) -> Vec<String> {
-    if !declared_scopes.is_empty() {
-        return declared_scopes;
+    if requires_write {
+        declared_scopes.extend(bounded_workspace_focus_scopes(
+            workspace_root,
+            intent,
+            focus_count,
+            true,
+            explicit_team,
+        ));
+    } else if declared_scopes.is_empty() && !uses_external {
+        declared_scopes.extend(bounded_workspace_focus_scopes(
+            workspace_root,
+            intent,
+            focus_count,
+            false,
+            explicit_team,
+        ));
     }
     if uses_external {
-        // The immutable Agent profile already proves this custom Team
-        // contains network researchers. Binding it to an arbitrary local
-        // directory would advertise network capability while cropping every
-        // physical network tool.
-        return vec!["network:*".to_string()];
+        // The immutable Agent profile proves this custom Team contains at
+        // least one network role. Network is orthogonal to workspace access:
+        // a heterogeneous Team may contain a network researcher and a
+        // separate writer without granting either role the other's tools.
+        declared_scopes.push("network:*".to_string());
     }
-    bounded_workspace_focus_scopes(
-        workspace_root,
-        intent,
-        focus_count,
-        requires_write,
-        explicit_team,
-    )
+    declared_scopes.sort();
+    declared_scopes.dedup();
+    declared_scopes
 }
 
 fn declared_evidence_scopes(evidence_contract: &[String]) -> Vec<String> {
@@ -555,7 +595,7 @@ fn team_authority_profile(
     node: &GraphSemanticNode,
     request_requires_write: bool,
     request_requires_external_facts: bool,
-    ephemeral_requires_write: Option<bool>,
+    ephemeral_profile: Option<TeamAuthorityProfile>,
 ) -> TeamAuthorityProfile {
     let template = node
         .template
@@ -564,9 +604,9 @@ fn team_authority_profile(
         .trim_start_matches("builtin/");
     let custom_template = template.starts_with("workspace/")
         || template.starts_with("user/")
-        || ephemeral_requires_write.is_some();
+        || ephemeral_profile.is_some();
     if template == "cowd/external-research-synthesis" {
-        return TeamAuthorityProfile::ExternalResearch;
+        return TeamAuthorityProfile::external_research();
     }
     if node
         .output_artifacts
@@ -579,7 +619,7 @@ fn team_authority_profile(
                 | "cowd/planner-executor-verifier"
         )
     {
-        return TeamAuthorityProfile::WorkspaceWrite;
+        return TeamAuthorityProfile::workspace_write();
     }
     if matches!(
         template,
@@ -587,19 +627,19 @@ fn team_authority_profile(
             | "cowd/debate-critic-arbiter"
             | "cowd/comparative-synthesis"
     ) {
-        return TeamAuthorityProfile::WorkspaceRead;
+        return TeamAuthorityProfile::workspace_read();
     }
     // A user-authored/custom template is not covered by the builtin
     // read-only family. When the admitted intent requires workspace writes,
     // Runtime treats the Team as write-capable; the template's own role
     // ceilings and the bounded focus scopes still crop the actual grants.
-    let custom_requires_write = ephemeral_requires_write.unwrap_or(request_requires_write);
-    if custom_requires_write && (custom_template || node.template.is_none()) {
-        TeamAuthorityProfile::WorkspaceWrite
-    } else if request_requires_external_facts {
-        TeamAuthorityProfile::ExternalResearch
-    } else {
-        TeamAuthorityProfile::WorkspaceRead
+    if let Some(profile) = ephemeral_profile {
+        return profile;
+    }
+    TeamAuthorityProfile {
+        requires_workspace_write: request_requires_write
+            && (custom_template || node.template.is_none()),
+        uses_external_network: request_requires_external_facts,
     }
 }
 
@@ -1286,6 +1326,7 @@ fn explicit_workspace_paths(
             token.starts_with('/')
                 || token.starts_with("./")
                 || (token.contains('/') && !token.contains("://") && !token.starts_with("http"))
+                || (allow_missing && is_bare_planned_file_token(token))
         })
         .filter_map(|token| {
             let pattern_prefix = workspace_pattern_existing_prefix(token, allow_missing)?;
@@ -1401,6 +1442,39 @@ fn is_probable_workspace_path_token(workspace_root: &Path, token: &str) -> bool 
                     .all(|character| character.is_ascii_alphanumeric())
         })
     })
+}
+
+/// Recognize a newly planned file in the workspace root without accepting a
+/// version, dotted prose token, URL, or traversing path as write authority.
+/// Nested relative artifacts continue through the existing slash path branch.
+fn is_bare_planned_file_token(token: &str) -> bool {
+    if token.is_empty()
+        || !token.is_ascii()
+        || token.contains('/')
+        || token.contains('\\')
+        || token.contains("..")
+        || token.contains("://")
+    {
+        return false;
+    }
+    let path = Path::new(token);
+    let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+        && extension
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphabetic())
+        && extension
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
 }
 
 /// Template/Agent Definition references such as
@@ -1663,14 +1737,40 @@ mod tests {
         };
 
         assert_eq!(
-            team_authority_profile(&node, true, false, Some(false)),
-            TeamAuthorityProfile::WorkspaceRead,
+            team_authority_profile(
+                &node,
+                true,
+                false,
+                Some(TeamAuthorityProfile::workspace_read()),
+            ),
+            TeamAuthorityProfile::workspace_read(),
             "a frozen read-only custom Team must not inherit unrelated global write intent"
         );
         assert_eq!(
-            team_authority_profile(&node, true, false, Some(true)),
-            TeamAuthorityProfile::WorkspaceWrite,
+            team_authority_profile(
+                &node,
+                true,
+                false,
+                Some(TeamAuthorityProfile::workspace_write()),
+            ),
+            TeamAuthorityProfile::workspace_write(),
             "a frozen Team with an explicit write-capable role keeps its write authority"
+        );
+        assert_eq!(
+            team_authority_profile(
+                &node,
+                true,
+                false,
+                Some(TeamAuthorityProfile {
+                    requires_workspace_write: true,
+                    uses_external_network: true,
+                }),
+            ),
+            TeamAuthorityProfile {
+                requires_workspace_write: true,
+                uses_external_network: true,
+            },
+            "a heterogeneous frozen Team preserves both orthogonal effects"
         );
     }
 
@@ -1788,8 +1888,30 @@ mod tests {
                 false,
                 true,
             ),
-            vec!["read:README.md".to_string()],
-            "an explicit narrower evidence contract remains authoritative"
+            vec!["network:*".to_string(), "read:README.md".to_string()],
+            "declared evidence cannot erase a frozen network capability"
+        );
+    }
+
+    #[test]
+    fn heterogeneous_custom_team_receives_network_and_exact_write_leases() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let scopes = custom_team_resource_scopes(
+            Vec::new(),
+            true,
+            workspace.path(),
+            "通过网络研究并生成 group-theory-ai-autonomous-evaluation.html",
+            4,
+            true,
+            true,
+        );
+
+        assert_eq!(
+            scopes,
+            vec![
+                "network:*".to_string(),
+                "write:group-theory-ai-autonomous-evaluation.html".to_string(),
+            ]
         );
     }
 
@@ -2468,6 +2590,25 @@ mod tests {
         let scopes = bounded_workspace_focus_scopes(workspace.path(), &objective, 1, true, true);
 
         assert_eq!(scopes, vec!["write:evidence/report.html"]);
+    }
+
+    #[test]
+    fn explicitly_named_bare_new_artifact_gets_an_exact_workspace_scope() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let scopes = bounded_workspace_focus_scopes(
+            workspace.path(),
+            "最终必须生成并写入 group-theory-ai-autonomous-evaluation.html，随后重读。",
+            1,
+            true,
+            true,
+        );
+
+        assert_eq!(
+            scopes,
+            vec!["write:group-theory-ai-autonomous-evaluation.html"]
+        );
+        assert!(!is_bare_planned_file_token("v0.9.714"));
+        assert!(!is_bare_planned_file_token("../report.html"));
     }
 
     #[test]

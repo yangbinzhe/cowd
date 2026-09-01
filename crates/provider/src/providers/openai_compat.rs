@@ -1486,7 +1486,7 @@ fn strip_routing_prefix(model: &str) -> &str {
 
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
     let mut messages = Vec::new();
-    if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
+    for system in provider_system_messages(request) {
         messages.push(json!({
             "role": "system",
             "content": system,
@@ -1599,7 +1599,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
 fn build_responses_request(request: &MessageRequest) -> Value {
     let wire_model = strip_routing_prefix(&request.model);
     let mut input = Vec::new();
-    if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
+    for system in provider_system_messages(request) {
         input.push(json!({
             "role": "system",
             "content": [{"type": "input_text", "text": system}],
@@ -1659,6 +1659,28 @@ fn build_responses_request(request: &MessageRequest) -> Value {
     }
 
     payload
+}
+
+/// Preserve the immutable cohort as its own wire item. Length-framed request
+/// canonicalization and provider-side caches can then reuse that item even
+/// when the following Team/Agent suffix has a different length.
+fn provider_system_messages(request: &MessageRequest) -> Vec<&str> {
+    let Some(system) = request.system.as_deref().filter(|value| !value.is_empty()) else {
+        return Vec::new();
+    };
+    let Some(prefix) = request
+        .system_cache_prefix
+        .as_deref()
+        .filter(|prefix| !prefix.is_empty() && system.starts_with(prefix))
+    else {
+        return vec![system];
+    };
+    let suffix = system[prefix.len()..].trim_start_matches("\n\n");
+    if suffix.is_empty() {
+        vec![prefix]
+    } else {
+        vec![prefix, suffix]
+    }
 }
 
 fn translate_message_for_responses(message: &InputMessage) -> Vec<Value> {
@@ -4105,6 +4127,7 @@ mod tests {
             context_window_limit: None,
             messages: vec![],
             system: None,
+            system_cache_prefix: None,
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
@@ -4122,6 +4145,32 @@ mod tests {
         assert_eq!(payload["frequency_penalty"], 0.5);
         assert_eq!(payload["presence_penalty"], 0.3);
         assert_eq!(payload["stop"], json!(["\n"]));
+    }
+
+    #[test]
+    fn openai_wire_splits_shared_system_cache_prefix_from_execution_suffix() {
+        let request = MessageRequest {
+            model: "deepseek-test".to_string(),
+            max_tokens: 128,
+            system: Some("shared-program\n\nteam-a".to_string()),
+            system_cache_prefix: Some("shared-program".to_string()),
+            messages: vec![InputMessage::user_text("inspect")],
+            ..Default::default()
+        };
+
+        let chat = build_chat_completion_request(&request, OpenAiCompatConfig::deepseek());
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][0]["content"], "shared-program");
+        assert_eq!(chat["messages"][1]["role"], "system");
+        assert_eq!(chat["messages"][1]["content"], "team-a");
+        assert_eq!(chat["messages"][2]["role"], "user");
+
+        let responses = build_responses_request(&request);
+        assert_eq!(
+            responses["input"][0]["content"][0]["text"],
+            "shared-program"
+        );
+        assert_eq!(responses["input"][1]["content"][0]["text"], "team-a");
     }
 
     #[test]

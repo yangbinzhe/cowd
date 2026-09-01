@@ -32,9 +32,13 @@ pub enum RuntimeProjectionLatencyClass {
 // backlog passes for this interval prevents a busy foreground stream from
 // turning each commit notification into a competing SQLite scan/write. At the
 // maximum 128-commit maintenance batch this still drains at least 640 commits
-// per second while leaving foreground writers three scheduling windows in a
-// typical 500ms burst.
+// per second when the foreground is quiet.
 const MAINTENANCE_PASS_INTERVAL: Duration = Duration::from_millis(200);
+// A maintenance pass starts only after a short foreground-commit quiet window.
+// Under a continuous write stream the bounded deferral still admits one pass,
+// preventing permanent projection starvation.
+const MAINTENANCE_FOREGROUND_QUIET: Duration = Duration::from_millis(50);
+const MAINTENANCE_MAX_FOREGROUND_DEFERRAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeProjectionDescriptor {
@@ -343,6 +347,20 @@ impl RuntimeEventReactor {
                         tokio::select! {
                             _ = cancellation.cancelled() => break,
                             _ = tokio::time::sleep(MAINTENANCE_PASS_INTERVAL) => {}
+                        }
+                        let deferral_started = tokio::time::Instant::now();
+                        loop {
+                            let remaining = event_store
+                                .foreground_quiet_remaining(MAINTENANCE_FOREGROUND_QUIET);
+                            if remaining.is_zero()
+                                || deferral_started.elapsed() >= MAINTENANCE_MAX_FOREGROUND_DEFERRAL
+                            {
+                                break;
+                            }
+                            tokio::select! {
+                                _ = cancellation.cancelled() => return,
+                                _ = tokio::time::sleep(remaining) => {}
+                            }
                         }
                     }
                     let permit = tokio::select! {

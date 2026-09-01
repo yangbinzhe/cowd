@@ -1502,16 +1502,20 @@ where
             revalidate_context_binding(&session_id, selected_items);
         let mut omitted = omitted;
         omitted.extend(binding_omissions);
-        let mut envelope = ContextRuntimeKernel::build_envelope(ContextEnvelopeRequest {
-            profile,
-            runtime_header,
-            identity,
-            intent: user_input.to_string(),
-            stable_head: canonical_prompt.stable_system_segments().to_vec(),
-            dynamic_items: selected_items,
-            omitted,
-            total_budget_tokens,
-        });
+        let cache_cohort_segment_count = canonical_prompt.cache_cohort_segment_count();
+        let mut envelope = ContextRuntimeKernel::build_envelope_with_cache_cohort(
+            ContextEnvelopeRequest {
+                profile,
+                runtime_header,
+                identity,
+                intent: user_input.to_string(),
+                stable_head: canonical_prompt.stable_system_segments().to_vec(),
+                dynamic_items: selected_items,
+                omitted,
+                total_budget_tokens,
+            },
+            cache_cohort_segment_count,
+        );
         envelope.diagnostics.degraded_sources = degraded_sources;
         envelope.diagnostics.cache_hit =
             self.current_context_cache_hit.swap(false, Ordering::AcqRel);
@@ -1531,9 +1535,12 @@ where
     }
 
     pub(super) fn provider_prompt_from_envelope(envelope: &ContextEnvelope) -> PromptAssembly {
-        let mut prompt = PromptAssembly::new(envelope.assembled.stable_head.clone());
+        let mut prompt = PromptAssembly::from_stable_system_with_cache_cohort(
+            envelope.assembled.stable_head.clone(),
+            envelope.assembled.cache_cohort_segment_count,
+        );
         for header in &envelope.assembled.runtime_header {
-            prompt.push_trusted_system(header.clone());
+            prompt.push_runtime_context(header.clone());
         }
         for item in &envelope.selected {
             prompt.push_context_item(item);

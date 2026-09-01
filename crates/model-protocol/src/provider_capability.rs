@@ -64,11 +64,37 @@ pub struct ProviderCapabilityProfile {
     pub requires_reasoning_content_roundtrip: CapabilityFact,
 }
 
+/// Provider-owned prefix-cache persistence semantics used by Runtime's
+/// request coordinator. This is deliberately separate from model reasoning
+/// and tool capabilities: it changes waiting, never prompt authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPromptCacheBehavior {
+    pub persistence_barrier_ms: u64,
+    pub requires_common_prefix_discovery: bool,
+}
+
 const fn unknown_capability_fact() -> CapabilityFact {
     CapabilityFact::bundled(CapabilityState::Unknown)
 }
 
 impl ProviderCapabilityProfile {
+    #[must_use]
+    pub fn prompt_cache_behavior(model: &str) -> ProviderPromptCacheBehavior {
+        if Self::is_deepseek_v4(model) {
+            // DeepSeek's documented disk cache is built asynchronously and
+            // needs a second divergent request before their common prefix is
+            // persisted as an independently matchable cache unit.
+            ProviderPromptCacheBehavior {
+                persistence_barrier_ms: 2_000,
+                requires_common_prefix_discovery: true,
+            }
+        } else {
+            ProviderPromptCacheBehavior {
+                persistence_barrier_ms: 0,
+                requires_common_prefix_discovery: false,
+            }
+        }
+    }
     #[must_use]
     pub const fn unknown() -> Self {
         let unknown = CapabilityFact::bundled(CapabilityState::Unknown);
@@ -238,6 +264,17 @@ mod tests {
             responses.supports_parallel_tool_calls_request.state,
             CapabilityState::Supported
         );
+    }
+
+    #[test]
+    fn deepseek_disk_cache_behavior_is_centralized_and_other_models_do_not_wait() {
+        let deepseek = ProviderCapabilityProfile::prompt_cache_behavior("deepseek-v4-flash");
+        assert_eq!(deepseek.persistence_barrier_ms, 2_000);
+        assert!(deepseek.requires_common_prefix_discovery);
+
+        let other = ProviderCapabilityProfile::prompt_cache_behavior("some-openai-model");
+        assert_eq!(other.persistence_barrier_ms, 0);
+        assert!(!other.requires_common_prefix_discovery);
     }
 
     #[test]

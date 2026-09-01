@@ -248,6 +248,7 @@ where
             turn_tool_exposure_metrics: std::sync::Mutex::new(TurnProviderState::default()),
             active_skill_tool_refs: std::sync::Mutex::new(BTreeSet::new()),
             tool_exposure_revision: AtomicU64::new(0),
+            tool_exposure_digest: AtomicU64::new(0),
             request_compiler: crate::PreparedRequestCompiler::new(
                 feature_config.session_history().request_cache_entries,
             ),
@@ -888,7 +889,7 @@ where
     ) -> Vec<crate::session_input::SessionInputRecord> {
         let consumed = self.consume_runtime_input_records(turn_id, checkpoint);
         if let Some(guidance) = crate::turn_inbox::checkpoint_guidance(checkpoint, &consumed) {
-            prompt.push_trusted_system(guidance);
+            prompt.push_runtime_context(guidance);
         }
         for item in crate::turn_inbox::checkpoint_context_items(checkpoint, &consumed) {
             prompt.push_context_item(&item);

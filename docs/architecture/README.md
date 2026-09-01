@@ -2,6 +2,12 @@
 
 ## 运行时
 
+Provider 请求缓存与成本治理的下一版本实施权威：
+[`provider-prompt-cache-hardening-v0.9.714.md`](provider-prompt-cache-hardening-v0.9.714.md)。
+该方案以真实 Provider 计费口径定义全程 `>=90%` 门禁，并覆盖稳定前缀、工具 schema
+纪元、多 Agent cache cohort/冷启动单飞、完整高价值上下文优先、append-only journal、
+自适应无损降级、压缩和失败恢复；稳态可比负载另设 `>=99%` 结构复用门而不伪报冷启动。
+
 ```text
 Surface（TUI / WebUI / Connector）
   -> Gateway（鉴权、API、SSE、审批投影、容量）

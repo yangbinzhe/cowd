@@ -508,9 +508,14 @@ pub fn compile_graph_mutation(
                         to: consumer.clone(),
                         kind: edge_kind,
                     });
-                    if edge_kind == ExecutionEdgeKind::CrossTeamHandoff
-                        && !semantic.required_evidence_refs.is_empty()
-                    {
+                    // CrossTeamHandoff is the durable organizational/dataflow
+                    // identity, not a scheduler edge. Every executable Team
+                    // dependency therefore needs a companion physical
+                    // readiness barrier. Without it the consumer can start
+                    // while its Program delivery is still AwaitingProducer,
+                    // then fail permanently trying to commit a receipt from a
+                    // producer with no terminal result.
+                    if edge_kind == ExecutionEdgeKind::CrossTeamHandoff {
                         edges.push(ExecutionEdge {
                             from: provider.clone(),
                             to: consumer.clone(),

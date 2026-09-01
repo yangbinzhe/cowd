@@ -284,7 +284,9 @@ mod tests {
             let events = store
                 .list_scope(RuntimeEventScope::Skill, 10)
                 .expect("events");
-            if !events.is_empty() || Instant::now() >= deadline {
+            if (!events.is_empty() && recorder.health().persisted >= 2)
+                || Instant::now() >= deadline
+            {
                 break events;
             }
             std::thread::sleep(Duration::from_millis(10));

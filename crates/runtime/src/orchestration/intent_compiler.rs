@@ -32,7 +32,7 @@ use crate::{
 
 use super::{GraphMutationProposal, GraphSemanticNode, RuntimeOrchestrationCommand};
 
-pub const INTENT_COMPILER_REVISION: &str = "collaboration-intent/v3";
+pub const INTENT_COMPILER_REVISION: &str = "collaboration-intent/v5";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,6 +174,7 @@ pub fn compile_turn_scoped_intent(
         .into());
     }
     let cross_workstream_dataflow = validate_cross_workstream_artifact_dataflow(decision)?;
+    let normalized_teams = normalize_cross_workstream_role_dependencies(decision)?;
     let lineage = request.lineage.as_ref().ok_or_else(|| {
         IntentCompilerError::Diagnostic(CollaborationCompileDiagnostic::validation(
             "collaboration_turn_lineage_missing",
@@ -207,10 +208,13 @@ pub fn compile_turn_scoped_intent(
             .into());
         }
         validate_concrete_evidence_scopes(workstream_index, workstream, services)?;
+        let normalized_team = normalized_teams
+            .get(&workstream.workstream_id)
+            .unwrap_or(&workstream.team);
         let compiled_team = compile_team(
             workstream_index,
             &workstream.workstream_id,
-            &workstream.team,
+            normalized_team,
             cross_workstream_dataflow
                 .consumer_roles
                 .get(&workstream.workstream_id)
@@ -335,6 +339,117 @@ pub fn compile_turn_scoped_intent(
         template_proposal: serde_json::json!({ "teams": team_entries }),
         semantic_intent,
     })
+}
+
+/// Providers occasionally repeat an already-complete workstream dependency
+/// as a role dependency inside the consumer Team. That spelling is invalid as
+/// local Team topology, but rejecting it forces an otherwise deterministic
+/// repair through another paid model turn. Normalize only the mechanically
+/// provable subset: the target is local, the source belongs to exactly one
+/// declared predecessor (or names that predecessor directly), every artifact
+/// is produced upstream and consumed locally, and the edge is delivery-only.
+/// Review/dispute semantics are never inferred or erased here.
+fn normalize_cross_workstream_role_dependencies(
+    decision: &ModelCollaborationControlDecisionV2,
+) -> Result<
+    BTreeMap<String, harness_contract::orchestration::ModelTurnScopedTeamIntent>,
+    IntentCompilerError,
+> {
+    let workstreams = decision
+        .workstreams
+        .iter()
+        .map(|workstream| (workstream.workstream_id.as_str(), workstream))
+        .collect::<BTreeMap<_, _>>();
+    let mut normalized = BTreeMap::new();
+
+    for (workstream_index, workstream) in decision.workstreams.iter().enumerate() {
+        let local_roles = workstream
+            .team
+            .roles
+            .iter()
+            .map(|role| role.role_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut team = workstream.team.clone();
+        let mut retained = Vec::with_capacity(team.dependencies.len());
+
+        for (dependency_index, dependency) in team.dependencies.iter().enumerate() {
+            if local_roles.contains(dependency.from.as_str())
+                || !local_roles.contains(dependency.to.as_str())
+                || !matches!(
+                    dependency.kind,
+                    ModelCollaborationDependencyKind::EvidenceFeed
+                        | ModelCollaborationDependencyKind::Handoff
+                        | ModelCollaborationDependencyKind::Aggregate
+                )
+            {
+                retained.push(dependency.clone());
+                continue;
+            }
+
+            let artifacts = canonical_set(&dependency.artifacts);
+            let target_consumes_all = team
+                .roles
+                .iter()
+                .find(|role| role.role_id == dependency.to)
+                .is_some_and(|role| {
+                    artifacts
+                        .iter()
+                        .all(|artifact| role.input_artifacts.contains(artifact))
+                });
+            let matching_predecessors = canonical_set(&workstream.depends_on)
+                .into_iter()
+                .filter_map(|predecessor_id| {
+                    let predecessor = workstreams.get(predecessor_id.as_str())?;
+                    let source_matches = predecessor_id == dependency.from
+                        || predecessor
+                            .team
+                            .roles
+                            .iter()
+                            .any(|role| role.role_id == dependency.from);
+                    let mut outputs = canonical_set(&predecessor.output_artifacts)
+                        .into_iter()
+                        .chain(canonical_set(&predecessor.team.result.required_artifacts))
+                        .collect::<BTreeSet<_>>();
+                    outputs.extend(
+                        predecessor
+                            .team
+                            .roles
+                            .iter()
+                            .filter(|role| {
+                                predecessor_id == dependency.from || role.role_id == dependency.from
+                            })
+                            .flat_map(|role| canonical_set(&role.output_artifacts)),
+                    );
+                    (source_matches
+                        && !artifacts.is_empty()
+                        && artifacts.iter().all(|artifact| outputs.contains(artifact)))
+                    .then_some(predecessor_id)
+                })
+                .collect::<Vec<_>>();
+
+            if target_consumes_all && matching_predecessors.len() == 1 {
+                continue;
+            }
+
+            let mut diagnostic = CollaborationCompileDiagnostic::validation(
+                "cross_workstream_role_dependency_not_normalizable",
+                format!("workstreams[{workstream_index}].team.dependencies[{dependency_index}]"),
+            );
+            diagnostic.semantic_ids = vec![
+                workstream.workstream_id.clone(),
+                dependency.from.clone(),
+                dependency.to.clone(),
+            ];
+            diagnostic.allowed_repairs = vec![
+                "remove_the_cross_team_role_edge_and_keep_workstream_depends_on".to_string(),
+                "bind_artifacts_to_exactly_one_declared_predecessor".to_string(),
+            ];
+            return Err(diagnostic.into());
+        }
+        team.dependencies = retained;
+        normalized.insert(workstream.workstream_id.clone(), team);
+    }
+    Ok(normalized)
 }
 
 /// Validate and classify artifact flow that crosses Team boundaries before a
@@ -670,6 +785,13 @@ fn compile_team(
             role,
             (terminal_role.as_deref() == Some(canonical_id)).then_some(result_fields.as_slice()),
         );
+        let mut resolved_output_artifacts = canonical_set(&role.output_artifacts);
+        let terminal_result_artifacts_derived = terminal_role.as_deref() == Some(canonical_id);
+        if terminal_result_artifacts_derived {
+            resolved_output_artifacts.extend(result_fields.iter().cloned());
+            resolved_output_artifacts.sort();
+            resolved_output_artifacts.dedup();
+        }
         roles.push(ProposedRole {
             role_id: canonical_id.clone(),
             display_name: Some(
@@ -689,7 +811,13 @@ fn compile_team(
             max_count: Some(u32::from(role.cardinality.max)),
             acceptance,
             input_artifacts: canonical_set(&role.input_artifacts),
-            output_artifacts: canonical_set(&role.output_artifacts),
+            // The Team result is the authoritative terminal contract. Once
+            // topology identifies a unique terminal role, Runtime lowers the
+            // result artifacts into that role instead of requiring the model
+            // to repeat the same declaration in two schema locations. This
+            // is a structural derivation only: it grants no capability,
+            // permission, tool, or evidence scope.
+            output_artifacts: resolved_output_artifacts.clone(),
             // Agent Definitions expose their complete immutable executable
             // allowlist. That profile-level inventory is not a model request
             // for every role to invoke tools. An upstream-only consumer has
@@ -715,6 +843,8 @@ fn compile_team(
             "required_capabilities": canonical_set(&role.required_capabilities),
             "required_skills": canonical_set(&role.required_skills),
             "required_tools": canonical_set(&role.required_tools),
+            "resolved_output_artifacts": resolved_output_artifacts.clone(),
+            "terminal_result_artifacts_derived": terminal_result_artifacts_derived,
         }));
         semantic_roles.push(CollaborationSemanticRoleSnapshot {
             role_id: canonical_id.clone(),
@@ -730,7 +860,7 @@ fn compile_team(
             cardinality_max: role.cardinality.max,
             acceptance_kinds: canonical_acceptance_kinds(&role.acceptance),
             input_artifacts: canonical_set(&role.input_artifacts),
-            output_artifacts: canonical_set(&role.output_artifacts),
+            output_artifacts: resolved_output_artifacts,
         });
         let _ = index;
     }
@@ -1175,36 +1305,26 @@ fn terminal_role_id(
         .into());
     }
     let required = result_fields.to_vec();
-    let candidates = team
+    let terminal_roles = team
         .roles
         .iter()
         .filter_map(|role| {
             let canonical_id = canonical_ids.get(&role.role_id)?;
-            (outgoing.get(canonical_id).copied().unwrap_or_default() == 0
-                && required
-                    .iter()
-                    .all(|artifact| role.output_artifacts.contains(artifact)))
-            .then(|| canonical_id.clone())
+            (outgoing.get(canonical_id).copied().unwrap_or_default() == 0)
+                .then(|| (role, canonical_id.clone()))
         })
         .collect::<Vec<_>>();
-    if candidates.is_empty() {
-        let terminal_roles = team
-            .roles
-            .iter()
-            .filter_map(|role| {
-                let canonical_id = canonical_ids.get(&role.role_id)?;
-                (outgoing.get(canonical_id).copied().unwrap_or_default() == 0)
-                    .then(|| role.role_id.clone())
-            })
-            .collect::<Vec<_>>();
-        let mut diagnostic = CollaborationCompileDiagnostic::validation(
-            "completion_terminal_role_missing",
-            format!("workstreams[{workstream_index}].team.roles[*].output_artifacts"),
-        );
-        diagnostic.semantic_ids = terminal_roles;
-        diagnostic.allowed_repairs =
-            vec!["assign_every_required_result_artifact_to_one_terminal_role".to_string()];
-        return Err(diagnostic.into());
+    let candidates = terminal_roles
+        .iter()
+        .filter_map(|(role, canonical_id)| {
+            required
+                .iter()
+                .all(|artifact| role.output_artifacts.contains(artifact))
+                .then(|| canonical_id.clone())
+        })
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return Ok(candidates.into_iter().next());
     }
     if candidates.len() > 1 {
         let mut diagnostic = CollaborationCompileDiagnostic::validation(
@@ -1216,7 +1336,24 @@ fn terminal_role_id(
             vec!["retain_exactly_one_terminal_role_for_required_result_artifacts".to_string()];
         return Err(diagnostic.into());
     }
-    Ok(candidates.into_iter().next())
+    // A unique topology sink is an unambiguous carrier for the Team-level
+    // result contract. Derive its terminal artifacts during lowering. This
+    // avoids a costly model retry for a redundant role-level spelling while
+    // preserving fail-closed behavior whenever ownership is ambiguous.
+    if terminal_roles.len() == 1 {
+        return Ok(terminal_roles.into_iter().next().map(|(_, id)| id));
+    }
+    let mut diagnostic = CollaborationCompileDiagnostic::validation(
+        "completion_terminal_role_missing",
+        format!("workstreams[{workstream_index}].team.roles[*].output_artifacts"),
+    );
+    diagnostic.semantic_ids = terminal_roles
+        .into_iter()
+        .map(|(role, _)| role.role_id.clone())
+        .collect();
+    diagnostic.allowed_repairs =
+        vec!["assign_every_required_result_artifact_to_one_terminal_role".to_string()];
+    Err(diagnostic.into())
 }
 
 fn validate_cardinality(
@@ -1704,6 +1841,61 @@ mod tests {
     }
 
     #[test]
+    fn redundant_cross_workstream_role_handoff_is_normalized_without_a_model_retry() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut valid = decision();
+        append_cross_workstream_synthesizer(
+            &mut valid,
+            "summary",
+            vec!["runtime-audit".to_string()],
+        );
+        valid.workstreams[1]
+            .team
+            .dependencies
+            .push(ModelRoleDependency {
+                from: "arbitrary-synthesizer".to_string(),
+                to: "final-role".to_string(),
+                kind: ModelCollaborationDependencyKind::Handoff,
+                artifacts: vec!["summary".to_string()],
+            });
+
+        let compiled = compile_turn_scoped_intent(&request(), &valid, &services)
+            .expect("a provable duplicate cross-Team handoff should compile in one turn");
+        assert_eq!(compiled.proposal.nodes[1].depends_on, vec!["runtime-audit"]);
+        assert_eq!(
+            compiled.template_proposal["teams"][1]["template"]["dependencies"],
+            serde_json::json!([]),
+            "the workstream barrier owns the cross-Team edge; it must not leak into local Team topology"
+        );
+    }
+
+    #[test]
+    fn cross_workstream_review_edge_is_not_silently_erased() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut invalid = decision();
+        append_cross_workstream_synthesizer(
+            &mut invalid,
+            "summary",
+            vec!["runtime-audit".to_string()],
+        );
+        invalid.workstreams[1]
+            .team
+            .dependencies
+            .push(ModelRoleDependency {
+                from: "arbitrary-synthesizer".to_string(),
+                to: "final-role".to_string(),
+                kind: ModelCollaborationDependencyKind::ReviewOf,
+                artifacts: vec!["summary".to_string()],
+            });
+
+        let error = compile_turn_scoped_intent(&request(), &invalid, &services)
+            .expect_err("cross-Team review semantics require an explicit supported contract");
+        assert!(error.to_string().contains("dependency_source_unknown"));
+    }
+
+    #[test]
     fn workstream_evidence_scope_reacquires_on_terminal_upstream_consumer() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         install_source_fixture(&services);
@@ -2072,16 +2264,35 @@ mod tests {
             .result
             .required_artifacts
             .push("unresolved".to_string());
-        valid.workstreams[0].team.roles[1]
-            .output_artifacts
-            .push("unresolved".to_string());
-
         let compiled = compile_turn_scoped_intent(&request(), &valid, &services)
-            .expect("the terminal role declares every Team result artifact");
+            .expect("the unique terminal role inherits the Team result contract");
         let roles = &compiled.template_proposal["teams"][0]["template"]["roles"];
         assert!(roles[1]["acceptance"]
             .as_array()
             .is_some_and(|criteria| criteria.iter().any(|value| value == "artifact:unresolved")));
+        assert!(roles[1]["output_artifacts"]
+            .as_array()
+            .is_some_and(|artifacts| artifacts.iter().any(|value| value == "unresolved")));
+    }
+
+    #[test]
+    fn evidence_required_is_lowered_without_a_redundant_model_spelling() {
+        let services = RuntimeServices::in_memory().expect("runtime services");
+        install_source_fixture(&services);
+        let mut valid = decision();
+        valid.workstreams[0].team.roles[1]
+            .output_artifacts
+            .retain(|artifact| artifact != "evidence");
+
+        let compiled = compile_turn_scoped_intent(&request(), &valid, &services)
+            .expect("the unique terminal role inherits the structured evidence result");
+        let role = &compiled.template_proposal["teams"][0]["template"]["roles"][1];
+        assert!(role["output_artifacts"]
+            .as_array()
+            .is_some_and(|artifacts| artifacts.iter().any(|value| value == "evidence")));
+        assert!(role["acceptance"]
+            .as_array()
+            .is_some_and(|criteria| criteria.iter().any(|value| value == "artifact:evidence")));
     }
 
     #[test]

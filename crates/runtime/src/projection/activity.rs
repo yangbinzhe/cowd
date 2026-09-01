@@ -801,7 +801,7 @@ fn project_single_execution_activities_from_events(
             .filter_map(|reference| safe_public_ref(reference))
             .collect();
     }
-    materialize_artifact_activities(&mut activities, &root_scope);
+    materialize_artifact_activities(&mut activities);
 
     let mut relations = BTreeMap::<String, ExecutionActivityRelation>::new();
     for activity in activities.values() {
@@ -2122,10 +2122,7 @@ pub(super) fn events_for_root_execution_kind(
     events
 }
 
-fn materialize_artifact_activities(
-    activities: &mut BTreeMap<String, ExecutionActivityProjection>,
-    scope: &ExecutionScopeProjection,
-) {
+fn materialize_artifact_activities(activities: &mut BTreeMap<String, ExecutionActivityProjection>) {
     let producers = activities
         .values()
         .flat_map(|activity| {
@@ -2143,16 +2140,16 @@ fn materialize_artifact_activities(
             ExecutionActivityKind::Artifact
         };
         let activity_id = if kind == ExecutionActivityKind::Outcome {
-            outcome_activity_id(&scope.execution_id, &reference)
+            outcome_activity_id(&producer.scope.execution_id, &reference)
         } else {
-            artifact_activity_id(&scope.execution_id, &reference)
+            artifact_activity_id(&producer.scope.execution_id, &reference)
         };
         activities
             .entry(activity_id.clone())
             .or_insert_with(|| ExecutionActivityProjection {
                 schema_version: EXECUTION_ACTIVITY_SCHEMA_VERSION,
                 activity_id,
-                scope: scope.clone(),
+                scope: producer.scope.clone(),
                 kind,
                 node_id: producer.node_id.clone(),
                 display_label: Some(if kind == ExecutionActivityKind::Outcome {
@@ -3409,7 +3406,13 @@ mod tests {
                 },
             );
         }
-        materialize_artifact_activities(&mut activities, &scope);
+        let mut descendant = activities[&execution_activity_id("execution")].clone();
+        descendant.activity_id = execution_activity_id("child-execution");
+        descendant.scope.execution_id = "child-execution".to_string();
+        descendant.artifact_refs = vec!["result:child".to_string()];
+        activities.insert(descendant.activity_id.clone(), descendant);
+
+        materialize_artifact_activities(&mut activities);
         assert_eq!(
             activities[&outcome_activity_id("execution", "result:terminal")].kind,
             ExecutionActivityKind::Outcome
@@ -3418,6 +3421,8 @@ mod tests {
             activities[&artifact_activity_id("execution", "artifact:source")].kind,
             ExecutionActivityKind::Artifact
         );
+        assert!(activities.contains_key(&outcome_activity_id("child-execution", "result:child")));
+        assert!(!activities.contains_key(&outcome_activity_id("execution", "result:child")));
 
         let mut relations = BTreeMap::new();
         insert_committed_predecessor_consumed_relations(

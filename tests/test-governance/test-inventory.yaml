@@ -1,7 +1,7 @@
 version: 2
-release_version: 0.9.713
-release_authority: docs/architecture/autonomous-collaboration-convergence-v0.9.713.md
-release_evidence: docs/evidence/autonomous-collaboration-convergence-v0.9.713.md
+release_version: 0.9.714
+release_authority: docs/architecture/provider-prompt-cache-hardening-v0.9.714.md
+release_evidence: docs/evidence/provider-prompt-cache-hardening-v0.9.714.md
 source_of_truth:
   execution: scripts/validate.sh
   inventory: scripts/test/inventory.sh

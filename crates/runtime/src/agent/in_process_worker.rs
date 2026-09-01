@@ -56,29 +56,11 @@ struct ActiveInProcessRun {
     cancellation: crate::CancellationToken,
     session_id: String,
     input_stream: crate::SessionInputStream,
-    completion: Arc<tokio::sync::Notify>,
-    completed: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct ActiveRunCleanup<'a> {
     worker: &'a InProcessAgentWorker,
     run_id: String,
-    completion: Arc<tokio::sync::Notify>,
-    completed: Arc<std::sync::atomic::AtomicBool>,
-}
-
-struct PendingCancellationOwner<'a> {
-    pending: &'a Mutex<BTreeSet<String>>,
-    run_id: String,
-}
-
-impl Drop for PendingCancellationOwner<'_> {
-    fn drop(&mut self) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.run_id);
-    }
 }
 
 impl Drop for ActiveRunCleanup<'_> {
@@ -97,8 +79,6 @@ impl Drop for ActiveRunCleanup<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.run_id);
-        self.completed.store(true, Ordering::SeqCst);
-        self.completion.notify_waiters();
     }
 }
 
@@ -561,8 +541,49 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             ),
             _ => Vec::new(),
         };
+        let program_dossier_fragment = crate::TaskRuntimePort::new(services.as_ref())
+            .get(&packet.assignment.root_task_id)
+            .ok()
+            .flatten()
+            .map(|root| {
+                let immutable = serde_json::json!({
+                    "schema_version": 1,
+                    "root_task_id": root.root_task_id,
+                    "mission_id": root.mission_id,
+                    "objective": root.objective,
+                    "phases": root.phases.into_iter().map(|phase| serde_json::json!({
+                        "phase_id": phase.phase_id,
+                        "name": phase.name,
+                        "objective": phase.objective,
+                        "dependency_refs": phase.dependency_refs,
+                        "plan": phase.plan,
+                        "acceptance": phase.acceptance,
+                        "test_commands": phase.test_commands,
+                    })).collect::<Vec<_>>(),
+                });
+                format!(
+                    "# Program dossier (Runtime-attested, immutable for this execution epoch)\nThis shared objective and acceptance context applies to every Team and Agent in the program. Role-specific objectives below refine it but cannot erase it.\n\n{}",
+                    serde_json::to_string(&immutable).unwrap_or_else(|_| "{}".to_string())
+                )
+            });
         let mut prompt_segments = system_prompt(&packet, services.workspace_root(), &tool_names);
-        prompt_segments.extend(team_markdown_fragment);
+        let cohort_boundary = prompt_segments
+            .iter()
+            .position(|segment| segment == crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY)
+            .unwrap_or(prompt_segments.len());
+        // Program truth is shared across every sibling and therefore belongs
+        // before the cache-cohort boundary. TEAM.md and the Agent assignment
+        // are immutable for this host but may differ between siblings, so
+        // they remain after that boundary and before request-local context.
+        prompt_segments.splice(cohort_boundary..cohort_boundary, program_dossier_fragment);
+        let execution_stable_start = prompt_segments
+            .iter()
+            .position(|segment| segment == crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY)
+            .map_or(prompt_segments.len(), |index| index.saturating_add(1));
+        prompt_segments.splice(
+            execution_stable_start..execution_stable_start,
+            team_markdown_fragment,
+        );
         if let Some(receipt_prompt) = recovered_tool_receipt_prompt {
             prompt_segments.push(receipt_prompt);
         }
@@ -582,7 +603,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             model_context_window: None,
             hook_progress_reporter: None,
             external_context_items,
-            skill_profiles: skill_catalog.profiles(),
+            // A delegated leaf may activate only Skills explicitly frozen in
+            // its Binding. Avoid exposing the global catalog when the role
+            // requested none: empty authority must not mean discovery-all.
+            skill_profiles: if binding.skill_refs.is_empty() {
+                Vec::new()
+            } else {
+                skill_catalog.profiles()
+            },
             agent_skill_profile: harness_contract::skill::AgentSkillProfile {
                 baseline_skill_refs: Vec::new(),
                 template_skill_refs: Vec::new(),
@@ -592,8 +620,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 hidden_skill_refs: Vec::new(),
                 adapter_ceiling: Vec::new(),
             },
-            skill_prompt_assets: skill_catalog.prompt_assets(),
-            skill_instruction_source: skill_catalog.instruction_source(),
+            skill_prompt_assets: if binding.skill_refs.is_empty() {
+                Vec::new()
+            } else {
+                skill_catalog.prompt_assets()
+            },
+            skill_instruction_source: (!binding.skill_refs.is_empty())
+                .then(|| skill_catalog.instruction_source())
+                .flatten(),
             memory_agent_id: binding.instance.instance_id.clone(),
             memory_definition_lineage_id: Some(
                 binding.definition_ref.definition_id.as_str().to_string(),
@@ -642,8 +676,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // only the parent Turn may publish conversation messages. The child
         // result returns through AgentReturnPacket and the Team reducer.
         let input_stream = runtime.session_input_stream();
-        let completion = Arc::new(tokio::sync::Notify::new());
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.active_runs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -653,15 +685,11 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     cancellation: cancellation.clone(),
                     session_id: child_session_id,
                     input_stream,
-                    completion: Arc::clone(&completion),
-                    completed: Arc::clone(&completed),
                 },
             );
         let active_run_cleanup = ActiveRunCleanup {
             worker: self,
             run_id: packet.run_id().to_string(),
-            completion: Arc::clone(&completion),
-            completed: Arc::clone(&completed),
         };
         if self
             .pending_cancellations
@@ -1113,94 +1141,40 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             harness_contract::agent::AgentCommand::Interrupt
             | harness_contract::agent::AgentCommand::Cancel
             | harness_contract::agent::AgentCommand::Shutdown => {
-                self.pending_cancellations
+                let active_token = self
+                    .active_runs
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(handle.run_id.clone());
-                let _pending_owner = PendingCancellationOwner {
-                    pending: &self.pending_cancellations,
-                    run_id: handle.run_id.clone(),
-                };
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                loop {
-                    let active = self
-                        .active_runs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(&handle.run_id)
-                        .map(|active| {
-                            (
-                                active.cancellation.clone(),
-                                Arc::clone(&active.completion),
-                                Arc::clone(&active.completed),
-                            )
-                        });
-                    if let Some((token, completion, completed)) = active {
-                        token.cancel();
-                        tokio::time::timeout_at(deadline, async {
-                            loop {
-                                let notified = completion.notified();
-                                if completed.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                                notified.await;
-                            }
-                        })
-                        .await
-                        .map_err(|_| {
-                            harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend
-                        })?;
-                        if self
-                            .active_runs
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .contains_key(&handle.run_id)
-                        {
-                            return Err(
-                                harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend,
-                            );
-                        }
+                    .get(&handle.run_id)
+                    .map(|active| {
+                        // Register the durable-in-worker intent while the
+                        // active handle is still protected. Cleanup acquires
+                        // the locks in the same order, so it cannot remove the
+                        // handle and then leave a late tombstone behind.
                         self.pending_cancellations
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&handle.run_id);
-                        break;
-                    }
-                    if self.run_completed(&handle.run_id) {
-                        self.pending_cancellations
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&handle.run_id);
-                        break;
-                    }
-                    let pending = self
-                        .pending_cancellations
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .contains(&handle.run_id);
-                    if !pending
-                        && !self
-                            .active_runs
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .contains_key(&handle.run_id)
-                    {
-                        // The worker consumed the pending cancellation and
-                        // removed its active handle after cleanup.
-                        break;
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        self.pending_cancellations
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&handle.run_id);
-                        return Err(
-                            harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend,
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            .insert(handle.run_id.clone());
+                        active.cancellation.clone()
+                    });
+                if let Some(token) = active_token {
+                    // Command acceptance means the cancellation intent reached
+                    // the canonical run owner. Provider/tool unwind and map
+                    // cleanup are asynchronous lifecycle facts; waiting for
+                    // them here made a slow but valid cancel look like an
+                    // unsupported backend and broke Session cascade.
+                    token.cancel();
+                    Ok(())
+                } else if self.run_completed(&handle.run_id) {
+                    // A terminal command is idempotent across the narrow
+                    // cleanup-to-Runtime-commit window.
+                    Ok(())
+                } else {
+                    // A restored Running projection without an active owner
+                    // is not a recoverable backend handle. Never acknowledge
+                    // a cancellation that no execution can observe.
+                    Err(harness_contract::agent::AgentCommandRejectReason::UnsupportedByBackend)
                 }
-                Ok(())
             }
             harness_contract::agent::AgentCommand::SendInput => {
                 let input = request
@@ -3430,6 +3404,18 @@ fn system_prompt(
         "You are a delegated Cowd agent. Return an evidence-backed result for the assigned objective.".into(),
         "You are a leaf role inside an already-running protocol. Do not create a nested team or session; return findings and evidence to the protocol reducer.".into(),
         "Use only native tool calls exposed by this runtime. Never write simulated tool syntax such as <tool_call>, <function=...>, <parameter=...>, or JSON-shaped pseudo-calls in final text. If no native tool is authorized, answer directly from the supplied objective and upstream evidence.".into(),
+        crate::prompt::stable_runtime_context_protocol(),
+    ];
+    if tool_names
+        .iter()
+        .any(|tool| tool == "collaboration_control")
+    {
+        prompt.push(
+            "# Stable autonomous-collaboration protocol\nYou are an active collaborator, not a passive one-shot role. Runtime-attested marketplace, Team-board, proposal, bid, claim, heartbeat, submission, independent review, challenge and acceptance events are business facts; prose can never simulate or replace them. Inspect the compact marketplace and follow its exact mutation templates and next_actions_for_caller. Create bounded proposals only when an eligible peer can finish them. Agent-proposed work follows inspect -> bid -> claim -> heartbeat when needed -> execute -> team_board read_after -> publish -> submit the returned durable reference -> independent review. A concrete evidence-backed defect may challenge submitted work; epistemic counterarguments belong on the Team board and need a thread-linked response when conclusions change. Challenged work must be reclaimed, revised, resubmitted and independently accepted. Unaccepted required work blocks verification, synthesis and materialization. At safe checkpoints read durable Team state and react to peer questions, conflicts and accepted artifacts. Runtime owns identity, permission, leases and terminal truth; never invent them.".to_string(),
+        );
+    }
+    prompt.push(crate::SYSTEM_PROMPT_CACHE_COHORT_BOUNDARY.to_string());
+    prompt.extend([
         format!("Objective: {}", packet.objective),
         format!("Workspace root: {}", workspace_root.display()),
         format!(
@@ -3440,7 +3426,7 @@ fn system_prompt(
                 packet.resource_scopes.join(", ")
             }
         ),
-    ];
+    ]);
     if let Some(binding) = &packet.binding {
         prompt.push(format!(
             "Agent Definition: {}@{} (binding {}).",
@@ -3506,15 +3492,6 @@ fn system_prompt(
         ));
     }
     if !tool_names.is_empty() {
-        if tool_names
-            .iter()
-            .any(|tool| tool == "collaboration_control")
-        {
-            prompt.push(
-                "You are an active collaborator, not a passive one-shot role. Inspect the Runtime-owned work marketplace when the objective calls for autonomous collaboration. When the Team instructions require proposals, bids, peer review, or challenges, those are mandatory Runtime actions: a terminal prose claim cannot substitute for them. Use collaboration_control(propose_work) to create bounded in-scope follow-up work, and collaboration_control(bid) to volunteer for another Agent's proposal before claiming it. The compact inspect response begins with exact mutation templates and per-item next_actions_for_caller; act on them instead of requesting the full operator graph. Every proposal is required work: create it only when another active eligible peer can finish it. For Agent-proposed work follow the exact durable cycle: inspect -> bid -> claim; retain the owner-only claim_token; heartbeat before a long tool action or lease expiry; execute; call team_board(read_after, after_revision: 0) before publishing, then publish with expected_revision equal to the returned latest revision plus kind and summary (do not use a workspace path); submit the exact `team-board:<entry_id>` returned by that publish or a tool evidence reference; then a different peer reviews it. Accept a correct submission. Use collaboration_control(challenge) only for a concrete evidence-backed defect that really requires the claimant to revise; never manufacture a negative verdict to satisfy a count. Epistemic counterarguments, limitations, and red-team critiques that do not reject a submitted WorkItem belong in team_board as kind=challenge and should be followed by a thread-linked response or resolution when the conclusion changes. After a WorkItem challenge, an eligible bidder must reclaim, revise, resubmit, and obtain an independent acceptance. Required Agent-proposed work that is not Accepted prevents Verify/Synthesize/Materialize from starting. Proposer, bidder, claimant and reviewer identities are Runtime-attested; never simulate them in prose. Keep proposal objectives inside this Team charter and never use proposal text to request broader permissions. At safe checkpoints, read the durable Team board and react to peer questions, challenges and accepted artifacts before terminal synthesis."
-                    .to_string(),
-            );
-        }
         if required_write_scopes.is_empty() {
             prompt.push(format!(
                 "Authorized tool contracts are available natively: {}. When the objective asks for source, workspace, file, or current-state evidence, use an authorized read-only tool and cite the resulting paths/receipts; do not substitute prior model knowledge.",
@@ -3528,6 +3505,12 @@ fn system_prompt(
             ));
         }
     }
+    // Every section above is derived from the immutable AgentTaskPacket,
+    // Binding, resource lease and host inventory. Request-local clocks,
+    // working-state deltas, memory and evidence capsules are appended after
+    // this boundary by PromptAssembly and are never duplicated into the
+    // stable Agent assignment.
+    prompt.push(crate::SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
     prompt
 }
 

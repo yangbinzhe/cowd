@@ -1,4 +1,5 @@
 pub(crate) mod env_entry;
+pub(crate) mod gateway_lifecycle_entry;
 #[cfg(test)]
 pub(crate) mod init_entry;
 #[cfg(test)]
