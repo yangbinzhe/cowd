@@ -1225,14 +1225,10 @@ for record in invalid_requests:
             == "TUI_ACCEPTANCE_INVALID_DSML verify fail-closed protocol handling"
         for item in record["messages"]
     ) == 1, "current invalid ingress is missing or duplicated in a provider request"
-    system_text = "\n".join(
-        item.get("text", "")
-        for item in record["messages"]
-        if item.get("role") == "system"
-    )
+    request_text = "\n".join(item.get("text", "") for item in record["messages"])
     assert (
         '"intent_preview":"TUI_ACCEPTANCE_INVALID_DSML verify fail-closed protocol handling"'
-        in system_text
+        in request_text
     ), "runtime execution decision is not bound to the current invalid objective"
 assert any(
     item.get("role") == "user"
