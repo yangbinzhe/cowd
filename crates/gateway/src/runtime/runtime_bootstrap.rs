@@ -412,7 +412,7 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
                     "expected_revision": { "type": "integer", "minimum": 0, "description": "Required for publish: the latest revision returned by read_after/read_exact; use 0 only when the board is empty." },
                     "kind": {
                         "type": "string",
-                        "enum": ["finding", "evidence", "decision", "conflict", "unresolved", "blocker", "user_intervention", "artifact", "proposal", "question", "response", "resolution"]
+                        "enum": ["finding", "evidence", "decision", "conflict", "unresolved", "blocker", "user_intervention", "artifact", "proposal", "question", "challenge", "response", "resolution"]
                     },
                     "summary": { "type": "string" },
                     "refs": { "type": "array", "items": { "type": "string" } },

@@ -1919,11 +1919,75 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         })
         .await
         .expect("peer response");
+    let unthreaded_challenge = services
+        .team_runtime()
+        .publish_working_state(crate::TeamWorkingStatePublishRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[0].clone(),
+            expected_revision: 4,
+            kind: crate::TeamWorkingStateKind::Challenge,
+            summary: "This critique has no response contract.".to_string(),
+            refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            visibility: crate::TeamWorkingStateVisibility::Team,
+            thread: None,
+        })
+        .await
+        .expect_err("epistemic challenge must be response-required");
+    assert!(unthreaded_challenge.contains("response-required thread"));
+    let challenge = services
+        .team_runtime()
+        .publish_working_state(crate::TeamWorkingStatePublishRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[0].clone(),
+            expected_revision: 4,
+            kind: crate::TeamWorkingStateKind::Challenge,
+            summary: "The conclusion needs a bounded counterexample caveat.".to_string(),
+            refs: vec!["evidence:test:v621".to_string()],
+            artifact_refs: Vec::new(),
+            visibility: crate::TeamWorkingStateVisibility::Team,
+            thread: Some(crate::TeamWorkingStateThread {
+                thread_id: "conclusion-challenge".to_string(),
+                reply_to_entry_id: None,
+                response_required: true,
+                resolves_entry_ids: Vec::new(),
+            }),
+        })
+        .await
+        .expect("publish epistemic challenge");
+    let challenge_id = challenge
+        .entries
+        .iter()
+        .find(|entry| entry.kind == crate::TeamWorkingStateKind::Challenge)
+        .expect("challenge entry")
+        .entry_id
+        .clone();
+    services
+        .team_runtime()
+        .publish_working_state(crate::TeamWorkingStatePublishRequest {
+            graph_id: registered.id.clone(),
+            node_id: agent_nodes[1].clone(),
+            expected_revision: 5,
+            kind: crate::TeamWorkingStateKind::Resolution,
+            summary: "The conclusion now states the counterexample boundary explicitly."
+                .to_string(),
+            refs: vec!["evidence:test:v621".to_string()],
+            artifact_refs: Vec::new(),
+            visibility: crate::TeamWorkingStateVisibility::Team,
+            thread: Some(crate::TeamWorkingStateThread {
+                thread_id: "conclusion-challenge".to_string(),
+                reply_to_entry_id: Some(challenge_id.clone()),
+                response_required: false,
+                resolves_entry_ids: vec![challenge_id],
+            }),
+        })
+        .await
+        .expect("resolve epistemic challenge with a revised conclusion");
     let unread = services
         .team_runtime()
         .read_working_state_from_cursor(registered.id.clone(), agent_nodes[1].clone())
         .expect("offline peer replays committed inbox");
-    assert_eq!(unread.entries.len(), 4);
+    assert_eq!(unread.entries.len(), 6);
     let cursor = services
         .team_runtime()
         .acknowledge_working_state(crate::TeamWorkingStateAcknowledgeRequest {
@@ -1933,7 +1997,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
             expected_cursor_revision: 0,
         })
         .expect("advance durable peer cursor");
-    assert_eq!(cursor.through_revision, 4);
+    assert_eq!(cursor.through_revision, 6);
     assert!(services
         .team_runtime()
         .read_working_state_from_cursor(registered.id.clone(), agent_nodes[1].clone())
@@ -1946,7 +2010,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .publish_working_state(crate::TeamWorkingStatePublishRequest {
             graph_id: registered.id,
             node_id: agent_nodes[0].clone(),
-            expected_revision: 4,
+            expected_revision: 6,
             kind: crate::TeamWorkingStateKind::Finding,
             summary: "raw chain-of-thought must remain private".to_string(),
             refs: Vec::new(),

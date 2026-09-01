@@ -27,6 +27,7 @@ pub enum TeamWorkingStateKind {
     Artifact,
     Proposal,
     Question,
+    Challenge,
     Response,
     Resolution,
 }
@@ -409,6 +410,27 @@ impl TeamWorkingState {
                 return Err(format!(
                     "Team role slot `{}` lacks a materialized {:?} working-state entry",
                     node.id, status
+                ));
+            }
+        }
+        for challenge in self
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == TeamWorkingStateKind::Challenge)
+        {
+            let resolved = self.entries.iter().any(|entry| {
+                entry.kind == TeamWorkingStateKind::Resolution
+                    && entry.thread.as_ref().is_some_and(|thread| {
+                        thread
+                            .resolves_entry_ids
+                            .iter()
+                            .any(|entry_id| entry_id == &challenge.entry_id)
+                    })
+            });
+            if !resolved {
+                return Err(format!(
+                    "Team epistemic challenge `{}` has no thread-linked resolution",
+                    challenge.entry_id
                 ));
             }
         }

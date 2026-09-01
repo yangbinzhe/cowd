@@ -100,6 +100,12 @@ fn autonomous_projection(reread_verified: bool) -> Value {
         "activities": [{
             "activity_id": "activity:discussion:challenge-a",
             "kind": "discussion",
+            "display_label": "discussion · challenge",
+            "status": "completed"
+        }, {
+            "activity_id": "activity:discussion:resolution-a",
+            "kind": "discussion",
+            "display_label": "discussion · resolution",
             "status": "completed"
         }],
         "graph": {
@@ -175,10 +181,11 @@ fn autonomy_metrics_deduplicate_runtime_facts_and_fail_closed_on_reread() {
     assert_eq!(metrics.distinct_claimants, 1);
     assert_eq!(metrics.review_count, 2);
     assert_eq!(metrics.distinct_reviewers, 2);
-    assert_eq!(metrics.challenge_findings, 1);
+    assert_eq!(metrics.challenge_findings, 2);
+    assert_eq!(metrics.challenge_resolutions, 1);
     assert_eq!(metrics.challenged_work_items, 1);
     assert_eq!(metrics.unresolved_challenged_work_items, 0);
-    assert_eq!(metrics.discussions, 1);
+    assert_eq!(metrics.discussions, 2);
     assert_eq!(metrics.output_artifact_kinds, 4);
     assert_eq!(metrics.output_materializations, 1);
 

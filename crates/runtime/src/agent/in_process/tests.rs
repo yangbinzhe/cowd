@@ -2705,6 +2705,21 @@ fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
 }
 
 #[test]
+fn autonomous_checkpoint_never_repeats_after_non_satisfied_terminal() {
+    use harness_contract::goal::GoalCompletion;
+
+    assert!(autonomy_continuation_may_advance(GoalCompletion::Satisfied));
+    for completion in [
+        GoalCompletion::Open,
+        GoalCompletion::Partial,
+        GoalCompletion::WaitingExternalDecision,
+        GoalCompletion::Cancelled,
+    ] {
+        assert!(!autonomy_continuation_may_advance(completion));
+    }
+}
+
+#[test]
 fn runtime_default_autonomous_proposal_is_identity_stable_and_parallel_safe() {
     use harness_contract::execution_graph::{
         ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec, ExecutionWorkRole,

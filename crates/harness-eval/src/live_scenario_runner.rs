@@ -159,7 +159,10 @@ fn autonomous_deepseek_spec() -> Result<LiveScenarioSpec, String> {
             minimum_agents: scale,
             minimum_work_items,
             minimum_proposals,
-            minimum_bids: minimum_claims,
+            // Only Agent-proposed market work requires a bid. Assigned Team
+            // nodes are claimed by the scheduler and legitimately contribute
+            // to the broader claim count without a marketplace bid.
+            minimum_bids: minimum_proposals,
             minimum_claims,
             minimum_reviews: minimum_proposals,
             minimum_challenges,
@@ -1908,6 +1911,7 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
         "work_review_count": autonomy.review_count,
         "distinct_reviewer_count": autonomy.distinct_reviewers,
         "challenge_finding_count": autonomy.challenge_findings,
+        "challenge_resolution_count": autonomy.challenge_resolutions,
         "challenged_work_item_count": autonomy.challenged_work_items,
         "unresolved_challenged_work_item_count": autonomy.unresolved_challenged_work_items,
         "discussion_count": autonomy.discussions,
@@ -2434,7 +2438,7 @@ impl LiveAcceptance {
                     && autonomy.claimed_work_items >= minimum_claims
                     && autonomy.distinct_claimants >= minimum_agents / 2;
                 let review_satisfied = autonomy.challenge_findings >= minimum_challenges
-                    && autonomy.challenged_work_items >= minimum_challenges
+                    && autonomy.challenge_resolutions > 0
                     && autonomy.review_count >= minimum_reviews
                     && autonomy.distinct_reviewers >= minimum_agents / 4
                     && autonomy.unresolved_challenged_work_items == 0;
@@ -2460,7 +2464,7 @@ impl LiveAcceptance {
                         json!({"name": "completed_autonomous_teams", "required": minimum_teams, "observed": team_health.team_count, "completed": team_health.completed_teams, "failed": team_health.failed_teams, "passed": teams_satisfied}),
                         json!({"name": "completed_autonomous_agents", "required": minimum_agents, "observed": team_health.agent_count, "completed": team_health.completed_agents, "failed": team_health.failed_agents, "passed": agents_satisfied}),
                         json!({"name": "runtime_work_market", "required_work_items": minimum_work_items, "observed_work_items": autonomy.work_items, "accepted_work_items": autonomy.accepted_work_items, "required_proposals": minimum_proposals, "observed_proposals": autonomy.proposed_work_items, "distinct_proposers": autonomy.distinct_proposers, "required_bids": minimum_bids, "observed_bids": autonomy.bid_count, "distinct_bidders": autonomy.distinct_bidders, "required_claims": minimum_claims, "observed_claims": autonomy.claimed_work_items, "autonomous_claimed_work_items": autonomy.autonomous_claimed_work_items, "distinct_claimants": autonomy.distinct_claimants, "passed": work_satisfied}),
-                        json!({"name": "durable_independent_review_cycle", "required_reviews": minimum_reviews, "observed_reviews": autonomy.review_count, "distinct_reviewers": autonomy.distinct_reviewers, "required_challenges": minimum_challenges, "challenge_findings": autonomy.challenge_findings, "challenged_work_items": autonomy.challenged_work_items, "unresolved_challenged_work_items": autonomy.unresolved_challenged_work_items, "passed": review_satisfied}),
+                        json!({"name": "durable_independent_review_cycle", "required_reviews": minimum_reviews, "observed_reviews": autonomy.review_count, "distinct_reviewers": autonomy.distinct_reviewers, "required_challenges": minimum_challenges, "challenge_findings": autonomy.challenge_findings, "challenge_resolutions": autonomy.challenge_resolutions, "challenged_work_items": autonomy.challenged_work_items, "unresolved_challenged_work_items": autonomy.unresolved_challenged_work_items, "passed": review_satisfied}),
                         json!({"name": "bounded_team_discussions", "required": minimum_discussions, "observed": autonomy.discussions, "passed": discussions_satisfied}),
                         json!({"name": "typed_output_artifacts", "required": 4, "observed": autonomy.output_artifact_kinds, "passed": artifacts_satisfied}),
                         json!({"name": "claimed_cross_team_edges", "required": minimum_cross_team_edges, "observed": cross_team_edges, "passed": edges_satisfied}),
@@ -3058,6 +3062,7 @@ struct AutonomyMetrics {
     review_count: usize,
     distinct_reviewers: usize,
     challenge_findings: usize,
+    challenge_resolutions: usize,
     challenged_work_items: usize,
     unresolved_challenged_work_items: usize,
     discussions: usize,
@@ -3078,6 +3083,7 @@ fn autonomy_metrics(projections: &[Value], output_path: &str) -> AutonomyMetrics
     let mut reviews = BTreeSet::new();
     let mut reviewers = BTreeSet::new();
     let mut challenge_findings = BTreeSet::new();
+    let mut challenge_resolutions = BTreeSet::new();
     let mut challenged_work_items = BTreeSet::new();
     let mut unresolved_challenged_work_items = BTreeSet::new();
     let mut discussions = BTreeSet::new();
@@ -3244,6 +3250,15 @@ fn autonomy_metrics(projections: &[Value], output_path: &str) -> AutonomyMetrics
             if activity.get("kind").and_then(Value::as_str) == Some("discussion") {
                 if let Some(activity_id) = activity.get("activity_id").and_then(Value::as_str) {
                     discussions.insert(activity_id.to_string());
+                    match activity.get("display_label").and_then(Value::as_str) {
+                        Some("discussion · challenge") => {
+                            challenge_findings.insert(format!("discussion:{activity_id}"));
+                        }
+                        Some("discussion · resolution") => {
+                            challenge_resolutions.insert(activity_id.to_string());
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -3291,6 +3306,7 @@ fn autonomy_metrics(projections: &[Value], output_path: &str) -> AutonomyMetrics
         review_count: reviews.len(),
         distinct_reviewers: reviewers.len(),
         challenge_findings: challenge_findings.len(),
+        challenge_resolutions: challenge_resolutions.len(),
         challenged_work_items: challenged_work_items.len(),
         unresolved_challenged_work_items: unresolved_challenged_work_items.len(),
         discussions: discussions.len(),

@@ -31,10 +31,13 @@ convention. A valid execution must satisfy ten coupled invariants:
    opportunities, Runtime commits one identity-attested idempotent bootstrap
    proposal if the model still omitted it; only failure of that governed
    mutation fails the Agent.
-7. The first topological proposer's work must receive one independent
-   challenge before acceptance. Runtime supplies revision-fenced actions, but
-   the Agents still bid, claim, execute, publish, submit, challenge, revise and
-   accept through native tools.
+7. Independent work review and epistemic red-team discussion are different
+   protocols. A reviewer accepts correct submitted work and challenges it only
+   for a concrete evidence-backed defect; unresolved work challenges block
+   completion. A Team-level counterargument uses a response-required
+   `challenge` entry and must close through a thread-linked `resolution`.
+   Runtime supplies revision fencing and control-plane reachability but never
+   fabricates a negative verdict merely to satisfy an activity counter.
 8. A Focus role whose business receipts and exact scopes are already satisfied
    cannot be downgraded solely because its model omitted presentation keys.
    After bounded recovery, Runtime may copy actual ToolHost receipts into the
@@ -78,7 +81,10 @@ these owners.
 - failed dependency ancestry is never proposal capacity;
 - explicit 4-Agent and 6-Agent market contracts require respectively two and
   three topological proposers;
-- first-proposal challenge/revision/review is revision fenced;
+- independent work acceptance/challenge is revision fenced, and no unresolved
+  work challenge may remain at completion;
+- epistemic challenges are response-required and must have a thread-linked
+  resolution;
 - receipt-backed terminal normalization never invents evidence or empty risk
   declarations;
 - Agent write/read-back truth produces one typed delivery materialization;
@@ -255,3 +261,49 @@ provider effects, or treats a longer bounded queue wait as a provider call
 timeout. Regression gates must cover invalid starvation policies, all default
 provider layers, four maximum-pressure requests at the degraded token floor,
 and service-class admission deadlines before another paid run.
+
+## Candidate-6 control-plane and semantic correction
+
+The clean `bbd4945b` candidate proved that provider admission now sustains the
+large run: it reached 127 DeepSeek rounds, 219 native Agent tool calls and
+5,752,346 live canonical tokens. It also isolated two framework faults before
+an external `402 Insufficient Balance` fenced the account.
+
+First, role resource cropping incorrectly treated the Team control plane as a
+business evidence source. An `upstream_only` verifier therefore received an
+empty tool contract even though its job still required independent market
+review. Business-tool declarations could erase the same controls. The repair
+defines `team_board` and `collaboration_control` as invariant Runtime controls:
+explicit business contracts retain them, while upstream-only roles retain only
+those controls and lose source, workspace, context and evidence-reacquisition
+tools. This preserves least authority without making coordination impossible.
+
+Second, the checkpoint loop interpreted an `Ok(TurnSummary)` transport result
+as permission to continue even when `terminal_completion` was `Partial` after
+the provider failure. That converted one terminal external failure into repeat
+rounds. Continuation now advances only after `GoalCompletion::Satisfied`; every
+other typed terminal completion records `agent.autonomy.checkpoint_stopped` and
+ends the bounded loop without another provider request.
+
+The same trace falsified the former forced-challenge policy. Manufacturing a
+negative review for the first proposal is semantically dishonest when the work
+is correct and can deadlock a serial final reviewer because no later peer can
+revise and independently accept it. Work review now accepts correct submissions
+and reserves `collaboration_control(challenge)` for actual defects. Required
+red-team reasoning is represented separately by a Team-board `challenge` with
+`response_required=true`; graph verification rejects it until a `resolution`
+explicitly names the challenged entry. The evaluator counts these epistemic
+challenges and resolutions, still requires independent work reviews, and still
+fails on any unresolved challenged work item.
+
+Finally, the evaluator's bid floor was inconsistent with the protocol: assigned
+scheduler work is claimed directly and only proposed market work is bid. The
+minimum bid count is therefore the proposal floor, not the total claim floor.
+This corrects measurement only; it does not synthesize actions or relax proposal,
+claim, review, discussion, materialization or terminal-completion requirements.
+
+The correction is rejected if business cropping restores external evidence
+tools to upstream-only roles, if a Partial/Blocked/Failed turn may re-enter the
+checkpoint loop, if Runtime fabricates a challenge finding, if a Team challenge
+can complete without a linked resolution, or if the evaluator mutates Runtime
+state to manufacture acceptance.

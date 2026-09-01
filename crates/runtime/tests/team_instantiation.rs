@@ -174,7 +174,11 @@ fn explicit_template_creates_bound_non_overlapping_role_slots() {
         packet.allowed_tools == binding.tool_contract_refs
             && packet.allowed_skills == binding.skill_refs
             && if upstream_only {
-                packet.allowed_tools.is_empty()
+                packet.allowed_tools.len() == 2
+                    && packet
+                        .allowed_tools
+                        .iter()
+                        .all(|tool| matches!(tool.as_str(), "team_board" | "collaboration_control"))
             } else {
                 !packet.allowed_tools.is_empty()
                     && packet.allowed_tools.iter().any(|tool| tool == "read_file")

@@ -388,7 +388,15 @@ impl TeamInstantiationService {
                         missing_tools.join(", ")
                     ));
                 }
-                role_allowed_tools.retain(|tool| required_tools.contains(tool));
+                // A role's declared tools describe its business/evidence
+                // operations. Runtime-owned Team control tools are an
+                // orthogonal protocol plane: removing them here can leave
+                // submitted required work with no eligible peer able to
+                // accept or challenge it. Keep the binding-scoped control
+                // plane inside the already-resolved capability/evaluation
+                // ceiling for every Team role.
+                role_allowed_tools =
+                    crop_tools_to_role_contract(&role_allowed_tools, &required_tools);
             }
             let (mut focuses, cardinality_resolution) = resolve_focuses(
                 role,
@@ -516,11 +524,15 @@ impl TeamInstantiationService {
                     && !upstream_only_consumer
                     && !escalation_assignee_selected;
                 escalation_assignee_selected |= requires_managed_collaboration_escalation;
-                let mut instance_allowed_tools = if upstream_only_consumer {
-                    Vec::new()
-                } else {
-                    crop_tools_to_resource_lease(&role_allowed_tools, &resource_scopes)
-                };
+                let mut instance_allowed_tools =
+                    crop_tools_to_resource_lease(&role_allowed_tools, &resource_scopes);
+                if upstream_only_consumer {
+                    // Upstream-only forbids source/workspace reacquisition,
+                    // not participation in the Runtime-owned Team protocol.
+                    // The control tools attest the immutable Team/Agent
+                    // binding and cannot widen the role's resource lease.
+                    instance_allowed_tools.retain(|tool| is_runtime_team_control_tool(tool));
+                }
                 if !requires_managed_collaboration_escalation {
                     instance_allowed_tools
                         .retain(|tool| tool != "request_collaboration_escalation");
@@ -581,7 +593,7 @@ impl TeamInstantiationService {
                         focus_partition.shared_baseline.join("; "),
                         focus_partition.output_contract.join(", "),
                         if upstream_only_consumer {
-                            "Use only the canonical upstream results attached by Runtime. Those attached results are already authenticated and sufficient for this bounded synthesis: produce the requested conclusion now. No workspace, network, capability-discovery, tool-search, context-retrieval, or evidence-retrieval tool is authorized; do not request, simulate, or describe a future tool call, and do not say that you need to inspect access/capabilities/evidence before answering. Your success criterion is this Team's bounded Focus only. Peer Teams are outside your visibility and authority: never claim that another Team is missing, failed, incomplete, or needs to be rerun, and never judge whether the parent objective is complete. Return only this Team's positive verified conclusion plus genuine gaps inside this Team's own attached upstream results.\n"
+                            "Use only the canonical upstream results attached by Runtime. Those attached results are already authenticated and sufficient for this bounded synthesis: produce the requested conclusion now. No workspace, network, capability-discovery, tool-search, context-retrieval, or evidence-retrieval operation is authorized; do not request, simulate, or describe one, and do not say that you need to inspect access/capabilities/evidence before answering. Runtime-owned team_board and collaboration_control remain authorized solely for bounded Team exchange and required work review: use their native contracts when a Runtime autonomy checkpoint requires a protocol action, but never treat them as source reacquisition. Your success criterion is this Team's bounded Focus only. Peer Teams are outside your visibility and authority: never claim that another Team is missing, failed, incomplete, or needs to be rerun, and never judge whether the parent objective is complete. Return only this Team's positive verified conclusion plus genuine gaps inside this Team's own attached upstream results.\n"
                         } else if requires_reacquisition
                             && role.behavior.iter().any(|facet| {
                                 matches!(facet, RoleBehaviorFacet::Verification { .. })
@@ -1996,6 +2008,18 @@ fn bounded_objective_context(requires_managed_collaboration_escalation: bool) ->
     context
 }
 
+fn is_runtime_team_control_tool(tool: &str) -> bool {
+    matches!(tool, "team_board" | "collaboration_control")
+}
+
+fn crop_tools_to_role_contract(tools: &[String], required_tools: &BTreeSet<String>) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|tool| required_tools.contains(*tool) || is_runtime_team_control_tool(tool))
+        .cloned()
+        .collect()
+}
+
 fn crop_tools_to_resource_lease(tools: &[String], scopes: &[String]) -> Vec<String> {
     let network = scopes.iter().any(|scope| scope == "network:*");
     let read_paths = scopes
@@ -2135,6 +2159,49 @@ mod acceptance_contract_tests {
                 "team_board".to_string(),
                 "collaboration_control".to_string(),
                 "evidence_retrieve".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_business_tool_contract_cannot_erase_team_control_plane() {
+        let tools = vec![
+            "web_search".to_string(),
+            "read_file".to_string(),
+            "context_retrieve".to_string(),
+            "team_board".to_string(),
+            "collaboration_control".to_string(),
+        ];
+        let required = BTreeSet::from(["web_search".to_string()]);
+        assert_eq!(
+            crop_tools_to_role_contract(&tools, &required),
+            vec![
+                "web_search".to_string(),
+                "team_board".to_string(),
+                "collaboration_control".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn upstream_only_agent_keeps_control_plane_without_source_reacquisition() {
+        let tools = vec![
+            "web_search".to_string(),
+            "read_file".to_string(),
+            "context_retrieve".to_string(),
+            "tool_search".to_string(),
+            "team_board".to_string(),
+            "collaboration_control".to_string(),
+            "evidence_retrieve".to_string(),
+        ];
+        let mut cropped =
+            crop_tools_to_resource_lease(&tools, &["network:*".to_string(), "read:.".to_string()]);
+        cropped.retain(|tool| is_runtime_team_control_tool(tool));
+        assert_eq!(
+            cropped,
+            vec![
+                "team_board".to_string(),
+                "collaboration_control".to_string(),
             ]
         );
     }

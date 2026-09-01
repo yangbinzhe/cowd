@@ -235,3 +235,62 @@ Candidate-5 correction deterministic evidence:
 The correction is eligible for the integrated workspace compile gate, a clean
 candidate commit and one replacement DeepSeek acceptance. The release status
 remains pending until that immutable report passes all 19 gates.
+
+## Candidate-6 failed-run evidence
+
+- Report: `target/acceptance/real-qwen/runs/v0.9.713-1788245558-mission-harness-deep/report.json`
+- Session: `d443f89d-6f8d-4b85-8dac-aa83a1b9b448`
+- Root execution: `session-ingress-graph:c627614d40b21d78276b7147a63a8dbe`
+- Candidate: `bbd4945b2253277e32f33faff799eedf9d11bd41`, clean at launch.
+- Provider/model: only `deepseek/deepseek-v4-flash`; 127 model rounds, 219
+  native Agent tool calls and 5,752,346 live canonical tokens; no fallback.
+- Report gate: 17/19. Deterministic, package, provider-round, token, observation
+  and identity gates passed; terminal live collaboration and its aggregate gate
+  failed.
+- Three Teams and twelve Agents started. Team A's four content roles completed,
+  but its final independent reviewer had `allowed_tools=[]` because
+  `upstream_only` role cropping erased Team controls. Two submitted work items
+  consequently had no legal review path and the reducer correctly reported
+  `autonomous_work_orphaned` instead of claiming completion.
+- Team B reached its checkpoint with the correct controls. The retained Gateway
+  log records the exact provider terminal at 2026-09-01 06:51:29: HTTP 402
+  `Insufficient Balance`, after which the account was fenced. Team C failures
+  were downstream of that same external terminal; Team D never became eligible.
+- The checkpoint nevertheless started later bounded rounds because it treated
+  `Ok(TurnSummary { terminal_completion: Partial })` as success. This is the
+  confirmed source of post-terminal request waste; it is not a scheduler stall.
+- The run produced 28 work items, 6 proposals, 5 bids, 15 claims, 7 accepted
+  items and 9 Team discussions. The former bid floor incorrectly compared bids
+  with all claims even though assigned work does not bid, and the forced first
+  proposal challenge conflated negative work review with epistemic red-team
+  discussion.
+
+Candidate-6 repair evidence before a replacement paid run:
+
+- explicit business-tool contracts cannot erase `team_board` or
+  `collaboration_control`;
+- upstream-only roles retain exactly the Team control plane without regaining
+  source/evidence acquisition authority;
+- a non-Satisfied typed terminal completion cannot start another autonomous
+  checkpoint round;
+- unthreaded epistemic challenges are rejected, and graph verification requires
+  a thread-linked resolution;
+- evaluator fixtures separately prove work review, epistemic challenge,
+  resolution and zero unresolved challenged-work requirements.
+- Runtime: 2003 passed, 0 failed, 3 ignored; all integration targets passed.
+- Gateway: 813 passed, 0 failed, 13 ignored; both integration targets passed.
+- Harness Contract: 205 passed, 0 failed. Harness Eval: 144 passed, 0 failed.
+- Workspace all-target check, architecture boundaries, backend `0.9.713`
+  version gate, formatting and diff checks passed. Runtime library Clippy exited
+  zero with only the recorded repository warning baseline and no diagnostic on
+  a changed line.
+- Release execution saturation completed 64/64 independent items in 0.24
+  seconds. The steady projection probe passed at 107,733 versus 107,652
+  microseconds. The catch-up probe's first co-scheduled sample was rejected at
+  591,655 versus 575,174 microseconds; one isolated rerun passed at 579,798
+  versus 575,277 microseconds (p95 73 versus 71, p99 253 versus 256). No
+  threshold or implementation was changed in response to host-load noise.
+
+The immutable failed report is retained as falsification evidence. A replacement
+DeepSeek run is permitted only after the complete deterministic suites pass on a
+new clean candidate commit; recharge alone does not bypass that gate.

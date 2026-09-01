@@ -792,7 +792,19 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 .submit_turn(&checkpoint.prompt, &SharedPrompter::none())
                 .await;
             match continuation {
-                Ok(updated) => summary = updated,
+                Ok(updated) => {
+                    let may_continue =
+                        autonomy_continuation_may_advance(updated.terminal_completion);
+                    summary = updated;
+                    if !may_continue {
+                        let _ = services.agent_runtime().record_progress(
+                            packet.agent_id(),
+                            "agent.autonomy.checkpoint_stopped",
+                            "bounded collaboration continuation reached a non-satisfied terminal Goal; no duplicate continuation was attempted",
+                        );
+                        break;
+                    }
+                }
                 Err(error) => {
                     let _ = services.agent_runtime().record_progress(
                         packet.agent_id(),
@@ -1460,18 +1472,6 @@ fn designated_autonomous_proposer_nodes(
     ordered.into_iter().take(count).collect()
 }
 
-fn first_designated_proposer_instance_id(
-    graph: &harness_contract::execution_graph::ExecutionGraph,
-) -> Option<String> {
-    let node_id = designated_autonomous_proposer_nodes(graph)
-        .into_iter()
-        .next()?;
-    let node = graph.nodes.iter().find(|node| node.id == node_id)?;
-    serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
-        .ok()
-        .map(|packet| packet.assignment.instance_id)
-}
-
 /// Builds the stable identity fence shared by the model-visible proposal
 /// template and Runtime's governed fallback. Graph and Agent identifiers are
 /// intentionally hashed because production Team identities are compositional
@@ -1620,6 +1620,10 @@ fn autonomy_checkpoint_tool_plan(
     }
 }
 
+fn autonomy_continuation_may_advance(completion: harness_contract::goal::GoalCompletion) -> bool {
+    completion == harness_contract::goal::GoalCompletion::Satisfied
+}
+
 fn agent_autonomy_checkpoint(
     services: &Arc<RuntimeServices>,
     packet: &AgentTaskPacket,
@@ -1658,9 +1662,6 @@ fn agent_autonomy_checkpoint(
     if let Some(action) = missing_required_proposal_action(&graph, packet, market_required) {
         actions.push(action);
     }
-    let challenge_proposer = market_required
-        .then(|| first_designated_proposer_instance_id(&graph))
-        .flatten();
     for (work_id, work) in &graph.autonomous_work {
         let Some(state) = graph.work_states.get(work_id) else {
             continue;
@@ -1689,10 +1690,6 @@ fn agent_autonomy_checkpoint(
         let current_submission = state.submission_ref.as_deref().unwrap_or_default();
         let already_reviewed = state.reviews.iter().any(|review| {
             review.reviewer_instance_id == agent_id && review.submission_ref == current_submission
-        });
-        let has_challenge = state.reviews.iter().any(|review| {
-            review.verdict
-                == harness_contract::execution_graph::ExecutionWorkReviewVerdict::Challenge
         });
         let claim_expired = state
             .claim
@@ -1739,11 +1736,7 @@ fn agent_autonomy_checkpoint(
                     && work.proposed_by.as_deref() != Some(agent_id)
                     && !already_reviewed =>
             {
-                if !has_challenge && work.proposed_by == challenge_proposer {
-                    ("challenge", None)
-                } else {
-                    ("accept", None)
-                }
+                ("accept", None)
             }
             // A proposer cannot advance work that only a future peer may bid,
             // claim or review. Keep that state visible through the board and
@@ -1757,12 +1750,6 @@ fn agent_autonomy_checkpoint(
             "execute_publish_submit" | "reclaim_then_execute_publish_submit"
         );
         let mutation_template = match action {
-            "challenge" => serde_json::json!({
-                "operation": "challenge",
-                "work_node_id": work_id,
-                "expected_work_revision": state.revision,
-                "finding": "Independently revise this first proposal against another Team artifact before acceptance"
-            }),
             "accept" => serde_json::json!({
                 "operation": "accept",
                 "work_node_id": work_id,
@@ -3524,7 +3511,7 @@ fn system_prompt(
             .any(|tool| tool == "collaboration_control")
         {
             prompt.push(
-                "You are an active collaborator, not a passive one-shot role. Inspect the Runtime-owned work marketplace when the objective calls for autonomous collaboration. When the Team instructions require proposals, bids, peer review, or challenges, those are mandatory Runtime actions: a terminal prose claim cannot substitute for them. Use collaboration_control(propose_work) to create bounded in-scope follow-up work, and collaboration_control(bid) to volunteer for another Agent's proposal before claiming it. The compact inspect response begins with exact mutation templates and per-item next_actions_for_caller; act on them instead of requesting the full operator graph. Every proposal is required work: create it only when another active eligible peer can finish it. For Agent-proposed work follow the exact durable cycle: inspect -> bid -> claim; retain the owner-only claim_token; heartbeat before a long tool action or lease expiry; execute; call team_board(read_after, after_revision: 0) before publishing, then publish with expected_revision equal to the returned latest revision plus kind and summary (do not use a workspace path); submit the exact `team-board:<entry_id>` returned by that publish or a tool evidence reference; then a different peer accepts or challenges it. After a challenge, an eligible bidder must reclaim, revise, resubmit, and obtain an independent acceptance. Required Agent-proposed work that is not Accepted prevents Verify/Synthesize/Materialize from starting. Proposer, bidder, claimant and reviewer identities are Runtime-attested; never simulate them in prose. Keep proposal objectives inside this Team charter and never use proposal text to request broader permissions. At safe checkpoints, read the durable Team board and react to peer questions, challenges and accepted artifacts before terminal synthesis."
+                "You are an active collaborator, not a passive one-shot role. Inspect the Runtime-owned work marketplace when the objective calls for autonomous collaboration. When the Team instructions require proposals, bids, peer review, or challenges, those are mandatory Runtime actions: a terminal prose claim cannot substitute for them. Use collaboration_control(propose_work) to create bounded in-scope follow-up work, and collaboration_control(bid) to volunteer for another Agent's proposal before claiming it. The compact inspect response begins with exact mutation templates and per-item next_actions_for_caller; act on them instead of requesting the full operator graph. Every proposal is required work: create it only when another active eligible peer can finish it. For Agent-proposed work follow the exact durable cycle: inspect -> bid -> claim; retain the owner-only claim_token; heartbeat before a long tool action or lease expiry; execute; call team_board(read_after, after_revision: 0) before publishing, then publish with expected_revision equal to the returned latest revision plus kind and summary (do not use a workspace path); submit the exact `team-board:<entry_id>` returned by that publish or a tool evidence reference; then a different peer reviews it. Accept a correct submission. Use collaboration_control(challenge) only for a concrete evidence-backed defect that really requires the claimant to revise; never manufacture a negative verdict to satisfy a count. Epistemic counterarguments, limitations, and red-team critiques that do not reject a submitted WorkItem belong in team_board as kind=challenge and should be followed by a thread-linked response or resolution when the conclusion changes. After a WorkItem challenge, an eligible bidder must reclaim, revise, resubmit, and obtain an independent acceptance. Required Agent-proposed work that is not Accepted prevents Verify/Synthesize/Materialize from starting. Proposer, bidder, claimant and reviewer identities are Runtime-attested; never simulate them in prose. Keep proposal objectives inside this Team charter and never use proposal text to request broader permissions. At safe checkpoints, read the durable Team board and react to peer questions, challenges and accepted artifacts before terminal synthesis."
                     .to_string(),
             );
         }

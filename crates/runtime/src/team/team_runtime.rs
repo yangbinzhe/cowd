@@ -1442,6 +1442,16 @@ impl TeamRuntime {
                 );
             }
         }
+        if request.kind == TeamWorkingStateKind::Challenge
+            && request
+                .thread
+                .as_ref()
+                .is_none_or(|thread| !thread.response_required)
+        {
+            return Err(
+                "team discussion challenge requires a response-required thread".to_string(),
+            );
+        }
         let mut refs = request
             .refs
             .into_iter()
