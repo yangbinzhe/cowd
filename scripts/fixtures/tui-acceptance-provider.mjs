@@ -210,18 +210,13 @@ function responseFor(messages, tools, system) {
     };
   }
   if (latest.includes("TUI_ACCEPTANCE_VALID_DSML")) {
-    const toolResultAfterRequest = messages
-      .slice(
-        Math.max(
-          0,
-          messages.findLastIndex(
-            (message) =>
-              message?.role === "user" &&
-              textOf(message.content).includes("TUI_ACCEPTANCE_VALID_DSML"),
-          ),
-        ),
-      )
-      .some((message) => message?.role === "tool");
+    // Runtime-attested guidance is appended after the durable tool receipt,
+    // so anchoring at the last marker would hide the receipt on continuation.
+    // This fixture owns one isolated session; any tool result here is the
+    // checked result of the current DSML probe.
+    const toolResultAfterRequest = messages.some(
+      (message) => message?.role === "tool",
+    );
     if (toolResultAfterRequest) {
       return {
         chunks: ["TUI_ACCEPTANCE-DSML-TOOL-COMPLETE"],
