@@ -751,7 +751,24 @@ fn compile_team(
         let canonical_id = canonical_ids
             .get(&role.role_id)
             .expect("canonical role id exists");
-        let selected = resolve_role(role, catalog, tool_inventory, ceiling)?;
+        // A topology terminal is responsible for turning the Team result
+        // into a grounded delivery.  Model proposals occasionally omit the
+        // otherwise implicit read capability; retain it as a Runtime-owned
+        // minimum so a terminal role cannot be compiled into a control-only
+        // Agent that has no possible source-acquisition path.
+        let mut role_for_resolution = role.clone();
+        if terminal_role.as_deref() == Some(canonical_id)
+            && !role_for_resolution
+                .required_capabilities
+                .iter()
+                .any(|capability| capability.eq_ignore_ascii_case("read"))
+        {
+            role_for_resolution
+                .required_capabilities
+                .push("read".to_string());
+        }
+        let required_capabilities = canonical_set(&role_for_resolution.required_capabilities);
+        let selected = resolve_role(&role_for_resolution, catalog, tool_inventory, ceiling)?;
         let behavior = derive_behavior(
             role,
             canonical_id,
@@ -799,16 +816,8 @@ fn compile_team(
         // exposes it.  This preserves authority (no new capability is granted)
         // and prevents an empty Team from reaching terminal evaluation.
         let mut required_tools = canonical_set(&role.required_tools);
-        if !upstream_only
-            && terminal_result_artifacts_derived
-            && (team.result.evidence_required || terminal_owns_workstream_evidence)
-            && required_tools.is_empty()
-            && selected
-                .executable_tools
-                .as_ref()
-                .is_some_and(|tools| tools.iter().any(|tool| tool == "workspace_snapshot"))
-        {
-            required_tools.push("workspace_snapshot".to_string());
+        if !upstream_only && terminal_result_artifacts_derived && required_tools.is_empty() {
+            required_tools.push("read_file".to_string());
         }
         roles.push(ProposedRole {
             role_id: canonical_id.clone(),
@@ -823,7 +832,7 @@ fn compile_team(
                 selected.entry.definition_ref.definition_id.as_str(),
                 selected.entry.definition_ref.revision
             ),
-            grant_ceiling: canonical_set(&role.required_capabilities),
+            grant_ceiling: required_capabilities.clone(),
             fixed_count: None,
             min_count: Some(u32::from(role.cardinality.min)),
             max_count: Some(u32::from(role.cardinality.max)),
@@ -858,7 +867,7 @@ fn compile_team(
             "role_id": canonical_id,
             "definition": selected.entry.definition_ref.definition_id.as_str(),
             "revision": selected.entry.definition_ref.revision,
-            "required_capabilities": canonical_set(&role.required_capabilities),
+            "required_capabilities": required_capabilities.clone(),
             "required_skills": canonical_set(&role.required_skills),
             "required_tools": required_tools.clone(),
             "resolved_output_artifacts": resolved_output_artifacts.clone(),
@@ -871,7 +880,7 @@ fn compile_team(
                 .clone()
                 .or_else(|| Some(role.role_id.clone())),
             responsibility: role.responsibility.trim().to_string(),
-            required_capabilities: canonical_set(&role.required_capabilities),
+            required_capabilities,
             required_skills: canonical_set(&role.required_skills),
             required_tools,
             cardinality_min: role.cardinality.min,
