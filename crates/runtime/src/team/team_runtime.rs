@@ -1064,7 +1064,7 @@ impl TeamRuntime {
                 );
             }
         }
-        let expected_work_revision = if proposed_contract.is_some() {
+        let mut expected_work_revision = if proposed_contract.is_some() {
             request.expected_work_revision.unwrap_or(0)
         } else {
             request.expected_work_revision.ok_or_else(|| {
@@ -1111,6 +1111,30 @@ impl TeamRuntime {
                 .get(&work_node_id)
                 .map_or(0, |state| state.revision);
             if observed_work_revision != expected_work_revision {
+                // Bids and claims are work-item scoped, idempotent market
+                // actions.  Several peers may inspect the same Offered item
+                // concurrently; by the time one reaches the CAS, another
+                // peer may already have appended a bid and advanced only this
+                // item's revision.  Refreshing the revision is safe while
+                // the item is still Offered/Challenged because the command
+                // below revalidates eligibility and state.  Keep strict
+                // rejection for every other mutation (especially submit,
+                // release and heartbeat) so evidence and ownership cannot be
+                // silently rebound across revisions.
+                let refreshable_market_race = matches!(
+                    request.operation,
+                    CollaborationControlOperation::Bid | CollaborationControlOperation::Claim
+                ) && current.work_states.get(&work_node_id).is_some_and(|state| {
+                    matches!(
+                        state.status,
+                        harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Offered
+                            | harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged
+                    ) && expected_work_revision < observed_work_revision
+                });
+                if refreshable_market_race {
+                    expected_work_revision = observed_work_revision;
+                    continue;
+                }
                 return Err(format!(
                     "collaboration work revision mismatch for `{work_node_id}`: expected {expected_work_revision}, actual {observed_work_revision}"
                 ));
