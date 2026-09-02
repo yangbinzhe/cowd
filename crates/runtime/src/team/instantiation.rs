@@ -569,7 +569,6 @@ impl TeamInstantiationService {
                 // an authority ceiling; acceptance obligations continue to
                 // require explicit paths where the contract names them.
                 if terminal_candidate_role
-                    && manifest.result_contract.evidence_required
                     && !node_resource_scopes.iter().any(|scope| {
                         scope.starts_with("read:")
                             || scope.starts_with("write:")
