@@ -1317,6 +1317,36 @@
     }
 
     #[test]
+    fn advisory_evaluation_lease_never_blocks_provider_admission() {
+        let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
+        let guard = registry
+            .install_advisory("session-advisory", "eval-advisory", 30)
+            .expect("advisory evaluation lease");
+        let lease = guard.lease();
+        let mut request = token_reservation_request();
+        let mut reservation = ProviderTokenReservationSet::acquire(
+            Some(&lease),
+            None,
+            "test",
+            &mut request,
+        )
+        .expect("advisory lease must not block an oversized request");
+        reservation.mark_dispatched();
+        reservation
+            .reconcile(model_protocol::usage::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 100,
+                ..Default::default()
+            })
+            .expect("advisory reconciliation");
+        let snapshot = guard.snapshot().expect("advisory snapshot");
+        assert_eq!(snapshot.limit, 30);
+        assert_eq!(snapshot.consumed, 200);
+        assert!(!snapshot.breached);
+        assert_eq!(snapshot.outstanding, 0);
+    }
+
+    #[test]
     fn evaluation_provider_token_leases_are_isolated_by_session_binding() {
         let registry = Arc::new(EvaluationProviderTokenLeaseRegistry::default());
         let small_guard = registry

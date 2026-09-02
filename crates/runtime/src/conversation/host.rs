@@ -561,11 +561,13 @@ where
         Err(error) => return (runtime, Err(error)),
     };
     let _evaluation_provider_token_guard = match evaluation_control.as_ref() {
-        Some(control) => match services.evaluation_provider_token_leases().install(
-            &session.session_id,
-            &control.budget_lease_id,
-            control.max_total_tokens,
-        ) {
+        Some(control) => match services
+            .evaluation_provider_token_leases()
+            .install_advisory(
+                &session.session_id,
+                &control.budget_lease_id,
+                control.max_total_tokens,
+            ) {
             Ok(guard) => {
                 runtime = runtime.with_evaluation_provider_token_lease(guard.lease());
                 Some(guard)

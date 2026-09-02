@@ -114,8 +114,12 @@ const fn provider_retry_is_fenced(
 struct EvaluationProviderTokenLeaseState {
     lease_id: String,
     limit: u64,
+    /// Evaluation capacity is telemetry by default; it must not become a
+    /// hidden execution stop condition for a real task.
+    enforced: bool,
     remaining: u64,
     variance_remaining: u64,
+    telemetry_consumed: u64,
     input_consumed: u64,
     output_consumed: u64,
     cached_consumed: u64,
@@ -129,7 +133,7 @@ pub(crate) struct EvaluationProviderTokenLease {
 }
 
 impl EvaluationProviderTokenLease {
-    fn new(lease_id: &str, limit: u64) -> Result<Self, RuntimeError> {
+    fn new(lease_id: &str, limit: u64, enforced: bool) -> Result<Self, RuntimeError> {
         if lease_id.trim().is_empty() || limit == 0 || limit > MAX_EVALUATION_PROVIDER_TOKEN_LEASE {
             return Err(RuntimeError::new(
                 "evaluation provider token lease identity/limit is invalid",
@@ -139,8 +143,10 @@ impl EvaluationProviderTokenLease {
             state: std::sync::Mutex::new(EvaluationProviderTokenLeaseState {
                 lease_id: lease_id.to_string(),
                 limit,
+                enforced,
                 remaining: limit,
                 variance_remaining: (limit / 20).max(1),
+                telemetry_consumed: 0,
                 input_consumed: 0,
                 output_consumed: 0,
                 cached_consumed: 0,
@@ -158,7 +164,11 @@ impl EvaluationProviderTokenLease {
         Ok(EvaluationProviderTokenLeaseSnapshot {
             lease_id: lease.lease_id.clone(),
             limit: lease.limit,
-            consumed: lease.limit.saturating_sub(lease.remaining),
+            consumed: if lease.enforced {
+                lease.limit.saturating_sub(lease.remaining)
+            } else {
+                lease.telemetry_consumed
+            },
             input_consumed: lease.input_consumed,
             output_consumed: lease.output_consumed,
             cached_consumed: lease.cached_consumed,
@@ -174,18 +184,42 @@ pub(crate) struct EvaluationProviderTokenLeaseRegistry {
 }
 
 impl EvaluationProviderTokenLeaseRegistry {
+    #[cfg(test)]
     pub(crate) fn install(
         self: &Arc<Self>,
         session_id: &str,
         lease_id: &str,
         limit: u64,
     ) -> Result<EvaluationProviderTokenLeaseGuard, RuntimeError> {
+        self.install_with_mode(session_id, lease_id, limit, true)
+    }
+
+    /// Install an evaluation lease that records usage without using the
+    /// nominal observation capacity as an execution stop condition.
+    pub(crate) fn install_advisory(
+        self: &Arc<Self>,
+        session_id: &str,
+        lease_id: &str,
+        limit: u64,
+    ) -> Result<EvaluationProviderTokenLeaseGuard, RuntimeError> {
+        self.install_with_mode(session_id, lease_id, limit, false)
+    }
+
+    fn install_with_mode(
+        self: &Arc<Self>,
+        session_id: &str,
+        lease_id: &str,
+        limit: u64,
+        enforced: bool,
+    ) -> Result<EvaluationProviderTokenLeaseGuard, RuntimeError> {
         if session_id.trim().is_empty() {
             return Err(RuntimeError::new(
                 "evaluation provider token lease session identity is invalid",
             ));
         }
-        let lease = Arc::new(EvaluationProviderTokenLease::new(lease_id, limit)?);
+        let lease = Arc::new(EvaluationProviderTokenLease::new(
+            lease_id, limit, enforced,
+        )?);
         let mut leases = self
             .leases
             .lock()
@@ -261,6 +295,7 @@ struct EvaluationProviderTokenReservation {
     reserved: u64,
     reconciled: bool,
     dispatched: bool,
+    advisory: bool,
 }
 
 impl EvaluationProviderTokenReservation {
@@ -275,6 +310,17 @@ impl EvaluationProviderTokenReservation {
             .state
             .lock()
             .map_err(|_| RuntimeError::new("evaluation provider token lease lock poisoned"))?;
+        if !state.enforced {
+            state.outstanding = state.outstanding.saturating_add(1);
+            drop(state);
+            return Ok(Some(Self {
+                lease: Arc::clone(lease),
+                reserved: 0,
+                reconciled: false,
+                dispatched: false,
+                advisory: true,
+            }));
+        }
         if state.breached {
             return Err(RuntimeError::new(format!(
                 "evaluation provider token lease `{}` is already breached",
@@ -322,6 +368,7 @@ impl EvaluationProviderTokenReservation {
             reserved,
             reconciled: false,
             dispatched: false,
+            advisory: false,
         }))
     }
 
@@ -345,6 +392,15 @@ impl EvaluationProviderTokenReservation {
             return;
         }
         if let Ok(mut lease) = self.lease.state.lock() {
+            if self.advisory || !lease.enforced {
+                lease.telemetry_consumed = lease.telemetry_consumed.saturating_add(actual);
+                lease.input_consumed = lease.input_consumed.saturating_add(input);
+                lease.output_consumed = lease.output_consumed.saturating_add(output);
+                lease.cached_consumed = lease.cached_consumed.saturating_add(cached);
+                lease.outstanding = lease.outstanding.saturating_sub(1);
+                self.reconciled = true;
+                return;
+            }
             lease.input_consumed = lease.input_consumed.saturating_add(input);
             lease.output_consumed = lease.output_consumed.saturating_add(output);
             lease.cached_consumed = lease.cached_consumed.saturating_add(cached);
@@ -385,7 +441,7 @@ impl Drop for EvaluationProviderTokenReservation {
             return;
         }
         if let Ok(mut lease) = self.lease.state.lock() {
-            if !self.dispatched {
+            if !self.advisory && !self.dispatched {
                 lease.remaining = lease
                     .remaining
                     .saturating_add(self.reserved)
