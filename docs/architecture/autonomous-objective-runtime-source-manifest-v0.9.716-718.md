@@ -235,3 +235,34 @@ amend the DAG and repeat the corresponding code-only gates before paying for E2E
 - No source path outside this manifest may be changed silently.
 - New files require owner, caller, schema, test and deletion decision before creation.
 - Evidence files are not completion proof until their referenced commit/tree/build hashes exist.
+
+## v0.9.719 — Closure repair and evidence convergence amendment
+
+This amendment owns repairs discovered by the reverse audit after the v0.9.718 candidate. It is
+not a new scheduler or a relaxation of the three-version architecture.
+
+```text
+docs/architecture/autonomous-objective-runtime-closure-repair-v0.9.719.md [new]
+scripts/manual/webui-live-workbench.sh
+crates/harness-contract/src/outcome.rs
+crates/runtime/src/execution_core/goal/mod.rs
+crates/runtime/src/execution_core/goal/supervisor.rs
+crates/runtime/src/orchestration/collaboration_coordinator.rs
+crates/runtime/src/conversation/host_presentation.rs
+crates/runtime/src/execution_core/services.rs
+crates/runtime/src/agent/in_process_worker.rs
+crates/runtime/src/agent/in_process/tests.rs
+crates/runtime/src/agent/runtime.rs
+crates/runtime/src/conversation/evidence_terminal_plane.rs
+crates/runtime/src/execution_core/outcome_service.rs
+crates/runtime/src/recovery/outcome_projector.rs
+crates/runtime/src/evolution/projector.rs
+crates/runtime/src/skill/maintenance.rs
+docs/evidence/autonomous-objective-runtime-v0.9.716.md
+docs/evidence/autonomous-objective-runtime-v0.9.717.md
+docs/evidence/autonomous-objective-runtime-v0.9.718.md
+```
+
+Required deletion/scan targets: fixed-ratio autonomous proposal helpers and tests; direct
+Objective `Satisfied` writers outside `ObjectiveSupervisor`; unscoped Team/Graph success
+consumers; browser scripts referencing missing specs/configs; evidence status contradictions.

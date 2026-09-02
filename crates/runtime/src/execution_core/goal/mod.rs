@@ -635,6 +635,27 @@ impl GoalStore {
         durable_evidence.sort();
         durable_evidence.dedup();
         if completion == GoalCompletion::Satisfied {
+            let unresolved_obligations = goal
+                .obligations
+                .iter()
+                .filter(|obligation| {
+                    obligation.required
+                        && (obligation.state != ObjectiveObligationState::Satisfied
+                            || (obligation
+                                .evidence_requirement
+                                .independent_verifier_required
+                                && obligation.verifier_decision.is_none())
+                            || (obligation.evidence_requirement.reread_required
+                                && obligation.reread_receipts.is_empty()))
+                })
+                .map(|obligation| obligation.obligation_id.clone())
+                .collect::<Vec<_>>();
+            if !unresolved_obligations.is_empty() {
+                return Err(format!(
+                    "cannot satisfy a goal while required obligations are unresolved: {}",
+                    unresolved_obligations.join(", ")
+                ));
+            }
             for criterion in &mut goal.criteria {
                 if let Some(status) = projection.progress.criteria.get(&criterion.id) {
                     criterion.status = *status;
@@ -905,7 +926,14 @@ impl GoalStore {
         };
         if terminal.kind == ObjectiveTerminalKind::Satisfied {
             let required_open = goal.obligations.iter().any(|obligation| {
-                obligation.required && obligation.state != ObjectiveObligationState::Satisfied
+                obligation.required
+                    && (obligation.state != ObjectiveObligationState::Satisfied
+                        || (obligation
+                            .evidence_requirement
+                            .independent_verifier_required
+                            && obligation.verifier_decision.is_none())
+                        || (obligation.evidence_requirement.reread_required
+                            && obligation.reread_receipts.is_empty()))
             });
             if required_open {
                 return Err(

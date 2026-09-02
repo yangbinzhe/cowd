@@ -2092,6 +2092,7 @@ where
                 session_id: state.session_ref.clone(),
                 turn_id: state.turn_ref.clone(),
                 terminal_generation: state.revision,
+                execution_scope: harness_contract::outcome::OutcomeExecutionScope::Session,
                 paired_sample_id: None,
                 task_id: self
                     .execution_identity

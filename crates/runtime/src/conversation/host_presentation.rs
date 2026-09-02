@@ -1252,18 +1252,30 @@ where
         ));
         outcome.delivery_envelope = Some(envelope.clone());
         outcome.terminal_presentation = presentation.clone();
-        outcome.domain_events.push(
-            self.services
-                .objective_supervisor()
-                .terminal_event(
-                    &goal_id,
-                    completion,
-                    vec![format!("execution_graph:{}", ticket.graph_id)],
-                    "terminal_synthesis".to_string(),
-                    format!("{}:goal-complete", ticket.idempotency_key),
-                )
-                .map_err(|error| format!("goal completion cannot commit: {error}"))?,
-        );
+        // Collaboration roots are finalized by the settled-graph Objective
+        // supervisor after Program/Team obligations and evidence are reduced.
+        // Committing a generic Satisfied Goal here would race that reducer and
+        // promote a local synthesis paragraph before the required Team facts
+        // exist. Direct turns retain the same terminal writer below.
+        let has_collaboration_program = projection
+            .orchestration
+            .as_ref()
+            .and_then(|metadata| metadata.collaboration_program.as_ref())
+            .is_some();
+        if !has_collaboration_program {
+            outcome.domain_events.push(
+                self.services
+                    .objective_supervisor()
+                    .terminal_event(
+                        &goal_id,
+                        completion,
+                        vec![format!("execution_graph:{}", ticket.graph_id)],
+                        "terminal_synthesis".to_string(),
+                        format!("{}:goal-complete", ticket.idempotency_key),
+                    )
+                    .map_err(|error| format!("goal completion cannot commit: {error}"))?,
+            );
+        }
         let recovery_scope = format!("turn:{turn_id}");
         let controlled_recovery_claim_fingerprints = self
             .runtime

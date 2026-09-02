@@ -1045,6 +1045,7 @@ impl AgentRuntime {
                 session_id: returned.session_id.clone(),
                 turn_id: turn_id.to_string(),
                 terminal_generation: u64::from(returned.attempt).saturating_add(1),
+                execution_scope: harness_contract::outcome::OutcomeExecutionScope::Agent,
                 paired_sample_id: None,
                 task_id: Some(returned.task_id.clone()),
                 mission_id: Some(returned.mission_id.clone()),

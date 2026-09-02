@@ -102,6 +102,10 @@ impl OutcomeService {
         {
             return Err("outcome identity is incomplete".to_string());
         }
+        outcome
+            .identity
+            .execution_scope
+            .validate_identity(&outcome.identity)?;
         validate_strategy_feedback(outcome)?;
         let stream_id = format!("outcome:{}", outcome.identity.execution_id);
         let key = format!(
@@ -384,6 +388,10 @@ fn validate_calibration_outcome(outcome: &ExecutionOutcome) -> Result<(), String
     if outcome.schema_revision != OUTCOME_SCHEMA_REVISION {
         return Err("unsupported Outcome schema revision".to_string());
     }
+    outcome
+        .identity
+        .execution_scope
+        .validate_identity(&outcome.identity)?;
     if outcome
         .identity
         .paired_sample_id
@@ -537,6 +545,7 @@ mod tests {
                 session_id: "session-1".to_string(),
                 turn_id: "turn-1".to_string(),
                 terminal_generation: 1,
+                execution_scope: harness_contract::outcome::OutcomeExecutionScope::Task,
                 paired_sample_id: None,
                 task_id: None,
                 mission_id: None,
@@ -600,9 +609,13 @@ mod tests {
                 ExecutionCandidateKind::Direct => {}
                 ExecutionCandidateKind::ParallelTools => {
                     outcome.identity.agent_id = Some("agent-1".to_string());
+                    outcome.identity.execution_scope =
+                        harness_contract::outcome::OutcomeExecutionScope::Agent;
                 }
                 ExecutionCandidateKind::Team => {
                     outcome.identity.team_id = Some("team-1".to_string());
+                    outcome.identity.execution_scope =
+                        harness_contract::outcome::OutcomeExecutionScope::Team;
                 }
             }
             assert!(!service.record_terminal(&outcome).unwrap().duplicate);
@@ -722,5 +735,25 @@ mod tests {
             .record_terminal(&invalid)
             .expect_err("invalid workload")
             .contains("fingerprint"));
+    }
+
+    #[test]
+    fn scope_identity_fence_rejects_ambiguous_team_and_legacy_outcomes() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let service = OutcomeService::new(store);
+        let mut team_without_id = outcome(ExecutionCandidateKind::Direct);
+        team_without_id.identity.execution_scope =
+            harness_contract::outcome::OutcomeExecutionScope::Team;
+        assert!(service
+            .record_terminal(&team_without_id)
+            .expect_err("team scope must be bound")
+            .contains("team_id"));
+
+        let mut legacy = outcome(ExecutionCandidateKind::Direct);
+        legacy.identity.execution_scope = harness_contract::outcome::OutcomeExecutionScope::Unknown;
+        assert!(service
+            .record_terminal(&legacy)
+            .expect_err("unknown scope must not enter canonical writer")
+            .contains("scope is unknown"));
     }
 }

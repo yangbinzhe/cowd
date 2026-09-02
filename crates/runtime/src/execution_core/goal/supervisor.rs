@@ -97,7 +97,21 @@ impl ObjectiveSupervisor {
             ObjectiveTerminalKind::PartiallySatisfied
         };
         let mut goal = projection.goal;
-        if !obligations.is_empty() && goal.obligations != obligations {
+        let mut durable_evidence = projection.progress.evidence_refs.clone();
+        durable_evidence.extend(evidence_refs.iter().cloned());
+        durable_evidence.sort();
+        durable_evidence.dedup();
+        let criteria_need_update = goal.criteria.iter().any(|criterion| {
+            criterion.status == harness_contract::goal::AcceptanceStatus::Open
+                && criterion
+                    .required_evidence
+                    .iter()
+                    .all(|required| durable_evidence.contains(required))
+        });
+        if (!obligations.is_empty() && goal.obligations != obligations)
+            || !durable_evidence.is_empty()
+            || criteria_need_update
+        {
             let expected = goal.revision;
             let next_sequence = goal.user_sequence.saturating_add(1);
             let (updated, _) = self.goals.revise(
@@ -107,11 +121,27 @@ impl ObjectiveSupervisor {
                 "objective_supervisor_obligation_projection",
                 |current| {
                     current.obligations = obligations.clone();
+                    current.evidence_refs = durable_evidence.clone();
+                    for criterion in &mut current.criteria {
+                        if criterion.status == harness_contract::goal::AcceptanceStatus::Open
+                            && criterion
+                                .required_evidence
+                                .iter()
+                                .all(|required| durable_evidence.contains(required))
+                        {
+                            criterion.status = harness_contract::goal::AcceptanceStatus::Satisfied;
+                        }
+                    }
                     current.program_ref = current
                         .program_ref
                         .clone()
                         .or_else(|| Some(goal_id.to_string()));
-                    vec!["obligations".to_string(), "program_ref".to_string()]
+                    vec![
+                        "obligations".to_string(),
+                        "evidence_refs".to_string(),
+                        "criteria".to_string(),
+                        "program_ref".to_string(),
+                    ]
                 },
             )?;
             goal = updated;
@@ -230,5 +260,93 @@ mod tests {
             .expect("goal");
         assert_eq!(projection.goal.completion, GoalCompletion::Satisfied);
         assert!(projection.goal.terminal.is_some());
+    }
+
+    #[test]
+    fn direct_terminal_event_cannot_bypass_objective_obligation_verification() {
+        let store = Arc::new(GoalStore::new(Arc::new(
+            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+        )));
+        let mut contract = goal();
+        contract.obligations = vec![ObjectiveObligation {
+            obligation_id: "required-team".to_string(),
+            required: true,
+            success_predicate: "verified Team evidence".to_string(),
+            producer: Default::default(),
+            evidence_requirement: Default::default(),
+            state: ObjectiveObligationState::Open,
+            artifact_refs: Vec::new(),
+            evidence_refs: Vec::new(),
+            reread_receipts: Vec::new(),
+            verifier_decision: None,
+            diagnostic_code: None,
+        }];
+        store.create(contract).expect("create goal");
+        let supervisor = ObjectiveSupervisor::new(store);
+        let error = supervisor
+            .terminal_event(
+                "objective-supervisor-test",
+                GoalCompletion::Satisfied,
+                vec!["evidence:unverified".to_string()],
+                "direct terminal attempt".to_string(),
+                "fence:direct".to_string(),
+            )
+            .expect_err("unresolved obligations must reject direct terminal writes");
+        assert!(error.contains("required obligations are unresolved"));
+    }
+
+    #[test]
+    fn program_projection_closes_the_root_execution_graph_criterion() {
+        let store = Arc::new(GoalStore::new(Arc::new(
+            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+        )));
+        let mut contract = goal();
+        contract.criteria = vec![AcceptanceCriterion {
+            id: "terminal_synthesis".to_string(),
+            statement: "produce one durable terminal synthesis".to_string(),
+            required_evidence: vec!["execution_graph:graph-1".to_string()],
+            status: AcceptanceStatus::Open,
+            waiver: None,
+        }];
+        store.create(contract).expect("create goal");
+        let supervisor = ObjectiveSupervisor::new(store.clone());
+        let obligations = vec![ObjectiveObligation {
+            obligation_id: "team-1".to_string(),
+            required: true,
+            success_predicate: "verified Team evidence".to_string(),
+            producer: Default::default(),
+            evidence_requirement: Default::default(),
+            state: ObjectiveObligationState::Satisfied,
+            artifact_refs: Vec::new(),
+            evidence_refs: vec!["team:evidence-1".to_string()],
+            reread_receipts: vec!["reread:team:evidence-1".to_string()],
+            verifier_decision: Some("team_terminal_verified".to_string()),
+            diagnostic_code: None,
+        }];
+        let decision = supervisor
+            .reconcile(
+                "objective-supervisor-test",
+                2,
+                "objective:graph-1:program:3",
+                obligations,
+                vec!["execution_graph:graph-1".to_string()],
+                Vec::new(),
+                false,
+                "program terminal projection",
+            )
+            .expect("reconcile");
+        assert!(matches!(decision, ObjectiveReconcileDecision::Terminal(_)));
+        let projection = store
+            .projection("objective-supervisor-test")
+            .expect("projection")
+            .expect("goal");
+        assert_eq!(
+            projection.goal.criteria[0].status,
+            AcceptanceStatus::Satisfied
+        );
+        assert!(projection
+            .goal
+            .evidence_refs
+            .contains(&"execution_graph:graph-1".to_string()));
     }
 }

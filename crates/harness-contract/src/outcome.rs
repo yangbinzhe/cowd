@@ -445,6 +445,11 @@ pub struct OutcomeIdentity {
     pub session_id: String,
     pub turn_id: String,
     pub terminal_generation: u64,
+    /// Execution scope prevents a local Team/Agent/Task result from being
+    /// consumed as an Objective business terminal.  The scope is durable and
+    /// therefore part of the identity rather than an inferred projection.
+    #[serde(default)]
+    pub execution_scope: OutcomeExecutionScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paired_sample_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,6 +462,49 @@ pub struct OutcomeIdentity {
     pub team_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_graph_ref: Option<String>,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeExecutionScope {
+    #[default]
+    Unknown,
+    Session,
+    Objective,
+    Program,
+    Task,
+    Team,
+    Agent,
+}
+
+impl OutcomeExecutionScope {
+    /// Validate the minimum identity fence for a durable outcome.  A scope is
+    /// part of the producer's contract, not a label inferred by a consumer;
+    /// ambiguous/legacy outcomes therefore cannot enter the canonical writer.
+    pub fn validate_identity(self, identity: &OutcomeIdentity) -> Result<(), String> {
+        match self {
+            Self::Unknown => Err("outcome execution scope is unknown".to_string()),
+            Self::Agent if identity.agent_id.is_none() => {
+                Err("agent outcome requires agent_id".to_string())
+            }
+            Self::Team if identity.team_id.is_none() => {
+                Err("team outcome requires team_id".to_string())
+            }
+            Self::Objective | Self::Program if identity.execution_graph_ref.is_none() => {
+                Err("objective/program outcome requires execution_graph_ref".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl OutcomeExecutionScope {
+    #[must_use]
+    pub const fn is_objective(self) -> bool {
+        matches!(self, Self::Objective)
+    }
 }
 
 /// Exact source identity of the Runtime binary that durably records an

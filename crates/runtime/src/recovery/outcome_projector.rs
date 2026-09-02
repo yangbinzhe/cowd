@@ -863,6 +863,7 @@ mod tests {
                 session_id: "session".to_string(),
                 turn_id: "turn".to_string(),
                 terminal_generation: 1,
+                execution_scope: harness_contract::outcome::OutcomeExecutionScope::Unknown,
                 paired_sample_id: None,
                 task_id: None,
                 mission_id: None,

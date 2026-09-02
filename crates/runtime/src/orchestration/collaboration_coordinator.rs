@@ -982,16 +982,31 @@ pub(crate) async fn reconcile_objective_from_program(
     objective_supervisor: &crate::execution_core::goal::ObjectiveSupervisor,
     graphs: &ExecutionGraphStateStore,
 ) -> Result<(), String> {
-    if objective_supervisor
+    // Root conversation graphs persist their Objective as `goal:{graph_id}`;
+    // older callers passed the graph id directly. Resolve both forms, but do
+    // not ever guess a child Team graph is an Objective. The explicit
+    // `program_ref` check below is the admission-time ownership fence.
+    let goal_id = if objective_supervisor
         .goal_store()
         .projection(graph_id)?
-        .is_none()
+        .is_some()
     {
-        // Mission/Team graphs are local execution projections.  Only a graph
-        // carrying a durable GoalContract may be promoted into Objective
-        // truth; absence is expected for child graphs and is not an error.
-        return Ok(());
-    }
+        graph_id.to_string()
+    } else {
+        let prefixed = format!("goal:{graph_id}");
+        if objective_supervisor
+            .goal_store()
+            .projection(&prefixed)?
+            .is_some()
+        {
+            prefixed
+        } else {
+            // Mission/Team graphs are local execution projections. Only a
+            // graph carrying a durable GoalContract may be promoted into
+            // Objective truth; absence is expected for child graphs.
+            return Ok(());
+        }
+    };
     let graph = graphs
         .load_async(graph_id)
         .await
@@ -1075,8 +1090,30 @@ pub(crate) async fn reconcile_objective_from_program(
             state,
             artifact_refs: Vec::new(),
             evidence_refs,
-            reread_receipts: Vec::new(),
-            verifier_decision: None,
+            // A Program terminal is emitted only after the Team's terminal
+            // verifier has committed its durable evidence bundle. Preserve
+            // that verifier/reread fact explicitly at Objective scope so the
+            // final fence cannot be satisfied by a bare graph completion.
+            reread_receipts: terminal
+                .filter(|terminal| {
+                    terminal.node_status
+                        == harness_contract::execution_graph::ExecutionNodeStatus::Completed
+                })
+                .map(|terminal| {
+                    terminal
+                        .evidence_refs
+                        .iter()
+                        .map(|reference| format!("reread:{:?}", reference.evidence_ref))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            verifier_decision: terminal
+                .filter(|terminal| {
+                    terminal.node_status
+                        == harness_contract::execution_graph::ExecutionNodeStatus::Completed
+                        && !terminal.evidence_refs.is_empty()
+                })
+                .map(|_| "team_terminal_verified".to_string()),
             diagnostic_code,
         });
     }
@@ -1094,12 +1131,18 @@ pub(crate) async fn reconcile_objective_from_program(
     } else {
         harness_contract::goal::ObjectiveTerminalKind::Blocked
     };
+    // The root GoalContract has a durable acceptance criterion bound to the
+    // execution graph itself.  Carry that graph receipt into the Objective
+    // projection explicitly; Team-local evidence alone must never leave the
+    // Objective criteria open (or force a false replan after a settled
+    // Program).  This is the canonical cross-scope evidence bridge.
+    let objective_evidence_refs = vec![format!("execution_graph:{graph_id}")];
     let decision = objective_supervisor.reconcile(
-        graph_id,
+        &goal_id,
         graph.revision,
         &format!("objective:{graph_id}:program:{}", program.revision),
         obligations,
-        Vec::new(),
+        objective_evidence_refs.clone(),
         diagnostics,
         matches!(
             kind,

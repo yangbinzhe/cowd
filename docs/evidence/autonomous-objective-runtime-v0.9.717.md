@@ -1,7 +1,8 @@
-# v0.9.717 Agent autonomy / task-market evidence
+# v0.9.717 Agent autonomy / task-market historical evidence
 
-Status: source implementation in progress; paid provider and browser E2E are
-reserved for v0.9.718.
+Status: **superseded by `autonomous-objective-runtime-closure-repair-v0.9.719.md`.**
+The original phase note was not a final acceptance record; its implementation and evidence state
+must be interpreted together with the closure-repair candidate.
 
 This phase removes production assumptions that a fixed fraction of Agents must
 propose work. `CollaborationWorkProposal::initiative` lets an Agent express

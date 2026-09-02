@@ -4135,6 +4135,7 @@ async fn project_team_terminal_outcome(
             session_id: packet.session_id().to_string(),
             turn_id: turn_id.to_string(),
             terminal_generation: graph.revision,
+            execution_scope: harness_contract::outcome::OutcomeExecutionScope::Team,
             paired_sample_id: None,
             task_id: Some(packet.task_id().to_string()),
             mission_id: Some(packet.mission_id().to_string()),

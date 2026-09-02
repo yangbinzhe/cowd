@@ -1,7 +1,10 @@
-# v0.9.716 Objective / Program Truth — Phase Evidence
+# v0.9.716 Objective / Program Truth — Historical Phase Evidence
 
-> Status: closed for source-level gates. Paid provider/browser E2E remains a
-> v0.9.718 gate.
+> Status: **superseded by `autonomous-objective-runtime-closure-repair-v0.9.719.md`.**
+> The original source-level closure claim was invalidated during reverse audit: the matrix below
+> still contained pending rows and therefore must not be read as a final acceptance record.
+
+> Historical status only. Paid provider/browser E2E remained a v0.9.718 gate.
 
 ## Frozen baseline
 
