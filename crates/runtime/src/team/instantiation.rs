@@ -595,8 +595,18 @@ impl TeamInstantiationService {
                 // from the frozen evidence contract; a resource lease is an
                 // authority ceiling and must never invent delivery debt.
                 add_explicit_evidence_acceptance(&mut slot_acceptance, upstream_only_consumer);
-                let resource_scopes =
+                let mut resource_scopes =
                     role_bounded_evidence_scopes(&slot_acceptance, &node_resource_scopes);
+                // Keep an authority-only workspace read alias for ToolHost
+                // cropping when the evidence contract has no concrete path.
+                // `role_bounded_evidence_scopes` intentionally omits `read:.`
+                // from acceptance debt, but dropping it here as well would
+                // erase every source tool from the delegated packet.
+                if resource_scopes.is_empty()
+                    && node_resource_scopes.iter().any(|scope| scope == "read:.")
+                {
+                    resource_scopes.push("read:.".to_string());
+                }
                 // Collaboration escalation is a Runtime-assigned exception,
                 // not a generic leaf capability.  Exposing its schema to
                 // every Team role contradicts `nested_orchestration:forbidden`:
