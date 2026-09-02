@@ -6,6 +6,12 @@
 
 ## v0.9.716 — Objective/Program Truth
 
+### Phase evidence
+
+```text
+docs/evidence/autonomous-objective-runtime-v0.9.716.md [new]
+```
+
 ### Core production files
 
 ```text
@@ -92,6 +98,12 @@ crates/runtime/src/orchestration/facade.rs:
 ```
 
 ## v0.9.717 — Event-driven Agent, projection, concurrency and cost
+
+### Phase evidence
+
+```text
+docs/evidence/autonomous-objective-runtime-v0.9.717.md [new]
+```
 
 ### Core production files
 
