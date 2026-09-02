@@ -1034,6 +1034,18 @@ impl TeamRuntime {
                 .into_iter()
                 .any(|receipt| {
                     receipt.outcome.evidence_ref == submission_ref
+                        // Providers commonly echo the durable receipt's
+                        // full-output handle (`tool://tool-raw-call…`) while
+                        // the commit index stores the focused evidence
+                        // handle (`…/evidence/…`).  Both are bound to this
+                        // exact Agent attempt; accepting the canonical
+                        // prefix avoids a false rejection without widening
+                        // authority to another Agent's receipts.
+                        || receipt
+                            .outcome
+                            .evidence_ref
+                            .starts_with(submission_ref)
+                        || submission_ref.starts_with(&receipt.outcome.evidence_ref)
                         || receipt.outcome.observed_evidence.iter().any(|evidence| {
                             evidence.evidence_ref.as_ref().is_some_and(|reference| {
                                 reference.evidence_ref.id == submission_ref
