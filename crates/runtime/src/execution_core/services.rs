@@ -1980,10 +1980,35 @@ impl RuntimeServices {
     /// where a catalog choice becomes an instance identity and data lease.
     pub fn compile_agent_task_intent(
         &self,
-        intent: AgentTaskIntent,
+        mut intent: AgentTaskIntent,
     ) -> Result<AgentTaskPacket, RuntimeServicesError> {
         let execution_identity = self.prepare_agent_task_intent(&intent)?;
         let policy_revision = self.canonical_task_policy_revision(&intent.task_id)?;
+        // Model-authored proposals occasionally omit the catalog identity even
+        // though Runtime has already admitted a typed Team role.  Recover only
+        // that narrow, authority-safe case: select exactly one approved catalog
+        // entry matching the role's granted capabilities.  Direct/untyped
+        // Agents remain fail-closed and still require an explicit Definition or
+        // catalog selection.
+        if intent.selected_agent_id.is_none()
+            && intent.definition_ref.is_none()
+            && intent.team_id.is_some()
+            && intent.team_role_identity.is_some()
+        {
+            let required = if intent.granted_capabilities.is_empty() {
+                vec!["read".to_string(), "search".to_string()]
+            } else {
+                intent
+                    .granted_capabilities
+                    .iter()
+                    .map(|capability| capability.as_str().to_string())
+                    .collect::<Vec<_>>()
+            };
+            let candidates = self.agent_runtime.catalog().discover(&required);
+            if candidates.len() == 1 {
+                intent.selected_agent_id = candidates.first().map(|entry| entry.agent_id.clone());
+            }
+        }
         let selected = intent
             .selected_agent_id
             .as_deref()
