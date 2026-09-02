@@ -499,11 +499,9 @@ pub(crate) fn compile_ephemeral_team_template_snapshot(
     .map_err(|error| format!("ephemeral_template_compile_failed:{error}"))?;
     let team_instructions =
         crate::team_template_candidate::normalized_team_instructions(&proposal.instructions);
-    let (revision, team_markdown) = crate::team_definition::build_revision(
-        candidate.manifest,
-        &team_instructions,
-    )
-    .map_err(|error| format!("ephemeral_template_revision_failed:{error}"))?;
+    let (revision, team_markdown) =
+        crate::team_definition::build_revision(candidate.manifest, &team_instructions)
+            .map_err(|error| format!("ephemeral_template_revision_failed:{error}"))?;
     let snapshot = harness_contract::execution_graph::EphemeralTeamTemplateSnapshot {
         session_id: lineage.session_id.clone(),
         turn_id: lineage.turn_id.clone(),
