@@ -1102,12 +1102,18 @@ impl ProviderRuntimeClient {
             .prompt
             .cache_cohort_user_prefix_messages()
             .into_iter()
-            .chain(request.prompt.immutable_user_prefix_messages())
             .map(InputMessage::user_text)
             .collect::<Vec<_>>();
+        // Keep cohort-wide immutable material at the beginning of the
+        // model-visible stream, but defer role-private material until after
+        // append-only history. Sibling Agents therefore share the longest
+        // real prefix possible; a different role brief cannot invalidate the
+        // common Team/program cache segment.
         let context = request
             .prompt
-            .contextual_messages()
+            .immutable_user_prefix_messages()
+            .into_iter()
+            .chain(request.prompt.contextual_messages())
             .into_iter()
             .map(InputMessage::user_text)
             .collect::<Vec<_>>();
@@ -1132,7 +1138,6 @@ fn compile_provider_input_messages(
         state.last_request_context.clear();
     }
     let append_only = history.starts_with(&state.session_history);
-    let history_unchanged = history == state.session_history;
     let context_unchanged = context == state.last_request_context;
     let mut wire = if append_only {
         state.wire_messages.clone()
@@ -1148,17 +1153,31 @@ fn compile_provider_input_messages(
     } else {
         wire.extend_from_slice(&history);
     }
-    // An identical retry remains byte-identical. Once Provider output extends
-    // SessionHistory, append the current capsule after that output even when
-    // the capsule itself did not change.
-    if !history_unchanged || !context_unchanged || wire.is_empty() {
-        wire.extend(context.iter().cloned());
+    // Append only a changed context suffix. Repeating an unchanged role brief
+    // after every assistant turn needlessly grows the prompt and makes the
+    // cache cohort pay for duplicate bytes; a changed runtime capsule still
+    // follows the latest history exactly once.
+    if !context_unchanged || wire.is_empty() {
+        wire.extend(context_delta(&state.last_request_context, &context));
     }
     state.session_history = history;
     state.immutable_prefix = immutable_prefix;
     state.wire_messages.clone_from(&wire);
     state.last_request_context = context;
     wire
+}
+
+fn context_delta(previous: &[InputMessage], current: &[InputMessage]) -> Vec<InputMessage> {
+    let common = previous
+        .iter()
+        .zip(current.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == current.len() {
+        Vec::new()
+    } else {
+        current[common..].to_vec()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2418,6 +2437,30 @@ mod tests {
         assert!(matches!(
             changed[0].content.as_slice(),
             [InputContentBlock::Text { text }] if text == "other-team-context"
+        ));
+    }
+
+    #[test]
+    fn role_private_context_is_after_history_for_cache_cohort_reuse() {
+        let mut state = ProviderPromptHistory::default();
+        let first = compile_provider_input_messages(
+            &mut state,
+            vec![provider::InputMessage::user_text("shared-cohort")],
+            vec![provider::InputMessage::user_text("turn-1")],
+            vec![provider::InputMessage::user_text("private-role")],
+        );
+        assert_eq!(first.len(), 3);
+        assert!(matches!(
+            first[0].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "shared-cohort"
+        ));
+        assert!(matches!(
+            first[1].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "turn-1"
+        ));
+        assert!(matches!(
+            first[2].content.as_slice(),
+            [InputContentBlock::Text { text }] if text == "private-role"
         ));
     }
 

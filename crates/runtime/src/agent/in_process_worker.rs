@@ -413,60 +413,14 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // refs below remain the capability ceiling; this worker never scans
         // package directories or falls back to an empty production profile.
         let skill_catalog = services.skill_catalog();
-        // Claim the exact assigned work at the Runtime safe checkpoint before
-        // provider execution. Independent nodes use per-work CAS and retry
-        // unrelated graph-stream contention, so a large Team does not spend
-        // an extra provider round bidding or serialize on a stale root rev.
-        if packet.team_id().is_some() {
-            let graph = services
-                .graph_state_store()
-                .load(packet.graph_id())
-                .map_err(|error| format!("load Team work marketplace: {error}"))?;
-            if graph
-                .nodes
-                .iter()
-                .any(|node| node.id == packet.node_id() && node.work.is_some())
-            {
-                let state = graph.work_states.get(packet.node_id());
-                let already_owned =
-                    state
-                        .and_then(|state| state.claim.as_ref())
-                        .is_some_and(|claim| {
-                            claim.claimant_instance_id == binding.instance.instance_id
-                        });
-                if !already_owned
-                    && state.is_none_or(|state| {
-                        matches!(
-                            state.status,
-                            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Offered
-                                | harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged
-                        )
-                    })
-                {
-                    services
-                        .team_runtime()
-                        .apply_collaboration_control(crate::CollaborationControlRequest {
-                            graph_id: packet.graph_id().to_string(),
-                            node_id: packet.node_id().to_string(),
-                            operation: crate::CollaborationControlOperation::Claim,
-                            expected_revision: Some(graph.revision),
-                            expected_work_revision: Some(
-                                state.map_or(0, |state| state.revision),
-                            ),
-                            work_node_id: Some(packet.node_id().to_string()),
-                            claim_token: None,
-                            lease_duration_ms: Some(300_000),
-                            submission_ref: None,
-                            finding: None,
-                            proposal: None,
-                            rationale: None,
-                            estimated_cost: None,
-                        })
-                        .await
-                        .map_err(|error| format!("claim assigned Team work: {error}"))?;
-                }
-            }
-        }
+        // Assigned Team work remains `Offered` until the bound Agent has
+        // consumed the durable marketplace checkpoint and explicitly bids and
+        // claims it.  The scheduler must never silently claim on the Agent's
+        // behalf: doing so bypasses the bid/claim lifecycle, makes autonomy
+        // metrics lie, and prevents a peer from seeing a real opportunity.
+        // The bounded checkpoint below is the only Runtime-assisted bootstrap
+        // and still requires native collaboration_control mutations by this
+        // exact binding.
         let external_context_items = if binding.data_lease.team_working_state_visible {
             let unread = services
                 .team_runtime()
@@ -1424,7 +1378,40 @@ fn agent_autonomy_checkpoint(
         .as_millis() as u64;
     let mut actions = Vec::new();
     let mut requires_execution_tools = false;
-    for (work_id, work) in &graph.autonomous_work {
+    let can_propose_peer_check = graph
+        .autonomous_work
+        .values()
+        .all(|work| work.proposed_by.as_deref() != Some(agent_id))
+        && graph.nodes.iter().any(|node| {
+            node.id != packet.node_id()
+                && node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask
+                && graph
+                    .node_statuses
+                    .get(&node.id)
+                    .is_none_or(|status| !status.is_terminal())
+                && serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
+                    .is_ok_and(|candidate| candidate.team_id() == packet.team_id())
+        });
+    // A Team has two truthful work sources: scheduler-offered node work and
+    // Agent-proposed market work.  Present both through one checkpoint so
+    // removing scheduler auto-claim does not strand assigned work, while
+    // only the latter requires a bid before claim.
+    let mut work_items = graph
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            node.work
+                .as_ref()
+                .map(|work| (node.id.as_str(), work, false))
+        })
+        .collect::<Vec<_>>();
+    work_items.extend(
+        graph
+            .autonomous_work
+            .iter()
+            .map(|(work_id, work)| (work_id.as_str(), work, true)),
+    );
+    for (work_id, work, agent_proposed) in work_items {
         let Some(state) = graph.work_states.get(work_id) else {
             continue;
         };
@@ -1462,11 +1449,19 @@ fn agent_autonomy_checkpoint(
             | harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged
                 if eligible && work.proposed_by.as_deref() != Some(agent_id) =>
             {
-                let has_bid = state
-                    .bids
-                    .iter()
-                    .any(|bid| bid.bidder_instance_id == agent_id);
-                (if has_bid { "claim" } else { "bid_then_claim" }, None)
+                if agent_proposed {
+                    let has_bid = state
+                        .bids
+                        .iter()
+                        .any(|bid| bid.bidder_instance_id == agent_id);
+                    (if has_bid { "claim" } else { "bid_then_claim" }, None)
+                } else {
+                    // Scheduler-offered Team work is not an Agent proposal,
+                    // therefore no bid is valid or required. It still needs
+                    // the bound Agent's explicit native claim; Runtime never
+                    // claims it on the Agent's behalf.
+                    ("claim", None)
+                }
             }
             harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Claimed
                 if eligible
@@ -1533,6 +1528,12 @@ fn agent_autonomy_checkpoint(
                     }
                 ]
             }),
+            "claim" => serde_json::json!({
+                "operation": "claim",
+                "work_node_id": work_id,
+                "expected_work_revision": state.revision,
+                "lease_duration_ms": 300000
+            }),
             _ => serde_json::Value::Null,
         };
         actions.push(serde_json::json!({
@@ -1550,6 +1551,37 @@ fn agent_autonomy_checkpoint(
         if actions.len() >= 16 {
             break;
         }
+    }
+
+    // A typed Team assignment is itself a bounded source of initiative: when
+    // no peer-check has yet been proposed by this binding, expose one concrete
+    // opportunity.  The Agent still chooses the semantic objective and must
+    // commit it through `propose_work`; Runtime only supplies a safe shape so
+    // the model cannot mistake the opportunity for a fabricated completion.
+    if can_propose_peer_check
+        && !graph
+            .autonomous_work
+            .values()
+            .any(|work| work.proposed_by.as_deref() == Some(agent_id))
+    {
+        actions.push(serde_json::json!({
+            "work_id": null,
+            "work_revision": 0,
+            "status": "opportunity",
+            "objective": format!("Independently cross-check the bounded result for role {} and publish one evidence-backed finding", packet.assignment.role_id),
+            "action": "propose_work",
+            "proposal_template": {
+                "operation": "propose_work",
+                "expected_work_revision": 0,
+                "proposal": {
+                    "idempotency_key": format!("peer-check:{}", packet.assignment.role_id),
+                    "objective": "replace with one concrete, bounded peer cross-check",
+                    "role": "cross_check",
+                    "required_capabilities": [],
+                    "output_artifact_kinds": ["peer_cross_check"]
+                }
+            }
+        }));
     }
 
     let unread = services
@@ -1603,7 +1635,7 @@ fn agent_autonomy_checkpoint(
         autonomy_checkpoint_tool_plan(packet, requires_tool_action, requires_execution_tools);
     Ok(Some(AgentAutonomyCheckpoint {
         prompt: format!(
-            "Runtime safe checkpoint committed after your prior model round. Resolve the actionable work and peer entries below using the native collaboration tools before returning. Do not invent identities, revisions, claim tokens, artifacts, sources, or completion. Do not create another proposal merely to prolong the loop. Preserve the substance and evidence of your earlier result and return a complete updated terminal answer after the checkpoint is closed.\n\n{checkpoint}"
+            "Runtime safe checkpoint committed after your prior model round. Resolve the actionable work and peer entries below using the native collaboration tools before returning. When the checkpoint contains a `propose_work` opportunity, make exactly one genuine bounded peer cross-check proposal if your result exposes a useful verification need; do not propose a cosmetic or duplicate task. Follow each action exactly: scheduler-offered work is claimed directly; Agent-proposed work requires bid before claim; then execute, publish, submit, and let an independent peer review it. Do not invent identities, revisions, claim tokens, artifacts, sources, or completion. Preserve the substance and evidence of your earlier result and return a complete updated terminal answer after the checkpoint is closed.\n\n{checkpoint}"
         ),
         tool_ids,
         requires_tool_action,
@@ -2819,10 +2851,21 @@ fn normalize_delegated_resource_value(
     else {
         return parsed;
     };
-    let requested_root = object
+    let requested_path = object
         .get("path")
         .and_then(serde_json::Value::as_str)
-        .is_none_or(|path| workspace_root_request(path, workspace_root));
+        .unwrap_or_default()
+        .to_string();
+    // Empty glob roots are semantically the workspace root.  Normalize them
+    // before scope rewriting so the ToolHost never receives an empty resource
+    // key (which is rejected as malformed rather than treated as `.`).
+    if requested_path.trim().is_empty() {
+        object.insert(
+            "path".to_string(),
+            serde_json::Value::String(".".to_string()),
+        );
+    }
+    let requested_root = workspace_root_request(&requested_path, workspace_root);
     if !requested_root {
         return parsed;
     }
@@ -2878,7 +2921,23 @@ fn normalize_delegated_resource_value(
         .strip_prefix(scope)
         .unwrap_or_default()
         .trim_start_matches('/');
-    let Ok(scoped_identity) = path_identity_resolver.resolve_existing(scope) else {
+    let scoped_identity = path_identity_resolver.resolve_existing(scope).ok();
+    // A Team may receive a write lease for a not-yet-created virtual delivery
+    // directory (currently `team.dependencies`).  Preserve the lexical scope
+    // in the native glob request; authorization below applies the same
+    // workspace/repository fence without requiring the directory to exist
+    // before the first Agent creates it.
+    if scoped_identity.is_none() && is_virtual_directory_scope(scope) {
+        object.insert("path".to_string(), serde_json::Value::String(scope.clone()));
+        if !suffix.is_empty() {
+            object.insert(
+                "pattern".to_string(),
+                serde_json::Value::String(suffix.to_string()),
+            );
+        }
+        return parsed;
+    }
+    let Some(scoped_identity) = scoped_identity else {
         return parsed;
     };
     if scoped_identity.object_kind == harness_contract::context::WorkspaceObjectKind::File {
@@ -2920,6 +2979,19 @@ fn glob_pattern_has_no_explicit_root(pattern: &str) -> bool {
         .split('/')
         .next()
         .is_some_and(|segment| segment.contains(['*', '?', '[', '{']))
+}
+
+/// Virtual delivery namespaces are declared as directory scopes before any
+/// artifact exists.  They are still lexical workspace-relative paths and are
+/// never allowed to contain traversal or an absolute prefix.
+fn is_virtual_directory_scope(scope: &str) -> bool {
+    let Some(parts) = normalized_relative_parts(scope) else {
+        return false;
+    };
+    !parts.is_empty()
+        && parts
+            .first()
+            .is_some_and(|part| part == "team.dependencies")
 }
 
 fn workspace_root_request(path: &str, workspace_root: &std::path::Path) -> bool {
@@ -3112,7 +3184,7 @@ fn resource_path_is_authorized(
         return false;
     };
     allowed_scopes.iter().any(|scope| {
-        let (mode, allowed) = scope.split_once(':').unwrap_or(("", ""));
+        let (mode, allowed_scope) = scope.split_once(':').unwrap_or(("", ""));
         if (write && mode != "write") || (!write && mode != "read" && mode != "write") {
             return false;
         }
@@ -3123,12 +3195,13 @@ fn resource_path_is_authorized(
         // scope already proves the Runtime authorized the entire workspace.
         // The workspace identity check below still bounds them to this
         // workspace and never to absolute or traversing paths.
+        let allowed_existing = resolver.resolve_existing(allowed_scope).ok();
         let allowed = if mode == "write" {
-            resolver.resolve_planned_file(allowed)
+            resolver.resolve_planned_file(allowed_scope).ok()
         } else {
-            resolver.resolve_existing(allowed)
+            allowed_existing.clone()
         };
-        let Ok(allowed) = allowed else {
+        let Some(allowed) = allowed else {
             return false;
         };
         if requested.workspace_id != allowed.workspace_id
@@ -3137,6 +3210,15 @@ fn resource_path_is_authorized(
             return false;
         }
         if allowed.object_kind == harness_contract::context::WorkspaceObjectKind::Directory {
+            path_within_scope(
+                &requested.repository_relative_path,
+                &allowed.repository_relative_path,
+            )
+        } else if allowed_existing.is_none() && is_virtual_directory_scope(allowed_scope) {
+            // `resolve_planned_file` intentionally classifies a missing path
+            // as File.  For the reserved virtual delivery namespace, a
+            // descendant is nevertheless a valid directory member; retain
+            // identity and repository checks above and compare lexically.
             path_within_scope(
                 &requested.repository_relative_path,
                 &allowed.repository_relative_path,

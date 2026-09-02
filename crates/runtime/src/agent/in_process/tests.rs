@@ -1286,6 +1286,36 @@ fn exact_new_artifact_scope_remains_narrow_and_writable() {
 }
 
 #[test]
+fn virtual_team_delivery_directory_scope_authorizes_new_descendants() {
+    let root = tempfile::tempdir().expect("workspace");
+    let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
+        .expect("path identities");
+    assert!(resource_path_is_authorized(
+        &resolver,
+        "team.dependencies/research/README.md",
+        &["write:team.dependencies".to_string()],
+        true,
+    ));
+    assert!(!resource_path_is_authorized(
+        &resolver,
+        "team.other/research/README.md",
+        &["write:team.dependencies".to_string()],
+        true,
+    ));
+    let normalized = normalize_delegated_resource_paths(
+        "glob_search",
+        &serde_json::json!({"path":"", "pattern":"team.dependencies/**"}).to_string(),
+        root.path(),
+        &resolver,
+        Some(&["write:team.dependencies".to_string()]),
+    )
+    .expect("normalize virtual delivery glob");
+    let normalized: serde_json::Value = serde_json::from_str(&normalized).expect("json");
+    assert_eq!(normalized["path"], "team.dependencies");
+    assert_eq!(normalized["pattern"], "**");
+}
+
+#[test]
 fn absolute_escape_and_parent_traversal_remain_unauthorized() {
     let root = tempfile::tempdir().expect("workspace");
     let resolver = crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())

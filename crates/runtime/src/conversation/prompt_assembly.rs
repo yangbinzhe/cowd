@@ -87,8 +87,8 @@ pub struct PromptAssembly {
     /// policy.
     pub(crate) cache_cohort_user_prefix: Vec<String>,
     /// Immutable but role-private user brief supplied by a frozen packet.
-    /// It follows the cohort prefix and therefore cannot cross a Team role
-    /// boundary while still staying before the private transcript.
+    /// Provider compilation emits it after append-only history so it cannot
+    /// invalidate the shared cohort prefix across sibling Team roles.
     pub(crate) immutable_user_prefix: Vec<String>,
     /// Runtime-attested request-local context. These fragments are emitted
     /// after the append-only conversation history so they cannot invalidate
