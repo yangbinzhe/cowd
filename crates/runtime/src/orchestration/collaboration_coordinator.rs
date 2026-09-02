@@ -982,6 +982,16 @@ pub(crate) async fn reconcile_objective_from_program(
     objective_supervisor: &crate::execution_core::goal::ObjectiveSupervisor,
     graphs: &ExecutionGraphStateStore,
 ) -> Result<(), String> {
+    if objective_supervisor
+        .goal_store()
+        .projection(graph_id)?
+        .is_none()
+    {
+        // Mission/Team graphs are local execution projections.  Only a graph
+        // carrying a durable GoalContract may be promoted into Objective
+        // truth; absence is expected for child graphs and is not an error.
+        return Ok(());
+    }
     let graph = graphs
         .load_async(graph_id)
         .await
