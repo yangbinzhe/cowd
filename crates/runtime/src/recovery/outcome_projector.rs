@@ -863,7 +863,11 @@ mod tests {
                 session_id: "session".to_string(),
                 turn_id: "turn".to_string(),
                 terminal_generation: 1,
-                execution_scope: harness_contract::outcome::OutcomeExecutionScope::Unknown,
+                // Projector fixtures must satisfy the canonical outcome
+                // writer's identity fence. `Unknown` is intentionally
+                // rejected at the durable boundary and is reserved for
+                // legacy payloads that are never recorded directly.
+                execution_scope: harness_contract::outcome::OutcomeExecutionScope::Task,
                 paired_sample_id: None,
                 task_id: None,
                 mission_id: None,
