@@ -837,7 +837,12 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // bidding round: it runs only when durable work already needs an
         // action from this identity and remains under the original budget,
         // permission, graph and attempt fences.
-        for checkpoint_round in 1..=3 {
+        // A Team may need more than one lifecycle action per Agent (proposal,
+        // bid, claim, submit, then an independent review).  Keep the loop
+        // finite and budget-governed, but do not abandon an actionable work
+        // item merely because a provider marks an intermediate response
+        // `Partial` or `Open`.
+        for checkpoint_round in 1..=8 {
             let Some(checkpoint) = agent_autonomy_checkpoint(&services, &packet)? else {
                 break;
             };
@@ -859,7 +864,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     let may_continue =
                         autonomy_continuation_may_advance(updated.terminal_completion);
                     summary = updated;
-                    if !may_continue {
+                    if !may_continue && !checkpoint.requires_tool_action {
                         let _ = services.agent_runtime().record_progress(
                             packet.agent_id(),
                             "agent.autonomy.checkpoint_stopped",
@@ -874,7 +879,10 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                         "agent.autonomy.checkpoint_failed",
                         &format!("bounded collaboration continuation failed: {error}"),
                     );
-                    break;
+                    // The next bounded round reloads the durable Team state
+                    // and may receive a fresh action template (for example
+                    // after a concurrent bid advanced the work revision).
+                    continue;
                 }
             }
         }
