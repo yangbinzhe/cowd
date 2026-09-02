@@ -554,10 +554,30 @@ impl TeamInstantiationService {
                 let node_id = format!("{}:{}:{}", graph.id, role.role_id, slot + 1);
                 let run_id = format!("{}:run:{}:{}", request.team_id, role.role_id, slot + 1);
                 let task_id = format!("{}:task:{}:{}", request.team_id, role.role_id, slot + 1);
-                let node_resource_scopes = bounded_slot_resource_scopes(
+                let mut node_resource_scopes = bounded_slot_resource_scopes(
                     &request.resource_scopes,
                     &focus_partition.capability_cropped_refs,
                 );
+                // A terminal role that owns an evidence-bearing Team result
+                // needs a concrete read lease even when the model omitted a
+                // focus/resource scope.  Without this normalization the
+                // delegated ToolHost quite correctly crops every file tool
+                // (there is no bounded workspace to read), leaving the Agent
+                // with only Runtime control tools and making a source-backed
+                // task fail before it can acquire its first receipt.  The
+                // whole-workspace read alias is still read-only and remains
+                // an authority ceiling; acceptance obligations continue to
+                // require explicit paths where the contract names them.
+                if terminal_candidate_role
+                    && manifest.result_contract.evidence_required
+                    && !node_resource_scopes.iter().any(|scope| {
+                        scope.starts_with("read:")
+                            || scope.starts_with("write:")
+                            || scope.starts_with("worktree:")
+                    })
+                {
+                    node_resource_scopes.push("read:.".to_string());
+                }
                 let requires_reacquisition =
                     role_requires_independent_evidence_reacquisition(role, &node_resource_scopes);
                 let upstream_only_consumer = upstream_consumer_role && !requires_reacquisition;
