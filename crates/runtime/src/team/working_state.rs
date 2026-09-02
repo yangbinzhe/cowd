@@ -99,6 +99,22 @@ pub struct CollaborationWorkProposal {
     pub expected_duration_ms: u64,
     #[serde(default)]
     pub scheduling_priority: u8,
+    /// Optional Agent-authored expansion. Runtime validates authority and
+    /// resources, but does not impose a fixed count or role shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiative: Option<AgentInitiativeProposal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInitiativeProposal {
+    pub objective: String,
+    #[serde(default)]
+    pub dependency_refs: Vec<String>,
+    #[serde(default)]
+    pub collaboration_refs: Vec<String>,
+    #[serde(default)]
+    pub requested_team_roles: Vec<String>,
 }
 
 /// Semantic Agent request. Graph/team/claimant/reviewer authority is never

@@ -1579,6 +1579,7 @@ fn runtime_default_autonomous_proposal_request(
             expected_output_tokens: 0,
             expected_duration_ms: 0,
             scheduling_priority: 64,
+            initiative: None,
         }),
         rationale: None,
         estimated_cost: None,

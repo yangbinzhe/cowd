@@ -1608,6 +1608,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
                 expected_output_tokens: 500,
                 expected_duration_ms: 30_000,
                 scheduling_priority: 200,
+                initiative: None,
             }),
             rationale: None,
             estimated_cost: None,
