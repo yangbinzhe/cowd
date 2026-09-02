@@ -31,6 +31,14 @@ const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(128);
 // requests explicitly call `without_retries()` so Runtime remains their sole
 // retry/fallback owner.
 const DEFAULT_MAX_RETRIES: u32 = 8;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+fn bounded_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
 // Some DeepSeek-compatible deployments emit a documented DSML envelope in
 // `content` instead of OpenAI's structured `tool_calls`. This is intentionally
 // narrow: generic XML-shaped model text must remain text and never become an
@@ -201,7 +209,7 @@ impl OpenAiCompatClient {
     }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
-        Self::new_with_http(api_key, config, reqwest::Client::new())
+        Self::new_with_http(api_key, config, bounded_http_client())
     }
 
     #[must_use]
@@ -250,7 +258,7 @@ impl OpenAiCompatClient {
             base_url,
             provider_name,
             wire_protocol,
-            reqwest::Client::new(),
+            bounded_http_client(),
         )
     }
 
