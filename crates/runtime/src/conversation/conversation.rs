@@ -115,6 +115,7 @@ struct EvaluationProviderTokenLeaseState {
     lease_id: String,
     limit: u64,
     remaining: u64,
+    variance_remaining: u64,
     input_consumed: u64,
     output_consumed: u64,
     cached_consumed: u64,
@@ -139,6 +140,7 @@ impl EvaluationProviderTokenLease {
                 lease_id: lease_id.to_string(),
                 limit,
                 remaining: limit,
+                variance_remaining: (limit / 20).max(1),
                 input_consumed: 0,
                 output_consumed: 0,
                 cached_consumed: 0,
@@ -289,16 +291,17 @@ impl EvaluationProviderTokenReservation {
             .input_total_tokens()
             .saturating_add(request.budget.protocol_overhead_tokens)
             .saturating_add(request.budget.safety_margin_tokens);
-        if input_reserve >= state.remaining {
+        let available = state.remaining.saturating_add(state.variance_remaining);
+        if input_reserve >= available {
             return Err(RuntimeError::new(format!(
                 "evaluation provider token lease `{}` has {} tokens remaining but request input reserves {}",
-                state.lease_id, state.remaining, input_reserve
+                state.lease_id, available, input_reserve
             )));
         }
         let output_reserve = request
             .budget
             .requested_output_tokens
-            .min(state.remaining.saturating_sub(input_reserve));
+            .min(available.saturating_sub(input_reserve));
         if output_reserve == 0 {
             return Err(RuntimeError::new(format!(
                 "evaluation provider token lease `{}` has no output capacity",
@@ -307,7 +310,11 @@ impl EvaluationProviderTokenReservation {
         }
         request.budget.requested_output_tokens = output_reserve;
         let reserved = input_reserve.saturating_add(output_reserve);
-        state.remaining = state.remaining.saturating_sub(reserved);
+        let primary = reserved.min(state.remaining);
+        state.remaining = state.remaining.saturating_sub(primary);
+        state.variance_remaining = state
+            .variance_remaining
+            .saturating_sub(reserved.saturating_sub(primary));
         state.outstanding = state.outstanding.saturating_add(1);
         drop(state);
         Ok(Some(Self {
@@ -354,8 +361,13 @@ impl EvaluationProviderTokenReservation {
                 // have already been removed from `remaining`, so this charge
                 // cannot steal their capacity or exceed the hard lease.
                 let unreserved_delta = actual.saturating_sub(self.reserved);
-                if unreserved_delta <= lease.remaining {
-                    lease.remaining = lease.remaining.saturating_sub(unreserved_delta);
+                let available = lease.remaining.saturating_add(lease.variance_remaining);
+                if unreserved_delta <= available {
+                    let primary = unreserved_delta.min(lease.remaining);
+                    lease.remaining = lease.remaining.saturating_sub(primary);
+                    lease.variance_remaining = lease
+                        .variance_remaining
+                        .saturating_sub(unreserved_delta.saturating_sub(primary));
                 } else {
                     lease.breached = true;
                     lease.remaining = 0;
