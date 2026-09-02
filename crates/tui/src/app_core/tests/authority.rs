@@ -102,11 +102,10 @@ fn repeated_full_refresh_avoids_at_least_fifteen_percent_of_materialization() {
     let mut state = TuiState::new("model", "session-0");
     let refreshes = 20;
 
-    reset_session_catalog_materializations();
     for _ in 0..refreshes {
         state.apply_gateway_session_catalog(&catalog);
     }
-    let candidate_materializations = session_catalog_materializations();
+    let candidate_materializations = state.session_catalog_materializations;
     let legacy_materializations = 128 * refreshes;
     let reduction_percent = 100.0 * (legacy_materializations - candidate_materializations) as f64
         / legacy_materializations as f64;

@@ -34,22 +34,6 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[cfg(test)]
-static SESSION_CATALOG_MATERIALIZATIONS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(test)]
-fn reset_session_catalog_materializations() {
-    SESSION_CATALOG_MATERIALIZATIONS.store(0, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-fn session_catalog_materializations() -> usize {
-    SESSION_CATALOG_MATERIALIZATIONS.load(Ordering::Relaxed)
-}
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 
@@ -254,6 +238,8 @@ pub struct TuiState {
     pub session: SessionUiState,
     pub workbench: WorkbenchState,
     pub overlay: OverlayState,
+    #[cfg(test)]
+    pub(crate) session_catalog_materializations: usize,
 }
 
 impl TuiState {
@@ -408,6 +394,8 @@ impl TuiState {
                 diff_viewer,
                 performance_dashboard,
             },
+            #[cfg(test)]
+            session_catalog_materializations: 0,
         };
         state.flush_app_surface_commands();
         state.sync_app_palette_actions();
@@ -823,7 +811,10 @@ impl TuiState {
                     .and_then(serde_json::Value::as_str)?
                     .to_string();
                 #[cfg(test)]
-                SESSION_CATALOG_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+                {
+                    self.session_catalog_materializations =
+                        self.session_catalog_materializations.saturating_add(1);
+                }
                 let updated_at_ms = session
                     .get("updated_at")
                     .and_then(serde_json::Value::as_str)
