@@ -60,6 +60,12 @@ const PROVIDER_PROTOCOL_RECOVERY_BUDGET: u8 = 1;
 /// whole multi-Team Program when one provider response omits schema labels,
 /// while the small hard bound still prevents an open-ended model loop.
 const STRUCTURED_OUTPUT_RECOVERY_BUDGET: u8 = 2;
+/// A delegated leaf may change its tool approach once after consecutive local
+/// failures with no retained evidence. This is intentionally independent from
+/// provider-protocol recovery: the latter repairs malformed provider frames,
+/// while this one repairs a valid-but-unproductive delegated work path.
+const DELEGATED_TOOL_FAILURE_REPLAN_BUDGET: u8 = 1;
+const DELEGATED_TOOL_FAILURE_REPLAN_MARKER: &str = "delegated_tool_failure_replan:v1";
 /// A provider can legally return prose despite a named-tool wire constraint.
 /// Permit three bounded root admission repairs before reporting a durable
 /// incomplete result. This budget applies only before any Team Program exists;
@@ -76,6 +82,16 @@ fn next_consecutive_tool_failure_batches(
     } else {
         current.saturating_add(1)
     }
+}
+
+fn delegated_tool_failure_replan_available(
+    bounded_evidence_role: bool,
+    has_successful_tool_evidence: bool,
+    consumed_replans: u8,
+) -> bool {
+    bounded_evidence_role
+        && !has_successful_tool_evidence
+        && consumed_replans < DELEGATED_TOOL_FAILURE_REPLAN_BUDGET
 }
 
 /// The root collaboration contract has a deliberately small, durable control
@@ -674,6 +690,7 @@ where
             clean_terminal_retry_attempted: false,
             terminal_failure_narration: None,
             consecutive_tool_failure_batches: 0,
+            delegated_failure_replans: 0,
             consecutive_low_novelty_batches: 0,
             successful_tool_calls: 0,
             tool_receipts_observed: recovered_tool_receipt_count,
@@ -965,6 +982,26 @@ where
         {
             let mut turn_state = state.lock().await;
             turn_state.goal_id = goal_id;
+            // Rehydrate the bounded delegated-recovery lease from the durable
+            // Goal stream. A graph/node replay must not reset a consumed
+            // semantic replan and accidentally reopen an unbounded retry path.
+            turn_state.delegated_failure_replans = services
+                .goal_store()
+                .projection(&turn_state.goal_id)
+                .ok()
+                .flatten()
+                .map(|projection| {
+                    projection
+                        .interventions
+                        .iter()
+                        .filter(|intervention| {
+                            intervention.reason.starts_with(DELEGATED_TOOL_FAILURE_REPLAN_MARKER)
+                        })
+                        .count()
+                        .min(usize::from(DELEGATED_TOOL_FAILURE_REPLAN_BUDGET))
+                        as u8
+                })
+                .unwrap_or_default();
             turn_state.required_write_for_completion = required_write_for_turn(
                 strategy.decision.strategy.understanding.requires_write,
                 turn_state.bounded_evidence_role,
@@ -2897,6 +2934,11 @@ struct TurnGraphState {
     /// provider output retains the exact observed attempt identity.
     terminal_failure_narration: Option<TerminalFailureNarration>,
     consecutive_tool_failure_batches: usize,
+    /// A delegated leaf may receive one Runtime-owned semantic replan after
+    /// consecutive tool failures with no retained evidence. This is a bounded
+    /// agency-preserving recovery, not a retry loop; once consumed, the next
+    /// identical failure remains fail-closed and is surfaced as blocked.
+    delegated_failure_replans: u8,
     consecutive_low_novelty_batches: usize,
     successful_tool_calls: usize,
     /// Count of committed success or failure tool receipts visible to later

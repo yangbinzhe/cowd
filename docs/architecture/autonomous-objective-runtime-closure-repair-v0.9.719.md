@@ -74,3 +74,30 @@ Provider。R3 完成后才运行真实 DeepSeek 与浏览器 E2E。每个失败�
 - cache gate 失败但总报告仍写 passed；
 - 旧 helper、旧 owner 或兼容 shim 仍在生产路径；
 - 真实运行卡在 finalizing/calling_tool，或目标状态与用户可见状态不一致。
+
+## v0.9.719 真实 DeepSeek 复盘与统一收敛（不可省略）
+
+真实 `deepseek-v4-flash` 场景（16 Agent / 4 Team）在 2026-09-02 的结果为
+`status=failed`，不是可接受的过渡交付。Runtime 观测到 A/B/C 完成，而 D 的一个
+上游整合角色只有 `collaboration_control` 与 `team_board` 两个控制工具，却在
+前驱写入后被动态追加了 `verify_upstream_change:<path>` 的精确读取义务；这是准入
+能力、工具暴露和运行时证据生成三处不一致造成的“不可能契约”，模型的两次工具
+尝试失败后被正确地 fail-closed。该失败不是模型质量问题，也不是应当通过放宽门禁
+掩盖的偶发错误。
+
+统一规则已经固化为：
+
+1. `upstream_evidence_only:no_tool_reacquisition` 的 reducer 只消费 Runtime 已认证
+   的 typed handoff，不再生成需要本地读取工具的二次校验义务；明确声明独立复核的
+   角色仍必须获得精确资源 lease 并执行 digest 读取。
+2. 有 bounded evidence lease 的 delegated leaf 在“连续工具失败且尚无证据”时，
+   只允许一次 Runtime-owned semantic replan（改变工具路径、读取诊断、禁止重复
+   指纹）；第二次仍失败立即 blocked。该计数与 graph/session 一起恢复，不能通过
+   新模型轮次或重启清零，也不能无限重试。
+3. Provider cache identity 只表示同一 provider/account/security cohort；不再把
+   角色工具 overlay、tool choice、采样等请求局部字段当作不同 cache identity。
+   真实 canonical prompt bytes 仍逐请求观测，DeepSeek 返回的 cache read/miss
+   才是成本事实，任何 internal warmup 合并都不得改写账单或验收阈值。
+
+本节的三条规则必须分别有 source-level negative/positive tests、运行时事件证据和
+最终浏览器/E2E 报告；缺任何一项都不得把本版本标记为完成。

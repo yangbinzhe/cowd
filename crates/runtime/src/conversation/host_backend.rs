@@ -3748,6 +3748,18 @@ where
             state.consecutive_low_novelty_batches = 0;
         }
         let has_successful_tool_evidence = state.successful_tool_calls > 0;
+        let delegated_failure_replan_available = delegated_tool_failure_replan_available(
+            bounded_evidence_role,
+            has_successful_tool_evidence,
+            state.delegated_failure_replans,
+        );
+        if repeated_local_failures && delegated_failure_replan_available {
+            // Consume the single semantic-replan lease before releasing the
+            // state guard. The next model step receives a fresh failure
+            // streak, while a second consecutive failure is still terminal.
+            state.delegated_failure_replans = state.delegated_failure_replans.saturating_add(1);
+            state.consecutive_tool_failure_batches = 0;
+        }
         let newly_completed_program_team_ids = completed_program_team_ids(&result.messages);
         let completed_root_team_this_batch = root_team_terminal_requires_text_only(
             state.execution_role.is_delegated_leaf(),
@@ -3991,12 +4003,19 @@ where
         } else if repeated_local_failures {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
-                kind: if has_successful_tool_evidence {
+                kind: if delegated_failure_replan_available {
+                    RuntimeInterventionKind::Replan
+                } else if has_successful_tool_evidence {
                     RuntimeInterventionKind::Synthesize
                 } else {
                     RuntimeInterventionKind::Block
                 },
-                reason: if has_successful_tool_evidence {
+                reason: if delegated_failure_replan_available {
+                    format!(
+                        "{}: one bounded delegated recovery lease is available: change the failed tool approach, inspect the exact Runtime diagnostic, and execute only an exposed authorized action; a second consecutive failure will block",
+                        DELEGATED_TOOL_FAILURE_REPLAN_MARKER
+                    )
+                } else if has_successful_tool_evidence {
                     "multiple consecutive tool batches failed after checked evidence was already retained; stop retrying and synthesize the bounded result with the failure explicit"
                         .to_string()
                 } else {

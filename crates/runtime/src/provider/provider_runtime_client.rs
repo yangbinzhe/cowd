@@ -1373,7 +1373,7 @@ fn provider_cache_material(
     wire: &provider::ProviderWireRequest,
     security_domain: &str,
     cache_cohort_system: Option<&str>,
-    cache_cohort_user_prefix: &[String],
+    _cache_cohort_user_prefix: &[String],
 ) -> (String, Vec<u8>) {
     let mut properties = wire.body.clone();
     let prompt_value = properties
@@ -1423,8 +1423,16 @@ fn provider_cache_material(
     // system message for OpenAI-compatible transports; providers with a
     // separate system field already carry it in `properties`.
     let stable_cohort_sha256 = format!("sha256:{:x}", Sha256::digest(stable_cohort_bytes));
-    let user_prefix_bytes = serde_json::to_vec(cache_cohort_user_prefix).unwrap_or_default();
-    let user_prefix_sha256 = format!("sha256:{:x}", Sha256::digest(user_prefix_bytes));
+    // The cache coordinator key is a *provider/account cohort*, not a copy of
+    // the complete request schema. Tool exposure, tool_choice, sampling and
+    // other request-local controls are intentionally excluded: delegated
+    // Agents may have different least-privilege overlays while still sharing
+    // the same immutable system/history prefix. The transport/provider remains
+    // the source of truth for actual prompt-cache billing; this key only lets
+    // the Runtime compare the real canonical prompt bytes and single-flight
+    // compatible prefixes instead of manufacturing one cold leader per role.
+    // Security fencing stays session/account scoped so no cache coordination
+    // crosses an authenticated execution domain.
     let identity = serde_json::json!({
         "provider": context.profile.provider_name,
         "base_url": context.profile.base_url,
@@ -1433,10 +1441,8 @@ fn provider_cache_material(
         "endpoint": wire.endpoint,
         "transport_fingerprint": context.transport_fingerprint.0,
         "security_domain": security_domain,
-        "cache_sensitive_properties": properties,
-        "tool_schema_sha256": wire.tool_schema_sha256,
+        "cache_cohort_schema_version": 2,
         "stable_cohort_sha256": stable_cohort_sha256,
-        "user_prefix_sha256": user_prefix_sha256,
     });
     let identity_bytes = serde_json::to_vec(&identity).unwrap_or_default();
     let cache_identity_sha256 = format!("sha256:{:x}", Sha256::digest(identity_bytes));
@@ -2231,7 +2237,68 @@ mod tests {
             Some("shared-program"),
             &["other-package".to_string()],
         );
-        assert_ne!(agent_a, other_package);
+        // User-prefix/package differences are represented in the canonical
+        // prompt bytes, not in the coordinator identity. This keeps one
+        // provider/account cohort warm while the prefix observer still
+        // reports the exact reusable-byte ratio for each request.
+        assert_eq!(agent_a, other_package);
+    }
+
+    #[test]
+    fn cache_coordinator_keeps_role_tool_overlays_in_one_provider_cohort() {
+        let context = ProviderRequestContext {
+            request_id: "request-a".to_string(),
+            profile: ResolvedProviderProfile {
+                registry_revision: 1,
+                provider_name: "deepseek".to_string(),
+                model: "deepseek-v4-flash".to_string(),
+                base_url: Some("https://api.deepseek.com".to_string()),
+                protocol: Some("openai".to_string()),
+                parallel_tool_calls_mode:
+                    model_protocol::provider_config::ParallelToolCallsMode::Auto,
+                effective_parallel_tool_calls: Some(true),
+                effective_early_tool_start: false,
+                model_capabilities: Vec::new(),
+                capabilities: ProviderCapabilityProfile::unknown(),
+            },
+            transport_fingerprint: crate::TransportProfileFingerprint(1),
+            attempt: 1,
+        };
+        let wire = |tool: &str| provider::ProviderWireRequest {
+            method: "POST".to_string(),
+            endpoint: "/chat/completions".to_string(),
+            protocol: "openai".to_string(),
+            headers: Vec::new(),
+            body: json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    {"role": "system", "content": "shared-program\nrole-private-tail"},
+                    {"role": "user", "content": "task"}
+                ],
+                "tools": [{"type": "function", "function": {"name": tool}}],
+                "parallel_tool_calls": true,
+                "temperature": 0.0,
+                "stream": true,
+                "max_tokens": 100
+            }),
+            body_sha256: format!("body-{tool}"),
+            tool_schema_sha256: Some(format!("schema-{tool}")),
+        };
+        let (reader, _) = provider_cache_material(
+            &context,
+            &wire("read_file"),
+            "session-a",
+            Some("shared-program"),
+            &[],
+        );
+        let (researcher, _) = provider_cache_material(
+            &context,
+            &wire("web_search"),
+            "session-a",
+            Some("shared-program"),
+            &[],
+        );
+        assert_eq!(reader, researcher);
     }
 
     #[test]

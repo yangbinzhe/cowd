@@ -215,36 +215,47 @@ impl NodeExecutor for AgentTaskExecutor {
             packet
                 .evidence_refs
                 .dedup_by(|left, right| left.evidence_ref == right.evidence_ref);
-            if let Some(resolver) = self.path_identity_resolver.get() {
-                for encoded in packet.evidence_refs.iter().filter_map(|evidence| {
-                    (evidence.evidence_ref.ref_type == "runtime_change")
-                        .then_some(evidence.evidence_ref.id.as_str())
-                }) {
-                    let Ok(change) = serde_json::from_str::<
-                        harness_contract::agent::AgentChangeReceipt,
-                    >(encoded) else {
-                        continue;
-                    };
-                    let Ok(mut obligation) = resolver
-                        .compile_obligation(&format!("verify_upstream_change:{}", change.path))
-                    else {
-                        continue;
-                    };
-                    if let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
-                        &mut obligation.target
-                    {
-                        scope.path.observed_revision_or_digest = Some(change.after_sha256);
-                    }
-                    if packet
-                        .required_acceptance
-                        .evidence_obligations
-                        .iter()
-                        .all(|existing| existing.obligation_id != obligation.obligation_id)
-                    {
-                        packet
+            // An upstream-only reducer consumes the authenticated predecessor
+            // envelope and is deliberately compiled without source tools. Its
+            // typed handoff is already the Runtime evidence boundary; adding a
+            // late `verify_upstream_change` obligation here would create an
+            // impossible contract (read evidence required, read_file absent)
+            // and deterministically block otherwise valid reducer roles. Roles
+            // that explicitly reacquire evidence keep the stronger digest
+            // verification below.
+            if should_verify_upstream_changes(&packet) {
+                if let Some(resolver) = self.path_identity_resolver.get() {
+                    for encoded in packet.evidence_refs.iter().filter_map(|evidence| {
+                        (evidence.evidence_ref.ref_type == "runtime_change")
+                            .then_some(evidence.evidence_ref.id.as_str())
+                    }) {
+                        let Ok(change) = serde_json::from_str::<
+                            harness_contract::agent::AgentChangeReceipt,
+                        >(encoded) else {
+                            continue;
+                        };
+                        let Ok(mut obligation) = resolver
+                            .compile_obligation(&format!("verify_upstream_change:{}", change.path))
+                        else {
+                            continue;
+                        };
+                        if let harness_contract::context::EvidenceTargetIdentity::Workspace {
+                            scope,
+                        } = &mut obligation.target
+                        {
+                            scope.path.observed_revision_or_digest = Some(change.after_sha256);
+                        }
+                        if packet
                             .required_acceptance
                             .evidence_obligations
-                            .push(obligation);
+                            .iter()
+                            .all(|existing| existing.obligation_id != obligation.obligation_id)
+                        {
+                            packet
+                                .required_acceptance
+                                .evidence_obligations
+                                .push(obligation);
+                        }
                     }
                 }
             }
@@ -443,6 +454,13 @@ impl NodeExecutor for AgentTaskExecutor {
             backend.cancellation_finalized(&packet);
         }
     }
+}
+
+fn should_verify_upstream_changes(packet: &AgentTaskPacket) -> bool {
+    !packet
+        .constraints
+        .iter()
+        .any(|constraint| constraint == "upstream_evidence_only:no_tool_reacquisition")
 }
 
 /// Collapse an append-only sequence of Runtime write receipts to one
@@ -954,5 +972,16 @@ mod tests {
             execution_status_for_agent_terminal(AgentTerminalStatus::Cancelled, true),
             ExecutionNodeStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn upstream_only_reducer_does_not_receive_impossible_digest_reverification() {
+        let mut packet = task();
+        packet
+            .constraints
+            .push("upstream_evidence_only:no_tool_reacquisition".to_string());
+        assert!(!should_verify_upstream_changes(&packet));
+        packet.constraints.clear();
+        assert!(should_verify_upstream_changes(&packet));
     }
 }

@@ -440,6 +440,14 @@
     }
 
     #[test]
+    fn delegated_tool_failure_recovery_is_single_use_and_evidence_aware() {
+        assert!(!delegated_tool_failure_replan_available(false, false, 0));
+        assert!(delegated_tool_failure_replan_available(true, false, 0));
+        assert!(!delegated_tool_failure_replan_available(true, false, 1));
+        assert!(!delegated_tool_failure_replan_available(true, true, 0));
+    }
+
+    #[test]
     fn terminal_program_failure_is_not_model_repairable() {
         let messages = vec![ConversationMessage::tool_result(
             "team",
