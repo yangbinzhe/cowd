@@ -792,6 +792,24 @@ fn compile_team(
             resolved_output_artifacts.sort();
             resolved_output_artifacts.dedup();
         }
+        // A terminal Team that owns workstream evidence must have at least one
+        // concrete read action available.  DeepSeek may omit `required_tools`
+        // while still declaring an evidence contract; inject the least
+        // privileged canonical snapshot tool when the selected Definition
+        // exposes it.  This preserves authority (no new capability is granted)
+        // and prevents an empty Team from reaching terminal evaluation.
+        let mut required_tools = canonical_set(&role.required_tools);
+        if !upstream_only
+            && terminal_result_artifacts_derived
+            && (team.result.evidence_required || terminal_owns_workstream_evidence)
+            && required_tools.is_empty()
+            && selected
+                .executable_tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool == "workspace_snapshot"))
+        {
+            required_tools.push("workspace_snapshot".to_string());
+        }
         roles.push(ProposedRole {
             role_id: canonical_id.clone(),
             display_name: Some(
@@ -831,7 +849,7 @@ fn compile_team(
                 selected
                     .executable_tools
                     .clone()
-                    .unwrap_or_else(|| canonical_tool_refs(&role.required_tools))
+                    .unwrap_or_else(|| canonical_tool_refs(&required_tools))
             },
             allowed_skill_refs: canonical_set(&role.required_skills),
             behavior,
@@ -842,7 +860,7 @@ fn compile_team(
             "revision": selected.entry.definition_ref.revision,
             "required_capabilities": canonical_set(&role.required_capabilities),
             "required_skills": canonical_set(&role.required_skills),
-            "required_tools": canonical_set(&role.required_tools),
+            "required_tools": required_tools.clone(),
             "resolved_output_artifacts": resolved_output_artifacts.clone(),
             "terminal_result_artifacts_derived": terminal_result_artifacts_derived,
         }));
@@ -855,7 +873,7 @@ fn compile_team(
             responsibility: role.responsibility.trim().to_string(),
             required_capabilities: canonical_set(&role.required_capabilities),
             required_skills: canonical_set(&role.required_skills),
-            required_tools: canonical_set(&role.required_tools),
+            required_tools,
             cardinality_min: role.cardinality.min,
             cardinality_max: role.cardinality.max,
             acceptance_kinds: canonical_acceptance_kinds(&role.acceptance),
