@@ -569,11 +569,9 @@ impl TeamInstantiationService {
                 // an authority ceiling; acceptance obligations continue to
                 // require explicit paths where the contract names them.
                 if terminal_candidate_role
-                    && !node_resource_scopes.iter().any(|scope| {
-                        scope.starts_with("read:")
-                            || scope.starts_with("write:")
-                            || scope.starts_with("worktree:")
-                    })
+                    && !node_resource_scopes
+                        .iter()
+                        .any(|scope| scope.starts_with("write:") || scope.starts_with("worktree:"))
                 {
                     node_resource_scopes.push("read:.".to_string());
                 }
@@ -603,6 +601,14 @@ impl TeamInstantiationService {
                 // erase every source tool from the delegated packet.
                 if resource_scopes.is_empty()
                     && node_resource_scopes.iter().any(|scope| scope == "read:.")
+                {
+                    resource_scopes.push("read:.".to_string());
+                }
+                if terminal_candidate_role
+                    && !resource_scopes
+                        .iter()
+                        .any(|scope| scope.starts_with("write:") || scope.starts_with("worktree:"))
+                    && !resource_scopes.iter().any(|scope| scope == "read:.")
                 {
                     resource_scopes.push("read:.".to_string());
                 }

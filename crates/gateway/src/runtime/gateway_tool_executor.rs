@@ -1810,7 +1810,10 @@ impl GatewayToolExecutor {
             .permission_ceiling
             .permits(harness_contract::policy::PermissionMode::ReadOnly)
         {
-            let active = allowed_tools.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+            let active = allowed_tools
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
             for name in [
                 "read_file",
                 "read_many",
