@@ -1797,6 +1797,41 @@ impl GatewayToolExecutor {
                 )
             })
             .collect::<Vec<_>>();
+        // Delegated Agents must not inherit the root model's transient
+        // exposure window.  That window may contain only control/discovery
+        // tools while source tools are deferred, which previously produced
+        // a child packet with no executable read capability even after
+        // Runtime had issued a bounded workspace read lease.  Re-introduce
+        // the registered read-only catalog entries here; Team resource
+        // cropping and per-call authorization remain the actual authority
+        // gates, so this does not grant write/network/process effects.
+        if request
+            .constraints
+            .permission_ceiling
+            .permits(harness_contract::policy::PermissionMode::ReadOnly)
+        {
+            let active = allowed_tools.iter().cloned().collect::<std::collections::BTreeSet<_>>();
+            for name in [
+                "read_file",
+                "read_many",
+                "grep_search",
+                "grep_many",
+                "glob_search",
+                "glob_many",
+                "workspace_snapshot",
+            ] {
+                if !active.contains(name)
+                    && lease
+                        .snapshot()
+                        .catalog
+                        .definitions(None)
+                        .iter()
+                        .any(|definition| definition.name == name)
+                {
+                    allowed_tools.push(name.to_string());
+                }
+            }
+        }
         allowed_tools.sort();
         allowed_tools.dedup();
         let allowed = allowed_tools
