@@ -475,18 +475,33 @@ pub(crate) fn compile_ephemeral_team_template_snapshot(
     let mut normalized = proposal_value;
     crate::team_template_candidate::normalize_template_proposal(&mut normalized)
         .map_err(|error| format!("ephemeral_template_invalid_proposal:{error}"))?;
-    let proposal: crate::team_template_candidate::TeamTemplateProposal =
+    let mut proposal: crate::team_template_candidate::TeamTemplateProposal =
         serde_json::from_value(normalized)
             .map_err(|error| format!("ephemeral_template_invalid_proposal:{error}"))?;
+    // Autonomous collaboration is a typed Runtime obligation, not an
+    // optional model convention. Preserve the user-authored Team charter
+    // while appending a stable marker before candidate compilation so the
+    // immutable manifest instructions digest remains self-consistent.
+    if !proposal
+        .instructions
+        .to_ascii_lowercase()
+        .contains("collaboration_control propose_work")
+    {
+        proposal.instructions.push_str(
+            "\n\nRuntime autonomy contract: use collaboration_control propose_work, bid, claim, submit, and accept actions for bounded peer work before terminal synthesis.\n",
+        );
+    }
     let candidate = crate::team_template_candidate::TemplateCandidateCompiler::compile(
         services.definition_registry(),
         &proposal,
         permission_ceiling,
     )
     .map_err(|error| format!("ephemeral_template_compile_failed:{error}"))?;
+    let team_instructions =
+        crate::team_template_candidate::normalized_team_instructions(&proposal.instructions);
     let (revision, team_markdown) = crate::team_definition::build_revision(
         candidate.manifest,
-        &crate::team_template_candidate::normalized_team_instructions(&proposal.instructions),
+        &team_instructions,
     )
     .map_err(|error| format!("ephemeral_template_revision_failed:{error}"))?;
     let snapshot = harness_contract::execution_graph::EphemeralTeamTemplateSnapshot {
