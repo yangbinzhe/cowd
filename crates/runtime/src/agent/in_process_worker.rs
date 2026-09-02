@@ -812,6 +812,24 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 return Err(error);
             }
         };
+        // Seed the typed autonomy obligation before the checkpoint loop.  A
+        // fallback proposal created after an Agent has already reached its
+        // terminal response leaves the new work Offered with no live peer to
+        // bid/claim it, which makes the Team correctly enter `blocked`.
+        // Creating it here lets the remaining live Agents observe and close
+        // the work through the normal governed collaboration lifecycle.
+        if let Err(error) = ensure_required_autonomous_proposal(&services, &packet).await {
+            let _ = services.agent_runtime().record_progress(
+                packet.agent_id(),
+                "agent.autonomy.contract_failed",
+                &error,
+            );
+            services.fail_live_execution(packet.run_id(), error.clone());
+            drop(runtime);
+            drop(child_execution_scope);
+            drop(active_run_cleanup);
+            return Err(error);
+        }
         // Agent autonomy is a bounded lifecycle, not a one-shot prompt hint.
         // Before accepting a terminal answer, surface newly committed Team
         // work/inbox facts and give this same bound Agent a chance to close an
@@ -859,18 +877,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     break;
                 }
             }
-        }
-        if let Err(error) = ensure_required_autonomous_proposal(&services, &packet).await {
-            let _ = services.agent_runtime().record_progress(
-                packet.agent_id(),
-                "agent.autonomy.contract_failed",
-                &error,
-            );
-            services.fail_live_execution(packet.run_id(), error.clone());
-            drop(runtime);
-            drop(child_execution_scope);
-            drop(active_run_cleanup);
-            return Err(error);
         }
         let (has_successful_escalation, has_source_evidence) = {
             let receipts = tool_executor
