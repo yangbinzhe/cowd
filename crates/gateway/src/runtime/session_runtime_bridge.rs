@@ -2175,7 +2175,9 @@ async fn deliver_terminal(
                     }
                     harness_contract::goal::GoalCompletion::Partial
                     | harness_contract::goal::GoalCompletion::Open
-                    | harness_contract::goal::GoalCompletion::WaitingExternalDecision => {
+                    | harness_contract::goal::GoalCompletion::WaitingExternalDecision
+                    | harness_contract::goal::GoalCompletion::Blocked
+                    | harness_contract::goal::GoalCompletion::Failed => {
                         harness_contract::projection::ExecutionLiveStatus::Error
                     }
                 };

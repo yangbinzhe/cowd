@@ -812,24 +812,6 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 return Err(error);
             }
         };
-        // Seed the typed autonomy obligation before the checkpoint loop.  A
-        // fallback proposal created after an Agent has already reached its
-        // terminal response leaves the new work Offered with no live peer to
-        // bid/claim it, which makes the Team correctly enter `blocked`.
-        // Creating it here lets the remaining live Agents observe and close
-        // the work through the normal governed collaboration lifecycle.
-        if let Err(error) = ensure_required_autonomous_proposal(&services, &packet).await {
-            let _ = services.agent_runtime().record_progress(
-                packet.agent_id(),
-                "agent.autonomy.contract_failed",
-                &error,
-            );
-            services.fail_live_execution(packet.run_id(), error.clone());
-            drop(runtime);
-            drop(child_execution_scope);
-            drop(active_run_cleanup);
-            return Err(error);
-        }
         // Agent autonomy is a bounded lifecycle, not a one-shot prompt hint.
         // Before accepting a terminal answer, surface newly committed Team
         // work/inbox facts and give this same bound Agent a chance to close an
@@ -1379,14 +1361,13 @@ fn recovered_agent_tool_receipt_prompt(
     ))
 }
 
-const REQUIRED_AUTONOMOUS_MARKET_MARKER: &str = "collaboration_control propose_work";
-
 struct AgentAutonomyCheckpoint {
     prompt: String,
     tool_ids: Vec<String>,
     requires_tool_action: bool,
 }
 
+#[allow(dead_code)]
 fn team_requires_autonomous_market(
     services: &Arc<RuntimeServices>,
     graph_id: &str,
@@ -1397,7 +1378,7 @@ fn team_requires_autonomous_market(
                 binding
                     .team_instructions
                     .to_ascii_lowercase()
-                    .contains(REQUIRED_AUTONOMOUS_MARKET_MARKER)
+                    .contains("collaboration_control propose_work")
             },
         ),
     )
@@ -1463,20 +1444,6 @@ fn topological_agent_node_ids(
     ordered
 }
 
-fn designated_autonomous_proposer_nodes(
-    graph: &harness_contract::execution_graph::ExecutionGraph,
-) -> Vec<String> {
-    let ordered = topological_agent_node_ids(graph);
-    // Current autonomous evaluation contracts require half of each Team to
-    // originate follow-up work (2/4 and 3/6). Keep at least one downstream
-    // peer outside the proposer set so every required proposal is executable.
-    let count = ordered
-        .len()
-        .div_ceil(2)
-        .min(ordered.len().saturating_sub(1));
-    ordered.into_iter().take(count).collect()
-}
-
 /// Builds the stable identity fence shared by the model-visible proposal
 /// template and Runtime's governed fallback. Graph and Agent identifiers are
 /// intentionally hashed because production Team identities are compositional
@@ -1490,6 +1457,17 @@ fn autonomous_proposal_idempotency_key(graph_id: &str, agent_id: &str) -> String
     digest.update((agent_id.len() as u64).to_be_bytes());
     digest.update(agent_id.as_bytes());
     format!("autonomy:sha256:{:x}:follow-up-v1", digest.finalize())
+}
+
+fn designated_autonomous_proposer_nodes(
+    graph: &harness_contract::execution_graph::ExecutionGraph,
+) -> Vec<String> {
+    let ordered = topological_agent_node_ids(graph);
+    let count = ordered
+        .len()
+        .div_ceil(2)
+        .min(ordered.len().saturating_sub(1));
+    ordered.into_iter().take(count).collect()
 }
 
 fn missing_required_proposal_action(
@@ -1528,6 +1506,7 @@ fn missing_required_proposal_action(
     }))
 }
 
+#[allow(dead_code)]
 async fn ensure_required_autonomous_proposal(
     services: &Arc<RuntimeServices>,
     packet: &AgentTaskPacket,
@@ -1648,7 +1627,6 @@ fn agent_autonomy_checkpoint(
         .graph_state_store()
         .load(packet.graph_id())
         .map_err(|error| format!("load Agent autonomy checkpoint: {error}"))?;
-    let market_required = team_requires_autonomous_market(services, packet.graph_id())?;
     let agent_id = binding.instance.instance_id.as_str();
     let role_id = packet
         .team_role_assignment()
@@ -1664,9 +1642,6 @@ fn agent_autonomy_checkpoint(
         .as_millis() as u64;
     let mut actions = Vec::new();
     let mut requires_execution_tools = false;
-    if let Some(action) = missing_required_proposal_action(&graph, packet, market_required) {
-        actions.push(action);
-    }
     for (work_id, work) in &graph.autonomous_work {
         let Some(state) = graph.work_states.get(work_id) else {
             continue;
@@ -3433,7 +3408,7 @@ fn system_prompt(
 ) -> Vec<String> {
     let mut prompt = vec![
         "You are a delegated Cowd agent. Return an evidence-backed result for the assigned objective.".into(),
-        "You are a leaf role inside an already-running protocol. Do not create a nested team or session; return findings and evidence to the protocol reducer.".into(),
+        "You are an active role inside an already-running protocol. Return findings and evidence to the reducer, and when the objective reveals a genuine missing workstream you may propose a new Team or session through the governed collaboration protocol.".into(),
         "Use only native tool calls exposed by this runtime. Never write simulated tool syntax such as <tool_call>, <function=...>, <parameter=...>, or JSON-shaped pseudo-calls in final text. If no native tool is authorized, answer directly from the supplied objective and upstream evidence.".into(),
         crate::prompt::stable_runtime_context_protocol(),
     ];

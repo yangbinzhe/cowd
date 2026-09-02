@@ -2172,6 +2172,29 @@ impl RuntimeService {
                     reason.clone(),
                 );
             }
+            harness_contract::goal::GoalCompletion::Blocked
+            | harness_contract::goal::GoalCompletion::Failed => {
+                let reason = format!("Runtime turn failed: {}", summary.final_answer);
+                self.block_live_execution(
+                    &graph_id,
+                    &summary.context_turn_report,
+                    &summary.write_attempt_paths,
+                    terminal_id.clone(),
+                    reason.clone(),
+                );
+                let event = runtime::CowdEvent::ExecutionScoped {
+                    context: runtime::CowdExecutionContext {
+                        execution_id: graph_id.clone(),
+                        session_id: record.session_id.clone(),
+                        turn_id: record.turn_id.clone(),
+                    },
+                    activity_binding: None,
+                    event: Box::new(runtime::CowdEvent::TurnError { error: reason }),
+                };
+                self.projection_hub
+                    .publish(&record.session_id, SessionProjectionEvent::runtime(event))
+                    .await;
+            }
             harness_contract::goal::GoalCompletion::Cancelled => {
                 self.runtime_services
                     .cancel_live_execution(&graph_id, "Runtime turn cancelled".to_string());

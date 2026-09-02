@@ -2336,9 +2336,9 @@ impl ExecutionGraphRunner {
                                     summary: None,
                                     evidence_refs: Vec::new(),
                                     failure: Some(ExecutionFailure {
-                                        kind: "autonomous_work_orphaned".to_string(),
-                                        message: "required autonomous collaboration work remained unresolved after every Team Agent became terminal".to_string(),
-                                        retryable: false,
+                                        kind: "objective_revision_required".to_string(),
+                                        message: "required autonomous collaboration work remained unresolved after every Team Agent became terminal; Objective supervision must replan or close the obligation".to_string(),
+                                        retryable: true,
                                         evidence_refs: Vec::new(),
                                     }),
                                     usage: Default::default(),

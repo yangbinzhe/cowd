@@ -954,6 +954,9 @@ where
                 evidence_refs: Vec::new(),
                 unresolved: Vec::new(),
                 blockers: Vec::new(),
+                obligations: Vec::new(),
+                program_ref: Some(graph.id.clone()),
+                terminal: None,
                 completion: GoalCompletion::Open,
                 revision: 1,
                 user_sequence: 1,
@@ -1322,6 +1325,10 @@ where
                     }
                     harness_contract::goal::GoalCompletion::Partial => {
                         crate::execution_core::TurnStrategyDecisionStatus::Partial
+                    }
+                    harness_contract::goal::GoalCompletion::Blocked
+                    | harness_contract::goal::GoalCompletion::Failed => {
+                        crate::execution_core::TurnStrategyDecisionStatus::Failed
                     }
                     harness_contract::goal::GoalCompletion::WaitingExternalDecision => {
                         crate::execution_core::TurnStrategyDecisionStatus::WaitingExternalDecision
@@ -4205,6 +4212,7 @@ fn terminal_delivery_envelope(
     let delivery_status = match completion {
         GoalCompletion::Satisfied => DeliveryStatus::Satisfied,
         GoalCompletion::Partial => DeliveryStatus::Partial,
+        GoalCompletion::Blocked | GoalCompletion::Failed => DeliveryStatus::Unavailable,
         GoalCompletion::WaitingExternalDecision => DeliveryStatus::Denied,
         GoalCompletion::Cancelled | GoalCompletion::Open => {
             if has_completed {

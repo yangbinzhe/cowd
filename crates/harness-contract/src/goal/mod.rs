@@ -42,8 +42,122 @@ pub enum GoalCompletion {
     Open,
     Satisfied,
     Partial,
+    Blocked,
+    Failed,
     WaitingExternalDecision,
     Cancelled,
+}
+
+/// Durable state of one business obligation.  It is intentionally distinct
+/// from an execution-graph node status: a graph may be terminal while the
+/// Objective still has an unresolved obligation or is being replanned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveObligationState {
+    #[default]
+    Open,
+    Satisfied,
+    Blocked,
+    Failed,
+    Waived,
+}
+
+impl ObjectiveObligationState {
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Satisfied | Self::Blocked | Self::Failed | Self::Waived
+        )
+    }
+}
+
+/// The executable producer and evidence route required for an Objective
+/// obligation.  Runtime resolves these references during admission; model
+/// prose and role names are never capability proof.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveProducerContract {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_definition_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveEvidenceRequirement {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_artifact_kinds: Vec<String>,
+    #[serde(default)]
+    pub independent_verifier_required: bool,
+    #[serde(default)]
+    pub reread_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveObligation {
+    pub obligation_id: String,
+    #[serde(default = "required_by_default")]
+    pub required: bool,
+    pub success_predicate: String,
+    #[serde(default)]
+    pub producer: ObjectiveProducerContract,
+    #[serde(default)]
+    pub evidence_requirement: ObjectiveEvidenceRequirement,
+    #[serde(default)]
+    pub state: ObjectiveObligationState,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reread_receipts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_code: Option<String>,
+}
+
+fn required_by_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveTerminalKind {
+    Satisfied,
+    PartiallySatisfied,
+    Blocked,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveDiagnostic {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveTerminal {
+    pub kind: ObjectiveTerminalKind,
+    pub terminal_fence: String,
+    pub authority_revision: u64,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ObjectiveDiagnostic>,
+    pub committed_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +175,15 @@ pub struct GoalContract {
     pub unresolved: Vec<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
+    /// The only business obligations that can promote the Objective to a
+    /// terminal result. Team/graph local terminal facts feed these entries but
+    /// never substitute for them.
+    #[serde(default)]
+    pub obligations: Vec<ObjectiveObligation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<ObjectiveTerminal>,
     pub completion: GoalCompletion,
     pub revision: u64,
     pub user_sequence: u64,
@@ -375,6 +498,9 @@ mod tests {
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
             blockers: Vec::new(),
+            obligations: Vec::new(),
+            program_ref: None,
+            terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
             user_sequence: 1,

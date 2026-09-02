@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
-use super::goal::GoalStore;
+use super::goal::{GoalStore, ObjectiveSupervisor};
 use super::graph::{
     aggregate_team_leaf_usage,
     executors::{
@@ -787,6 +787,7 @@ pub struct RuntimeServices {
     mission_schedule_policy: Arc<RwLock<crate::MissionSchedulePolicy>>,
     session_relations: Arc<SessionRelationGraph>,
     goal_store: Arc<GoalStore>,
+    objective_supervisor: Arc<ObjectiveSupervisor>,
     provider_registry: Arc<crate::ProviderRegistry>,
     provider_resource_config: Arc<RwLock<crate::ProviderResourceConfig>>,
     provider_fallbacks: Arc<RwLock<Vec<String>>>,
@@ -1340,6 +1341,7 @@ impl RuntimeServices {
                 .map_err(RuntimeServicesError::Invariant)?,
         );
         let goal_store = Arc::new(GoalStore::new(Arc::clone(&event_store)));
+        let objective_supervisor = Arc::new(ObjectiveSupervisor::new(Arc::clone(&goal_store)));
         let conflict_resolver = Arc::new(ConflictArbiter::new(
             Arc::clone(&mission_evidence),
             Arc::clone(&event_store),
@@ -1365,6 +1367,7 @@ impl RuntimeServices {
         let settled_outcome_service = Arc::clone(&outcome_service);
         let settled_lineage_supervisor = Arc::clone(&execution_supervisor);
         let settled_team_runtime = Arc::clone(&team_runtime);
+        let settled_objective_supervisor = Arc::clone(&objective_supervisor);
         execution_supervisor
             .install_graph_settled_observer(move |graph_id| {
                 let graph_id = graph_id.to_string();
@@ -1376,6 +1379,7 @@ impl RuntimeServices {
                 let coordinator_store = graph_store.clone();
                 let coordinator_supervisor = Arc::clone(&lineage_supervisor);
                 let coordinator_teams = Arc::clone(&settled_team_runtime);
+                let objective_supervisor = Arc::clone(&settled_objective_supervisor);
                 tokio::spawn(async move {
                     if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_program_wait_state_with(
                         &graph_id,
@@ -1433,6 +1437,15 @@ impl RuntimeServices {
                             %error,
                             "settled graph could not reconcile CollaborationProgram terminal truth"
                         );
+                    }
+                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_objective_from_program(
+                        &graph_id,
+                        objective_supervisor.as_ref(),
+                        &coordinator_store,
+                    )
+                    .await
+                    {
+                        tracing::warn!(graph_id, %error, "settled graph could not reconcile Objective truth");
                     }
                 });
             })
@@ -1504,6 +1517,7 @@ impl RuntimeServices {
             mission_schedule_policy: Arc::new(RwLock::new(mission_schedule_policy)),
             session_relations,
             goal_store,
+            objective_supervisor,
             provider_registry,
             provider_resource_config: Arc::new(RwLock::new(provider_resource_config)),
             provider_fallbacks: Arc::new(RwLock::new(normalize_provider_fallbacks(
@@ -3585,6 +3599,9 @@ impl RuntimeServices {
     }
     pub fn goal_store(&self) -> &Arc<GoalStore> {
         &self.goal_store
+    }
+    pub fn objective_supervisor(&self) -> &Arc<ObjectiveSupervisor> {
+        &self.objective_supervisor
     }
     pub fn conflict_resolver(&self) -> &Arc<ConflictArbiter> {
         &self.conflict_resolver

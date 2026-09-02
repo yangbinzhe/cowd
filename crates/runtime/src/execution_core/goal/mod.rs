@@ -9,10 +9,14 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 pub mod policy;
+pub mod supervisor;
+
+pub use supervisor::{ObjectiveReconcileDecision, ObjectiveSupervisor};
 
 use harness_contract::goal::{
     AcceptanceStatus, GoalCompletion, GoalContract, GoalProgressSnapshot, GoalRevision,
-    ResolutionDeltaKind, RuntimeIntervention, RuntimeInterventionTrace, RuntimeObservation,
+    ObjectiveObligationState, ObjectiveTerminal, ObjectiveTerminalKind, ResolutionDeltaKind,
+    RuntimeIntervention, RuntimeInterventionTrace, RuntimeObservation,
 };
 
 use crate::{
@@ -699,9 +703,33 @@ impl GoalStore {
         }
         goal.evidence_refs = durable_evidence;
         goal.completion = completion;
+        let terminal_kind = match completion {
+            GoalCompletion::Satisfied => harness_contract::goal::ObjectiveTerminalKind::Satisfied,
+            GoalCompletion::Partial => {
+                harness_contract::goal::ObjectiveTerminalKind::PartiallySatisfied
+            }
+            GoalCompletion::Blocked => harness_contract::goal::ObjectiveTerminalKind::Blocked,
+            GoalCompletion::Failed => harness_contract::goal::ObjectiveTerminalKind::Failed,
+            GoalCompletion::WaitingExternalDecision => {
+                harness_contract::goal::ObjectiveTerminalKind::Blocked
+            }
+            GoalCompletion::Cancelled => harness_contract::goal::ObjectiveTerminalKind::Cancelled,
+            GoalCompletion::Open => return Err("terminal completion must not be open".to_string()),
+        };
+        goal.terminal = Some(ObjectiveTerminal {
+            kind: terminal_kind,
+            terminal_fence: idempotency_key.clone(),
+            authority_revision: goal.revision.saturating_add(1),
+            reason: reason.clone(),
+            evidence_refs: goal.evidence_refs.clone(),
+            diagnostics: Vec::new(),
+            committed_at_ms: crate::tool_invocation::now_ms(),
+        });
         goal.phase = match completion {
             GoalCompletion::Satisfied => "completed".to_string(),
             GoalCompletion::Partial => "partial".to_string(),
+            GoalCompletion::Blocked => "blocked".to_string(),
+            GoalCompletion::Failed => "failed".to_string(),
             GoalCompletion::WaitingExternalDecision => "waiting_external".to_string(),
             GoalCompletion::Cancelled => "cancelled".to_string(),
             GoalCompletion::Open => return Err("terminal completion must not be open".to_string()),
@@ -710,6 +738,8 @@ impl GoalStore {
         let status = match completion {
             GoalCompletion::Satisfied => "satisfied",
             GoalCompletion::Partial => "partial",
+            GoalCompletion::Blocked => "blocked",
+            GoalCompletion::Failed => "failed",
             GoalCompletion::WaitingExternalDecision => "waiting_external",
             GoalCompletion::Cancelled => "cancelled",
             GoalCompletion::Open => return Err("terminal completion must not be open".to_string()),
@@ -786,6 +816,8 @@ impl GoalStore {
                 return Err("completion cannot transition back to open".to_string())
             }
             GoalCompletion::Partial
+            | GoalCompletion::Blocked
+            | GoalCompletion::Failed
             | GoalCompletion::WaitingExternalDecision
             | GoalCompletion::Cancelled => {}
         }
@@ -793,6 +825,8 @@ impl GoalStore {
         goal.phase = match completion {
             GoalCompletion::Satisfied => "completed".to_string(),
             GoalCompletion::Partial => "partial".to_string(),
+            GoalCompletion::Blocked => "blocked".to_string(),
+            GoalCompletion::Failed => "failed".to_string(),
             GoalCompletion::WaitingExternalDecision => "waiting_external".to_string(),
             GoalCompletion::Cancelled => "cancelled".to_string(),
             GoalCompletion::Open => {
@@ -809,6 +843,8 @@ impl GoalStore {
             match completion {
                 GoalCompletion::Satisfied => "satisfied",
                 GoalCompletion::Partial => "partial",
+                GoalCompletion::Blocked => "blocked",
+                GoalCompletion::Failed => "failed",
                 GoalCompletion::WaitingExternalDecision => "waiting_external",
                 GoalCompletion::Cancelled => "cancelled",
                 GoalCompletion::Open => {
@@ -820,6 +856,110 @@ impl GoalStore {
             vec![RuntimeEventRef {
                 kind: "completion_reason".to_string(),
                 id: reason.into(),
+            }],
+        )?;
+        Ok(goal)
+    }
+
+    /// Commit the business Objective terminal exactly once.  Local Team or
+    /// graph terminal facts are inputs to this method, never a substitute for
+    /// the obligation/evidence checks below.
+    pub fn complete_objective(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+        terminal: ObjectiveTerminal,
+    ) -> Result<GoalContract, String> {
+        if terminal.terminal_fence.trim().is_empty() || terminal.reason.trim().is_empty() {
+            return Err("objective terminal requires fence and reason".to_string());
+        }
+        let stream_id = stream_id(goal_id);
+        let stream_revision = self
+            .event_store
+            .stream_revision(&stream_id)
+            .map_err(|error| error.to_string())?;
+        let projection = self
+            .projection(goal_id)?
+            .ok_or_else(|| format!("goal {goal_id} not found"))?;
+        let mut goal = projection.goal;
+        if goal.revision != expected_revision {
+            return Err(format!(
+                "objective terminal has stale revision {expected_revision}, actual {}",
+                goal.revision
+            ));
+        }
+        if let Some(existing) = goal.terminal.as_ref() {
+            if existing.terminal_fence == terminal.terminal_fence {
+                return Ok(goal);
+            }
+            return Err(format!(
+                "goal {goal_id} already has a different terminal fence"
+            ));
+        }
+        let completion = match terminal.kind {
+            ObjectiveTerminalKind::Satisfied => GoalCompletion::Satisfied,
+            ObjectiveTerminalKind::PartiallySatisfied => GoalCompletion::Partial,
+            ObjectiveTerminalKind::Blocked => GoalCompletion::Blocked,
+            ObjectiveTerminalKind::Failed => GoalCompletion::Failed,
+            ObjectiveTerminalKind::Cancelled => GoalCompletion::Cancelled,
+        };
+        if terminal.kind == ObjectiveTerminalKind::Satisfied {
+            let required_open = goal.obligations.iter().any(|obligation| {
+                obligation.required && obligation.state != ObjectiveObligationState::Satisfied
+            });
+            if required_open {
+                return Err(
+                    "cannot satisfy Objective while a required obligation is unresolved"
+                        .to_string(),
+                );
+            }
+            if goal.criteria.iter().any(|criterion| {
+                !matches!(
+                    criterion.status,
+                    AcceptanceStatus::Satisfied | AcceptanceStatus::Waived
+                )
+            }) {
+                return Err(
+                    "cannot satisfy Objective while acceptance criteria are open".to_string(),
+                );
+            }
+        }
+        goal.terminal = Some(terminal.clone());
+        goal.completion = completion;
+        goal.phase = match completion {
+            GoalCompletion::Satisfied => "completed".to_string(),
+            GoalCompletion::Partial => "partial".to_string(),
+            GoalCompletion::Blocked => "blocked".to_string(),
+            GoalCompletion::Failed => "failed".to_string(),
+            GoalCompletion::WaitingExternalDecision => "waiting_external".to_string(),
+            GoalCompletion::Cancelled => "cancelled".to_string(),
+            GoalCompletion::Open => return Err("objective terminal cannot be open".to_string()),
+        };
+        let mut evidence_refs = goal.evidence_refs.clone();
+        evidence_refs.extend(terminal.evidence_refs.iter().cloned());
+        evidence_refs.sort();
+        evidence_refs.dedup();
+        goal.evidence_refs = evidence_refs;
+        goal.revision = goal.revision.saturating_add(1);
+        self.append_goal_event(
+            &stream_id,
+            stream_revision,
+            format!("objective-terminal:{goal_id}:{}", terminal.terminal_fence),
+            "goal.completed",
+            match completion {
+                GoalCompletion::Satisfied => "satisfied",
+                GoalCompletion::Partial => "partial",
+                GoalCompletion::Blocked => "blocked",
+                GoalCompletion::Failed => "failed",
+                GoalCompletion::WaitingExternalDecision => "waiting_external",
+                GoalCompletion::Cancelled => "cancelled",
+                GoalCompletion::Open => return Err("objective terminal cannot be open".to_string()),
+            },
+            &goal,
+            "runtime.objective_supervisor",
+            vec![RuntimeEventRef {
+                kind: "terminal_fence".to_string(),
+                id: terminal.terminal_fence,
             }],
         )?;
         Ok(goal)
@@ -1024,6 +1164,9 @@ mod tests {
             evidence_refs: Vec::new(),
             unresolved: Vec::new(),
             blockers: Vec::new(),
+            obligations: Vec::new(),
+            program_ref: None,
+            terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
             user_sequence: 1,

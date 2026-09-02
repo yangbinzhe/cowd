@@ -12,6 +12,11 @@ pub(super) fn agent_terminal_outcome(
             AgentTerminalStatus::Blocked,
             Some(terminal_answer.to_string()),
         ),
+        harness_contract::goal::GoalCompletion::Blocked
+        | harness_contract::goal::GoalCompletion::Failed => (
+            AgentTerminalStatus::Blocked,
+            Some(terminal_answer.to_string()),
+        ),
         harness_contract::goal::GoalCompletion::WaitingExternalDecision => (
             AgentTerminalStatus::Blocked,
             Some(terminal_answer.to_string()),

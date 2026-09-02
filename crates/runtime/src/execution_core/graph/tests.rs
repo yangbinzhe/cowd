@@ -1021,7 +1021,7 @@ async fn terminal_agent_wave_immediately_orphans_unfinished_autonomous_work() {
             .as_ref()
             .expect("typed orphan failure")
             .kind,
-        "autonomous_work_orphaned"
+        "objective_revision_required"
     );
     assert!(terminal
         .node_statuses

@@ -1254,7 +1254,7 @@ where
         outcome.terminal_presentation = presentation.clone();
         outcome.domain_events.push(
             self.services
-                .goal_store()
+                .objective_supervisor()
                 .terminal_event(
                     &goal_id,
                     completion,

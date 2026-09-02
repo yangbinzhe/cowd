@@ -9,6 +9,7 @@ use harness_contract::execution_graph::{
     CollaborationProgramLifecycle, ExecutionEdge, ExecutionGraph, ExecutionGraphCommand,
     TeamAdmissionObligation, TeamAdmissionState,
 };
+use harness_contract::goal::{ObjectiveDiagnostic, ObjectiveObligation, ObjectiveObligationState};
 use sha2::{Digest, Sha256};
 
 use crate::execution_core::ExecutionStateStoreError;
@@ -970,6 +971,142 @@ pub(crate) async fn reconcile_terminal_program(
     )
     .await?;
     record_terminal_experience_episode(graph_id, services).await
+}
+
+/// Project the durable Program/Team facts into the Objective authority.  This
+/// is intentionally a one-way adapter: Team-local completion can satisfy an
+/// Objective obligation only when its terminal evidence is present; it never
+/// writes the Team's local delivery envelope as an Objective terminal.
+pub(crate) async fn reconcile_objective_from_program(
+    graph_id: &str,
+    objective_supervisor: &crate::execution_core::goal::ObjectiveSupervisor,
+    graphs: &ExecutionGraphStateStore,
+) -> Result<(), String> {
+    let graph = graphs
+        .load_async(graph_id)
+        .await
+        .map_err(|error| format!("objective_program_load_failed:{error}"))?;
+    let Some(program) = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+    else {
+        return Ok(());
+    };
+    let mut obligations = Vec::with_capacity(program.team_instances.len());
+    let mut diagnostics = Vec::new();
+    for instance in &program.team_instances {
+        let admission = program
+            .control
+            .obligations
+            .iter()
+            .find(|obligation| obligation.instance_id == instance.instance_id);
+        let terminal = admission.and_then(|obligation| obligation.terminal.as_ref());
+        let (state, evidence_refs, diagnostic_code) = match terminal {
+            Some(terminal)
+                if terminal.node_status
+                    == harness_contract::execution_graph::ExecutionNodeStatus::Completed
+                    && !terminal.evidence_refs.is_empty() =>
+            {
+                (
+                    ObjectiveObligationState::Satisfied,
+                    terminal
+                        .evidence_refs
+                        .iter()
+                        .map(|reference| format!("{reference:?}"))
+                        .collect(),
+                    None,
+                )
+            }
+            Some(terminal) => {
+                let code = terminal
+                    .failure_kind
+                    .clone()
+                    .unwrap_or_else(|| "team_terminal_not_verified".to_string());
+                diagnostics.push(ObjectiveDiagnostic {
+                    code: code.clone(),
+                    message: terminal
+                        .failure_message
+                        .clone()
+                        .unwrap_or_else(|| "Team terminal evidence is incomplete".to_string()),
+                    retryable: terminal.retryable,
+                    obligation_id: Some(instance.instance_id.clone()),
+                    next_action: Some("replan_or_inspect_team_obligation".to_string()),
+                });
+                (
+                    if terminal.retryable {
+                        ObjectiveObligationState::Blocked
+                    } else {
+                        ObjectiveObligationState::Failed
+                    },
+                    Vec::new(),
+                    Some(code),
+                )
+            }
+            None => (
+                ObjectiveObligationState::Blocked,
+                Vec::new(),
+                Some("team_terminal_missing".to_string()),
+            ),
+        };
+        obligations.push(ObjectiveObligation {
+            obligation_id: instance.instance_id.clone(),
+            required: instance.required,
+            success_predicate: format!(
+                "Team {} produces independently verified evidence",
+                instance.semantic_node_id
+            ),
+            producer: Default::default(),
+            evidence_requirement: harness_contract::goal::ObjectiveEvidenceRequirement {
+                independent_verifier_required: true,
+                reread_required: true,
+                ..Default::default()
+            },
+            state,
+            artifact_refs: Vec::new(),
+            evidence_refs,
+            reread_receipts: Vec::new(),
+            verifier_decision: None,
+            diagnostic_code,
+        });
+    }
+    let kind = if diagnostics.is_empty()
+        && obligations
+            .iter()
+            .filter(|obligation| obligation.required)
+            .all(|obligation| obligation.state == ObjectiveObligationState::Satisfied)
+    {
+        harness_contract::goal::ObjectiveTerminalKind::Satisfied
+    } else if obligations.iter().any(|obligation| {
+        obligation.required && obligation.state == ObjectiveObligationState::Failed
+    }) {
+        harness_contract::goal::ObjectiveTerminalKind::Failed
+    } else {
+        harness_contract::goal::ObjectiveTerminalKind::Blocked
+    };
+    let decision = objective_supervisor.reconcile(
+        graph_id,
+        graph.revision,
+        &format!("objective:{graph_id}:program:{}", program.revision),
+        obligations,
+        Vec::new(),
+        diagnostics,
+        matches!(
+            kind,
+            harness_contract::goal::ObjectiveTerminalKind::PartiallySatisfied
+        ),
+        "program_terminal_projection",
+    )?;
+    if matches!(
+        decision,
+        crate::execution_core::goal::ObjectiveReconcileDecision::ReplanRequired { .. }
+    ) {
+        tracing::info!(
+            graph_id,
+            "Objective requires replan after Program projection"
+        );
+    }
+    Ok(())
 }
 
 async fn record_terminal_experience_episode(
