@@ -1,17 +1,17 @@
 # Cowd 自主编排与多 Team 协同交接计划（2026-08-27）
 
 > Historical handoff: superseded by
-> `docs/architecture/model-observation-attestation-v0.9.710.md`. The progress and
-> “next step” statements below describe the state on 2026-08-27 and are not a
-> current release-status source.
+> `docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`.
+> The progress and “next step” statements below describe the state on 2026-08-27
+> and are not a current release-status or execution-plan source.
 
 ## 使用方式
 
 这是给下一个 Session 的连续执行交接，而不是已完成报告。新的执行者应先读
 本文件，再读以下权威文档，保持其顺序和边界：
 
-1. `docs/architecture/collaboration-program-hardening.md`（跨版本唯一架构权威）；
-2. `docs/architecture/collaboration-semantic-harness-plan-audit.md`（审查结论）；
+1. `docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`（当前唯一架构权威）；
+2. `docs/architecture/autonomous-objective-runtime-plan-audit-v0.9.716-718.md`（当前审查结论）；
 3. `docs/architecture/collaboration-semantic-harness-v0.9.706.md`；
 4. `docs/architecture/collaboration-semantic-harness-v0.9.707.md`；
 5. `docs/evidence/collaboration-semantic-compiler-v0.9.705.md`；

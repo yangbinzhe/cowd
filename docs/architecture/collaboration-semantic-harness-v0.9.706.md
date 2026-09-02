@@ -2,10 +2,10 @@
 
 ## Contract status
 
-This is the subordinate execution contract for `v0.9.706`. It starts only
-after `v0.9.705` is committed, tagged and audited in both repositories. The
-cross-version authority is
-`docs/architecture/collaboration-program-hardening.md`.
+This is the historical subordinate contract for `v0.9.706`. Current execution
+authority is
+`docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`;
+this file is retained as evidence and is not an active implementation plan.
 
 ## Closed outcome
 

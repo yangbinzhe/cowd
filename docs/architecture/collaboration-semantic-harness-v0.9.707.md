@@ -2,10 +2,10 @@
 
 ## Contract status
 
-This is the third and final subordinate implementation contract under
-`collaboration-program-hardening.md`. It may start only after both repositories
-are clean and carry the accepted `v0.9.706` tag. It closes P10 and the remaining
-P11 integrated-acceptance work.
+This is the historical subordinate contract for the former v0.9.707 scope.
+Current execution authority is
+`docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`;
+this file is retained as evidence and is not an active implementation plan.
 
 Implementation is forbidden until the user accepts the audited three-version
 plan. A successful v0.9.707 release closes the semantic harness programme; an

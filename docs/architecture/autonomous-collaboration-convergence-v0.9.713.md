@@ -1,5 +1,9 @@
 # Autonomous Collaboration Convergence v0.9.713
 
+> Historical incident/evidence document. Current execution authority is
+> `docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`.
+> The invariants below are inputs to the new plan, not a competing execution path.
+
 ## Decision
 
 Autonomous Team work is a Runtime state-machine obligation, not a prompt-only

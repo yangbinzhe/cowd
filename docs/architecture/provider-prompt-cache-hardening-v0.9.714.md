@@ -2,9 +2,11 @@
 
 ## 1. 决策与边界
 
-本文件是 `v0.9.714` 在 Provider 输入缓存、请求布局和成本治理范围内的唯一实施权威。
-它补充而不替代 `collaboration-program-hardening.md` 的协同语义、权限、调度、证据和
-终态所有权。若两者发生交叉，以如下边界解释：
+本文件是历史性的 `v0.9.714` Provider 输入缓存、请求布局和成本治理证据。
+当前执行权威是
+`docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`。
+本文件仅保留缓存事实和测量方法，不再拥有独立实施边界；缓存不得替代协同语义、权限、
+调度、证据和 Objective 终态所有权。
 
 - `CollaborationProgram`、Execution Graph、Team/Agent Binding 仍拥有业务真相；
 - 本方案只改变这些真相如何被编译为模型可见请求、如何复用 Provider 前缀、如何计量；

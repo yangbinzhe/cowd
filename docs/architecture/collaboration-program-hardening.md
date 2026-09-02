@@ -2,11 +2,13 @@
 
 ## Status and execution authority
 
-This is the sole implementation authority for hardening user-directed Team
-collaboration. It supersedes ad-hoc fixes that interpret a model tool receipt
-inside the conversation host. The terminal architecture extends the existing
-graph-owned `CollaborationProgram`; it does not introduce a second Team
-scheduler or a second collaboration lifecycle registry.
+This document is historical architecture evidence. Its current execution
+authority is superseded by
+`docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`,
+which extends the graph-owned `CollaborationProgram` with Objective truth,
+event-driven Agent work and target-level recovery. This document remains useful
+for its incident facts and must not be used to start a competing implementation
+path or a second Team scheduler/lifecycle registry.
 
 Historical incident baseline captured 2026-08-25:
 

@@ -2,16 +2,21 @@
 
 ## Audit result
 
-**Verdict: executable after explicit user confirmation.**
+**Verdict: historical audit; execution authority superseded.**
 
-The three-version plan is dependency-complete, has one owner for every durable
-state and wait path, and contains no known unresolved architecture decision.
-Implementation has not started. The remaining gate is the user's acceptance of
-the proposed locked decisions and version boundaries.
+The current authority is
+`docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`
+and its audit
+`docs/architecture/autonomous-objective-runtime-plan-audit-v0.9.716-718.md`.
+This file records the older v0.9.705–707 audit only.
+
+The older three-version plan was bounded to semantic/capacity/experience
+concerns and did not prove objective-level autonomous recovery or a genuine
+pull-based task market. Implementation status in this file is historical.
 
 Audited contracts:
 
-- `docs/architecture/collaboration-program-hardening.md` — sole global authority;
+- `docs/architecture/collaboration-program-hardening.md` — sole global authority at the historical audit date;
 - `docs/architecture/collaboration-semantic-harness-v0.9.705.md` — semantic
   intent and deterministic compilation;
 - `docs/architecture/collaboration-semantic-harness-v0.9.706.md` — capacity,
