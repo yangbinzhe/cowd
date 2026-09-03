@@ -585,10 +585,31 @@ fn runtime_orchestration_input_schema() -> serde_json::Value {
 }
 
 fn collaboration_decision_input_schema() -> serde_json::Value {
-    serde_json::to_value(schemars::schema_for!(
+    let mut schema = serde_json::to_value(schemars::schema_for!(
         harness_contract::orchestration::ModelCollaborationControlDecisionV2
     ))
-    .expect("narrow collaboration decision schema must serialize")
+    .expect("narrow collaboration decision schema must serialize");
+
+    fn strip_non_semantic_metadata(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for key in ["description", "title", "default", "examples"] {
+                    object.remove(key);
+                }
+                for child in object.values_mut() {
+                    strip_non_semantic_metadata(child);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    strip_non_semantic_metadata(item);
+                }
+            }
+            _ => {}
+        }
+    }
+    strip_non_semantic_metadata(&mut schema);
+    schema
 }
 
 pub(crate) fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
