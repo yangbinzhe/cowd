@@ -128,6 +128,15 @@ pub struct ExecutionActivityProjection {
     /// protocol identifiers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_label: Option<String>,
+    /// Human-facing Team role label, separate from the Agent Definition name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_role_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_focus_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_digest: Option<String>,
     /// Business phase or lifecycle phase, when Runtime can state it without
     /// exposing a private prompt or provider transcript.
     #[serde(default, skip_serializing_if = "Option::is_none")]

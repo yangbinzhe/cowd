@@ -1,8 +1,14 @@
 # Autonomous Objective Runtime 源码清单（v0.9.716–v0.9.718）
 
-本文是统合方案的可执行 source manifest。目录级 glob 不等于允许编辑；除下列文件外，
-任何生产代码、测试、生成文件和配置都必须先做 allowlist amendment。`[new]` 表示目标文件
-尚不存在，`[delete]` 表示在完成 caller rewiring 和 deletion preflight 后删除。
+> 状态：历史 allowlist，已被 2026-09-03 根因与提交格式统合方案 supersede。
+> 当前执行权威为
+> [`autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md`](./autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md)。
+> 本文仅保留旧版本的文件事实和删除候选；Provider/Gateway/Edge/WebUI 提交格式链路以及
+> 新增 owner/测试必须以当前执行方案重新建 manifest，不能直接沿用此清单。
+
+目录级 glob 不等于允许编辑；除当前方案重新生成的 allowlist 外，任何生产代码、测试、生成文件
+和配置都必须先做 amendment。`[new]` 表示目标文件尚不存在，`[delete]` 表示完成 caller
+rewiring 和 deletion preflight 后才可删除。
 
 ## v0.9.716 — Objective/Program Truth
 

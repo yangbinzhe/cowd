@@ -4,7 +4,7 @@
 
 本文件是历史性的 `v0.9.714` Provider 输入缓存、请求布局和成本治理证据。
 当前执行权威是
-`docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`。
+`docs/architecture/autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md`。
 本文件仅保留缓存事实和测量方法，不再拥有独立实施边界；缓存不得替代协同语义、权限、
 调度、证据和 Objective 终态所有权。
 

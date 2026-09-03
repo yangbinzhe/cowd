@@ -4,7 +4,10 @@
 > `docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`
 > 与 `docs/architecture/autonomous-objective-runtime-source-manifest-v0.9.716-718.md`。
 >
-> 审计状态：**方案准入 PASS（第二轮终态/自治复审后）；代码实施尚未开始。**
+> 审计状态：**历史审计证据；已由 2026-09-03 根因与提交格式统合方案重新收敛。**
+> 当前执行权威为
+> [`autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md`](./autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md)。
+> 本文只保留此前的方案准入证据，不得用于宣称当前代码已实施或已 E2E 验收。
 >
 > 本文只证明方案具备可实施的边界、owner、依赖、删除、测试和证据门，不宣称任何版本的
 > Runtime、Agent、Surface 或真实业务已经完成。

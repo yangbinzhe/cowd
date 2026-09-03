@@ -4,7 +4,7 @@
 
 本文件是历史性的 `v0.9.715` Provider 请求缓存、成本归因与多 Agent 共享前缀证据。
 当前执行权威是
-`docs/architecture/autonomous-objective-runtime-unified-plan-v0.9.716-718.md`。
+`docs/architecture/autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md`。
 本文保留原始测量和缓存经济学结论，不再拥有独立实施边界，也不得恢复第二条协同执行路径。
 
 本版本只改变 Runtime 如何把已获授权的业务真相编译成模型输入、如何协调同一安全域中的缓存预热，以及如何计量；

@@ -37,6 +37,16 @@ pub struct ExecutionNodeProjection {
     pub focus_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_label: Option<String>,
+    /// Human-facing Team role label, kept separate from the Agent Definition
+    /// name in `display_label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_role_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_focus_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_digest: Option<String>,
     #[serde(default)]
     pub acceptance: ExecutionAcceptance,
     #[serde(default)]
@@ -207,6 +217,10 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                     role_id: identity.role_id,
                     focus_id: identity.focus_id,
                     display_label: identity.display_label,
+                    display_role_label: identity.display_role_label,
+                    display_focus_label: identity.display_focus_label,
+                    display_provenance: identity.display_provenance,
+                    display_digest: identity.display_digest,
                     acceptance: node.acceptance.clone(),
                     resource_scopes: node.resource_scopes.clone(),
                     result_ref: result.and_then(|value| value.result_ref.clone()),
@@ -280,6 +294,10 @@ struct PublicNodeIdentity {
     role_id: Option<String>,
     focus_id: Option<String>,
     display_label: Option<String>,
+    display_role_label: Option<String>,
+    display_focus_label: Option<String>,
+    display_provenance: Option<String>,
+    display_digest: Option<String>,
 }
 
 fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
@@ -291,10 +309,29 @@ fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
                 .team_role_identity
                 .as_ref()
                 .map(|identity| identity.focus_id.clone());
-            let display_label = focus_id
+            let display = packet
+                .binding
                 .as_ref()
-                .map(|focus| format!("{} · {focus}", packet.assignment.role_id))
-                .or_else(|| role_id.clone());
+                .and_then(|binding| binding.display.as_ref())
+                .filter(|display| !display.provenance.contains("unavailable-name"));
+            let display_label = display
+                .and_then(|display| usable_display_value(&display.label))
+                .map(str::to_owned)
+                .or_else(|| Some("Agent".to_string()));
+            let display_role_label = display.and_then(|display| {
+                display
+                    .role_display_name
+                    .as_deref()
+                    .and_then(usable_display_value)
+                    .or_else(|| usable_display_value(&display.role_label))
+                    .map(str::to_owned)
+            });
+            let display_focus_label = display
+                .and_then(|display| display.focus_label.as_deref())
+                .and_then(usable_display_value)
+                .map(str::to_owned);
+            let display_provenance = display.map(|display| display.provenance.clone());
+            let display_digest = display.map(|display| display.digest.clone());
             return PublicNodeIdentity {
                 team_run_id: packet.assignment.team_run_id.clone(),
                 agent_instance_id: Some(packet.assignment.instance_id.clone()),
@@ -302,6 +339,10 @@ fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
                 role_id,
                 focus_id,
                 display_label,
+                display_role_label,
+                display_focus_label,
+                display_provenance,
+                display_digest,
             };
         }
         if let Ok(intent) = serde_json::from_str::<crate::agent::AgentTaskIntent>(&node.payload_ref)
@@ -319,7 +360,7 @@ fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
                 agent_run_id: Some(intent.run_id),
                 role_id: role_id.clone(),
                 focus_id: focus_id.clone(),
-                display_label: role_id.or(focus_id),
+                display_label: Some("Agent".to_string()),
                 ..PublicNodeIdentity::default()
             };
         }
@@ -336,6 +377,26 @@ fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
         }
     }
     PublicNodeIdentity::default()
+}
+
+fn usable_display_value(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    let machine = lower.starts_with("instance:")
+        || lower.starts_with("runtime-team:")
+        || lower.starts_with("agent:")
+        || lower.starts_with("team:")
+        || lower.starts_with("role:")
+        || lower.starts_with("role-")
+        || lower.starts_with("role_")
+        || lower.starts_with("builtin/")
+        || lower.starts_with("workspace/")
+        || lower.contains(":run:")
+        || (lower.len() >= 8 && lower.chars().all(|character| character.is_ascii_hexdigit()));
+    (!machine).then_some(value)
 }
 
 #[must_use]
@@ -613,5 +674,31 @@ fn dependency_completion(
                 .get(usize::from(*minimum).saturating_sub(1))
                 .copied(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::usable_display_value;
+
+    #[test]
+    fn display_identity_accepts_human_labels_without_length_cap() {
+        let label =
+            "这是一个足够长的 Agent Definition 展示名称，用于验证布局层而不是契约层负责换行";
+        assert_eq!(usable_display_value(label), Some(label));
+    }
+
+    #[test]
+    fn display_identity_rejects_machine_references() {
+        for value in [
+            "instance:abc",
+            "runtime-team:team-1:run:1",
+            "agent:researcher",
+            "role-implementer",
+            "builtin/cowd/execute",
+            "0123456789abcdef",
+        ] {
+            assert_eq!(usable_display_value(value), None, "{value}");
+        }
     }
 }

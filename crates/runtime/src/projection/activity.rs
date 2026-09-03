@@ -246,6 +246,10 @@ fn project_single_execution_activities_from_events(
             kind: ExecutionActivityKind::Execution,
             node_id: None,
             display_label: non_empty(graph.objective.as_str()),
+            display_role_label: None,
+            display_focus_label: None,
+            display_provenance: None,
+            display_digest: None,
             phase: Some("execution".to_string()),
             visibility: vec![
                 ActivityVisibility::Narrative,
@@ -352,11 +356,11 @@ fn project_single_execution_activities_from_events(
                 scope: root_scope.clone(),
                 kind: activity_kind(node.kind, &node.executor_kind),
                 node_id: Some(node.node_id.clone()),
-                display_label: node
-                    .display_label
-                    .clone()
-                    .or_else(|| node_display_label(node.kind, &node.executor_kind))
-                    .or_else(|| agent_binding_display_label(&node_events)),
+                display_label: projected_node_display_label(node, &node_events),
+                display_role_label: node.display_role_label.clone(),
+                display_focus_label: node.display_focus_label.clone(),
+                display_provenance: node.display_provenance.clone(),
+                display_digest: node.display_digest.clone(),
                 phase: Some(node_phase(node.kind).to_string()),
                 visibility: visibility(node.kind),
                 parent_activity_id: Some(root_id.clone()),
@@ -504,6 +508,10 @@ fn project_single_execution_activities_from_events(
                 kind: ExecutionActivityKind::Artifact,
                 node_id: Some(item.work_id.clone()),
                 display_label: item.work.objective.clone(),
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
                 phase: Some("autonomous_work".to_string()),
                 visibility: vec![ActivityVisibility::Operational, ActivityVisibility::Audit],
                 parent_activity_id: Some(root_id.clone()),
@@ -700,6 +708,31 @@ fn project_single_execution_activities_from_events(
             kind,
             node_id: binding.as_ref().and_then(|binding| binding.node_id.clone()),
             display_label: event_display_label(event, kind),
+            display_role_label: (kind == ExecutionActivityKind::Agent)
+                .then(|| {
+                    pointer_string(
+                        &event.payload,
+                        "/snapshot/binding/display/role_display_name",
+                    )
+                    .or_else(|| {
+                        pointer_string(&event.payload, "/snapshot/binding/display/role_label")
+                    })
+                })
+                .flatten()
+                .and_then(|value| non_empty(&value))
+                .filter(|value| usable_agent_display_label(value)),
+            display_focus_label: (kind == ExecutionActivityKind::Agent)
+                .then(|| pointer_string(&event.payload, "/snapshot/binding/display/focus_label"))
+                .flatten()
+                .and_then(|value| non_empty(&value)),
+            display_provenance: (kind == ExecutionActivityKind::Agent)
+                .then(|| pointer_string(&event.payload, "/snapshot/binding/display/provenance"))
+                .flatten()
+                .and_then(|value| non_empty(&value)),
+            display_digest: (kind == ExecutionActivityKind::Agent)
+                .then(|| pointer_string(&event.payload, "/snapshot/binding/display/digest"))
+                .flatten()
+                .and_then(|value| non_empty(&value)),
             phase: event_phase(event),
             visibility,
             parent_activity_id: Some(parent_activity_id.clone()),
@@ -1134,6 +1167,10 @@ fn insert_descendant_graph_activities(
                 kind: ExecutionActivityKind::Execution,
                 node_id: None,
                 display_label: non_empty(&graph.objective),
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
                 phase: Some("execution".to_string()),
                 visibility: vec![
                     ActivityVisibility::Narrative,
@@ -1222,10 +1259,11 @@ fn insert_descendant_graph_activities(
                     scope: child_scope.clone(),
                     kind: activity_kind(node.kind, &node.executor_kind),
                     node_id: Some(node.node_id.clone()),
-                    display_label: node
-                        .display_label
-                        .clone()
-                        .or_else(|| node_display_label(node.kind, &node.executor_kind)),
+                    display_label: projected_node_display_label(node, &[]),
+                    display_role_label: node.display_role_label.clone(),
+                    display_focus_label: node.display_focus_label.clone(),
+                    display_provenance: node.display_provenance.clone(),
+                    display_digest: node.display_digest.clone(),
                     phase: Some(node_phase(node.kind).to_string()),
                     visibility: visibility(node.kind),
                     parent_activity_id: Some(execution_id.clone()),
@@ -1678,7 +1716,56 @@ fn node_display_label(kind: ExecutionNodeKind, executor_kind: &str) -> Option<St
     Some(node_phase(kind).to_string())
 }
 
+/// Resolve an Agent activity title from the canonical graph projection first,
+/// then from a binding-attested event for legacy nodes. Machine identities are
+/// never promoted to a public title and are replaced by the typed phase label.
+fn projected_node_display_label(
+    node: &harness_contract::execution_graph::ExecutionNodeProjection,
+    events: &[&DurableRuntimeEvent],
+) -> Option<String> {
+    if node.kind == ExecutionNodeKind::AgentTask {
+        if let Some(display) = node
+            .display_label
+            .as_deref()
+            .filter(|value| usable_agent_display_label(value))
+        {
+            return Some(display.to_string());
+        }
+        if let Some(display) = agent_binding_display_label(events) {
+            return Some(display);
+        }
+        return Some("agent".to_string());
+    }
+    node.display_label
+        .clone()
+        .or_else(|| node_display_label(node.kind, &node.executor_kind))
+}
+
+fn usable_agent_display_label(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    !(lower.starts_with("instance:")
+        || lower.starts_with("runtime-team:")
+        || lower.starts_with("agent:")
+        || lower.starts_with("team:")
+        || lower.starts_with("role:")
+        || lower.starts_with("role-")
+        || lower.starts_with("role_")
+        || lower.starts_with("builtin/")
+        || lower.starts_with("workspace/")
+        || lower.contains(":run:")
+        || (lower.len() >= 8 && lower.chars().all(|character| character.is_ascii_hexdigit())))
+}
+
 fn event_display_label(event: &DurableRuntimeEvent, kind: ExecutionActivityKind) -> Option<String> {
+    if kind == ExecutionActivityKind::Agent {
+        if let Some(display) = agent_binding_display_label(std::slice::from_ref(&event)) {
+            return Some(display);
+        }
+    }
     [
         "display_label",
         "label",
@@ -1714,6 +1801,7 @@ fn event_display_label(event: &DurableRuntimeEvent, kind: ExecutionActivityKind)
         _ => None,
     })
     .and_then(|value| non_empty(&value))
+    .filter(|value| kind != ExecutionActivityKind::Agent || usable_agent_display_label(value))
     .map(|value| crop(&value, 120))
 }
 
@@ -1721,14 +1809,16 @@ fn agent_binding_display_label(events: &[&DurableRuntimeEvent]) -> Option<String
     events
         .iter()
         .filter_map(|event| {
-            pointer_string(
-                &event.payload,
-                "/snapshot/binding/display/role_display_name",
-            )
-            .or_else(|| pointer_string(&event.payload, "/snapshot/binding/display/label"))
-            .or_else(|| pointer_string(&event.payload, "/snapshot/binding/display/role_label"))
+            pointer_string(&event.payload, "/snapshot/binding/display/label")
+                .or_else(|| {
+                    pointer_string(
+                        &event.payload,
+                        "/snapshot/binding/display/role_display_name",
+                    )
+                })
+                .or_else(|| pointer_string(&event.payload, "/snapshot/binding/display/role_label"))
         })
-        .find_map(|value| non_empty(&value))
+        .find_map(|value| non_empty(&value).filter(|value| usable_agent_display_label(value)))
         .map(|value| crop(&value, 120))
 }
 
@@ -2157,6 +2247,10 @@ fn materialize_artifact_activities(activities: &mut BTreeMap<String, ExecutionAc
                 } else {
                     "artifact".to_string()
                 }),
+                display_role_label: producer.display_role_label.clone(),
+                display_focus_label: producer.display_focus_label.clone(),
+                display_provenance: producer.display_provenance.clone(),
+                display_digest: producer.display_digest.clone(),
                 phase: Some("completed".to_string()),
                 visibility: artifact_visibility(&reference),
                 parent_activity_id: Some(producer.activity_id.clone()),
@@ -2258,6 +2352,22 @@ fn merge_activity(
         .display_label
         .take()
         .or_else(|| existing.display_label.clone());
+    existing.display_role_label = update
+        .display_role_label
+        .take()
+        .or_else(|| existing.display_role_label.clone());
+    existing.display_focus_label = update
+        .display_focus_label
+        .take()
+        .or_else(|| existing.display_focus_label.clone());
+    existing.display_provenance = update
+        .display_provenance
+        .take()
+        .or_else(|| existing.display_provenance.clone());
+    existing.display_digest = update
+        .display_digest
+        .take()
+        .or_else(|| existing.display_digest.clone());
     existing.phase = update.phase.take().or_else(|| existing.phase.clone());
     existing.status_reason = update
         .status_reason
@@ -2386,6 +2496,10 @@ mod tests {
             role_id: None,
             focus_id: None,
             display_label: None,
+            display_role_label: None,
+            display_focus_label: None,
+            display_provenance: None,
+            display_digest: None,
             acceptance: Default::default(),
             resource_scopes: Vec::new(),
             result_ref: None,
@@ -2443,6 +2557,10 @@ mod tests {
             role_id: None,
             focus_id: None,
             display_label: None,
+            display_role_label: None,
+            display_focus_label: None,
+            display_provenance: None,
+            display_digest: None,
             acceptance: Default::default(),
             resource_scopes: Vec::new(),
             result_ref: None,
@@ -2861,6 +2979,10 @@ mod tests {
             kind: ExecutionActivityKind::Tool,
             node_id: Some("node".to_string()),
             display_label: Some("search".to_string()),
+            display_role_label: None,
+            display_focus_label: None,
+            display_provenance: None,
+            display_digest: None,
             phase: Some("tool".to_string()),
             visibility: vec![ActivityVisibility::Narrative],
             parent_activity_id: Some("parent".to_string()),
@@ -2951,6 +3073,10 @@ mod tests {
                     kind,
                     node_id: None,
                     display_label: None,
+                    display_role_label: None,
+                    display_focus_label: None,
+                    display_provenance: None,
+                    display_digest: None,
                     phase: None,
                     visibility: vec![ActivityVisibility::Narrative],
                     parent_activity_id: parent.map(str::to_string),
@@ -3361,6 +3487,10 @@ mod tests {
                     kind,
                     node_id: None,
                     display_label: None,
+                    display_role_label: None,
+                    display_focus_label: None,
+                    display_provenance: None,
+                    display_digest: None,
                     phase: None,
                     visibility: vec![ActivityVisibility::Narrative],
                     parent_activity_id: None,
@@ -3486,5 +3616,19 @@ mod tests {
         );
         assert!(artifact_visibility("workspace://reports/result.md")
             .contains(&ActivityVisibility::Narrative));
+    }
+
+    #[test]
+    fn agent_activity_display_accepts_long_human_identity() {
+        let label =
+            "一个足够长的 Agent Definition 展示名称，不应因为界面布局阈值而被运行时投影丢弃";
+        assert!(usable_agent_display_label(label));
+    }
+
+    #[test]
+    fn agent_activity_display_rejects_machine_identity() {
+        assert!(!usable_agent_display_label("runtime-team:team-1:run:1"));
+        assert!(!usable_agent_display_label("instance:agent:1"));
+        assert!(!usable_agent_display_label("0123456789abcdef"));
     }
 }

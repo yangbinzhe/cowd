@@ -1,8 +1,10 @@
 # Autonomous Objective Runtime 统合方案（v0.9.716–v0.9.718）
 
-> 状态：方案已通过首次审计；本次终态/自治复审补强条款已纳入，实施仍必须按版本门禁推进。
-> 本文是当前唯一执行权威，取代此前只覆盖 semantic harness、cache、observation 或
-> collaboration convergence 的局部计划。旧文档保留为历史证据，不得再作为当前完成状态来源。
+> 状态：**历史基线 / 已被 2026-09-03 根因与提交格式统合方案 supersede**。
+> 当前执行权威为
+> [`autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md`](./autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md)。
+> 本文保留为历史审计证据；其中的 baseline、完成声明、文件 allowlist 和“唯一执行权威”措辞
+> 不得再用于当前状态判断。这样可以避免多个文档同时声称自己是执行真相源。
 
 ## 0. 目标、边界与不可妥协约束
 
@@ -687,7 +689,7 @@ phase evidence with exact commit/tree/build identity
 
 1. 统合方案审计报告为 `PASS`，且没有未命名的核心残留；
 2. 每个版本的代码 allowlist、删除目标、替代 owner、调用者和测试迁移已确认；
-3. 旧计划全部标记 `superseded`，本文件是唯一执行权威；
+3. 旧计划全部标记 `superseded`；当前执行权威改为 2026-09-03 根因与提交格式统合方案；
 4. 两仓库基线 hash 已冻结；
 5. 716/717 的真实 Provider/E2E 禁止门已加入脚本或 CI；
 6. 最终 718 的模型、配置、独立 storage、浏览器和安装服务运行条件已预留；

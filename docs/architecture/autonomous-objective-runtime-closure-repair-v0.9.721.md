@@ -1,5 +1,9 @@
 # Autonomous Objective Runtime v0.9.721：五项闭环修复设计
 
+> 状态：历史候选修复，未代表当前实施状态；已并入并由
+> [`autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md`](./autonomous-objective-runtime-root-cause-and-execution-plan-2026-09-03.md)
+> 重新编排。文中的局部修复不得脱离当前 Objective/transport/TaskMarket owner 体系单独实施。
+
 ## 真实 E2E 失败的统一根因
 
 v0.9.720 的 DeepSeek 16 Agent 场景并非“模型没有努力”，而是五条业务链在
