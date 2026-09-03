@@ -2754,9 +2754,19 @@ where
                                         "Runtime tool-exposure recovery (single attempt): the prior response selected a known deferred tool and Runtime has now activated its canonical native schema.{detail} Continue the same objective by invoking that exposed schema with valid arguments, or return a normal visible final answer when no call is needed."
                                     )
                                 } else {
-                                    format!(
-                                        "Runtime provider-protocol recovery (single attempt): the prior response used an invalid tool-call frame or requested an unknown, unavailable, or unauthorized tool.{detail} Retry from committed evidence using only an exposed native tool with valid arguments, or return a normal visible final answer. Never print tool-protocol markup as prose."
-                                    )
+                                    let compact_collaboration_recovery = protocol_failure_detail
+                                        .is_some_and(|value| {
+                                            value.contains("submit_collaboration_decision")
+                                        });
+                                    if compact_collaboration_recovery {
+                                        format!(
+                                            "Runtime provider-protocol recovery (single attempt): the prior submit_collaboration_decision arguments were truncated or invalid.{detail} Retry the same admission with ONE compact valid JSON payload under 6000 characters: preserve required schema_version, decision_id, intent, reason, each workstream_id/objective, each team_key, and each role_id/responsibility/required_capabilities; omit optional instructions, acceptance text, evidence_contract, output_artifacts, skills, tools, cardinality and other descriptive fields; use short identifiers and dependency IDs only. Do not repeat the user's long prompt or emit multiple calls. Never print tool-protocol markup as prose."
+                                        )
+                                    } else {
+                                        format!(
+                                            "Runtime provider-protocol recovery (single attempt): the prior response used an invalid tool-call frame or requested an unknown, unavailable, or unauthorized tool.{detail} Retry from committed evidence using only an exposed native tool with valid arguments, or return a normal visible final answer. Never print tool-protocol markup as prose."
+                                        )
+                                    }
                                 }
                             } else {
                                 "Runtime recovery directive: a provider step failed. Replan from the committed goal and evidence before retrying; do not assume uncommitted output is valid."
