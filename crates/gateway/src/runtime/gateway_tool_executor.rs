@@ -203,6 +203,12 @@ struct CollaborationControlToolRequest {
     proposal: Option<runtime::CollaborationWorkProposal>,
     rationale: Option<String>,
     estimated_cost: Option<u64>,
+    /// Legacy clients occasionally put proposal evidence at the top level.
+    /// Keep this harmless compatibility field so a stale model projection does
+    /// not abort the whole work-market turn; authoritative evidence remains
+    /// validated from `proposal.evidence_refs` by TeamRuntime.
+    #[serde(default)]
+    evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -707,6 +713,10 @@ impl GatewayToolExecutor {
         if tool_name == "collaboration_control" {
             let input: CollaborationControlToolRequest = serde_json::from_value(value)
                 .map_err(|error| self.input_contract_error(tool_name, error))?;
+            // Accepted solely for wire compatibility with older projections;
+            // evidence authority is still derived from the immutable Team
+            // packet and proposal-owned refs in TeamRuntime.
+            let _legacy_evidence_refs = input.evidence_refs;
             let parent = binding.parent_execution.ok_or_else(|| {
                 ToolError::new(
                     "collaboration_control requires an immutable managed Agent parent binding",

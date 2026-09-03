@@ -2431,6 +2431,7 @@ mod tests {
                             producer_attempt: 1,
                             producer_result_ref: "artifact:a".to_string(),
                             evidence_refs: Vec::new(),
+                            degraded: false,
                         }),
                         claim_receipt: Some(CrossTeamEdgeClaimReceipt {
                             claim_ref: "claim-a".to_string(),

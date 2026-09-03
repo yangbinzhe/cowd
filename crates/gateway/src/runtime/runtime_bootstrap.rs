@@ -590,6 +590,15 @@ fn collaboration_decision_input_schema() -> serde_json::Value {
     ))
     .expect("narrow collaboration decision schema must serialize");
 
+    // The V2 contract is generated from the single Rust owner above, but its
+    // field-level prose is deliberately not repeated in every Provider tool
+    // request.  DeepSeek and other OpenAI-compatible models receive the tool
+    // schema on every turn; duplicating several kilobytes of descriptions
+    // materially increases the model-visible prefix and makes a long semantic
+    // decision more likely to be truncated mid-string.  Guidance remains in
+    // the tool description and contract constant, while the wire schema keeps
+    // only executable JSON-Schema semantics.  This is a projection of the
+    // generated schema, not a second contract.
     fn strip_non_semantic_metadata(value: &mut serde_json::Value) {
         match value {
             serde_json::Value::Object(object) => {

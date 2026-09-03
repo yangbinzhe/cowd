@@ -495,10 +495,10 @@ fn web_search_rejects_search_backend_navigation_as_false_evidence() {
         "COWD_WEB_SEARCH_BASE_URL",
         format!("http://{}/self", server.addr()),
     );
-    let error = execute_tool("web_search", &json!({ "query": "no evidence" }))
-        .expect_err("search backend navigation is not external evidence");
+    let degraded = execute_tool("web_search", &json!({ "query": "no evidence" }))
+        .expect("search backend navigation should produce a structured degraded result");
     std::env::remove_var("COWD_WEB_SEARCH_BASE_URL");
-    assert!(error.contains("no usable external results"));
+    assert!(degraded.to_string().contains("source_unavailable"));
 }
 
 #[test]

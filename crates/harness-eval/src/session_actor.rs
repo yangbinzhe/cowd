@@ -24,7 +24,13 @@ impl<'a> SessionActor<'a> {
         surface_id: &str,
     ) -> Result<Self, String> {
         let base_url = base_url.trim_end_matches('/').to_string();
-        let observer_id = format!("{surface_id}:{}", uuid::Uuid::new_v4());
+        // Session lease ownership is keyed by the exact attached writer
+        // Surface.  A generated observer suffix made attach use
+        // `surface:<id>` while release used `observer:<id>:<uuid>`, yielding a
+        // false 403 during otherwise successful runs.  The session itself is
+        // the isolation boundary, so the stable surface id is both valid and
+        // sufficient here.
+        let observer_id = surface_id.to_string();
         let body = model
             .filter(|value| !value.trim().is_empty())
             .map_or_else(|| json!({}), |model| json!({"model": model}));

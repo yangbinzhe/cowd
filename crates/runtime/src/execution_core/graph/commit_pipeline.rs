@@ -1411,9 +1411,11 @@ pub(super) fn record_terminal_cross_team_edge_deliveries(
         if producer_attempt > 0
             && result.as_ref().is_some_and(|result| {
                 cross_team_input_contract_is_satisfied(&edge.input_contract, result)
+                    || cross_team_degraded_delivery_allowed(&edge.input_contract, result)
             })
         {
             let result = result.as_ref().expect("checked above");
+            let degraded = cross_team_degraded_delivery_allowed(&edge.input_contract, result);
             edge.delivery_receipt = Some(
                 harness_contract::execution_graph::CrossTeamEdgeDeliveryReceipt {
                     receipt_ref: format!(
@@ -1427,6 +1429,7 @@ pub(super) fn record_terminal_cross_team_edge_deliveries(
                         .clone()
                         .unwrap_or_else(|| format!("execution-node:{producer_node_id}")),
                     evidence_refs: result.evidence_refs.clone(),
+                    degraded,
                 },
             );
             edge.state = harness_contract::execution_graph::CrossTeamEdgeState::Delivered;
@@ -1498,6 +1501,28 @@ pub(super) fn cross_team_input_contract_is_satisfied(
                 .acceptance_evaluation
                 .as_ref()
                 .is_some_and(|evaluation| evaluation.verdict == AcceptanceVerdict::Satisfied))
+}
+
+/// Permit a downstream synthesis/review Team to consume partial upstream
+/// evidence when the producer was governed-blocked by an environmental or
+/// provider condition.  Contracts requiring an effect, artifact kind, or
+/// satisfied acceptance remain strict; degraded delivery is explicit in the
+/// receipt and therefore cannot masquerade as producer success.
+pub(super) fn cross_team_degraded_delivery_allowed(
+    contract: &harness_contract::execution_graph::CrossTeamInputContract,
+    result: &ExecutionNodeResult,
+) -> bool {
+    result.status == ExecutionNodeStatus::Blocked
+        && !result.evidence_refs.is_empty()
+        && contract.required_artifact_kinds.is_empty()
+        && !contract.require_committed_effect
+        && !contract.require_satisfied_acceptance
+        && contract.required_fact_kinds.iter().all(|kind| {
+            matches!(
+                kind,
+                harness_contract::acceptance::TerminalFactKind::ObservedEvidence
+            )
+        })
 }
 
 pub(super) fn status_name(status: ExecutionNodeStatus) -> &'static str {

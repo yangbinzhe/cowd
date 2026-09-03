@@ -2402,6 +2402,7 @@ impl ExecutionCommitService {
                     producer_attempt: *producer_attempt,
                     producer_result_ref,
                     evidence_refs: result.evidence_refs.clone(),
+                    degraded: false,
                 };
                 let edge = &mut program.edges[edge_index];
                 edge.delivery_receipt = Some(receipt);

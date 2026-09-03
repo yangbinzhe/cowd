@@ -235,9 +235,21 @@ pub(crate) fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutp
             })
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(format!(
-            "web search returned no usable external results for {query:?}; sources: {failures}"
-        ));
+        // Search availability is an environmental fact, not a malformed
+        // Agent action.  Return a structured degraded result so the Agent can
+        // record source_unavailable uncertainty, switch to durable local
+        // evidence, or ask for a retry without losing the entire Team run.
+        return Ok(WebSearchOutput {
+            query: query.to_string(),
+            intent,
+            depth: input.depth,
+            results: vec![WebSearchResultItem::Commentary(format!(
+                "No usable external results were available for {query:?}; sources: {failures}. Treat this as source_unavailable and do not claim external verification."
+            ))],
+            sources: receipts,
+            network_policy: policy_receipt,
+            duration_seconds: started.elapsed().as_secs_f64(),
+        });
     }
 
     let successful = receipts

@@ -2898,7 +2898,12 @@ fn normalize_delegated_resource_value(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let mut allowed = if matched.is_empty()
+    let mut allowed = if matched.is_empty() && requested_path == "." && allowed.len() == 1 {
+        // A delegated Agent commonly uses `path: "."` to mean "search my
+        // assigned directory".  Rebind that unambiguous root to the sole
+        // leased scope; never do this when multiple scopes exist.
+        allowed
+    } else if matched.is_empty()
         && allowed.len() == 1
         && glob_pattern_has_no_explicit_root(&pattern)
     {

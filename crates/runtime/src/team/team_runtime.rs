@@ -121,6 +121,24 @@ fn effective_collaboration_lease_ms(
         .clamp(MIN_COLLABORATION_LEASE_MS, MAX_COLLABORATION_LEASE_MS))
 }
 
+/// Syntactic fence for peer-produced durable evidence locators.  Unknown
+/// values still fail closed; accepting these URI forms only acknowledges that
+/// the reference belongs to the session evidence plane, while actual reads
+/// remain subject to the caller's authenticated lease.
+fn is_durable_team_reference(reference: &str) -> bool {
+    let value = reference.trim();
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    ["tool://", "artifact://", "evidence:", "team-board:"]
+        .iter()
+        .any(|prefix| {
+            value
+                .strip_prefix(prefix)
+                .is_some_and(|rest| !rest.is_empty())
+        })
+}
+
 /// Return the collaboration market as a bounded, action-first control view.
 ///
 /// The public graph projection is intentionally rich enough for operators and
@@ -945,7 +963,17 @@ impl TeamRuntime {
                 .input_artifact_refs
                 .iter()
                 .chain(proposal.evidence_refs.iter())
-                .any(|reference| !known_refs.contains(reference))
+                .any(|reference| {
+                    // A peer may publish a durable receipt in the same
+                    // graph immediately before this proposal reaches the
+                    // Team stream.  The receipt is not necessarily projected
+                    // into this Agent's packet yet, so accept only
+                    // well-formed durable locators in addition to refs
+                    // already indexed by the Team.  These locators grant no
+                    // access by themselves; downstream reads still pass the
+                    // normal session/lease evidence authorization checks.
+                    !known_refs.contains(reference) && !is_durable_team_reference(reference)
+                })
             {
                 return Err(
                     "collaboration proposal references evidence or artifacts not held by the Team"
@@ -1415,12 +1443,18 @@ impl TeamRuntime {
             );
         }
         let stream_id = format!("team-working-state:{team_id}");
+        // The semantic publication identity deliberately excludes the caller's
+        // board revision.  This makes a safe CAS rebase idempotent: a concurrent
+        // peer advancing the append-only board cannot turn one finding into
+        // duplicate entries merely because the stale revision was refreshed.
+        let mut identity_request = request.clone();
+        identity_request.expected_revision = 0;
         let entry_id = format!(
             "{}:{}:{:016x}",
             request.graph_id,
             request.node_id,
             model_protocol::fingerprint::stable_hash_bytes(
-                serde_json::to_string(&request)
+                serde_json::to_string(&identity_request)
                     .map_err(|error| error.to_string())?
                     .as_bytes(),
             )
@@ -1438,10 +1472,16 @@ impl TeamRuntime {
             {
                 return Ok(existing);
             }
-            return Err(format!(
-                "team board revision mismatch: expected {}, actual {current_revision}",
-                request.expected_revision
-            ));
+            // Appends are commutative semantic checkpoints.  Rebase a stale
+            // lower revision onto the latest board and let the event-store
+            // fence provide the final race check.  A future revision remains
+            // an integrity error and is rejected.
+            if request.expected_revision > current_revision {
+                return Err(format!(
+                    "team board revision mismatch: expected {}, actual {current_revision}",
+                    request.expected_revision
+                ));
+            }
         }
         if let Some(thread) = &request.thread {
             if thread.thread_id.trim().is_empty() {
@@ -1949,7 +1989,7 @@ mod collaboration_market_tests {
 
     use super::{
         agent_node_is_actionable, agent_node_is_future_schedulable,
-        effective_collaboration_lease_ms,
+        effective_collaboration_lease_ms, is_durable_team_reference,
     };
 
     #[test]
@@ -2025,5 +2065,15 @@ mod collaboration_market_tests {
             900_000
         );
         assert!(effective_collaboration_lease_ms(Some(3_600_001), 1).is_err());
+    }
+
+    #[test]
+    fn durable_team_reference_shape_is_narrow_and_nonempty() {
+        assert!(is_durable_team_reference("tool://receipt-1"));
+        assert!(is_durable_team_reference("artifact://report-1"));
+        assert!(is_durable_team_reference("evidence:sha256:abc"));
+        assert!(!is_durable_team_reference("memory:guess"));
+        assert!(!is_durable_team_reference("tool://"));
+        assert!(!is_durable_team_reference("tool://bad ref"));
     }
 }

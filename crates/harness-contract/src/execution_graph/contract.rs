@@ -550,6 +550,12 @@ pub struct CrossTeamEdgeDeliveryReceipt {
     pub producer_result_ref: String,
     #[serde(default)]
     pub evidence_refs: Vec<EvidenceAccessRef>,
+    /// True when the producer reached a governed Blocked terminal but supplied
+    /// usable partial evidence and the edge contract explicitly permits a
+    /// degraded handoff. Consumers must surface this uncertainty; it never
+    /// counts as a successful producer result.
+    #[serde(default)]
+    pub degraded: bool,
 }
 
 /// Runtime-derived consumer acknowledgement for a delivered cross-Team edge.
