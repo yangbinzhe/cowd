@@ -1600,6 +1600,7 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
                 idempotency_key: "independent-cross-check-v1".to_string(),
                 objective: "independently cross-check the bounded source finding".to_string(),
                 role: harness_contract::execution_graph::ExecutionWorkRole::CrossCheck,
+                required: true,
                 required_capabilities: Vec::new(),
                 input_artifact_refs: Vec::new(),
                 output_artifact_kinds: vec!["cross_check".to_string()],
@@ -1620,6 +1621,10 @@ async fn team_board_is_revisioned_idempotent_and_binding_scoped() {
         .and_then(serde_json::Value::as_str)
         .expect("projected autonomous work id")
         .to_string();
+    assert_eq!(
+        proposal_receipt.pointer("/marketplace/autonomous_work/0/required"),
+        Some(&serde_json::Value::Bool(true))
+    );
     let self_bid = services
         .team_runtime()
         .apply_collaboration_control(crate::CollaborationControlRequest {

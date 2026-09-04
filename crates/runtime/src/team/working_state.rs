@@ -84,6 +84,13 @@ pub struct CollaborationWorkProposal {
     pub idempotency_key: String,
     pub objective: String,
     pub role: harness_contract::execution_graph::ExecutionWorkRole,
+    /// Agent-initiated work is advisory by default.  An Agent may opt into a
+    /// hard completion obligation when the work is genuinely required for the
+    /// Team result; Runtime then keeps the peer-review gate strict.  Keeping
+    /// the default optional prevents a speculative cross-check from orphaning
+    /// an otherwise complete Team when no review turn remains schedulable.
+    #[serde(default)]
+    pub required: bool,
     #[serde(default)]
     pub required_capabilities: Vec<String>,
     #[serde(default)]

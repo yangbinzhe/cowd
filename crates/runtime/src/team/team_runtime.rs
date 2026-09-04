@@ -278,7 +278,7 @@ fn collaboration_control_view(
     serde_json::json!({
         "action_guide": {
             "rule": "Use each work item's work_revision as expected_work_revision. Agent-proposed work requires bid before claim; only the claim owner receives claim_token; a different peer must accept or challenge a submission.",
-            "propose_work": {"operation": "propose_work", "expected_work_revision": 0, "proposal": {"idempotency_key": "stable-key", "objective": "bounded objective", "role": "cross_check", "output_artifact_kinds": ["cross_check"]}},
+            "propose_work": {"operation": "propose_work", "expected_work_revision": 0, "proposal": {"idempotency_key": "stable-key", "objective": "bounded objective", "role": "cross_check", "required": false, "output_artifact_kinds": ["cross_check"]}},
             "bid": {"operation": "bid", "work_node_id": "<id>", "expected_work_revision": "<revision>", "rationale": "bounded rationale", "estimated_cost": 0},
             "claim": {"operation": "claim", "work_node_id": "<id>", "expected_work_revision": "<revision>", "lease_duration_ms": DEFAULT_COLLABORATION_LEASE_MS},
             "submit": {"operation": "submit", "work_node_id": "<id>", "expected_work_revision": "<revision>", "claim_token": "<owner-token>", "submission_ref": "team-board:<entry_id>"},
@@ -1011,6 +1011,10 @@ impl TeamRuntime {
             let mut contract =
                 harness_contract::execution_graph::ExecutionWorkContract::new(proposal.role);
             contract.collaboration_work_id = Some(work_id.clone());
+            // Speculative Agent autonomy is advisory by default. A hard
+            // completion gate must be an explicit proposal choice so a
+            // submitted cross-check cannot strand a Team with no review turn.
+            contract.required = proposal.required;
             contract.objective = Some(proposal.objective.trim().to_string());
             contract.proposed_by = Some(binding.instance.instance_id.clone());
             contract.proposal_evidence_refs = proposal.evidence_refs.clone();
