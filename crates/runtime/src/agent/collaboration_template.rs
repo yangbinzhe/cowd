@@ -89,6 +89,7 @@ impl CollaborationTemplateMatcher {
             )
         } else if automatic_team_is_structurally_required(&strategy.understanding)
             && !strategy.understanding.requires_write
+            && !strategy.understanding.requests_deliberation
         {
             // Candidate selection has already established that this objective
             // needs independent, tool-backed ownership.  Preserve that same
@@ -125,7 +126,21 @@ impl CollaborationTemplateMatcher {
         } else if contains_any(
             &normalized,
             &[
-                "tradeoff", "pros", "cons", "debate", "是否", "利弊", "权衡", "取舍",
+                "tradeoff",
+                "pros",
+                "cons",
+                "debate",
+                "discuss",
+                "challenge",
+                "是否",
+                "利弊",
+                "权衡",
+                "取舍",
+                "反驳",
+                "讨论",
+                "研讨",
+                "对抗性审查",
+                "民主集中",
             ],
         ) {
             (
@@ -354,6 +369,19 @@ mod tests {
             .template_id
             .as_str()
             .contains("debate-critic-arbiter"));
+    }
+
+    #[test]
+    fn deliberation_request_outweighs_generic_read_only_fanout() {
+        let prompt = "调研群论在当前 AI 中的应用，要求两个团队进行对抗性审查、反驳和综合";
+        let strategy = decide_strategy(&StrategyInput::from_prompt(prompt));
+        assert!(strategy.understanding.requests_deliberation);
+        assert_eq!(
+            CollaborationTemplateMatcher
+                .decide(prompt, &strategy)
+                .template_id,
+            CollaborationTemplateId::DebateCriticArbiter
+        );
     }
 
     #[test]

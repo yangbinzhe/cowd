@@ -58,11 +58,29 @@ pub(crate) struct ExplicitTeamNodeContract {
 }
 
 #[must_use]
+#[allow(dead_code)]
 pub(crate) fn explicit_team_node_contract(
     index: usize,
     team_count: usize,
     requires_write: bool,
     requires_external_facts: bool,
+) -> ExplicitTeamNodeContract {
+    explicit_team_node_contract_with_deliberation(
+        index,
+        team_count,
+        requires_write,
+        requires_external_facts,
+        false,
+    )
+}
+
+#[must_use]
+pub(crate) fn explicit_team_node_contract_with_deliberation(
+    index: usize,
+    team_count: usize,
+    requires_write: bool,
+    requires_external_facts: bool,
+    requests_deliberation: bool,
 ) -> ExplicitTeamNodeContract {
     let writer = requires_write && index + 1 == team_count;
     if writer {
@@ -70,6 +88,13 @@ pub(crate) fn explicit_team_node_contract(
             template: "cowd/execute-review",
             output_artifacts: &["workspace_change", "terminal_synthesis"],
             evidence_contract: &["implementation", "source_verification", "evidence", "risks"],
+        };
+    }
+    if requests_deliberation {
+        return ExplicitTeamNodeContract {
+            template: "cowd/debate-critic-arbiter",
+            output_artifacts: &["terminal_synthesis", "deliberation_evidence"],
+            evidence_contract: &["summary", "evidence", "unresolved"],
         };
     }
     if requires_external_facts {
@@ -569,11 +594,12 @@ fn bind_required_managed_agent_escalation(
             template.starts_with("workspace/") || template.starts_with("user/")
         });
         if !custom_template {
-            let contract = explicit_team_node_contract(
+            let contract = explicit_team_node_contract_with_deliberation(
                 team_index,
                 team_count.max(1),
                 requires_write,
                 understanding.requires_external_facts,
+                understanding.requests_deliberation,
             );
             node.template = Some(contract.template.to_string());
             node.output_artifacts = contract
@@ -1845,6 +1871,59 @@ mod tests {
             writer.evidence_contract,
             &["implementation", "source_verification", "evidence", "risks"]
         );
+
+        let debate = explicit_team_node_contract_with_deliberation(0, 2, false, false, true);
+        assert_eq!(debate.template, "cowd/debate-critic-arbiter");
+        assert_eq!(
+            debate.output_artifacts,
+            &["terminal_synthesis", "deliberation_evidence"]
+        );
+    }
+
+    #[test]
+    fn managed_escalation_preserves_deliberation_topology() {
+        let understanding = harness_contract::strategy::understand(
+            &harness_contract::strategy::StrategyInput::from_prompt(
+                "两个团队开展对抗性审查、反驳和讨论，最后综合结论；必须让 Team A 的 Agent 实际调用 request_collaboration_escalation。",
+            ),
+        );
+        assert!(understanding.requests_deliberation);
+        let team = |id: &str| GraphSemanticNode {
+            node_id: id.to_string(),
+            recipe: CapabilityRecipeId::Team,
+            objective: "compare independent evidence".to_string(),
+            depends_on: Vec::new(),
+            multiplicity: 1,
+            focuses: Vec::new(),
+            managed_agent_escalation: ManagedAgentEscalationRequirement::None,
+            template: Some("builtin/cowd/direct-executor".to_string()),
+            target_session_id: None,
+            output_artifacts: vec!["model-supplied".to_string()],
+            evidence_contract: vec!["model-supplied".to_string()],
+            required_evidence_refs: Vec::new(),
+            resource_scopes: Vec::new(),
+            required: true,
+            dependency: Default::default(),
+            cancellation_group: None,
+        };
+        let mut proposal = crate::orchestration::GraphMutationProposal {
+            mutation_id: "deliberation-template-binding".to_string(),
+            target_execution_id: None,
+            expected_revision: None,
+            nodes: vec![team("team-a"), team("team-b")],
+            completion: Default::default(),
+            collaboration_program: None,
+            collaboration_escalation: None,
+            retired_collaboration_instance_ids: Vec::new(),
+            reason: "test".to_string(),
+        };
+
+        bind_required_managed_agent_escalation(&mut proposal, &understanding, false);
+
+        assert!(proposal.nodes.iter().all(|node| {
+            node.template.as_deref() == Some("cowd/debate-critic-arbiter")
+                && node.output_artifacts == ["terminal_synthesis", "deliberation_evidence"]
+        }));
     }
 
     #[test]

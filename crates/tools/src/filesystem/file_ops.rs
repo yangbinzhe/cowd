@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,6 +14,15 @@ use crate::path_policy::WorkspacePathPolicy;
 
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Filesystem searches are bounded before they enter the blocking ToolHost
+/// adapter. A Runtime waiter timeout alone cannot interrupt a synchronous
+/// directory walk, so broad model requests must return a truthful partial
+/// result instead of holding a required Agent branch indefinitely.
+const MAX_SEARCH_ENTRIES: usize = 100_000;
+const MAX_SEARCH_DEPTH: usize = 20;
+const MAX_SEARCH_DURATION_MS: u128 = 10_000;
+const MAX_SEARCH_RESULTS: usize = 100;
 
 /// Default line window used when callers omit an explicit read limit.
 const DEFAULT_READ_LINE_LIMIT: usize = 1_000;
@@ -130,6 +138,8 @@ pub struct GlobSearchOutput {
     pub num_files: usize,
     pub filenames: Vec<String>,
     pub truncated: bool,
+    #[serde(rename = "continuationCursor", skip_serializing_if = "Option::is_none")]
+    pub continuation_cursor: Option<String>,
 }
 
 /// Parameters accepted by the grep-style search tool.
@@ -165,6 +175,8 @@ pub struct GrepSearchInput {
     pub offset: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_optional_boolish")]
     pub multiline: Option<bool>,
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 fn deserialize_optional_boolish<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
@@ -207,6 +219,8 @@ pub struct GrepSearchOutput {
     pub applied_limit: Option<usize>,
     #[serde(rename = "appliedOffset")]
     pub applied_offset: Option<usize>,
+    #[serde(rename = "continuationCursor", skip_serializing_if = "Option::is_none")]
+    pub continuation_cursor: Option<String>,
 }
 
 /// Reads a text file and returns a line-windowed payload.
@@ -364,10 +378,29 @@ pub fn edit_file(
 }
 
 /// Expands a glob pattern and returns matching filenames.
+fn non_glob_root(pattern: &Path, fallback: &Path) -> PathBuf {
+    let mut root = PathBuf::new();
+    for component in pattern.components() {
+        let value = component.as_os_str().to_string_lossy();
+        if value.contains(['*', '?', '[', '{']) {
+            break;
+        }
+        root.push(component.as_os_str());
+    }
+    if root.as_os_str().is_empty() {
+        fallback.to_path_buf()
+    } else if root.is_dir() {
+        root
+    } else {
+        root.parent().unwrap_or(fallback).to_path_buf()
+    }
+}
+
 pub fn glob_search(
     policy: &WorkspacePathPolicy,
     pattern: &str,
     path: Option<&str>,
+    cursor: Option<&str>,
 ) -> io::Result<GlobSearchOutput> {
     let started = Instant::now();
     let base_dir = path
@@ -388,35 +421,68 @@ pub fn glob_search(
     let mut seen = std::collections::HashSet::new();
     let mut matches = Vec::new();
     let mut scan_complete = true;
-    for pat in &expanded {
-        let entries = glob::glob(pat)
+    let mut visited = 0usize;
+    let mut last_visited = None;
+    'walk: for root_pattern in &expanded {
+        let matcher = Pattern::new(root_pattern)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
-        for entry in entries {
+        let walk_root = non_glob_root(Path::new(root_pattern), &base_dir);
+        let skip_dirs = [
+            "target",
+            "node_modules",
+            ".git",
+            ".cowd",
+            ".cargo",
+            ".gitnexus",
+        ];
+        for entry in WalkDir::new(walk_root)
+            .max_depth(MAX_SEARCH_DEPTH)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !skip_dirs.iter().any(|name| entry.file_name() == *name))
+        {
+            if visited >= MAX_SEARCH_ENTRIES
+                || started.elapsed().as_millis() >= MAX_SEARCH_DURATION_MS
+            {
+                scan_complete = false;
+                break 'walk;
+            }
+            visited = visited.saturating_add(1);
             let Ok(entry) = entry else {
                 scan_complete = false;
                 continue;
             };
-            if entry.is_file() {
-                match policy.ensure_resolved_path(&entry) {
-                    Ok(resolved) if seen.insert(resolved.clone()) => matches.push(resolved),
-                    Ok(_) => {}
-                    Err(_) => scan_complete = false,
-                }
+            let entry_path = entry.path().to_string_lossy().into_owned();
+            last_visited = Some(entry_path.clone());
+            if cursor.is_some_and(|cursor| entry_path.as_str() <= cursor) {
+                continue;
+            }
+            if entry.depth() >= MAX_SEARCH_DEPTH && entry.file_type().is_dir() {
+                // WalkDir intentionally stops descending at the safety depth;
+                // report that omission instead of presenting a false full scan.
+                scan_complete = false;
+                continue;
+            }
+            if !entry.file_type().is_file() || !matcher.matches_path(entry.path()) {
+                continue;
+            }
+            match policy.ensure_resolved_path(entry.path()) {
+                Ok(resolved) if seen.insert(resolved.clone()) => matches.push(resolved),
+                Ok(_) => {}
+                Err(_) => scan_complete = false,
             }
         }
     }
 
-    matches.sort_by_key(|path| {
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .map(Reverse)
-    });
+    // Lexical ordering is deterministic and avoids an unbounded metadata pass
+    // over the workspace. Callers can refine the pattern when scan_complete is
+    // false rather than relying on an implicit full-tree sort.
+    matches.sort();
 
-    let truncated = matches.len() > 100;
+    let truncated = matches.len() > MAX_SEARCH_RESULTS;
     let filenames = matches
         .into_iter()
-        .take(100)
+        .take(MAX_SEARCH_RESULTS)
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
 
@@ -428,6 +494,7 @@ pub fn glob_search(
         num_files: filenames.len(),
         filenames,
         truncated,
+        continuation_cursor: (!scan_complete).then_some(last_visited).flatten(),
     })
 }
 
@@ -475,9 +542,13 @@ pub fn grep_search(
     let mut filenames = Vec::new();
     let mut content_lines = Vec::new();
     let mut total_matches = 0usize;
-    let (search_files, mut scan_complete) = collect_search_files(policy, &base_path)?;
+    let (search_files, mut scan_complete, mut continuation_cursor) =
+        collect_search_files(policy, &base_path, input.cursor.as_deref())?;
 
     for file_path in search_files {
+        if scan_complete {
+            continuation_cursor = Some(file_path.to_string_lossy().into_owned());
+        }
         if !matches_optional_filters(&file_path, glob_filter.as_ref(), file_type) {
             continue;
         }
@@ -546,6 +617,9 @@ pub fn grep_search(
             num_matches: None,
             applied_limit: limit,
             applied_offset: offset,
+            continuation_cursor: (!scan_complete)
+                .then_some(continuation_cursor.clone())
+                .flatten(),
         });
     } else {
         None
@@ -562,15 +636,17 @@ pub fn grep_search(
         num_matches: (output_mode == "count").then_some(total_matches),
         applied_limit,
         applied_offset,
+        continuation_cursor: (!scan_complete).then_some(continuation_cursor).flatten(),
     })
 }
 
 fn collect_search_files(
     policy: &WorkspacePathPolicy,
     base_path: &Path,
-) -> io::Result<(Vec<PathBuf>, bool)> {
+    cursor: Option<&str>,
+) -> io::Result<(Vec<PathBuf>, bool, Option<String>)> {
     if base_path.is_file() {
-        return Ok((vec![policy.ensure_resolved_path(base_path)?], true));
+        return Ok((vec![policy.ensure_resolved_path(base_path)?], true, None));
     }
 
     let skip_dirs = [
@@ -583,17 +659,35 @@ fn collect_search_files(
     ];
     let mut files = Vec::new();
     let mut complete = true;
+    let started = Instant::now();
+    let mut visited = 0usize;
+    let mut last_visited = None;
     for entry in WalkDir::new(base_path)
-        .max_depth(20)
+        .max_depth(MAX_SEARCH_DEPTH)
         .into_iter()
         .filter_entry(|e| !skip_dirs.iter().any(|d| e.file_name().to_str() == Some(d)))
     {
+        if visited >= MAX_SEARCH_ENTRIES || started.elapsed().as_millis() >= MAX_SEARCH_DURATION_MS
+        {
+            complete = false;
+            break;
+        }
+        visited = visited.saturating_add(1);
         // A workspace may contain mounted service data or other unreadable
         // subtrees. One inaccessible path must not invalidate the whole search.
         let Ok(entry) = entry else {
             complete = false;
             continue;
         };
+        let entry_path = entry.path().to_string_lossy().into_owned();
+        last_visited = Some(entry_path.clone());
+        if cursor.is_some_and(|cursor| entry_path.as_str() <= cursor) {
+            continue;
+        }
+        if entry.depth() >= MAX_SEARCH_DEPTH && entry.file_type().is_dir() {
+            complete = false;
+            continue;
+        }
         if entry.file_type().is_file() {
             if let Ok(resolved) = policy.ensure_resolved_path(entry.path()) {
                 files.push(resolved);
@@ -602,7 +696,11 @@ fn collect_search_files(
             }
         }
     }
-    Ok((files, complete))
+    Ok((
+        files,
+        complete,
+        (!complete).then_some(last_visited).flatten(),
+    ))
 }
 
 fn matches_optional_filters(
@@ -838,8 +936,13 @@ mod tests {
         )
         .expect("file write should succeed");
 
-        let globbed = glob_search(&policy, "**/*.rs", Some(dir.to_string_lossy().as_ref()))
-            .expect("glob should succeed");
+        let globbed = glob_search(
+            &policy,
+            "**/*.rs",
+            Some(dir.to_string_lossy().as_ref()),
+            None,
+        )
+        .expect("glob should succeed");
         assert_eq!(globbed.num_files, 1);
 
         let grep_output = grep_search(
@@ -859,6 +962,7 @@ mod tests {
                 head_limit: Some(10),
                 offset: Some(0),
                 multiline: Some(false),
+                cursor: None,
             },
         )
         .expect("grep should succeed");
@@ -895,6 +999,7 @@ mod tests {
                 head_limit: None,
                 offset: None,
                 multiline: None,
+                cursor: None,
             },
         )
         .expect("grep should succeed");
@@ -967,12 +1072,35 @@ mod tests {
         std::fs::write(dir.join("b.toml"), "[package]").unwrap();
         std::fs::write(dir.join("c.txt"), "hello").unwrap();
 
-        let result = glob_search(&policy, "*.{rs,toml}", Some(dir.to_str().unwrap()))
+        let result = glob_search(&policy, "*.{rs,toml}", Some(dir.to_str().unwrap()), None)
             .expect("glob should succeed");
         assert_eq!(
             result.num_files, 2,
             "should match .rs and .toml but not .txt"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn broad_glob_reports_incomplete_when_depth_bound_hides_descendants() {
+        let dir = temp_path("glob-depth-bound");
+        std::fs::create_dir_all(&dir).expect("directory should be created");
+        let policy = WorkspacePathPolicy::new(&dir);
+        let mut nested = dir.clone();
+        for index in 0..(super::MAX_SEARCH_DEPTH + 2) {
+            nested.push(format!("level-{index}"));
+            std::fs::create_dir_all(&nested).expect("nested directory should be created");
+        }
+        std::fs::write(nested.join("hidden.rs"), "fn hidden() {}").expect("file should be created");
+
+        let result = glob_search(&policy, "**/*", Some(dir.to_str().unwrap()), None)
+            .expect("bounded glob should succeed");
+        assert!(!result.scan_complete, "depth truncation must be explicit");
+        assert_eq!(
+            result.num_files, 0,
+            "the file is intentionally beyond the bound"
+        );
+        assert!(result.continuation_cursor.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

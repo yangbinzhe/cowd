@@ -401,17 +401,18 @@ impl AgentRuntime {
             .map(|_| ())
     }
 
-    /// Convert replayed active runs without a reattached backend handle into
-    /// a durable blocked state. Restart recovery must never pretend a child
-    /// process or in-process turn is still controllable merely because its
-    /// last persisted event was `running`.
+    /// Convert replayed runs whose backend may already have started into a
+    /// durable blocked state. A `Prepared` run has not crossed backend
+    /// admission and is intentionally left reclaimable: the scheduler can
+    /// re-submit the same packet after restart without guessing about an
+    /// external effect. Any later lifecycle state is ambiguous without a
+    /// reattached handle and must not be silently replayed.
     pub fn block_unrecoverable_replayed_runs(&self) -> Result<Vec<String>, String> {
         let snapshots = self.list();
         let mut blocked = Vec::new();
-        for mut snapshot in snapshots
-            .into_iter()
-            .filter(|snapshot| !snapshot.status.is_terminal())
-        {
+        for mut snapshot in snapshots.into_iter().filter(|snapshot| {
+            !snapshot.status.is_terminal() && snapshot.status != AgentStatus::Prepared
+        }) {
             snapshot.status = AgentStatus::Blocked;
             snapshot.updated_at_ms = now_ms();
             snapshot.failure = Some("backend handle is unavailable after runtime restart".into());
@@ -3147,5 +3148,46 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("backend handle"));
+    }
+
+    #[test]
+    fn restart_recovery_leaves_prepared_runs_reclaimable() {
+        let runtime = AgentRuntime::new(
+            Arc::new(RuntimeEventStore::try_open_in_memory().expect("store")),
+            configured_registry(),
+        );
+        let packet = task("agent-prepared-recovery");
+        runtime
+            .restore_verified_run(AgentRunSnapshot {
+                execution_identity: packet.assignment.execution_identity.clone(),
+                run_id: packet.run_id().to_string(),
+                agent_id: packet.agent_id().to_string(),
+                task_id: packet.task_id().to_string(),
+                root_task_id: packet.assignment.root_task_id.clone(),
+                session_id: packet.session_id().to_string(),
+                graph_id: packet.graph_id().to_string(),
+                node_id: packet.node_id().to_string(),
+                attempt: packet.attempt,
+                expected_graph_revision: packet.expected_graph_revision,
+                backend: AgentBackendKind::ProcessJsonl,
+                status: AgentStatus::Prepared,
+                revision: 0,
+                model: Some("fast".into()),
+                provider: Some("test".into()),
+                binding: None,
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                failure: None,
+            })
+            .expect("restore");
+
+        assert!(runtime
+            .block_unrecoverable_replayed_runs()
+            .expect("recovery sweep")
+            .is_empty());
+        assert_eq!(
+            runtime.get(packet.agent_id()).expect("prepared run").status,
+            AgentStatus::Prepared
+        );
     }
 }

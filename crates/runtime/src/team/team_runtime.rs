@@ -261,6 +261,7 @@ fn collaboration_control_view(
                 "work_node_id": work_id,
                 "objective": work.objective,
                 "proposed_by": work.proposed_by,
+                "required": work.required,
                 "required_capabilities": work.eligibility.required_capabilities,
                 "output_artifact_kinds": work.output_artifact_kinds,
                 "status": state.status,

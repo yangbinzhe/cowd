@@ -397,12 +397,13 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_search",
-            description: "Find files by glob pattern.",
+            description: "Find files by glob pattern with bounded depth, entry, duration, and result limits. The response reports scanComplete=false when the safety bound or an inaccessible subtree prevents a full scan; refine the path/pattern and continue when complete coverage is required.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
-                    "path": { "type": "string" }
+                    "path": { "type": "string" },
+                    "cursor": { "type": "string", "description": "Continuation cursor returned by an incomplete scan." }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
@@ -411,7 +412,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob_many",
-            description: "Run multiple glob searches in one ordered read-only batch.",
+            description: "Run multiple bounded glob searches in one ordered read-only batch. Each result reports scanComplete=false when its safety bound prevents full coverage; refine incomplete searches instead of assuming the result set is exhaustive.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -421,7 +422,8 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                             "type": "object",
                             "properties": {
                                 "pattern": { "type": "string" },
-                                "path": { "type": "string" }
+                                "path": { "type": "string" },
+                                "cursor": { "type": "string", "description": "Continuation cursor returned by an incomplete scan." }
                             },
                             "required": ["pattern"],
                             "additionalProperties": false
@@ -436,7 +438,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep_search",
-            description: "Preferred locator for symbols, text, or logic in large files. Search workspace file contents with a regex and return exact matching lines with optional context; use it before bounded read_file calls to avoid expensive full-file scans.",
+            description: "Preferred locator for symbols, text, or logic in large files. Search workspace file contents with a regex and return exact matching lines with optional context; scans are bounded by depth, entries, duration, and file size and report scanComplete=false when incomplete. Refine the path/glob and continue before concluding no match exists; use it before bounded read_file calls to avoid expensive full-file scans.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -454,6 +456,7 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
                     "head_limit": { "type": "integer", "minimum": 1 },
                     "offset": { "type": "integer", "minimum": 0 },
                     "multiline": { "type": "boolean" }
+                    ,"cursor": { "type": "string", "description": "Continuation cursor returned by an incomplete scan." }
                 },
                 "required": ["pattern"],
                 "additionalProperties": false
