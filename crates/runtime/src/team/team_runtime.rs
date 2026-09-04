@@ -23,7 +23,7 @@ use crate::{
     RuntimeEventStore, RuntimeExecutionSupervisor, RuntimeTransactionEventInput, TaskRuntimePort,
     TeamInstantiation, TeamProjection, TeamProjectionCursor, TeamProjectionPage,
     TeamProjectionReader, TeamWorkingState, TeamWorkingStateAcknowledgeRequest,
-    TeamWorkingStateCursor, TeamWorkingStateEntry, TeamWorkingStateKind,
+    TeamWorkingStateCursor, TeamWorkingStateEntry, TeamWorkingStateKind, TeamWorkingStatePage,
     TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest, TeamWorkingStateVisibility,
 };
 
@@ -1717,6 +1717,21 @@ impl TeamRuntime {
             after_revision: Some(cursor.through_revision),
             exact_revision: None,
         })
+    }
+
+    /// Read a bounded page after the caller's durable cursor. The page is
+    /// ordered by event revision and exposes the exact revision delivered;
+    /// callers must acknowledge only this value after admitting the page.
+    pub fn read_working_state_page_from_cursor(
+        &self,
+        graph_id: String,
+        node_id: String,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<Option<TeamWorkingStatePage>, String> {
+        let cursor = self.working_state_cursor(&graph_id, &node_id)?;
+        let state = self.read_working_state_from_cursor(graph_id, node_id)?;
+        Ok(state.page_after(cursor.through_revision, max_entries, max_bytes))
     }
 
     pub fn working_state_cursor(

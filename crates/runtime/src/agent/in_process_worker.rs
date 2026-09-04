@@ -421,42 +421,41 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // The bounded checkpoint below is the only Runtime-assisted bootstrap
         // and still requires native collaboration_control mutations by this
         // exact binding.
+        let mut initial_team_ack = None;
         let external_context_items = if binding.data_lease.team_working_state_visible {
-            let unread = services
+            let page = services
                 .team_runtime()
-                .read_working_state_from_cursor(
+                .read_working_state_page_from_cursor(
                     packet.graph_id().to_string(),
                     packet.node_id().to_string(),
+                    32,
+                    64 * 1024,
                 )
-                .ok();
-            let cursor = services
-                .team_runtime()
-                .working_state_cursor(packet.graph_id(), packet.node_id())
-                .ok();
-            if let (Some(state), Some(cursor)) = (unread.as_ref(), cursor) {
-                if state.board_revision > cursor.through_revision {
-                    services
-                        .team_runtime()
-                        .acknowledge_working_state(crate::TeamWorkingStateAcknowledgeRequest {
-                            graph_id: packet.graph_id().to_string(),
-                            node_id: packet.node_id().to_string(),
-                            through_revision: state.board_revision,
-                            expected_cursor_revision: cursor.cursor_revision,
-                        })
-                        .map_err(|error| format!("advance Team inbox cursor: {error}"))?;
-                }
-            }
-            unread
-                .filter(|state| !state.entries.is_empty())
-                .map(|state| {
-                    let team_id = state.team_id.clone();
-                    let board_revision = state.board_revision;
+                .ok()
+                .flatten();
+            page.filter(|page| !page.entries.is_empty())
+                .map(|page| {
+                    let team_id = page.team_id.clone();
+                    let to_revision = page.to_revision;
                     let summary = serde_json::to_string(&serde_json::json!({
-                        "board_revision": board_revision,
-                        "entries": state.entries.into_iter().rev().take(32).collect::<Vec<_>>(),
+                        "from_revision": page.from_revision,
+                        "to_revision": to_revision,
+                        "source_board_revision": page.source_board_revision,
+                        "has_more": page.has_more,
+                        "entries": page.entries,
                         "instruction": "Use committed semantic entries only. Call team_board read_after at safe checkpoints before synthesis; publish findings, conflicts, unresolved work, or artifacts without private reasoning."
                     }))
                     .unwrap_or_else(|_| "{}".to_string());
+                    initial_team_ack = services
+                        .team_runtime()
+                        .working_state_cursor(packet.graph_id(), packet.node_id())
+                        .ok()
+                        .map(|cursor| crate::TeamWorkingStateAcknowledgeRequest {
+                            graph_id: packet.graph_id().to_string(),
+                            node_id: packet.node_id().to_string(),
+                            through_revision: to_revision,
+                            expected_cursor_revision: cursor.cursor_revision,
+                        });
                     let mut item = crate::ContextItem::new(
                         format!("team-board:{team_id}"),
                         crate::ContextSourceKind::AgentPeer,
@@ -466,7 +465,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                     item.authority = crate::ContextAuthority::Tool;
                     item.evidence = vec![format!(
                         "team-working-state:{}:{}",
-                        team_id, board_revision
+                        team_id, to_revision
                     )];
                     item
                 })
@@ -756,7 +755,20 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             )
             .await;
         let mut summary = match result {
-            Ok(summary) => summary,
+            Ok(summary) => {
+                if let Some(request) = initial_team_ack.take() {
+                    if let Err(error) = services.team_runtime().acknowledge_working_state(request) {
+                        let _ = services.agent_runtime().record_progress(
+                            packet.agent_id(),
+                            "agent.team_inbox_ack_deferred",
+                            &format!(
+                                "Team inbox page will be redelivered after ack failure: {error}"
+                            ),
+                        );
+                    }
+                }
+                summary
+            }
             Err(error) => {
                 let error = format!("in-process agent turn failed: {error}");
                 services.fail_live_execution(packet.run_id(), error.clone());
@@ -778,16 +790,47 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
         // finite and budget-governed, but do not abandon an actionable work
         // item merely because a provider marks an intermediate response
         // `Partial` or `Open`.
-        for checkpoint_round in 1..=8 {
+        // Continue while durable work is actionable and the owning execution
+        // still has time/budget. There is deliberately no fixed "N rounds"
+        // business rule here: a checkpoint is useful only when it observes a
+        // new durable state. Repeating the same checkpoint twice is a
+        // liveness fuse; a changing state may continue until the packet's
+        // existing deadline/budget fence is reached.
+        let mut previous_checkpoint_digest: Option<String> = None;
+        let mut repeated_checkpoint_count = 0usize;
+        loop {
+            if packet.deadline_at_ms > 0
+                && crate::tool_invocation::now_ms() >= packet.deadline_at_ms
+            {
+                let _ = services.agent_runtime().record_progress(
+                    packet.agent_id(),
+                    "agent.autonomy.checkpoint_stopped",
+                    "autonomy continuation reached the durable execution deadline",
+                );
+                break;
+            }
             let Some(checkpoint) = agent_autonomy_checkpoint(&services, &packet)? else {
                 break;
             };
+            let checkpoint_digest = format!("{:x}", Sha256::digest(checkpoint.prompt.as_bytes()));
+            if previous_checkpoint_digest.as_deref() == Some(checkpoint_digest.as_str()) {
+                repeated_checkpoint_count = repeated_checkpoint_count.saturating_add(1);
+            } else {
+                previous_checkpoint_digest = Some(checkpoint_digest);
+                repeated_checkpoint_count = 0;
+            }
+            if repeated_checkpoint_count >= 2 {
+                let _ = services.agent_runtime().record_progress(
+                    packet.agent_id(),
+                    "agent.autonomy.checkpoint_stopped",
+                    "identical actionable checkpoint repeated without durable progress",
+                );
+                break;
+            }
             let _ = services.agent_runtime().record_progress(
                 packet.agent_id(),
                 "agent.autonomy.checkpoint",
-                &format!(
-                    "durable Team work requires a bounded continuation; round={checkpoint_round}"
-                ),
+                "durable Team work requires a progress-bearing continuation",
             );
             if checkpoint.requires_tool_action {
                 runtime.require_next_model_tool_action(checkpoint.tool_ids.clone());
@@ -799,6 +842,17 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
                 Ok(updated) => {
                     let may_continue =
                         autonomy_continuation_may_advance(updated.terminal_completion);
+                    if let Some(request) = checkpoint.team_inbox_ack {
+                        if let Err(error) =
+                            services.team_runtime().acknowledge_working_state(request)
+                        {
+                            let _ = services.agent_runtime().record_progress(
+                                packet.agent_id(),
+                                "agent.team_inbox_ack_deferred",
+                                &format!("Team inbox page will be redelivered after ack failure: {error}"),
+                            );
+                        }
+                    }
                     summary = updated;
                     if !may_continue && !checkpoint.requires_tool_action {
                         let _ = services.agent_runtime().record_progress(
@@ -1319,6 +1373,7 @@ struct AgentAutonomyCheckpoint {
     prompt: String,
     tool_ids: Vec<String>,
     requires_tool_action: bool,
+    team_inbox_ack: Option<crate::TeamWorkingStateAcknowledgeRequest>,
 }
 
 fn autonomy_checkpoint_tool_plan(
@@ -1548,7 +1603,7 @@ fn agent_autonomy_checkpoint(
             "latest_challenge": state.review_findings.last(),
             "mutation_template": mutation_template,
         }));
-        if actions.len() >= 16 {
+        if actions.len() >= 32 {
             break;
         }
     }
@@ -1584,41 +1639,37 @@ fn agent_autonomy_checkpoint(
         }));
     }
 
-    let unread = services
+    let page = services
         .team_runtime()
-        .read_working_state_from_cursor(packet.graph_id().to_string(), packet.node_id().to_string())
-        .ok();
-    let unread_entries = unread
-        .as_ref()
-        .map(|state| {
-            state
-                .entries
-                .iter()
-                .rev()
-                .filter(|entry| entry.producer_instance_id != agent_id)
-                .take(16)
-                .cloned()
-                .collect::<Vec<_>>()
+        .read_working_state_page_from_cursor(
+            packet.graph_id().to_string(),
+            packet.node_id().to_string(),
+            16,
+            48 * 1024,
+        )
+        .ok()
+        .flatten();
+    let (unread_entries, team_inbox_ack) = page
+        .map(|page| {
+            let ack = services
+                .team_runtime()
+                .working_state_cursor(packet.graph_id(), packet.node_id())
+                .ok()
+                .map(|cursor| crate::TeamWorkingStateAcknowledgeRequest {
+                    graph_id: packet.graph_id().to_string(),
+                    node_id: packet.node_id().to_string(),
+                    through_revision: page.to_revision,
+                    expected_cursor_revision: cursor.cursor_revision,
+                });
+            (
+                page.entries
+                    .into_iter()
+                    .filter(|entry| entry.producer_instance_id != agent_id)
+                    .collect::<Vec<_>>(),
+                ack,
+            )
         })
         .unwrap_or_default();
-    if let Some(state) = unread.as_ref().filter(|state| !state.entries.is_empty()) {
-        if let Ok(cursor) = services
-            .team_runtime()
-            .working_state_cursor(packet.graph_id(), packet.node_id())
-        {
-            if state.board_revision > cursor.through_revision {
-                services
-                    .team_runtime()
-                    .acknowledge_working_state(crate::TeamWorkingStateAcknowledgeRequest {
-                        graph_id: packet.graph_id().to_string(),
-                        node_id: packet.node_id().to_string(),
-                        through_revision: state.board_revision,
-                        expected_cursor_revision: cursor.cursor_revision,
-                    })
-                    .map_err(|error| format!("advance Agent autonomy inbox cursor: {error}"))?;
-            }
-        }
-    }
     if actions.is_empty() && unread_entries.is_empty() {
         return Ok(None);
     }
@@ -1635,10 +1686,11 @@ fn agent_autonomy_checkpoint(
         autonomy_checkpoint_tool_plan(packet, requires_tool_action, requires_execution_tools);
     Ok(Some(AgentAutonomyCheckpoint {
         prompt: format!(
-            "Runtime safe checkpoint committed after your prior model round. Resolve the actionable work and peer entries below using the native collaboration tools before returning. When the checkpoint contains a `propose_work` opportunity, make exactly one genuine bounded peer cross-check proposal if your result exposes a useful verification need; do not propose a cosmetic or duplicate task. Follow each action exactly: scheduler-offered work is claimed directly; Agent-proposed work requires bid before claim; then execute, publish, submit, and let an independent peer review it. Do not invent identities, revisions, claim tokens, artifacts, sources, or completion. Preserve the substance and evidence of your earlier result and return a complete updated terminal answer after the checkpoint is closed.\n\n{checkpoint}"
+            "Runtime safe checkpoint committed after your prior model round. Resolve the actionable work and peer entries below using the native collaboration tools before returning. When the checkpoint contains a `propose_work` opportunity, make a genuine bounded peer cross-check proposal only when your result exposes a useful verification need; do not propose a cosmetic or duplicate task. Follow each action exactly: scheduler-offered work is claimed directly; Agent-proposed work requires bid before claim; then execute, publish, submit, and let an independent peer review it. Do not invent identities, revisions, claim tokens, artifacts, sources, or completion. Preserve the substance and evidence of your earlier result and return a complete updated terminal answer after the checkpoint is closed.\n\n{checkpoint}"
         ),
         tool_ids,
         requires_tool_action,
+        team_inbox_ack,
     }))
 }
 
@@ -2351,6 +2403,9 @@ impl ScopedRuntimeToolExecutor {
         }
         let input = serde_json::from_str::<serde_json::Value>(input)
             .map_err(|error| ToolError::new(format!("invalid scoped tool input: {error}")))?;
+        if tool_name == "glob_search" {
+            enforce_glob_scope(&input, allowed_scopes)?;
+        }
         let descriptor = self
             .host
             .delegated_tool_effect_descriptor(tool_name, &input)
@@ -2789,6 +2844,68 @@ impl ScopedRuntimeToolExecutor {
     }
 }
 
+/// `glob_search` effect descriptors carry only the request root, so the
+/// pattern itself must also be checked against the delegated lexical lease.
+/// Without this guard an out-of-scope pattern such as
+/// `path:"."/pattern:"crates/gateway/**/*.rs"` looks like a workspace-root
+/// read even when the Agent owns only `read:crates/runtime`.
+fn enforce_glob_scope(
+    input: &serde_json::Value,
+    allowed_scopes: &[String],
+) -> Result<(), ToolError> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| ToolError::new("glob_search input must be a JSON object"))?;
+    let path = object
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(".")
+        .trim()
+        .replace('\\', "/");
+    let pattern = object
+        .get("pattern")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ToolError::new("glob_search input is missing pattern"))?
+        .trim()
+        .replace('\\', "/");
+    let path_parts = normalized_relative_parts(&path)
+        .ok_or_else(|| ToolError::new("glob_search path escapes its workspace"))?;
+    let pattern_parts = normalized_relative_parts(&pattern)
+        .ok_or_else(|| ToolError::new("glob_search pattern escapes its workspace"))?;
+    let pattern_prefix = pattern_parts
+        .iter()
+        .take_while(|part| !part.contains(['*', '?', '[', '{']))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("/");
+    let requested_prefix = if path_parts.is_empty() {
+        pattern_prefix
+    } else if pattern_prefix.is_empty() {
+        path_parts.join("/")
+    } else {
+        format!("{}/{}", path_parts.join("/"), pattern_prefix)
+    };
+    let permitted = allowed_scopes.iter().any(|scope| {
+        let Some((mode, raw_scope)) = scope.split_once(':') else {
+            return false;
+        };
+        if !matches!(mode, "read" | "write") {
+            return false;
+        }
+        let scope_parts = match normalized_relative_parts(raw_scope) {
+            Some(parts) => parts,
+            None => return false,
+        };
+        let scope = scope_parts.join("/");
+        scope_parts.is_empty()
+            || requested_prefix == scope
+            || requested_prefix.starts_with(&(scope + "/"))
+    });
+    permitted
+        .then_some(())
+        .ok_or_else(|| ToolError::new("glob_search pattern is outside the Team resource lease"))
+}
+
 fn deterministic_scoped_tool_idempotency_key(
     execution_id: &str,
     node_id: &str,
@@ -2898,7 +3015,11 @@ fn normalize_delegated_resource_value(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let mut allowed = if matched.is_empty() && requested_path == "." && allowed.len() == 1 {
+    let mut allowed = if matched.is_empty()
+        && requested_path == "."
+        && allowed.len() == 1
+        && glob_pattern_has_no_explicit_root(&pattern)
+    {
         // A delegated Agent commonly uses `path: "."` to mean "search my
         // assigned directory".  Rebind that unambiguous root to the sole
         // leased scope; never do this when multiple scopes exist.

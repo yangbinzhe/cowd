@@ -812,8 +812,8 @@ pub use team_working_state::{
     AgentInitiativeProposal, CollaborationControlOperation, CollaborationControlRequest,
     CollaborationWorkProposal, FocusOverlapAssessment, TeamWorkingState,
     TeamWorkingStateAcknowledgeRequest, TeamWorkingStateCursor, TeamWorkingStateEntry,
-    TeamWorkingStateKind, TeamWorkingStatePublishRequest, TeamWorkingStateReadRequest,
-    TeamWorkingStateThread, TeamWorkingStateVisibility,
+    TeamWorkingStateKind, TeamWorkingStatePage, TeamWorkingStatePublishRequest,
+    TeamWorkingStateReadRequest, TeamWorkingStateThread, TeamWorkingStateVisibility,
 };
 pub use tool_execution_plane::{
     ToolExecutionAdmission, ToolExecutionPlane, ToolExecutionPlaneError, ToolExecutionPlaneStats,

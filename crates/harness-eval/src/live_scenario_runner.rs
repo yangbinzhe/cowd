@@ -3682,8 +3682,12 @@ impl ProjectedTeamHealth {
     }
 
     fn has_pending_work(&self) -> bool {
+        // A blocked/partial Team is a terminal outcome for evaluator waiting:
+        // it must make acceptance fail, but it must not keep the harness
+        // polling for an hour after every Agent has already retired. Team
+        // status is therefore evaluated by the acceptance checks, while the
+        // wait loop only considers non-terminal Agent work.
         self.completed_agents.saturating_add(self.failed_agents) < self.agent_count
-            || self.completed_teams.saturating_add(self.failed_teams) < self.team_count
     }
 
     fn to_value(&self) -> Value {

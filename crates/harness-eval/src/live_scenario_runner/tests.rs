@@ -502,6 +502,30 @@ fn root_progress_fingerprint_tracks_streaming_output_without_graph_changes() {
 }
 
 #[test]
+fn blocked_team_is_terminal_for_waiting_but_unfinished_agent_is_not() {
+    let blocked_teams = ProjectedTeamHealth {
+        agent_count: 12,
+        completed_agents: 12,
+        failed_agents: 0,
+        team_count: 4,
+        completed_teams: 1,
+        failed_teams: 2,
+    };
+    assert!(!blocked_teams.has_pending_work());
+    assert!(!blocked_teams.satisfies(1));
+
+    let live_agent = ProjectedTeamHealth {
+        agent_count: 12,
+        completed_agents: 11,
+        failed_agents: 0,
+        team_count: 4,
+        completed_teams: 1,
+        failed_teams: 0,
+    };
+    assert!(live_agent.has_pending_work());
+}
+
+#[test]
 fn descendant_live_terminal_never_forces_root_terminal_polling() {
     let child = ExecutionLiveObservation {
         fingerprint: "child".to_string(),

@@ -733,6 +733,7 @@ fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
             waiting_relation: None,
             blocker_ref: None,
             next_action: Some("await_graph_transitions".to_string()),
+            superseded_instance_ids: Vec::new(),
         },
         semantic_intent: None,
     });
@@ -792,6 +793,7 @@ fn collaboration_program_revision_keeps_prior_obligations_and_adds_new_teams() {
             waiting_relation: Some("team_admission".to_string()),
             blocker_ref: None,
             next_action: Some("admit_exact_team_bindings".to_string()),
+            superseded_instance_ids: Vec::new(),
         },
         semantic_intent: None,
     };
@@ -1219,6 +1221,7 @@ fn retirement_cancels_only_a_confirmed_unstarted_team_and_revises_program_atomic
         waiting_relation: Some("team_admission".to_string()),
         blocker_ref: None,
         next_action: Some("admit_exact_team_bindings".to_string()),
+        superseded_instance_ids: Vec::new(),
     };
     let registered = service.register_graph(graph).expect("register graph").graph;
     let started_registered = service

@@ -21,10 +21,10 @@ use super::graph::{
 };
 use crate::CancellationToken;
 
+#[cfg(test)]
 const DEFAULT_QUEUE_CAPACITY: usize = 1_024;
+#[cfg(test)]
 const DEFAULT_MAX_PARALLEL_GRAPHS: usize = 64;
-const DEFAULT_MAX_ACTIVE_NODES_PER_GRAPH: usize = 64;
-const DEFAULT_MAX_PARALLEL_OWNED_TASKS: usize = 256;
 const DEFAULT_QUEUE_PARTITIONS: u16 = 32;
 const LIFECYCLE_OPEN: u8 = 0;
 const LIFECYCLE_CLOSING: u8 = 1;
@@ -316,6 +316,7 @@ pub struct RuntimeExecutionSupervisor {
     slots: Arc<StdMutex<HashMap<String, Arc<DriverSlot>>>>,
     parallelism: Arc<Semaphore>,
     owned_parallelism: Arc<Semaphore>,
+    max_active_nodes_per_graph: usize,
     cancellation: CancellationToken,
     metrics: Arc<SupervisorMetrics>,
     queue_capacity: usize,
@@ -368,6 +369,7 @@ impl RuntimeExecutionSupervisor {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(runner: Arc<ExecutionGraphRunner>) -> Self {
         Self::with_limits(
@@ -378,11 +380,47 @@ impl RuntimeExecutionSupervisor {
         )
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn with_limits(
         runner: Arc<ExecutionGraphRunner>,
         queue_capacity: usize,
         max_parallel_graphs: usize,
+        shutdown_timeout: Duration,
+    ) -> Self {
+        Self::with_capacity_limits(
+            runner,
+            queue_capacity,
+            max_parallel_graphs,
+            max_parallel_graphs,
+            max_parallel_graphs.saturating_mul(4),
+            shutdown_timeout,
+        )
+    }
+
+    pub(crate) fn with_capacity_profile(
+        runner: Arc<ExecutionGraphRunner>,
+        profile: &crate::ExecutionCapacityProfile,
+    ) -> Self {
+        let agent_capacity = profile.max_parallel_agents.max(1);
+        Self::with_capacity_limits(
+            runner,
+            profile.max_pending_instance.max(1),
+            agent_capacity,
+            agent_capacity,
+            agent_capacity
+                .saturating_mul(4)
+                .min(profile.max_pending_per_class.max(1)),
+            Duration::from_secs(20),
+        )
+    }
+
+    fn with_capacity_limits(
+        runner: Arc<ExecutionGraphRunner>,
+        queue_capacity: usize,
+        max_parallel_graphs: usize,
+        max_active_nodes_per_graph: usize,
+        max_parallel_owned_tasks: usize,
         shutdown_timeout: Duration,
     ) -> Self {
         let queue_capacity = queue_capacity.max(1);
@@ -397,7 +435,8 @@ impl RuntimeExecutionSupervisor {
             dispatcher: StdMutex::new(None),
             slots: Arc::new(StdMutex::new(HashMap::new())),
             parallelism: Arc::new(Semaphore::new(max_parallel_graphs.max(1))),
-            owned_parallelism: Arc::new(Semaphore::new(DEFAULT_MAX_PARALLEL_OWNED_TASKS)),
+            owned_parallelism: Arc::new(Semaphore::new(max_parallel_owned_tasks.max(1))),
+            max_active_nodes_per_graph: max_active_nodes_per_graph.max(1),
             cancellation: CancellationToken::new(),
             metrics: Arc::new(SupervisorMetrics::new()),
             queue_capacity,
@@ -476,6 +515,7 @@ impl RuntimeExecutionSupervisor {
         let slots = Arc::clone(&self.slots);
         let parallelism = Arc::clone(&self.parallelism);
         let owned_parallelism = Arc::clone(&self.owned_parallelism);
+        let max_active_nodes_per_graph = self.max_active_nodes_per_graph;
         let cancellation = self.cancellation.clone();
         let metrics = Arc::clone(&self.metrics);
         let graph_settled_observer = Arc::clone(&self.graph_settled_observer);
@@ -487,6 +527,7 @@ impl RuntimeExecutionSupervisor {
                 slots,
                 parallelism,
                 owned_parallelism,
+                max_active_nodes_per_graph,
                 cancellation,
                 metrics,
                 graph_settled_observer,
@@ -1068,6 +1109,7 @@ async fn dispatch_loop(
     slots: Arc<StdMutex<HashMap<String, Arc<DriverSlot>>>>,
     parallelism: Arc<Semaphore>,
     owned_parallelism: Arc<Semaphore>,
+    max_active_nodes_per_graph: usize,
     cancellation: CancellationToken,
     metrics: Arc<SupervisorMetrics>,
     graph_settled_observer: Arc<OnceLock<GraphSettledObserver>>,
@@ -1193,6 +1235,7 @@ async fn dispatch_loop(
                                 slot,
                                 Arc::clone(&runner),
                                 Arc::clone(&parallelism),
+                                max_active_nodes_per_graph,
                                 cancellation.clone(),
                                 Arc::clone(&metrics),
                             );
@@ -1266,6 +1309,7 @@ async fn dispatch_loop(
                                     slot,
                                     Arc::clone(&runner),
                                     Arc::clone(&parallelism),
+                                    max_active_nodes_per_graph,
                                     cancellation.clone(),
                                     Arc::clone(&metrics),
                                 );
@@ -1329,6 +1373,7 @@ fn spawn_graph_pump(
     slot: Arc<DriverSlot>,
     runner: Arc<ExecutionGraphRunner>,
     parallelism: Arc<Semaphore>,
+    max_active_nodes_per_graph: usize,
     cancellation: CancellationToken,
     metrics: Arc<SupervisorMetrics>,
 ) {
@@ -1354,6 +1399,7 @@ fn spawn_graph_pump(
             let result = run_completion_pump(
                 Arc::clone(&runner),
                 &graph_id,
+                max_active_nodes_per_graph,
                 cancellation.clone(),
             )
             .await;
@@ -1382,6 +1428,7 @@ fn spawn_graph_pump(
 async fn run_completion_pump(
     runner: Arc<ExecutionGraphRunner>,
     graph_id: &str,
+    max_active_nodes_per_graph: usize,
     cancellation: CancellationToken,
 ) -> DriverOutcome {
     let durable_progress = Arc::new(Notify::new());
@@ -1398,7 +1445,7 @@ async fn run_completion_pump(
             }
         };
 
-        let available = DEFAULT_MAX_ACTIVE_NODES_PER_GRAPH.saturating_sub(active_nodes.len());
+        let available = max_active_nodes_per_graph.saturating_sub(active_nodes.len());
         let ready = snapshot
             .ready
             .into_iter()

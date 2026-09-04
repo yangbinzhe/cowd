@@ -182,11 +182,47 @@ pub struct GoalContract {
     pub obligations: Vec<ObjectiveObligation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program_ref: Option<String>,
+    /// Runtime-owned bounded semantic recovery cursor.  This is deliberately
+    /// additive so older goal streams remain readable and default to no
+    /// recovery attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ObjectiveRecoveryState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<ObjectiveTerminal>,
     pub completion: GoalCompletion,
     pub revision: u64,
     pub user_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectiveRecoveryState {
+    pub source_revision: u64,
+    pub attempts: u32,
+    pub budget: u32,
+    pub status: ObjectiveRecoveryStatus,
+    pub idempotency_key: String,
+    /// Durable graph mutation identity. It lets a restarted executor
+    /// distinguish "graph applied, Goal marker pending" from a fresh patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_id: Option<String>,
+    /// The exact required Team obligation that produced the recovery request.
+    /// Keeping this identity durable prevents a later observer from selecting
+    /// a different retryable Team when several terminal failures coexist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_obligation_id: Option<String>,
+    #[serde(default)]
+    pub last_diagnostic: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectiveRecoveryStatus {
+    Pending,
+    ApplyingGraph,
+    GraphApplied,
+    Committed,
+    Exhausted,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,6 +536,7 @@ mod tests {
             blockers: Vec::new(),
             obligations: Vec::new(),
             program_ref: None,
+            recovery: None,
             terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,

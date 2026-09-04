@@ -29,6 +29,12 @@ API_TOKEN="release-smoke-$$_credential"
 SMOKE_OBSERVER_ID="release-smoke:$$_writer"
 FAILED=0
 
+if command -v rg >/dev/null 2>&1; then
+  match() { rg -q "$1"; }
+else
+  match() { grep -Eq "$1"; }
+fi
+
 curl() {
   command curl -H "Authorization: Bearer $API_TOKEN" "$@"
 }
@@ -63,7 +69,7 @@ on_error() {
 trap cleanup EXIT
 trap on_error ERR
 
-for cmd in tmux curl python3 rg ss; do
+for cmd in tmux curl python3 ss grep; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "$cmd is required for release full-product smoke" >&2
     exit 1
@@ -78,7 +84,7 @@ if [[ ! -f "$FRONTEND_REPO/Cargo.toml" ]]; then
   echo "missing Cowd Edge repository at $FRONTEND_REPO" >&2
   exit 1
 fi
-if ss -ltnp | rg -q ":$PORT\\b|:$PROVIDER_PORT\\b"; then
+if ss -ltnp | match ":$PORT\\b|:$PROVIDER_PORT\\b"; then
   echo "release smoke port $PORT or provider port $PROVIDER_PORT is already in use" >&2
   exit 1
 fi
@@ -190,8 +196,8 @@ done
 
 curl -fsS "$BASE_URL/health" >/dev/null
 curl -fsS "$BASE_URL/healthz" >/dev/null
-curl -fsS "$BASE_URL/readyz" | rg -q '"ready":true'
-curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"config_key":"gateway.webui_dir"'
+curl -fsS "$BASE_URL/readyz" | match '"ready":true'
+curl -fsS "$BASE_URL/api/webui/manifest" | match '"config_key":"gateway.webui_dir"'
 
 curl -fsS -X POST "$BASE_URL/api/sessions/$SMOKE_ID/ensure" \
   -H 'content-type: application/json' \
@@ -249,7 +255,7 @@ attention_id="$(printf '%s' "$fact_json" | python3 -c 'import json,sys; data=jso
 curl -fsS "$BASE_URL/api/matrix/evidence/build" \
   -H 'content-type: application/json' \
   -d "{\"request_id\":\"release-smoke-evidence\",\"session_id\":\"$SMOKE_ID\",\"attention_id\":\"$attention_id\",\"problem_statement\":\"Release smoke validates structured evidence and outcome timeline\"}" \
-  | rg -q '"kind":"matrix.evidence.packet"'
+  | match '"kind":"matrix.evidence.packet"'
 curl -fsS "$BASE_URL/api/runtime/timeline?session_id=$SMOKE_ID&limit=200" \
   | python3 -c 'import json,sys; events=json.load(sys.stdin).get("events", []); assert any(e.get("kind")=="runtime.outcome.recorded.v1" and e.get("status")=="succeeded" for e in events), events; assert any(e.get("kind")=="application.execution_summary" for e in events), events'
 
@@ -257,26 +263,26 @@ release_gate_json="$(curl -fsS "$BASE_URL/api/cowd/release-gate")"
 printf '%s' "$release_gate_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); checks={item.get("check_id"): item.get("status") for item in data.get("checks", [])}; assert data.get("status")=="pass", data; required=["structured_data.indexes.ready","structured_data.watermark.persistent","execution_outcome.timeline.available"]; missing=[item for item in required if checks.get(item)!="pass"]; assert not missing, f"release gate checks not passing: {missing}"'
 
 curl -fsS "$BASE_URL/api/context/current?q=release%20full%20product&session_id=$SMOKE_ID" \
-  | rg -q '"session_id"\s*:\s*"'"$SMOKE_ID"'"|release full product'
+  | match '"session_id"\s*:\s*"'"$SMOKE_ID"'"|release full product'
 
 curl -fsS "$BASE_URL/api/memory/L3" \
   -H 'content-type: application/json' \
   -d '{"title":"RELEASE_SMOKE_MEMORY","content":"Release smoke validates memory runtime wiring.","tags":["release-smoke"],"category":"Reference","priority":"High"}' \
-  | rg -q '"id"'
-curl -fsS "$BASE_URL/api/memory/runtime" | rg -q '"runtime"'
+  | match '"id"'
+curl -fsS "$BASE_URL/api/memory/runtime" | match '"runtime"'
 
-curl -fsS "$BASE_URL/api/connectors/summary" | rg -q '"kind"\s*:\s*"connector_summary"'
+curl -fsS "$BASE_URL/api/connectors/summary" | match '"kind"\s*:\s*"connector_summary"'
 curl -fsS "$BASE_URL/api/cross-plane/grants" \
   -H 'content-type: application/json' \
   -d "{\"id\":\"$GRANT_ID\",\"principal_id\":\"$PRINCIPAL\",\"capability\":\"service.local.docs.read\",\"grant_type\":\"single_use\",\"created_by\":\"release-smoke\"}" \
-  | rg -q "\"$GRANT_ID\""
+  | match "\"$GRANT_ID\""
 curl -fsS "$BASE_URL/api/connectors/services/local.docs/execute" \
   -H 'content-type: application/json' \
   -d "{\"source_channel\":\"channel://tui/release\",\"session_id\":\"$SMOKE_ID\",\"tool_id\":\"service.local.docs.read\",\"resource_id\":\"release-doc-$SMOKE_ID\",\"title\":\"Release Smoke Doc\",\"mode\":\"commit\",\"idempotency_key\":\"release-$SMOKE_ID\"}" \
-  | rg -q '"status"\s*:\s*"executed"'
-curl -fsS "$BASE_URL/api/cross-plane/audit" | rg -q "\"consumed_grant_id\"\\s*:\\s*\"$GRANT_ID\""
+  | match '"status"\s*:\s*"executed"'
+curl -fsS "$BASE_URL/api/cross-plane/audit" | match "\"consumed_grant_id\"\\s*:\\s*\"$GRANT_ID\""
 
 curl -fsS "$BASE_URL/api/connectors/resources" \
-  | rg -q "release-doc-$SMOKE_ID|Release Smoke Doc"
+  | match "release-doc-$SMOKE_ID|Release Smoke Doc"
 
 echo "release full-product smoke passed"

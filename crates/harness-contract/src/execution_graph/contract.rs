@@ -1097,6 +1097,11 @@ pub struct CollaborationProgramControlState {
     pub blocker_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
+    /// Required Team instances that were durably superseded by a bounded
+    /// Runtime recovery attempt. The original terminal/evidence remains
+    /// immutable, but it no longer blocks the replacement obligation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_instance_ids: Vec<String>,
 }
 
 /// One stable Team obligation compiled into a root execution graph.
@@ -2228,6 +2233,7 @@ mod dependency_policy_tests {
                 waiting_relation: None,
                 blocker_ref: None,
                 next_action: None,
+                superseded_instance_ids: Vec::new(),
             },
         };
         assert!(program.validate().is_ok());

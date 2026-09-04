@@ -975,15 +975,67 @@ where
                 blockers: Vec::new(),
                 obligations: Vec::new(),
                 program_ref: Some(graph.id.clone()),
+                recovery: None,
                 terminal: None,
                 completion: GoalCompletion::Open,
                 revision: 1,
                 user_sequence: 1,
             })
             .map_err(RuntimeError::new)?;
+        // A retryable Objective gap is recovered by Runtime from the frozen
+        // Team terminal contract before the next model round.  This preserves
+        // the original Program authority and avoids making a continuation
+        // prompt the only recovery mechanism.
+        let recovery_graph_id = continuation_binding
+            .as_ref()
+            .map(|binding| binding.source_root_id.clone())
+            .unwrap_or_else(|| graph.id.clone());
+        let recovery_goal_id = format!("goal:{recovery_graph_id}");
+        crate::orchestration::collaboration_coordinator::execute_pending_objective_replan(
+            &recovery_graph_id,
+            &recovery_goal_id,
+            services.as_ref(),
+        )
+        .await
+        .map_err(RuntimeError::new)?;
         {
             let mut turn_state = state.lock().await;
-            turn_state.goal_id = goal_id;
+            turn_state.goal_id = goal_id.clone();
+            // A settled Program may have emitted a durable Objective replan
+            // proposal after the previous turn closed. Carry the latest
+            // typed proposal into this turn's private context so the model
+            // can issue a revision against the current graph rather than
+            // reconstructing recovery from prose or an empty inspect call.
+            let recovery_goal_id = continuation_binding
+                .as_ref()
+                .map(|binding| format!("goal:{}", binding.source_root_id))
+                .unwrap_or_else(|| turn_state.goal_id.clone());
+            if let Ok(Some(projection)) = services.goal_store().projection(&recovery_goal_id) {
+                if let Some(intervention) = projection
+                    .interventions
+                    .iter()
+                    .rev()
+                    .find(|intervention| {
+                        intervention.kind
+                            == harness_contract::goal::RuntimeInterventionKind::Replan
+                    })
+                {
+                    let mut item = ContextItem::new(
+                        format!("objective-replan:{}:{}", graph.id, graph.revision),
+                        ContextSourceKind::Task,
+                        ContextRole::Instruction,
+                        format!(
+                            "Durable Objective recovery proposal: {}. Submit a bounded semantic revision against graph revision {} when recovery is justified; preserve completed evidence and do not fabricate completion.",
+                            intervention.reason,
+                            intervention.expected_graph_revision.unwrap_or(graph.revision)
+                        ),
+                    );
+                    item.authority = ContextAuthority::System;
+                    item.visibility = ContextVisibility::Private;
+                    item.evidence = intervention.evidence_refs.clone();
+                    turn_state.pending_next_model_context.push(item);
+                }
+            }
             // Rehydrate the bounded delegated-recovery lease from the durable
             // Goal stream. A graph/node replay must not reset a consumed
             // semantic replan and accidentally reopen an unbounded retry path.

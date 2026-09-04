@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 pub mod policy;
 pub mod supervisor;
@@ -15,8 +16,9 @@ pub use supervisor::{ObjectiveReconcileDecision, ObjectiveSupervisor};
 
 use harness_contract::goal::{
     AcceptanceStatus, GoalCompletion, GoalContract, GoalProgressSnapshot, GoalRevision,
-    ObjectiveObligationState, ObjectiveTerminal, ObjectiveTerminalKind, ResolutionDeltaKind,
-    RuntimeIntervention, RuntimeInterventionTrace, RuntimeObservation,
+    ObjectiveObligationState, ObjectiveRecoveryState, ObjectiveRecoveryStatus, ObjectiveTerminal,
+    ObjectiveTerminalKind, ResolutionDeltaKind, RuntimeIntervention, RuntimeInterventionTrace,
+    RuntimeObservation,
 };
 
 use crate::{
@@ -502,12 +504,35 @@ impl GoalStore {
         intervention: RuntimeIntervention,
         trigger_observations: &[RuntimeObservation],
     ) -> Result<(), String> {
-        let event = self.intervention_event(
-            &intervention,
-            trigger_observations,
-            format!("direct:{}", uuid::Uuid::new_v4()),
-        )?;
+        if trigger_observations.is_empty() {
+            return Err(
+                "runtime intervention requires at least one typed trigger observation".to_string(),
+            );
+        }
+        // Settled observers may be delivered more than once after a process
+        // restart.  The intervention is a durable proposal, so its
+        // idempotency identity must be derived from the typed trigger and
+        // intervention—not from a fresh UUID on every projection pass.
+        let mut identity = serde_json::to_vec(&intervention).map_err(|error| error.to_string())?;
+        for observation in trigger_observations {
+            identity.extend_from_slice(observation.idempotency_fingerprint().as_bytes());
+        }
+        let idempotency_key = format!(
+            "goal-intervention:{}:{:x}",
+            intervention.goal_id,
+            sha2::Sha256::digest(identity),
+        );
+        let event =
+            self.intervention_event(&intervention, trigger_observations, idempotency_key.clone())?;
         let stream_id = event.event.stream_id.clone();
+        if self
+            .event_store
+            .event_by_idempotency_key(&stream_id, &idempotency_key)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
         let revision = self
             .event_store
             .stream_revision(&stream_id)
@@ -516,15 +541,276 @@ impl GoalStore {
             .append_batch_if_revision(
                 stream_id,
                 revision,
-                format!(
-                    "goal-intervention:{}:{}",
-                    intervention.goal_id,
-                    uuid::Uuid::new_v4()
-                ),
+                format!("{}:append", idempotency_key,),
                 vec![event],
             )
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// Reserve one bounded semantic recovery attempt in the durable Goal
+    /// stream.  This is only the authority/fence reservation; orchestration
+    /// must still compile and commit the physical recovery patch through the
+    /// canonical graph pipeline.
+    pub fn reserve_recovery(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+        source_revision: u64,
+        budget: u32,
+        idempotency_key: impl Into<String>,
+        diagnostic: impl Into<String>,
+    ) -> Result<Option<GoalContract>, String> {
+        self.reserve_recovery_for_obligation(
+            goal_id,
+            expected_revision,
+            source_revision,
+            budget,
+            idempotency_key,
+            diagnostic,
+            None,
+        )
+    }
+
+    /// Reserve recovery while binding it to the exact source obligation.  The
+    /// legacy method above remains available for older callers that do not
+    /// have an obligation identity; new orchestration paths should use this
+    /// stronger fence whenever one is available.
+    pub fn reserve_recovery_for_obligation(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+        source_revision: u64,
+        budget: u32,
+        idempotency_key: impl Into<String>,
+        diagnostic: impl Into<String>,
+        source_obligation_id: Option<String>,
+    ) -> Result<Option<GoalContract>, String> {
+        let key = idempotency_key.into();
+        let diagnostic = diagnostic.into();
+        let current = self
+            .get(goal_id)?
+            .ok_or_else(|| format!("goal {goal_id} not found"))?;
+        if current.revision != expected_revision {
+            return Err(format!(
+                "goal recovery revision stale: expected {expected_revision}, actual {}",
+                current.revision
+            ));
+        }
+        if let Some(recovery) = &current.recovery {
+            if recovery.idempotency_key == key {
+                return Ok(Some(current));
+            }
+            if recovery.attempts >= recovery.budget
+                || matches!(
+                    recovery.status,
+                    ObjectiveRecoveryStatus::Exhausted | ObjectiveRecoveryStatus::Failed
+                )
+            {
+                return Ok(None);
+            }
+        }
+        let next_attempt = current
+            .recovery
+            .as_ref()
+            .map_or(1, |state| state.attempts.saturating_add(1));
+        if next_attempt > budget {
+            return Ok(None);
+        }
+        let next_sequence = current.user_sequence.saturating_add(1);
+        let (updated, _) = self.revise(
+            goal_id,
+            expected_revision,
+            next_sequence,
+            "objective_recovery_reservation",
+            |goal| {
+                goal.recovery = Some(ObjectiveRecoveryState {
+                    source_revision,
+                    attempts: next_attempt,
+                    budget,
+                    status: ObjectiveRecoveryStatus::Pending,
+                    idempotency_key: key.clone(),
+                    mutation_id: None,
+                    source_obligation_id: source_obligation_id.clone(),
+                    last_diagnostic: Some(diagnostic.clone()),
+                });
+                vec!["recovery".to_string()]
+            },
+        )?;
+        Ok(Some(updated))
+    }
+
+    /// Claim the physical graph mutation phase. The mutation id is durable so
+    /// a crash can safely resume the same patch instead of creating another
+    /// Team instance.
+    pub fn begin_recovery_graph(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+        idempotency_key: &str,
+        mutation_id: &str,
+    ) -> Result<GoalContract, String> {
+        self.transition_recovery(
+            goal_id,
+            expected_revision,
+            idempotency_key,
+            ObjectiveRecoveryStatus::ApplyingGraph,
+            Some(mutation_id.to_string()),
+            None,
+            "objective_recovery_applying_graph",
+        )
+    }
+
+    /// Record that the graph mutation receipt is durable. Goal terminal
+    /// verification remains a separate canonical step, but this marker makes
+    /// the two-step boundary crash-recoverable and idempotent.
+    pub fn mark_recovery_graph_applied(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+        idempotency_key: &str,
+        mutation_id: &str,
+    ) -> Result<GoalContract, String> {
+        self.transition_recovery(
+            goal_id,
+            expected_revision,
+            idempotency_key,
+            ObjectiveRecoveryStatus::GraphApplied,
+            Some(mutation_id.to_string()),
+            None,
+            "objective_recovery_graph_applied",
+        )
+    }
+
+    /// Fail closed with an actionable diagnostic. This is intentionally not a
+    /// model-visible retry loop; only a fresh reservation can ever create a
+    /// new semantic attempt, and budget exhaustion is terminal.
+    pub fn fail_recovery(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+        idempotency_key: &str,
+        diagnostic: impl Into<String>,
+    ) -> Result<GoalContract, String> {
+        let current = self
+            .get(goal_id)?
+            .ok_or_else(|| format!("goal {goal_id} not found"))?;
+        let recovery = current
+            .recovery
+            .as_ref()
+            .ok_or_else(|| "goal recovery failure has no reservation".to_string())?;
+        if recovery.idempotency_key != idempotency_key {
+            return Err("goal recovery failure key mismatch".to_string());
+        }
+        let status = if recovery.attempts >= recovery.budget {
+            ObjectiveRecoveryStatus::Exhausted
+        } else {
+            ObjectiveRecoveryStatus::Failed
+        };
+        self.transition_recovery(
+            goal_id,
+            expected_revision,
+            idempotency_key,
+            status,
+            recovery.mutation_id.clone(),
+            Some(diagnostic.into()),
+            "objective_recovery_failed",
+        )
+    }
+
+    fn transition_recovery(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+        idempotency_key: &str,
+        status: ObjectiveRecoveryStatus,
+        mutation_id: Option<String>,
+        diagnostic: Option<String>,
+        reason: &str,
+    ) -> Result<GoalContract, String> {
+        let current = self
+            .get(goal_id)?
+            .ok_or_else(|| format!("goal {goal_id} not found"))?;
+        if current.revision != expected_revision {
+            return Err(format!(
+                "goal recovery transition revision stale: expected {expected_revision}, actual {}",
+                current.revision
+            ));
+        }
+        let recovery = current
+            .recovery
+            .as_ref()
+            .ok_or_else(|| "goal recovery transition has no reservation".to_string())?;
+        if recovery.idempotency_key != idempotency_key {
+            return Err("goal recovery transition key mismatch".to_string());
+        }
+        if recovery.status == status
+            && (mutation_id.is_none() || recovery.mutation_id == mutation_id)
+        {
+            return Ok(current);
+        }
+        let next_sequence = current.user_sequence.saturating_add(1);
+        self.revise(goal_id, expected_revision, next_sequence, reason, |goal| {
+            let recovery = goal
+                .recovery
+                .as_mut()
+                .expect("recovery checked before transition");
+            recovery.status = status;
+            if mutation_id.is_some() {
+                recovery.mutation_id = mutation_id.clone();
+            }
+            if let Some(diagnostic) = diagnostic.clone() {
+                recovery.last_diagnostic = Some(diagnostic);
+            }
+            vec!["recovery.status".to_string()]
+        })
+        .map(|(goal, _)| goal)
+    }
+
+    /// Mark the already-reserved recovery mutation as committed only after the
+    /// graph transaction has admitted its replacement work.  A stale caller
+    /// cannot overwrite a newer reservation.
+    pub fn commit_recovery(
+        &self,
+        goal_id: &str,
+        expected_revision: u64,
+        idempotency_key: &str,
+    ) -> Result<GoalContract, String> {
+        let current = self
+            .get(goal_id)?
+            .ok_or_else(|| format!("goal {goal_id} not found"))?;
+        if current.revision != expected_revision {
+            return Err(format!(
+                "goal recovery commit revision stale: expected {expected_revision}, actual {}",
+                current.revision
+            ));
+        }
+        let recovery = current
+            .recovery
+            .as_ref()
+            .ok_or_else(|| "goal recovery commit has no reservation".to_string())?;
+        if recovery.idempotency_key != idempotency_key {
+            return Err("goal recovery commit key mismatch".to_string());
+        }
+        if recovery.status == ObjectiveRecoveryStatus::Committed {
+            return Ok(current);
+        }
+        let next_sequence = current.user_sequence.saturating_add(1);
+        self.revise(
+            goal_id,
+            expected_revision,
+            next_sequence,
+            "objective_recovery_committed",
+            |goal| {
+                let recovery = goal
+                    .recovery
+                    .as_mut()
+                    .expect("recovery checked before revision");
+                recovery.status = ObjectiveRecoveryStatus::Committed;
+                vec!["recovery.status".to_string()]
+            },
+        )
+        .map(|(goal, _)| goal)
     }
 
     /// Build, but do not append, an observation event. Node executors attach
@@ -1194,6 +1480,7 @@ mod tests {
             blockers: Vec::new(),
             obligations: Vec::new(),
             program_ref: None,
+            recovery: None,
             terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
@@ -1370,6 +1657,18 @@ mod tests {
         store.create(goal()).unwrap();
         let trigger = observation(1);
         store.record_observation(trigger.clone()).unwrap();
+        store
+            .record_intervention(
+                RuntimeIntervention {
+                    goal_id: "goal-test".to_string(),
+                    kind: harness_contract::goal::RuntimeInterventionKind::Replan,
+                    reason: "typed trigger".to_string(),
+                    evidence_refs: Vec::new(),
+                    expected_graph_revision: None,
+                },
+                std::slice::from_ref(&trigger),
+            )
+            .unwrap();
         store
             .record_intervention(
                 RuntimeIntervention {

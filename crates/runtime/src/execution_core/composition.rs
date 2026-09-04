@@ -329,6 +329,7 @@ impl RuntimeServicesBuilder {
             elapsed_ms = assemble_started_at.elapsed().as_millis() as u64,
             "Runtime service graph assembly completed"
         );
+        services.install_graph_settled_observer()?;
         let task_recovery_started_at = Instant::now();
         services
             .task_runtime_port()

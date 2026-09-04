@@ -946,6 +946,19 @@ impl GatewayToolExecutor {
                     permission_ceiling: binding.permission_ceiling,
                 },
             );
+            // An active model turn already has an authenticated parent graph.
+            // Binding an omitted inspect target to that graph prevents a
+            // seemingly successful `runtime_orchestrate(operation=inspect)`
+            // from returning an empty snapshot during terminal recovery.
+            // Explicit targets remain untouched and are still validated by
+            // the Runtime ownership/lineage checks.
+            if request.operation == runtime::RuntimeOrchestrationOperation::Inspect
+                && request.inspect_execution_id.is_none()
+            {
+                request.inspect_execution_id = binding
+                    .parent_execution
+                    .map(|parent| parent.execution_id.clone());
+            }
             request.collaboration_intent = submitted_collaboration_intent;
             self.bind_delegated_capabilities(&mut request);
             let decision =

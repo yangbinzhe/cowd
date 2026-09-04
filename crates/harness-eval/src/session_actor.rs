@@ -113,7 +113,14 @@ impl<'a> SessionActor<'a> {
         if !self.active {
             return Ok(());
         }
-        let release_body = json!({"session_id": self.session_id});
+        // Lease mutation is authorized against the exact attached writer
+        // Surface. Headers identify the caller, but the public command also
+        // requires the surface in its body; omitting it produced a misleading
+        // 403 during otherwise successful E2E cleanup.
+        let release_body = json!({
+            "session_id": self.session_id,
+            "surface": self.surface_id,
+        });
         let release = send_json(
             self.writer_request(
                 self.client

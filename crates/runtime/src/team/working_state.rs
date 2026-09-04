@@ -207,6 +207,20 @@ pub struct TeamWorkingState {
     pub entries: Vec<TeamWorkingStateEntry>,
 }
 
+/// A bounded, cursor-addressed Team inbox page. `to_revision` is the highest
+/// entry revision actually delivered in this page; callers must never
+/// acknowledge a board revision merely because it was observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamWorkingStatePage {
+    pub team_id: String,
+    pub graph_id: String,
+    pub from_revision: u64,
+    pub to_revision: u64,
+    pub source_board_revision: u64,
+    pub has_more: bool,
+    pub entries: Vec<TeamWorkingStateEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeamWorkingStatePublishRequest {
@@ -249,6 +263,50 @@ pub struct FocusOverlapAssessment {
 }
 
 impl TeamWorkingState {
+    /// Build a bounded page from an already materialized board. This pure
+    /// helper keeps cursor semantics testable without booting Runtime.
+    pub fn page_after(
+        &self,
+        after_revision: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Option<TeamWorkingStatePage> {
+        let max_entries = max_entries.max(1);
+        let max_bytes = max_bytes.max(1);
+        let mut entries = Vec::new();
+        let mut bytes = 0usize;
+        let mut has_more = false;
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| entry.revision > after_revision)
+        {
+            let entry_bytes = serde_json::to_vec(entry).ok()?.len();
+            if !entries.is_empty()
+                && (entries.len() >= max_entries || bytes.saturating_add(entry_bytes) > max_bytes)
+            {
+                has_more = true;
+                break;
+            }
+            bytes = bytes.saturating_add(entry_bytes);
+            entries.push(entry.clone());
+        }
+        let to_revision = entries.last().map(|entry| entry.revision)?;
+        has_more |= self
+            .entries
+            .iter()
+            .any(|entry| entry.revision > to_revision);
+        Some(TeamWorkingStatePage {
+            team_id: self.team_id.clone(),
+            graph_id: self.graph_id.clone(),
+            from_revision: after_revision,
+            to_revision,
+            source_board_revision: self.board_revision,
+            has_more,
+            entries,
+        })
+    }
+
     #[must_use]
     pub fn from_events(
         team_id: impl Into<String>,
@@ -288,9 +346,11 @@ impl TeamWorkingState {
                 state.entries.push(entry);
             }
         }
-        state
-            .entries
-            .sort_by(|left, right| left.entry_id.cmp(&right.entry_id));
+        state.entries.sort_by(|left, right| {
+            left.revision
+                .cmp(&right.revision)
+                .then_with(|| left.entry_id.cmp(&right.entry_id))
+        });
         state
     }
 
@@ -870,5 +930,67 @@ mod tests {
         };
 
         assert!(state.verify_completed_graph(&graph).is_ok());
+    }
+
+    #[test]
+    fn inbox_page_is_ascending_and_ack_never_jumps_to_board_head() {
+        let mut entries = Vec::new();
+        for revision in 1..=5 {
+            let mut entry = overlap_entry(&format!("entry-{revision}"), &[], 0);
+            entry.revision = revision;
+            entry.entry_id = format!("entry-{revision}");
+            entries.push(entry);
+        }
+        let state = TeamWorkingState {
+            team_id: "team".to_string(),
+            graph_id: "graph".to_string(),
+            graph_revision: 1,
+            board_revision: 5,
+            entries,
+        };
+
+        let first = state.page_after(0, 2, usize::MAX).expect("first page");
+        assert_eq!(first.from_revision, 0);
+        assert_eq!(first.to_revision, 2);
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.revision)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let second = state
+            .page_after(first.to_revision, 2, usize::MAX)
+            .expect("second page");
+        assert_eq!(second.from_revision, 2);
+        assert_eq!(second.to_revision, 4);
+        assert!(second.has_more);
+
+        let last = state
+            .page_after(second.to_revision, 2, usize::MAX)
+            .expect("last page");
+        assert_eq!(last.to_revision, 5);
+        assert!(!last.has_more);
+    }
+
+    #[test]
+    fn inbox_page_delivers_one_complete_large_entry_without_truncation() {
+        let mut entry = overlap_entry("large", &[], 0);
+        entry.revision = 7;
+        entry.summary = "x".repeat(2048);
+        let state = TeamWorkingState {
+            team_id: "team".to_string(),
+            graph_id: "graph".to_string(),
+            graph_revision: 1,
+            board_revision: 7,
+            entries: vec![entry.clone()],
+        };
+        let page = state.page_after(0, 1, 1).expect("large entry page");
+        assert_eq!(page.to_revision, 7);
+        assert_eq!(page.entries, vec![entry]);
+        assert!(!page.has_more);
     }
 }

@@ -998,6 +998,7 @@ impl RuntimeServices {
             Vec::new(),
             Some(ephemeral_root),
         )?);
+        services.install_graph_settled_observer()?;
         services.agent_runtime.bind_services(Arc::clone(&services));
         services
             .agent_runtime
@@ -1227,7 +1228,11 @@ impl RuntimeServices {
             workspace_root.clone(),
             Arc::clone(&path_identity_resolver),
         ));
-        let execution_supervisor = Arc::new(crate::RuntimeExecutionSupervisor::new(graph_runner));
+        let execution_supervisor =
+            Arc::new(crate::RuntimeExecutionSupervisor::with_capacity_profile(
+                graph_runner,
+                &execution_capacity_profile,
+            ));
         tool_execution_plane.bind_supervisor(&execution_supervisor);
         let deadline_supervisor = Arc::clone(&execution_supervisor);
         let deadline_approval_coordinator = Arc::clone(&approval_coordinator);
@@ -1361,95 +1366,6 @@ impl RuntimeServices {
             elapsed_ms = assembly_started_at.elapsed().as_millis() as u64,
             "Runtime mission and Managed Agent projections assembled"
         );
-        let managed_projection_store = graph_state_store.clone();
-        let managed_projection_dispatcher = Arc::clone(&managed_agents);
-        let outcome_projection_store = graph_state_store.clone();
-        let settled_outcome_service = Arc::clone(&outcome_service);
-        let settled_lineage_supervisor = Arc::clone(&execution_supervisor);
-        let settled_team_runtime = Arc::clone(&team_runtime);
-        let settled_objective_supervisor = Arc::clone(&objective_supervisor);
-        execution_supervisor
-            .install_graph_settled_observer(move |graph_id| {
-                let graph_id = graph_id.to_string();
-                let graph_store = managed_projection_store.clone();
-                let dispatcher = Arc::clone(&managed_projection_dispatcher);
-                let outcome_store = outcome_projection_store.clone();
-                let outcome_service = Arc::clone(&settled_outcome_service);
-                let lineage_supervisor = Arc::clone(&settled_lineage_supervisor);
-                let coordinator_store = graph_store.clone();
-                let coordinator_supervisor = Arc::clone(&lineage_supervisor);
-                let coordinator_teams = Arc::clone(&settled_team_runtime);
-                let objective_supervisor = Arc::clone(&settled_objective_supervisor);
-                tokio::spawn(async move {
-                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_program_wait_state_with(
-                        &graph_id,
-                        coordinator_supervisor.as_ref(),
-                        &coordinator_store,
-                        coordinator_teams.as_ref(),
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            graph_id,
-                            %error,
-                            "settled graph could not reconcile CollaborationProgram wait truth"
-                        );
-                    }
-                    if let Err(error) = lineage_supervisor
-                        .wake_parent_for_settled_child(&graph_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            graph_id,
-                            %error,
-                            "settled child graph could not wake its durable parent join"
-                        );
-                    }
-                    if let Err(error) =
-                        project_managed_invocation_terminal(graph_store, dispatcher, &graph_id)
-                            .await
-                    {
-                        tracing::warn!(
-                            graph_id,
-                            error,
-                            "managed Agent terminal projector could not reduce graph state"
-                        );
-                    }
-                    if let Err(error) =
-                        project_team_terminal_outcome(outcome_store, outcome_service, &graph_id)
-                            .await
-                    {
-                        tracing::warn!(
-                            graph_id,
-                            error,
-                            "Team terminal Outcome projector could not reduce graph state"
-                        );
-                    }
-                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_terminal_program_with(
-                        &graph_id,
-                        coordinator_supervisor.as_ref(),
-                        &coordinator_store,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            graph_id,
-                            %error,
-                            "settled graph could not reconcile CollaborationProgram terminal truth"
-                        );
-                    }
-                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_objective_from_program(
-                        &graph_id,
-                        objective_supervisor.as_ref(),
-                        &coordinator_store,
-                    )
-                    .await
-                    {
-                        tracing::warn!(graph_id, %error, "settled graph could not reconcile Objective truth");
-                    }
-                });
-            })
-            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         let session_relations = Arc::new(
             SessionRelationGraph::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
@@ -1558,6 +1474,111 @@ impl RuntimeServices {
             ),
             _ephemeral_root: ephemeral_root,
         })
+    }
+
+    /// Install the single settled-graph observer after `RuntimeServices` has
+    /// been fully assembled. Keeping the callback on an `Arc` lets it invoke
+    /// the complete recovery executor without constructing a second service
+    /// graph or capturing a strong self-cycle.
+    pub(crate) fn install_graph_settled_observer(
+        self: &Arc<Self>,
+    ) -> Result<(), RuntimeServicesError> {
+        let managed_projection_store = self.graph_state_store.clone();
+        let managed_projection_dispatcher = Arc::clone(&self.managed_agents);
+        let outcome_projection_store = self.graph_state_store.clone();
+        let settled_outcome_service = Arc::clone(&self.outcome_service);
+        let settled_lineage_supervisor = Arc::clone(&self.execution_supervisor);
+        let settled_team_runtime = Arc::clone(&self.team_runtime);
+        let settled_objective_supervisor = Arc::clone(&self.objective_supervisor);
+        let services_weak = Arc::downgrade(self);
+        self.execution_supervisor
+            .install_graph_settled_observer(move |graph_id| {
+                let graph_id = graph_id.to_string();
+                let graph_store = managed_projection_store.clone();
+                let dispatcher = Arc::clone(&managed_projection_dispatcher);
+                let outcome_store = outcome_projection_store.clone();
+                let outcome_service = Arc::clone(&settled_outcome_service);
+                let lineage_supervisor = Arc::clone(&settled_lineage_supervisor);
+                let coordinator_store = graph_store.clone();
+                let coordinator_supervisor = Arc::clone(&lineage_supervisor);
+                let coordinator_teams = Arc::clone(&settled_team_runtime);
+                let objective_supervisor = Arc::clone(&settled_objective_supervisor);
+                let services_weak = services_weak.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_program_wait_state_with(
+                        &graph_id,
+                        coordinator_supervisor.as_ref(),
+                        &coordinator_store,
+                        coordinator_teams.as_ref(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(graph_id, %error, "settled graph could not reconcile CollaborationProgram wait truth");
+                    }
+                    if let Err(error) = lineage_supervisor
+                        .wake_parent_for_settled_child(&graph_id)
+                        .await
+                    {
+                        tracing::warn!(graph_id, %error, "settled child graph could not wake its durable parent join");
+                    }
+                    if let Err(error) =
+                        project_managed_invocation_terminal(graph_store, dispatcher, &graph_id)
+                            .await
+                    {
+                        tracing::warn!(graph_id, error, "managed Agent terminal projector could not reduce graph state");
+                    }
+                    if let Err(error) =
+                        project_team_terminal_outcome(outcome_store, outcome_service, &graph_id)
+                            .await
+                    {
+                        tracing::warn!(graph_id, error, "Team terminal Outcome projector could not reduce graph state");
+                    }
+                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_terminal_program_with(
+                        &graph_id,
+                        coordinator_supervisor.as_ref(),
+                        &coordinator_store,
+                    )
+                    .await
+                    {
+                        tracing::warn!(graph_id, %error, "settled graph could not reconcile CollaborationProgram terminal truth");
+                    }
+                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_objective_from_program(
+                        &graph_id,
+                        objective_supervisor.as_ref(),
+                        &coordinator_store,
+                    )
+                    .await
+                    {
+                        tracing::warn!(graph_id, %error, "settled graph could not reconcile Objective truth");
+                    }
+                    // The settled durable event is the liveness trigger. A
+                    // user continuation can observe the same state, but is
+                    // never required to start objective recovery.
+                    let goal_id = if objective_supervisor
+                        .goal_store()
+                        .projection(&graph_id)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        graph_id.clone()
+                    } else {
+                        format!("goal:{graph_id}")
+                    };
+                    if let Some(services) = services_weak.upgrade() {
+                        if let Err(error) = crate::orchestration::collaboration_coordinator::execute_pending_objective_replan(
+                            &graph_id,
+                            &goal_id,
+                            &services,
+                        )
+                        .await
+                        {
+                            tracing::warn!(graph_id, %error, "settled graph could not activate Objective recovery");
+                        }
+                    }
+                });
+            })
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
 
     pub fn install_session_ports(

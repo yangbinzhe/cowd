@@ -15,6 +15,12 @@ LOG="$TMP_DIR/gateway.log"
 FAILED=0
 API_TOKEN="gateway-webui-contract-$$_credential"
 
+if command -v rg >/dev/null 2>&1; then
+  match() { rg -q "$1"; }
+else
+  match() { grep -Eq "$1"; }
+fi
+
 # Every request, including public probes, carries the temporary scenario
 # credential. Protected routes therefore exercise Gateway's production
 # fail-closed authentication path rather than a test-only bypass.
@@ -61,7 +67,7 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 
-if ss -ltnp | rg -q ":$PORT\\b"; then
+if ss -ltnp | match ":$PORT\\b"; then
   echo "port $PORT is already in use" >&2
   exit 1
 fi
@@ -108,14 +114,14 @@ for _ in {1..80}; do
   sleep 0.25
 done
 
-curl -fsS "$BASE_URL/healthz" | rg -q '"gateway":"gateway-runtime-host"'
+curl -fsS "$BASE_URL/healthz" | match '"gateway":"gateway-runtime-host"'
 # The fixture has no live Provider.  It validates Gateway/WebUI transport, so
 # require the local health contract; global readiness remains fail-closed for
 # unavailable external model dependencies.
 curl -fsS "$BASE_URL/healthz" >/dev/null
-curl -fsS "$BASE_URL/api/webui/manifest" | rg -q '"kind":"cowd.webui.manifest"'
+curl -fsS "$BASE_URL/api/webui/manifest" | match '"kind":"cowd.webui.manifest"'
 curl -fsS "$BASE_URL/healthz" >/dev/null
-curl -sS "$BASE_URL/manifest.json" | rg -q '"error":"webui_not_configured"'
+curl -sS "$BASE_URL/manifest.json" | match '"error":"webui_not_configured"'
 
 if [[ ! -f "$LOG" ]]; then
   echo "gateway log file was not created" >&2

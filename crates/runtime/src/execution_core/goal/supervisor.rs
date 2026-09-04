@@ -214,6 +214,7 @@ mod tests {
             blockers: Vec::new(),
             obligations: Vec::new(),
             program_ref: None,
+            recovery: None,
             terminal: None,
             completion: GoalCompletion::Open,
             revision: 1,
@@ -244,7 +245,7 @@ mod tests {
         let decision = supervisor
             .reconcile(
                 "objective-supervisor-test",
-                1,
+                2,
                 "fence:1",
                 obligations,
                 vec!["evidence:1".to_string()],
@@ -293,6 +294,163 @@ mod tests {
             )
             .expect_err("unresolved obligations must reject direct terminal writes");
         assert!(error.contains("required obligations are unresolved"));
+    }
+
+    #[test]
+    fn recovery_reservation_is_idempotent_and_budgeted() {
+        let store = Arc::new(GoalStore::new(Arc::new(
+            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+        )));
+        store.create(goal()).expect("create goal");
+        let first = store
+            .reserve_recovery_for_obligation(
+                "objective-supervisor-test",
+                1,
+                7,
+                2,
+                "recovery:1",
+                "blocked",
+                Some("team-a".to_string()),
+            )
+            .expect("reserve")
+            .expect("first attempt");
+        assert_eq!(first.recovery.as_ref().expect("state").attempts, 1);
+        assert_eq!(
+            first
+                .recovery
+                .as_ref()
+                .expect("state")
+                .source_obligation_id
+                .as_deref(),
+            Some("team-a")
+        );
+        let replay = store
+            .reserve_recovery(
+                "objective-supervisor-test",
+                2,
+                7,
+                2,
+                "recovery:1",
+                "blocked",
+            )
+            .expect("replay")
+            .expect("idempotent replay");
+        assert_eq!(replay.revision, first.revision);
+        assert!(store
+            .reserve_recovery(
+                "objective-supervisor-test",
+                2,
+                7,
+                2,
+                "recovery:2",
+                "blocked"
+            )
+            .expect("second")
+            .is_some());
+        let latest = store
+            .get("objective-supervisor-test")
+            .expect("get")
+            .expect("goal");
+        assert!(store
+            .reserve_recovery(
+                "objective-supervisor-test",
+                latest.revision,
+                7,
+                2,
+                "recovery:3",
+                "blocked"
+            )
+            .expect("exhausted")
+            .is_none());
+    }
+
+    #[test]
+    fn recovery_graph_state_is_durable_and_failure_is_terminal() {
+        let store = Arc::new(GoalStore::new(Arc::new(
+            crate::RuntimeEventStore::try_open_in_memory().expect("event store"),
+        )));
+        store.create(goal()).expect("create goal");
+        let reserved = store
+            .reserve_recovery(
+                "objective-supervisor-test",
+                1,
+                7,
+                2,
+                "recovery:lifecycle",
+                "blocked",
+            )
+            .expect("reserve")
+            .expect("reservation");
+        let applying = store
+            .begin_recovery_graph(
+                "objective-supervisor-test",
+                reserved.revision,
+                "recovery:lifecycle",
+                "program-patch:1",
+            )
+            .expect("begin graph recovery");
+        assert_eq!(
+            applying.recovery.as_ref().expect("state").status,
+            harness_contract::goal::ObjectiveRecoveryStatus::ApplyingGraph
+        );
+        let applied = store
+            .mark_recovery_graph_applied(
+                "objective-supervisor-test",
+                applying.revision,
+                "recovery:lifecycle",
+                "program-patch:1",
+            )
+            .expect("mark applied");
+        assert_eq!(
+            applied.recovery.as_ref().expect("state").status,
+            harness_contract::goal::ObjectiveRecoveryStatus::GraphApplied
+        );
+        let committed = store
+            .commit_recovery(
+                "objective-supervisor-test",
+                applied.revision,
+                "recovery:lifecycle",
+            )
+            .expect("commit");
+        assert_eq!(
+            committed.recovery.as_ref().expect("state").status,
+            harness_contract::goal::ObjectiveRecoveryStatus::Committed
+        );
+
+        let reserved = store
+            .reserve_recovery(
+                "objective-supervisor-test",
+                committed.revision,
+                8,
+                2,
+                "recovery:failure",
+                "second blocked",
+            )
+            .expect("reserve second")
+            .expect("second reservation");
+        let failed = store
+            .fail_recovery(
+                "objective-supervisor-test",
+                reserved.revision,
+                "recovery:failure",
+                "capability_gap:missing verifier",
+            )
+            .expect("fail closed");
+        assert_eq!(
+            failed.recovery.as_ref().expect("state").status,
+            harness_contract::goal::ObjectiveRecoveryStatus::Exhausted
+        );
+        assert!(store
+            .reserve_recovery(
+                "objective-supervisor-test",
+                failed.revision,
+                8,
+                2,
+                "recovery:third",
+                "must not re-enter"
+            )
+            .expect("terminal reservation")
+            .is_none());
     }
 
     #[test]

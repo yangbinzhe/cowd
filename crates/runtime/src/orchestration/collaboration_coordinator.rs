@@ -9,7 +9,10 @@ use harness_contract::execution_graph::{
     CollaborationProgramLifecycle, ExecutionEdge, ExecutionGraph, ExecutionGraphCommand,
     TeamAdmissionObligation, TeamAdmissionState,
 };
-use harness_contract::goal::{ObjectiveDiagnostic, ObjectiveObligation, ObjectiveObligationState};
+use harness_contract::goal::{
+    InformationGain, ObjectiveDiagnostic, ObjectiveObligation, ObjectiveObligationState,
+    ObservationResultClass, RuntimeObservation, RuntimeObservationIdentity, RuntimeObservationKind,
+};
 use sha2::{Digest, Sha256};
 
 use crate::execution_core::ExecutionStateStoreError;
@@ -24,6 +27,300 @@ const MAX_CAS_ATTEMPTS: usize = 3;
 const MIN_PROGRAM_CAS_ATTEMPTS: usize = 8;
 const MAX_PROGRAM_CAS_ATTEMPTS: usize = 128;
 const MAX_PROGRAM_CAS_BACKOFF_MS: u64 = 32;
+
+/// Materialize exactly one Runtime-owned recovery Team from a retryable,
+/// durable Team terminal. It is the public recovery boundary used by startup,
+/// settled observers and optional conversation continuation. Deterministic
+/// executor failures are persisted as a typed terminal instead of leaving a
+/// Goal forever Pending.
+pub async fn execute_pending_objective_replan(
+    graph_id: &str,
+    goal_id: &str,
+    services: &RuntimeServices,
+) -> Result<bool, String> {
+    let result = execute_pending_objective_replan_inner(graph_id, goal_id, services).await;
+    if let Err(error) = &result {
+        if let Ok(Some(projection)) = services.goal_store().projection(goal_id) {
+            if let Some(recovery) = projection.goal.recovery.as_ref() {
+                if matches!(
+                    recovery.status,
+                    harness_contract::goal::ObjectiveRecoveryStatus::Pending
+                        | harness_contract::goal::ObjectiveRecoveryStatus::ApplyingGraph
+                ) {
+                    let mutation_applied = recovery
+                        .mutation_id
+                        .as_deref()
+                        .and_then(|mutation_id| {
+                            services
+                                .graph_state_store()
+                                .load(graph_id)
+                                .ok()
+                                .map(|graph| {
+                                    graph.orchestration.as_ref().is_some_and(|metadata| {
+                                        metadata
+                                            .applied_mutation_ids
+                                            .iter()
+                                            .any(|applied| applied == mutation_id)
+                                    })
+                                })
+                        })
+                        .unwrap_or(false);
+                    if !mutation_applied {
+                        let _ = services.goal_store().fail_recovery(
+                            goal_id,
+                            projection.goal.revision,
+                            &recovery.idempotency_key,
+                            error.clone(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Materialize exactly one Runtime-owned recovery Team from a retryable,
+/// durable Team terminal. It reuses the frozen terminal request rather than
+/// interpreting a display label or model prose, and delegates physical graph
+/// mutation to the existing collaboration patch compiler/commit path.
+async fn execute_pending_objective_replan_inner(
+    graph_id: &str,
+    goal_id: &str,
+    services: &RuntimeServices,
+) -> Result<bool, String> {
+    // Continuation bootstrap may run before the root graph admission receipt is
+    // durable (or for a plain/direct turn that has no execution graph at all).
+    // Recovery is an observer-side optimization in that window, so a missing
+    // graph is a deterministic no-op rather than a turn-failing error. Any
+    // other store failure remains visible and governed.
+    let graph = match services.graph_state_store().load_async(graph_id).await {
+        Ok(graph) => graph,
+        Err(ExecutionStateStoreError::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(format!("objective_replan_graph_load_failed:{error}")),
+    };
+    let Some(program) = graph
+        .orchestration
+        .as_ref()
+        .and_then(|metadata| metadata.collaboration_program.as_ref())
+    else {
+        return Ok(false);
+    };
+    // Not every durable Program has an Objective projection (for example a
+    // direct/legacy orchestration graph).  Startup reconciliation is a
+    // best-effort observer and must leave those graphs untouched rather than
+    // turning an absent optional projection into a failed recovery episode.
+    let Some(projection) = services.goal_store().projection(goal_id)? else {
+        return Ok(false);
+    };
+    let Some(recovery) = projection.goal.recovery.as_ref() else {
+        return Ok(false);
+    };
+    if !matches!(
+        recovery.status,
+        harness_contract::goal::ObjectiveRecoveryStatus::Pending
+            | harness_contract::goal::ObjectiveRecoveryStatus::ApplyingGraph
+            | harness_contract::goal::ObjectiveRecoveryStatus::GraphApplied
+    ) {
+        return Ok(false);
+    }
+    // The reservation records the graph revision at the observation point.
+    // Reopening the Program control plane is itself a durable graph commit,
+    // so a crash between that commit and the semantic patch necessarily
+    // observes a newer graph revision.  Only a regression is impossible;
+    // newer revisions are safely rebased through the command CAS below.
+    if graph.revision < recovery.source_revision {
+        return Ok(false);
+    }
+    let Some((source, _terminal)) = program.control.obligations.iter().find_map(|obligation| {
+        obligation
+            .terminal
+            .as_ref()
+            .filter(|terminal| terminal.retryable)
+            .filter(|_| {
+                recovery
+                    .source_obligation_id
+                    .as_ref()
+                    .is_none_or(|source_id| source_id == &obligation.instance_id)
+            })
+            .map(|terminal| (obligation, terminal))
+    }) else {
+        return Ok(false);
+    };
+    let source_instance = program
+        .team_instances
+        .iter()
+        .find(|instance| instance.instance_id == source.instance_id)
+        .ok_or_else(|| "objective_replan_source_instance_missing".to_string())?;
+    let source_node_id = node_id_for_instance(program, &source.instance_id)?;
+    let source_request = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == source_node_id)
+        .ok_or_else(|| format!("objective_replan_source_node_missing:{source_node_id}"))
+        .and_then(|node| {
+            serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
+                &node.payload_ref,
+            )
+            .map_err(|error| format!("objective_replan_source_request_invalid:{error}"))
+        })?;
+    let semantic = program
+        .semantic_intent
+        .as_ref()
+        .and_then(|intent| {
+            intent
+                .teams
+                .iter()
+                .find(|team| team.workstream_id == source_instance.semantic_node_id)
+        })
+        .ok_or_else(|| "objective_replan_source_semantic_snapshot_missing".to_string())?;
+    let semantic_node_id = format!("{}:recovery:{}", source.instance_id, recovery.attempts);
+    let recovery_digest = format!(
+        "{:x}",
+        Sha256::digest(format!("{}:{}", recovery.idempotency_key, semantic_node_id).as_bytes())
+    );
+    let mutation_id = format!("program-patch:{recovery_digest}");
+    // A crash after the graph transaction but before GoalStore commit must be
+    // recoverable. If the idempotent semantic mutation is already present,
+    // only finish the Goal-side marker; never submit a second Team patch.
+    if graph.orchestration.as_ref().is_some_and(|metadata| {
+        metadata
+            .applied_mutation_ids
+            .iter()
+            .any(|applied| applied == &mutation_id)
+    }) {
+        let current = services
+            .goal_store()
+            .projection(goal_id)?
+            .ok_or_else(|| format!("objective_replan_goal_missing:{goal_id}"))?;
+        if current.goal.recovery.as_ref().is_some_and(|state| {
+            state.status != harness_contract::goal::ObjectiveRecoveryStatus::GraphApplied
+        }) {
+            services.goal_store().mark_recovery_graph_applied(
+                goal_id,
+                current.goal.revision,
+                &recovery.idempotency_key,
+                &mutation_id,
+            )?;
+        }
+        let current = services
+            .goal_store()
+            .projection(goal_id)?
+            .ok_or_else(|| format!("objective_replan_goal_missing:{goal_id}"))?;
+        services.goal_store().commit_recovery(
+            goal_id,
+            current.goal.revision,
+            &recovery.idempotency_key,
+        )?;
+        return Ok(true);
+    }
+    let mut output_artifacts = semantic
+        .roles
+        .iter()
+        .flat_map(|role| role.output_artifacts.iter().cloned())
+        .collect::<Vec<_>>();
+    output_artifacts.sort();
+    output_artifacts.dedup();
+    let ephemeral_template = match &source_request.template_selector {
+        harness_contract::team::TeamTemplateSelector::Ephemeral { snapshot } => {
+            Some((**snapshot).clone())
+        }
+        _ => None,
+    };
+    let patch = harness_contract::execution_graph::CollaborationIntentPatch {
+        program_id: program.program_id.clone(),
+        // Updating control state advances the enclosing graph revision but
+        // does not advance the semantic Program revision.  The patch compiler
+        // fences against the latter, so keep this value bound to the frozen
+        // Program snapshot rather than guessing from graph revision.
+        base_revision: program.revision,
+        source_attempt: format!("runtime-objective-recovery:{}", recovery.idempotency_key),
+        reason: format!("bounded recovery for {}", source.instance_id),
+        evidence_refs: Vec::new(),
+        canonical_digest: format!(
+            "{:x}",
+            Sha256::digest(format!("{}:{}", recovery.idempotency_key, semantic_node_id).as_bytes())
+        ),
+        user_confirmation_ref: None,
+        escalation: None,
+        operation: harness_contract::execution_graph::CollaborationIntentPatchOperation::AddTeam {
+            team: harness_contract::execution_graph::CollaborationPatchTeam {
+                semantic_node_id,
+                objective: source_request.objective.clone(),
+                depends_on: semantic.dependencies.clone(),
+                behavior_facets: Vec::new(),
+                ephemeral_template,
+                resource_scopes: source_request.resource_scopes.clone(),
+                output_artifacts,
+                evidence_contract: semantic.result_field_shapes.clone(),
+                required: source_instance.required,
+                parallelism_hint: u16::try_from(semantic.roles.len()).unwrap_or(u16::MAX),
+            },
+        },
+    };
+    if recovery.status == harness_contract::goal::ObjectiveRecoveryStatus::Pending {
+        services.goal_store().begin_recovery_graph(
+            goal_id,
+            projection.goal.revision,
+            &recovery.idempotency_key,
+            &mutation_id,
+        )?;
+    }
+    let mut control = program.control.clone();
+    control.lifecycle = CollaborationProgramLifecycle::Reconciling;
+    control.waiting_relation = Some("objective_recovery".to_string());
+    control.next_action = Some("admit_recovery_team".to_string());
+    let needs_reopen = !control
+        .superseded_instance_ids
+        .iter()
+        .any(|id| id == &source.instance_id);
+    if needs_reopen {
+        control
+            .superseded_instance_ids
+            .push(source.instance_id.clone());
+        control.superseded_instance_ids.sort();
+        services
+            .execution_supervisor()
+            .command(
+                graph_id,
+                ExecutionGraphCommand::UpdateCollaborationProgramControl {
+                    expected_revision: graph.revision,
+                    control: Box::new(control),
+                },
+            )
+            .await
+            .map_err(|error| format!("objective_replan_reopen_program_failed:{error}"))?;
+    }
+    let outcome = super::facade::submit_collaboration_intent_patch(graph_id, &patch, services)
+        .await
+        .map_err(|error| format!("objective_replan_patch_submit_failed:{error}"))?;
+    if outcome.disposition != super::RuntimeOrchestrationDisposition::Admitted {
+        return Err(format!(
+            "objective_replan_patch_not_admitted:{}",
+            outcome.status
+        ));
+    }
+    let current = services
+        .goal_store()
+        .projection(goal_id)?
+        .ok_or_else(|| format!("objective_replan_goal_missing:{goal_id}"))?;
+    services.goal_store().mark_recovery_graph_applied(
+        goal_id,
+        current.goal.revision,
+        &recovery.idempotency_key,
+        &mutation_id,
+    )?;
+    let current = services
+        .goal_store()
+        .projection(goal_id)?
+        .ok_or_else(|| format!("objective_replan_goal_missing:{goal_id}"))?;
+    services.goal_store().commit_recovery(
+        goal_id,
+        current.goal.revision,
+        &recovery.idempotency_key,
+    )?;
+    Ok(true)
+}
 
 /// Whole-Program control updates are revision fenced. Multiple independent
 /// Team nodes can therefore finish admission against the same root revision.
@@ -1076,7 +1373,12 @@ pub(crate) async fn reconcile_objective_from_program(
         };
         obligations.push(ObjectiveObligation {
             obligation_id: instance.instance_id.clone(),
-            required: instance.required,
+            required: instance.required
+                && !program
+                    .control
+                    .superseded_instance_ids
+                    .iter()
+                    .any(|id| id == &instance.instance_id),
             success_predicate: format!(
                 "Team {} produces independently verified evidence",
                 instance.semantic_node_id
@@ -1151,9 +1453,98 @@ pub(crate) async fn reconcile_objective_from_program(
         "program_terminal_projection",
     )?;
     if matches!(
-        decision,
+        &decision,
         crate::execution_core::goal::ObjectiveReconcileDecision::ReplanRequired { .. }
     ) {
+        // Keep the recovery request durable and visible to the next
+        // ConversationRuntime checkpoint.  This is intentionally a proposal:
+        // graph mutation still requires a typed, revision-fenced semantic
+        // patch and is never fabricated from a terminal summary.
+        if let crate::execution_core::goal::ObjectiveReconcileDecision::ReplanRequired {
+            ref diagnostics,
+        } = decision
+        {
+            let diagnostic_digest =
+                Sha256::digest(serde_json::to_vec(diagnostics).map_err(|error| {
+                    format!("objective_replan_diagnostic_encode_failed:{error}")
+                })?);
+            let observation = RuntimeObservation {
+                identity: RuntimeObservationIdentity {
+                    workspace_id: "runtime".to_string(),
+                    session_id: objective_supervisor
+                        .goal_store()
+                        .projection(&goal_id)?
+                        .map(|projection| projection.goal.session_id)
+                        .unwrap_or_else(|| goal_id.clone()),
+                    turn_id: None,
+                    task_id: None,
+                    graph_id: graph_id.to_string(),
+                    goal_id: goal_id.clone(),
+                    node_id: None,
+                },
+                kind: RuntimeObservationKind::GraphProgress,
+                source: "runtime.objective_program_reconcile".to_string(),
+                source_revision: graph.revision.max(1),
+                freshness: harness_contract::goal::ObservationFreshness {
+                    observed_at_ms: crate::tool_invocation::now_ms(),
+                    valid_until_ms: None,
+                    policy_revision: "objective-replan-v1".to_string(),
+                },
+                summary: "required Team obligations remain unresolved after terminal Agent wave; bounded semantic replan is required".to_string(),
+                fingerprint: format!("objective-replan-required:{:x}", diagnostic_digest),
+                evidence_refs: objective_evidence_refs.clone(),
+                observed_evidence: Vec::new(),
+                criterion_deltas: Vec::new(),
+                evidence_delta: Default::default(),
+                effect_deltas: Vec::new(),
+                conflict_deltas: Vec::new(),
+                unknown_deltas: Vec::new(),
+                cost_delta: Default::default(),
+                information_gain: InformationGain::default(),
+                context_delta: Default::default(),
+                parallelism_delta: Default::default(),
+                result_class: ObservationResultClass::Partial,
+                failure_class: Some(harness_contract::goal::ObservationFailureClass::Verification),
+            };
+            let intervention = harness_contract::goal::RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: harness_contract::goal::RuntimeInterventionKind::Replan,
+                reason: diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                evidence_refs: objective_evidence_refs.clone(),
+                expected_graph_revision: Some(graph.revision),
+            };
+            objective_supervisor
+                .goal_store()
+                .record_intervention(intervention, &[observation])?;
+            // Reserve a bounded recovery attempt in the same durable Goal
+            // authority. Physical Team/node creation is performed only by a
+            // subsequent revision-fenced compiler step; this reservation
+            // prevents duplicate observers from opening an unbounded loop.
+            let current_goal = objective_supervisor
+                .goal_store()
+                .projection(&goal_id)?
+                .ok_or_else(|| "objective_goal_disappeared_during_replan".to_string())?;
+            let recovery_key = format!("replan:{}:{:x}", graph.revision, diagnostic_digest);
+            let source_obligation_id = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.retryable)
+                .and_then(|diagnostic| diagnostic.obligation_id.clone());
+            let _ = objective_supervisor
+                .goal_store()
+                .reserve_recovery_for_obligation(
+                    &goal_id,
+                    current_goal.goal.revision,
+                    graph.revision,
+                    3,
+                    recovery_key,
+                    "bounded semantic replan requested",
+                    source_obligation_id,
+                )?;
+        }
         tracing::info!(
             graph_id,
             "Objective requires replan after Program projection"
@@ -1766,6 +2157,15 @@ pub(crate) async fn reconcile_terminal_program_with(
             obligation.terminal = terminals.get(&obligation.instance_id).cloned();
         }
         let every_required_team_completed = program.team_instances.iter().all(|instance| {
+            if !instance.required
+                || program
+                    .control
+                    .superseded_instance_ids
+                    .iter()
+                    .any(|id| id == &instance.instance_id)
+            {
+                return true;
+            }
             terminals
                 .get(&instance.instance_id)
                 .is_some_and(|terminal| {
@@ -1926,6 +2326,7 @@ pub(crate) async fn reconcile_program_wait_state_with(
                             next_action: Some(
                                 "inspect_and_revise_the_semantic_team_plan".to_string(),
                             ),
+                            superseded_instance_ids: Vec::new(),
                         };
                     if quarantine != program.control {
                         match supervisor
@@ -2047,6 +2448,18 @@ pub(crate) async fn reconcile_terminal_programs_on_startup(
             )
             .await?;
             reconcile_terminal_program(graph_id, services).await?;
+            reconcile_objective_from_program(
+                graph_id,
+                services.objective_supervisor().as_ref(),
+                services.graph_state_store(),
+            )
+            .await?;
+            let goal_id = if services.goal_store().projection(graph_id)?.is_some() {
+                graph_id.clone()
+            } else {
+                format!("goal:{graph_id}")
+            };
+            let _ = execute_pending_objective_replan(graph_id, &goal_id, services).await?;
             examined = examined.saturating_add(1);
         }
         let (graph_id, commit_cursor) = page
@@ -2153,6 +2566,7 @@ fn admission_control(
         waiting_relation: Some("team_admission".to_string()),
         blocker_ref: None,
         next_action: Some("admit_exact_team_bindings".to_string()),
+        superseded_instance_ids: Vec::new(),
     })
 }
 
@@ -2925,6 +3339,7 @@ mod tests {
                     waiting_relation: None,
                     blocker_ref: None,
                     next_action: None,
+                    superseded_instance_ids: Vec::new(),
                 },
             }),
         });

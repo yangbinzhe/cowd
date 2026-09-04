@@ -2104,6 +2104,7 @@ mod tests {
                     blockers: Vec::new(),
                     obligations: Vec::new(),
                     program_ref: None,
+                    recovery: None,
                     terminal: None,
                     completion: GoalCompletion::Open,
                     revision: 1,
