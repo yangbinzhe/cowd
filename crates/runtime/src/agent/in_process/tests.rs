@@ -2690,6 +2690,17 @@ fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
 }
 
 #[test]
+fn autonomous_checkpoint_progress_digest_ignores_projection_revision_only() {
+    let first = "Runtime safe checkpoint committed.\n\n{\"kind\":\"runtime_agent_autonomy_checkpoint\",\"graph_revision\":7,\"required_actions\":[{\"action\":\"claim\",\"work_revision\":3}],\"unread_team_entries\":[]}";
+    let second = first.replace("\"graph_revision\":7", "\"graph_revision\":42");
+    assert_eq!(
+        autonomy_checkpoint_progress_digest(first),
+        autonomy_checkpoint_progress_digest(&second),
+        "projection-only graph revisions must not defeat the liveness fuse"
+    );
+}
+
+#[test]
 fn autonomous_checkpoint_never_repeats_after_non_satisfied_terminal() {
     use harness_contract::goal::GoalCompletion;
 

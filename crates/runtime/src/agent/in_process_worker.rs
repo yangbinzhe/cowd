@@ -812,7 +812,7 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             let Some(checkpoint) = agent_autonomy_checkpoint(&services, &packet)? else {
                 break;
             };
-            let checkpoint_digest = format!("{:x}", Sha256::digest(checkpoint.prompt.as_bytes()));
+            let checkpoint_digest = autonomy_checkpoint_progress_digest(&checkpoint.prompt);
             if previous_checkpoint_digest.as_deref() == Some(checkpoint_digest.as_str()) {
                 repeated_checkpoint_count = repeated_checkpoint_count.saturating_add(1);
             } else {
@@ -1397,6 +1397,25 @@ fn autonomy_checkpoint_tool_plan(
 
 fn autonomy_continuation_may_advance(completion: harness_contract::goal::GoalCompletion) -> bool {
     completion == harness_contract::goal::GoalCompletion::Satisfied
+}
+
+/// Fingerprint only the durable checkpoint state that can justify another
+/// continuation. Graph revisions advance for ordinary projection/tool events;
+/// including that counter made the liveness fuse ineffective and allowed a
+/// model to repeat the same read-only checkpoint forever. Work revisions,
+/// claims, submissions, reviews and unread entries remain part of the digest.
+fn autonomy_checkpoint_progress_digest(prompt: &str) -> String {
+    let Some((_, payload)) = prompt.rsplit_once("\n\n") else {
+        return format!("{:x}", Sha256::digest(prompt.as_bytes()));
+    };
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return format!("{:x}", Sha256::digest(prompt.as_bytes()));
+    };
+    if let serde_json::Value::Object(object) = &mut value {
+        object.remove("graph_revision");
+    }
+    let canonical = serde_json::to_vec(&value).unwrap_or_else(|_| payload.as_bytes().to_vec());
+    format!("{:x}", Sha256::digest(canonical))
 }
 
 fn agent_autonomy_checkpoint(
