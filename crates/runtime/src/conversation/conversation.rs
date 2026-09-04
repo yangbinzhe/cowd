@@ -1757,9 +1757,31 @@ async fn consume_provider_stream_with_activity(
     let mut early_workers = Vec::new();
     let mut early_tool_deferrals = Vec::new();
     let mut tool_plan = ModelStepToolPlan::default();
+    // Transport heartbeats only prove that the socket is alive. They must not
+    // extend a model turn indefinitely when the provider emits no semantic
+    // event (text/reasoning/tool/usage/stop). Keep one deadline owned by the
+    // semantic stream and refresh it only after an actual AssistantEvent.
+    let mut semantic_deadline = timeout_policy.map(|policy| {
+        Instant::now()
+            .checked_add(policy.idle.saturating_add(policy.heartbeat_grace))
+            .unwrap_or_else(Instant::now)
+    });
     loop {
         let next = if let Some(policy) = timeout_policy {
             loop {
+                let idle_window = policy.idle.saturating_add(policy.heartbeat_grace);
+                let remaining = semantic_deadline
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                    .unwrap_or(idle_window);
+                if remaining.is_zero() {
+                    resource_result_class =
+                        crate::execution_core::graph::ResourceResultClass::TimedOut;
+                    failure = Some(RuntimeError::new(format!(
+                        "stream stalled after {}s without semantic activity",
+                        idle_window.as_secs()
+                    )));
+                    break None;
+                }
                 let generation = transport_activity
                     .as_ref()
                     .map(provider::TransportActivity::generation)
@@ -1771,7 +1793,6 @@ async fn consume_provider_stream_with_activity(
                         std::future::pending::<()>().await;
                     }
                 };
-                let idle_window = policy.idle.saturating_add(policy.heartbeat_grace);
                 let polled = tokio::select! {
                     () = cancellation.cancelled() => {
                         resource_result_class =
@@ -1781,14 +1802,14 @@ async fn consume_provider_stream_with_activity(
                         ));
                         None
                     }
-                    next = tokio::time::timeout(idle_window, stream.next()) => {
+                    next = tokio::time::timeout(remaining, stream.next()) => {
                         match next {
                             Ok(next) => next,
                             Err(_) => {
                                 resource_result_class =
                                     crate::execution_core::graph::ResourceResultClass::TimedOut;
                                 failure = Some(RuntimeError::new(format!(
-                                    "stream stalled after {}s without transport or semantic activity",
+                                    "stream stalled after {}s without semantic activity",
                                     idle_window.as_secs()
                                 )));
                                 None
@@ -1823,6 +1844,11 @@ async fn consume_provider_stream_with_activity(
         };
         match event {
             Ok(event) => {
+                if let Some(policy) = timeout_policy {
+                    semantic_deadline = Instant::now()
+                        .checked_add(policy.idle.saturating_add(policy.heartbeat_grace))
+                        .or(semantic_deadline);
+                }
                 let (stop, ready) = match reducer.apply(event, Instant::now()) {
                     Ok(applied) => applied,
                     Err(error) => {

@@ -1,7 +1,8 @@
     use super::{
         apply_explicit_team_requirement, apply_named_e2e_strategy_fixture,
         build_cc_memory_config_with_budget, canonicalize_model_tool_names,
-        classify_model_step_intent, consume_provider_stream, conversation_message_text,
+        classify_model_step_intent, consume_provider_stream,
+        consume_provider_stream_with_activity, conversation_message_text,
         current_turn_messages, deterministic_checkpoint_id, enforce_explicit_team_requirement,
         eval_override_selection, image_user_message_from_path, is_append_only_projection,
         is_runtime_team_orchestration_call, memory_project_id_for_session, prepared_vision_payload,
@@ -51,6 +52,45 @@
     use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn transport_heartbeats_cannot_extend_semantic_stream_timeout() {
+        let activity = provider::TransportActivity::default();
+        let heartbeat_activity = activity.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                heartbeat_activity.observe();
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+        let stream = Box::pin(futures::stream::pending::<Result<
+            AssistantEvent,
+            RuntimeError,
+        >>());
+        let result = consume_provider_stream_with_activity(
+            stream,
+            CancellationToken::new(),
+            Some(super::ProviderStreamTimeoutPolicy {
+                idle: Duration::from_millis(20),
+                heartbeat_grace: Duration::ZERO,
+            }),
+            ModelStreamReducer::new(None, None, "semantic-timeout".to_string()),
+            None,
+            Some(activity),
+        )
+        .await;
+        heartbeat.abort();
+
+        assert_eq!(
+            result.resource_result_class,
+            crate::execution_core::graph::ResourceResultClass::TimedOut
+        );
+        assert!(result
+            .failure
+            .expect("semantic timeout")
+            .to_string()
+            .contains("without semantic activity"));
+    }
 
     struct CollaborationAvailableExecutor;
 
