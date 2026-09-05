@@ -2981,6 +2981,11 @@ pub struct ModelToolCall {
 pub struct ModelStepResult {
     pub intent: ModelStepIntent,
     pub assistant_message: ConversationMessage,
+    /// Runtime-authored results for individual provider tool calls rejected
+    /// before dispatch. These messages must commit atomically with the
+    /// assistant ToolUse frame so every provider tool-call id has a truthful
+    /// continuation even when valid siblings proceed to a ToolBatch.
+    pub preflight_tool_results: Vec<ConversationMessage>,
     pub usage: TokenUsage,
     pub model: Option<String>,
     /// Ordered provider/model candidates actually attempted for this

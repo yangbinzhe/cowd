@@ -1254,6 +1254,7 @@
             .execute_model_step("inspect available tools", true)
             .await
             .expect("one invented member must not discard an independent valid action");
+        assert_eq!(executed.preflight_tool_results.len(), 1);
         let ModelStepIntent::ToolCalls { calls } = executed.intent else {
             panic!("the valid call must remain executable");
         };

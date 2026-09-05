@@ -699,6 +699,53 @@
     }
 
     #[derive(Clone)]
+    struct MixedValidAndInventedThenFinalClient {
+        attempts: Arc<AtomicUsize>,
+        requests: Arc<Mutex<Vec<ApiRequest>>>,
+    }
+
+    impl ApiClient for MixedValidAndInventedThenFinalClient {
+        fn stream(
+            &mut self,
+            request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            self.requests.lock().unwrap().push(request.clone());
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(stream::iter(vec![
+                    Ok(AssistantEvent::ToolUse {
+                        id: "valid-search".to_string(),
+                        name: "tool_search".to_string(),
+                        input: r#"{"query":"read files"}"#.to_string(),
+                    }),
+                    Ok(AssistantEvent::ToolUse {
+                        id: "invented-action".to_string(),
+                        name: "agent_invoke".to_string(),
+                        input: "{}".to_string(),
+                    }),
+                    Ok(AssistantEvent::MessageStop),
+                ]));
+            }
+            let result_ids = request
+                .messages
+                .iter()
+                .flat_map(|message| &message.blocks)
+                .filter_map(|block| match block {
+                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(result_ids.contains("valid-search"));
+            assert!(result_ids.contains("invented-action"));
+            Box::pin(stream::iter(vec![
+                Ok(AssistantEvent::TextDelta(
+                    "mixed frame continued after isolated rejection".to_string(),
+                )),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
+    #[derive(Clone)]
     struct InvalidInputThenFinalClient {
         attempts: Arc<AtomicUsize>,
         requests: Arc<Mutex<Vec<ApiRequest>>>,
@@ -2005,6 +2052,59 @@
         assert!(assistants[0].blocks.iter().any(
             |block| matches!(block, ContentBlock::Text { text } if text == "exposure recovery retained current objective")
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mixed_tool_frame_commits_every_result_before_provider_continuation() {
+        const OBJECTIVE: &str = "inspect available tools and continue";
+
+        let services = crate::RuntimeServices::in_memory().expect("runtime services");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let executed = Arc::new(AtomicUsize::new(0));
+        let runtime = crate::ConversationRuntime::new(
+            Session::new(),
+            MixedValidAndInventedThenFinalClient {
+                attempts: Arc::clone(&attempts),
+                requests: Arc::clone(&requests),
+            },
+            RecordingToolExecutor {
+                executed: Arc::clone(&executed),
+                order: Arc::new(Mutex::new(Vec::new())),
+            },
+            PermissionPolicy::new(crate::PermissionMode::DangerFullAccess),
+            vec!["use only exposed tools".to_string()],
+        )
+        .without_memory();
+
+        let (runtime, result) = submit_test_owned_conversation_turn(
+            runtime,
+            Arc::clone(&services),
+            OBJECTIVE,
+            &SharedPrompter::none(),
+            test_execution_lineage(),
+        )
+        .await;
+        let summary = result.expect("mixed provider frame must remain continuable");
+        assert_eq!(
+            summary.final_answer,
+            "mixed frame continued after isolated rejection"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+
+        let transcript = runtime.session_snapshot().await.materialize_messages();
+        let tool_result_ids = transcript
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(tool_result_ids.contains("valid-search"));
+        assert!(tool_result_ids.contains("invented-action"));
+        assert_eq!(requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

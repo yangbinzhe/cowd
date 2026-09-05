@@ -711,6 +711,7 @@ where
                     committed_messages.push(ConversationMessage::user_text(content));
                 }
                 committed_messages.push(step.assistant_message.clone());
+                committed_messages.extend(step.preflight_tool_results.clone());
                 state
                     .pending_transcript
                     .insert(ticket.node_id.clone(), committed_messages);

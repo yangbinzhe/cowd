@@ -546,6 +546,7 @@ where
                             blocks,
                             usage: Some(usage),
                         },
+                        preflight_tool_results: Vec::new(),
                         usage,
                         model: effective_model,
                         models_used: models_tried.clone(),
@@ -1670,15 +1671,20 @@ where
                 &assistant_message,
                 self.session_head().await.message_count.wrapping_sub(1),
             );
-            for (call, reason) in rejected_tool_calls {
-                let tool_result = ConversationMessage::tool_result(
-                    &call.id,
-                    &call.name,
-                    format!(
-                        "Runtime rejected this individual tool call without executing it: {reason}. Other valid calls from the same response continue; use only the currently exposed tool definitions."
-                    ),
-                    true,
-                );
+            let preflight_tool_results = rejected_tool_calls
+                .into_iter()
+                .map(|(call, reason)| {
+                    ConversationMessage::tool_result(
+                        call.id,
+                        call.name,
+                        format!(
+                            "Runtime rejected this individual tool call without executing it: {reason}. Other valid calls from the same response continue; use only the currently exposed tool definitions."
+                        ),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            for tool_result in &preflight_tool_results {
                 self.session
                     .write()
                     .await
@@ -1723,6 +1729,7 @@ where
             return Ok(ModelStepResult {
                 intent,
                 assistant_message,
+                preflight_tool_results,
                 usage,
                 // Preserve the model that actually produced the provider stream,
                 // not merely Runtime's preferred candidate.
