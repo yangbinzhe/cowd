@@ -1133,7 +1133,18 @@ where
                                 "inline_model",
                             )];
                         }
-                        let successful_write_observed = write_obligation_satisfied(
+                        // ObjectiveSupervisor is the sole business completion
+                        // authority. Once an Agentic Program is Verified, its
+                        // reviewed final artifact satisfies the root delivery
+                        // write obligation even when a delegated Agent, rather
+                        // than the presentation Agent, performed the physical
+                        // workspace write. Rechecking only root-local write
+                        // receipts here creates a second owner and causes
+                        // post-terminal no-op edits/model rounds.
+                        let successful_write_observed = root_delivery_write_satisfied(
+                            agentic_program.as_ref().is_some_and(|program| {
+                                program.status == crate::AgenticProgramStatus::Verified
+                            }),
                             state.required_write_for_completion,
                             &state.required_workspace_write_scopes,
                             &state.committed_workspace_observed_evidence,
@@ -2552,6 +2563,14 @@ impl DelegatedAgenticProtocolState {
         }
     }
 
+    pub(super) fn convergence_action_tools(&self) -> BTreeSet<String> {
+        if self.mode == "review" {
+            BTreeSet::from([harness_contract::agent_action::TASK_REVIEW_TOOL_ID.to_string()])
+        } else {
+            self.required_terminal_tools()
+        }
+    }
+
     pub(super) fn continuation_instruction(&self) -> String {
         match self.mode.as_str() {
             "review" => format!(
@@ -2576,6 +2595,16 @@ impl DelegatedAgenticProtocolState {
             ),
         }
     }
+}
+
+pub(super) fn pending_delegated_action_is_ready(
+    protocol: Option<&DelegatedAgenticProtocolState>,
+    repeated_evidence_saturation: bool,
+    has_successful_tool_evidence: bool,
+) -> bool {
+    repeated_evidence_saturation
+        && has_successful_tool_evidence
+        && protocol.is_some_and(|protocol| !protocol.is_terminal())
 }
 
 pub(super) fn delegated_agentic_protocol_state(
@@ -3629,8 +3658,11 @@ where
                     .name
                     .eq_ignore_ascii_case(harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID)
         });
+        let delegated_protocol_for_batch =
+            delegated_agentic_protocol_state(self.services.as_ref(), ticket)?;
         let delegated_protocol_after_batch = if committed_agentic_artifact {
-            delegated_agentic_protocol_state(self.services.as_ref(), ticket)?
+            delegated_protocol_for_batch
+                .clone()
                 .filter(|protocol| !protocol.is_terminal())
         } else {
             None
@@ -3827,11 +3859,48 @@ where
         let repeated_local_failures = state.consecutive_tool_failure_batches >= 2;
         let repeated_evidence_saturation = state.consecutive_low_novelty_batches
             >= evidence_saturation_limit(bounded_evidence_role);
+        let pending_delegated_action = pending_delegated_action_is_ready(
+            delegated_protocol_for_batch.as_ref(),
+            repeated_evidence_saturation,
+            state.successful_tool_calls > 0,
+        );
+        if pending_delegated_action {
+            // Evidence saturation for delegated work is not a presentation
+            // terminal. The business terminal is the next durable protocol
+            // action: artifact_commit/task_submit for execution or
+            // task_review for review. Keep only those actions exposed and
+            // skip the generic text-only synthesis detour. Otherwise an Agent
+            // can state that work is complete with an empty tool set, only
+            // for the outer autonomy checkpoint to spend another model
+            // request restoring the exact action it already needed.
+            state.consecutive_low_novelty_batches = 0;
+            state.force_text_only_next_model = false;
+            state.clean_terminal_synthesis_next = false;
+            state.force_tool_allowlist_next_model = delegated_protocol_for_batch
+                .as_ref()
+                .map(DelegatedAgenticProtocolState::convergence_action_tools);
+            if let Some(protocol) = delegated_protocol_for_batch.as_ref() {
+                let mut item = ContextItem::new(
+                    format!("agentic-terminal-action-ready:{}", ticket.node_id),
+                    ContextSourceKind::Task,
+                    ContextRole::Instruction,
+                    format!(
+                        "Runtime Agent-first evidence boundary: retained tool receipts are sufficient and further acquisition added no required coverage. {}",
+                        protocol.continuation_instruction()
+                    ),
+                );
+                item.authority = ContextAuthority::System;
+                item.visibility = ContextVisibility::Private;
+                item.evidence = protocol.artifact_evidence_refs.clone();
+                state.pending_next_model_context.push(item);
+            }
+        }
         let exact_workspace_evidence = focus_scopes_are_exact_workspace_files(
             &focus_acceptance_scopes,
             self.services.workspace_root(),
         );
-        let focus_synthesis_ready = delegated_protocol_after_batch.is_none()
+        let focus_synthesis_ready = !pending_delegated_action
+            && delegated_protocol_after_batch.is_none()
             && should_force_focus_synthesis(
                 focus_acceptance_met,
                 &focus_acceptance_scopes,
@@ -4041,10 +4110,11 @@ where
         }
         let goal_id = state.goal_id.clone();
         drop(state);
-        if focus_synthesis_ready
-            || (repeated_evidence_saturation
-                && !focus_acceptance_pending
-                && !required_write_recovery)
+        if !pending_delegated_action
+            && (focus_synthesis_ready
+                || (repeated_evidence_saturation
+                    && !focus_acceptance_pending
+                    && !required_write_recovery))
         {
             self.runtime
                 .lock()
@@ -4061,7 +4131,16 @@ where
                     reason: error.to_string(),
                 })?;
         }
-        let intervention = if delegated_protocol_after_batch.is_some() {
+        let intervention = if pending_delegated_action {
+            Some(RuntimeIntervention {
+                goal_id: goal_id.clone(),
+                kind: RuntimeInterventionKind::Replan,
+                reason: "delegated Agent evidence is saturated; commit the next durable Agent-first protocol action without a text-only synthesis round"
+                    .to_string(),
+                evidence_refs: observation.evidence_refs.clone(),
+                expected_graph_revision: None,
+            })
+        } else if delegated_protocol_after_batch.is_some() {
             Some(RuntimeIntervention {
                 goal_id: goal_id.clone(),
                 kind: RuntimeInterventionKind::Continue,

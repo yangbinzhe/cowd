@@ -414,22 +414,13 @@ impl GatewayToolExecutor {
                 .agent_action_service()
                 .apply(&envelope)
                 .map_err(|error| ToolError::new(error.to_string()))?;
-            if observation.status == harness_contract::agent_action::AgentActionStatus::Applied
-                && matches!(
-                    envelope.action,
-                    harness_contract::agent_action::AgentAction::ObjectiveCompleteRequest(_)
-                )
-            {
-                services
-                    .reconcile_agentic_completion_request(&envelope.actor.program_id)
-                    .map_err(ToolError::new)?;
-                let was_duplicate = observation.duplicate;
-                observation = services
-                    .agent_action_service()
-                    .apply(&envelope)
-                    .map_err(|error| ToolError::new(error.to_string()))?;
-                observation.duplicate = was_duplicate;
-            }
+            // `objective_complete_request` only commits the model-authored
+            // request here. The durable Program projection lane is the sole
+            // live reconciliation trigger: it asks ObjectiveSupervisor for a
+            // verdict and wakes the root graph. Running the same reconciliation
+            // synchronously in this foreground tool path raced that lane on the
+            // Goal stream, producing a false failed tool receipt even when the
+            // Objective terminal had already committed successfully.
             let should_dispatch = observation.status
                 == harness_contract::agent_action::AgentActionStatus::Applied
                 && !matches!(

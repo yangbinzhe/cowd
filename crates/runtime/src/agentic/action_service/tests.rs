@@ -307,11 +307,20 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
                 content_ref: "artifact://abc".to_string(),
                 kind: "research".to_string(),
                 title: "Findings".to_string(),
-                relates_to: vec![task_id.clone()],
+                relates_to: Vec::new(),
             }),
         ))
         .expect("artifact");
     let artifact_ref = artifact_receipt.changed_refs[0].clone();
+    assert_eq!(
+        service
+            .project("program-1")
+            .expect("artifact projection")
+            .artifacts[&artifact_ref]
+            .relates_to,
+        vec![task_id.clone()],
+        "Runtime must derive the current Task relation from the attested execute binding"
+    );
     service
         .apply(&managed(
             "submit-task",
@@ -790,6 +799,95 @@ fn task_claim_requires_a_roster_agent_and_expired_lease_is_reclaimable() {
     assert_eq!(
         validate_transition(&projection, &expired_submit, 11),
         Some(("task_claim_expired", task))
+    );
+}
+
+#[test]
+fn one_physical_agent_execution_cannot_claim_two_active_tasks() {
+    let service = AgentActionService::new(Arc::new(
+        RuntimeEventStore::try_open_in_memory().expect("event store"),
+    ));
+    let team = service
+        .apply(&root(
+            "single-execution-team",
+            AgentAction::TeamCreate(TeamCreateInput {
+                name: "Execution Fence Team".to_string(),
+                mission: "keep physical work identity unambiguous".to_string(),
+                objective: None,
+            }),
+        ))
+        .expect("team")
+        .changed_refs[0]
+        .clone();
+    let agent = service
+        .apply(&root(
+            "single-execution-agent",
+            AgentAction::AgentInvite(AgentInviteInput {
+                team_ref: team.clone(),
+                role: "worker".to_string(),
+                mission: "execute exactly one bound task".to_string(),
+                required_capabilities: vec!["read".to_string()],
+            }),
+        ))
+        .expect("agent")
+        .changed_refs[0]
+        .clone();
+    let first = service
+        .apply(&root(
+            "single-execution-task-a",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Task A".to_string(),
+                objective: "Task A".to_string(),
+                acceptance: "reviewed artifact".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+            }),
+        ))
+        .expect("task A")
+        .changed_refs[0]
+        .clone();
+    let second = service
+        .apply(&root(
+            "single-execution-task-b",
+            AgentAction::TaskPublish(TaskPublishInput {
+                team_ref: team.clone(),
+                title: "Task B".to_string(),
+                objective: "Task B".to_string(),
+                acceptance: "reviewed artifact".to_string(),
+                required_capabilities: vec!["read".to_string()],
+                depends_on: Vec::new(),
+            }),
+        ))
+        .expect("task B")
+        .changed_refs[0]
+        .clone();
+    service
+        .apply(&managed(
+            "single-execution-claim-a",
+            &team,
+            &agent,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: first,
+                reason: None,
+            }),
+        ))
+        .expect("first claim");
+    let rejected = service
+        .apply(&managed(
+            "single-execution-claim-b",
+            &team,
+            &agent,
+            AgentAction::TaskClaim(TaskClaimInput {
+                task_ref: second,
+                reason: None,
+            }),
+        ))
+        .expect("second claim rejection");
+    assert_eq!(rejected.status, AgentActionStatus::Rejected);
+    assert_eq!(
+        rejected.error.expect("error").code,
+        "execution_already_claims_task"
     );
 }
 

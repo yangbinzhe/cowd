@@ -212,6 +212,9 @@ pub struct ArtifactCommitInput {
     pub content_ref: String,
     pub kind: String,
     pub title: String,
+    /// Additional semantic relations. For an executing Agent, Runtime always
+    /// appends the actor's currently claimed Task from its attested execution
+    /// binding; the model does not need to repeat that Task ID here.
     #[serde(default)]
     pub relates_to: Vec<String>,
 }

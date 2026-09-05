@@ -184,6 +184,22 @@ fn validate_task_claim(
     if member.team_id != task.team_id {
         return Some(("task_outside_actor_team", task.team_id.clone()));
     }
+    if !same_execution_renewal {
+        if let Some(active) = projection.tasks.values().find(|candidate| {
+            candidate.task_id != input.task_ref
+                && candidate.status == AgenticTaskStatus::Claimed
+                && candidate.claimant.as_deref() == Some(agent_id.as_str())
+                && candidate.claim_execution_id == envelope.actor.execution_id
+        }) {
+            return Some((
+                "execution_already_claims_task",
+                format!(
+                    "physical Agent execution is already bound to active Task {}",
+                    active.task_id
+                ),
+            ));
+        }
+    }
     // Roster capability labels are semantic matching hints. Physical Agent
     // definitions, tools, permissions, and resource scopes are bound by the
     // trusted dispatcher; exact model-authored string equality is neither an

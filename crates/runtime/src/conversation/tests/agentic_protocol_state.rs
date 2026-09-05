@@ -1,4 +1,7 @@
-use super::host_backend::{delegated_agentic_protocol_state, DelegatedAgenticProtocolState};
+use super::host_backend::{
+    delegated_agentic_protocol_state, pending_delegated_action_is_ready,
+    DelegatedAgenticProtocolState,
+};
 use super::agentic_program_owns_root_terminal;
 use harness_contract::agent::AgentTaskPacket;
 use harness_contract::agent_action::{
@@ -406,7 +409,7 @@ async fn commit_protocol_artifact(
 }
 
 #[tokio::test]
-async fn delegated_protocol_reads_real_parent_and_selects_only_owned_task_artifacts() {
+async fn delegated_protocol_reads_real_parent_and_selects_all_runtime_bound_task_artifacts() {
     let fixture = protocol_fixture();
     let execute_graph = "agent-execute-active";
     fixture
@@ -431,13 +434,13 @@ async fn delegated_protocol_reads_real_parent_and_selects_only_owned_task_artifa
         "included evidence",
     )
     .await;
-    let (unrelated_ref, _) = commit_protocol_artifact(
+    let (auto_bound_ref, auto_bound_evidence) = commit_protocol_artifact(
         &fixture,
-        "unrelated-artifact",
+        "auto-bound-artifact",
         &fixture.author_ref,
         execute_graph,
         vec!["task:unrelated".to_string()],
-        "wrong task",
+        "same execution evidence",
     )
     .await;
     let (foreign_ref, _) = commit_protocol_artifact(
@@ -467,12 +470,13 @@ async fn delegated_protocol_reads_real_parent_and_selects_only_owned_task_artifa
     assert_eq!(state.status, crate::AgenticTaskStatus::Claimed);
     assert!(state.owns_active_attempt);
     assert!(!state.is_terminal());
-    assert_eq!(state.artifact_refs, vec![included_ref.clone()]);
-    assert_eq!(
-        state.artifact_evidence_refs,
-        vec![included_evidence.clone()]
-    );
-    assert!(!state.artifact_refs.contains(&unrelated_ref));
+    let mut expected_refs = vec![included_ref.clone(), auto_bound_ref.clone()];
+    expected_refs.sort();
+    let mut expected_evidence = vec![included_evidence.clone(), auto_bound_evidence.clone()];
+    expected_evidence.sort();
+    assert_eq!(state.artifact_refs, expected_refs);
+    assert_eq!(state.artifact_evidence_refs, expected_evidence);
+    assert!(state.artifact_refs.contains(&auto_bound_ref));
     assert!(!state.artifact_refs.contains(&foreign_ref));
     assert_eq!(
         state.required_terminal_tools(),
@@ -507,6 +511,63 @@ fn delegated_protocol_terminal_classification_is_mode_and_fence_aware() {
     assert!(state("review", crate::AgenticTaskStatus::Rework, false).is_terminal());
     assert!(state("review", crate::AgenticTaskStatus::Blocked, false).is_terminal());
     assert!(state("execute", crate::AgenticTaskStatus::Claimed, false).is_terminal());
+}
+
+#[test]
+fn saturated_delegated_work_commits_its_next_action_without_text_only_detour() {
+    let state = |mode: &str, status, owns_active_attempt| DelegatedAgenticProtocolState {
+        program_id: "program".to_string(),
+        task_id: "task".to_string(),
+        mode: mode.to_string(),
+        status,
+        artifact_refs: vec!["artifact:one".to_string()],
+        artifact_evidence_refs: vec!["artifact://content".to_string()],
+        owns_active_attempt,
+    };
+    let pending_review = state("review", crate::AgenticTaskStatus::Submitted, true);
+    assert!(pending_delegated_action_is_ready(
+        Some(&pending_review),
+        true,
+        true,
+    ));
+    assert_eq!(
+        pending_review.convergence_action_tools(),
+        std::collections::BTreeSet::from(["task_review".to_string()])
+    );
+    assert!(!pending_delegated_action_is_ready(
+        Some(&pending_review),
+        false,
+        true,
+    ));
+    assert!(!pending_delegated_action_is_ready(
+        Some(&pending_review),
+        true,
+        false,
+    ));
+
+    let accepted_review = state("review", crate::AgenticTaskStatus::Accepted, false);
+    assert!(!pending_delegated_action_is_ready(
+        Some(&accepted_review),
+        true,
+        true,
+    ));
+    let executing = state("execute", crate::AgenticTaskStatus::Claimed, true);
+    assert!(pending_delegated_action_is_ready(
+        Some(&executing),
+        true,
+        true,
+    ));
+    assert_eq!(
+        executing.required_terminal_tools(),
+        std::collections::BTreeSet::from(["task_submit".to_string()])
+    );
+    let mut executing_before_artifact = executing;
+    executing_before_artifact.artifact_refs.clear();
+    assert_eq!(
+        executing_before_artifact.required_terminal_tools(),
+        std::collections::BTreeSet::from(["artifact_commit".to_string()])
+    );
+    assert!(!pending_delegated_action_is_ready(None, true, true));
 }
 
 #[test]

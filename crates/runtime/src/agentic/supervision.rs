@@ -2,6 +2,7 @@ use harness_contract::agent_action::{AgentActionEnvelope, ObjectiveCompleteReque
 use harness_contract::goal::{
     ObjectiveEvidenceRequirement, ObjectiveObligation, ObjectiveObligationState,
 };
+use std::collections::BTreeSet;
 
 use super::program::{
     AgenticCompletionRequestProjection, AgenticProgramProjection, AgenticProgramStatus,
@@ -68,22 +69,15 @@ pub(crate) fn completion_gap(
     }) {
         return Some("final_artifact_not_accepted_by_task_review".to_string());
     }
-    let Some(final_artifact) = projection.artifacts.get(&input.final_artifact_ref) else {
-        return Some("final_artifact_not_committed".to_string());
-    };
+    let integrated_tasks = integrated_accepted_tasks(projection, &input.final_artifact_ref);
     let uncovered_teams = projection
         .teams
         .values()
         .filter(|team| {
-            !team.task_ids.iter().any(|task_id| {
-                projection.tasks.get(task_id).is_some_and(|task| {
-                    task.status == AgenticTaskStatus::Accepted
-                        && task.artifact_refs.iter().any(|artifact_ref| {
-                            artifact_ref == &input.final_artifact_ref
-                                || final_artifact.relates_to.contains(artifact_ref)
-                        })
-                })
-            })
+            !team
+                .task_ids
+                .iter()
+                .any(|task_id| integrated_tasks.contains(task_id))
         })
         .map(|team| team.team_id.clone())
         .collect::<Vec<_>>();
@@ -124,6 +118,231 @@ pub(crate) fn completion_gap(
         return Some("completion_has_no_evidence".to_string());
     }
     None
+}
+
+/// Resolve the accepted Task lineage represented by a final artifact.
+///
+/// Models should express synthesis as an ordinary Task dependency graph. The
+/// supervisor starts only from accepted Tasks that actually submitted the
+/// final Artifact, then follows accepted `depends_on` edges transitively.
+/// `Artifact.relates_to` is useful semantic metadata but is model-authored, so
+/// it can never prove cross-Team integration by itself.
+fn integrated_accepted_tasks(
+    projection: &AgenticProgramProjection,
+    final_artifact_ref: &str,
+) -> BTreeSet<String> {
+    let mut integrated = BTreeSet::new();
+    let mut pending = projection
+        .tasks
+        .values()
+        .filter(|task| {
+            task.status == AgenticTaskStatus::Accepted
+                && task
+                    .artifact_refs
+                    .iter()
+                    .any(|artifact_ref| artifact_ref == final_artifact_ref)
+        })
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<_>>();
+
+    while let Some(task_ref) = pending.pop() {
+        if integrated.contains(&task_ref) {
+            continue;
+        }
+        let Some(task) = projection.tasks.get(&task_ref) else {
+            continue;
+        };
+        if task.status != AgenticTaskStatus::Accepted {
+            continue;
+        }
+        integrated.insert(task.task_id.clone());
+        pending.extend(task.depends_on.iter().cloned());
+    }
+
+    integrated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agentic::program::{AgenticArtifactProjection, AgenticTaskProjection};
+
+    fn accepted_task(
+        task_id: &str,
+        team_id: &str,
+        depends_on: Vec<&str>,
+        artifact_refs: Vec<&str>,
+    ) -> AgenticTaskProjection {
+        AgenticTaskProjection {
+            task_id: task_id.to_string(),
+            team_id: team_id.to_string(),
+            title: task_id.to_string(),
+            objective: task_id.to_string(),
+            acceptance: "reviewed".to_string(),
+            required_capabilities: Vec::new(),
+            depends_on: depends_on.into_iter().map(str::to_string).collect(),
+            status: AgenticTaskStatus::Accepted,
+            claimant: Some("agent:author".to_string()),
+            claim_generation: 1,
+            claim_execution_id: Some("graph:author".to_string()),
+            claimed_at_ms: Some(1),
+            lease_expires_at_ms: Some(2),
+            artifact_refs: artifact_refs.into_iter().map(str::to_string).collect(),
+            evidence_refs: vec!["evidence:review".to_string()],
+            unresolved: Vec::new(),
+            review_reason: Some("accepted".to_string()),
+            reviewed_by: Some("agent:reviewer".to_string()),
+            failed_attempts: 0,
+            review_generation: 1,
+            failed_review_attempts: 0,
+            last_failure: None,
+            replacement_task_refs: Vec::new(),
+            supersede_evidence_refs: Vec::new(),
+            superseded_reason: None,
+            superseded_by: None,
+        }
+    }
+
+    #[test]
+    fn final_artifact_inherits_team_coverage_from_task_dependency_dag() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task:research".to_string(),
+            accepted_task(
+                "task:research",
+                "team:research",
+                Vec::new(),
+                vec!["artifact:research"],
+            ),
+        );
+        projection.tasks.insert(
+            "task:experiment".to_string(),
+            accepted_task(
+                "task:experiment",
+                "team:experiment",
+                Vec::new(),
+                vec!["artifact:experiment"],
+            ),
+        );
+        projection.tasks.insert(
+            "task:synthesis".to_string(),
+            accepted_task(
+                "task:synthesis",
+                "team:integration",
+                vec!["task:research", "task:experiment"],
+                vec!["artifact:final"],
+            ),
+        );
+        projection.artifacts.insert(
+            "artifact:final".to_string(),
+            AgenticArtifactProjection {
+                artifact_ref: "artifact:final".to_string(),
+                content_ref: "workspace://report.html".to_string(),
+                kind: "final-report".to_string(),
+                title: "Final report".to_string(),
+                relates_to: vec!["task:synthesis".to_string()],
+                committed_by: "agent:author".to_string(),
+            },
+        );
+
+        assert_eq!(
+            integrated_accepted_tasks(&projection, "artifact:final"),
+            BTreeSet::from([
+                "task:experiment".to_string(),
+                "task:research".to_string(),
+                "task:synthesis".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn unaccepted_dependency_cannot_supply_transitive_team_coverage() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        let mut unaccepted = accepted_task(
+            "task:unaccepted",
+            "team:research",
+            vec!["task:hidden"],
+            vec!["artifact:research"],
+        );
+        unaccepted.status = AgenticTaskStatus::Submitted;
+        projection
+            .tasks
+            .insert("task:unaccepted".to_string(), unaccepted);
+        projection.tasks.insert(
+            "task:hidden".to_string(),
+            accepted_task(
+                "task:hidden",
+                "team:hidden",
+                Vec::new(),
+                vec!["artifact:hidden"],
+            ),
+        );
+        projection.tasks.insert(
+            "task:synthesis".to_string(),
+            accepted_task(
+                "task:synthesis",
+                "team:integration",
+                vec!["task:unaccepted"],
+                vec!["artifact:final"],
+            ),
+        );
+        projection.artifacts.insert(
+            "artifact:final".to_string(),
+            AgenticArtifactProjection {
+                artifact_ref: "artifact:final".to_string(),
+                content_ref: "workspace://report.html".to_string(),
+                kind: "final-report".to_string(),
+                title: "Final report".to_string(),
+                relates_to: vec!["task:synthesis".to_string()],
+                committed_by: "agent:author".to_string(),
+            },
+        );
+
+        assert_eq!(
+            integrated_accepted_tasks(&projection, "artifact:final"),
+            BTreeSet::from(["task:synthesis".to_string()])
+        );
+    }
+
+    #[test]
+    fn model_authored_artifact_relations_cannot_forge_team_coverage() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.tasks.insert(
+            "task:unrelated".to_string(),
+            accepted_task(
+                "task:unrelated",
+                "team:unrelated",
+                Vec::new(),
+                vec!["artifact:unrelated"],
+            ),
+        );
+        projection.tasks.insert(
+            "task:synthesis".to_string(),
+            accepted_task(
+                "task:synthesis",
+                "team:integration",
+                Vec::new(),
+                vec!["artifact:final"],
+            ),
+        );
+        projection.artifacts.insert(
+            "artifact:final".to_string(),
+            AgenticArtifactProjection {
+                artifact_ref: "artifact:final".to_string(),
+                content_ref: "workspace://report.html".to_string(),
+                kind: "final-report".to_string(),
+                title: "Final report".to_string(),
+                relates_to: vec!["task:unrelated".to_string()],
+                committed_by: "agent:author".to_string(),
+            },
+        );
+
+        assert_eq!(
+            integrated_accepted_tasks(&projection, "artifact:final"),
+            BTreeSet::from(["task:synthesis".to_string()]),
+            "model-authored artifact metadata must not substitute for a real Task dependency"
+        );
+    }
 }
 
 pub(crate) fn apply_completion_request(

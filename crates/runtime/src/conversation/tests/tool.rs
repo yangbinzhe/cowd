@@ -2734,6 +2734,14 @@
             false,
             &resolver,
         ));
+        assert!(root_delivery_write_satisfied(
+            true,
+            true,
+            &required,
+            &wrong,
+            false,
+            &resolver,
+        ), "a reviewed, Objective-verified Agentic delivery must not be re-vetoed by root-local write accounting");
     }
 
     #[test]

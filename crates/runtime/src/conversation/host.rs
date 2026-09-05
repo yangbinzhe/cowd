@@ -2179,6 +2179,24 @@ fn write_obligation_satisfied(
     })
 }
 
+fn root_delivery_write_satisfied(
+    verified_agentic_program: bool,
+    required_write_for_completion: bool,
+    required_scopes: &[String],
+    observed_evidence: &[harness_contract::context::ObservedEvidence],
+    unscoped_committed_write: bool,
+    resolver: &crate::path_identity::WorkspacePathIdentityResolver,
+) -> bool {
+    verified_agentic_program
+        || write_obligation_satisfied(
+            required_write_for_completion,
+            required_scopes,
+            observed_evidence,
+            unscoped_committed_write,
+            resolver,
+        )
+}
+
 #[cfg(test)]
 mod write_obligation_probe {
     use super::*;
