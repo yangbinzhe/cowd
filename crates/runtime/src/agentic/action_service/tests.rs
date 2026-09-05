@@ -604,7 +604,10 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
                 task_ref: task.clone(),
                 artifact_refs: vec![artifact.clone()],
                 evidence_refs: vec![content.selector.clone()],
-                unresolved: Vec::new(),
+                unresolved: vec![
+                    "Known limitation disclosed in the reviewed artifact; not an acceptance blocker"
+                        .to_string(),
+                ],
             }),
         ))
         .expect("submit");
@@ -633,6 +636,21 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
     assert_eq!(
         service
             .apply(&root(
+                "blocked-objective-complete",
+                AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
+                    final_artifact_ref: artifact.clone(),
+                    evidence_refs: vec![content.selector.clone()],
+                    unresolved: vec!["Objective-level delivery blocker".to_string()],
+                }),
+            ))
+            .expect("objective blocker rejection")
+            .status,
+        AgentActionStatus::Rejected,
+        "objective-level blockers remain authoritative even after Task acceptance"
+    );
+    assert_eq!(
+        service
+            .apply(&root(
                 "durable-complete",
                 AgentAction::ObjectiveCompleteRequest(ObjectiveCompleteRequestInput {
                     final_artifact_ref: artifact,
@@ -642,7 +660,8 @@ async fn production_artifact_authority_closes_submit_review_and_completion_chain
             ))
             .expect("completion")
             .status,
-        AgentActionStatus::Applied
+        AgentActionStatus::Applied,
+        "an independent Task accept verdict is authoritative; disclosed limitations must not be re-litigated by the Objective supervisor"
     );
 }
 

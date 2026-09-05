@@ -3,6 +3,10 @@ use std::collections::BTreeSet;
 use super::*;
 
 use harness_contract::agent::AgentCommand;
+use harness_contract::agent_action::{
+    AgentAction, AgentActionEnvelope, AgentActorBinding, AgentActorKind, AgentInviteInput,
+    ArtifactCommitInput, TaskClaimInput, TaskPublishInput, TaskSubmitInput, TeamCreateInput,
+};
 use harness_contract::turn::TurnId;
 use sha2::{Digest, Sha256};
 
@@ -2535,13 +2539,187 @@ fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
 
 #[test]
 fn generic_team_packet_has_no_retired_graph_work_market_checkpoint() {
-    let services = RuntimeServices::in_memory().expect("runtime");
+    let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
     let packet = test_agent_packet(Vec::new());
     assert!(
         agent_autonomy_checkpoint(&services, &packet)
             .expect("generic packet is not an Agent-first protocol error")
             .is_none(),
         "generic ExecutionGraph/Team packets must not revive a second task ownership plane"
+    );
+}
+
+#[tokio::test]
+async fn cross_team_review_checkpoint_is_valid_but_cross_team_execution_is_fenced() {
+    let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
+    let actions = services.agent_action_service();
+    let root_actor = || AgentActorBinding {
+        objective_id: "objective-checkpoint".to_string(),
+        program_id: "program-checkpoint".to_string(),
+        session_id: "session-checkpoint".to_string(),
+        turn_id: "turn-checkpoint".to_string(),
+        root_execution_id: Some("root-checkpoint".to_string()),
+        required_team_count: 2,
+        objective_summary: "exercise independent cross-Team review".to_string(),
+        model_lease: "model".to_string(),
+        permission_ceiling: Some(PermissionMode::ReadOnly),
+        resource_scopes: vec!["workspace:.".to_string()],
+        actor_id: "root:session-checkpoint".to_string(),
+        kind: AgentActorKind::Root,
+        execution_id: None,
+        team_id: None,
+        agent_id: None,
+    };
+    let apply_root = |action_id: &str, action: AgentAction| {
+        actions.apply(&AgentActionEnvelope {
+            action_id: action_id.to_string(),
+            actor: root_actor(),
+            expected_revision: None,
+            action,
+        })
+    };
+    let author_team = apply_root(
+        "author-team",
+        AgentAction::TeamCreate(TeamCreateInput {
+            name: "Authors".to_string(),
+            mission: "produce evidence".to_string(),
+            objective: None,
+        }),
+    )
+    .expect("author team")
+    .changed_refs[0]
+        .clone();
+    let review_team = apply_root(
+        "review-team",
+        AgentAction::TeamCreate(TeamCreateInput {
+            name: "Reviewers".to_string(),
+            mission: "independently inspect another Team".to_string(),
+            objective: None,
+        }),
+    )
+    .expect("review team")
+    .changed_refs[0]
+        .clone();
+    let author = apply_root(
+        "author",
+        AgentAction::AgentInvite(AgentInviteInput {
+            team_ref: author_team.clone(),
+            role: "Author".to_string(),
+            mission: "produce".to_string(),
+            required_capabilities: vec!["read".to_string()],
+        }),
+    )
+    .expect("author")
+    .changed_refs[0]
+        .clone();
+    let reviewer = apply_root(
+        "reviewer",
+        AgentAction::AgentInvite(AgentInviteInput {
+            team_ref: review_team.clone(),
+            role: "Reviewer".to_string(),
+            mission: "verify independently".to_string(),
+            required_capabilities: vec!["read".to_string()],
+        }),
+    )
+    .expect("reviewer")
+    .changed_refs[0]
+        .clone();
+    let task = apply_root(
+        "task",
+        AgentAction::TaskPublish(TaskPublishInput {
+            team_ref: author_team.clone(),
+            title: "Cross-Team review target".to_string(),
+            objective: "produce durable evidence".to_string(),
+            acceptance: "independent review".to_string(),
+            required_capabilities: vec!["read".to_string()],
+            depends_on: Vec::new(),
+        }),
+    )
+    .expect("task")
+    .changed_refs[0]
+        .clone();
+    let author_execution = "author-execution";
+    let mut author_actor = root_actor();
+    author_actor.actor_id.clone_from(&author);
+    author_actor.kind = AgentActorKind::Agent;
+    author_actor.execution_id = Some(author_execution.to_string());
+    author_actor.team_id = Some(author_team.clone());
+    author_actor.agent_id = Some(author.clone());
+    let apply_author = |action_id: &str, action: AgentAction| {
+        actions.apply(&AgentActionEnvelope {
+            action_id: action_id.to_string(),
+            actor: author_actor.clone(),
+            expected_revision: None,
+            action,
+        })
+    };
+    apply_author(
+        "claim",
+        AgentAction::TaskClaim(TaskClaimInput {
+            task_ref: task.clone(),
+            reason: None,
+        }),
+    )
+    .expect("claim");
+    let content = services
+        .artifact_store()
+        .write_bytes(
+            harness_contract::context::ArtifactWriteDescriptor {
+                media_type: "text/markdown".to_string(),
+                visibility_scope: "session:session-checkpoint".to_string(),
+                expected_bytes: None,
+                original_name: Some("cross-team.md".to_string()),
+            },
+            b"independently reviewable evidence",
+        )
+        .await
+        .expect("content");
+    let artifact = apply_author(
+        "artifact",
+        AgentAction::ArtifactCommit(ArtifactCommitInput {
+            content_ref: content.selector.clone(),
+            kind: "report".to_string(),
+            title: "Cross-Team report".to_string(),
+            relates_to: vec![task.clone()],
+        }),
+    )
+    .expect("artifact")
+    .changed_refs[0]
+        .clone();
+    apply_author(
+        "submit",
+        AgentAction::TaskSubmit(TaskSubmitInput {
+            task_ref: task.clone(),
+            artifact_refs: vec![artifact],
+            evidence_refs: vec![content.selector],
+            unresolved: Vec::new(),
+        }),
+    )
+    .expect("submit");
+
+    let mut packet = test_agent_packet(Vec::new());
+    packet.allowed_tools = vec!["task_review".to_string(), "read_file".to_string()];
+    packet.context_refs = vec![
+        "agentic_program:program-checkpoint".to_string(),
+        format!("agentic_member:{reviewer}"),
+        format!("agentic_task:{task}"),
+        "agentic_mode:review".to_string(),
+    ];
+    let checkpoint = agent_autonomy_checkpoint(&services, &packet)
+        .expect("cross-Team review checkpoint must remain valid")
+        .expect("submitted Task requires a review action");
+    assert!(checkpoint.prompt.contains("inspect_and_review"));
+    assert!(checkpoint.tool_ids.iter().any(|tool| tool == "task_review"));
+
+    packet.context_refs.pop();
+    packet.context_refs.push("agentic_mode:execute".to_string());
+    let error = match agent_autonomy_checkpoint(&services, &packet) {
+        Err(error) => error,
+        Ok(_) => panic!("cross-Team execution must remain fenced"),
+    };
+    assert_eq!(
+        error,
+        "Agent-first packet member is outside the bound Task Team"
     );
 }
 

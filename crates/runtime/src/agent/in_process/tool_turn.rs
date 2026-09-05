@@ -332,7 +332,12 @@ pub(super) fn agent_autonomy_checkpoint(
         .tasks
         .get(task_id)
         .ok_or_else(|| format!("Agent-first Program `{program_id}` has no Task `{task_id}`"))?;
-    if member.team_id != task.team_id {
+    // Execution ownership is Team-scoped, while review independence is
+    // deliberately allowed (and preferentially scheduled) across Teams.  Do
+    // not reuse the execution ownership fence for review packets: doing so
+    // lets the review action commit and then falsely fails the physical Agent
+    // graph at the next checkpoint.
+    if mode == "execute" && member.team_id != task.team_id {
         return Err("Agent-first packet member is outside the bound Task Team".to_string());
     }
     let topic_ref = projection

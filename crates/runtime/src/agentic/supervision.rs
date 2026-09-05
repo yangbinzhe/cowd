@@ -46,18 +46,10 @@ pub(crate) fn completion_gap(
     if !input.unresolved.is_empty() {
         return Some("completion_has_unresolved_items".to_string());
     }
-    let tasks_with_unresolved = projection
-        .tasks
-        .values()
-        .filter(|task| task.status != AgenticTaskStatus::Superseded && !task.unresolved.is_empty())
-        .map(|task| task.task_id.clone())
-        .collect::<Vec<_>>();
-    if !tasks_with_unresolved.is_empty() {
-        return Some(format!(
-            "tasks_have_unresolved_items:{}",
-            tasks_with_unresolved.join(",")
-        ));
-    }
+    // Task acceptance is the independent reviewer's completion verdict.
+    // A Task's `unresolved` field remains a durable disclosure for the
+    // supervisor and final synthesis; it is not a second completion veto.
+    // Objective-level blockers belong exclusively to `input.unresolved`.
     let incomplete = projection
         .tasks
         .values()

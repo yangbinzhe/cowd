@@ -201,7 +201,7 @@ pub fn runtime_capability_primer() -> String {
         "Publish independent Tasks without artificial dependencies so Runtime can execute them concurrently.",
         "Keep long reasoning and deliverables in normal content or workspace files. Action payloads carry compact semantic fields and durable refs.",
         "A Task is complete only after a real claimant submits durable evidence and a different Agent accepts it.",
-        "Request Objective completion only after every required Team has members and accepted work, the final artifact is durable and reviewed, and unresolved items are empty.",
+        "Request Objective completion only after every required Team has members and accepted work, the final artifact is durable and reviewed, and no objective-level blocker remains. Accepted Task limitations remain visible disclosures and are not a second completion veto.",
         "On rejection or restart, inspect current state and continue from the returned revision; never repeat an unchanged failing action.",
     ]
     .join("\n")
@@ -317,7 +317,8 @@ pub fn runtime_capabilities_response_with_leased_decision_and_tools(
         },
         "completion": {
             "request": harness_contract::agent_action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
-            "requires": ["required Teams staffed", "accepted Tasks", "independent reviewers", "durable reviewed final artifact", "evidence", "no unresolved items"],
+            "requires": ["required Teams staffed", "accepted Tasks", "independent reviewers", "durable reviewed final artifact", "evidence", "no objective-level blockers"],
+            "accepted_task_disclosures": "accepted Task limitations remain visible but are not re-litigated by a second completion owner",
         },
         "context_retrieval": {
             "available": available_tool_names.iter().any(|tool| tool == "context_retrieve"),

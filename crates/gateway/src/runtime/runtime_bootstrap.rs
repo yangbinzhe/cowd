@@ -401,7 +401,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::TaskSubmitInput>(
             action::TASK_SUBMIT_TOOL_ID,
-            "Submit one claimed Task using committed artifact and evidence references. Long result content must be committed separately, never embedded in this action.",
+            "Submit one claimed Task using committed artifact and evidence references. Long result content must be committed separately, never embedded in this action. unresolved carries honest limitations or follow-up disclosures for the independent reviewer; that reviewer decides whether they block Task acceptance.",
         ),
         agent_action_definition::<action::TaskReviewInput>(
             action::TASK_REVIEW_TOOL_ID,
@@ -417,7 +417,7 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::ObjectiveCompleteRequestInput>(
             action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
-            "Request Objective verification using a committed final artifact, evidence references and explicit unresolved items. The Supervisor alone decides terminal success.",
+            "Request Objective verification using a committed final artifact, evidence references and explicit Objective-level blockers. Accepted Task limitations remain visible disclosures and are not repeated as blockers. The Supervisor verifies terminal invariants without re-litigating independent Task accept verdicts.",
         ),
     ]
 }

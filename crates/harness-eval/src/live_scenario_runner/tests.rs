@@ -543,6 +543,41 @@ fn architecture_acceptance_rejects_failed_team_even_when_prose_claims_evidence()
 }
 
 #[test]
+fn architecture_acceptance_rejects_failed_physical_agent_graph() {
+    let answer = "runtime memory gateway canonical event risk";
+    let program = agentic_program_projection("verified", true);
+    let result = LiveAcceptance::ArchitectureQuality {
+        minimum_teams: 1,
+        minimum_claimed_cross_team_edges: 0,
+        evidence_profile: ArchitectureEvidenceProfile::Basic,
+    }
+    .evaluate(
+        answer,
+        &successful_root_outcome_timeline(json!({})),
+        &[json!({
+            "execution_id": "root",
+            "revision": 1,
+            "activities": [{
+                "agent_instance_id": "reviewer-agent",
+                "team_run_id": "review-team",
+                "status": "failed",
+                "started_at_ms": 1,
+                "completed_at_ms": 2
+            }]
+        })],
+        Some(&program),
+        "root",
+    );
+
+    assert!(!result.passed);
+    assert!(result.checks.iter().any(|check| {
+        check["name"] == "physical_agent_graphs_succeeded"
+            && check["passed"] == false
+            && check["failed_activities"] == 1
+    }));
+}
+
+#[test]
 fn partial_team_is_terminal_unsuccessful_not_pending_work() {
     let mut program = agentic_program_projection("open", true);
     program.tasks.get_mut("task-b").expect("task").status = runtime::AgenticTaskStatus::Blocked;

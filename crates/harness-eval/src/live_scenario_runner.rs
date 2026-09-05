@@ -2077,6 +2077,7 @@ fn scenario_metrics(
         "agentic_artifact_count": artifact_count,
         "accepted_cross_team_dependency_count": agentic_program.map(accepted_cross_team_dependency_count).unwrap_or_default(),
         "physical_parallel_overlap_count": physical_parallel_overlap_count(projections),
+        "physical_failed_agent_activity_count": physical_failed_agent_activity_count(projections),
         "wall_ms": elapsed_ms,
         "first_token_latency_ms": first_token_latency_ms,
         "wall_tokens_per_second": wall_tokens_per_second.or(output_tokens_per_second),
@@ -2725,6 +2726,8 @@ impl LiveAcceptance {
                 let parallel_overlaps = physical_parallel_overlap_count(projections);
                 let parallel_satisfied = minimum_teams <= 1 || parallel_overlaps > 0;
                 let physical_terminal = no_active_agent_waits(projections);
+                let physical_failed_agents = physical_failed_agent_activity_count(projections);
+                let physical_success = physical_failed_agents == 0;
                 let presentation_checks = match evidence_profile {
                     ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
                         large_scale_presentation_checks(response)
@@ -2800,6 +2803,7 @@ impl LiveAcceptance {
                     json!({"name": "accepted_cross_team_dependencies", "required": minimum_claimed_cross_team_edges, "observed": accepted_cross_team_dependencies, "passed": edges_satisfied}),
                     json!({"name": "physical_agent_concurrency", "required_overlaps": usize::from(minimum_teams > 1), "observed_overlaps": parallel_overlaps, "passed": parallel_satisfied}),
                     json!({"name": "physical_agent_waits_resolved", "passed": physical_terminal}),
+                    json!({"name": "physical_agent_graphs_succeeded", "failed_activities": physical_failed_agents, "passed": physical_success}),
                     json!({"name": "runtime_attested_complete_source_coverage", "required": required_complete_source_paths.len(), "observed": complete_source_paths.len(), "missing": missing_complete_source_paths, "passed": complete_source_coverage}),
                     json!({"name": "runtime_attested_independent_source_review", "required": required_independent_source_paths.len(), "observed": independently_reviewed_source_paths.len(), "missing": missing_independently_reviewed_source_paths, "receipt_rule": "distinct exact-content receipts from two different Agent identities", "passed": independent_source_review}),
                     json!({"name": "runtime_attested_terminal_team_source_review", "required": if evidence_profile == ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis { GROUP_THEORY_SOURCE_PATHS.len() } else { 0 }, "observed": terminal_team_source_paths.len(), "terminal_semantic_team_ids": terminal_team_ids, "missing": missing_terminal_team_source_paths, "receipt_rule": "exact-content read receipt must belong to the unique sink Team Agent identity", "passed": terminal_team_source_review}),
@@ -2814,6 +2818,7 @@ impl LiveAcceptance {
                         && edges_satisfied
                         && parallel_satisfied
                         && physical_terminal
+                        && physical_success
                         && complete_source_coverage
                         && independent_source_review
                         && terminal_team_source_review
@@ -2849,6 +2854,8 @@ impl LiveAcceptance {
                 let topic_entries = program.topics.values().map(Vec::len).sum::<usize>();
                 let cross_team_edges = accepted_cross_team_dependency_count(program);
                 let overlaps = physical_parallel_overlap_count(projections);
+                let physical_failed_agents = physical_failed_agent_activity_count(projections);
+                let physical_success = physical_failed_agents == 0;
                 let program_verified = program.status == runtime::AgenticProgramStatus::Verified
                     && program.root_execution_id.as_deref() == Some(root_execution_id)
                     && program.objective_verdict.is_some()
@@ -2889,6 +2896,7 @@ impl LiveAcceptance {
                         && edges_satisfied
                         && overlaps > 0
                         && no_active_agent_waits(projections)
+                        && physical_success
                         && final_artifact_satisfied,
                     quality: None,
                     checks: vec![
@@ -2903,6 +2911,7 @@ impl LiveAcceptance {
                         json!({"name": "accepted_cross_team_dependencies", "required": minimum_cross_team_edges, "observed": cross_team_edges, "passed": edges_satisfied}),
                         json!({"name": "physical_agent_concurrency", "required_overlaps": 1, "observed_overlaps": overlaps, "passed": overlaps > 0}),
                         json!({"name": "physical_agent_waits_resolved", "passed": no_active_agent_waits(projections)}),
+                        json!({"name": "physical_agent_graphs_succeeded", "failed_activities": physical_failed_agents, "passed": physical_success}),
                         json!({"name": "durable_final_artifact", "expected_path": output_path, "final_artifact_ref": program.final_artifact_ref, "passed": final_artifact_satisfied}),
                     ],
                 }
@@ -3568,6 +3577,29 @@ fn no_active_agent_waits(projections: &[Value]) -> bool {
                 )
             })
     })
+}
+
+fn physical_failed_agent_activity_count(projections: &[Value]) -> usize {
+    projections
+        .iter()
+        .flat_map(|projection| {
+            projection
+                .get("activities")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|activity| {
+            activity
+                .get("agent_instance_id")
+                .and_then(Value::as_str)
+                .is_some()
+                && matches!(
+                    activity.get("status").and_then(Value::as_str),
+                    Some("failed" | "cancelled" | "canceled")
+                )
+        })
+        .count()
 }
 
 #[derive(Default)]

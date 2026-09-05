@@ -163,6 +163,9 @@ pub struct TaskSubmitInput {
     /// tool receipts. The committed artifact content is attached by Runtime.
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    /// Known limitations, risks, or follow-up opportunities disclosed to the
+    /// independent reviewer. A reviewer may accept them as non-blocking; its
+    /// accept verdict is the sole Task completion authority.
     #[serde(default)]
     pub unresolved: Vec<String>,
 }
@@ -219,6 +222,8 @@ pub struct ObjectiveCompleteRequestInput {
     pub final_artifact_ref: String,
     #[serde(default)]
     pub evidence_refs: Vec<String>,
+    /// Objective-level delivery blockers only. Accepted Task disclosures stay
+    /// visible in the Program projection but are not duplicated here.
     #[serde(default)]
     pub unresolved: Vec<String>,
 }
