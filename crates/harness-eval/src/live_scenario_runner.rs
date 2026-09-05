@@ -1379,12 +1379,12 @@ impl LiveScenarioRunner {
             if since_progress >= Duration::from_secs(30) {
                 observer.mark_quiet();
             }
-            if elapsed >= timeout.absolute_wait {
+            if timeout.should_abort_for_absolute_wait(elapsed) {
                 observer.mark_stalled();
                 return Err(format!(
-                    "timed out after {}ms waiting for a durable assistant message; absolute scenario safety wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
+                    "timed out after {}ms waiting for a durable assistant message; explicit absolute scenario safety wait={}ms, phase={}, last_active_phase={}, progress_observations={}, message_cursor={}, timeline_cursor={}",
                     elapsed.as_millis(),
-                    timeout.absolute_wait.as_millis(),
+                    timeout.absolute_wait.map_or(0, |wait| wait.as_millis()),
                     observer.phase(),
                     observer.last_active_phase(),
                     observer.progress_observations(),
@@ -1400,7 +1400,7 @@ impl LiveScenarioRunner {
                     "no durable execution progress before the nominal scenario wait elapsed after {}ms; nominal wait={}ms, absolute safety wait={}ms, phase={}, last_active_phase={}, message_cursor={}, timeline_cursor={}",
                     elapsed.as_millis(),
                     timeout.nominal_wait.as_millis(),
-                    timeout.absolute_wait.as_millis(),
+                    timeout.absolute_wait.map(|wait| wait.as_millis()).map_or_else(|| "none".to_string(), |wait| wait.to_string()),
                     observer.phase(),
                     observer.last_active_phase(),
                     observer.next_message_sequence(),
@@ -1419,7 +1419,7 @@ impl LiveScenarioRunner {
                     elapsed.as_millis(),
                     timeout.inactivity_wait.as_millis(),
                     timeout.nominal_wait.as_millis(),
-                    timeout.absolute_wait.as_millis(),
+                    timeout.absolute_wait.map(|wait| wait.as_millis()).map_or_else(|| "none".to_string(), |wait| wait.to_string()),
                     observer.phase(),
                     observer.last_active_phase(),
                     observer.progress_observations(),
@@ -1746,7 +1746,7 @@ impl LiveScenarioRunner {
             let since_progress = Duration::from_millis(
                 observer.since_last_progress_ms(scenario_elapsed.as_millis() as u64),
             );
-            if scenario_elapsed >= timeout.absolute_wait
+            if timeout.should_abort_for_absolute_wait(scenario_elapsed)
                 || timeout.should_abort_for_inactivity(
                     scenario_elapsed,
                     since_progress,
@@ -1762,7 +1762,7 @@ impl LiveScenarioRunner {
                         "required": true,
                         "elapsed_ms": wait_started.elapsed().as_millis(),
                         "observations": observations,
-                        "terminal_reason": if scenario_elapsed >= timeout.absolute_wait {
+                        "terminal_reason": if timeout.should_abort_for_absolute_wait(scenario_elapsed) {
                             "scenario_absolute_wait_elapsed_while_team_descendants_running"
                         } else {
                             "scenario_inactivity_wait_elapsed_while_team_descendants_running"
@@ -2477,7 +2477,7 @@ struct LiveScenarioTimeout {
     initial_wait: Duration,
     inactivity_wait: Duration,
     nominal_wait: Duration,
-    absolute_wait: Duration,
+    absolute_wait: Option<Duration>,
 }
 
 impl LiveScenarioTimeout {
@@ -2486,7 +2486,7 @@ impl LiveScenarioTimeout {
             initial_wait: Duration::from_secs(45),
             inactivity_wait: Duration::from_secs(45),
             nominal_wait: Duration::from_secs(120),
-            absolute_wait: Duration::from_secs(240),
+            absolute_wait: Some(Duration::from_secs(240)),
         }
     }
 
@@ -2495,7 +2495,7 @@ impl LiveScenarioTimeout {
             initial_wait: Duration::from_secs(90),
             inactivity_wait: Duration::from_secs(75),
             nominal_wait: Duration::from_secs(300),
-            absolute_wait: Duration::from_secs(600),
+            absolute_wait: Some(Duration::from_secs(600)),
         }
     }
 
@@ -2508,23 +2508,32 @@ impl LiveScenarioTimeout {
             initial_wait: Duration::from_secs(360),
             inactivity_wait: Duration::from_secs(600),
             nominal_wait: Duration::from_secs(1_800),
-            absolute_wait: Duration::from_secs(3_600),
+            // Team work is completion- and progress-governed. A fixed wall
+            // clock limit can only be supplied explicitly by the evaluator
+            // operator; it must not silently cancel productive descendants.
+            absolute_wait: None,
         }
     }
 
     const fn large_scale(agent_count: usize) -> Self {
-        // A real provider-backed Agent step can legitimately take around
-        // three minutes including tool and durable commit work. Derive the
-        // hard ceiling from declared topology instead of using the former
-        // fixed 30-minute cutoff. Independent branches still finish earlier;
-        // this is only the isolated evaluator's last-resort kill switch.
-        let derived = 900_u64.saturating_add((agent_count as u64).saturating_mul(180));
-        let topology_ceiling_secs = if derived < 1_800 { 1_800 } else { derived };
+        // `agent_count` is a minimum acceptance threshold, not the topology
+        // the model will actually choose. It is therefore valid for sizing
+        // the no-progress window, but never for deriving a destructive wall
+        // clock deadline. Productive autonomous work ends through semantic
+        // closure; stalled work ends through the inactivity window. An
+        // operator can still opt into a visible absolute cap with
+        // COWD_EVAL_SCENARIO_TIMEOUT_SECS.
+        let topology_wait_secs = 900_u64.saturating_add((agent_count as u64).saturating_mul(180));
+        let nominal_wait_secs = if topology_wait_secs < 1_800 {
+            1_800
+        } else {
+            topology_wait_secs
+        };
         Self {
             initial_wait: Duration::from_secs(360),
             inactivity_wait: Duration::from_secs(480),
-            nominal_wait: Duration::from_secs(1_800),
-            absolute_wait: Duration::from_secs(topology_ceiling_secs),
+            nominal_wait: Duration::from_secs(nominal_wait_secs),
+            absolute_wait: None,
         }
     }
 
@@ -2542,7 +2551,7 @@ impl LiveScenarioTimeout {
             initial_wait: self.initial_wait,
             inactivity_wait: self.inactivity_wait.min(cap),
             nominal_wait: self.nominal_wait.min(cap),
-            absolute_wait: self.absolute_wait.min(cap),
+            absolute_wait: Some(self.absolute_wait.map_or(cap, |wait| wait.min(cap))),
         }
     }
 
@@ -2559,7 +2568,7 @@ impl LiveScenarioTimeout {
             "initial_wait_ms": self.initial_wait.as_millis(),
             "inactivity_wait_ms": self.inactivity_wait.as_millis(),
             "nominal_wait_ms": self.nominal_wait.as_millis(),
-            "absolute_wait_ms": self.absolute_wait.as_millis(),
+            "absolute_wait_ms": self.absolute_wait.map(|wait| wait.as_millis()),
             "elapsed_ms": elapsed.as_millis(),
             "since_last_progress_ms": since_progress.as_millis(),
             "progress_observations": progress_observations,
@@ -2571,6 +2580,10 @@ impl LiveScenarioTimeout {
 
     fn should_abort_for_no_progress(self, elapsed: Duration, progress_observations: usize) -> bool {
         progress_observations == 0 && elapsed >= self.nominal_wait
+    }
+
+    fn should_abort_for_absolute_wait(self, elapsed: Duration) -> bool {
+        self.absolute_wait.is_some_and(|wait| elapsed >= wait)
     }
 
     fn should_abort_for_inactivity(

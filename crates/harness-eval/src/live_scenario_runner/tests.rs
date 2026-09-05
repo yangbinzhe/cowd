@@ -1324,11 +1324,12 @@ fn live_timeout_is_complexity_aware_and_not_default_capped() {
     let direct = LiveScenarioTimeout::direct().with_cap(None);
     let team = LiveScenarioTimeout::team().with_cap(None);
     assert!(team.nominal_wait > direct.nominal_wait);
-    assert!(team.absolute_wait > direct.absolute_wait);
+    assert_eq!(team.absolute_wait, None);
+    assert!(direct.absolute_wait.is_some());
 
     let capped = team.with_cap(Some(Duration::from_secs(600)));
     assert_eq!(capped.nominal_wait, Duration::from_secs(600));
-    assert_eq!(capped.absolute_wait, Duration::from_secs(600));
+    assert_eq!(capped.absolute_wait, Some(Duration::from_secs(600)));
     assert_eq!(capped.inactivity_wait, Duration::from_secs(600));
 
     // An accidentally tiny operator cap cannot make the team scenario
@@ -1340,8 +1341,17 @@ fn live_timeout_is_complexity_aware_and_not_default_capped() {
 
     let sixteen = LiveScenarioTimeout::large_scale(16);
     let twenty_four = LiveScenarioTimeout::large_scale(24);
-    assert!(sixteen.absolute_wait > sixteen.nominal_wait);
-    assert!(twenty_four.absolute_wait > sixteen.absolute_wait);
+    assert_eq!(sixteen.absolute_wait, None);
+    assert_eq!(twenty_four.absolute_wait, None);
+    assert!(twenty_four.nominal_wait > sixteen.nominal_wait);
+    assert!(!twenty_four.should_abort_for_absolute_wait(Duration::from_secs(86_400)));
+
+    let explicitly_capped = twenty_four.with_cap(Some(Duration::from_secs(7_200)));
+    assert_eq!(
+        explicitly_capped.absolute_wait,
+        Some(Duration::from_secs(7_200))
+    );
+    assert!(explicitly_capped.should_abort_for_absolute_wait(Duration::from_secs(7_200)));
 }
 
 #[test]
