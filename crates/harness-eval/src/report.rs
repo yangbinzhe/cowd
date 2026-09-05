@@ -625,6 +625,8 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
             .and_then(Value::as_bool)
             .unwrap_or(false);
     let live = report.get("live_gateway_scenarios").unwrap_or(&Value::Null);
+    let focused_live_claim =
+        level == "deep" && live.get("claim_scope").and_then(Value::as_str) == Some("focused");
     let live_provider_rounds = live_gateway_provider_rounds(live);
     let live_total_tokens = live_gateway_total_tokens(live);
     let cache = trace.get("provider_cache").unwrap_or(&Value::Null);
@@ -686,7 +688,7 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         !scenarios.is_empty()
             && scenarios.iter().all(|item| {
                 item.get("status").and_then(Value::as_str) == Some("passed")
-                    || (level != "deep"
+                    || ((level != "deep" || focused_live_claim)
                         && item.get("capability").and_then(Value::as_str)
                             == Some("next_gen_harness_closure")
                         && item.get("status").and_then(Value::as_str) == Some("not_observed"))
@@ -763,7 +765,7 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         "next_gen_harness_closure_complete",
         (scenario_status(&scenarios, "next_gen_harness_closure") == Some("passed")
             && next_gen.get("status").and_then(Value::as_str) == Some("passed")
-            || (level != "deep"
+            || ((level != "deep" || focused_live_claim)
                 && scenario_status(&scenarios, "next_gen_harness_closure")
                     == Some("not_observed")
                 && next_gen.get("status").and_then(Value::as_str) == Some("not_observed")))
@@ -1507,6 +1509,43 @@ mod gate_tests {
         assert_eq!(item.status, "passed");
         assert!(item.evidence.contains("required_scenarios=1"));
         assert!(item.evidence.contains("complete_observations=true"));
+    }
+
+    #[test]
+    fn focused_deep_claim_does_not_claim_unselected_next_gen_scenarios() {
+        let next_gen_scenarios = (0..7)
+            .map(|index| json!({"scenario_id": format!("scenario-{index}")}))
+            .collect::<Vec<_>>();
+        let mut report = json!({
+            "level": "deep",
+            "scenarios": [{
+                "capability": "next_gen_harness_closure",
+                "status": "not_observed"
+            }],
+            "next_gen_harness_closure": {
+                "status": "not_observed",
+                "failed": 0,
+                "scenarios": next_gen_scenarios
+            },
+            "live_gateway_scenarios": {"claim_scope": "focused"}
+        });
+
+        let focused = evaluate_report_gate(&report);
+        assert_eq!(
+            gate_item(&focused, "scenario_capability_status").status,
+            "passed"
+        );
+        assert_eq!(
+            gate_item(&focused, "next_gen_harness_closure_complete").status,
+            "passed"
+        );
+
+        report["live_gateway_scenarios"]["claim_scope"] = json!("release-certification");
+        let release = evaluate_report_gate(&report);
+        assert_eq!(
+            gate_item(&release, "next_gen_harness_closure_complete").status,
+            "failed"
+        );
     }
 
     #[test]

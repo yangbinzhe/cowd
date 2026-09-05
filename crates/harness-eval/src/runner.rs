@@ -226,6 +226,36 @@ pub fn run_eval_controlled(
             next_gen_input.with_agentic_program_projection(projection),
         );
     }
+    // A focused paid run proves only its explicitly selected component. A
+    // direct or tool-only scenario cannot truthfully observe the Program,
+    // cross-Session, and recovery members of the aggregate next-gen suite.
+    // Preserve those rows as not_observed; do not turn an intentionally
+    // narrow claim into a false whole-run failure. Real failed rows and
+    // missing capabilities remain failures, while release-certification
+    // continues to require the complete aggregate.
+    let focused_live_claim = live_gateway_scenarios
+        .as_ref()
+        .is_some_and(|live| live.get("claim_scope").and_then(Value::as_str) == Some("focused"));
+    if focused_live_claim
+        && next_gen_harness.status == "failed"
+        && next_gen_harness.failed == 0
+        && next_gen_harness.missing_capabilities.is_empty()
+        && next_gen_harness.not_observed > 0
+    {
+        next_gen_harness.status = "not_observed".to_string();
+    }
+    if let Some(row) = scenarios.iter_mut().find(|row| {
+        row.get("capability").and_then(Value::as_str) == Some("next_gen_harness_closure")
+    }) {
+        row["status"] = Value::String(next_gen_harness.status.clone());
+        row["evidence"] = Value::String(format!(
+            "{}/{} next-gen closure scenarios passed; not_observed={}; missing={}",
+            next_gen_harness.passed,
+            next_gen_harness.total,
+            next_gen_harness.not_observed,
+            next_gen_harness.missing_capabilities.len()
+        ));
+    }
     // The production Gateway owns model execution. Its per-scenario metrics
     // are therefore the canonical real-provider evidence for deep evaluation,
     // rather than a later report-writing model call.
