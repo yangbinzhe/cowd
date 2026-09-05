@@ -742,12 +742,18 @@ where
                                 Some(self.session_id()),
                                 async move {
                                     if is_evidence_retrieve {
-                                        return retrieve_tool_evidence_from_sandbox(
+                                        if let Ok(output) = retrieve_tool_evidence_from_sandbox(
                                             evidence_sandbox.as_ref(),
                                             &tinput,
-                                        )
-                                        .map(harness_contract::context::ToolOutputDraft::bounded_inline)
-                                        .map_err(ToolError::new);
+                                        ) {
+                                            return Ok(harness_contract::context::ToolOutputDraft::bounded_inline(output));
+                                        }
+                                        // Small outputs are intentionally not duplicated in the
+                                        // in-memory search index, while every completed invocation
+                                        // still exposes its durable `tool://` ArtifactStore ref.
+                                        // Let the authorized Runtime ToolHost resolve that source of
+                                        // truth instead of turning an index miss into a false tool
+                                        // failure. Scope and Session checks remain in that host.
                                     }
                                     if matches!(
                                         tname.as_str(),

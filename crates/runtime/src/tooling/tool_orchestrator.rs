@@ -97,6 +97,7 @@ impl ToolSafetyCategory {
             | "git_show"
             | "memory_search"
             | "context_retrieve"
+            | "evidence_retrieve"
             | "memory_list"
             | "memory_get"
             | "session_list"
@@ -312,6 +313,10 @@ mod tests {
         );
         assert_eq!(
             ToolSafetyCategory::from_tool_name("lsp_definition"),
+            ToolSafetyCategory::ReadOnly
+        );
+        assert_eq!(
+            ToolSafetyCategory::from_tool_name("evidence_retrieve"),
             ToolSafetyCategory::ReadOnly
         );
     }

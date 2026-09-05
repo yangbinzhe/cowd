@@ -3033,6 +3033,85 @@
             .contains(&harness_contract::core::ExecutionModifier::Parallel));
     }
 
+    #[tokio::test]
+    async fn evidence_index_miss_falls_through_to_the_durable_tool_host() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&executions);
+        let session = Session::new();
+        let session_store = Arc::new(session::UnifiedSessionStore::open_in_memory().unwrap());
+        session_store
+            .create_session(&session::SessionRecord {
+                session_id: session.session_id.clone(),
+                platform: "test".to_string(),
+                chat_id: "durable-evidence-fallback".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-09-04T00:00:00Z".to_string(),
+                last_activity: "2026-09-04T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                status: "active".to_string(),
+            })
+            .await
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let artifacts = Arc::new(
+            crate::ArtifactStore::sqlite(temporary.path(), crate::ArtifactStoreConfig::default())
+                .unwrap(),
+        );
+        let runtime = ConversationRuntime::new(
+            session,
+            MockApi,
+            StaticToolExecutor::new().register("evidence_retrieve", move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(r#"{"available":true,"content":"durable evidence"}"#.to_string())
+            }),
+            PermissionPolicy::new(PermissionMode::ReadOnly),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::new(
+            RuntimeEventStore::open_in_memory().expect("event store"),
+        ))
+        .with_session_journal_port(crate::session_runtime_port::TestSessionPortAdapter::new(
+            session_store,
+        ))
+        .with_artifact_store(artifacts);
+        runtime
+            .begin_turn_strategy("turn-durable-evidence", "retrieve retained evidence")
+            .expect("admit evidence turn");
+        let calls = vec![ModelToolCall {
+            id: "retrieve".to_string(),
+            name: "evidence_retrieve".to_string(),
+            input: r#"{"evidence_ref":"tool://small-output-not-indexed","query":"fact"}"#
+                .to_string(),
+            depends_on: Vec::new(),
+        }];
+
+        let result = runtime
+            .execute_tool_batch_step(&calls, &crate::SharedPrompter::none(), 1)
+            .await
+            .expect("durable evidence fallback");
+
+        assert_eq!(result.failed, 0, "messages={:?}", result.messages);
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
+        assert!(result.messages.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    crate::session::ContentBlock::ToolResult {
+                        output,
+                        is_error: false,
+                        ..
+                    } if output.contains("durable evidence")
+                )
+            })
+        }));
+    }
+
     #[test]
     fn canonical_outcome_covers_direct_and_parallel_tool_turns_without_graph_ref() {
         for candidate in [
