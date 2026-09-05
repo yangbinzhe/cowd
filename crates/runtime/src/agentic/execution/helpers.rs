@@ -95,13 +95,12 @@ pub(super) fn eligible_members<'a>(
         .agents
         .values()
         .filter(|member| match mode {
-            DispatchMode::Execute => {
-                member.team_id == task.team_id
-                    && task
-                        .required_capabilities
-                        .iter()
-                        .all(|capability| member.required_capabilities.contains(capability))
-            }
+            // Team membership is the semantic eligibility boundary. Model
+            // capability labels express expertise and ranking hints, not a
+            // trusted physical grant or an exact-string scheduling fence.
+            // Concrete effect capabilities and ToolHost availability are
+            // resolved later by Runtime admission for the selected member.
+            DispatchMode::Execute => member.team_id == task.team_id,
             DispatchMode::Review => task.claimant.as_deref() != Some(member.agent_id.as_str()),
         })
         .collect()

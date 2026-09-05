@@ -381,11 +381,11 @@ fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
         ),
         agent_action_definition::<action::AgentInviteInput>(
             action::AGENT_INVITE_TOOL_ID,
-            "Invite one Agent into an existing Team by role mission and capabilities. Runtime resolves the concrete Agent definition, identity, permissions and execution binding.",
+            "Invite one Agent into an existing Team by role, mission, and optional semantic capability hints. Prefer portable effect hints read/search/write/test/network; put domain expertise in role and mission. Runtime translates hints and resolves the concrete Agent definition, identity, least-privilege permissions, and execution binding, so unknown domain labels do not grant authority or block dispatch.",
         ),
         agent_action_definition::<action::TaskPublishInput>(
             action::TASK_PUBLISH_TOOL_ID,
-            "Publish one bounded semantic Task to a Team work market. Dependencies are existing Task references only; Runtime owns scheduling, leases and physical execution.",
+            "Publish one bounded semantic Task to a Team work market. Dependencies are existing Task references only. required_capabilities is optional: prefer portable effect hints read/search/write/test/network and keep domain detail in title/objective/acceptance. Runtime owns capability translation, scheduling, leases and physical execution.",
         ),
         agent_action_definition::<action::TaskClaimInput>(
             action::TASK_CLAIM_TOOL_ID,

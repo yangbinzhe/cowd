@@ -2809,3 +2809,55 @@
         assert_eq!(second, vec![persistent.clone()]);
         assert_eq!(deduplicated, vec![persistent]);
     }
+
+    #[test]
+    fn applied_agentic_mutation_receipt_is_distinguishing_progress() {
+        let applied = harness_contract::agent_action::AgentActionObservation {
+            receipt_id: "receipt:team-create".to_string(),
+            action_id: "action:team-create".to_string(),
+            action: "team_create".to_string(),
+            program_id: "program:test".to_string(),
+            revision: 2,
+            status: harness_contract::agent_action::AgentActionStatus::Applied,
+            duplicate: false,
+            changed_refs: vec!["team:test".to_string()],
+            actionable: vec!["invite an Agent".to_string()],
+            projection: None,
+            error: None,
+        };
+        let rejected = harness_contract::agent_action::AgentActionObservation {
+            receipt_id: "receipt:rejected".to_string(),
+            action_id: "action:rejected".to_string(),
+            action: "task_publish".to_string(),
+            program_id: "program:test".to_string(),
+            revision: 2,
+            status: harness_contract::agent_action::AgentActionStatus::Rejected,
+            duplicate: false,
+            changed_refs: Vec::new(),
+            actionable: vec!["revise only this action".to_string()],
+            projection: None,
+            error: None,
+        };
+        let messages = vec![
+            ConversationMessage::tool_result(
+                "call-applied",
+                "team_create",
+                serde_json::to_string(&applied).expect("applied receipt"),
+                false,
+            ),
+            ConversationMessage::tool_result(
+                "call-rejected",
+                "task_publish",
+                serde_json::to_string(&rejected).expect("rejected receipt"),
+                false,
+            ),
+        ];
+
+        assert_eq!(
+            agentic_action_progress_refs(&messages),
+            std::collections::BTreeSet::from([
+                "agentic_changed:team:test".to_string(),
+                "agentic_receipt:receipt:team-create".to_string(),
+            ])
+        );
+    }

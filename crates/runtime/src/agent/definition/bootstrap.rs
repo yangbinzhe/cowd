@@ -169,6 +169,27 @@ fn builtin_agents() -> Result<Vec<BuiltinAgent>, ValidationError> {
                 CognitiveReadScope::DefinitionLineage,
             ],
         )?,
+        builtin(
+            "autonomous",
+            1,
+            "Autonomous",
+            "Researches, changes, verifies, and reports bounded cross-effect work under Runtime leases.",
+            "# Autonomous\n\nChoose and combine only the tools granted for this Task. Acquire evidence, implement bounded changes, verify observable results, and preserve uncertainty and citations. Runtime permissions and resource scopes remain authoritative.\n",
+            vec![
+                AgentCapability::Read,
+                AgentCapability::Search,
+                AgentCapability::Write,
+                AgentCapability::Test,
+                AgentCapability::Network,
+            ],
+            vec![
+                CognitiveReadScope::Session,
+                CognitiveReadScope::Team,
+                CognitiveReadScope::Project,
+                CognitiveReadScope::WorkspaceKnowledge,
+                CognitiveReadScope::DefinitionLineage,
+            ],
+        )?,
     ])
 }
 

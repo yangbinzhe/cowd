@@ -77,6 +77,11 @@ pub struct AgentInviteInput {
     pub team_ref: String,
     pub role: String,
     pub mission: String,
+    /// Optional semantic capability hints. Prefer Runtime effect names
+    /// `read`, `search`, `write`, `test`, and `network` when the effect is
+    /// known. Domain labels such as `formal_methods` or `literature_review`
+    /// remain useful matching hints; Runtime, not the model, translates them
+    /// into a concrete Agent definition and least-privilege tool grant.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
 }
@@ -88,6 +93,10 @@ pub struct TaskPublishInput {
     pub title: String,
     pub objective: String,
     pub acceptance: String,
+    /// Optional semantic capability hints. The five portable execution
+    /// effects are `read`, `search`, `write`, `test`, and `network`. Unknown
+    /// domain labels are never treated as trusted permissions and never make
+    /// an otherwise runnable Task permanently undispatchable.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
     #[serde(default)]

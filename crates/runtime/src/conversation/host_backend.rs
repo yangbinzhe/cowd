@@ -3274,6 +3274,7 @@ where
             mut orchestration_terminal_summary,
             _prepared_tool_invocations,
             successful_observed_evidence,
+            agentic_progress_refs,
         ) = if let Some(host) = governed_host {
             let (
                 tool_authorizations,
@@ -3335,6 +3336,10 @@ where
                 self.services.workspace_root(),
                 true,
             );
+            // Semantic Action progress must be read from the complete
+            // Runtime receipt. The model-facing evidence compactor may
+            // legitimately truncate a large projection after this point.
+            let agentic_progress_refs = agentic_action_progress_refs(&governed_messages);
             // Graph scheduling executes outside the legacy adapter. Before
             // the next model node sees the result, route its raw output
             // through the same durable evidence and context-ledger path used
@@ -3366,6 +3371,7 @@ where
                 orchestration_terminal_summary,
                 prepared_tool_invocations,
                 observed_evidence,
+                agentic_progress_refs,
             )
         } else {
             let mut runtime = self.runtime.lock().await;
@@ -3401,11 +3407,13 @@ where
                 reason: error.to_string(),
             })?;
             let orchestration_terminal_summary: Option<String> = None;
+            let agentic_progress_refs = agentic_action_progress_refs(&result.messages);
             (
                 result,
                 orchestration_terminal_summary,
                 prepared_tool_invocations,
                 observed_evidence,
+                agentic_progress_refs,
             )
         };
         self.runtime
@@ -3608,11 +3616,15 @@ where
             .cloned()
             .collect::<BTreeSet<_>>();
         let low_novelty = failed == 0
+            && agentic_progress_refs.is_empty()
             && !coverage_keys.is_empty()
             && novelty_target_bp > 0
             && coverage_novelty_bp < novelty_target_bp;
-        let evidence_saturated =
-            failed == 0 && !coverage_keys.is_empty() && newly_covered == 0 && newly_scoped == 0;
+        let evidence_saturated = failed == 0
+            && agentic_progress_refs.is_empty()
+            && !coverage_keys.is_empty()
+            && newly_covered == 0
+            && newly_scoped == 0;
         // File-level receipts may be individually new while adding no new
         // responsibility zone. A delegated role has a finite evidence
         // contract, so repeated work inside already-covered zones is a
@@ -3905,7 +3917,8 @@ where
             state.clean_terminal_synthesis_attempted = true;
             state.clean_terminal_synthesis_next = true;
         }
-        state.last_verified_progress = !new_observed_fingerprints.is_empty();
+        state.last_verified_progress =
+            !new_observed_fingerprints.is_empty() || !agentic_progress_refs.is_empty();
         let verified_evidence_refs = if state.last_verified_progress {
             new_observed_fingerprints
                 .iter()
@@ -3923,6 +3936,7 @@ where
                         .iter()
                         .map(|scope| format!("focus_resource_scope:{scope}")),
                 )
+                .chain(agentic_progress_refs.iter().cloned())
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>()
@@ -3994,6 +4008,7 @@ where
                     .iter()
                     .map(|scope| format!("focus_resource_scope:{scope}")),
             )
+            .chain(agentic_progress_refs.iter().cloned())
             .collect();
         observation.evidence_delta.added = verified_evidence_refs.clone();
         observation.effect_deltas.push(EffectDelta {

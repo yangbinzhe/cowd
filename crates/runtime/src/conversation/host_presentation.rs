@@ -3143,6 +3143,42 @@ pub(super) fn successful_tool_call_ids(messages: &[ConversationMessage]) -> BTre
         .collect()
 }
 
+/// Extract durable semantic progress from complete Runtime Agent-action receipts.
+/// Collaboration mutations do not necessarily touch a filesystem resource,
+/// so the generic evidence novelty tracker cannot infer their information
+/// gain from path receipts. Only an applied, non-duplicate action with
+/// changed refs is progress; inspections and rejected actions are excluded.
+pub(super) fn agentic_action_progress_refs(messages: &[ConversationMessage]) -> BTreeSet<String> {
+    messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                output,
+                is_error: false,
+                ..
+            } => serde_json::from_str::<harness_contract::agent_action::AgentActionObservation>(
+                output,
+            )
+            .ok(),
+            _ => None,
+        })
+        .filter(|observation| {
+            observation.status == harness_contract::agent_action::AgentActionStatus::Applied
+                && !observation.duplicate
+                && !observation.changed_refs.is_empty()
+        })
+        .flat_map(|observation| {
+            std::iter::once(format!("agentic_receipt:{}", observation.receipt_id)).chain(
+                observation
+                    .changed_refs
+                    .into_iter()
+                    .map(|reference| format!("agentic_changed:{reference}")),
+            )
+        })
+        .collect()
+}
+
 pub(super) fn normalize_workspace_scope(scope: &str) -> Option<(&str, String)> {
     let (mode, path) = scope.split_once(':')?;
     if !matches!(mode, "read" | "write" | "workspace") {

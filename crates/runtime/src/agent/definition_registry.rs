@@ -761,7 +761,13 @@ mod tests {
         let (_temporary, registry) = registry();
         let reviewer = publish_reviewer(&registry);
         let catalog = registry.runnable_agent_catalog().expect("catalog");
-        assert_eq!(catalog.len(), 4);
+        let catalog_len = catalog.len();
+        assert!(
+            catalog
+                .iter()
+                .any(|entry| entry.agent_id == "builtin/cowd/autonomous"),
+            "the cross-effect builtin must remain independently runnable"
+        );
         let reviewer_entry = catalog
             .iter()
             .find(|entry| entry.agent_id == reviewer.as_str())
@@ -803,7 +809,7 @@ mod tests {
         let catalog_after_stop = registry
             .runnable_agent_catalog()
             .expect("catalog after stop");
-        assert_eq!(catalog_after_stop.len(), 3);
+        assert_eq!(catalog_after_stop.len(), catalog_len - 1);
         assert!(catalog_after_stop
             .iter()
             .all(|entry| entry.agent_id != reviewer.as_str()));

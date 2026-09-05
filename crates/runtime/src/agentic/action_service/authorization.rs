@@ -184,16 +184,10 @@ fn validate_task_claim(
     if member.team_id != task.team_id {
         return Some(("task_outside_actor_team", task.team_id.clone()));
     }
-    if task
-        .required_capabilities
-        .iter()
-        .any(|capability| !member.required_capabilities.contains(capability))
-    {
-        return Some((
-            "actor_missing_capability",
-            task.required_capabilities.join(","),
-        ));
-    }
+    // Roster capability labels are semantic matching hints. Physical Agent
+    // definitions, tools, permissions, and resource scopes are bound by the
+    // trusted dispatcher; exact model-authored string equality is neither an
+    // authorization primitive nor a valid reason to reject an Agent claim.
     None
 }
 

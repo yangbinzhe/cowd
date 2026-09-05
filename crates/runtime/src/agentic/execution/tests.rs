@@ -328,7 +328,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
         .task_runtime_port()
         .bind_task_spec(
             "session-dispatch",
-            Some(PermissionMode::ReadOnly),
+            Some(PermissionMode::DangerFullAccess),
             harness_contract::task::TaskSpec::new("root Agent-first Program"),
         )
         .expect("bind root task policy");
@@ -369,7 +369,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
                 team_ref: team_ref.clone(),
                 role: "Researcher".to_string(),
                 mission: "collect evidence".to_string(),
-                required_capabilities: vec!["read".to_string()],
+                required_capabilities: vec!["web-research".to_string()],
             }),
         )))
         .expect("agent")
@@ -382,7 +382,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
             title: "Evidence review".to_string(),
             objective: "review the source".to_string(),
             acceptance: "cite evidence".to_string(),
-            required_capabilities: vec!["read".to_string()],
+            required_capabilities: vec!["python".to_string(), "verification".to_string()],
             depends_on: Vec::new(),
         }),
     ));
@@ -394,8 +394,8 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
                 session_id: "session-dispatch".to_string(),
                 turn_id: "turn-dispatch".to_string(),
                 model_lease: "default".to_string(),
-                permission_ceiling: PermissionMode::ReadOnly,
-                resource_scopes: Vec::new(),
+                permission_ceiling: PermissionMode::DangerFullAccess,
+                resource_scopes: vec!["workspace:.".to_string(), "network:*".to_string()],
             },
         )
         .await
@@ -407,6 +407,13 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
         .expect("graph");
     let packet: AgentTaskPacket =
         serde_json::from_str(&graph.nodes[0].payload_ref).expect("packet");
+    assert_eq!(
+        packet
+            .binding
+            .as_ref()
+            .map(|binding| binding.definition_ref.definition_id.as_str()),
+        Some("builtin/cowd/autonomous")
+    );
     packet
         .validate_cohort_prompt_package()
         .expect("Agentic Program cohort scope");
@@ -453,9 +460,18 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     let binding = packet.binding.expect("binding");
     assert_eq!(
         binding.definition_ref.definition_id.as_str(),
-        "builtin/cowd/direct"
+        "builtin/cowd/autonomous"
     );
-    assert_eq!(binding.effective_capabilities, vec![AgentCapability::Read]);
+    assert_eq!(
+        binding.effective_capabilities,
+        vec![
+            AgentCapability::Read,
+            AgentCapability::Search,
+            AgentCapability::Write,
+            AgentCapability::Test,
+            AgentCapability::Network,
+        ]
+    );
     assert!(binding.skill_refs.is_empty());
     assert!(binding
         .tool_contract_refs
@@ -640,9 +656,9 @@ fn admission_intersects_multiple_definition_skills_and_custom_tools() {
     assert!(allowed.contains(&"custom_report_reader".to_string()));
 }
 
-#[tokio::test]
-async fn dispatch_rejects_a_capability_no_definition_can_satisfy() {
-    let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
+#[test]
+fn semantic_capability_hints_translate_without_becoming_physical_authority() {
+    let services = RuntimeServices::in_memory().expect("runtime");
     let actions = services.agent_action_service();
     let team = actions
         .apply(&root(
@@ -662,8 +678,13 @@ async fn dispatch_rejects_a_capability_no_definition_can_satisfy() {
             AgentAction::AgentInvite(AgentInviteInput {
                 team_ref: team.clone(),
                 role: "Specialist".to_string(),
-                mission: "use an unavailable domain capability".to_string(),
-                required_capabilities: vec!["custom_domain_operation".to_string()],
+                mission: "research evidence and implement a verified Python experiment".to_string(),
+                required_capabilities: vec![
+                    "custom_domain_operation".to_string(),
+                    "web-research".to_string(),
+                    "python".to_string(),
+                    "verification".to_string(),
+                ],
             }),
         ))
         .expect("the semantic action contract must not own the capability catalog");
@@ -672,28 +693,28 @@ async fn dispatch_rejects_a_capability_no_definition_can_satisfy() {
         AgentAction::TaskPublish(TaskPublishInput {
             team_ref: team,
             title: "Run domain operation".to_string(),
-            objective: "prove catalog admission fails closed".to_string(),
-            acceptance: "no paid graph is admitted".to_string(),
-            required_capabilities: vec!["custom_domain_operation".to_string()],
+            objective: "prove semantic labels are translated by Runtime".to_string(),
+            acceptance: "a least-privilege physical capability set is derived".to_string(),
+            required_capabilities: vec!["evidence-gathering".to_string()],
             depends_on: Vec::new(),
         }),
     );
-    actions.apply(&task).expect("task");
+    let task_ref = actions.apply(&task).expect("task").changed_refs[0].clone();
+    let projection = actions.project("program-dispatch").expect("projection");
+    let member = projection.agents.values().next().expect("member");
+    let task = projection.tasks.get(&task_ref).expect("task");
+    let translated = super::admission::required_capabilities(member, task);
 
-    let error = services
-        .dispatch_agentic_followups(
-            &task,
-            AgenticDispatchContext {
-                session_id: "session-dispatch".to_string(),
-                turn_id: "turn-dispatch".to_string(),
-                model_lease: "test".to_string(),
-                permission_ceiling: PermissionMode::ReadOnly,
-                resource_scopes: Vec::new(),
-            },
-        )
-        .await
-        .expect_err("no immutable Agent Definition grants the requested capability");
-    assert!(error.contains("no Agent Definition satisfies"), "{error}");
+    assert_eq!(translated, ["network", "read", "search", "test", "write"]);
+    assert!(!translated.contains(&"custom_domain_operation".to_string()));
+    let selected = super::admission::select_catalog_entry(
+        &services.agent_runtime().catalog().all(),
+        member,
+        task,
+        &translated,
+    )
+    .expect("a general autonomous definition composes the standard physical effects");
+    assert_eq!(selected.name, "Autonomous");
 }
 
 #[test]

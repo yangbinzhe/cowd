@@ -80,14 +80,21 @@ pub(super) fn required_capabilities(
     task: &AgenticTaskProjection,
 ) -> Vec<String> {
     let mut required = BTreeSet::from(["read".to_string()]);
-    for capability in member
+    let hints = member
         .required_capabilities
         .iter()
         .chain(task.required_capabilities.iter())
-    {
-        let normalized = normalize_capability(capability);
-        if !normalized.is_empty() {
-            required.insert(normalized);
+        .map(|capability| normalize_capability(capability))
+        .filter(|capability| !capability.is_empty())
+        .collect::<Vec<_>>();
+    for hint in &hints {
+        if capability_from_name(hint).is_some() {
+            required.insert(hint.clone());
+        }
+        for term in capability_terms(hint) {
+            for capability in physical_capabilities_for_term(term) {
+                required.insert((*capability).to_string());
+            }
         }
     }
     required.into_iter().collect()
@@ -95,6 +102,34 @@ pub(super) fn required_capabilities(
 
 pub(super) fn normalize_capability(capability: &str) -> String {
     capability.trim().replace('-', "_").to_ascii_lowercase()
+}
+
+fn capability_terms(capability: &str) -> impl Iterator<Item = &str> {
+    capability
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|term| !term.is_empty())
+}
+
+/// Translate model-authored expertise labels into Runtime-owned execution
+/// effects. These aliases describe generic effects, not business domains.
+/// Unknown labels remain semantic ranking context and intentionally grant no
+/// extra tool authority.
+fn physical_capabilities_for_term(term: &str) -> &'static [&'static str] {
+    match term {
+        "read" | "reader" | "inspect" | "inspection" => &["read"],
+        "search" | "research" | "explore" | "lookup" | "retrieval" | "source" | "sources"
+        | "citation" | "citations" | "evidence" | "gathering" => &["search"],
+        "web" | "online" | "external" | "internet" | "network" | "url" | "urls" => &["network"],
+        "write" | "writer" | "writeup" | "edit" | "author" | "implementation" | "implement"
+        | "artifact" | "report" | "script" | "code" => &["write"],
+        "test" | "testing" | "verify" | "verification" | "validate" | "validation" | "check"
+        | "experiment" | "experimental" | "benchmark" | "counterexample" => &["test"],
+        // A Python capability request normally means the worker must author
+        // and execute code. The immutable Program permission/resource scopes
+        // still decide whether those effects are physically available.
+        "python" => &["write", "test"],
+        _ => &[],
+    }
 }
 
 pub(super) fn select_catalog_entry(
