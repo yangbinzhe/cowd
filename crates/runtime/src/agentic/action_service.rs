@@ -209,9 +209,12 @@ impl AgentActionService {
                 AgentAction::ObjectiveCompleteRequest(input) => &input.evidence_refs,
                 _ => &[],
             };
+            // Opaque artifact selectors can be verified locally. Stable
+            // logical tool:// evidence is resolved and authenticated against
+            // the Session journal by the async Gateway ingress before this
+            // synchronous Program transition is applied.
             if let Some(reference) = evidence_refs.iter().find(|reference| {
-                evidence_artifact_selector(reference)
-                    .is_some_and(|selector| artifacts.resolve(&selector).is_err())
+                reference.starts_with("artifact://") && artifacts.resolve(reference).is_err()
             }) {
                 return Ok(rejected(
                     envelope,
@@ -808,17 +811,6 @@ fn is_durable_evidence_ref(reference: &str) -> bool {
         .iter()
         .any(|prefix| reference.starts_with(prefix) && reference.len() > prefix.len())
         && !reference.chars().any(char::is_whitespace)
-}
-
-fn evidence_artifact_selector(reference: &str) -> Option<String> {
-    reference
-        .strip_prefix("tool://")
-        .map(|id| format!("artifact://{id}"))
-        .or_else(|| {
-            reference
-                .starts_with("artifact://")
-                .then(|| reference.to_string())
-        })
 }
 
 fn actor_agent_id(envelope: &AgentActionEnvelope) -> Option<&str> {

@@ -1,4 +1,61 @@
 impl GatewayToolExecutor {
+    async fn validate_agent_action_evidence(
+        &self,
+        services: &runtime::RuntimeServices,
+        actor: &harness_contract::agent_action::AgentActorBinding,
+        action: &harness_contract::agent_action::AgentAction,
+    ) -> Result<(), ToolError> {
+        use harness_contract::agent_action::AgentAction;
+
+        let evidence_refs: &[String] = match action {
+            AgentAction::TaskSubmit(input) => &input.evidence_refs,
+            AgentAction::TaskReview(input) => &input.evidence_refs,
+            AgentAction::TaskSupersede(input) => &input.evidence_refs,
+            AgentAction::ObjectiveCompleteRequest(input) => &input.evidence_refs,
+            _ => &[],
+        };
+        for evidence_ref in evidence_refs {
+            let Some(evidence_id) = evidence_ref.strip_prefix("tool://") else {
+                continue;
+            };
+            let access = services
+                .session_evidence_access(&actor.session_id, evidence_id)
+                .await
+                .map_err(|error| {
+                    ToolError::new(format!(
+                        "{} could not resolve evidence `{evidence_ref}` through the authenticated Session journal: {error}",
+                        action.kind()
+                    ))
+                })?
+                .ok_or_else(|| {
+                    ToolError::new(format!(
+                        "{} evidence `{evidence_ref}` has no canonical durable receipt in Session `{}`; use a tool:// reference returned by a completed tool call in this Session",
+                        action.kind(), actor.session_id
+                    ))
+                })?;
+            let artifact = services
+                .artifact_store()
+                .resolve(&access.retrieval_selector)
+                .map_err(|error| {
+                    ToolError::new(format!(
+                        "{} evidence `{evidence_ref}` points to missing durable content: {error}",
+                        action.kind()
+                    ))
+                })?;
+            if artifact.sha256 != access.sha256
+                || artifact.bytes != access.bytes
+                || artifact.media_type != access.media_type
+                || artifact.visibility_scope != access.visibility_scope
+            {
+                return Err(ToolError::new(format!(
+                    "{} evidence `{evidence_ref}` failed durable receipt integrity validation",
+                    action.kind()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn input_contract_error(&self, tool_name: &str, error: impl std::fmt::Display) -> ToolError {
         let lease = self.tool_host.pin_snapshot();
         let definition = lease
@@ -313,6 +370,8 @@ impl GatewayToolExecutor {
                 expected_revision,
                 action,
             };
+            self.validate_agent_action_evidence(&services, &envelope.actor, &envelope.action)
+                .await?;
             let mut observation = services
                 .agent_action_service()
                 .apply(&envelope)

@@ -5,7 +5,7 @@ use harness_contract::agent_action::{
 
 use crate::agentic::program::{AgenticProgramProjection, AgenticTaskStatus};
 
-use super::{actor_agent_id, evidence_artifact_selector, is_durable_evidence_ref};
+use super::{actor_agent_id, is_durable_evidence_ref};
 
 pub(super) fn validate_transition(
     projection: &AgenticProgramProjection,
@@ -385,22 +385,12 @@ fn validate_task_submission(
     {
         return Some(("unsupported_evidence_ref", reference.clone()));
     }
-    let cites_submitted_artifact = input.evidence_refs.iter().any(|reference| {
-        evidence_artifact_selector(reference).is_some_and(|selector| {
-            input.artifact_refs.iter().any(|artifact_ref| {
-                projection
-                    .artifacts
-                    .get(artifact_ref)
-                    .is_some_and(|artifact| artifact.content_ref == selector)
-            })
-        })
-    });
-    if !cites_submitted_artifact {
-        return Some((
-            "submission_evidence_not_bound_to_artifact",
-            input.task_ref.clone(),
-        ));
-    }
+    // The submitted collaboration artifact is already authenticated above by
+    // claimant, Task and durable content.  `evidence_refs` are supporting
+    // observations (tool receipts, sources, test runs), not a second encoding
+    // of the artifact-content selector.  Requiring the model to copy that
+    // internal selector into both fields leaks storage topology and turns an
+    // otherwise valid submission into a brittle join operation.
     None
 }
 
@@ -446,21 +436,10 @@ fn validate_task_review(
     {
         return Some(("unsupported_evidence_ref", reference.clone()));
     }
-    let cites_submitted_artifact = input.evidence_refs.iter().any(|reference| {
-        evidence_artifact_selector(reference).is_some_and(|selector| {
-            task.artifact_refs.iter().any(|artifact_ref| {
-                projection
-                    .artifacts
-                    .get(artifact_ref)
-                    .is_some_and(|artifact| artifact.content_ref == selector)
-            })
-        })
-    });
-    if !cites_submitted_artifact {
-        return Some((
-            "review_did_not_inspect_submitted_artifact",
-            input.task_ref.clone(),
-        ));
-    }
+    // Review authority is bound to a different roster Agent and the submitted
+    // artifact set is part of the Task projection.  Supporting evidence is
+    // validated at the trusted Gateway boundary; forcing the reviewer to echo
+    // a storage selector does not prove inspection and only couples the model
+    // contract to ArtifactStore internals.
     None
 }

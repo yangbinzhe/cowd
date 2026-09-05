@@ -122,8 +122,31 @@
             .expect("raw evidence receipt");
         let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
         executor
-            .bind_runtime_services(services)
+            .bind_runtime_services(Arc::clone(&services))
             .expect("bind Runtime services");
+
+        let actor = root_agent_action_actor(RuntimeToolExecutionBinding {
+            action_id: None,
+            session_id: Some(session_id),
+            authorized_scopes: &[],
+            memory_context: None,
+            model_lease: Some("deepseek-v4-flash"),
+            parent_execution: None,
+            execution_decision: None,
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        });
+        let action = harness_contract::agent_action::AgentAction::TaskSubmit(
+            harness_contract::agent_action::TaskSubmitInput {
+                task_ref: "task:any".to_string(),
+                artifact_refs: vec!["artifact:any".to_string()],
+                evidence_refs: vec![format!("tool://{evidence_id}")],
+                unresolved: Vec::new(),
+            },
+        );
+        executor
+            .validate_agent_action_evidence(&services, &actor, &action)
+            .await
+            .expect("logical evidence is authenticated before Program mutation");
 
         let output = executor
             .execute_evidence_retrieve(
@@ -387,6 +410,26 @@
         assert_eq!(
             rejected.error.expect("error").code,
             "artifact_content_not_durable"
+        );
+
+        let actor = root_agent_action_actor(binding);
+        let fake_evidence = harness_contract::agent_action::AgentAction::TaskSubmit(
+            harness_contract::agent_action::TaskSubmitInput {
+                task_ref: "task:any".to_string(),
+                artifact_refs: vec!["artifact:any".to_string()],
+                evidence_refs: vec!["tool://invented-receipt".to_string()],
+                unresolved: Vec::new(),
+            },
+        );
+        let error = executor
+            .validate_agent_action_evidence(&services, &actor, &fake_evidence)
+            .await
+            .expect_err("invented logical evidence must fail at trusted ingress");
+        assert!(
+            error
+                .to_string()
+                .contains("has no canonical durable receipt"),
+            "{error}"
         );
     }
 

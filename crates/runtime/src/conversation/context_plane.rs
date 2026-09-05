@@ -847,6 +847,18 @@ where
             .chars()
             .take(600)
             .collect::<String>();
+        // A reconstructed message does not carry ArtifactStore internals.
+        // Reuse only the canonical durable reference that the Runtime itself
+        // placed in the model receipt; never synthesize a plausible-looking
+        // URI from the provider call id. Such aliases cannot be authenticated
+        // after a checkpoint and previously caused submit/review retry loops.
+        let evidence_ids = output
+            .split_once("Evidence: tool://")
+            .and_then(|(_, suffix)| suffix.split_whitespace().next())
+            .map(|id| id.trim_end_matches(['.', ',', ';']).to_string())
+            .filter(|id| !id.is_empty())
+            .into_iter()
+            .collect();
         let packet = ToolTracePacket {
             tool_name: tool_name.clone(),
             invocation_id: tool_use_id.clone(),
@@ -857,7 +869,7 @@ where
             },
             summary,
             changed_files: Vec::new(),
-            evidence_ids: vec![tool_use_id.clone()],
+            evidence_ids,
             token_estimate: (output.len() as u64).div_ceil(4).min(256).max(1),
         };
         let mut item = ContextRuntimeKernel::tool_trace_item(&packet);

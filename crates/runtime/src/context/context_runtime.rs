@@ -328,6 +328,8 @@ pub struct ToolTracePacket {
     pub status: ToolTraceStatus,
     pub summary: String,
     pub changed_files: Vec<String>,
+    /// Canonical persisted evidence identities (normally `tool-raw-*`), never
+    /// provider invocation ids or presentation-layer URI fragments.
     pub evidence_ids: Vec<String>,
     pub token_estimate: u64,
 }
@@ -1949,7 +1951,10 @@ impl ContextRuntimeKernel {
         item.evidence = packet
             .evidence_ids
             .iter()
-            .map(|id| format!("tool://{}/evidence/{id}", packet.invocation_id))
+            .map(|id| {
+                id.strip_prefix("tool://")
+                    .map_or_else(|| format!("tool://{id}"), |_| id.clone())
+            })
             .collect();
         item.evidence.extend(
             packet
@@ -3294,9 +3299,7 @@ mod tests {
         assert_eq!(trace_item.source, ContextSourceKind::ToolTrace);
         assert_eq!(trace_item.token_estimate, 12);
         assert!(trace_item.content.contains("parser"));
-        assert!(trace_item
-            .evidence
-            .contains(&"tool://tool-1/evidence/event-9".to_string()));
+        assert!(trace_item.evidence.contains(&"tool://event-9".to_string()));
         assert!(trace_item
             .evidence
             .contains(&"workspace://changed-file/src/parser.rs".to_string()));

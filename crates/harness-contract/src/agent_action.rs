@@ -154,8 +154,13 @@ pub struct TaskAttemptFailInput {
 #[serde(deny_unknown_fields)]
 pub struct TaskSubmitInput {
     pub task_ref: String,
+    /// Collaboration artifact references returned as `changed_refs` by
+    /// `artifact_commit`. Runtime binds their durable content automatically;
+    /// do not duplicate storage selectors in `evidence_refs`.
     #[serde(default)]
     pub artifact_refs: Vec<String>,
+    /// Supporting durable observations such as source, command, test, or file
+    /// tool receipts. The committed artifact content is attached by Runtime.
     #[serde(default)]
     pub evidence_refs: Vec<String>,
     #[serde(default)]
@@ -176,6 +181,9 @@ pub struct TaskReviewInput {
     pub task_ref: String,
     pub decision: TaskReviewDecision,
     pub reason: String,
+    /// Durable observations used for the independent verdict, normally the
+    /// receipt returned after retrieving/inspecting the submitted artifact.
+    /// Runtime already knows which artifacts belong to the Task.
     #[serde(default)]
     pub evidence_refs: Vec<String>,
 }

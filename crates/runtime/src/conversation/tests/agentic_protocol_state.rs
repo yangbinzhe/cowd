@@ -325,6 +325,48 @@ fn register_protocol_graph(
     }
 }
 
+#[tokio::test]
+async fn delegated_content_uses_parent_agent_task_session_visibility() {
+    let fixture = protocol_fixture();
+    let ticket = register_protocol_graph(
+        &fixture,
+        "execute",
+        &fixture.author_ref,
+        "agent-content-parent",
+        "agent-content-conversation",
+        1,
+    );
+    let message = ConversationMessage::assistant(vec![ContentBlock::Text {
+        text: "shared reviewable Agent result".to_string(),
+    }]);
+
+    let selector = persist_agentic_content_draft(fixture.services.as_ref(), &ticket, &message)
+        .await
+        .expect("persist delegated content")
+        .expect("content selector");
+    let artifact = fixture
+        .services
+        .artifact_store()
+        .resolve(&selector)
+        .expect("resolve delegated content");
+
+    assert_eq!(
+        artifact.visibility_scope,
+        format!("session:{}", fixture.root.session_id),
+        "a submitted Agent artifact must be readable by a different reviewer execution in the same Session"
+    );
+    fixture
+        .services
+        .artifact_store()
+        .read(
+            &artifact,
+            &format!("session:{}", fixture.root.session_id),
+            None,
+        )
+        .await
+        .expect("same-Session reviewer can read committed content");
+}
+
 async fn commit_protocol_artifact(
     fixture: &AgenticProtocolFixture,
     action_id: &str,

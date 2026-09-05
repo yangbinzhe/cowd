@@ -238,10 +238,19 @@ pub(crate) fn apply_task_submit(
     projection: &mut AgenticProgramProjection,
     input: &TaskSubmitInput,
 ) {
+    let mut evidence_refs = input.evidence_refs.clone();
+    evidence_refs.extend(input.artifact_refs.iter().filter_map(|artifact_ref| {
+        projection
+            .artifacts
+            .get(artifact_ref)
+            .map(|artifact| artifact.content_ref.clone())
+    }));
+    evidence_refs.sort();
+    evidence_refs.dedup();
     if let Some(task) = projection.tasks.get_mut(&input.task_ref) {
         task.status = AgenticTaskStatus::Submitted;
         task.artifact_refs.clone_from(&input.artifact_refs);
-        task.evidence_refs.clone_from(&input.evidence_refs);
+        task.evidence_refs = evidence_refs;
         task.unresolved.clone_from(&input.unresolved);
     }
 }

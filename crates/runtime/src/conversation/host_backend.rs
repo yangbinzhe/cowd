@@ -2563,7 +2563,7 @@ impl DelegatedAgenticProtocolState {
                 self.program_id
             ),
             _ if self.artifact_refs.is_empty() => format!(
-                "Runtime collaboration protocol: execute Task `{}` is still {:?}. Your substantive content is retained. Commit it with `artifact_commit` related to this exact Task, then call `task_submit` with the returned artifact/evidence refs. Do not return prose before durable submission succeeds. Program `{}`.",
+                "Runtime collaboration protocol: execute Task `{}` is still {:?}. Your substantive content is retained. Commit it with `artifact_commit` related to this exact Task, then call `task_submit` with its returned `artifact:...` changed_ref plus real durable source/test/tool evidence refs. Runtime binds artifact content automatically; do not duplicate the internal artifact:// selector as evidence. Do not return prose before durable submission succeeds. Program `{}`.",
                 self.task_id, self.status, self.program_id
             ),
             _ => format!(
@@ -2711,40 +2711,50 @@ fn agentic_content_draft_scope(
         attempt: ticket.attempt,
         actor_id: format!("root:{}", ticket.graph_id),
     };
-    let Ok(graph) = services.graph_state_store().load(&ticket.graph_id) else {
+    let Some(packet) = delegated_agent_task_packet(services, ticket) else {
         return root_scope();
     };
-    let Some(parent) = graph.parent_execution.as_ref() else {
-        return root_scope();
-    };
-    let Ok(parent_graph) = services.graph_state_store().load(&parent.execution_id) else {
-        return root_scope();
-    };
-    let Some(node) = parent_graph
-        .nodes
-        .iter()
-        .find(|node| node.id == parent.node_id && node.kind == ExecutionNodeKind::AgentTask)
-    else {
-        return root_scope();
-    };
-    let Ok(packet) =
-        serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&node.payload_ref)
-    else {
-        return root_scope();
-    };
-    if !packet
-        .context_refs
-        .iter()
-        .any(|reference| reference.starts_with("agentic_program:"))
-    {
-        return root_scope();
-    }
     AgenticContentDraftScope {
         execution_id: packet.assignment.graph_id.clone(),
         node_id: packet.assignment.node_id.clone(),
         attempt: packet.attempt,
         actor_id: format!("{}:{}", packet.agent_id(), packet.run_id()),
     }
+}
+
+/// Resolve the immutable AgentTask packet behind a delegated Conversation
+/// graph. Dynamic model-step graphs point at the Agent node in their parent
+/// graph, so inspecting only the current graph loses both Session visibility
+/// and the stable Agent attempt identity.
+fn delegated_agent_task_packet(
+    services: &crate::RuntimeServices,
+    ticket: &NodeExecutionTicket,
+) -> Option<harness_contract::agent::AgentTaskPacket> {
+    let graph = services.graph_state_store().load(&ticket.graph_id).ok()?;
+    let payload_ref = graph
+        .nodes
+        .iter()
+        .find(|node| node.kind == ExecutionNodeKind::AgentTask)
+        .map(|node| node.payload_ref.clone())
+        .or_else(|| {
+            let parent = graph.parent_execution.as_ref()?;
+            let parent_graph = services
+                .graph_state_store()
+                .load(&parent.execution_id)
+                .ok()?;
+            parent_graph
+                .nodes
+                .into_iter()
+                .find(|node| node.id == parent.node_id && node.kind == ExecutionNodeKind::AgentTask)
+                .map(|node| node.payload_ref)
+        })?;
+    let packet =
+        serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(&payload_ref).ok()?;
+    packet
+        .context_refs
+        .iter()
+        .any(|reference| reference.starts_with("agentic_program:"))
+        .then_some(packet)
 }
 
 fn agentic_message_text(message: &ConversationMessage) -> Option<String> {
@@ -3019,26 +3029,8 @@ fn message_artifact_visibility(
     _message: &ConversationMessage,
     ticket: &NodeExecutionTicket,
 ) -> String {
-    if let Ok(graph) = services.graph_state_store().load(&ticket.graph_id) {
-        if let Some(session_id) = graph.nodes.iter().find_map(|node| {
-            (node.kind == ExecutionNodeKind::AgentTask)
-                .then(|| {
-                    serde_json::from_str::<harness_contract::agent::AgentTaskPacket>(
-                        &node.payload_ref,
-                    )
-                    .ok()
-                })
-                .flatten()
-                .filter(|packet| {
-                    packet
-                        .context_refs
-                        .iter()
-                        .any(|reference| reference.starts_with("agentic_program:"))
-                })
-                .map(|packet| packet.session_id().to_string())
-        }) {
-            return format!("session:{session_id}");
-        }
+    if let Some(packet) = delegated_agent_task_packet(services, ticket) {
+        return format!("session:{}", packet.session_id());
     }
     format!("execution:{}", ticket.graph_id)
 }

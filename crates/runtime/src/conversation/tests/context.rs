@@ -2315,7 +2315,7 @@
         let tool_result = ConversationMessage::tool_result(
             "tool-1".to_string(),
             "bash".to_string(),
-            "cargo test passed for context runtime".to_string(),
+            "Tool `bash` completed. Evidence: tool://tool-raw-tool-1-deadbeef. cargo test passed for context runtime".to_string(),
             false,
         );
         rt.remember_tool_trace_from_message(&tool_result);
@@ -2333,6 +2333,9 @@
             .selected
             .iter()
             .any(|item| item.source == ContextSourceKind::ToolTrace));
+        assert!(envelope.selected.iter().any(|item| item
+            .evidence
+            .contains(&"tool://tool-raw-tool-1-deadbeef".to_string())));
     }
 
     #[tokio::test(flavor = "multi_thread")]

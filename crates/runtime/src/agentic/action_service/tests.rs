@@ -320,11 +320,20 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
             AgentAction::TaskSubmit(TaskSubmitInput {
                 task_ref: task_id.clone(),
                 artifact_refs: vec![artifact_ref.clone()],
-                evidence_refs: vec!["artifact://abc".to_string()],
+                evidence_refs: vec!["tool://source-observation".to_string()],
                 unresolved: Vec::new(),
             }),
         ))
         .expect("submit");
+    let submitted = service.project("program-1").expect("submitted projection");
+    assert_eq!(
+        submitted.tasks[&task_id].evidence_refs,
+        vec![
+            "artifact://abc".to_string(),
+            "tool://source-observation".to_string(),
+        ],
+        "Runtime attaches committed artifact content without making the model duplicate it"
+    );
     service
         .apply(&managed(
             "review-task",
@@ -334,7 +343,7 @@ fn complete_vertical_chain_is_durable_and_idempotent() {
                 task_ref: task_id.clone(),
                 decision: TaskReviewDecision::Accept,
                 reason: "verified".to_string(),
-                evidence_refs: vec!["artifact://abc".to_string()],
+                evidence_refs: vec!["tool://independent-inspection".to_string()],
             }),
         ))
         .expect("review");
