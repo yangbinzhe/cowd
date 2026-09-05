@@ -73,7 +73,7 @@ impl EvolutionAnalysisInputPacket {
              Produce exactly one JSON object and no Markdown. Every factual-looking statement must remain a hypothesis.\n\
              Use only evidence_ref values present in the packet. Include 2-5 competing hypotheses, supporting and contradicting evidence, one falsification experiment, acceptance scenarios, expected value, risks, and unknowns.\n\
              Never propose automatic publication, release, deployment, code mutation, credential access, or arbitrary file access.\n\n\
-             Candidate kinds: agent_definition, team_template, strategy, skill, tool, connector, runtime, surface, code_patch, architecture_plan, test_scenario, contract.\n\n\
+             Candidate kinds: agent_definition, strategy, skill, tool, connector, runtime, surface, code_patch, architecture_plan, test_scenario, contract.\n\n\
              Required JSON shape:\n\
              {{\"hypotheses\":[{{\"hypothesis_id\":\"h1\",\"statement\":\"...\",\"supporting_evidence_refs\":[\"...\"],\"contradicting_evidence_refs\":[\"...\"],\"uncertainty\":\"...\"}}],\
              \"falsification_experiment\":{{\"target_hypothesis_id\":\"h1\",\"objective\":\"...\",\"method\":[\"...\"],\"pass_criterion\":\"...\",\"falsification_criterion\":\"...\",\"required_evidence_refs\":[\"...\"]}},\

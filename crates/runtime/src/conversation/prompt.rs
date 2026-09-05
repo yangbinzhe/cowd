@@ -986,11 +986,10 @@ mod tests {
     fn prompt_includes_runtime_capability_primer() {
         let rendered = SystemPromptBuilder::new().render();
 
-        assert!(rendered.contains("Runtime capability awareness"));
-        assert!(rendered.contains("tool_batch_readonly"));
-        assert!(rendered.contains("subagent, team"));
-        assert!(rendered.contains("runtime-owned"));
-        assert!(rendered.contains("runtime_capabilities"));
+        assert!(rendered.contains("Agent-first collaboration contract"));
+        assert!(rendered.contains("small Agent actions incrementally"));
+        assert!(rendered.contains("Runtime owns actor identity"));
+        assert!(rendered.contains("independent Tasks"));
     }
 
     #[test]
@@ -1010,9 +1009,9 @@ mod tests {
             .with_runtime_config(config)
             .render();
 
-        assert!(rendered.contains("Collaboration invariants:"));
-        assert!(rendered.contains("submit_collaboration_decision"));
-        assert!(rendered.contains("Exact-file evidence"));
+        assert!(rendered.contains("Agent-first collaboration contract"));
+        assert!(rendered.contains("small Agent actions incrementally"));
+        assert!(rendered.contains("independent Tasks"));
         assert!(!rendered
             .contains("Each declared result artifact is a required terminal structured field"));
         assert!(
@@ -1029,7 +1028,7 @@ mod tests {
             .render();
 
         assert!(rendered.contains("Active model: gateway-small"));
-        assert!(rendered.contains("Collaboration invariants:"));
+        assert!(rendered.contains("Agent-first collaboration contract"));
         assert!(!rendered
             .contains("Each declared result artifact is a required terminal structured field"));
     }
@@ -1051,8 +1050,8 @@ mod tests {
             .with_runtime_config(config)
             .render();
 
-        assert!(rendered
-            .contains("Each declared result artifact is a required terminal structured field"));
+        assert!(rendered.contains("Agent-first collaboration contract"));
+        assert!(rendered.contains("A Task is complete only after a real claimant"));
         fs::remove_dir_all(root).expect("cleanup large model config");
     }
 

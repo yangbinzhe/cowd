@@ -1252,17 +1252,16 @@ where
         ));
         outcome.delivery_envelope = Some(envelope.clone());
         outcome.terminal_presentation = presentation.clone();
-        // Collaboration roots are finalized by the settled-graph Objective
-        // supervisor after Program/Team obligations and evidence are reduced.
-        // Committing a generic Satisfied Goal here would race that reducer and
-        // promote a local synthesis paragraph before the required Team facts
-        // exist. Direct turns retain the same terminal writer below.
-        let has_collaboration_program = projection
-            .orchestration
-            .as_ref()
-            .and_then(|metadata| metadata.collaboration_program.as_ref())
-            .is_some();
-        if !has_collaboration_program {
+        let terminal_owned = root_terminal_owned_elsewhere(
+            self.services.as_ref(),
+            execution_role.owns_root_presentation(),
+            &session_id,
+            &turn_id,
+            &ticket.graph_id,
+            &goal_id,
+            completion,
+        )?;
+        if !terminal_owned {
             outcome.domain_events.push(
                 self.services
                     .objective_supervisor()
@@ -1683,6 +1682,37 @@ where
     }
 }
 
+/// Resolve terminal ownership before emitting a Goal event. Agent-first
+/// supervision and a previously committed Objective verdict are both durable
+/// authorities; presentation must never race either one.
+fn root_terminal_owned_elsewhere(
+    services: &crate::RuntimeServices,
+    root_presentation: bool,
+    session_id: &str,
+    turn_id: &str,
+    graph_id: &str,
+    goal_id: &str,
+    completion: GoalCompletion,
+) -> Result<bool, String> {
+    let agentic_supervisor = root_presentation
+        && agentic_program_owns_root_terminal(services, session_id, turn_id, graph_id)?;
+    let existing = services
+        .goal_store()
+        .get(goal_id)
+        .map_err(|error| format!("load Objective terminal before presentation: {error}"))?
+        .filter(|goal| goal.completion != GoalCompletion::Open);
+    if let Some(goal) = existing {
+        if goal.completion != completion {
+            return Err(format!(
+                "presentation completion {:?} conflicts with authoritative Objective verdict {:?}",
+                completion, goal.completion
+            ));
+        }
+        return Ok(true);
+    }
+    Ok(agentic_supervisor)
+}
+
 pub(super) fn terminal_commit_owned_by(
     owner: Option<&(String, u32)>,
     node_id: &str,
@@ -2084,7 +2114,7 @@ pub(super) fn dynamic_node(
                 ExecutionNodeKind::Synthesize => {
                     harness_contract::execution_graph::ExecutionWorkRole::Synthesize
                 }
-                ExecutionNodeKind::AgentTask | ExecutionNodeKind::Subgraph => {
+                ExecutionNodeKind::AgentTask => {
                     harness_contract::execution_graph::ExecutionWorkRole::EvidenceAnalyze
                 }
                 ExecutionNodeKind::InlineModel => {
@@ -2298,44 +2328,11 @@ pub(super) fn normalize_terminal_answer_with_evidence(
 }
 
 pub(super) fn retained_orchestration_terminal_candidate(
-    messages: &[ConversationMessage],
-    workspace_root: &std::path::Path,
-    objective: &str,
+    _messages: &[ConversationMessage],
+    _workspace_root: &std::path::Path,
+    _objective: &str,
 ) -> Option<String> {
-    let mut candidates = messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_name,
-                output,
-                is_error: false,
-                ..
-            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
-                || tool_name.eq_ignore_ascii_case(
-                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-                ) =>
-            {
-                orchestration_receipt_json(output)
-            }
-            _ => None,
-        })
-        .filter_map(|receipt| verified_team_terminal_summary(&receipt))
-        .map(|summary| summary.trim().to_string())
-        .filter(|summary| !summary.is_empty() && !looks_like_unfinished_work_preamble(summary))
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.chars().count()));
-    candidates.into_iter().find_map(|candidate| {
-        let normalized = normalize_terminal_answer_with_evidence(
-            &candidate,
-            messages,
-            workspace_root,
-            objective,
-        );
-        final_answer_recovery_reason_for_objective(&normalized, workspace_root, objective)
-            .is_none()
-            .then_some(normalized)
-    })
+    None
 }
 
 pub(super) fn replace_latest_assistant_text(
@@ -2637,49 +2634,6 @@ pub(super) fn failed_tool_names(messages: &[ConversationMessage]) -> Vec<String>
     names.sort();
     names.dedup();
     names
-}
-
-/// Return the one bounded, model-repairable semantic admission diagnostic from
-/// a failed receipt. Gateway deliberately exposes this compact receipt instead
-/// of an executable graph, so this parser uses typed recovery hints rather
-/// than inferring state from provider prose.
-pub(super) fn retryable_collaboration_compile_diagnostic(
-    messages: &[ConversationMessage],
-) -> Option<String> {
-    messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .find_map(|block| {
-            let ContentBlock::ToolResult {
-                tool_name,
-                output,
-                is_error: true,
-                ..
-            } = block
-            else {
-                return None;
-            };
-            if !tool_name.eq_ignore_ascii_case(
-                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-            ) {
-                return None;
-            }
-            orchestration_receipt_json(output).and_then(|receipt| {
-                receipt
-                    .get("recovery_hints")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|hints| {
-                        hints.iter().find_map(|hint| {
-                            (hint.get("retryable").and_then(serde_json::Value::as_bool)
-                                == Some(true))
-                            .then(|| hint.get("code").and_then(serde_json::Value::as_str))
-                            .flatten()
-                            .filter(|code| code.starts_with("collaboration_compile_"))
-                            .map(str::to_string)
-                        })
-                    })
-            })
-        })
 }
 
 /// A governed action is identified by its tool name and canonical input, not
@@ -3447,7 +3401,7 @@ pub(super) fn evaluation_scope_rejection_outcome(
             state.required_write_for_completion,
             &state.required_workspace_write_scopes,
             &state.committed_workspace_observed_evidence,
-            state.committed_workspace_write_observed || state.collaboration_committed_write,
+            state.committed_workspace_write_observed,
             path_identity_resolver,
         ),
     ) {
@@ -3837,206 +3791,13 @@ pub(super) fn upstream_verification_completion_instruction(
     ))
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct ParsedRouteInput {
-    pub(super) batch: harness_contract::input_disposition::ModelInputDispositionBatch,
-    pub(super) constraints: harness_contract::orchestration::ModelRuntimeOrchestrationConstraints,
-    pub(super) remaining_calls: Vec<ModelToolCall>,
-    pub(super) route_call_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum RouteInputResolution {
-    NotRequired,
-    Valid(ParsedRouteInput),
-    Invalid(String),
-}
-
-pub(super) fn parse_route_input_intent(
-    intent: &ModelStepIntent,
-    slot_count: usize,
-) -> RouteInputResolution {
-    let ModelStepIntent::ToolCalls { calls } = intent else {
-        return RouteInputResolution::Invalid(
-            "pending running-Turn inputs require a route_input tool call before terminal output"
-                .to_string(),
-        );
-    };
-    let route_calls = calls
-        .iter()
-        .filter(|call| {
-            call.name
-                .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
-        })
-        .filter_map(|call| {
-            serde_json::from_str::<harness_contract::orchestration::ModelRuntimeOrchestrationInput>(
-                &call.input,
-            )
-            .ok()
-            .filter(|input| {
-                input.operation
-                    == harness_contract::orchestration::RuntimeOrchestrationOperation::RouteInput
-            })
-            .map(|input| (call, input))
-        })
-        .collect::<Vec<_>>();
-    if route_calls.len() != 1 {
-        return RouteInputResolution::Invalid(format!(
-            "expected exactly one runtime_orchestrate(route_input) call, received {}",
-            route_calls.len()
-        ));
-    }
-    let (route_call, mut input) = route_calls[0].clone();
-    if input.inspect_execution_id.is_some() || input.proposal.is_some() || input.control.is_some() {
-        return RouteInputResolution::Invalid(
-            "route_input must contain only semantic input_disposition decisions".to_string(),
-        );
-    }
-    let Some(batch) = input.input_disposition.take() else {
-        return RouteInputResolution::Invalid(
-            "route_input is missing input_disposition".to_string(),
-        );
-    };
-    if let Err(error) = batch.validate_slots(slot_count) {
-        return RouteInputResolution::Invalid(error);
-    }
-    let route_call_id = route_call.id.as_str();
-    let mut remaining_calls = calls
-        .iter()
-        .filter(|call| call.id != route_call_id)
-        .cloned()
-        .collect::<Vec<_>>();
-    for call in &mut remaining_calls {
-        call.depends_on
-            .retain(|dependency| dependency != route_call_id);
-    }
-    RouteInputResolution::Valid(ParsedRouteInput {
-        batch,
-        constraints: input.constraints,
-        remaining_calls,
-        route_call_id: route_call.id.clone(),
-    })
-}
-
-pub(super) fn remove_tool_call_from_latest_assistant(
-    assistant_messages: &mut [ConversationMessage],
-    pending_transcript: &mut BTreeMap<String, Vec<ConversationMessage>>,
-    node_id: &str,
-    tool_call_id: &str,
-) {
-    let remove = |message: &mut ConversationMessage| {
-        message.blocks.retain(
-            |block| !matches!(block, ContentBlock::ToolUse { id, .. } if id == tool_call_id),
-        );
-    };
-    if let Some(message) = assistant_messages.last_mut() {
-        remove(message);
-    }
-    if let Some(message) = pending_transcript
-        .get_mut(node_id)
-        .and_then(|messages| messages.last_mut())
-    {
-        remove(message);
-    }
-}
-
-/// Keep stateful runtime orchestration outside a workspace-tool batch.
-///
-/// A `runtime_orchestrate(propose:team)` call may synchronously drive a child
-/// graph whose agents read or write the workspace. If it shares one parent
-/// ToolBatch with a file mutation, the graph-level lease would be retained
-/// across the entire child execution. We compile two ordered durable batches:
-/// normal tools retain their exact scopes; runtime control is governed by its
-/// own contract and does not claim filesystem ownership. Cross-batch
-/// dependencies are represented by this order and removed from the inner
-/// batch scheduler.
+/// Keep one model tool frame intact. The governed tool planner owns dependency
+/// and effect scheduling; Agent Actions are short journal mutations and never
+/// synchronously retain a workspace lease while delegated work runs.
 pub(super) fn tool_batches_for_turn(
     calls: &[ModelToolCall],
 ) -> Result<Vec<Vec<ModelToolCall>>, String> {
-    // An escalation is guarded by a Runtime receipt, rather than a model
-    // assertion that it has already inspected source.  Providers commonly
-    // emit a first read/glob and the required escalation in the same frame;
-    // executing that frame as one parallel ToolBatch races the receipt guard
-    // and consumes the Agent's only requested escalation.  Persist the
-    // source batch first and make the escalation its own successor node.
-    //
-    // This is deliberately a scheduling constraint, not an inferred model
-    // dependency: the delegated tool itself retains the safe-checkpoint
-    // validation and still rejects an escalation when there is no actual
-    // prior evidence receipt.
-    let (managed_escalation, other): (Vec<_>, Vec<_>) = calls.iter().cloned().partition(|call| {
-        call.name
-            .eq_ignore_ascii_case("request_collaboration_escalation")
-    });
-    if !managed_escalation.is_empty() && !other.is_empty() {
-        let mut batches = tool_batches_for_turn(&other)?;
-        let escalation_ids = managed_escalation
-            .iter()
-            .map(|call| call.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let mut escalation = managed_escalation;
-        for call in &mut escalation {
-            // Dependencies on the completed evidence batch are represented by
-            // the durable graph edge between batches; retain only dependencies
-            // between same-batch escalation calls for the leaf scheduler.
-            call.depends_on
-                .retain(|dependency| escalation_ids.contains(dependency));
-        }
-        batches.push(escalation);
-        return Ok(batches);
-    }
-
-    let (runtime_control, regular): (Vec<_>, Vec<_>) = calls.iter().cloned().partition(|call| {
-        call.name
-            .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
-    });
-    if runtime_control.is_empty() || regular.is_empty() {
-        return Ok(vec![calls.to_vec()]);
-    }
-
-    let runtime_ids = runtime_control
-        .iter()
-        .map(|call| call.id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let regular_ids = regular
-        .iter()
-        .map(|call| call.id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let regular_after_runtime = regular.iter().any(|call| {
-        call.depends_on
-            .iter()
-            .any(|dependency| runtime_ids.contains(dependency.as_str()))
-    });
-    let runtime_after_regular = runtime_control.iter().any(|call| {
-        call.depends_on
-            .iter()
-            .any(|dependency| regular_ids.contains(dependency.as_str()))
-    });
-    if regular_after_runtime && runtime_after_regular {
-        return Err(
-            "runtime_orchestrate and workspace tools contain a cross-batch dependency cycle"
-                .to_string(),
-        );
-    }
-
-    let mut ordered = if regular_after_runtime {
-        vec![runtime_control, regular]
-    } else {
-        // No explicit cross-batch dependency, or runtime control depends on
-        // evidence from regular tools: release workspace leases first.
-        vec![regular, runtime_control]
-    };
-    for batch in &mut ordered {
-        let ids = batch
-            .iter()
-            .map(|call| call.id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        for call in batch {
-            call.depends_on
-                .retain(|dependency| ids.contains(dependency));
-        }
-    }
-    Ok(ordered)
+    Ok(vec![calls.to_vec()])
 }
 
 pub(super) fn dynamic_edges(from: &str, nodes: &[ExecutionNodeSpec]) -> Vec<ExecutionEdge> {

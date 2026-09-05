@@ -20,7 +20,6 @@ fn one_definition_compiles_eight_isolated_instances_with_a_shared_revision_diges
                 format!("session:research:{slot}"),
                 format!("task:research:{slot}"),
             );
-            request.role_slot_id = Some(format!("researcher:{slot}"));
             request.team_id = Some("team:parallel-research".to_string());
             request.granted_capabilities = vec![AgentCapability::Read, AgentCapability::Search];
             request.fact_boundaries = vec!["observed".to_string()];

@@ -6,14 +6,6 @@
 
 use super::*;
 
-pub(super) fn orchestration_tool_protocol_failed(
-    disposition: runtime::orchestration::RuntimeOrchestrationDisposition,
-    status: &str,
-) -> bool {
-    disposition == runtime::orchestration::RuntimeOrchestrationDisposition::PreAdmission
-        && matches!(status, "rejected" | "unavailable" | "blocked" | "failed")
-}
-
 pub(super) fn resource_capability_keywords(
     kind: &str,
     mime: Option<&str>,

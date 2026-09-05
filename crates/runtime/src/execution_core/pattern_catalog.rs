@@ -110,7 +110,7 @@ impl ExecutionPatternCatalog {
                         "cowd/parallel-research-synthesis",
                         "implementation_review_fix",
                     ],
-                    &["team_runtime", "agent_runtime", "evidence_ledger"],
+                    &["agentic_program", "agent_runtime", "evidence_ledger"],
                     RuntimeCompileTarget::EvidenceGraph,
                 ),
                 spec(

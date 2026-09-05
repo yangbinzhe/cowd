@@ -282,13 +282,7 @@ impl GovernedToolExecutor {
             .map(|index| dag.tasks[*index].tool_call_id.clone())
             .collect();
         GovernedToolExecutionReport {
-            outcomes: state
-                .outcomes
-                .into_iter()
-                .map(|outcome| {
-                    outcome.expect("validated DAG executor produces one outcome per task")
-                })
-                .collect(),
+            outcomes: state.outcomes.into_iter().flatten().collect(),
             completion_order: state.completion_order,
             terminal_task_ids,
             blocked_task_ids,

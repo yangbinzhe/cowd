@@ -40,12 +40,14 @@ struct LimitObservation {
 
 impl<'ast> Visit<'ast> for RustLimits<'_> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        self.check_function(
-            &node.sig.ident.to_string(),
-            node.span(),
-            node.sig.inputs.len(),
-            matches!(node.vis, syn::Visibility::Public(_)),
-        );
+        if !is_test_function(&node.attrs) {
+            self.check_function(
+                &node.sig.ident.to_string(),
+                node.span(),
+                node.sig.inputs.len(),
+                matches!(node.vis, syn::Visibility::Public(_)),
+            );
+        }
         syn::visit::visit_item_fn(self, node);
     }
 
@@ -83,6 +85,16 @@ impl<'ast> Visit<'ast> for RustLimits<'_> {
         }
         syn::visit::visit_item_struct(self, node);
     }
+}
+
+fn is_test_function(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "test")
+    })
 }
 
 impl RustLimits<'_> {
@@ -295,5 +307,23 @@ mod tests {
             &observation("function-lines:new", 251),
             &baseline
         ));
+    }
+
+    #[test]
+    fn structural_gate_does_not_treat_acceptance_scenarios_as_production_architecture() {
+        let ordinary: syn::ItemFn = syn::parse_quote!(
+            fn helper() {}
+        );
+        let unit: syn::ItemFn = syn::parse_quote!(
+            #[test]
+            fn unit() {}
+        );
+        let asynchronous: syn::ItemFn = syn::parse_quote!(
+            #[tokio::test]
+            async fn scenario() {}
+        );
+        assert!(!is_test_function(&ordinary.attrs));
+        assert!(is_test_function(&unit.attrs));
+        assert!(is_test_function(&asynchronous.attrs));
     }
 }

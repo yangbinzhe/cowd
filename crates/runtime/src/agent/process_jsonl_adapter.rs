@@ -404,8 +404,6 @@ mod tests {
             output_acceptance: Vec::new(),
             requires_managed_collaboration_escalation: false,
             acceptance: Vec::new(),
-            team_role_identity: None,
-            team_role: None,
             cohort_prompt_package: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),

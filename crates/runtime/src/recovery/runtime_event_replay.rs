@@ -127,11 +127,12 @@ pub fn candidate_from_action(action: &RuntimeRecoveryAction) -> Option<RuntimeRe
             "runtime.execution_graph"
         }
         RuntimeEventScope::ExecutionLive => "runtime.execution_live",
+        RuntimeEventScope::Program => "runtime.agentic_program",
         RuntimeEventScope::Goal => "runtime.goal_runtime",
         RuntimeEventScope::Session
         | RuntimeEventScope::SessionInput
         | RuntimeEventScope::SessionCommand => "runtime.session",
-        RuntimeEventScope::Team => "runtime.team_projection",
+        RuntimeEventScope::Team => "runtime.agentic_program",
         RuntimeEventScope::Agent => "runtime.agent_lifecycle",
         RuntimeEventScope::AgentDefinition => "runtime.agent_definition",
         RuntimeEventScope::TeamTemplate => "runtime.team_template",

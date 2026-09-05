@@ -9,6 +9,8 @@ where
     pub fn new(config: StandardRuntimeHostConfig<T>) -> Result<Self, String> {
         let services = Arc::clone(&config.runtime_services);
         let recovered_tool_receipt_count = config.recovered_tool_receipt_count;
+        let recovered_tool_receipts_require_text_only =
+            config.recovered_tool_receipts_require_text_only;
         let root_provider_owner = config.execution_role.owns_root_presentation();
         let execution_service_class = if config
             .reality_binding
@@ -86,7 +88,7 @@ where
                 .with_reality_binding(services.reality_recall_port().as_ref().clone(), binding);
         }
         runtime.set_active_model(active_model);
-        if recovered_tool_receipt_count > 0 {
+        if recovered_tool_receipt_count > 0 && recovered_tool_receipts_require_text_only {
             runtime.require_next_model_final_response();
         }
 
@@ -118,6 +120,7 @@ where
             execution_lineage: config.execution_lineage,
             execution_role: config.execution_role,
             recovered_tool_receipt_count,
+            recovered_tool_receipts_require_text_only,
         })
     }
 
@@ -381,6 +384,8 @@ where
         let execution_lineage = self.execution_lineage.clone();
         let execution_role = self.execution_role;
         let recovered_tool_receipt_count = self.recovered_tool_receipt_count;
+        let recovered_tool_receipts_require_text_only =
+            self.recovered_tool_receipts_require_text_only;
         let (runtime_sender, runtime_receiver) =
             tokio::sync::oneshot::channel::<crate::ConversationRuntime<ProviderRuntimeClient, T>>();
         let (completion_sender, completion_receiver) = tokio::sync::oneshot::channel();
@@ -471,6 +476,7 @@ where
                                     execution_lineage,
                                     execution_role,
                                     recovered_tool_receipt_count,
+                                    recovered_tool_receipts_require_text_only,
                                 )
                                 .await
                             }
@@ -491,6 +497,7 @@ where
                             execution_lineage,
                             execution_role,
                             recovered_tool_receipt_count,
+                            recovered_tool_receipts_require_text_only,
                         )
                         .await
                     }

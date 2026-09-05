@@ -596,7 +596,12 @@ fn coalesce_embedding_segments(
                 )));
             }
             if segments.len() == 1 {
-                return Ok(segments.pop().expect("one checked segment").1);
+                if let Some((_, vector)) = segments.pop() {
+                    return Ok(vector);
+                }
+                return Err(MemoryError::Store(format!(
+                    "embedding input {original_index} lost its only vector"
+                )));
             }
             let total_weight = segments.iter().map(|(weight, _)| *weight).sum::<usize>() as f32;
             let mut pooled = vec![0.0f32; dimension];

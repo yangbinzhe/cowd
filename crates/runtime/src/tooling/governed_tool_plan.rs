@@ -234,6 +234,8 @@ pub enum GovernedToolCompileError {
     },
     #[error("tool task `{task_id}` has invalid JSON input: {reason}")]
     InvalidInput { task_id: String, reason: String },
+    #[error("governed tool compiler invariant failed: {reason}")]
+    CompilationInvariant { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -539,7 +541,11 @@ impl ValidatedGovernedToolDag {
                     }
                 }
             }
-            return Err(first_rejection.expect("rejected task records a typed compile error"));
+            return Err(first_rejection.unwrap_or_else(|| {
+                GovernedToolCompileError::CompilationInvariant {
+                    reason: "rejected tool set has no typed rejection".to_string(),
+                }
+            }));
         }
 
         let mut predecessors = vec![Vec::<usize>::new(); requests.len()];
@@ -877,10 +883,16 @@ fn uses_inner_runtime_validator(tool_name: &str) -> bool {
         .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect::<String>();
-    matches!(
-        normalized.as_str(),
-        "runtimecapabilities" | "runtimeorchestrate"
-    )
+    normalized == "runtimecapabilities"
+        || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+            .iter()
+            .any(|action| {
+                action
+                    .chars()
+                    .filter(char::is_ascii_alphanumeric)
+                    .collect::<String>()
+                    == normalized
+            })
 }
 
 fn has_single_known_mutation_path(tasks: &[&GovernedToolPlanTask]) -> bool {
@@ -1493,8 +1505,11 @@ pub(crate) fn fixture_effect(tool_name: &str, input: &Value) -> ToolEffectDescri
     let normalized = tool_name.trim().replace('-', "_").to_ascii_lowercase();
     if matches!(
         normalized.as_str(),
-        "todo_write" | "todowrite" | "runtime_orchestrate" | "runtimeorchestrate"
-    ) {
+        "todo_write" | "todowrite" | "runtime_capabilities"
+    ) || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+        .iter()
+        .any(|action| *action == normalized)
+    {
         effect.effect_kind = ToolEffectKind::System;
         effect.idempotency = ToolIdempotency::IdempotentWithKey;
         effect.uses_network = false;
@@ -2522,7 +2537,7 @@ mod tests {
     fn runtime_entry_tools_defer_to_their_inner_validators() {
         let plan = GovernedToolPlan::from_requests(&[
             request("capabilities-1", "RuntimeCapabilities", Vec::new()),
-            request("orchestrate-1", "runtime_orchestrate", Vec::new()),
+            request("publish-1", "task_publish", Vec::new()),
         ]);
         let decision =
             execution_decision(RuntimeCompileTarget::InlineModel, TaskRisk::Low, &[], &[]);
@@ -2534,7 +2549,7 @@ mod tests {
     fn runtime_state_updates_do_not_claim_a_workspace_write_scope() {
         let plan = GovernedToolPlan::from_requests(&[
             request("todo-1", "todo_write", Vec::new()),
-            request("orchestrate-1", "runtime_orchestrate", Vec::new()),
+            request("publish-1", "task_publish", Vec::new()),
         ]);
 
         assert!(plan

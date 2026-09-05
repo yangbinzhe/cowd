@@ -39,14 +39,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             get(team_templates_handler),
         )
         .route(
-            surface::gateway_api::paths::API_TEAM_TEMPLATES_INSTANTIATE.template(),
-            post(team_template_instantiate_handler),
-        )
-        .route(
-            surface::gateway_api::paths::API_RUNTIME_TEAMS_BY_ID_WORKING_STATE.template(),
-            get(team_working_state_handler),
-        )
-        .route(
             surface::gateway_api::paths::API_AGENTS_EXECUTION_GRAPHS.template(),
             get(execution_graphs_handler),
         )
@@ -166,42 +158,6 @@ async fn team_templates_handler(
         "kind": "team_templates",
         "templates": templates,
         "source": "runtime.definition_catalog",
-    })))
-}
-
-/// Gateway accepts declarative template intent only. Runtime resolves the
-/// immutable template/Agent revisions and owns graph construction.
-async fn team_template_instantiate_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Json(request): Json<harness_contract::team::TeamInstantiationRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime = runtime_services(&state)?;
-    let projection = runtime
-        .team_runtime()
-        .instantiate(request)
-        .await
-        .map_err(|error| api_error(StatusCode::BAD_REQUEST, error))?;
-    Ok((
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "kind": "runtime.team.instantiated",
-            "team": projection,
-        })),
-    ))
-}
-
-async fn team_working_state_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
-    let runtime = runtime_services(&state)?;
-    let state = runtime
-        .team_runtime()
-        .working_state(&id)
-        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))?;
-    Ok(Json(serde_json::json!({
-        "kind": "runtime.team.working_state",
-        "working_state": state,
     })))
 }
 

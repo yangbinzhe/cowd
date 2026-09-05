@@ -2,18 +2,16 @@
 
 ## 运行时
 
-Provider 请求缓存与成本治理的下一版本实施权威：
-[`provider-cache-economics-v0.9.715.md`](provider-cache-economics-v0.9.715.md)。它以 Provider
-原始 usage、可审计的请求分段和安全共享 package 定义分层目标：高复用同域 cohort 的真实
-冷启动输入命中 `>=90%`，低复用任务优化绝对成本与并发而不靠填充伪造比例。此前
-[`provider-cache-economics-v0.9.715.md`](provider-cache-economics-v0.9.715.md)
-保留为历史设计和已交付功能的证据，不再作为未完成 SLO 的验收权威。
+当前 Agent-first 架构权威及执行证据位于工作区外的
+`plan/cowd-agent-first-model-framework-2026-09-04.md` 与
+`plan/cowd-agent-first-implementation-board-2026-09-04.md`。本目录内 v0.9.715 及更早的
+collaboration/cache 方案只保留为历史事故与演化证据，不再定义生产控制面或验收口径。
 
 ```text
 Surface（TUI / WebUI / Connector）
   -> Gateway（鉴权、API、SSE、审批投影、容量）
     -> Runtime（Session/Task/Mission/Execution）
-      -> 执行图（节点并行：model/team/agent/tool/approval/synthesize）
+      -> 执行图（节点并行：model/agent/tool/approval/verify/synthesize）
       -> Storage（PostgreSQL 默认；SQLite 仅冷启动回退）
 ```
 
@@ -34,11 +32,18 @@ apps.directories -> verify/admit -> catalog -> supervisor -> isolated Worker
 
 ## 编排与并行
 
-- 模型只提出语义拓扑；Runtime 负责租约、权限、编译、终态。
-- 会话内团队提案无条件获得 `session:` 证据租约；read-only 不再无租约可编译。
-- `blocked/rejected` 携带 `RecoveryHint`，编译自动重试 ≤2 次（补租约/回绑默认 mission）。
-- 并行 ceiling 自动抬升到提案宽度并记录 `parallel_ceiling_elevated_for_explicit_team`；真实并发仍受资源管理器上限约束。
-- 团队 Agent 的 `team_board`/`evidence_retrieve` 通过 RuntimeExecutionHost 委托执行，不落入 ToolHost 无适配器分支。
+- 模型拥有过程控制权：根 Agent、Team lead 与 worker 使用同一 Agent Action loop，自主组队、
+  邀请、发布/领取/提交/复核任务、讨论与请求完成；模板仅提供可修改的能力和模式提示。
+- Runtime 拥有环境控制权：唯一 `AgentActionService` 维护 Program/Roster/Work/Topic/Artifact/
+  Supervision 事实，ExecutionGraph 只负责物理执行、租约、权限、资源、恢复与幂等。
+- 独立 Task 直接进入共享 work market；Agent 通过 CAS 主动 claim，Scheduler 不替 Agent
+  预领取。只有真实依赖等待，无依赖工作按资源容量并发。
+- root barrier 由 Program 事件和子图终态驱动，不占 provider round 或执行 permit；崩溃重启
+  从 durable journal/checkpoint 恢复，不重建全图或重复 effect。
+- Gateway 仅做小型 typed Action 与 content-ref 适配；长正文先进入 ArtifactStore，Action 不承载
+  大 JSON。MFG 只消费 Runtime 的 snapshot/delta/resync，不建立第二份协同 registry。
+- 预算与 usage 只提供遥测和成本反馈，不截断、拒绝或降低已经准入的 Agent 工作；安全、权限、
+  资源容量和证据终态仍由内核硬约束。
 
 ## 审批
 

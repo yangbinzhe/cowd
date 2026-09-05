@@ -2583,34 +2583,6 @@ fn parse_optional_runtime_control_config(
         }
         if let Some(value) = optional_usize(
             capacity,
-            "max_program_teams",
-            "merged settings.runtime.control.capacity",
-        )? {
-            config.policy.capacity.max_program_teams = value;
-        }
-        if let Some(value) = optional_usize(
-            capacity,
-            "max_team_roles",
-            "merged settings.runtime.control.capacity",
-        )? {
-            config.policy.capacity.max_team_roles = value;
-        }
-        if let Some(value) = optional_usize(
-            capacity,
-            "max_role_instances_per_team",
-            "merged settings.runtime.control.capacity",
-        )? {
-            config.policy.capacity.max_role_instances_per_team = value;
-        }
-        if let Some(value) = optional_usize(
-            capacity,
-            "max_agent_nodes_per_team",
-            "merged settings.runtime.control.capacity",
-        )? {
-            config.policy.capacity.max_agent_nodes_per_team = value;
-        }
-        if let Some(value) = optional_usize(
-            capacity,
             "max_pending_instance",
             "merged settings.runtime.control.capacity",
         )? {
@@ -2636,20 +2608,6 @@ fn parse_optional_runtime_control_config(
             "merged settings.runtime.control.capacity",
         )? {
             config.policy.capacity.admission_aging_interval_ms = value;
-        }
-        if let Some(value) = optional_u64(
-            capacity,
-            "user_team_veto_window_ms",
-            "merged settings.runtime.control.capacity",
-        )? {
-            config.policy.capacity.user_team_veto_window_ms = value;
-        }
-        if let Some(value) = optional_usize(
-            capacity,
-            "max_semantic_revisions_per_turn",
-            "merged settings.runtime.control.capacity",
-        )? {
-            config.policy.capacity.max_semantic_revisions_per_turn = value;
         }
         config
             .policy

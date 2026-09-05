@@ -35,7 +35,7 @@ pub(crate) fn growth_projection_lane(
     growth: GrowthService,
     memory: MemoryService,
     matrix: MatrixService,
-) -> runtime::RuntimeProjectionLane {
+) -> Result<runtime::RuntimeProjectionLane, String> {
     let descriptor = runtime::RuntimeProjectionDescriptor::new(
         GROWTH_PROJECTOR_ID,
         runtime::RuntimeProjectionInterest::new([runtime::RuntimeProjectionEventInterest::new(
@@ -44,19 +44,22 @@ pub(crate) fn growth_projection_lane(
         )]),
         GROWTH_BATCH,
         Duration::from_secs(30),
-    )
-    .expect("Growth projection descriptor is static and valid")
+    )?
     .with_latency_class(runtime::RuntimeProjectionLatencyClass::Maintenance);
-    runtime::RuntimeProjectionLane::asynchronous(descriptor, move |batch_size| {
-        let config_home = config_home.clone();
-        let event_store = Arc::clone(&event_store);
-        let growth = growth.clone();
-        let memory = memory.clone();
-        let matrix = matrix.clone();
-        Box::pin(async move {
-            project_growth_page(config_home, event_store, growth, memory, matrix, batch_size).await
-        })
-    })
+    Ok(runtime::RuntimeProjectionLane::asynchronous(
+        descriptor,
+        move |batch_size| {
+            let config_home = config_home.clone();
+            let event_store = Arc::clone(&event_store);
+            let growth = growth.clone();
+            let memory = memory.clone();
+            let matrix = matrix.clone();
+            Box::pin(async move {
+                project_growth_page(config_home, event_store, growth, memory, matrix, batch_size)
+                    .await
+            })
+        },
+    ))
 }
 
 async fn project_growth_page(
@@ -473,7 +476,8 @@ mod tests {
                     growth.clone(),
                     memory.clone(),
                     matrix.clone(),
-                )],
+                )
+                .unwrap()],
             )
             .unwrap(),
         );
@@ -549,7 +553,8 @@ mod tests {
                     growth,
                     MemoryService::new(),
                     MatrixService::new(),
-                )],
+                )
+                .unwrap()],
             )
             .unwrap(),
         );

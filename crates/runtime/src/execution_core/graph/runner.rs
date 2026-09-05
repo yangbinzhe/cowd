@@ -3,14 +3,12 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
 
-use harness_contract::acceptance::{AcceptanceEvaluation, AcceptanceVerdict, TerminalFactKind};
-use harness_contract::context::{EvidenceAccessRef, EvidenceRef};
+use harness_contract::acceptance::{AcceptanceVerdict, TerminalFactKind};
 use harness_contract::execution_graph::{
-    validate_execution_graph, ExecutionFailure, ExecutionGraph, ExecutionGraphCommand,
-    ExecutionGraphValidationError, ExecutionNodeKind, ExecutionNodeResult, ExecutionNodeStatus,
+    validate_execution_graph, ExecutionGraph, ExecutionGraphCommand, ExecutionGraphValidationError,
+    ExecutionNodeResult, ExecutionNodeStatus,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{futures::OwnedNotified, oneshot, Mutex, Notify, OwnedMutexGuard};
 
@@ -343,16 +341,6 @@ impl ExecutionGraphRunner {
         &self.state_store
     }
 
-    pub(crate) fn load_delegated_agent_tool_receipts(
-        &self,
-        graph_id: &str,
-        node_id: &str,
-        attempt: u32,
-    ) -> Result<Vec<super::commit_service::DurableAgentToolReceipt>, ExecutionCommitError> {
-        self.commit_service
-            .load_delegated_agent_tool_receipts(graph_id, node_id, attempt)
-    }
-
     pub(crate) async fn recover_graph(
         &self,
         graph_id: &str,
@@ -607,105 +595,6 @@ impl ExecutionGraphRunner {
             .values()
             .all(|status| status.is_terminal())
             .then(|| report(&graph)))
-    }
-
-    /// Resolve the exact parent join from durable child terminal truth.
-    /// Duplicate observer/startup reconciliation passes are idempotent; a
-    /// concurrent parent cancellation wins because the command is revision
-    /// and WaitingExternal fenced.
-    pub(crate) async fn resolve_parent_for_settled_child(
-        &self,
-        child_graph_id: &str,
-    ) -> Result<Option<String>, ExecutionRunnerError> {
-        let child = self.state_store.load_async(child_graph_id).await?;
-        if child.nodes.is_empty()
-            || child
-                .node_statuses
-                .values()
-                .any(|status| !status.is_terminal())
-        {
-            return Ok(None);
-        }
-        let Some(parent) = child.parent_execution.clone() else {
-            return Ok(None);
-        };
-        for _ in 0..3 {
-            let current = self.state_store.load_async(&parent.execution_id).await?;
-            if current.node_statuses.get(&parent.node_id)
-                != Some(&ExecutionNodeStatus::WaitingExternal)
-            {
-                return Ok(None);
-            }
-            let parent_node = current
-                .nodes
-                .iter()
-                .find(|node| node.id == parent.node_id)
-                .ok_or_else(|| ExecutionRunnerError::Resource {
-                    node_id: parent.node_id.clone(),
-                    reason: "registered child parent node is absent".to_string(),
-                })?;
-            let request = serde_json::from_str::<harness_contract::team::TeamInstantiationRequest>(
-                &parent_node.payload_ref,
-            )
-            .map_err(|error| ExecutionRunnerError::Resource {
-                node_id: parent.node_id.clone(),
-                reason: format!("registered child parent payload is invalid: {error}"),
-            })?;
-            if parent_node.kind != harness_contract::execution_graph::ExecutionNodeKind::Subgraph
-                || format!("team-graph:{}", request.team_id) != child.id
-                || request.parent_execution.as_ref() != Some(&parent)
-            {
-                return Err(ExecutionRunnerError::Resource {
-                    node_id: parent.node_id.clone(),
-                    reason: "child execution does not match the durable parent join binding"
-                        .to_string(),
-                });
-            }
-            let parent_attempt = current
-                .recovery_cursor
-                .node_attempts
-                .get(&parent.node_id)
-                .copied()
-                .unwrap_or_default();
-            let command =
-                harness_contract::execution_graph::ExecutionGraphCommand::ResolveChildExecution {
-                    expected_revision: current.revision,
-                    receipt: Box::new(
-                        harness_contract::execution_graph::ChildExecutionTerminalReceipt {
-                            parent_execution_id: parent.execution_id.clone(),
-                            parent_node_id: parent.node_id.clone(),
-                            child_execution_id: child.id.clone(),
-                            child_revision: child.revision,
-                            parent_attempt,
-                            result: team_child_terminal_result(&child),
-                            correlation_id: child_resolution_correlation(
-                                &parent.execution_id,
-                                &parent.node_id,
-                                &child.id,
-                                parent_attempt,
-                                child.revision,
-                            ),
-                        },
-                    ),
-                };
-            match self.command(&parent.execution_id, command).await {
-                Ok(_) => return Ok(Some(parent.execution_id)),
-                Err(ExecutionRunnerError::Commit(
-                    super::commit_service::ExecutionCommitError::StaleRevision { .. },
-                )) => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        let latest = self.state_store.load_async(&parent.execution_id).await?;
-        if latest.node_statuses.get(&parent.node_id) == Some(&ExecutionNodeStatus::WaitingExternal)
-        {
-            return Err(ExecutionRunnerError::Resource {
-                node_id: parent.node_id,
-                reason: "child terminal join remained stale after bounded CAS retries; durable resolver checkpoint must retry"
-                    .to_string(),
-            });
-        }
-        Ok(None)
     }
 
     /// Prepares every currently schedulable node and commits the admitted wave
@@ -1091,77 +980,11 @@ impl ExecutionGraphRunner {
         result: Result<(String, NodeExecutionOutcome), ExecutionRunnerError>,
         durable_progress: Arc<Notify>,
     ) -> Result<(), ExecutionRunnerError> {
-        let (node_id, outcome) = match result {
-            Err(ExecutionRunnerError::CommandSuperseded { node_id }) => {
-                if let Some(active) = self
-                    .active
-                    .lock()
-                    .await
-                    .remove(&(graph_id.to_string(), node_id))
-                {
-                    let _ = active.executor.cancel(&active.ticket).await;
-                }
-                return Ok(());
-            }
-            Err(error @ ExecutionRunnerError::ResourceDeferred { .. }) => return Err(error),
-            Err(ExecutionRunnerError::DeadlineExceeded {
-                node_id,
-                deadline_at_ms,
-            }) => {
-                self.terminalize_deadline_node(graph_id, &node_id, deadline_at_ms)
-                    .await?;
-                self.converge_after_terminal_commit(graph_id).await?;
-                durable_progress.notify_one();
-                return Ok(());
-            }
-            Err(ExecutionRunnerError::Resource { node_id, reason }) => {
-                self.block_unstarted_resource_node(graph_id, &node_id, reason)
-                    .await?;
-                self.converge_after_terminal_commit(graph_id).await?;
-                durable_progress.notify_one();
-                return Ok(());
-            }
-            Ok(value) => value,
-            Err(ExecutionRunnerError::Executor(error)) => {
-                if matches!(error, NodeExecutorError::Start { .. }) {
-                    let node_id = executor_error_node_id(&error).to_string();
-                    self.isolate_node_failure(graph_id, &node_id, error.to_string())
-                        .await?;
-                    self.converge_after_terminal_commit(graph_id).await?;
-                    durable_progress.notify_one();
-                    return Ok(());
-                }
-                let node_id = executor_error_node_id(&error).to_string();
-                if let Some(waiter) = self.command_intent_waiter(graph_id) {
-                    waiter.await;
-                }
-                self.active
-                    .lock()
-                    .await
-                    .remove(&(graph_id.to_string(), node_id.clone()));
-                let result = failed_result(&error);
-                let terminal_status = result.status;
-                let _coordination = self.graph_coordination_without_command(graph_id).await;
-                let current = self.state_store.load_async(graph_id).await?;
-                if current.node_statuses.get(&node_id) == Some(&ExecutionNodeStatus::Running) {
-                    self.commit_service
-                        .transition_node_async(
-                            current,
-                            node_id,
-                            terminal_status,
-                            Some(result),
-                            Vec::new(),
-                        )
-                        .await?;
-                    drop(_coordination);
-                    self.converge_after_terminal_commit(graph_id).await?;
-                    durable_progress.notify_one();
-                }
-                // A Pause/Cancel command may have superseded the executor while
-                // it returned. The command's durable graph state remains truth.
-                return Ok(());
-            }
-            Err(error) => return Err(error),
+        let Some((node_id, outcome)) = self
+            .resolve_pump_result(graph_id, result, &durable_progress)
+            .await?
+        else {
+            return Ok(());
         };
         let deadline_terminal = outcome
             .result
@@ -1227,9 +1050,11 @@ impl ExecutionGraphRunner {
             && outcome.delivery_envelope.is_none()
             && outcome.terminal_presentation.is_none();
         if batchable {
-            let (executor, ticket, _, effect_receipt_required) = active_wave
-                .clone()
-                .expect("batchable active wave has an execution binding");
+            let Some((executor, ticket, _, effect_receipt_required)) = active_wave.clone() else {
+                return Err(ExecutionRunnerError::Driver(
+                    "batchable active wave has no execution binding".to_string(),
+                ));
+            };
             let disposition = self
                 .commit_terminal_wave(
                     graph_id,
@@ -1384,6 +1209,86 @@ impl ExecutionGraphRunner {
                 .remove(&(graph_id.to_string(), node_id));
         }
         Ok(())
+    }
+
+    async fn resolve_pump_result(
+        &self,
+        graph_id: &str,
+        result: Result<(String, NodeExecutionOutcome), ExecutionRunnerError>,
+        durable_progress: &Notify,
+    ) -> Result<Option<(String, NodeExecutionOutcome)>, ExecutionRunnerError> {
+        match result {
+            Err(ExecutionRunnerError::CommandSuperseded { node_id }) => {
+                if let Some(active) = self
+                    .active
+                    .lock()
+                    .await
+                    .remove(&(graph_id.to_string(), node_id))
+                {
+                    let _ = active.executor.cancel(&active.ticket).await;
+                }
+                Ok(None)
+            }
+            Err(error @ ExecutionRunnerError::ResourceDeferred { .. }) => Err(error),
+            Err(ExecutionRunnerError::DeadlineExceeded {
+                node_id,
+                deadline_at_ms,
+            }) => {
+                self.terminalize_deadline_node(graph_id, &node_id, deadline_at_ms)
+                    .await?;
+                self.converge_after_terminal_commit(graph_id).await?;
+                durable_progress.notify_one();
+                Ok(None)
+            }
+            Err(ExecutionRunnerError::Resource { node_id, reason }) => {
+                self.block_unstarted_resource_node(graph_id, &node_id, reason)
+                    .await?;
+                self.converge_after_terminal_commit(graph_id).await?;
+                durable_progress.notify_one();
+                Ok(None)
+            }
+            Ok(value) => Ok(Some(value)),
+            Err(ExecutionRunnerError::Executor(error)) => {
+                if matches!(error, NodeExecutorError::Start { .. }) {
+                    let node_id = executor_error_node_id(&error).to_string();
+                    self.isolate_node_failure(graph_id, &node_id, error.to_string())
+                        .await?;
+                    self.converge_after_terminal_commit(graph_id).await?;
+                    durable_progress.notify_one();
+                    return Ok(None);
+                }
+                let node_id = executor_error_node_id(&error).to_string();
+                if let Some(waiter) = self.command_intent_waiter(graph_id) {
+                    waiter.await;
+                }
+                self.active
+                    .lock()
+                    .await
+                    .remove(&(graph_id.to_string(), node_id.clone()));
+                let result = failed_result(&error);
+                let terminal_status = result.status;
+                let _coordination = self.graph_coordination_without_command(graph_id).await;
+                let current = self.state_store.load_async(graph_id).await?;
+                if current.node_statuses.get(&node_id) == Some(&ExecutionNodeStatus::Running) {
+                    self.commit_service
+                        .transition_node_async(
+                            current,
+                            node_id,
+                            terminal_status,
+                            Some(result),
+                            Vec::new(),
+                        )
+                        .await?;
+                    drop(_coordination);
+                    self.converge_after_terminal_commit(graph_id).await?;
+                    durable_progress.notify_one();
+                }
+                // A Pause/Cancel command may have superseded the executor while
+                // it returned. The command's durable graph state remains truth.
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn start_and_execute_node(
@@ -1541,8 +1446,8 @@ impl ExecutionGraphRunner {
             )
         };
         // The coordination gate protects the state check and durable effect
-        // intent. It must not cover executor work: a ToolBatch may submit a
-        // child execution graph (for example `runtime_orchestrate`), which
+        // intent. It must not cover executor work: a ToolBatch may dispatch a
+        // child Agent execution graph, which
         // correctly needs the same Runner to make progress. Holding the gate
         // across that await creates a parent/child re-entrancy deadlock.
         if let Some(waiter) = self.command_intent_waiter(graph_id) {
@@ -1747,10 +1652,9 @@ impl ExecutionGraphRunner {
             harness_contract::execution_graph::ExecutionNodeKind::Materialize => {
                 Some(ExecutionResourceKind::Tool)
             }
-            harness_contract::execution_graph::ExecutionNodeKind::Subgraph
-            | harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => {
-                // Subgraph and ToolBatch are durable orchestration
-                // containers. Their child Agent/tool leaves acquire the
+            harness_contract::execution_graph::ExecutionNodeKind::ToolBatch => {
+                // ToolBatch is a durable orchestration container. Its tool
+                // leaves acquire the
                 // authoritative resource and scope leases. Holding a path
                 // lock here while synchronously awaiting a descendant that
                 // needs the same path creates a parent-waits-child / child-
@@ -2238,52 +2142,6 @@ impl ExecutionGraphRunner {
         Ok(graph)
     }
 
-    pub(crate) async fn revise_semantic_graph(
-        &self,
-        graph_id: &str,
-        expected_revision: u64,
-        nodes: Vec<harness_contract::execution_graph::ExecutionNodeSpec>,
-        edges: Vec<harness_contract::execution_graph::ExecutionEdge>,
-        reason: String,
-        mutation_id: String,
-        completion: harness_contract::execution_graph::ExecutionCompletionContract,
-        collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
-        collaboration_escalation: Option<
-            harness_contract::execution_graph::CollaborationEscalationReceipt,
-        >,
-        retired_instance_ids: Vec<String>,
-    ) -> Result<ExecutionGraph, ExecutionRunnerError> {
-        self.ensure_mutation_allowed()?;
-        let coordination = self.graph_coordination_without_command(graph_id).await;
-        let graph = self.state_store.load_async(graph_id).await?;
-        if graph.revision != expected_revision {
-            return Err(ExecutionCommitError::StaleRevision {
-                graph_id: graph_id.to_string(),
-                expected: expected_revision,
-                actual: graph.revision,
-            }
-            .into());
-        }
-        self.registry.validate_nodes(&nodes)?;
-        let graph = self
-            .commit_service
-            .replan_semantic_async(
-                graph,
-                nodes,
-                edges,
-                reason,
-                mutation_id,
-                completion,
-                collaboration_program,
-                collaboration_escalation,
-                retired_instance_ids,
-            )
-            .await?
-            .graph;
-        drop(coordination);
-        Ok(graph)
-    }
-
     pub(crate) async fn projection(
         &self,
         graph_id: &str,
@@ -2320,38 +2178,6 @@ impl ExecutionGraphRunner {
                     .map(|work| work.dependency.clone())
                     .unwrap_or_default();
                 let target = dependency_target(&dependency, &predecessors);
-                let waits_for_autonomous_work = node
-                    .is_some_and(|node| autonomous_work_blocks_terminal(&graph, node.kind, target));
-                if waits_for_autonomous_work {
-                    if autonomous_work_is_orphaned(&graph) {
-                        graph = self
-                            .commit_service
-                            .transition_node_async(
-                                graph,
-                                node_id,
-                                ExecutionNodeStatus::Blocked,
-                                Some(ExecutionNodeResult {
-                                    status: ExecutionNodeStatus::Blocked,
-                                    result_ref: None,
-                                    summary: None,
-                                    evidence_refs: Vec::new(),
-                                    failure: Some(ExecutionFailure {
-                                        kind: "objective_revision_required".to_string(),
-                                        message: "required autonomous collaboration work remained unresolved after every Team Agent became terminal; Objective supervision must replan or close the obligation".to_string(),
-                                        retryable: true,
-                                        evidence_refs: Vec::new(),
-                                    }),
-                                    usage: Default::default(),
-                                    finished_at_ms: now_ms(),
-                                }),
-                                Vec::new(),
-                            )
-                            .await?
-                            .graph;
-                        changed = true;
-                    }
-                    continue;
-                }
                 if let Some(target) = target {
                     graph = self
                         .commit_service
@@ -2367,48 +2193,6 @@ impl ExecutionGraphRunner {
             }
         }
     }
-}
-
-fn autonomous_work_blocks_terminal(
-    graph: &ExecutionGraph,
-    node_kind: ExecutionNodeKind,
-    target: Option<ExecutionNodeStatus>,
-) -> bool {
-    target == Some(ExecutionNodeStatus::Ready)
-        && matches!(
-            node_kind,
-            ExecutionNodeKind::Synthesize
-                | ExecutionNodeKind::Verify
-                | ExecutionNodeKind::Materialize
-        )
-        && graph.autonomous_work.iter().any(|(work_id, work)| {
-            work.required
-                && graph.work_states.get(work_id).is_none_or(|state| {
-                    state.status
-                        != harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted
-                })
-        })
-}
-
-fn autonomous_work_is_orphaned(graph: &ExecutionGraph) -> bool {
-    let unresolved_required_work = graph.autonomous_work.iter().any(|(work_id, work)| {
-        work.required
-            && graph.work_states.get(work_id).is_none_or(|state| {
-                state.status
-                    != harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted
-            })
-    });
-    unresolved_required_work
-        && graph
-            .nodes
-            .iter()
-            .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-            .all(|node| {
-                graph
-                    .node_statuses
-                    .get(&node.id)
-                    .is_some_and(|status| status.is_terminal())
-            })
 }
 
 /// One predecessor lane carrying both its durable lifecycle status and its
@@ -2487,7 +2271,9 @@ fn dependency_target(
         ExecutionDependencyPolicy::All | ExecutionDependencyPolicy::Finally => predecessors.len(),
         ExecutionDependencyPolicy::Any { .. } => 1,
         ExecutionDependencyPolicy::Quorum { minimum, .. } => usize::from(*minimum),
-        ExecutionDependencyPolicy::EvidenceReady { .. } => unreachable!(),
+        ExecutionDependencyPolicy::EvidenceReady { predicate, .. } => {
+            return evidence_ready_target(predicate, predecessors);
+        }
     };
     if completed >= required {
         Some(ExecutionNodeStatus::Ready)
@@ -2658,7 +2444,6 @@ fn execution_deadline_at_ms(
     if !matches!(
         node.kind,
         harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-            | harness_contract::execution_graph::ExecutionNodeKind::Subgraph
     ) {
         return Ok(None);
     }
@@ -2675,8 +2460,14 @@ fn execution_deadline_at_ms(
         .filter(|deadline| *deadline != 0)
         .ok_or_else(|| ExecutionRunnerError::Resource {
             node_id: node.id.clone(),
-            reason: "AgentTask/Subgraph has no Runtime-issued absolute deadline".to_string(),
+            reason: "AgentTask has no Runtime-issued absolute deadline".to_string(),
         })?;
+    // `u64::MAX` is the explicit no-wall-deadline sentinel used by durable
+    // Agent packets. Do not convert it into an enormous Tokio timer: Runtime
+    // still governs cancellation, resource admission and rolling claims.
+    if deadline_at_ms == u64::MAX {
+        return Ok(None);
+    }
     Ok(Some(deadline_at_ms))
 }
 
@@ -2832,218 +2623,6 @@ fn validate_outcome(
     }
 }
 
-/// Aggregate provider/tool usage exactly once from Team AgentTask leaves.
-/// Verify/Synthesize are deterministic reducers over those leaves and must
-/// never be counted a second time. Failed children without a synthesize result
-/// therefore retain their actual cost.
-pub(crate) fn aggregate_team_leaf_usage(
-    graph: &ExecutionGraph,
-) -> harness_contract::execution_graph::ExecutionUsage {
-    let mut aggregate = harness_contract::execution_graph::ExecutionUsage::default();
-    let mut models = BTreeSet::new();
-    for node in graph
-        .nodes
-        .iter()
-        .filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask)
-    {
-        let Some(result) = graph.node_results.get(&node.id) else {
-            continue;
-        };
-        let usage = &result.usage;
-        if let Some(model) = usage
-            .model
-            .as_ref()
-            .filter(|model| !model.trim().is_empty())
-        {
-            models.insert(model.clone());
-        }
-        aggregate.input_tokens = aggregate.input_tokens.saturating_add(usage.input_tokens);
-        aggregate.output_tokens = aggregate.output_tokens.saturating_add(usage.output_tokens);
-        aggregate.cached_tokens = aggregate.cached_tokens.saturating_add(usage.cached_tokens);
-        aggregate.duration_ms = aggregate.duration_ms.max(usage.duration_ms);
-        aggregate.tool_calls = aggregate.tool_calls.saturating_add(usage.tool_calls);
-        aggregate.duplicate_tool_calls = aggregate
-            .duplicate_tool_calls
-            .saturating_add(usage.duplicate_tool_calls);
-        aggregate.max_tool_concurrency_observed = aggregate
-            .max_tool_concurrency_observed
-            .max(usage.max_tool_concurrency_observed);
-        aggregate.parallel_tool_batches = aggregate
-            .parallel_tool_batches
-            .saturating_add(usage.parallel_tool_batches);
-        aggregate
-            .runtime_write_attempt_paths
-            .extend(usage.runtime_write_attempt_paths.iter().cloned());
-        aggregate
-            .observed_acceptance
-            .merge_from(&usage.observed_acceptance);
-    }
-    aggregate.model = (models.len() == 1)
-        .then(|| models.into_iter().next())
-        .flatten();
-    aggregate.runtime_write_attempt_paths.sort();
-    aggregate.runtime_write_attempt_paths.dedup();
-    aggregate
-}
-
-fn team_child_terminal_result(graph: &ExecutionGraph) -> ExecutionNodeResult {
-    let synthesize = graph
-        .nodes
-        .iter()
-        .find(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::Synthesize);
-    let synthesize_result = synthesize.and_then(|node| graph.node_results.get(&node.id));
-    let statuses = graph.node_statuses.values().copied().collect::<Vec<_>>();
-    let status = if statuses
-        .iter()
-        .any(|status| *status == ExecutionNodeStatus::Failed)
-    {
-        ExecutionNodeStatus::Failed
-    } else if statuses
-        .iter()
-        .any(|status| *status == ExecutionNodeStatus::Blocked)
-    {
-        ExecutionNodeStatus::Blocked
-    } else if statuses
-        .iter()
-        .any(|status| *status == ExecutionNodeStatus::Cancelled)
-    {
-        ExecutionNodeStatus::Cancelled
-    } else if synthesize_result
-        .is_some_and(|result| result.status == ExecutionNodeStatus::Completed)
-    {
-        ExecutionNodeStatus::Completed
-    } else {
-        ExecutionNodeStatus::Blocked
-    };
-    let mut evidence_refs = graph
-        .node_results
-        .values()
-        .flat_map(|result| result.evidence_refs.iter().cloned())
-        .collect::<Vec<_>>();
-    evidence_refs.sort_by(|left, right| {
-        serde_json::to_string(left)
-            .unwrap_or_default()
-            .cmp(&serde_json::to_string(right).unwrap_or_default())
-    });
-    evidence_refs.dedup();
-    let failure = if status == ExecutionNodeStatus::Completed {
-        None
-    } else {
-        graph
-            .node_results
-            .values()
-            .find_map(|result| result.failure.clone())
-            .or_else(|| {
-                Some(harness_contract::execution_graph::ExecutionFailure {
-                    kind: "child_graph_terminal_without_verified_result".to_string(),
-                    message: format!(
-                        "child execution `{}` settled as {}",
-                        graph.id,
-                        status_name_for_child(status)
-                    ),
-                    retryable: false,
-                    evidence_refs: evidence_refs.clone(),
-                })
-            })
-    };
-    let result_ref = synthesize_result
-        .and_then(|result| result.result_ref.clone())
-        .or_else(|| Some(format!("execution-graph:{}", graph.id)));
-    let mut usage = aggregate_team_leaf_usage(graph);
-    if status == ExecutionNodeStatus::Completed {
-        promote_completed_team_terminal_facts(
-            &mut usage,
-            &mut evidence_refs,
-            &graph.id,
-            graph.revision,
-            result_ref.as_deref(),
-            graph
-                .lineage
-                .as_ref()
-                .map_or("unknown", |lineage| lineage.session_id.as_str()),
-        );
-    }
-    ExecutionNodeResult {
-        status,
-        result_ref,
-        summary: synthesize_result
-            .and_then(|result| result.summary.clone())
-            .or_else(|| {
-                Some(format!(
-                    "child execution `{}` settled as {}",
-                    graph.id,
-                    status_name_for_child(status)
-                ))
-            }),
-        evidence_refs,
-        failure,
-        usage,
-        finished_at_ms: now_ms(),
-    }
-}
-
-/// Parent resolution bypasses `TeamSubgraphExecutor::poll_or_await`: the
-/// durable supervisor joins an already-terminal child directly. Promote the
-/// child terminal fact here so its parent node can satisfy a typed fan-in
-/// dependency and cross-Team delivery contract after restart as well.
-fn promote_completed_team_terminal_facts(
-    usage: &mut harness_contract::execution_graph::ExecutionUsage,
-    evidence_refs: &mut Vec<EvidenceAccessRef>,
-    child_graph_id: &str,
-    child_revision: u64,
-    result_ref: Option<&str>,
-    session_id: &str,
-) {
-    let terminal_id = format!(
-        "{child_graph_id}:revision:{child_revision}:{}",
-        result_ref.unwrap_or("terminal-result-unavailable")
-    );
-    if !evidence_refs
-        .iter()
-        .any(|reference| reference.evidence_ref.ref_type == "terminal_synthesis")
-    {
-        evidence_refs.push(EvidenceAccessRef::durable(
-            EvidenceRef::observed("terminal_synthesis", terminal_id.clone()),
-            format!("sha256:{:x}", Sha256::digest(terminal_id.as_bytes())),
-            terminal_id.len() as u64,
-            "application/vnd.cowd.team-terminal+json",
-            format!("runtime-event:execution-graph:{child_graph_id}:terminal"),
-            format!("session:{session_id}"),
-        ));
-    }
-    if usage.acceptance_evaluation.is_none() {
-        usage.acceptance_evaluation = Some(AcceptanceEvaluation {
-            evaluator_revision: crate::acceptance_evaluator::AcceptanceEvaluator::REVISION,
-            contract_digest: format!("team-child-terminal:{child_graph_id}:{child_revision}"),
-            receipt_set_digest: format!("sha256:{:x}", Sha256::digest(terminal_id.as_bytes())),
-            derived_obligations: vec![format!("team-child-terminal:{child_graph_id}")],
-            verdict: AcceptanceVerdict::Satisfied,
-        });
-    }
-}
-
-const fn status_name_for_child(status: ExecutionNodeStatus) -> &'static str {
-    match status {
-        ExecutionNodeStatus::Completed => "completed",
-        ExecutionNodeStatus::Blocked => "partial",
-        ExecutionNodeStatus::Failed => "failed",
-        ExecutionNodeStatus::Cancelled => "cancelled",
-        _ => "non_terminal",
-    }
-}
-
-pub(crate) fn child_resolution_correlation(
-    parent_execution_id: &str,
-    parent_node_id: &str,
-    child_execution_id: &str,
-    parent_attempt: u32,
-    child_revision: u64,
-) -> String {
-    format!(
-        "child:{parent_execution_id}:{parent_node_id}:{child_execution_id}:{parent_attempt}:{child_revision}"
-    )
-}
-
 fn executor_error_node_id(error: &NodeExecutorError) -> &str {
     match error {
         NodeExecutorError::DuplicateExecutor(kind) => kind,
@@ -3125,80 +2704,16 @@ mod dependency_policy_tests {
     };
     use harness_contract::execution_graph::{
         ExecutionEdge, ExecutionEdgeKind, ExecutionGraph, ExecutionNodeKind, ExecutionNodeSpec,
-        ExecutionWorkContract, ExecutionWorkRole, ExecutionWorkRuntimeState,
-        ExecutionWorkRuntimeStatus,
+        ExecutionWorkContract, ExecutionWorkRole,
     };
 
     use super::{
-        aggregate_team_leaf_usage, autonomous_work_blocks_terminal, autonomous_work_is_orphaned,
         dependency_predecessors, dependency_target, quorum_tail_cancellations,
-        team_child_terminal_result, verified_predecessor_status, DependencyPredecessor,
+        verified_predecessor_status, DependencyPredecessor,
     };
 
     fn predecessor(status: ExecutionNodeStatus) -> DependencyPredecessor<'static> {
         DependencyPredecessor::status_only(status)
-    }
-
-    #[test]
-    fn required_autonomous_work_blocks_terminal_reducer_until_peer_acceptance() {
-        let mut graph = ExecutionGraph::new("autonomous work gate");
-        let mut work = ExecutionWorkContract::new(ExecutionWorkRole::CrossCheck);
-        work.collaboration_work_id = Some("agent-work-a".to_string());
-        work.objective = Some("independent cross-check".to_string());
-        work.proposed_by = Some("agent-a".to_string());
-        work.output_artifact_kinds = vec!["review".to_string()];
-        graph
-            .autonomous_work
-            .insert("agent-work-a".to_string(), work);
-        graph.work_states.insert(
-            "agent-work-a".to_string(),
-            ExecutionWorkRuntimeState {
-                status: ExecutionWorkRuntimeStatus::Claimed,
-                revision: 2,
-                ..ExecutionWorkRuntimeState::default()
-            },
-        );
-        assert!(autonomous_work_blocks_terminal(
-            &graph,
-            ExecutionNodeKind::Synthesize,
-            Some(ExecutionNodeStatus::Ready),
-        ));
-        graph.work_states.get_mut("agent-work-a").unwrap().status =
-            ExecutionWorkRuntimeStatus::Accepted;
-        assert!(!autonomous_work_blocks_terminal(
-            &graph,
-            ExecutionNodeKind::Synthesize,
-            Some(ExecutionNodeStatus::Ready),
-        ));
-    }
-
-    #[test]
-    fn unresolved_required_work_becomes_orphaned_only_after_all_agents_are_terminal() {
-        let mut graph = ExecutionGraph::new("autonomous orphan convergence");
-        let mut work = ExecutionWorkContract::new(ExecutionWorkRole::CrossCheck);
-        work.collaboration_work_id = Some("agent-work-a".to_string());
-        work.proposed_by = Some("agent-a".to_string());
-        graph
-            .autonomous_work
-            .insert("agent-work-a".to_string(), work);
-        let mut agent = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
-        agent.id = "agent-a".to_string();
-        graph.nodes.push(agent);
-        graph
-            .node_statuses
-            .insert("agent-a".to_string(), ExecutionNodeStatus::Running);
-
-        assert!(!autonomous_work_is_orphaned(&graph));
-        graph
-            .node_statuses
-            .insert("agent-a".to_string(), ExecutionNodeStatus::Completed);
-        assert!(autonomous_work_is_orphaned(&graph));
-        graph
-            .work_states
-            .entry("agent-work-a".to_string())
-            .or_default()
-            .status = ExecutionWorkRuntimeStatus::Accepted;
-        assert!(!autonomous_work_is_orphaned(&graph));
     }
 
     #[test]
@@ -3683,107 +3198,5 @@ mod dependency_policy_tests {
             .node_statuses
             .insert("merge".to_string(), ExecutionNodeStatus::Ready);
         assert_eq!(quorum_tail_cancellations(&graph), vec!["running"]);
-    }
-
-    #[test]
-    fn child_terminal_preserves_failed_leaf_usage_without_counting_synthesis_twice() {
-        let mut graph = ExecutionGraph::new("child terminal aggregation");
-        graph.id = "team-graph:usage".to_string();
-        let mut agent = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent", "{}");
-        agent.id = "agent".to_string();
-        let mut synth = ExecutionNodeSpec::new(ExecutionNodeKind::Synthesize, "synth", "{}");
-        synth.id = "synth".to_string();
-        graph.nodes = vec![agent, synth];
-        graph
-            .node_statuses
-            .insert("agent".to_string(), ExecutionNodeStatus::Failed);
-        graph
-            .node_statuses
-            .insert("synth".to_string(), ExecutionNodeStatus::Cancelled);
-        let mut leaf_usage = harness_contract::execution_graph::ExecutionUsage::default();
-        leaf_usage.input_tokens = 13;
-        leaf_usage.output_tokens = 8;
-        leaf_usage.tool_calls = 2;
-        let mut synth_usage = harness_contract::execution_graph::ExecutionUsage::default();
-        synth_usage.input_tokens = 13;
-        synth_usage.output_tokens = 8;
-        graph.node_results.insert(
-            "agent".to_string(),
-            harness_contract::execution_graph::ExecutionNodeResult {
-                status: ExecutionNodeStatus::Failed,
-                result_ref: Some("artifact://partial".to_string()),
-                summary: Some("partial evidence".to_string()),
-                evidence_refs: Vec::new(),
-                failure: Some(harness_contract::execution_graph::ExecutionFailure {
-                    kind: "provider_failure".to_string(),
-                    message: "fixture".to_string(),
-                    retryable: false,
-                    evidence_refs: Vec::new(),
-                }),
-                usage: leaf_usage,
-                finished_at_ms: 1,
-            },
-        );
-        graph.node_results.insert(
-            "synth".to_string(),
-            harness_contract::execution_graph::ExecutionNodeResult {
-                status: ExecutionNodeStatus::Cancelled,
-                result_ref: None,
-                summary: None,
-                evidence_refs: Vec::new(),
-                failure: None,
-                usage: synth_usage,
-                finished_at_ms: 2,
-            },
-        );
-
-        let aggregate = aggregate_team_leaf_usage(&graph);
-        assert_eq!(aggregate.input_tokens, 13);
-        assert_eq!(aggregate.output_tokens, 8);
-        assert_eq!(aggregate.tool_calls, 2);
-        let terminal = team_child_terminal_result(&graph);
-        assert_eq!(terminal.status, ExecutionNodeStatus::Failed);
-        assert_eq!(terminal.usage, aggregate);
-        assert_eq!(terminal.failure.unwrap().kind, "provider_failure");
-    }
-
-    #[test]
-    fn completed_child_terminal_promotes_typed_handoff_facts() {
-        let mut graph = ExecutionGraph::new("completed child");
-        graph.id = "team-graph:alpha".to_string();
-        graph.revision = 7;
-        let mut synth = ExecutionNodeSpec::new(ExecutionNodeKind::Synthesize, "synth", "{}");
-        synth.id = "synth".to_string();
-        graph.nodes = vec![synth];
-        graph
-            .node_statuses
-            .insert("synth".to_string(), ExecutionNodeStatus::Completed);
-        graph.node_results.insert(
-            "synth".to_string(),
-            ExecutionNodeResult {
-                status: ExecutionNodeStatus::Completed,
-                result_ref: Some("assistant_json:\"verified\"".to_string()),
-                summary: Some("verified".to_string()),
-                evidence_refs: Vec::new(),
-                failure: None,
-                usage: ExecutionUsage::default(),
-                finished_at_ms: 1,
-            },
-        );
-
-        let terminal = team_child_terminal_result(&graph);
-
-        assert_eq!(terminal.status, ExecutionNodeStatus::Completed);
-        assert_eq!(
-            terminal
-                .usage
-                .acceptance_evaluation
-                .as_ref()
-                .map(|evaluation| evaluation.verdict),
-            Some(AcceptanceVerdict::Satisfied)
-        );
-        assert!(terminal.evidence_refs.iter().any(|reference| {
-            reference.evidence_ref.ref_type == "terminal_synthesis" && reference.is_durable()
-        }));
     }
 }

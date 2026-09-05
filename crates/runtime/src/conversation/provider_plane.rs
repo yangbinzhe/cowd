@@ -188,35 +188,15 @@ where
         self.next_model_tool_required.store(true, Ordering::SeqCst);
     }
 
-    /// Require one exact already-governed native tool on the next provider
-    /// request. This is used only for a control-plane continuation after the
-    /// model has already inspected the capability catalog.
-    pub(crate) fn require_next_model_named_tool_action(&self, tool_id: impl Into<String>) {
-        let tool_id = tool_id.into();
-        self.require_next_model_tool_action([tool_id.clone()]);
-        if let Ok(mut required_tool_name) = self.next_model_required_tool_name.lock() {
-            *required_tool_name = Some(tool_id);
-        }
-    }
-
-    /// Require the root model to take one native control-plane action before
-    /// a user-required collaboration may admit any Team. The bounded pair
-    /// deliberately includes a read-only capability inspection as well as a
-    /// proposal: a model must be able to discover current template role ids
-    /// before it can make a valid typed proposal. Ordinary workspace and
-    /// discovery tools remain unavailable, so this is still an admission
-    /// barrier rather than a hardcoded Team topology.
+    /// Test support for proving that every small Agent action remains
+    /// available when a collaboration obligation requires a real action.
     #[cfg(test)]
-    pub(crate) fn require_next_model_orchestration_only(&self) {
-        self.require_next_model_tool_action([
-            "runtime_capabilities".to_string(),
-            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID.to_string(),
-        ]);
-        // Qwen hybrid endpoints reject `tool_choice=required` while their
-        // thinking mode is enabled.  The proposal step is intentionally tiny
-        // and fully typed, so disable thinking for this one wire request only;
-        // every admitted Team and Agent keeps its normal model policy.
-        self.require_next_model_reasoning_effort("none");
+    pub(crate) fn require_next_agent_action(&self) {
+        self.require_next_model_tool_action(
+            harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                .iter()
+                .map(|tool| (*tool).to_string()),
+        );
     }
 
     /// Override reasoning effort for exactly one provider request. Provider
@@ -1013,21 +993,18 @@ where
             .active_turn_strategy()
             .and_then(|state| state.decision.collaboration_obligation);
         if let Some(obligation) = collaboration_obligation {
-            for tool in [
-                "runtime_capabilities",
-                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-            ] {
-                exposure.active.insert(tool.to_string());
-                exposure.deferred.remove(tool);
+            for tool in harness_contract::agent_action::AGENT_ACTION_TOOL_IDS {
+                exposure.active.insert((*tool).to_string());
+                exposure.deferred.remove(*tool);
             }
             exposure.reason =
-                "collaboration execution obligation forces orchestration tools active".to_string();
+                "collaboration execution obligation activates Agent-first actions".to_string();
             tracing::info!(
                 team_required = true,
                 obligation_source = ?obligation.source,
                 minimum_team_count = obligation.minimum_team_count,
                 active = ?exposure.active,
-                "collaboration execution obligation forced orchestration exposure"
+                "collaboration execution obligation activated Agent-first actions"
             );
         }
         let one_shot_tool_overlay =

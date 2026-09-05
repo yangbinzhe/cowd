@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::MeasureProvenance;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AcceptanceStatus {
     Open,
@@ -125,7 +125,7 @@ fn required_by_default() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectiveTerminalKind {
     Satisfied,

@@ -48,6 +48,8 @@ pub mod graph_contract;
 pub mod green_contract;
 #[path = "infrastructure/wave.rs"]
 pub mod wave;
+#[path = "conversation/workspace_scopes.rs"]
+mod workspace_scopes;
 pub use green_contract::GreenLevel;
 #[path = "approval/coordinator.rs"]
 pub mod approval_coordinator;
@@ -166,6 +168,11 @@ pub mod agent_result_validator;
 pub mod agent_run_handle;
 #[path = "agent/runtime.rs"]
 pub mod agent_runtime;
+#[path = "agentic/mod.rs"]
+pub mod agentic;
+#[cfg(test)]
+#[path = "architecture_retirement_tests.rs"]
+mod architecture_retirement_tests;
 #[path = "context/artifact.rs"]
 pub mod artifact;
 #[path = "policy/authorization_negotiator.rs"]
@@ -184,13 +191,17 @@ pub mod cowd_event;
 pub mod cross_plane_policy;
 #[path = "agent/definition_registry.rs"]
 pub mod definition_registry;
-#[path = "agent/display_identity.rs"]
-pub mod display_identity;
 #[path = "session/history.rs"]
 mod session_history;
 #[cfg(test)]
 #[path = "agent/test_support.rs"]
 mod test_support;
+pub use agentic::{
+    AgentActionService, AgentActionServiceError, AgentMemberProjection, AgenticArtifactProjection,
+    AgenticCompletionRequestProjection, AgenticDispatchContext, AgenticDispatchReceipt,
+    AgenticObjectiveVerdictProjection, AgenticProgramProjection, AgenticProgramStatus,
+    AgenticTaskProjection, AgenticTaskStatus, AgenticTeamProjection, AgenticTopicEntryProjection,
+};
 pub use definition_registry::AgentDefinitionDraftReceipt;
 #[path = "infrastructure/eval_gate.rs"]
 pub mod eval_gate;
@@ -220,8 +231,6 @@ pub mod knowledge_candidate_projector;
 pub mod lane_completion;
 #[path = "session/mission_command_interpreter.rs"]
 pub mod mission_command_interpreter;
-#[path = "orchestration/mod.rs"]
-pub mod orchestration;
 #[path = "recovery/outcome_projector.rs"]
 pub mod outcome_projector;
 #[path = "agent/pairing.rs"]
@@ -268,6 +277,8 @@ pub mod runtime_harness;
 pub mod runtime_memory_summarizer;
 #[path = "security/mod.rs"]
 pub mod security;
+#[path = "session/collaboration_continuation.rs"]
+mod session_continuation;
 #[path = "session/session_execution.rs"]
 pub mod session_execution;
 #[path = "session/session_input.rs"]
@@ -296,32 +307,10 @@ pub mod summary_compression;
 #[path = "infrastructure/surface_contract.rs"]
 pub mod surface_contract;
 pub mod task;
-#[path = "team/agent_selector.rs"]
-pub mod team_agent_selector;
-#[path = "team/agent_task.rs"]
-pub mod team_agent_task;
-#[path = "team/team_binding.rs"]
-pub mod team_binding;
 #[path = "team/definition/mod.rs"]
 pub mod team_definition;
-#[path = "team/instantiation.rs"]
-pub mod team_instantiation;
 #[path = "team/l4_promotion.rs"]
 pub mod team_l4_promotion;
-#[path = "team/legacy_import.rs"]
-pub mod team_legacy_import;
-#[path = "team/profile_migration.rs"]
-pub mod team_profile_migration;
-#[path = "team/projection.rs"]
-pub mod team_projection;
-#[path = "team/result_reducer.rs"]
-pub mod team_result_reducer;
-#[path = "team/team_runtime.rs"]
-pub mod team_runtime;
-#[path = "team/template_candidate.rs"]
-pub mod team_template_candidate;
-#[path = "team/working_state.rs"]
-pub mod team_working_state;
 #[path = "tooling/tool_dispatch.rs"]
 pub mod tool_dispatch;
 #[path = "tooling/tool_execution_plane.rs"]
@@ -483,10 +472,6 @@ pub use hooks::{
     format_hook_output, HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter,
     HookRunResult, HookRunner, HOOK_PREVIEW_CHAR_LIMIT,
 };
-pub use team_agent_task::{
-    AgentTask, AgentTaskCompletionReceipt, AgentTaskOutcome, AgentTaskQualityStatus,
-    AgentTaskStatus,
-};
 #[path = "conversation/host.rs"]
 pub mod host;
 pub use host::{
@@ -616,19 +601,6 @@ pub use module_authority::{
 };
 pub use module_map::{
     runtime_module_map, runtime_module_names_by_domain, RuntimeDomain, RuntimeModuleDescriptor,
-};
-pub use orchestration::collaboration_continuation::{
-    claim_continuation_root, compile_continuation_binding, ensure_reauthorized, resolve_candidate,
-    ContinuationCandidate, ContinuationPriority,
-};
-pub use orchestration::{
-    handle_runtime_orchestration_request, handle_runtime_orchestration_request_with_decision,
-    runtime_orchestration_response, runtime_orchestration_response_with_decision,
-    submit_runtime_orchestration_request, CapabilityRecipeId, CompiledOrchestration,
-    GraphMutationProposal, GraphSemanticNode, RuntimeControlKind, RuntimeControlRequest,
-    RuntimeControlScope, RuntimeOrchestrationBinding, RuntimeOrchestrationCommand,
-    RuntimeOrchestrationConstraints, RuntimeOrchestrationDecision, RuntimeOrchestrationOperation,
-    RuntimeOrchestrationResult, RuntimeStateSnapshot, RuntimeToolInventorySnapshot, SemanticFocus,
 };
 pub use outcome_projector::{
     OutcomeProjectionCheckpoint, OutcomeProjectionDlqEntry, OutcomeProjectionHealth,
@@ -795,25 +767,9 @@ pub use task::{
     TaskStatus as MissionTaskStatus, TaskStoreBackend, TaskStoreSnapshot, TaskTurnBinding,
     TaskTurnRole,
 };
-pub use team_agent_selector::AgentSelector;
-pub use team_instantiation::{ResolvedRoleSlot, TeamInstantiation, TeamInstantiationService};
 pub use team_l4_promotion::{
     KnowledgeCandidateProjection, L4CandidateLifecycle, L4PromotionCandidate, L4PromotionReceipt,
     L4PromotionService,
-};
-pub use team_legacy_import::LegacyTeamImportReport;
-pub use team_profile_migration::LegacyTeamProfileMigrationReport;
-pub use team_projection::{
-    TeamProjection, TeamProjectionCursor, TeamProjectionPage, TeamProjectionReader,
-};
-pub use team_result_reducer::TeamResultReducer;
-pub use team_runtime::TeamRuntime;
-pub use team_working_state::{
-    AgentInitiativeProposal, CollaborationControlOperation, CollaborationControlRequest,
-    CollaborationWorkProposal, FocusOverlapAssessment, TeamWorkingState,
-    TeamWorkingStateAcknowledgeRequest, TeamWorkingStateCursor, TeamWorkingStateEntry,
-    TeamWorkingStateKind, TeamWorkingStatePage, TeamWorkingStatePublishRequest,
-    TeamWorkingStateReadRequest, TeamWorkingStateThread, TeamWorkingStateVisibility,
 };
 pub use tool_execution_plane::{
     ToolExecutionAdmission, ToolExecutionPlane, ToolExecutionPlaneError, ToolExecutionPlaneStats,
@@ -873,7 +829,7 @@ pub use context_runtime::{
 pub use runtime_control::{
     AgentControlPolicy, CollaborationCapacityPolicy, ContextControlPolicy,
     ExecutionCapacityProfile, MemoryControlPolicy, MissionSchedulePolicy, ObservabilityPolicy,
-    RuntimeControlPolicy, TaskControlPolicy, MAX_REPRESENTABLE_TEAM_AGENT_NODES,
+    RuntimeControlPolicy, TaskControlPolicy,
 };
 #[cfg(test)]
 pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {

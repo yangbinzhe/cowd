@@ -151,7 +151,7 @@ fn terminal_report_checks(report_path: &Path) -> Vec<Value> {
             .cloned()
             .unwrap_or(Value::Null)
     };
-    let team = scenario("team_agent_execution_outcome");
+    let agentic_program = scenario("agentic_program_closure");
     let cross = scenario("cross_session_dispatch");
     let recovery = scenario("conflict_recovery");
     let tool_batch = scenario("tool_batch_efficiency");
@@ -171,35 +171,41 @@ fn terminal_report_checks(report_path: &Path) -> Vec<Value> {
             "run full/deep harness eval so next_gen_harness_closure scenarios are emitted",
         ),
         check(
-            "team_agent_terminal_count",
-            u64_at(&team, "/terminal_evidence/agent_terminal_count") >= 2,
+            "agentic_program_accepted_tasks",
+            u64_at(&agentic_program, "/terminal_evidence/accepted_task_count") >= 1,
             true,
             format!(
-                "agent_terminal_count={}",
-                u64_at(&team, "/terminal_evidence/agent_terminal_count")
+                "accepted_task_count={}",
+                u64_at(&agentic_program, "/terminal_evidence/accepted_task_count")
             ),
-            "emit terminal_evidence.agent_terminal_count >= 2 for team_agent_execution_outcome",
+            "emit terminal_evidence.accepted_task_count >= 1 for agentic_program_closure",
         ),
         check(
-            "team_agent_mailbox_completed",
-            u64_at(&team, "/terminal_evidence/mailbox_completed_count") >= 1,
+            "agentic_program_independent_reviews",
+            u64_at(
+                &agentic_program,
+                "/terminal_evidence/independent_review_count",
+            ) >= 1,
             true,
             format!(
-                "mailbox_completed_count={}",
-                u64_at(&team, "/terminal_evidence/mailbox_completed_count")
+                "independent_review_count={}",
+                u64_at(
+                    &agentic_program,
+                    "/terminal_evidence/independent_review_count"
+                )
             ),
-            "complete at least one agent/session mailbox command in terminal evidence",
+            "record at least one independent Agent review in terminal evidence",
         ),
         check(
-            "team_agent_synthesis_receipt",
-            str_at(&team, "/terminal_evidence/synthesis_receipt_id")
+            "agentic_program_final_artifact",
+            str_at(&agentic_program, "/terminal_evidence/final_artifact_ref")
                 .is_some_and(|value| !value.trim().is_empty()),
             true,
             format!(
-                "synthesis_receipt_id={}",
-                str_at(&team, "/terminal_evidence/synthesis_receipt_id").unwrap_or("-")
+                "final_artifact_ref={}",
+                str_at(&agentic_program, "/terminal_evidence/final_artifact_ref").unwrap_or("-")
             ),
-            "emit a synthesis receipt id for the team scenario",
+            "emit the durable final artifact reference for the Agentic Program scenario",
         ),
         check(
             "cross_session_relation_count",
@@ -316,7 +322,7 @@ mod tests {
                 "execution_trace": {"provider_rounds": 0},
                 "next_gen_harness_closure": {
                     "scenarios": [
-                        {"scenario_id": "team_agent_execution_outcome", "terminal_evidence": {}},
+                        {"scenario_id": "agentic_program_closure", "terminal_evidence": {}},
                         {"scenario_id": "cross_session_dispatch", "terminal_evidence": {}},
                         {"scenario_id": "conflict_recovery", "terminal_evidence": {}},
                         {"scenario_id": "tool_batch_efficiency", "tool_calls": 0, "terminal_evidence": {}}
@@ -333,7 +339,8 @@ mod tests {
             .as_array()
             .expect("checks")
             .iter()
-            .any(|item| item["name"] == "team_agent_terminal_count" && item["status"] == "failed"));
+            .any(|item| item["name"] == "agentic_program_accepted_tasks"
+                && item["status"] == "failed"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -349,11 +356,11 @@ mod tests {
                 "next_gen_harness_closure": {
                     "scenarios": [
                         {
-                            "scenario_id": "team_agent_execution_outcome",
+                            "scenario_id": "agentic_program_closure",
                             "terminal_evidence": {
-                                "agent_terminal_count": 2,
-                                "mailbox_completed_count": 1,
-                                "synthesis_receipt_id": "synthesis:demo"
+                                "accepted_task_count": 2,
+                                "independent_review_count": 1,
+                                "final_artifact_ref": "artifact:demo"
                             }
                         },
                         {

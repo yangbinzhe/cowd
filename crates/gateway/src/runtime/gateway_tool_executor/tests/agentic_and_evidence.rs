@@ -1,0 +1,505 @@
+    #[test]
+    fn evidence_retrieve_request_matches_published_query_schema() {
+        let request: EvidenceRetrieveToolRequest = serde_json::from_value(serde_json::json!({
+            "evidence_ref": "artifact://sha256:abc",
+            "query": "acceptance evidence",
+            "limit": 4
+        }))
+        .expect("published evidence_retrieve schema must deserialize");
+        assert_eq!(request.evidence_ref, "artifact://sha256:abc");
+        assert_eq!(request.query.as_deref(), Some("acceptance evidence"));
+        assert_eq!(request.limit, Some(4));
+        assert!(
+            serde_json::from_value::<EvidenceRetrieveToolRequest>(serde_json::json!({
+                "evidence_ref": "artifact://sha256:abc",
+                "selector": "legacy-hidden-field"
+            }))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_root_model_bootstraps_program_and_inherits_evidence_scope() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let mut graph =
+            harness_contract::execution_graph::ExecutionGraph::new("root Agent-first bootstrap");
+        graph.id = "graph-root-agent-first".to_string();
+        graph.lineage = Some(harness_contract::execution_graph::ExecutionGraphLineage {
+            session_id: "session-root-agent-first".to_string(),
+            turn_id: "turn-root-agent-first".to_string(),
+            root_task_id: "task-root-agent-first".to_string(),
+            task_id: "task-root-agent-first".to_string(),
+            generation: 1,
+        });
+        let mut node = harness_contract::execution_graph::ExecutionNodeSpec::new(
+            harness_contract::execution_graph::ExecutionNodeKind::InlineModel,
+            "inline_model",
+            "payload:root-model",
+        );
+        node.id = "graph-root-agent-first:model".to_string();
+        node.idempotency_key = "root-model".to_string();
+        graph.nodes.push(node.clone());
+        services
+            .commit_service()
+            .register_graph(graph)
+            .expect("register root graph");
+
+        let mut decision = runtime::build_runtime_execution_decision(
+            "建立1个团队，只读检查 cowd-dev/Cargo.toml",
+            None,
+        );
+        decision.execution_graph_ref = Some("graph-root-agent-first".to_string());
+        decision.session_ref = Some("session-root-agent-first".to_string());
+        decision.turn_ref = Some("turn-root-agent-first".to_string());
+        let parent = harness_contract::execution_graph::ExecutionParentBinding {
+            execution_id: "graph-root-agent-first".to_string(),
+            node_id: node.id,
+        };
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+            .expect("Agent action tools");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let binding = RuntimeToolExecutionBinding {
+            action_id: Some("bound-root-create-team"),
+            session_id: Some("session-root-agent-first"),
+            authorized_scopes: &[],
+            memory_context: None,
+            model_lease: Some("deepseek-v4-flash"),
+            parent_execution: Some(&parent),
+            execution_decision: Some(&decision),
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        };
+        let receipt = executor
+            .execute_runtime_tool_with_binding(
+                harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
+                serde_json::json!({
+                    "name": "Evidence Team",
+                    "mission": "inspect the exact admitted evidence scope"
+                }),
+                binding,
+            )
+            .await
+            .expect("bound root creates Team");
+        let receipt: harness_contract::agent_action::AgentActionObservation =
+            serde_json::from_str(&receipt).expect("Team receipt");
+        assert_eq!(
+            receipt.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let program = services
+            .agent_action_service()
+            .project(&harness_contract::agent_action::program_id_for_objective(
+                &harness_contract::agent_action::root_objective_id(
+                    "session-root-agent-first",
+                    "turn-root-agent-first",
+                ),
+            ))
+            .expect("durable Program");
+        assert_eq!(program.teams.len(), 1);
+        assert_eq!(
+            program.resource_scopes,
+            vec!["read:cowd-dev/Cargo.toml".to_string()]
+        );
+
+        // A later dynamically appended model node may carry a refreshed
+        // decision preview/model binding. It is the same authenticated root,
+        // so Runtime must inherit the Program's first durable binding instead
+        // of rejecting every subsequent small action as a mismatch.
+        let mut continuation_decision = decision.clone();
+        continuation_decision.user_intent_preview =
+            "dynamic replan text must not replace frozen Program authority".to_string();
+        continuation_decision
+            .strategy
+            .understanding
+            .required_workspace_evidence_scopes = Vec::new();
+        let continuation = RuntimeToolExecutionBinding {
+            action_id: Some("bound-root-invite-agent"),
+            model_lease: Some("refreshed-model-binding"),
+            execution_decision: Some(&continuation_decision),
+            ..binding
+        };
+        let team_ref = program.teams.keys().next().expect("created Team").clone();
+        let receipt = executor
+            .execute_runtime_tool_with_binding(
+                harness_contract::agent_action::AGENT_INVITE_TOOL_ID,
+                serde_json::json!({
+                    "team_ref": team_ref,
+                    "role": "Independent Reviewer",
+                    "mission": "independently verify the admitted file evidence",
+                    "required_capabilities": ["read"]
+                }),
+                continuation,
+            )
+            .await
+            .expect("continuation inherits frozen Program binding");
+        let receipt: harness_contract::agent_action::AgentActionObservation =
+            serde_json::from_str(&receipt).expect("Agent receipt");
+        assert_eq!(
+            receipt.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        let continued = services
+            .agent_action_service()
+            .project(&program.program_id)
+            .expect("continued durable Program");
+        assert_eq!(continued.agents.len(), 1);
+        assert_eq!(continued.model_lease, "deepseek-v4-flash");
+        assert_eq!(continued.resource_scopes, program.resource_scopes);
+
+        let foreign = RuntimeToolExecutionBinding {
+            action_id: Some("foreign-root-create-team"),
+            session_id: Some("session-foreign"),
+            ..binding
+        };
+        assert!(executor
+            .execute_runtime_tool_with_binding(
+                harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
+                serde_json::json!({"name":"Foreign", "mission":"must fail"}),
+                foreign,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_action_gateway_commits_small_actions_and_rejects_fake_content() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+            .expect("Agent action tools");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let binding = RuntimeToolExecutionBinding {
+            action_id: Some("create-team"),
+            session_id: Some("session-agentic-gateway"),
+            authorized_scopes: &[],
+            memory_context: None,
+            model_lease: Some("default"),
+            parent_execution: None,
+            execution_decision: None,
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        };
+        let created = executor
+            .execute_runtime_tool_with_binding(
+                harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
+                serde_json::json!({
+                    "name": "Evidence Team",
+                    "mission": "produce independently reviewable evidence"
+                }),
+                binding,
+            )
+            .await
+            .expect("create Team");
+        let created: harness_contract::agent_action::AgentActionObservation =
+            serde_json::from_str(&created).expect("Team receipt");
+        assert_eq!(
+            created.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        assert_eq!(created.changed_refs.len(), 1);
+
+        let artifact = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/markdown".to_string(),
+                    visibility_scope: "session:session-agentic-gateway".to_string(),
+                    expected_bytes: Some(20),
+                    original_name: Some("agent-report.md".to_string()),
+                },
+                b"durable agent report",
+            )
+            .await
+            .expect("durable Agent content");
+        let committed = executor
+            .execute_runtime_tool_with_binding(
+                harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID,
+                serde_json::json!({
+                    "content_ref": artifact.selector,
+                    "kind": "report",
+                    "title": "Durable report"
+                }),
+                RuntimeToolExecutionBinding {
+                    action_id: Some("durable-artifact"),
+                    ..binding
+                },
+            )
+            .await
+            .expect("commit durable artifact");
+        let committed: serde_json::Value =
+            serde_json::from_str(&committed).expect("artifact receipt");
+        assert_eq!(
+            committed["content_ref"].as_str(),
+            Some(artifact.selector.as_str()),
+            "receipt must echo the Runtime-parsed physical content_ref"
+        );
+
+        let rejected = executor
+            .execute_runtime_tool_with_binding(
+                harness_contract::agent_action::ARTIFACT_COMMIT_TOOL_ID,
+                serde_json::json!({
+                    "content_ref": "artifact://invented",
+                    "kind": "report",
+                    "title": "Invented report"
+                }),
+                RuntimeToolExecutionBinding {
+                    action_id: Some("fake-artifact"),
+                    ..binding
+                },
+            )
+            .await
+            .expect("structured rejection");
+        let rejected: harness_contract::agent_action::AgentActionObservation =
+            serde_json::from_str(&rejected).expect("artifact rejection");
+        assert_eq!(
+            rejected.status,
+            harness_contract::agent_action::AgentActionStatus::Rejected
+        );
+        assert_eq!(
+            rejected.error.expect("error").code,
+            "artifact_content_not_durable"
+        );
+    }
+
+    #[test]
+    fn successful_gateway_file_fact_has_typed_identity_and_digest() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        std::fs::write(services.workspace_root().join("identity.txt"), "checked")
+            .expect("workspace fixture");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "typed-receipt".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"identity.txt"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.category = runtime::ToolSafetyCategory::ReadOnly;
+        request.governed_plan_revision = 7;
+        request.observation_wave_sequence = 7;
+        let output = serde_json::json!({
+            "type": "text",
+            "truncated": false,
+            "file": {
+                "filePath": services.workspace_root().join("identity.txt"),
+                "content": "checked",
+                "numLines": 1,
+                "startLine": 1,
+                "totalLines": 1,
+                "sha256": format!("{:x}", Sha256::digest(b"checked")),
+                "byteLength": 7
+            }
+        })
+        .to_string();
+        let observed = gateway_observed_evidence(
+            &executor,
+            &request,
+            &output,
+            "gateway-tool:test:7:typed-receipt",
+        );
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].observed_at_sequence, 7);
+        assert!(matches!(
+            &observed[0].target,
+            harness_contract::context::EvidenceTargetIdentity::Workspace { scope }
+                if scope.path.workspace_relative_path == "identity.txt"
+                    && scope.path.observed_revision_or_digest.is_some()
+        ));
+        request.tool_name = "unrelated_tool".to_string();
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &output,
+            "gateway-tool:test:7:unrelated",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn gateway_windowed_read_never_mints_exact_content_evidence() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        std::fs::write(
+            services.workspace_root().join("windowed.txt"),
+            "one\ntwo\nthree",
+        )
+        .expect("workspace fixture");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "windowed-read".to_string(),
+                tool_name: "read_file".to_string(),
+                input: r#"{"path":"windowed.txt","offset":1,"limit":1}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.category = runtime::ToolSafetyCategory::ReadOnly;
+        let base = serde_json::json!({
+            "type": "text",
+            "file": {
+                "filePath": services.workspace_root().join("windowed.txt"),
+                "content": "two",
+                "numLines": 1,
+                "startLine": 2,
+                "totalLines": 3,
+                "sha256": format!("{:x}", Sha256::digest(b"one\ntwo\nthree")),
+                "byteLength": 13
+            }
+        });
+        let mut truncated = base.clone();
+        truncated["truncated"] = serde_json::Value::Bool(true);
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &truncated.to_string(),
+            "gateway-tool:test:windowed-truncated",
+        )
+        .is_empty());
+
+        let mut offset = base;
+        offset["truncated"] = serde_json::Value::Bool(false);
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &offset.to_string(),
+            "gateway-tool:test:windowed-offset",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn successful_gateway_edit_fact_hashes_exact_result_without_rereading_disk() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        std::fs::write(
+            services.workspace_root().join("edit.txt"),
+            "alpha beta alpha",
+        )
+        .expect("workspace fixture");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "typed-edit-receipt".to_string(),
+                tool_name: "edit_file".to_string(),
+                input: r#"{"path":"edit.txt"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.category = runtime::ToolSafetyCategory::WriteLocal;
+        request.governed_plan_revision = 9;
+        request.observation_wave_sequence = 9;
+        let output = serde_json::json!({
+            "filePath": services.workspace_root().join("edit.txt"),
+            "oldString": "alpha",
+            "newString": "omega",
+            "originalFile": "alpha beta alpha",
+            "structuredPatch": [],
+            "userModified": false,
+            "replaceAll": false,
+            "gitDiff": null
+        })
+        .to_string();
+        std::fs::write(services.workspace_root().join("edit.txt"), "different now")
+            .expect("concurrent fixture");
+
+        let observed = gateway_observed_evidence(
+            &executor,
+            &request,
+            &output,
+            "gateway-tool:test:9:typed-edit-receipt",
+        );
+        let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
+            &observed[0].target
+        else {
+            panic!("workspace evidence expected");
+        };
+        let expected = format!("{:x}", Sha256::digest(b"omega beta alpha"));
+        assert_eq!(
+            scope.path.observed_revision_or_digest.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            observed[0].workspace_prior_state,
+            Some(harness_contract::context::WorkspacePriorState::Existing {
+                sha256: format!("{:x}", Sha256::digest(b"alpha beta alpha")),
+            })
+        );
+    }
+
+    #[test]
+    fn gateway_write_receipt_distinguishes_attested_absence_from_existing_preimage() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let mut request = runtime::RuntimeToolExecutionRequest::from_tool_request(
+            &runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "typed-write-receipt".to_string(),
+                tool_name: "write_file".to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+        );
+        request.observation_wave_sequence = 10;
+
+        let created = serde_json::json!({
+            "type": "create",
+            "filePath": services.workspace_root().join("created.txt"),
+            "content": "created",
+            "originalFile": null
+        });
+        let created =
+            gateway_observed_evidence(&executor, &request, &created.to_string(), "created");
+        assert_eq!(
+            created[0].workspace_prior_state,
+            Some(harness_contract::context::WorkspacePriorState::Absent)
+        );
+
+        let updated = serde_json::json!({
+            "type": "update",
+            "filePath": services.workspace_root().join("updated.txt"),
+            "content": "after",
+            "originalFile": "before"
+        });
+        let updated =
+            gateway_observed_evidence(&executor, &request, &updated.to_string(), "updated");
+        assert_eq!(
+            updated[0].workspace_prior_state,
+            Some(harness_contract::context::WorkspacePriorState::Existing {
+                sha256: format!("{:x}", Sha256::digest(b"before")),
+            })
+        );
+
+        let ambiguous = serde_json::json!({
+            "type": "create",
+            "filePath": services.workspace_root().join("ambiguous.txt"),
+            "content": "after",
+            "originalFile": "unreadable-is-not-absent"
+        });
+        assert!(gateway_observed_evidence(
+            &executor,
+            &request,
+            &ambiguous.to_string(),
+            "ambiguous",
+        )
+        .is_empty());
+    }
+
+    use serde_json::json;
+    use tools::permissions::PermissionMode as ToolPermissionMode;
+    use tools::RuntimeToolDefinition;
+

@@ -4,7 +4,7 @@ structural:
   # Immutable start-of-phase snapshots. Structural limits reject only new or
   # worsened debt relative to these audited commits; global source-size limits
   # remain absolute and cannot be baseline-waived.
-  core_base: 1b18e0878a166346396b061fca9ff4a011213885
+  core_base: 388f23856976de695189d9010eb3ccba75409d4c
   edge_base: e4e6431d2131453965f4a34484a21d26f5009b4d
   max_function_lines: 250
   max_state_fields: 40

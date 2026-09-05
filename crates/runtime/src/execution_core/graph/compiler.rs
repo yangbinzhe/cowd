@@ -237,9 +237,7 @@ const fn work_role(kind: ExecutionNodeKind) -> ExecutionWorkRole {
         ExecutionNodeKind::ToolBatch | ExecutionNodeKind::Materialize => ExecutionWorkRole::Tool,
         ExecutionNodeKind::Verify | ExecutionNodeKind::Approval => ExecutionWorkRole::Verify,
         ExecutionNodeKind::Synthesize => ExecutionWorkRole::Synthesize,
-        ExecutionNodeKind::AgentTask | ExecutionNodeKind::Subgraph => {
-            ExecutionWorkRole::EvidenceAnalyze
-        }
+        ExecutionNodeKind::AgentTask => ExecutionWorkRole::EvidenceAnalyze,
         ExecutionNodeKind::InlineModel
         | ExecutionNodeKind::SessionDispatch
         | ExecutionNodeKind::Timer => ExecutionWorkRole::Plan,

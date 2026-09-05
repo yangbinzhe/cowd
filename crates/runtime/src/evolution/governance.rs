@@ -15,7 +15,6 @@ use harness_contract::{
         EvaluationStoppingReason,
     },
     reality::EvidenceRef,
-    team::{TeamTemplateDefinitionId, TeamTemplateRevisionRef},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -73,9 +72,6 @@ pub enum EvolutionCandidateSubject {
     AgentDefinition {
         revision_ref: AgentDefinitionRevisionRef,
     },
-    TeamTemplate {
-        revision_ref: TeamTemplateRevisionRef,
-    },
 }
 
 /// Immutable comparison origin selected and verified by Runtime. A newly
@@ -115,11 +111,6 @@ impl EvolutionCandidateSubject {
                 revision_ref.definition_id.as_str(),
                 revision_ref.revision
             ),
-            Self::TeamTemplate { revision_ref } => format!(
-                "team-template:{}@{}",
-                revision_ref.template_id.as_str(),
-                revision_ref.revision
-            ),
         }
     }
 
@@ -129,22 +120,18 @@ impl EvolutionCandidateSubject {
             Self::AgentDefinition { revision_ref } => {
                 revision_ref.definition_id.as_str().to_string()
             }
-            Self::TeamTemplate { revision_ref } => revision_ref.template_id.as_str().to_string(),
         }
     }
 
     /// Logical release target without a revision. Candidate subjects are
     /// revision-specific so evidence remains attributable, whereas pointer
     /// generations and Canary exclusivity are properties of the underlying
-    /// Agent/Team definition.
+    /// Agent definition.
     #[must_use]
     pub fn release_target_ref(&self) -> String {
         match self {
             Self::AgentDefinition { revision_ref } => {
                 format!("agent-definition:{}", revision_ref.definition_id.as_str())
-            }
-            Self::TeamTemplate { revision_ref } => {
-                format!("team-template:{}", revision_ref.template_id.as_str())
             }
         }
     }
@@ -1481,10 +1468,7 @@ impl EvolutionGovernanceService {
     ) -> Result<Vec<EvolutionGovernanceCandidate>, EvolutionGovernanceError> {
         let mut refreshed = Vec::new();
         for candidate in self.list_candidates()? {
-            let EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject
-            else {
-                continue;
-            };
+            let EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject;
             let Ok(assignment) = self.active_canary_assignment(&candidate) else {
                 continue;
             };
@@ -1899,10 +1883,7 @@ impl EvolutionGovernanceService {
         }
         let mut selected = Vec::new();
         for candidate in self.list_candidates()? {
-            let EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject
-            else {
-                continue;
-            };
+            let EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject;
             if &revision_ref.definition_id != definition_id {
                 continue;
             }
@@ -1944,10 +1925,7 @@ impl EvolutionGovernanceService {
         for candidate in self.list_candidates()? {
             let EvolutionCandidateSubject::AgentDefinition {
                 revision_ref: candidate_revision,
-            } = &candidate.subject
-            else {
-                continue;
-            };
+            } = &candidate.subject;
             if candidate_revision != revision_ref {
                 continue;
             }
@@ -1971,10 +1949,7 @@ impl EvolutionGovernanceService {
         let candidate = self.candidate(candidate_id)?;
         let EvolutionCandidateSubject::AgentDefinition {
             revision_ref: candidate_revision,
-        } = &candidate.subject
-        else {
-            return Err(EvolutionGovernanceError::CanaryPrerequisiteRequired);
-        };
+        } = &candidate.subject;
         if candidate_revision != revision_ref
             || !candidate
                 .evaluation_contract
@@ -1991,80 +1966,6 @@ impl EvolutionGovernanceService {
             return Err(EvolutionGovernanceError::CanaryPrerequisiteRequired);
         }
         Ok(())
-    }
-
-    /// Deterministically select a Team Template Canary using the exact same
-    /// ledger and rollout policy as Agent Bindings. The Team graph compiler
-    /// consumes the returned assignment and records its chosen revision
-    /// before any graph is started; Gateway never performs this routing.
-    pub(crate) fn select_team_canary_assignment(
-        &self,
-        template_id: &TeamTemplateDefinitionId,
-        selector: &RevisionSelector,
-        routing_identity: &str,
-    ) -> Result<Option<EvolutionReleaseAssignment>, EvolutionGovernanceError> {
-        if matches!(selector, RevisionSelector::ExactApprovedRevision { .. }) {
-            return Ok(None);
-        }
-        let mut selected = Vec::new();
-        for candidate in self.list_candidates()? {
-            let EvolutionCandidateSubject::TeamTemplate { revision_ref } = &candidate.subject
-            else {
-                continue;
-            };
-            if &revision_ref.template_id != template_id {
-                continue;
-            }
-            if let Ok(assignment) = self.active_canary_assignment(&candidate) {
-                selected.push((candidate, assignment));
-            }
-        }
-        if selected.len() > 1 {
-            return Err(EvolutionGovernanceError::ActiveCanaryAlreadyExists);
-        }
-        let Some((candidate, assignment)) = selected.pop() else {
-            return Ok(None);
-        };
-        let policy = assignment
-            .canary_policy
-            .as_ref()
-            .ok_or(EvolutionGovernanceError::CanaryPrerequisiteRequired)?;
-        let digest = Sha256::digest(format!(
-            "{}|{}|{}|{}",
-            template_id.as_str(),
-            subject_revision(&candidate.subject).unwrap_or_default(),
-            assignment.assignment_id,
-            routing_identity
-        ));
-        let bucket = u16::from_be_bytes([digest[0], digest[1]]) % 10_000;
-        Ok((bucket < policy.traffic_basis_points).then_some(assignment))
-    }
-
-    /// Fences Team graph admission after a `StopCanary` decision. A graph
-    /// already started retains its immutable Template revision; only a newly
-    /// admitted Team instantiation is rejected.
-    pub(crate) fn validate_team_canary_binding(
-        &self,
-        revision_ref: &TeamTemplateRevisionRef,
-        assignment_id: &str,
-        generation: u64,
-    ) -> Result<(), EvolutionGovernanceError> {
-        for candidate in self.list_candidates()? {
-            let EvolutionCandidateSubject::TeamTemplate {
-                revision_ref: candidate_revision,
-            } = &candidate.subject
-            else {
-                continue;
-            };
-            if candidate_revision != revision_ref {
-                continue;
-            }
-            let assignment = self.active_canary_assignment(&candidate)?;
-            if assignment.assignment_id == assignment_id && assignment.generation == generation {
-                return Ok(());
-            }
-        }
-        Err(EvolutionGovernanceError::CanaryPrerequisiteRequired)
     }
 
     fn current_release_generation(
@@ -2541,7 +2442,6 @@ fn subject_ref(subject: &EvolutionCandidateSubject) -> RuntimeEventRef {
 fn subject_revision(subject: &EvolutionCandidateSubject) -> Option<u64> {
     Some(match subject {
         EvolutionCandidateSubject::AgentDefinition { revision_ref } => revision_ref.revision,
-        EvolutionCandidateSubject::TeamTemplate { revision_ref } => revision_ref.revision,
     })
 }
 fn event(
@@ -2808,20 +2708,6 @@ mod tests {
             evidence_refs: vec![EvidenceRef::observed("evaluation", "paired-1")],
             created_at_ms: now_ms(),
         }
-    }
-
-    fn team_candidate() -> EvolutionGovernanceCandidate {
-        let mut candidate = candidate();
-        candidate.candidate_id = "team-candidate-v2".to_string();
-        candidate.subject = EvolutionCandidateSubject::TeamTemplate {
-            revision_ref: TeamTemplateRevisionRef::new(
-                TeamTemplateDefinitionId::try_from("workspace/cowd/research-team").unwrap(),
-                2,
-            )
-            .unwrap(),
-        };
-        candidate.canary_policy.traffic_basis_points = 10_000;
-        candidate
     }
 
     #[test]
@@ -3243,10 +3129,7 @@ mod tests {
             )
             .expect("canary decision")
             .expect("canary assignment");
-        let revision_ref = match &candidate.subject {
-            EvolutionCandidateSubject::AgentDefinition { revision_ref } => revision_ref,
-            EvolutionCandidateSubject::TeamTemplate { .. } => unreachable!("agent fixture"),
-        };
+        let EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject;
         service
             .validate_agent_canary_binding(revision_ref, &canary.assignment_id, canary.generation)
             .expect("active canary binding is valid");
@@ -3440,92 +3323,6 @@ mod tests {
                 "second canary must not overlap".to_string(),
             ),
             Err(EvolutionGovernanceError::ActiveCanaryAlreadyExists)
-        ));
-    }
-
-    #[test]
-    fn team_canary_routes_deterministically_and_stop_fences_new_graphs() {
-        let service = service();
-        let candidate = service
-            .create_candidate(team_candidate())
-            .expect("candidate");
-        let mut report = eligible_report();
-        report.candidate_id = candidate.candidate_id.clone();
-        report.report_id = "report-team-v2".to_string();
-        report.evaluation_contract_digest = candidate.evaluation_contract_digest();
-        report.subject_ref = candidate.subject.subject_ref();
-        service.record_comparison(report).expect("comparison");
-        let review = service
-            .request_canary_review(&candidate.candidate_id)
-            .expect("canary review");
-        let principal = crate::security::test_human_interactive_principal();
-        let lease = crate::security::test_verified_decision_lease(
-            &review.review_id,
-            release_action_key(review.action),
-            review.subject.scope_ref(),
-            review_digest(&review),
-        );
-        let assignment = service
-            .decide_review(
-                &principal,
-                &lease,
-                &review.review_id,
-                ReleaseChangeReviewDecision::Approve,
-                "team canary".to_string(),
-            )
-            .expect("decision")
-            .expect("assignment");
-        let EvolutionCandidateSubject::TeamTemplate { revision_ref } = &candidate.subject else {
-            unreachable!("team fixture");
-        };
-        let selected = service
-            .select_team_canary_assignment(
-                &revision_ref.template_id,
-                &RevisionSelector::LatestApprovedStable,
-                "team-routing-identity",
-            )
-            .expect("select")
-            .expect("100% fixture policy would select");
-        service
-            .validate_team_canary_binding(
-                revision_ref,
-                &assignment.assignment_id,
-                assignment.generation,
-            )
-            .expect("active Team Canary binding");
-        assert_eq!(selected.assignment_id, assignment.assignment_id);
-        let stop = service
-            .request_release_change(ReleaseChangeRequest {
-                request_id: "stop-team-candidate-v2".to_string(),
-                subject: candidate.subject.clone(),
-                action: ReleaseChangeAction::StopCanary,
-                selector: None,
-                candidate_id: Some(candidate.candidate_id.clone()),
-                evidence_refs: vec![EvidenceRef::observed("incident", "team-canary")],
-            })
-            .expect("stop review");
-        let stop_lease = crate::security::test_verified_decision_lease(
-            &stop.review_id,
-            release_action_key(stop.action),
-            stop.subject.scope_ref(),
-            review_digest(&stop),
-        );
-        service
-            .decide_review(
-                &principal,
-                &stop_lease,
-                &stop.review_id,
-                ReleaseChangeReviewDecision::Approve,
-                "stop Team Canary".to_string(),
-            )
-            .expect("stop decision");
-        assert!(matches!(
-            service.validate_team_canary_binding(
-                revision_ref,
-                &assignment.assignment_id,
-                assignment.generation,
-            ),
-            Err(EvolutionGovernanceError::CanaryPrerequisiteRequired)
         ));
     }
 

@@ -162,7 +162,7 @@ fn discover_mcp_tool_definitions_once(
 }
 
 pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition> {
-    vec![
+    let mut definitions = vec![
         RuntimeToolDefinition {
             name: "lark_cli_read".to_string(),
             description: Some(
@@ -345,158 +345,14 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
             effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
         RuntimeToolDefinition {
-            name: "runtime_orchestrate".to_string(),
-            description: Some(
-                "Inspect Runtime state or propose, revise, and control a semantic Mission graph. The model selects only capability recipes and dependencies; Runtime owns physical nodes, executors, definitions, leases, approval and execution. Use this Team path only for an explicitly selected catalog template; proposal.nodes[].focuses must list the catalog role_ids that the semantic Team activates. For a user-named Team or user-named roles, use submit_collaboration_decision instead: it is the sole turn-scoped custom-Team admission path and does not publish a template. max_parallel_agents limits simultaneously runnable instances, not total graph nodes. Shared network/resource infrastructure is valid when focus objectives and evidence responsibilities remain distinct. Use runtime_capabilities(detail=orchestration_options) first when effective limits or templates are uncertain.".to_string(),
-            ),
-            input_schema: runtime_orchestration_input_schema(),
-            required_permission: ToolPermissionMode::ReadOnly,
-            effect_resolver: runtime_effect_resolver("runtime.orchestration"),
-        },
-        RuntimeToolDefinition {
-            name: harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
-                .to_string(),
-            description: Some(
-                "Submit the initial semantic collaboration decision for this user turn. Use it for all user-named, turn-scoped Teams: one workstream is one Team and its optional template contains the complete arbitrary role topology, display names, typed behavior and directed role dependencies. Each role's required_capabilities must fit one runnable Agent profile, not union Team-wide abilities. Baseline profiles are [read], [read,search], [read,search,network], and [read,search,write,test]; split network research from workspace mutation and omit required_skills unless the exact reference came from runtime_capabilities(detail=agent_catalog). Keep the wire payload compact: do not copy the user's prose into objective, reason, instructions, responsibilities, or acceptance; use concise identifiers and only semantic fields needed for admission. Runtime validates and freezes the snapshot without catalog publication. Runtime owns physical graph nodes, permissions, resources, approvals, recovery and terminal state. Do not use this for inspect, revision, catalog template publication, or control."
-                    .to_string(),
-            ),
-            input_schema: collaboration_decision_input_schema(),
-            required_permission: ToolPermissionMode::ReadOnly,
-            effect_resolver: runtime_effect_resolver("runtime.orchestration"),
-        },
-        RuntimeToolDefinition {
-            name: "request_collaboration_escalation".to_string(),
-            description: Some(
-                "At a managed-Agent safe checkpoint, request one additional bounded Team from the parent Collaboration Program. Runtime attests the caller identity and attempt, derives the current Program revision and idempotency digest, and may accept or reject the request. This tool never creates a child root graph or grants new permissions.".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "reason": { "type": "string", "minLength": 1 },
-                    "evidence_refs": { "type": "array", "items": { "type": "object" } },
-                    "requested_add_team": {
-                        "type": "object",
-                        "properties": {
-                            "semantic_node_id": { "type": "string", "minLength": 1 },
-                            "objective": { "type": "string", "minLength": 1 },
-                            "depends_on": { "type": "array", "items": { "type": "string" } },
-                            "resource_scopes": { "type": "array", "items": { "type": "string" } },
-                            "output_artifacts": { "type": "array", "items": { "type": "string" } },
-                            "evidence_contract": { "type": "array", "items": { "type": "string" } },
-                            "required": { "type": "boolean", "default": true },
-                            "parallelism_hint": { "type": "integer", "minimum": 1 }
-                        },
-                        "required": ["semantic_node_id", "objective"],
-                        "additionalProperties": false
-                    },
-                    "template_proposal": {
-                        "type": "object",
-                        "description": "Optional semantic custom-Team template. Runtime compiles it into a parent Program-bound ephemeral snapshot and never publishes it to the shared catalog."
-                    }
-                },
-                "required": ["reason", "requested_add_team"],
-                "additionalProperties": false
-            }),
-            required_permission: ToolPermissionMode::ReadOnly,
-            effect_resolver: runtime_effect_resolver("runtime.collaboration_escalation"),
-        },
-        RuntimeToolDefinition {
-            name: "team_board".to_string(),
-            description: Some(
-                "Publish or retrieve bounded semantic Team working-state checkpoints. Runtime binds the caller's Team, role, Agent instance and graph; raw private reasoning and arbitrary topology are rejected. First call read_after with after_revision: 0, then publish with expected_revision equal to the returned latest revision (including 0 for an empty board); publish also requires kind and summary. Use the returned entry_id as team-board:<entry_id> when collaboration_control submit requires a durable submission_ref.".to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "operation": { "type": "string", "enum": ["publish", "read_after", "read_exact"] },
-                    "expected_revision": { "type": "integer", "minimum": 0, "description": "Required for publish: the latest revision returned by read_after/read_exact; use 0 only when the board is empty." },
-                    "kind": {
-                        "type": "string",
-                        "enum": ["finding", "evidence", "decision", "conflict", "unresolved", "blocker", "user_intervention", "artifact", "proposal", "question", "challenge", "response", "resolution"]
-                    },
-                    "summary": { "type": "string" },
-                    "refs": { "type": "array", "items": { "type": "string" } },
-                    "artifact_refs": { "type": "array", "items": { "type": "string" } },
-                    "visibility": { "type": "string", "enum": ["team", "role", "private"] },
-                    "after_revision": { "type": "integer", "minimum": 0, "description": "For the initial bounded board read use 0; the response returns the latest revision for a later publish CAS." },
-                    "exact_revision": { "type": "integer", "minimum": 1 }
-                    ,"thread": {
-                        "type": "object",
-                        "properties": {
-                            "thread_id": { "type": "string", "minLength": 1 },
-                            "reply_to_entry_id": { "type": "string", "minLength": 1 },
-                            "response_required": { "type": "boolean", "default": false },
-                            "resolves_entry_ids": { "type": "array", "items": { "type": "string" } }
-                        },
-                        "required": ["thread_id"],
-                        "additionalProperties": false
-                    }
-                },
-                "required": ["operation"],
-                "additionalProperties": false
-            }),
-            // Publish is a bounded Runtime-state mutation, not a workspace
-            // file effect. The executor still requires an immutable Team
-            // binding and revision CAS, while read-only Teams remain able to
-            // exchange findings and close their collaboration loop.
-            required_permission: ToolPermissionMode::ReadOnly,
-            effect_resolver: runtime_effect_resolver("runtime.team_board"),
-        },
-        RuntimeToolDefinition {
-            name: "collaboration_control".to_string(),
-            description: Some(
-                "Inspect the Team work marketplace; propose bounded new work; bid on another Agent's proposal; or claim, heartbeat, release, submit, accept, and challenge work. Runtime derives Agent identity, role, capabilities, Team graph and clock from the immutable binding. Use inspect before mutations, propose_work with a stable idempotency key, and bid before claiming Agent-proposed work. submission_ref must be this Agent's durable tool evidence ref or `team-board:<entry_id>` from its own published board result."
-                    .to_string(),
-            ),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "operation": { "type": "string", "enum": ["inspect", "propose_work", "bid", "claim", "heartbeat", "release", "submit", "accept", "challenge"] },
-                    "expected_revision": { "type": "integer", "minimum": 0 },
-                    "expected_work_revision": { "type": "integer", "minimum": 0, "description": "Per-work CAS fence returned by inspect; required for mutations and allows unrelated work items to commit concurrently." },
-                    "work_node_id": { "type": "string", "minLength": 1 },
-                    "claim_token": { "type": "string", "minLength": 1 },
-                    "lease_duration_ms": { "type": "integer", "minimum": 5000, "maximum": 300000 },
-                    "submission_ref": { "type": "string", "minLength": 1 },
-                    "finding": { "type": "string", "minLength": 1, "maxLength": 4000 },
-                    "rationale": { "type": "string", "minLength": 1, "maxLength": 1000 },
-                    "estimated_cost": { "type": "integer", "minimum": 0, "maximum": 1000000 },
-                    "proposal": {
-                        "type": "object",
-                        "properties": {
-                            "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 160 },
-                            "objective": { "type": "string", "minLength": 1, "maxLength": 2000 },
-                            "role": { "type": "string", "enum": ["plan", "tool", "evidence_analyze", "cross_check", "synthesize", "verify"] },
-                            "required_capabilities": { "type": "array", "maxItems": 16, "description": "Exact native tool ids required from a bidder's immutable Agent binding; omit when no extra tool capability is needed.", "items": { "type": "string", "minLength": 1 } },
-                            "input_artifact_refs": { "type": "array", "maxItems": 32, "items": { "type": "string", "minLength": 1 } },
-                            "output_artifact_kinds": { "type": "array", "minItems": 1, "maxItems": 16, "items": { "type": "string", "minLength": 1 } },
-                            "evidence_refs": { "type": "array", "maxItems": 32, "items": { "type": "string", "minLength": 1 } },
-                            "expected_input_tokens": { "type": "integer", "minimum": 0, "maximum": 500000 },
-                            "expected_output_tokens": { "type": "integer", "minimum": 0, "maximum": 500000 },
-                            "expected_duration_ms": { "type": "integer", "minimum": 0, "maximum": 3600000 },
-                            "scheduling_priority": { "type": "integer", "minimum": 0, "maximum": 255 }
-                        },
-                        "required": ["idempotency_key", "objective", "role", "output_artifact_kinds"],
-                        "additionalProperties": false
-                    }
-                },
-                "required": ["operation"],
-                "additionalProperties": false
-            }),
-            required_permission: ToolPermissionMode::ReadOnly,
-            // Internal graph-control request: Runtime attests the Agent and
-            // applies per-work CAS. It grants no workspace/external effect.
-            effect_resolver: runtime_effect_resolver("runtime.collaboration_escalation"),
-        },
-        RuntimeToolDefinition {
             name: "evidence_retrieve".to_string(),
             description: Some(
-                "Retrieve selected chunks from an immutable tool evidence reference returned by a prior tool receipt. Use a focused query when the raw result is large.".to_string(),
+                "Retrieve selected chunks from an immutable tool:// evidence receipt or artifact:// content reference. Use this before independent review; use a focused query when the content is large.".to_string(),
             ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "evidence_ref": { "type": "string", "description": "tool:// evidence reference from a prior receipt" },
+                    "evidence_ref": { "type": "string", "description": "tool:// evidence reference or artifact:// content reference" },
                     "query": { "type": "string", "description": "Optional FTS query; omit to read the first chunks" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 16 }
                 },
@@ -506,119 +362,98 @@ pub(crate) fn runtime_capability_tool_definitions() -> Vec<RuntimeToolDefinition
             required_permission: ToolPermissionMode::ReadOnly,
             effect_resolver: runtime_effect_resolver("runtime.readonly"),
         },
+    ];
+    definitions.extend(agent_action_tool_definitions());
+    definitions
+}
+
+fn agent_action_tool_definitions() -> Vec<RuntimeToolDefinition> {
+    use harness_contract::agent_action as action;
+
+    vec![
+        agent_action_definition::<action::StateInspectInput>(
+            action::STATE_INSPECT_TOOL_ID,
+            "Inspect the current Program, Team, roster, work, topic and artifact facts. Runtime binds the Objective, Program and actor; provide only an optional scope reference and cursor.",
+        ),
+        agent_action_definition::<action::TeamCreateInput>(
+            action::TEAM_CREATE_TOOL_ID,
+            "Create one Team from a semantic name and mission. Runtime creates identity, roster, topic, revision and receipt. Do not submit roles, graph nodes, dependencies or artifact contracts here.",
+        ),
+        agent_action_definition::<action::AgentInviteInput>(
+            action::AGENT_INVITE_TOOL_ID,
+            "Invite one Agent into an existing Team by role mission and capabilities. Runtime resolves the concrete Agent definition, identity, permissions and execution binding.",
+        ),
+        agent_action_definition::<action::TaskPublishInput>(
+            action::TASK_PUBLISH_TOOL_ID,
+            "Publish one bounded semantic Task to a Team work market. Dependencies are existing Task references only; Runtime owns scheduling, leases and physical execution.",
+        ),
+        agent_action_definition::<action::TaskClaimInput>(
+            action::TASK_CLAIM_TOOL_ID,
+            "Claim one available Task. Runtime derives the caller identity and checks roster, capabilities, dependencies and lease state.",
+        ),
+        agent_action_definition::<action::TaskReleaseInput>(
+            action::TASK_RELEASE_TOOL_ID,
+            "Release the caller's current Task claim with a semantic reason so another eligible Agent can continue.",
+        ),
+        agent_action_definition::<action::TaskSupersedeInput>(
+            action::TASK_SUPERSEDE_TOOL_ID,
+            "Retire failed or challenged work in favor of concrete successor Tasks. Supply one replacement Task reference, or multiple references for a split, plus durable evidence and a reason. Retirement preserves failure history and never counts as accepted work.",
+        ),
+        agent_action_definition::<action::TaskSubmitInput>(
+            action::TASK_SUBMIT_TOOL_ID,
+            "Submit one claimed Task using committed artifact and evidence references. Long result content must be committed separately, never embedded in this action.",
+        ),
+        agent_action_definition::<action::TaskReviewInput>(
+            action::TASK_REVIEW_TOOL_ID,
+            "Independently accept, challenge or request rework for one submitted Task using a concise reason and evidence references.",
+        ),
+        agent_action_definition::<action::MessagePublishInput>(
+            action::MESSAGE_PUBLISH_TOOL_ID,
+            "Publish a concise Team/Program update or a reference to committed long content. This is shared semantic communication, not private chain-of-thought.",
+        ),
+        agent_action_definition::<action::ArtifactCommitInput>(
+            action::ARTIFACT_COMMIT_TOOL_ID,
+            "Commit a staged model content part or existing content reference as a versioned artifact. Use content_ref=preceding_content only when ordinary model content immediately precedes this tool call; never put the content body in JSON.",
+        ),
+        agent_action_definition::<action::ObjectiveCompleteRequestInput>(
+            action::OBJECTIVE_COMPLETE_REQUEST_TOOL_ID,
+            "Request Objective verification using a committed final artifact, evidence references and explicit unresolved items. The Supervisor alone decides terminal success.",
+        ),
     ]
 }
 
-fn runtime_orchestration_input_schema() -> serde_json::Value {
-    let mut schema = serde_json::to_value(schemars::schema_for!(
-        harness_contract::orchestration::ModelRuntimeOrchestrationInput
-    ))
-    .expect("runtime orchestration model contract schema must serialize");
-    // Guidance-only, deliberately relaxed: every field is described, nothing
-    // is enforced by the schema. The Runtime normalizer accepts wrapped JSON,
-    // map/array roles, string ceilings, group/string dependencies, and ignores
-    // extra fields. A strict embedded schema previously made models refuse to
-    // call the tool at all.
-    schema["properties"]["template_proposal"] = serde_json::json!({
-        "type": "object",
-        "description": "Structured turn-scoped custom Team template proposal. For one Team put the template fields directly here. For multiple named Teams use {teams:[{node_id,template}, ...]}; every Team node must be bound exactly once. Every field below is guidance; Runtime accepts tolerant variants and validates after admission.",
-        "properties": {
-            "teams": {
-                "type": "array",
-                "description": "Multiple custom Team bindings. Each item has the semantic Team node_id and its complete template object; this is not catalog publication.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "node_id": { "type": "string" },
-                        "template": { "type": "object", "additionalProperties": true }
-                    },
-                    "required": ["node_id", "template"],
-                    "additionalProperties": true
-                }
-            },
-            "template_id": {
-                "type": "string",
-                "description": "Publish-local template id, e.g. cross-team-collaborative-decision. Scope prefixes (cowd/, workspace/, user/) are accepted and normalized."
-            },
-            "name": { "type": "string", "description": "Template name shown in the catalog." },
-            "team_display_name": {
-                "type": "string",
-                "description": "Human-facing Team name shown in the UI."
-            },
-            "role_display_names": {
-                "type": "array",
-                "description": "Optional [{role_id, display_name}] overrides.",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "role_id": { "type": "string" },
-                        "display_name": { "type": "string" }
-                    }
-                }
-            },
-            "roles": {
-                "type": "array",
-                "description": "One object per role. Required semantic fields: role_id, responsibility, behavior. behavior is one or more typed facets, for example [{kind:reacquire_evidence,required:true}] or [{kind:reducer,mode:finally},{kind:upstream_consumption,required:true},{kind:terminal_candidate,required:true}]. Runtime freezes those facets and never infers them from a role name, graph position, or result field. Other fields: display_name (UI only), team (business/technical/convergence), grant_ceiling (array of read/search/write/test/network, or a string like workspace-read-write), agent_definition_ref (optional exact id from agent_catalog; omit/null for a safe default), fixed_count/min_count/max_count (positive integers), acceptance (array of strings). Extra fields are tolerated.",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": true
-                }
-            },
-            "dependencies": {
-                "type": ["array", "object", "string"],
-                "description": "Role-level edges or group memberships. Accepted: [{from, to}], [{\"group\": [role_id, ...]}], {\"group\": [role_id, ...]}, [\"from -> to\"], or \"from -> to\". Runtime normalizes every form."
-            },
-            "result_fields": {
-                "type": "array",
-                "description": "Required result fields of the final synthesis; include summary and evidence.",
-                "items": { "type": "string" }
-            },
-            "evidence_required": { "type": "boolean" },
-            "instructions": {
-                "type": "string",
-                "description": "Markdown instructions given to every Team role (e.g. team_board collaboration protocol)."
-            }
-        },
-        "additionalProperties": true
-    });
-    schema
-}
-
-fn collaboration_decision_input_schema() -> serde_json::Value {
-    let mut schema = serde_json::to_value(schemars::schema_for!(
-        harness_contract::orchestration::ModelCollaborationControlDecisionV2
-    ))
-    .expect("narrow collaboration decision schema must serialize");
-
-    // The V2 contract is generated from the single Rust owner above, but its
-    // field-level prose is deliberately not repeated in every Provider tool
-    // request.  DeepSeek and other OpenAI-compatible models receive the tool
-    // schema on every turn; duplicating several kilobytes of descriptions
-    // materially increases the model-visible prefix and makes a long semantic
-    // decision more likely to be truncated mid-string.  Guidance remains in
-    // the tool description and contract constant, while the wire schema keeps
-    // only executable JSON-Schema semantics.  This is a projection of the
-    // generated schema, not a second contract.
-    fn strip_non_semantic_metadata(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(object) => {
-                for key in ["description", "title", "default", "examples"] {
-                    object.remove(key);
-                }
-                for child in object.values_mut() {
-                    strip_non_semantic_metadata(child);
-                }
-            }
-            serde_json::Value::Array(items) => {
-                for item in items {
-                    strip_non_semantic_metadata(item);
-                }
-            }
-            _ => {}
-        }
+fn agent_action_definition<T: schemars::JsonSchema>(
+    name: &str,
+    description: &str,
+) -> RuntimeToolDefinition {
+    let mut input_schema = serde_json::to_value(schemars::schema_for!(T))
+        .unwrap_or_else(|_| json!({"type": "object", "additionalProperties": false}));
+    // Optimistic concurrency is part of every Agent action contract.  Keep
+    // the domain payload small while still letting a model fence a mutation
+    // against the revision returned by state_inspect.
+    if let Some(properties) = input_schema
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        properties.insert(
+            "expected_revision".to_string(),
+            json!({
+                "type": "integer",
+                "minimum": 0,
+                "description": "Optional Program revision fence from the latest state_inspect receipt"
+            }),
+        );
     }
-    strip_non_semantic_metadata(&mut schema);
-    schema
+    RuntimeToolDefinition {
+        name: name.to_string(),
+        description: Some(description.to_string()),
+        input_schema,
+        // Collaboration-journal mutations do not directly alter the user
+        // workspace or external systems. Concrete tools invoked by an Agent
+        // retain their own workspace/danger authorization gates.
+        required_permission: ToolPermissionMode::ReadOnly,
+        effect_resolver: runtime_effect_resolver("runtime.agent_action"),
+    }
 }
 
 pub(crate) fn mcp_runtime_tool_definition(tool: &runtime::ManagedMcpTool) -> RuntimeToolDefinition {
@@ -818,121 +653,25 @@ mod tests {
             .as_deref()
             .is_some_and(|description| description.contains("not MCP resources")));
 
-        let collaboration_control = tools
-            .iter()
-            .find(|tool| tool.name == "collaboration_control")
-            .expect("binding-attested collaboration control tool");
+        for action_id in harness_contract::agent_action::AGENT_ACTION_TOOL_IDS {
+            let action = tools
+                .iter()
+                .find(|tool| tool.name == *action_id)
+                .unwrap_or_else(|| panic!("missing Agent action `{action_id}`"));
+            assert_eq!(action.required_permission, ToolPermissionMode::ReadOnly);
+            assert_eq!(action.effect_resolver.resolver_id, "runtime.agent_action");
+            assert_eq!(action.input_schema["additionalProperties"], false);
+            assert_eq!(
+                action.input_schema["properties"]["expected_revision"]["type"],
+                "integer"
+            );
+        }
         assert_eq!(
-            collaboration_control.required_permission,
-            ToolPermissionMode::ReadOnly
-        );
-        let control_schema = collaboration_control.input_schema.to_string();
-        assert!(control_schema.contains("expected_work_revision"));
-        assert!(!control_schema.contains("agent_instance_id"));
-        assert!(!control_schema.contains("team_id"));
-        assert!(!control_schema.contains("graph_id"));
-        assert!(!control_schema.contains("role_id"));
-
-        let orchestration_tool = tools
-            .iter()
-            .find(|tool| tool.name == "runtime_orchestrate")
-            .expect("runtime orchestration tool");
-        let collaboration_decision_tool = tools
-            .iter()
-            .find(|tool| {
-                tool.name == harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
-            })
-            .expect("narrow collaboration decision tool");
-        assert!(collaboration_decision_tool.input_schema["properties"]
-            .get("workstreams")
-            .is_some());
-        assert!(collaboration_decision_tool.input_schema["properties"]
-            .get("proposal")
-            .is_none());
-        assert!(collaboration_decision_tool.input_schema["properties"]
-            .get("input_disposition")
-            .is_none());
-        assert!(collaboration_decision_tool.input_schema["properties"]
-            .get("schema_version")
-            .is_some());
-        let collaboration_schema = collaboration_decision_tool.input_schema.to_string();
-        assert!(!collaboration_schema.contains("agent_definition_ref"));
-        assert!(!collaboration_schema.contains("grant_ceiling"));
-        assert!(!collaboration_schema.contains("RoleBehaviorFacet"));
-        assert!(!collaboration_schema.contains("\"behavior\""));
-        let semantic_node =
-            &orchestration_tool.input_schema["$defs"]["ModelGraphSemanticNode"]["properties"];
-        assert!(
-            orchestration_tool.input_schema["$defs"]["ModelGraphSemanticNode"]["required"]
-                .as_array()
-                .is_some_and(|required| {
-                    required
-                        .iter()
-                        .any(|field| field == "managed_agent_escalation")
-                }),
-            "the model must explicitly select the managed escalation policy"
-        );
-        assert!(
-            orchestration_tool.input_schema["$defs"]["ManagedAgentEscalationRequirement"]["oneOf"]
-                .as_array()
-                .is_some_and(|variants| {
-                    ["none", "required"].into_iter().all(|expected| {
-                        variants.iter().any(|variant| {
-                            variant["const"] == expected
-                                || variant["enum"].as_array().is_some_and(|values| {
-                                    values.iter().any(|value| value == expected)
-                                })
-                        })
-                    })
-                }),
-            "the escalation policy must be a compact typed enum, not optional prose"
-        );
-        assert_eq!(semantic_node["required"]["type"], "boolean");
-        assert!(semantic_node["required"]["description"]
-            .as_str()
-            .is_some_and(|description| description.contains("Defaults to true")));
-        assert!(
-            orchestration_tool.input_schema["$defs"]["ExecutionDependencyPolicy"]["oneOf"]
-                .as_array()
-                .is_some_and(|variants| variants
-                    .iter()
-                    .any(|variant| { variant["properties"]["mode"]["const"] == "quorum" }))
-        );
-        assert_eq!(semantic_node["cancellation_group"]["type"][0], "string");
-        assert!(
-            orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]
-                ["roles"]
-                .is_object(),
-            "the model must receive the typed Team template proposal contract"
-        );
-        assert_eq!(
-            orchestration_tool.input_schema["properties"]["template_proposal"]["properties"]
-                ["dependencies"]["type"],
-            serde_json::json!(["array", "object", "string"]),
-            "dependency guidance must stay relaxed so models never refuse the tool"
-        );
-
-        let escalation_tool = tools
-            .iter()
-            .find(|tool| tool.name == "request_collaboration_escalation")
-            .expect("managed-Agent escalation tool");
-        assert_eq!(
-            escalation_tool.required_permission,
-            ToolPermissionMode::ReadOnly
-        );
-        assert_eq!(
-            escalation_tool.effect_resolver.resolver_id,
-            "runtime.collaboration_escalation"
-        );
-        assert_eq!(
-            escalation_tool.input_schema["required"],
-            json!(["reason", "requested_add_team"])
-        );
-        assert!(
-            escalation_tool.input_schema["properties"]["requested_add_team"]
-                ["additionalProperties"]
-                .as_bool()
-                .is_some_and(|value| !value)
+            tools
+                .iter()
+                .filter(|tool| tool.effect_resolver.resolver_id == "runtime.agent_action")
+                .count(),
+            harness_contract::agent_action::AGENT_ACTION_TOOL_IDS.len()
         );
 
         let evidence_tool = tools
@@ -944,6 +683,17 @@ mod tests {
             ToolPermissionMode::ReadOnly
         );
         assert_eq!(evidence_tool.input_schema["required"][0], "evidence_ref");
+        assert_eq!(
+            evidence_tool.input_schema["properties"]["query"]["type"],
+            "string"
+        );
+        assert_eq!(
+            evidence_tool.input_schema["properties"]["limit"]["maximum"],
+            16
+        );
+        assert!(evidence_tool.input_schema["properties"]
+            .get("selector")
+            .is_none());
     }
 
     #[test]

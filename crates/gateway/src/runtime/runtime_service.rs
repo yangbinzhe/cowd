@@ -47,8 +47,12 @@ fn normalize_configured_model(model: Option<String>) -> Option<String> {
 #[path = "tests/mod.rs"]
 mod tests;
 
+#[path = "session_control.rs"]
+mod session_control;
 #[path = "session_materializer.rs"]
 mod session_materializer;
+
+use session_control::{parse_session_approval_control, surface_actor_from_classification};
 
 #[derive(Debug)]
 pub(crate) enum RuntimeTurnExecutionError {
@@ -1036,12 +1040,21 @@ impl RuntimeService {
         }
         let mission = mission_port.projection();
         let execution = self.session_execution_index(session_id);
+        let teams = self
+            .runtime_services()
+            .agent_action_service()
+            .list_programs()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|program| program.session_id == session_id)
+            .flat_map(|program| program.teams.into_values())
+            .collect::<Vec<_>>();
         Some(serde_json::json!({
             "kind": "session_input.progress",
             "session_id": session_id,
             "mission": mission.aggregate,
             "execution": execution,
-            "teams": mission.team_projection,
+            "teams": teams,
             "agents": mission.agent_projection,
             "approvals": mission.approval_projection,
             "health": mission.health_projection,
@@ -1640,19 +1653,14 @@ impl RuntimeService {
                 .resolve_requested_cancellation(&requested.cancellation_id)
                 .map_err(|error| error.to_string())?;
         }
-        let durable_cancelled = cancellation.as_ref().is_some_and(|receipt| {
-            receipt.status == harness_contract::turn::CancellationStatus::Cancelled
-                || (receipt.status == harness_contract::turn::CancellationStatus::Requested
-                    && self
-                        .runtime_services
-                        .execution_live(&graph_id)
-                        .is_some_and(|live| {
-                            live.status
-                                == harness_contract::projection::ExecutionLiveStatus::Cancelled
-                        }))
-        });
+        let durable_cancelled = cancellation_is_terminal(
+            cancellation.as_ref(),
+            self.runtime_services.as_ref(),
+            &graph_id,
+        );
         if durable_cancelled {
-            let cancelled = cancellation.expect("checked cancellation receipt");
+            let cancelled =
+                require_cancel(cancellation, "durable cancellation receipt disappeared")?;
             self.bind_primary_ingress_projection(record, &graph_id)
                 .await;
             self.cancel_primary_ingress_projection(
@@ -1879,19 +1887,16 @@ impl RuntimeService {
                 .resolve_requested_cancellation(&requested.cancellation_id)
                 .map_err(|error| error.to_string())?;
         }
-        if cancellation_after_control.as_ref().is_some_and(|receipt| {
-            receipt.status == harness_contract::turn::CancellationStatus::Cancelled
-                || (receipt.status == harness_contract::turn::CancellationStatus::Requested
-                    && self
-                        .runtime_services
-                        .execution_live(&graph_id)
-                        .is_some_and(|live| {
-                            live.status
-                                == harness_contract::projection::ExecutionLiveStatus::Cancelled
-                        }))
-        }) {
+        if cancellation_is_terminal(
+            cancellation_after_control.as_ref(),
+            self.runtime_services.as_ref(),
+            &graph_id,
+        ) {
             cancellation_token.cancel();
-            let receipt = cancellation_after_control.expect("checked cancellation receipt");
+            let receipt = require_cancel(
+                cancellation_after_control,
+                "cancellation receipt disappeared after control",
+            )?;
             self.bind_primary_ingress_projection(record, &graph_id)
                 .await;
             self.cancel_primary_ingress_projection(
@@ -2684,27 +2689,37 @@ impl RuntimeService {
         );
         carriers.extend(
             self.runtime_services()
-                .team_runtime()
-                .list()
+                .agent_action_service()
+                .list_programs()
                 .unwrap_or_default()
                 .into_iter()
-                .map(|snapshot| {
-                    let status = upgrade_team_status(snapshot.status.as_str());
-                    upgrade_carrier_record(
-                        "team",
-                        snapshot.team_id.clone(),
-                        status,
-                        snapshot.graph_revision,
-                        snapshot
-                            .terminal_result
-                            .as_ref()
-                            .map(|result| result.result_ref.clone()),
-                        Some(format!(
-                            "mission://session/{}/team/{}",
-                            snapshot.session_id, snapshot.team_id
-                        )),
-                        &snapshot,
-                    )
+                .flat_map(|program| {
+                    let status = upgrade_agentic_program_status(program.status);
+                    let revision = program.revision;
+                    let result_ref = program.final_artifact_ref.clone();
+                    let session_id = program.session_id.clone();
+                    let program_id = program.program_id.clone();
+                    program.teams.into_values().map(move |team| {
+                        let snapshot = serde_json::json!({
+                            "program_id": program_id,
+                            "session_id": session_id,
+                            "revision": revision,
+                            "status": status,
+                            "team": team,
+                        });
+                        upgrade_carrier_record(
+                            "agentic_team",
+                            team.team_id.clone(),
+                            status,
+                            revision,
+                            result_ref.clone(),
+                            Some(format!(
+                                "agentic-program://{program_id}/team/{}",
+                                team.team_id
+                            )),
+                            &snapshot,
+                        )
+                    })
                 }),
         );
         carriers.extend(self.sessions.list().into_iter().map(|session_id| {
@@ -4915,6 +4930,27 @@ fn upgrade_carrier_record(
     }
 }
 
+fn require_cancel(
+    receipt: Option<harness_contract::turn::CancellationReceipt>,
+    invariant: &str,
+) -> Result<harness_contract::turn::CancellationReceipt, String> {
+    receipt.ok_or_else(|| invariant.to_string())
+}
+
+fn cancellation_is_terminal(
+    receipt: Option<&harness_contract::turn::CancellationReceipt>,
+    services: &runtime::RuntimeServices,
+    graph_id: &str,
+) -> bool {
+    receipt.is_some_and(|receipt| {
+        receipt.status == harness_contract::turn::CancellationStatus::Cancelled
+            || (receipt.status == harness_contract::turn::CancellationStatus::Requested
+                && services.execution_live(graph_id).is_some_and(|live| {
+                    live.status == harness_contract::projection::ExecutionLiveStatus::Cancelled
+                }))
+    })
+}
+
 fn upgrade_agent_status(
     status: &harness_contract::agent::AgentStatus,
 ) -> runtime::UpgradeCarrierStatus {
@@ -4934,70 +4970,15 @@ fn upgrade_agent_status(
     }
 }
 
-fn upgrade_team_status(status: &str) -> runtime::UpgradeCarrierStatus {
+fn upgrade_agentic_program_status(
+    status: runtime::AgenticProgramStatus,
+) -> runtime::UpgradeCarrierStatus {
     match status {
-        "planned" => runtime::UpgradeCarrierStatus::Ready,
-        "running" => runtime::UpgradeCarrierStatus::Running,
-        "paused" => runtime::UpgradeCarrierStatus::Paused,
-        "waiting" | "review_required" => runtime::UpgradeCarrierStatus::Waiting,
-        "completed" => runtime::UpgradeCarrierStatus::Completed,
-        "cancelled" => runtime::UpgradeCarrierStatus::Cancelled,
-        "failed" => runtime::UpgradeCarrierStatus::Failed,
-        "blocked" => runtime::UpgradeCarrierStatus::Blocked,
-        _ => runtime::UpgradeCarrierStatus::Blocked,
-    }
-}
-
-struct SessionApprovalControl {
-    approval_id: Option<String>,
-    approved: bool,
-    skip: bool,
-    scope: runtime::ApprovalGrantScope,
-}
-
-fn parse_session_approval_control(content: &str) -> Option<SessionApprovalControl> {
-    let tokens = content.split_whitespace().collect::<Vec<_>>();
-    let command = tokens.first()?.to_ascii_lowercase();
-    let (approved, skip) = match command.as_str() {
-        "/approve" | "approve" | "批准" | "同意" => (true, false),
-        "/deny" | "deny" | "拒绝" => (false, false),
-        "/skip" | "skip" | "跳过" => (false, true),
-        _ => return None,
-    };
-    let mut approval_id = None;
-    let mut scope = runtime::ApprovalGrantScope::Once;
-    for token in tokens.iter().skip(1) {
-        let normalized = token.to_ascii_lowercase();
-        let parsed_scope = match normalized.as_str() {
-            "once" | "本次" => Some(runtime::ApprovalGrantScope::Once),
-            "turn" | "本轮" | "回合" => Some(runtime::ApprovalGrantScope::Turn),
-            "task" | "任务" => Some(runtime::ApprovalGrantScope::Task),
-            "session" | "会话" => Some(runtime::ApprovalGrantScope::Session),
-            "global" | "全局" => Some(runtime::ApprovalGrantScope::Global),
-            _ => None,
-        };
-        if let Some(parsed_scope) = parsed_scope {
-            scope = parsed_scope;
-        } else if approval_id.is_none() {
-            approval_id = Some((*token).to_string());
+        runtime::AgenticProgramStatus::Open => runtime::UpgradeCarrierStatus::Running,
+        runtime::AgenticProgramStatus::CompletionRequested => {
+            runtime::UpgradeCarrierStatus::Waiting
         }
+        runtime::AgenticProgramStatus::Verified => runtime::UpgradeCarrierStatus::Completed,
+        runtime::AgenticProgramStatus::Blocked => runtime::UpgradeCarrierStatus::Blocked,
     }
-    Some(SessionApprovalControl {
-        approval_id,
-        approved,
-        skip,
-        scope,
-    })
-}
-
-fn surface_actor_from_classification(classification_json: Option<&str>) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(classification_json?).ok()?;
-    let surface = value
-        .pointer("/metadata/surface")
-        .and_then(serde_json::Value::as_str)?;
-    let user = value
-        .pointer("/metadata/user_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("bound-user");
-    Some(format!("surface:{surface}:{user}"))
 }

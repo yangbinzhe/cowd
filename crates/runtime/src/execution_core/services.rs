@@ -19,9 +19,6 @@ use harness_contract::execution::ExecutionIdentity;
 use harness_contract::execution_graph::{
     ExecutionGraph, ExecutionGraphCommand, ExecutionNodeKind, ExecutionNodeStatus,
 };
-use harness_contract::team::{
-    TeamInstantiationRequest, TeamSelectionMode, TeamTemplateRevisionRef, TeamTemplateSelector,
-};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -29,11 +26,10 @@ use thiserror::Error;
 use super::cross_plane::{CrossPlaneRuntimeError, CrossPlaneRuntimeService};
 use super::goal::{GoalStore, ObjectiveSupervisor};
 use super::graph::{
-    aggregate_team_leaf_usage,
     executors::{
-        AgentTaskExecutor, ApprovalNodeExecutor, CompileTargetGuardExecutor,
-        MaterializeNodeExecutor, ScopedNodeExecutor, SynthesizeNodeExecutor, TeamSubgraphExecutor,
-        VerifyNodeExecutor,
+        AgentTaskExecutor, AgenticProgramWaitExecutor, ApprovalNodeExecutor,
+        CompileTargetGuardExecutor, MaterializeNodeExecutor, ScopedNodeExecutor,
+        SynthesizeNodeExecutor, VerifyNodeExecutor,
     },
     ExecutionCommitService, ExecutionGraphRunner, ExecutionGraphStateStore, ExecutionRecoveryError,
     ExecutionResourceKind, ExecutionResourceManager, ExecutionRunnerError, ExecutionServiceClass,
@@ -57,7 +53,7 @@ use crate::{
     MissionScheduleStore, ProcessJsonlAdapter, RealityRecallPort, RuntimeDefinitionRegistry,
     RuntimeEventReplayer, RuntimeEventScope, RuntimeEventStore, RuntimeSessionOutboxFailureClass,
     RuntimeSessionOutboxHealth, RuntimeSessionOutboxRecord, SessionInputRouter,
-    SessionRelationGraph, TeamResultReducer, TeamRuntime,
+    SessionRelationGraph,
 };
 
 #[path = "composition.rs"]
@@ -277,9 +273,10 @@ impl RuntimeMaintenanceSupervisor {
 
                 if let Some(existing) = state.owners.get_mut(&owner) {
                     if existing.queued.len() < MAX_QUEUED_MAINTENANCE_PER_OWNER {
-                        existing
-                            .queued
-                            .push_back(pending_work.take().expect("maintenance work is pending"));
+                        let Some(work) = pending_work.take() else {
+                            return false;
+                        };
+                        existing.queued.push_back(work);
                         return true;
                     }
                     true
@@ -292,7 +289,9 @@ impl RuntimeMaintenanceSupervisor {
                     let worker_changed = Arc::clone(&self.changed);
                     let completion_tx = self.completion_tx.clone();
                     let worker_owner = owner.clone();
-                    let initial_work = pending_work.take().expect("maintenance work is pending");
+                    let Some(initial_work) = pending_work.take() else {
+                        return false;
+                    };
                     let (start_tx, start_rx) = tokio::sync::oneshot::channel();
                     let handle = tokio::spawn(async move {
                         if start_rx.await.is_err() {
@@ -317,9 +316,9 @@ impl RuntimeMaintenanceSupervisor {
                                 if let Some(next) = entry.queued.pop_front() {
                                     (Some(next), None)
                                 } else {
-                                    let completed = state.owners.remove(&worker_owner).expect(
-                                        "maintenance owner exists while its worker is running",
-                                    );
+                                    let Some(completed) = state.owners.remove(&worker_owner) else {
+                                        return;
+                                    };
                                     state.reaping = state.reaping.saturating_add(1);
                                     (None, Some(completed))
                                 }
@@ -752,7 +751,6 @@ pub struct RuntimeServices {
     cross_plane_connector_executor: Arc<ScopedNodeExecutor>,
     agent_task_executor: Arc<AgentTaskExecutor>,
     agent_runtime: Arc<AgentRuntime>,
-    team_runtime: Arc<TeamRuntime>,
     l4_promotion_service: Arc<crate::L4PromotionService>,
     knowledge_candidate_projector: Arc<crate::KnowledgeCandidateProjector>,
     outcome_service: Arc<crate::execution_core::OutcomeService>,
@@ -800,6 +798,10 @@ pub struct RuntimeServices {
     memory_manager: Option<Arc<memory::CognitiveContextManager>>,
     evolution_eval_runner: Option<Arc<dyn crate::EvolutionEvalRunner>>,
     evolution_evaluation_flights: Arc<Mutex<BTreeSet<String>>>,
+    /// Runtime-instance single-flight for Agent-first physical dispatch. The
+    /// durable task claim remains the cross-process owner; this local fence
+    /// only suppresses duplicate reconcilers inside this service graph.
+    agentic_dispatch_flights: Arc<Mutex<BTreeSet<String>>>,
     skill_catalog: Arc<RwLock<crate::RuntimeSkillCatalog>>,
     reality_recall_port: Arc<RealityRecallPort>,
     knowledge_activation: crate::knowledge_activation::KnowledgeActivationRuntime,
@@ -1097,10 +1099,6 @@ impl RuntimeServices {
             workspace_root.clone(),
         ));
         let synthesize_executor = Arc::new(SynthesizeNodeExecutor::new());
-        synthesize_executor.install_resolver(Arc::new(TeamResultReducer::new(
-            graph_state_store.clone(),
-            Arc::clone(&agent_runtime),
-        )));
         synthesize_executor.install_resolver(Arc::new(ProtocolResultReducer::new(
             graph_state_store.clone(),
             Arc::clone(&agent_runtime),
@@ -1233,6 +1231,11 @@ impl RuntimeServices {
                 graph_runner,
                 &execution_capacity_profile,
             ));
+        executor_registry.register(Arc::new(AgenticProgramWaitExecutor::new(
+            crate::AgentActionService::new(Arc::clone(&event_store)),
+            graph_state_store.clone(),
+            Arc::downgrade(&execution_supervisor),
+        )))?;
         tool_execution_plane.bind_supervisor(&execution_supervisor);
         let deadline_supervisor = Arc::clone(&execution_supervisor);
         let deadline_approval_coordinator = Arc::clone(&approval_coordinator);
@@ -1254,30 +1257,6 @@ impl RuntimeServices {
             MissionRuntime::event_sourced(Arc::clone(&event_store), workspace_key.clone())
                 .map_err(RuntimeServicesError::Mission)?,
         );
-        let task_runtime_port = crate::TaskRuntimePort::from_components(
-            Arc::clone(&task_aggregate_service),
-            Arc::clone(&mission_runtime),
-            Arc::clone(&event_store),
-            graph_state_store.clone(),
-            Arc::clone(&session_execution_policy_controls),
-            Arc::clone(&session_execution_policy_admission_blocks),
-        );
-        let team_runtime = Arc::new(TeamRuntime::new(
-            Arc::clone(&execution_supervisor),
-            graph_state_store.clone(),
-            Arc::clone(&agent_runtime),
-            Arc::clone(&event_store),
-            Arc::clone(&definition_registry),
-            Arc::clone(&evolution_governance),
-            workspace_key.clone(),
-            Arc::clone(&path_identity_resolver),
-            task_runtime_port,
-            Arc::clone(&mission_runtime),
-        ));
-        executor_registry.register(Arc::new(TeamSubgraphExecutor::new(
-            Arc::downgrade(&team_runtime),
-            Arc::downgrade(&execution_supervisor),
-        )))?;
         let l4_session_policy_lookup = {
             let controls = Arc::clone(&session_execution_policy_controls);
             Arc::new(move |session_id: &str| {
@@ -1330,17 +1309,32 @@ impl RuntimeServices {
         });
         let mission_evidence = Arc::new(MissionEvidenceBus::new(Arc::clone(&event_store)));
         projection_lanes.extend([
-            knowledge_candidate_projector.projection_lane(),
-            outcome_projector.projection_lane(),
-            mission_evidence.projection_lane(),
-            evolution_signal_projector.projection_lane(),
-            skill_maintenance_projector.projection_lane(),
+            knowledge_candidate_projector
+                .projection_lane()
+                .map_err(RuntimeServicesError::Invariant)?,
+            outcome_projector
+                .projection_lane()
+                .map_err(RuntimeServicesError::Invariant)?,
+            mission_evidence
+                .projection_lane()
+                .map_err(RuntimeServicesError::Invariant)?,
+            evolution_signal_projector
+                .projection_lane()
+                .map_err(RuntimeServicesError::Invariant)?,
+            skill_maintenance_projector
+                .projection_lane()
+                .map_err(RuntimeServicesError::Invariant)?,
         ]);
-        projection_lanes.push(child_execution_resolution_lane(
+        projection_lanes.push(agentic_settled_graph_resolution_lane(
             Arc::clone(&event_store),
             graph_state_store.clone(),
             Arc::clone(&execution_supervisor),
-        ));
+        )?);
+        projection_lanes.push(agentic_program_wait_resolution_lane(
+            Arc::clone(&event_store),
+            graph_state_store.clone(),
+            Arc::clone(&execution_supervisor),
+        )?);
         let event_reactor = Arc::new(
             crate::RuntimeEventReactor::sealed(Arc::clone(&event_store), projection_lanes)
                 .map_err(RuntimeServicesError::Invariant)?,
@@ -1398,7 +1392,6 @@ impl RuntimeServices {
             cross_plane_connector_executor,
             agent_task_executor,
             agent_runtime,
-            team_runtime,
             l4_promotion_service,
             knowledge_candidate_projector,
             outcome_service,
@@ -1449,6 +1442,7 @@ impl RuntimeServices {
             memory_manager,
             evolution_eval_runner,
             evolution_evaluation_flights: Arc::new(Mutex::new(BTreeSet::new())),
+            agentic_dispatch_flights: Arc::new(Mutex::new(BTreeSet::new())),
             skill_catalog: Arc::new(RwLock::new(skill_catalog)),
             reality_recall_port,
             knowledge_activation: knowledge_activation.unwrap_or_else(|| {
@@ -1485,96 +1479,31 @@ impl RuntimeServices {
     ) -> Result<(), RuntimeServicesError> {
         let managed_projection_store = self.graph_state_store.clone();
         let managed_projection_dispatcher = Arc::clone(&self.managed_agents);
-        let outcome_projection_store = self.graph_state_store.clone();
-        let settled_outcome_service = Arc::clone(&self.outcome_service);
         let settled_lineage_supervisor = Arc::clone(&self.execution_supervisor);
-        let settled_team_runtime = Arc::clone(&self.team_runtime);
-        let settled_objective_supervisor = Arc::clone(&self.objective_supervisor);
-        let services_weak = Arc::downgrade(self);
+        let settled_agentic_actions = self.agent_action_service();
         self.execution_supervisor
             .install_graph_settled_observer(move |graph_id| {
                 let graph_id = graph_id.to_string();
                 let graph_store = managed_projection_store.clone();
                 let dispatcher = Arc::clone(&managed_projection_dispatcher);
-                let outcome_store = outcome_projection_store.clone();
-                let outcome_service = Arc::clone(&settled_outcome_service);
                 let lineage_supervisor = Arc::clone(&settled_lineage_supervisor);
-                let coordinator_store = graph_store.clone();
-                let coordinator_supervisor = Arc::clone(&lineage_supervisor);
-                let coordinator_teams = Arc::clone(&settled_team_runtime);
-                let objective_supervisor = Arc::clone(&settled_objective_supervisor);
-                let services_weak = services_weak.clone();
+                let agentic_actions = settled_agentic_actions.clone();
                 tokio::spawn(async move {
-                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_program_wait_state_with(
+                    if let Err(error) = crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
                         &graph_id,
-                        coordinator_supervisor.as_ref(),
-                        &coordinator_store,
-                        coordinator_teams.as_ref(),
+                        &agentic_actions,
+                        &graph_store,
+                        lineage_supervisor.as_ref(),
                     )
                     .await
                     {
-                        tracing::warn!(graph_id, %error, "settled graph could not reconcile CollaborationProgram wait truth");
-                    }
-                    if let Err(error) = lineage_supervisor
-                        .wake_parent_for_settled_child(&graph_id)
-                        .await
-                    {
-                        tracing::warn!(graph_id, %error, "settled child graph could not wake its durable parent join");
+                        tracing::warn!(graph_id, %error, "settled Agent graph could not wake its Agentic Program root barrier");
                     }
                     if let Err(error) =
                         project_managed_invocation_terminal(graph_store, dispatcher, &graph_id)
                             .await
                     {
                         tracing::warn!(graph_id, error, "managed Agent terminal projector could not reduce graph state");
-                    }
-                    if let Err(error) =
-                        project_team_terminal_outcome(outcome_store, outcome_service, &graph_id)
-                            .await
-                    {
-                        tracing::warn!(graph_id, error, "Team terminal Outcome projector could not reduce graph state");
-                    }
-                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_terminal_program_with(
-                        &graph_id,
-                        coordinator_supervisor.as_ref(),
-                        &coordinator_store,
-                    )
-                    .await
-                    {
-                        tracing::warn!(graph_id, %error, "settled graph could not reconcile CollaborationProgram terminal truth");
-                    }
-                    if let Err(error) = crate::orchestration::collaboration_coordinator::reconcile_objective_from_program(
-                        &graph_id,
-                        objective_supervisor.as_ref(),
-                        &coordinator_store,
-                    )
-                    .await
-                    {
-                        tracing::warn!(graph_id, %error, "settled graph could not reconcile Objective truth");
-                    }
-                    // The settled durable event is the liveness trigger. A
-                    // user continuation can observe the same state, but is
-                    // never required to start objective recovery.
-                    let goal_id = if objective_supervisor
-                        .goal_store()
-                        .projection(&graph_id)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                    {
-                        graph_id.clone()
-                    } else {
-                        format!("goal:{graph_id}")
-                    };
-                    if let Some(services) = services_weak.upgrade() {
-                        if let Err(error) = crate::orchestration::collaboration_coordinator::execute_pending_objective_replan(
-                            &graph_id,
-                            &goal_id,
-                            &services,
-                        )
-                        .await
-                        {
-                            tracing::warn!(graph_id, %error, "settled graph could not activate Objective recovery");
-                        }
                     }
                 });
             })
@@ -1826,111 +1755,6 @@ impl RuntimeServices {
         &self.definition_registry
     }
 
-    /// Publishes an approved AI-authored Team template candidate. The
-    /// candidate is read from the durable approval-bound event stream, so a
-    /// human approval can be completed long after the proposing turn ended.
-    /// Publishing is idempotent through the definition store's revision
-    /// semantics.
-    pub fn publish_approved_template_candidate(
-        &self,
-        approval_id: &str,
-    ) -> Result<serde_json::Value, String> {
-        let request = self
-            .approval_queue()
-            .get(approval_id)
-            .ok_or_else(|| format!("approval_not_found: {approval_id}"))?;
-        if request.action != "definition.template.publish" {
-            return Err(format!(
-                "approval `{approval_id}` is not a template publish approval"
-            ));
-        }
-        if request.status != harness_contract::policy::ApprovalStatus::Approved {
-            return Err(format!("approval `{approval_id}` is not approved"));
-        }
-        let stream_id = format!("definition-template-candidate:{approval_id}");
-        let candidate_event = self
-            .event_store()
-            .list_stream(&stream_id)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|event| event.kind == "definition.template.candidate.v1")
-            .ok_or_else(|| format!("template candidate missing for approval {approval_id}"))?;
-        let mut manifest = serde_json::from_value::<harness_contract::team::TeamTemplateManifest>(
-            candidate_event
-                .payload
-                .get("manifest")
-                .cloned()
-                .unwrap_or_default(),
-        )
-        .map_err(|error| format!("decode template candidate manifest: {error}"))?;
-        // The candidate is compiled as Draft and becomes runnable only after
-        // this approval completes; the store refuses to resolve non-published
-        // revisions even with an active stable release assignment.
-        manifest.lifecycle = harness_contract::agent::RevisionLifecycle::Published;
-        let instructions = candidate_event
-            .payload
-            .get("instructions")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let stored = self
-            .definition_registry()
-            .teams()
-            .store_revision(manifest, &instructions)
-            .map_err(|error| format!("template_publish_failed: {error}"))?;
-        let scope = stored.revision.revision_ref.template_id.scope();
-        let authorization = harness_contract::agent::ReleaseAuthorization::HumanApproval {
-            approval_ref: format!("approval/{approval_id}"),
-        };
-        self.definition_registry()
-            .teams()
-            .record_release_assignment(&crate::team_definition::TeamReleaseAssignment {
-                scope,
-                revision_ref: stored.revision.revision_ref.clone(),
-                channel: harness_contract::agent::ReleaseChannel::Stable,
-                status: harness_contract::agent::ReleaseAssignmentStatus::Active,
-                authorization: authorization.clone(),
-                content_digest: stored.revision.content_digest.clone(),
-            })
-            .map_err(|error| format!("template_publish_failed: {error}"))?;
-        self.definition_registry()
-            .teams()
-            .set_default_pointer(&crate::team_definition::TeamDefaultPointer::latest(
-                scope,
-                stored.revision.revision_ref.template_id.clone(),
-                authorization,
-            ))
-            .map_err(|error| format!("template_publish_failed: {error}"))?;
-        let _ = self.event_store().append(crate::RuntimeEventInput {
-            stream_id,
-            scope: crate::RuntimeEventScope::Mission,
-            kind: "definition.template.published.v1".to_string(),
-            status: Some("published".to_string()),
-            actor: Some(approval_id.to_string()),
-            refs: vec![crate::RuntimeEventRef {
-                kind: "team_template".to_string(),
-                id: stored
-                    .revision
-                    .revision_ref
-                    .template_id
-                    .as_str()
-                    .to_string(),
-            }],
-            payload: serde_json::json!({
-                "approval_id": approval_id,
-                "template_id": stored.revision.revision_ref.template_id.as_str(),
-                "revision": stored.revision.revision_ref.revision,
-                "digest": stored.revision.content_digest,
-            }),
-        });
-        Ok(serde_json::json!({
-            "approval_id": approval_id,
-            "template_id": stored.revision.revision_ref.template_id.as_str(),
-            "revision": stored.revision.revision_ref.revision,
-            "content_digest": stored.revision.content_digest,
-        }))
-    }
-
     /// Rebuild the executable Agent index after a Definition release state
     /// changes. The operation replaces, rather than merges, cached entries so
     /// stopped or revoked Definitions cannot remain selectable.
@@ -1983,12 +1807,7 @@ impl RuntimeServices {
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
         if let Some(assignment) = selected_canary {
             let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } =
-                &assignment.subject
-            else {
-                return Err(RuntimeServicesError::Invariant(
-                    "agent Canary routing selected a non-Agent Definition subject".to_string(),
-                ));
-            };
+                &assignment.subject;
             let resolved = self
                 .definition_registry
                 .resolve_agent_canary(revision_ref)
@@ -2015,35 +1834,10 @@ impl RuntimeServices {
     /// where a catalog choice becomes an instance identity and data lease.
     pub fn compile_agent_task_intent(
         &self,
-        mut intent: AgentTaskIntent,
+        intent: AgentTaskIntent,
     ) -> Result<AgentTaskPacket, RuntimeServicesError> {
         let execution_identity = self.prepare_agent_task_intent(&intent)?;
         let policy_revision = self.canonical_task_policy_revision(&intent.task_id)?;
-        // Model-authored proposals occasionally omit the catalog identity even
-        // though Runtime has already admitted a typed Team role.  Recover only
-        // that narrow, authority-safe case: select exactly one approved catalog
-        // entry matching the role's granted capabilities.  Direct/untyped
-        // Agents remain fail-closed and still require an explicit Definition or
-        // catalog selection.
-        if intent.selected_agent_id.is_none()
-            && intent.definition_ref.is_none()
-            && intent.team_id.is_some()
-            && intent.team_role_identity.is_some()
-        {
-            let required = if intent.granted_capabilities.is_empty() {
-                vec!["read".to_string(), "search".to_string()]
-            } else {
-                intent
-                    .granted_capabilities
-                    .iter()
-                    .map(|capability| capability.as_str().to_string())
-                    .collect::<Vec<_>>()
-            };
-            let candidates = self.agent_runtime.catalog().discover(&required);
-            if candidates.len() == 1 {
-                intent.selected_agent_id = candidates.first().map(|entry| entry.agent_id.clone());
-            }
-        }
         let selected = intent
             .selected_agent_id
             .as_deref()
@@ -2275,6 +2069,152 @@ impl RuntimeServices {
     }
     pub(crate) fn event_store(&self) -> &Arc<RuntimeEventStore> {
         &self.event_store
+    }
+
+    /// Returns the single Agent-first collaboration mutation owner. The
+    /// service is a cheap handle over the workspace event journal; callers do
+    /// not receive direct event-store access.
+    #[must_use]
+    pub fn agent_action_service(&self) -> crate::AgentActionService {
+        crate::AgentActionService::new(Arc::clone(&self.event_store))
+            .with_artifact_store(Arc::clone(&self.artifact_store))
+    }
+
+    /// Ask the sole ObjectiveSupervisor to reduce one durable Agentic
+    /// completion request, then bind its GoalStore terminal back to Program.
+    /// Model/Gateway callers cannot supply or infer the verdict.
+    pub fn reconcile_agentic_completion_request(
+        &self,
+        program_id: &str,
+    ) -> Result<Option<crate::AgenticProgramProjection>, String> {
+        crate::agentic::supervision::reconcile_completion_request(
+            &self.agent_action_service(),
+            self.objective_supervisor.as_ref(),
+            program_id,
+        )
+    }
+
+    /// Resolve a delegated model's immutable Agent-first identity from the
+    /// graph packet supplied by Runtime. No identity or scope is accepted from
+    /// model-authored tool input.
+    pub async fn resolve_agent_action_actor(
+        &self,
+        parent: &harness_contract::execution_graph::ExecutionParentBinding,
+        trusted_root: Option<harness_contract::agent_action::AgentActorBinding>,
+    ) -> Result<harness_contract::agent_action::AgentActorBinding, String> {
+        let graph = self
+            .graph_state_store
+            .load_async(&parent.execution_id)
+            .await
+            .map_err(|error| format!("agent_actor_graph_load_failed:{error}"))?;
+        let node = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == parent.node_id)
+            .ok_or_else(|| "agent_actor_node_not_found".to_string())?;
+        if node.kind != harness_contract::execution_graph::ExecutionNodeKind::AgentTask {
+            let mut root =
+                trusted_root.ok_or_else(|| "agent_actor_node_is_not_agent_task".to_string())?;
+            let lineage = graph
+                .lineage
+                .as_ref()
+                .ok_or_else(|| "agent_actor_root_graph_has_no_lineage".to_string())?;
+            let objective_id = harness_contract::agent_action::root_objective_id(
+                &lineage.session_id,
+                &lineage.turn_id,
+            );
+            let program_id =
+                harness_contract::agent_action::program_id_for_objective(&objective_id);
+            if graph.parent_execution.is_some()
+                || root.kind != harness_contract::agent_action::AgentActorKind::Root
+                || root.session_id != lineage.session_id
+                || root.turn_id != lineage.turn_id
+                || root.objective_id != objective_id
+                || root.program_id != program_id
+                || root.root_execution_id.as_deref() != Some(parent.execution_id.as_str())
+                || root.actor_id != format!("root:{}", lineage.session_id)
+                || root.execution_id.is_some()
+                || root.team_id.is_some()
+                || root.agent_id.is_some()
+            {
+                return Err("agent_actor_root_binding_mismatch".to_string());
+            }
+
+            // The first accepted root action freezes the Program's semantic
+            // and authorization binding. Dynamic model/replan nodes may carry
+            // a refreshed decision snapshot, but they must never become a
+            // second source of truth for the same Program. Keep validating the
+            // immutable graph/session/turn identity above, then inherit the
+            // durable Program authority for every continuation action.
+            if let Some(program) = self
+                .agent_action_service()
+                .project_if_exists(&program_id)
+                .map_err(|error| format!("agent_actor_program_load_failed:{error}"))?
+            {
+                if program.objective_id != objective_id
+                    || program.session_id != lineage.session_id
+                    || program.turn_id != lineage.turn_id
+                    || program.root_execution_id.as_deref() != Some(parent.execution_id.as_str())
+                {
+                    return Err("agent_actor_program_binding_mismatch".to_string());
+                }
+                root.required_team_count = program.required_team_count;
+                root.objective_summary = program.objective_summary;
+                root.model_lease = program.model_lease;
+                root.permission_ceiling = Some(program.permission_ceiling);
+                root.resource_scopes = program.resource_scopes;
+            }
+            return Ok(root);
+        }
+        let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
+            .map_err(|error| format!("agent_actor_packet_invalid:{error}"))?;
+        let agentic_program_id = packet
+            .context_refs
+            .iter()
+            .find_map(|reference| reference.strip_prefix("agentic_program:"));
+        if let Some(program_id) = agentic_program_id {
+            let team_id = packet
+                .context_refs
+                .iter()
+                .find_map(|reference| reference.strip_prefix("agentic_team:"))
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "agent_actor_packet_has_no_agentic_team".to_string())?;
+            let agent_id = packet
+                .context_refs
+                .iter()
+                .find_map(|reference| reference.strip_prefix("agentic_member:"))
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "agent_actor_packet_has_no_agentic_member".to_string())?;
+            let projection = self
+                .agent_action_service()
+                .project(program_id)
+                .map_err(|error| format!("agent_actor_program_load_failed:{error}"))?;
+            let member = projection
+                .agents
+                .get(agent_id)
+                .ok_or_else(|| "agent_actor_is_not_in_program_roster".to_string())?;
+            if member.team_id != team_id {
+                return Err("agent_actor_agentic_team_mismatch".to_string());
+            }
+            return Ok(harness_contract::agent_action::AgentActorBinding {
+                objective_id: projection.objective_id,
+                program_id: program_id.to_string(),
+                session_id: projection.session_id,
+                turn_id: projection.turn_id,
+                root_execution_id: projection.root_execution_id,
+                required_team_count: projection.required_team_count,
+                objective_summary: projection.objective_summary,
+                model_lease: projection.model_lease,
+                permission_ceiling: Some(projection.permission_ceiling),
+                resource_scopes: projection.resource_scopes,
+                actor_id: agent_id.to_string(),
+                kind: harness_contract::agent_action::AgentActorKind::Agent,
+                execution_id: Some(parent.execution_id.clone()),
+                team_id: Some(team_id.to_string()),
+                agent_id: Some(agent_id.to_string()),
+            });
+        }
+        Err("agent_actor_packet_is_not_agent_first_bound".to_string())
     }
 
     /// Bind the live bus owned by one root Session execution. Nested Agents
@@ -2932,6 +2872,10 @@ impl RuntimeServices {
         &self.agent_runtime
     }
 
+    pub(crate) fn agentic_dispatch_flights(&self) -> Arc<Mutex<BTreeSet<String>>> {
+        Arc::clone(&self.agentic_dispatch_flights)
+    }
+
     /// Runtime-owned, immutable terminal run evidence. Consumers receive
     /// projections only and cannot amend a Definition's self-model directly.
     #[must_use]
@@ -2954,9 +2898,6 @@ impl RuntimeServices {
         self.evolution_governance
             .refresh_canary_observations_from_agent_runs(&self.agent_runtime.evaluations())
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
-    }
-    pub fn team_runtime(&self) -> &Arc<TeamRuntime> {
-        &self.team_runtime
     }
     pub fn verify_executor(&self) -> &Arc<VerifyNodeExecutor> {
         &self.verify_executor
@@ -3800,6 +3741,7 @@ impl RuntimeServices {
         self.session_journal_port.get().cloned()
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn session_application_port(
         &self,
@@ -3813,30 +3755,6 @@ impl RuntimeServices {
             .get()
             .and_then(|port| port.history_reader())
     }
-}
-
-fn ensure_team_evaluation_contract_noninferior(
-    baseline: &harness_contract::team::TeamTemplateManifest,
-    candidate: &harness_contract::team::TeamTemplateManifest,
-) -> Result<(), RuntimeServicesError> {
-    let baseline_result = &baseline.result_contract;
-    let candidate_result = &candidate.result_contract;
-    if (baseline.topology.require_synthesis && !candidate.topology.require_synthesis)
-        || (baseline.topology.require_review && !candidate.topology.require_review)
-        || (baseline_result.evidence_required && !candidate_result.evidence_required)
-        || (baseline_result.synthesis_required && !candidate_result.synthesis_required)
-        || baseline_result
-            .required_fields
-            .iter()
-            .any(|field| !candidate_result.required_fields.contains(field))
-        || !candidate.evaluation.is_noninferior_to(&baseline.evaluation)
-    {
-        return Err(RuntimeServicesError::Invariant(
-            "candidate Team Template weakens the baseline evaluation/result contract; submit a separate policy review"
-                .to_string(),
-        ));
-    }
-    Ok(())
 }
 
 /// Evaluation evidence must never create an untracked external side effect.
@@ -3887,15 +3805,141 @@ fn now_ms() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-const CHILD_EXECUTION_RESOLVER_PROJECTION_ID: &str = "runtime:child-execution-resolver:v1";
+const AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID: &str =
+    "runtime:agentic-settled-graph-resolver:v1";
+const AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID: &str =
+    "runtime:agentic-program-wait-resolver:v1";
 
-fn child_execution_resolution_lane(
+fn agentic_program_wait_resolution_lane(
     event_store: Arc<RuntimeEventStore>,
     graph_store: ExecutionGraphStateStore,
     supervisor: Arc<crate::RuntimeExecutionSupervisor>,
-) -> crate::RuntimeProjectionLane {
+) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
     let descriptor = crate::RuntimeProjectionDescriptor::new(
-        CHILD_EXECUTION_RESOLVER_PROJECTION_ID,
+        AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID,
+        crate::RuntimeProjectionInterest::new([
+            crate::RuntimeProjectionEventInterest::new(
+                RuntimeEventScope::Program,
+                "agentic.action_applied",
+            ),
+            crate::RuntimeProjectionEventInterest::new(
+                RuntimeEventScope::Program,
+                "agentic.objective_verdict_bound",
+            ),
+        ]),
+        256,
+        Duration::from_secs(5),
+    )
+    .map_err(RuntimeServicesError::Invariant)?;
+    Ok(crate::RuntimeProjectionLane::asynchronous(
+        descriptor,
+        move |batch_size| {
+            let event_store = Arc::clone(&event_store);
+            let graph_store = graph_store.clone();
+            let supervisor = Arc::clone(&supervisor);
+            Box::pin(async move {
+                let checkpoint = event_store
+                    .projection_checkpoint(AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID)
+                    .map_err(|error| error.to_string())?;
+                let source_cursor = checkpoint
+                    .as_ref()
+                    .map_or(0, |checkpoint| checkpoint.source_cursor);
+                let interest = crate::RuntimeProjectionInterest::new([
+                    crate::RuntimeProjectionEventInterest::new(
+                        RuntimeEventScope::Program,
+                        "agentic.action_applied",
+                    ),
+                    crate::RuntimeProjectionEventInterest::new(
+                        RuntimeEventScope::Program,
+                        "agentic.objective_verdict_bound",
+                    ),
+                ]);
+                let page = event_store
+                    .projection_scan_page(
+                        source_cursor,
+                        &interest,
+                        batch_size.max(1),
+                        10_000,
+                        16 * 1024 * 1024,
+                    )
+                    .map_err(|error| error.to_string())?;
+                if page.scanned_commits == 0 {
+                    return Ok(crate::RuntimeProjectionPass::default());
+                }
+                let mut program_ids = BTreeSet::new();
+                for batch in &page.batches {
+                    for event in &batch.events {
+                        if let Some(program_id) = event
+                            .payload
+                            .get("envelope")
+                            .and_then(|envelope| envelope.get("actor"))
+                            .and_then(|actor| actor.get("program_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| {
+                                event
+                                    .payload
+                                    .get("program_id")
+                                    .and_then(serde_json::Value::as_str)
+                            })
+                            .filter(|program_id| !program_id.trim().is_empty())
+                        {
+                            program_ids.insert(program_id.to_string());
+                        }
+                    }
+                }
+                let actions = crate::AgentActionService::new(Arc::clone(&event_store));
+                let objective_supervisor =
+                    crate::execution_core::goal::ObjectiveSupervisor::new(Arc::new(
+                        crate::execution_core::goal::GoalStore::new(Arc::clone(&event_store)),
+                    ));
+                let mut resolved = 0usize;
+                for program_id in &program_ids {
+                    crate::agentic::supervision::reconcile_completion_request(
+                        &actions,
+                        &objective_supervisor,
+                        program_id,
+                    )?;
+                    resolved = resolved.saturating_add(
+                        crate::execution_core::graph::executors::resolve_agentic_program_wait(
+                            program_id,
+                            &actions,
+                            &graph_store,
+                            supervisor.as_ref(),
+                            false,
+                        )
+                        .await?,
+                    );
+                }
+                let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
+                event_store
+                    .compare_and_put_projection_checkpoint(
+                        AGENTIC_PROGRAM_WAIT_RESOLVER_PROJECTION_ID,
+                        page.scanned_through_cursor,
+                        expected_revision,
+                        &serde_json::json!({
+                            "source_cursor": page.scanned_through_cursor,
+                            "programs": program_ids.len(),
+                            "resolved_waits": resolved,
+                        }),
+                        now_ms(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(
+                    crate::RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
+                        .with_matches(page.matched_events),
+                )
+            })
+        },
+    ))
+}
+
+fn agentic_settled_graph_resolution_lane(
+    event_store: Arc<RuntimeEventStore>,
+    graph_store: ExecutionGraphStateStore,
+    supervisor: Arc<crate::RuntimeExecutionSupervisor>,
+) -> Result<crate::RuntimeProjectionLane, RuntimeServicesError> {
+    let descriptor = crate::RuntimeProjectionDescriptor::new(
+        AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID,
         crate::RuntimeProjectionInterest::new([crate::RuntimeProjectionEventInterest::new(
             RuntimeEventScope::ExecutionNode,
             "execution_node.transitioned",
@@ -3903,87 +3947,97 @@ fn child_execution_resolution_lane(
         256,
         Duration::from_secs(5),
     )
-    .expect("child execution resolver descriptor is static and valid");
-    crate::RuntimeProjectionLane::asynchronous(descriptor, move |batch_size| {
-        let event_store = Arc::clone(&event_store);
-        let graph_store = graph_store.clone();
-        let supervisor = Arc::clone(&supervisor);
-        Box::pin(async move {
-            let checkpoint = event_store
-                .projection_checkpoint(CHILD_EXECUTION_RESOLVER_PROJECTION_ID)
-                .map_err(|error| error.to_string())?;
-            let source_cursor = checkpoint
-                .as_ref()
-                .map_or(0, |checkpoint| checkpoint.source_cursor);
-            let interest = crate::RuntimeProjectionInterest::new([
-                crate::RuntimeProjectionEventInterest::new(
-                    RuntimeEventScope::ExecutionNode,
-                    "execution_node.transitioned",
-                ),
-            ]);
-            let page = event_store
-                .projection_scan_page(
-                    source_cursor,
-                    &interest,
-                    batch_size.max(1),
-                    10_000,
-                    16 * 1024 * 1024,
-                )
-                .map_err(|error| error.to_string())?;
-            if page.scanned_commits == 0 {
-                return Ok(crate::RuntimeProjectionPass::default());
-            }
-            let mut touched_graphs = BTreeSet::new();
-            for batch in &page.batches {
-                for event in &batch.events {
-                    if let Some(graph_id) = event
-                        .payload
-                        .get("graph_id")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        touched_graphs.insert(graph_id.to_string());
+    .map_err(RuntimeServicesError::Invariant)?;
+    Ok(crate::RuntimeProjectionLane::asynchronous(
+        descriptor,
+        move |batch_size| {
+            let event_store = Arc::clone(&event_store);
+            let graph_store = graph_store.clone();
+            let supervisor = Arc::clone(&supervisor);
+            Box::pin(async move {
+                let checkpoint = event_store
+                    .projection_checkpoint(AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID)
+                    .map_err(|error| error.to_string())?;
+                let source_cursor = checkpoint
+                    .as_ref()
+                    .map_or(0, |checkpoint| checkpoint.source_cursor);
+                let interest = crate::RuntimeProjectionInterest::new([
+                    crate::RuntimeProjectionEventInterest::new(
+                        RuntimeEventScope::ExecutionNode,
+                        "execution_node.transitioned",
+                    ),
+                ]);
+                let page = event_store
+                    .projection_scan_page(
+                        source_cursor,
+                        &interest,
+                        batch_size.max(1),
+                        10_000,
+                        16 * 1024 * 1024,
+                    )
+                    .map_err(|error| error.to_string())?;
+                if page.scanned_commits == 0 {
+                    return Ok(crate::RuntimeProjectionPass::default());
+                }
+                let mut touched_graphs = BTreeSet::new();
+                for batch in &page.batches {
+                    for event in &batch.events {
+                        if let Some(graph_id) = event
+                            .payload
+                            .get("graph_id")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            touched_graphs.insert(graph_id.to_string());
+                        }
                     }
                 }
-            }
-            // Resolve from either side of the durable join. A fast child may
-            // terminal before the parent commits WaitingExternal; the later
-            // parent transition then discovers the same child via lineage.
-            for graph_id in &touched_graphs {
-                supervisor
-                    .wake_parent_for_settled_child(graph_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                for link in graph_store
-                    .child_links(graph_id)
-                    .map_err(|error| error.to_string())?
-                {
-                    supervisor
-                        .wake_parent_for_settled_child(&link.child_execution_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                }
-            }
-            // The checkpoint advances only after every matching join was
-            // either atomically resolved or proven inapplicable/terminal.
-            let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
-            event_store
-                .compare_and_put_projection_checkpoint(
-                    CHILD_EXECUTION_RESOLVER_PROJECTION_ID,
-                    page.scanned_through_cursor,
-                    expected_revision,
-                    &serde_json::json!({
-                        "source_cursor": page.scanned_through_cursor,
-                        "resolved_graphs": touched_graphs.len(),
-                    }),
-                    now_ms(),
+                // A graph may settle before or after its Program root commits the
+                // durable wait. Reconcile both the transitioned graph and its
+                // linked Agent children so either event order closes the barrier.
+                let actions = crate::AgentActionService::new(Arc::clone(&event_store));
+                for graph_id in &touched_graphs {
+                    crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
+                    graph_id,
+                    &actions,
+                    &graph_store,
+                    supervisor.as_ref(),
                 )
-                .map_err(|error| error.to_string())?;
-            Ok(
-                crate::RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
-                    .with_matches(page.matched_events),
-            )
-        })
-    })
+                .await?;
+                    for link in graph_store
+                        .child_links(graph_id)
+                        .map_err(|error| error.to_string())?
+                    {
+                        crate::execution_core::graph::executors::reconcile_agentic_program_wait_for_settled_graph(
+                        &link.child_execution_id,
+                        &actions,
+                        &graph_store,
+                        supervisor.as_ref(),
+                    )
+                    .await?;
+                    }
+                }
+                // The checkpoint advances only after every matching join was
+                // either atomically resolved or proven inapplicable/terminal.
+                let expected_revision = checkpoint.as_ref().map_or(0, |value| value.revision);
+                event_store
+                    .compare_and_put_projection_checkpoint(
+                        AGENTIC_SETTLED_GRAPH_RESOLVER_PROJECTION_ID,
+                        page.scanned_through_cursor,
+                        expected_revision,
+                        &serde_json::json!({
+                            "source_cursor": page.scanned_through_cursor,
+                            "resolved_graphs": touched_graphs.len(),
+                        }),
+                        now_ms(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(
+                    crate::RuntimeProjectionPass::scanned(page.scanned_commits, batch_size)
+                        .with_matches(page.matched_events),
+                )
+            })
+        },
+    ))
 }
 
 async fn project_managed_invocation_terminal(
@@ -4064,156 +4118,6 @@ async fn project_managed_invocation_terminal(
     }
 }
 
-async fn project_team_terminal_outcome(
-    graph_state_store: ExecutionGraphStateStore,
-    outcome_service: Arc<crate::execution_core::OutcomeService>,
-    graph_id: &str,
-) -> Result<(), String> {
-    let graph = match graph_state_store.load_async(graph_id).await {
-        Ok(graph) => graph,
-        Err(ExecutionStateStoreError::NotFound(_)) => return Ok(()),
-        Err(error) => return Err(error.to_string()),
-    };
-    if graph.node_statuses.is_empty()
-        || graph
-            .node_statuses
-            .values()
-            .any(|status| !status.is_terminal())
-    {
-        return Ok(());
-    }
-    let Some(packet) = graph
-        .nodes
-        .iter()
-        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-        .filter_map(|node| serde_json::from_str::<AgentTaskPacket>(&node.payload_ref).ok())
-        .find(|packet| packet.team_id().is_some())
-    else {
-        // Direct and Tool-only graphs are owned by the parent Turn Outcome;
-        // standalone Agent nodes emit their own Agent terminal Outcome.
-        return Ok(());
-    };
-    let team_id = packet
-        .team_id()
-        .ok_or_else(|| "Team graph has no team identity".to_string())?;
-    let identity = &packet.assignment.execution_identity;
-    let turn_id = identity
-        .turn_id()
-        .ok_or_else(|| "Team outcome has no canonical turn identity".to_string())?;
-    let has_failed = graph_has_status(&graph, ExecutionNodeStatus::Failed);
-    let has_blocked = graph_has_status(&graph, ExecutionNodeStatus::Blocked);
-    let has_cancelled = graph_has_status(&graph, ExecutionNodeStatus::Cancelled);
-    let has_completed = graph_has_status(&graph, ExecutionNodeStatus::Completed);
-    let terminal = if has_failed && has_completed {
-        harness_contract::outcome::OutcomeTerminalClass::PartialFailure(
-            "Team graph contains completed and failed nodes".to_string(),
-        )
-    } else if has_failed {
-        harness_contract::outcome::OutcomeTerminalClass::PartialFailure(
-            "Team graph contains failed nodes; committed evidence is retained".to_string(),
-        )
-    } else if has_blocked {
-        harness_contract::outcome::OutcomeTerminalClass::PartialFailure(
-            "Team graph contains blocked nodes; unresolved work is retained".to_string(),
-        )
-    } else if has_cancelled {
-        harness_contract::outcome::OutcomeTerminalClass::Cancelled(
-            "Team graph contains cancelled nodes".to_string(),
-        )
-    } else {
-        harness_contract::outcome::OutcomeTerminalClass::Succeeded(
-            "Team graph completed".to_string(),
-        )
-    };
-    let completed_at_ms = graph
-        .node_results
-        .values()
-        .map(|result| result.finished_at_ms)
-        .max()
-        .unwrap_or_else(now_ms);
-    let leaf_usage = aggregate_team_leaf_usage(&graph);
-    let duration_ms = leaf_usage.duration_ms;
-    let usage = harness_contract::outcome::OutcomeUsage {
-        input_tokens: Some(leaf_usage.input_tokens),
-        output_tokens: Some(leaf_usage.output_tokens),
-        cached_tokens: Some(leaf_usage.cached_tokens),
-        evaluation_tokens: None,
-        tool_calls: leaf_usage.tool_calls,
-        duplicate_tool_calls: leaf_usage.duplicate_tool_calls,
-        retries: 0,
-        max_observed_concurrency: leaf_usage.max_tool_concurrency_observed,
-    };
-    let mut evidence_refs = graph
-        .node_results
-        .values()
-        .flat_map(|result| result.evidence_refs.iter())
-        .map(|reference| reference.evidence_ref.clone())
-        .collect::<Vec<_>>();
-    dedupe_evolution_evidence(&mut evidence_refs);
-    let outcome = harness_contract::outcome::ExecutionOutcome {
-        identity: harness_contract::outcome::OutcomeIdentity {
-            execution_id: format!("team:{team_id}:{}", graph.id),
-            session_id: packet.session_id().to_string(),
-            turn_id: turn_id.to_string(),
-            terminal_generation: graph.revision,
-            execution_scope: harness_contract::outcome::OutcomeExecutionScope::Team,
-            paired_sample_id: None,
-            task_id: Some(packet.task_id().to_string()),
-            mission_id: Some(packet.mission_id().to_string()),
-            agent_id: None,
-            team_id: Some(team_id.to_string()),
-            execution_graph_ref: Some(graph.id.clone()),
-        },
-        runtime: harness_contract::outcome::RuntimeIdentity {
-            workspace_key: identity.workspace_id().to_string(),
-            runtime_revision: env!("CARGO_PKG_VERSION").to_string(),
-            config_revision: packet.binding.as_ref().map_or_else(
-                || "team-graph:unknown-binding".to_string(),
-                |binding| format!("team-binding:{}", binding.binding_digest),
-            ),
-            build: Default::default(),
-        },
-        provider: None,
-        strategy: harness_contract::outcome::StrategyIdentity {
-            decision_id: format!("team-graph:{}", graph.id),
-            policy_revision: "runtime.team_graph.v1".to_string(),
-            decision_source: "runtime.execution_supervisor".to_string(),
-            selected_candidate: harness_contract::strategy::ExecutionCandidateKind::Team,
-            selected_pattern: "team".to_string(),
-        },
-        timing: harness_contract::outcome::OutcomeTiming {
-            started_at_ms: completed_at_ms.saturating_sub(duration_ms),
-            completed_at_ms,
-            duration_ms,
-        },
-        usage,
-        terminal,
-        quality: harness_contract::outcome::OutcomeQuality::Unknown,
-        observation: harness_contract::outcome::OutcomeObservation {
-            source: "runtime.team_terminal".to_string(),
-            observed_at_ms: completed_at_ms,
-            freshness_ms: 0,
-        },
-        strategy_feedback: harness_contract::outcome::OutcomeStrategyFeedback {
-            evaluation_environment: if packet.session_id().starts_with("evolution-eval:") {
-                "evolution_evaluation".to_string()
-            } else {
-                "production".to_string()
-            },
-            ..Default::default()
-        },
-        evidence_completeness: if evidence_refs.is_empty() {
-            harness_contract::reality::EvidenceCompleteness::None
-        } else {
-            harness_contract::reality::EvidenceCompleteness::Partial
-        },
-        evidence_refs,
-        schema_revision: harness_contract::outcome::OUTCOME_SCHEMA_REVISION,
-    };
-    outcome_service.record_terminal(&outcome)?;
-    Ok(())
-}
-
 fn scenario_observation(
     packet: &AgentTaskPacket,
     returned: &harness_contract::agent::AgentReturnPacket,
@@ -4267,148 +4171,6 @@ fn scenario_observation(
         input_tokens: returned.input_tokens,
         output_tokens: returned.output_tokens,
         tool_calls: returned.tool_calls,
-        elapsed_ms,
-        provider_model_refs,
-        environment_fingerprint,
-    }
-}
-
-fn evolution_team_request(
-    candidate: &crate::EvolutionGovernanceCandidate,
-    scenario: &EvaluationScenarioSpec,
-    revision_ref: &TeamTemplateRevisionRef,
-    side: &str,
-    sample_index: u32,
-    mission_id: &str,
-    execution_capacity: harness_contract::team::TeamExecutionCapacitySnapshot,
-) -> TeamInstantiationRequest {
-    let identity = format!(
-        "evolution-eval:{}:{}:{}:{}:{}",
-        candidate.candidate_id, scenario.scenario_ref, side, revision_ref.revision, sample_index
-    );
-    let deadline_at_ms =
-        now_ms().saturating_add(harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS);
-    TeamInstantiationRequest {
-        request_id: format!("{identity}:request"),
-        team_id: format!("{identity}:team"),
-        mission_id: mission_id.to_string(),
-        lineage: harness_contract::execution_graph::ExecutionGraphLineage {
-            session_id: format!("evolution-eval:{}", candidate.candidate_id),
-            turn_id: format!("{identity}:turn"),
-            root_task_id: format!("{identity}:root-task"),
-            task_id: format!("{identity}:root-task"),
-            generation: 1,
-        },
-        parent_execution: None,
-        selection_mode: TeamSelectionMode::Explicit,
-        strategy_binding: None,
-        template_selector: TeamTemplateSelector::Exact {
-            revision_ref: revision_ref.clone(),
-        },
-        objective: scenario.objective.clone(),
-        acceptance: scenario.acceptance.clone(),
-        risk: None,
-        role_binding_overrides: Vec::new(),
-        display_name: None,
-        role_display_overrides: Vec::new(),
-        cardinality_overrides: Vec::new(),
-        focus_partition_plans: Vec::new(),
-        requires_managed_collaboration_escalation: false,
-        permission_ceiling: scenario.permission_ceiling.clone(),
-        model_lease: scenario.model_lease.clone(),
-        execution_budget: crate::team_instantiation::bounded_parent_execution_budget(
-            format!("evolution-eval-budget:{identity}"),
-            65_536,
-            deadline_at_ms,
-            32,
-        ),
-        deadline_at_ms,
-        managed_invocation: None,
-        resource_scopes: scenario.resource_scopes.clone(),
-        allow_whole_workspace_scope: false,
-        upstream_evidence_refs: Vec::new(),
-        upstream_artifact_refs: Vec::new(),
-        upstream_result_context: Vec::new(),
-        execution_capacity: Some(execution_capacity),
-    }
-}
-
-fn team_scenario_observation(
-    projection: &crate::TeamProjection,
-    evaluations: &[crate::AgentRunEvaluation],
-    scenario: &EvaluationScenarioSpec,
-    definition_revision: u64,
-    elapsed_ms: u64,
-) -> EvaluationScenarioObservation {
-    let run_ids = projection
-        .tasks
-        .iter()
-        .map(|task| task.run_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let matched = evaluations
-        .iter()
-        .filter(|evaluation| run_ids.contains(evaluation.run_id.as_str()))
-        .collect::<Vec<_>>();
-    let mut evidence_refs = projection
-        .terminal_result
-        .as_ref()
-        .map(|result| {
-            result
-                .evidence_refs
-                .iter()
-                .map(|evidence| evidence.evidence_ref.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    evidence_refs.extend(matched.iter().flat_map(|evaluation| {
-        evaluation.evidence_refs.iter().map(|reference| {
-            harness_contract::reality::EvidenceRef::observed(
-                "agent_run_evidence",
-                reference.clone(),
-            )
-            .with_source(evaluation.evaluation_id.clone())
-        })
-    }));
-    dedupe_evolution_evidence(&mut evidence_refs);
-    let succeeded = projection.status == "completed" && projection.terminal_result.is_some();
-    let mut provider_model_refs = matched
-        .iter()
-        .filter(|evaluation| {
-            !evaluation.provider.trim().is_empty() || !evaluation.model.trim().is_empty()
-        })
-        .map(|evaluation| format!("{}/{}", evaluation.provider, evaluation.model))
-        .collect::<Vec<_>>();
-    provider_model_refs.sort();
-    provider_model_refs.dedup();
-    let mut environment_inputs = matched
-        .iter()
-        .map(|evaluation| evaluation.environment_fingerprint.clone())
-        .collect::<Vec<_>>();
-    environment_inputs.sort();
-    environment_inputs.dedup();
-    let environment_fingerprint = format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&environment_inputs).unwrap_or_default())
-    );
-    EvaluationScenarioObservation {
-        scenario_ref: scenario.scenario_ref.clone(),
-        definition_revision,
-        run_ref: format!("team-graph:{}", projection.graph_id),
-        succeeded,
-        acceptance_total: scenario.acceptance.len().min(u32::MAX as usize) as u32,
-        acceptance_satisfied: succeeded
-            .then_some(scenario.acceptance.len().min(u32::MAX as usize) as u32)
-            .unwrap_or_default(),
-        evidence_refs,
-        input_tokens: matched
-            .iter()
-            .map(|evaluation| evaluation.input_tokens)
-            .sum(),
-        output_tokens: matched
-            .iter()
-            .map(|evaluation| evaluation.output_tokens)
-            .sum(),
-        tool_calls: matched.iter().map(|evaluation| evaluation.tool_calls).sum(),
         elapsed_ms,
         provider_model_refs,
         environment_fingerprint,

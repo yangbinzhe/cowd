@@ -6,10 +6,30 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy},
-    orchestration::{CapabilityRecipeId, ModelGraphSemanticNode, ModelSemanticFocus},
-};
+use crate::execution_graph::{ExecutionCompletionContract, ExecutionDependencyPolicy};
+
+/// Generic execution recipe used only inside a typed running-turn input
+/// disposition. It is not a model-visible collaboration control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityRecipeId {
+    Direct,
+    Agent,
+    Team,
+    Review,
+    Synthesis,
+    SessionDispatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelSemanticFocus {
+    pub focus_id: String,
+    pub role_id: String,
+    pub objective: String,
+    #[serde(default)]
+    pub evidence_responsibilities: Vec<String>,
+}
 
 /// Model-visible graph node for input disposition. Physical Session identity
 /// is intentionally absent and is injected by Runtime after authorization.
@@ -40,28 +60,6 @@ pub struct ModelInputDispositionGraphNode {
     pub dependency: ExecutionDependencyPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancellation_group: Option<String>,
-}
-
-impl From<ModelInputDispositionGraphNode> for ModelGraphSemanticNode {
-    fn from(value: ModelInputDispositionGraphNode) -> Self {
-        Self {
-            node_id: value.node_id,
-            recipe: value.recipe,
-            objective: value.objective,
-            depends_on: value.depends_on,
-            multiplicity: value.multiplicity,
-            focuses: value.focuses,
-            managed_agent_escalation: crate::orchestration::ManagedAgentEscalationRequirement::None,
-            template: value.template,
-            target_session_id: None,
-            output_artifacts: value.output_artifacts,
-            evidence_contract: value.evidence_contract,
-            required_evidence_refs: value.required_evidence_refs,
-            required: value.required,
-            dependency: value.dependency,
-            cancellation_group: value.cancellation_group,
-        }
-    }
 }
 
 const fn default_multiplicity() -> u16 {

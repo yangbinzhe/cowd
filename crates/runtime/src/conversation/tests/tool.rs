@@ -13,29 +13,6 @@
         assert!(!TurnExecutionRole::DelegatedLeaf.owns_root_presentation());
         assert!(TurnExecutionRole::DelegatedLeaf.is_delegated_leaf());
     }
-    fn route_input_call(input_slots: &[u16]) -> ModelToolCall {
-        ModelToolCall {
-            id: "route-input".to_string(),
-            name: harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID.to_string(),
-            input: serde_json::json!({
-                "intent": "route new running-Turn input",
-                "operation": "route_input",
-                "input_disposition": {
-                    "decisions": [{
-                        "input_slots": input_slots,
-                        "action": "add_required_task",
-                        "relation": "new_task",
-                        "objective": "complete the newly requested work",
-                        "required": true,
-                        "confidence_basis_points": 9500,
-                        "reason": "the user explicitly introduced independent required work"
-                    }]
-                }
-            })
-            .to_string(),
-            depends_on: Vec::new(),
-        }
-    }
 
     #[test]
     fn collaboration_team_slots_are_independent_of_tool_capacity() {
@@ -44,113 +21,6 @@
         // Tool collapsed to one must not reduce Team capacity below Agent.
         assert_eq!(collaboration_team_slots(8, 4), 4);
         assert_eq!(collaboration_team_slots(1, 8), 1);
-    }
-
-    #[test]
-    fn semantic_team_width_is_not_reduced_by_live_capacity() {
-        let understanding = harness_contract::strategy::understand(
-            &harness_contract::strategy::StrategyInput::from_prompt(
-                "审查三个独立责任域，分别取得工具证据后综合",
-            ),
-        );
-        assert_eq!(understanding.independent_workstreams, 3);
-        assert_eq!(semantic_team_focus_count(&understanding), 3);
-
-        // Scheduling capacity is deliberately absent from this function's
-        // inputs: a one-slot runtime may serialize three Teams but may not
-        // erase two semantic obligations.
-        let one_slot_snapshot = harness_contract::strategy::StrategyResourceSnapshot {
-            team_slots: 1,
-            ..Default::default()
-        };
-        assert_eq!(one_slot_snapshot.team_slots, 1);
-        assert_eq!(semantic_team_focus_count(&understanding), 3);
-    }
-
-    #[test]
-    fn evaluation_metering_labels_are_not_semantic_focus_scopes() {
-        let control = EvaluationTurnControl {
-            corpus_id: "live-scenarios-v1".to_string(),
-            workspace_fixture: "none".to_string(),
-            provider_constraint: "normal".to_string(),
-            temperature_milli: 0,
-            resource_scopes: vec![
-                "provider".to_string(),
-                "provider_account".to_string(),
-                "provider_token_pool".to_string(),
-                "read:crates".to_string(),
-                "network:*".to_string(),
-            ],
-            budget_lease_id: "lease".to_string(),
-            max_total_tokens: 1,
-            prompt: "inspect crates".to_string(),
-        };
-
-        assert_eq!(
-            evaluation_semantic_focus_scopes(&control),
-            vec!["read:crates".to_string(), "network:*".to_string()]
-        );
-    }
-
-    #[test]
-    fn implicit_three_domain_prompt_freezes_three_bounded_team_obligations() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        std::fs::create_dir_all(workspace.path().join("crates/runtime/src"))
-            .expect("workspace source tree");
-        let prompt = "请对三个独立责任域分别取得只读工具证据并交叉核验，最后统一综合结论。责任域一核查策略选择与执行义务，责任域二核查状态持久化与恢复，责任域三核查最终验收与投影。必须列出至少三个本次实际读取的完整 crates/.../*.rs 源码路径；不要自行指定 Team、Agent、角色、模板或编排拓扑。";
-        let understanding = harness_contract::strategy::understand(
-            &harness_contract::strategy::StrategyInput::from_prompt(prompt),
-        );
-        let control = EvaluationTurnControl {
-            corpus_id: "live-scenarios-v1".to_string(),
-            workspace_fixture: "none".to_string(),
-            provider_constraint: "normal".to_string(),
-            temperature_milli: 0,
-            resource_scopes: vec![
-                "provider".to_string(),
-                "provider_account".to_string(),
-                "provider_token_pool".to_string(),
-            ],
-            budget_lease_id: "lease".to_string(),
-            max_total_tokens: 1,
-            prompt: prompt.to_string(),
-        };
-        let forced_scopes = evaluation_semantic_focus_scopes(&control);
-        let plans = crate::orchestration::team_authority::derive_team_focus_partition_plans(
-            prompt,
-            workspace.path(),
-            &forced_scopes,
-            semantic_team_focus_count(&understanding),
-            false,
-            understanding.requests_multi_agent,
-            false,
-        );
-        let obligation = harness_contract::strategy::CollaborationExecutionObligation::for_selected_team(
-            &understanding,
-            u8::try_from(semantic_team_focus_count(&understanding)).expect("bounded width"),
-            plans
-                .iter()
-                .flat_map(|plan| plan.slots.iter().map(|slot| slot.focus_id.clone())),
-        )
-        .expect("automatic collaboration obligation");
-        let researcher = plans
-            .iter()
-            .find(|plan| plan.role_id == "researcher")
-            .expect("researcher focus plan");
-
-        assert_eq!(understanding.required_team_count, 0);
-        assert!(forced_scopes.is_empty());
-        assert_eq!(researcher.slots.len(), 3);
-        assert!(researcher
-            .slots
-            .iter()
-            .all(|slot| slot.capability_cropped_refs == vec!["read:crates"]));
-        assert_eq!(obligation.minimum_team_count, 3);
-        assert_eq!(obligation.exact_team_count, None);
-        assert_eq!(
-            obligation.source,
-            harness_contract::strategy::CollaborationObligationSource::AutomaticStrategy
-        );
     }
 
     #[test]
@@ -173,64 +43,6 @@
             "graph:synthesize",
             3
         ));
-    }
-
-    #[test]
-    fn route_input_requires_exact_slot_coverage_and_preserves_unrelated_calls() {
-        let ordinary = ModelToolCall {
-            id: "read-after-route".to_string(),
-            name: "read_file".to_string(),
-            input: r#"{"path":"README.md"}"#.to_string(),
-            depends_on: vec!["route-input".to_string()],
-        };
-        let valid = ModelStepIntent::ToolCalls {
-            calls: vec![route_input_call(&[0, 1]), ordinary],
-        };
-        let RouteInputResolution::Valid(parsed) = parse_route_input_intent(&valid, 2) else {
-            panic!("valid route_input must parse");
-        };
-        assert_eq!(parsed.batch.decisions[0].input_slots, vec![0, 1]);
-        assert_eq!(parsed.remaining_calls.len(), 1);
-        assert!(parsed.remaining_calls[0].depends_on.is_empty());
-
-        let incomplete = ModelStepIntent::ToolCalls {
-            calls: vec![route_input_call(&[0])],
-        };
-        assert!(matches!(
-            parse_route_input_intent(&incomplete, 2),
-            RouteInputResolution::Invalid(error) if error.contains("did not cover")
-        ));
-    }
-
-    #[test]
-    fn explicit_local_research_focus_uses_workspace_team_transport() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        std::fs::create_dir_all(workspace.path().join("Code/AICS")).expect("workspace directory");
-        let objective = format!(
-            "使用3个 researcher 调研 {} 的真实代码，不得修改文件",
-            workspace.path().join("Code/AICS").display()
-        );
-        let local = crate::orchestration::team_authority::derive_team_focus_partition_plans(
-            &objective,
-            workspace.path(),
-            &[],
-            3,
-            false,
-            true,
-            true,
-        );
-        let external = crate::orchestration::team_authority::derive_team_focus_partition_plans(
-            "research the latest provider API from official sources",
-            workspace.path(),
-            &[],
-            3,
-            false,
-            true,
-            true,
-        );
-
-        assert!(!focus_partition_plans_use_external_transport(&local));
-        assert!(focus_partition_plans_use_external_transport(&external));
     }
 
     #[test]
@@ -1218,7 +1030,7 @@
             Box::pin(stream::iter(vec![
                 Ok(AssistantEvent::ToolUse {
                     id: "team-1".to_string(),
-                    name: "runtime_orchestrate".to_string(),
+                    name: "team_create".to_string(),
                     input: r#"{"intent":"review architecture","operation":"propose","proposal":{"mutation_id":"review-architecture","nodes":[{"node_id":"review-team","recipe":"team","objective":"review architecture"}],"reason":"independent review is required"}}"#.to_string(),
                 }),
                 Ok(AssistantEvent::MessageStop),
@@ -1265,152 +1077,6 @@
         }
     }
 
-    struct CompletedHostTeamBackend;
-
-    #[async_trait::async_trait]
-    impl crate::AgentRuntimeBackend for CompletedHostTeamBackend {
-        fn kind(&self) -> crate::AgentBackendKind {
-            crate::AgentBackendKind::InProcess
-        }
-
-        fn capabilities(&self) -> crate::AgentBackendCapabilities {
-            crate::AgentBackendCapabilities::in_process()
-        }
-
-        async fn execute(
-            &self,
-            packet: harness_contract::agent::AgentTaskPacket,
-            selection: crate::AgentModelSelection,
-        ) -> Result<harness_contract::agent::AgentReturnPacket, String> {
-            let evidence_id = format!("materialized:{}", packet.node_id());
-            let evidence = harness_contract::context::EvidenceAccessRef::durable(
-                harness_contract::context::EvidenceRef::observed("tool", evidence_id),
-                "a".repeat(64),
-                1,
-                "application/json",
-                "artifact://art_conversation_host_packet",
-                format!("session:{}", packet.session_id()),
-            );
-            let mut evidence_refs = packet.evidence_refs.clone();
-            evidence_refs.push(evidence);
-            let observed_evidence = packet
-                .required_acceptance
-                .evidence_obligations
-                .iter()
-                .enumerate()
-                .map(|(index, obligation)| {
-                    let mut target = obligation.target.clone();
-                    if let harness_contract::context::EvidenceTargetIdentity::Workspace { scope } =
-                        &mut target
-                    {
-                        if scope.coverage
-                            == harness_contract::context::EvidenceCoverageKind::ScopedContent
-                        {
-                            scope.coverage =
-                                harness_contract::context::EvidenceCoverageKind::ExactContent;
-                        }
-                        if matches!(
-                            scope.coverage,
-                            harness_contract::context::EvidenceCoverageKind::ExactContent
-                                | harness_contract::context::EvidenceCoverageKind::WriteEffect
-                        ) && scope.path.observed_revision_or_digest.is_none()
-                        {
-                            scope.path.observed_revision_or_digest = Some("a".repeat(64));
-                        }
-                    }
-                    harness_contract::context::ObservedEvidence {
-                        obligation_id: obligation.obligation_id.clone(),
-                        target,
-                        observed_at_sequence: u64::try_from(index + 1).unwrap_or(u64::MAX),
-                        tool_name: "test_runtime_evidence".to_string(),
-                        provenance:
-                            harness_contract::context::ObservedEvidenceProvenance::FreshExecution,
-                        evidence_ref: None,
-                        model_observation: None,
-                        workspace_prior_state: None,
-                    }
-                })
-                .collect::<Vec<_>>();
-            let runtime_change_receipts = packet
-                .acceptance
-                .iter()
-                .any(|criterion| matches!(criterion.as_str(), "implementation" | "mitigation"))
-                .then(|| {
-                    vec![harness_contract::agent::AgentChangeReceipt {
-                        path: packet
-                            .resource_scopes
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "fixture.txt".to_string()),
-                        before_sha256: Some("b".repeat(64)),
-                        after_sha256: "c".repeat(64),
-                        write_sequence: 1,
-                        bytes: None,
-                        reread_sequence: None,
-                        reread_evidence_ref: None,
-                    }]
-                })
-                .unwrap_or_default();
-            let changes = runtime_change_receipts
-                .iter()
-                .map(|receipt| receipt.path.clone())
-                .collect();
-            Ok(harness_contract::agent::AgentReturnPacket {
-                run_id: packet.run_id().to_string(),
-                agent_id: packet.agent_id().to_string(),
-                task_id: packet.task_id().to_string(),
-                session_id: packet.session_id().to_string(),
-                mission_id: packet.mission_id().to_string(),
-                team_id: packet.team_id().map(ToString::to_string),
-                graph_id: packet.graph_id().to_string(),
-                node_id: packet.node_id().to_string(),
-                attempt: packet.attempt,
-                expected_graph_revision: packet.expected_graph_revision,
-                status: harness_contract::agent::AgentTerminalStatus::Completed,
-                outcome: serde_json::json!({
-                    "summary": "bounded host-selected Team role completed",
-                    "findings": ["fixture finding"],
-                    "plan": "fixture plan",
-                    "implementation": "fixture change",
-                    "source_verification": "fixture verification",
-                    "review": "fixture review",
-                    "risks": ["fixture risk"],
-                    "unresolved": [],
-                    "proposal": "fixture proposal",
-                    "critique": "fixture critique",
-                    "mitigation": "fixture mitigation",
-                    "checkpoint": "fixture checkpoint"
-                })
-                .to_string(),
-                answer_candidate: None,
-                observed_acceptance: harness_contract::context::ObservedAcceptance {
-                    satisfied_criteria: packet.acceptance.clone(),
-                    observed_evidence,
-                    unresolved_obligation_ids: Vec::new(),
-                },
-                acceptance_evaluation: None,
-                acceptance: packet.acceptance,
-                evidence_refs,
-                changes,
-                runtime_change_receipts,
-                conflicts: Vec::new(),
-                unresolved: Vec::new(),
-                input_tokens: 11,
-                output_tokens: 7,
-                cached_tokens: 0,
-                model: selection.model,
-                provider: selection.provider,
-                tool_calls: 1,
-                duplicate_tool_calls: 0,
-                max_tool_concurrency_observed: 3,
-                parallel_tool_batches: 2,
-                runtime_write_attempt_paths: Vec::new(),
-                runtime_observed_resource_scopes: Vec::new(),
-                failure: None,
-            })
-        }
-    }
-
     struct TeamTerminalReceiptExecutor;
 
     #[async_trait::async_trait]
@@ -1420,7 +1086,7 @@
             name: &str,
             _input: &str,
         ) -> Result<harness_contract::context::ToolOutputDraft, ToolError> {
-            assert_eq!(name, "runtime_orchestrate");
+            assert_eq!(name, "team_create");
             Ok(harness_contract::context::ToolOutputDraft::bounded_inline(
                 serde_json::json!({
                     "status": "completed",
@@ -1431,7 +1097,7 @@
         }
 
         fn available_tool_names(&self) -> Vec<String> {
-            vec!["runtime_orchestrate".to_string()]
+            vec!["team_create".to_string()]
         }
 
         fn classify_tool_safety(
@@ -1439,7 +1105,7 @@
             name: &str,
             _input: &str,
         ) -> Option<crate::tool_orchestrator::ToolSafetyCategory> {
-            (name == "runtime_orchestrate")
+            (name == "team_create")
                 .then_some(crate::tool_orchestrator::ToolSafetyCategory::WriteLocal)
         }
 
@@ -1460,7 +1126,7 @@
                 ToolPermissionMode,
             };
 
-            (name == "runtime_orchestrate").then(|| ToolEffectDescriptor {
+            (name == "team_create").then(|| ToolEffectDescriptor {
                 tool_id: name.to_string(),
                 descriptor_hash: "test-runtime-orchestrate-v1".to_string(),
                 effect_kind: ToolEffectKind::Write,
@@ -1589,6 +1255,7 @@
             execution_parent: None,
             execution_role: TurnExecutionRole::RootTurn,
             recovered_tool_receipt_count: 0,
+            recovered_tool_receipts_require_text_only: false,
         })
         .expect("standard host")
     }
@@ -2863,280 +2530,7 @@
     }
 
     #[test]
-    fn host_does_not_materialize_required_teams_before_root_control_plane_receipt() {
-        // The model fixture returns prose instead of the required native
-        // control-plane action.  This must never be translated into a
-        // heuristic Program merely because its user input mentioned two
-        // Teams. Use a bounded stack because the production-shaped root graph
-        // still runs its ordinary terminal/recovery machinery.
-        std::thread::Builder::new()
-            .name("two-team-host-admission-test".to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(|| {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("test runtime")
-                    .block_on(async {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        for relative in ["crates/runtime", "crates/gateway", "surfaces/webui"] {
-            std::fs::create_dir_all(workspace.join(relative)).expect("bounded workspace scope");
-        }
-        // Keep a production-shaped workspace: this proves that the absence of
-        // a model proposal, rather than an absent resource, prevents Program
-        // admission.
-        for relative in [
-            "crates/runtime/src.rs",
-            "crates/gateway/src.rs",
-            "surfaces/webui/App.vue",
-        ] {
-            std::fs::write(workspace.join(relative), "// bounded test resource\n")
-                .expect("materialize bounded workspace resource");
-        }
-        let providers = crate::config::ProvidersConfig {
-            providers: HashMap::from([(
-                "test".to_string(),
-                crate::config::ProviderConfig {
-                    name: "test".to_string(),
-                    base_url: "https://example.test/v1".to_string(),
-                    api_key: "test".to_string(),
-                    models: vec!["fast".to_string()],
-                    protocol: Some("responses".to_string()),
-                    parallel_tool_calls: Default::default(),
-                    early_tool_start: Default::default(),
-                },
-            )]),
-        };
-        let services = crate::RuntimeServices::builder(temp.path(), &workspace)
-            .provider_registry(Arc::new(
-                crate::ProviderRegistry::new(providers).expect("provider registry"),
-            ))
-            .build()
-            .expect("runtime services");
-        services
-            .agent_runtime()
-            .register_observation_authority_backend(Arc::new(CompletedHostTeamBackend));
-        let bus = crate::CowdEventBus::new();
-        let mut runtime = crate::ConversationRuntime::new(
-            Session::new(),
-            FinalAnswerClient,
-            TeamTerminalReceiptExecutor,
-            PermissionPolicy::new(crate::PermissionMode::ReadOnly),
-            vec!["answer from Runtime-owned collaboration evidence".to_string()],
-        )
-        .without_memory()
-        .with_cowd_event_bus(bus);
-        runtime.set_active_model("fast");
-
-        let (_runtime, result) = submit_test_owned_conversation_turn(
-            runtime,
-            Arc::clone(&services),
-            "必须启动两个 Team：一个全面核对 runtime 与 gateway 的独立职责，另一个核对 webui 的验收与风险；最后综合证据",
-            &SharedPrompter::none(),
-            test_execution_lineage(),
-        )
-        .await;
-        let summary = result.expect("turn must complete");
-        let events = services
-            .event_store()
-            .all_events(500)
-            .expect("strategy events");
-        assert!(
-            !summary.final_answer.trim().is_empty(),
-            "turn must surface a terminal answer; strategy events: {:?}",
-            events
-                .iter()
-                .filter(|event| {
-                    event.kind.contains("strategy")
-                        || event.kind.contains("team")
-                        || event.kind.contains("execution_node")
-                })
-                .map(|event| (&event.kind, &event.status, &event.payload))
-                .collect::<Vec<_>>()
-        );
-        let outcome = events
-            .iter()
-            .find(|event| event.kind == "runtime.strategy.outcome")
-            .expect("outcome event");
-        assert_eq!(
-            outcome
-                .payload
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("partial"),
-            "a prose-only root response must be an honest incomplete result, never a heuristic Team admission"
-        );
-        assert_eq!(
-            outcome
-                .payload
-                .get("collaboration_receipt")
-                .filter(|value| !value.is_null()),
-            None,
-            "without runtime_orchestrate there is no durable collaboration receipt"
-        );
-        let required_control_plane = events
-            .iter()
-            .find(|event| event.kind == "runtime.control_plane.required")
-            .expect("a required root control-plane state must be durable");
-        assert_eq!(required_control_plane.status.as_deref(), Some("waiting"));
-        assert_eq!(
-            required_control_plane
-                .payload
-                .get("required_team_count")
-                .and_then(serde_json::Value::as_u64),
-            Some(2)
-        );
-        assert_eq!(
-            required_control_plane
-                .payload
-                .get("required_tool_choice")
-                .and_then(serde_json::Value::as_str),
-            Some(harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID)
-        );
-        let missing_proposal = events
-            .iter()
-            .find(|event| event.kind == "runtime.control_plane.missing_proposal")
-            .expect("one failed root proposal repair must leave a durable receipt");
-        assert_eq!(missing_proposal.status.as_deref(), Some("blocked"));
-        assert_eq!(
-            missing_proposal
-                .payload
-                .get("program_admitted")
-                .and_then(serde_json::Value::as_bool),
-            Some(false),
-            "a missing proposal must never materialize a hidden Program"
-        );
-        assert!(
-            missing_proposal
-                .payload
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|reason| reason.contains("missing_control_plane_proposal")),
-            "receipt must distinguish the root control-plane failure from a Team failure"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|event| event.kind == "runtime.strategy.outcome"),
-            "the parent must publish a durable strategy outcome after its Team program finishes"
-        );
-                    });
-            })
-            .expect("spawn two-Team host admission test")
-            .join()
-            .expect("two-Team host admission test must not panic");
-    }
-
-    #[test]
-    fn durable_program_progress_refuses_to_count_a_blocked_required_team() {
-        let mut graph = harness_contract::execution_graph::ExecutionGraph::new("two teams");
-        let mut first = harness_contract::execution_graph::ExecutionNodeSpec::new(
-            ExecutionNodeKind::Subgraph,
-            crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR,
-            "{}",
-        );
-        first.id = "team-physical-1".to_string();
-        first.idempotency_key = first.id.clone();
-        let mut second = harness_contract::execution_graph::ExecutionNodeSpec::new(
-            ExecutionNodeKind::Subgraph,
-            crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR,
-            "{}",
-        );
-        second.id = "team-physical-2".to_string();
-        second.idempotency_key = second.id.clone();
-        graph.nodes = vec![first, second];
-        graph.node_statuses.insert(
-            "team-physical-1".to_string(),
-            ExecutionNodeStatus::Completed,
-        );
-        graph
-            .node_statuses
-            .insert("team-physical-2".to_string(), ExecutionNodeStatus::Blocked);
-        graph.orchestration = Some(
-            harness_contract::execution_graph::ExecutionOrchestrationMetadata {
-                mutation_id: "program-mutation".to_string(),
-                applied_mutation_ids: vec!["program-mutation".to_string()],
-                collaboration_escalations: Vec::new(),
-                semantic_revision: 1,
-                source_generation: 1,
-                completion: Default::default(),
-                collaboration_program: Some(
-                    harness_contract::execution_graph::CollaborationProgram {
-                        program_id: "program-1".to_string(),
-                        revision: 1,
-                        approval_policy_digest: "sha256:policy".to_string(),
-                        required_team_count: 2,
-                        team_instances: vec![
-                            harness_contract::execution_graph::CollaborationTeamInstance {
-                                instance_id: "team:1".to_string(),
-                                semantic_node_id: "team".to_string(),
-                                required: true,
-                            },
-                            harness_contract::execution_graph::CollaborationTeamInstance {
-                                instance_id: "team:2".to_string(),
-                                semantic_node_id: "team".to_string(),
-                                required: true,
-                            },
-                        ],
-                        edges: Vec::new(),
-                        semantic_node_instances: BTreeMap::from([(
-                            "team".to_string(),
-                            vec!["team-physical-1".to_string(), "team-physical-2".to_string()],
-                        )]),
-                        control: Default::default(),
-                        semantic_intent: None,
-                    },
-                ),
-            },
-        );
-
-        let progress = collaboration_program_progress_from_graph(&graph)
-            .expect("valid durable program")
-            .expect("program progress");
-        assert_eq!(progress.required_team_count, 2);
-        assert_eq!(progress.completed_required_team_count, 1);
-        assert_eq!(progress.completed_required_instance_ids, vec!["team:1"]);
-        assert!(
-            !team_phase_satisfies_parent_goal(
-                progress.required_team_count,
-                false,
-                true,
-                progress.completed_required_team_count,
-            ),
-            "a blocked Team is not evidence that the two-Team program completed"
-        );
-    }
-
-    #[test]
-    fn explicit_followup_team_gets_one_additional_collaboration_lease() {
-        let objective = "用一个团队调研资料，然后另一个团队负责生成 HTML 研究报告网站";
-
-        assert!(!team_phase_satisfies_parent_goal(2, true, false, 1));
-        assert!(!team_phase_satisfies_parent_goal(2, true, true, 1));
-        assert!(team_phase_satisfies_parent_goal(2, true, true, 2));
-        assert!(team_orchestration_request_available(objective, true, 0));
-        assert!(!team_orchestration_request_available(objective, true, 1));
-        assert!(!team_orchestration_request_available(
-            "必须启动 Team 完成一次架构审查",
-            true,
-            0
-        ));
-        assert!(team_orchestration_request_available(
-            "必须启动 Team 完成一次架构审查",
-            false,
-            0
-        ));
-        assert!(team_orchestration_request_available(
-            "必须启动 Team 完成一次架构审查",
-            false,
-            1
-        ));
-        assert!(!team_orchestration_request_available(
-            "必须启动 Team 完成一次架构审查",
-            false,
-            ROOT_CONTROL_PLANE_REPAIR_BUDGET
-        ));
+    fn delegated_leaf_does_not_inherit_parent_team_cardinality() {
         let collaboration_obligation = test_collaboration_obligation(2);
         assert_eq!(
             required_team_execution_count_for_execution_context(
@@ -3209,7 +2603,7 @@
         );
 
         assert_eq!(
-            crate::orchestration::team_authority::explicit_workspace_resource_scopes(
+            crate::workspace_scopes::explicit_workspace_resource_scopes(
                 workspace.path(),
                 &objective,
                 true,
@@ -3310,65 +2704,4 @@
         assert_eq!(first, vec![persistent.clone()]);
         assert_eq!(second, vec![persistent.clone()]);
         assert_eq!(deduplicated, vec![persistent]);
-    }
-
-    #[test]
-    fn program_terminal_count_ignores_failed_and_duplicate_receipts() {
-        let verified = serde_json::json!({
-            "status": "completed",
-            "working_state_verified": true,
-            "team_execution_id": "team-graph-1",
-            "terminal_summary": "Checked conclusion.",
-            "execution": {"terminal_result_available": true},
-            "collaboration_program": {
-                "program_id": "program-1",
-                "lifecycle": "completed",
-                "required_team_count": 1,
-                "completed_required_instance_ids": ["research:1"],
-                "terminal_diagnostics": []
-            },
-            "delivery_envelope": {
-                "envelope_id": "team-envelope-1",
-                "revision": 1,
-                "objective_id": "root-objective",
-                "pipeline_status": "completed",
-                "delivery_status": "satisfied",
-                "created_at_ms": 1
-            },
-            "terminal_presentation": {
-                "presentation_id": "team-presentation-1",
-                "attempt_id": "team-attempt-1",
-                "envelope_id": "team-envelope-1",
-                "envelope_revision": 1,
-                "state": "committed",
-                "answer_origin": "team_synthesizer",
-                "generated_at_ms": 2
-            }
-        })
-        .to_string();
-        let failed = serde_json::json!({
-            "status": "failed",
-            "working_state_verified": false,
-            "team_execution_id": "team-graph-2",
-            "terminal_summary": "Unverified conclusion.",
-            "execution": {"terminal_result_available": false}
-        })
-        .to_string();
-        let messages = vec![
-            ConversationMessage::tool_result(
-                "team-1",
-                "runtime_orchestrate",
-                verified.clone(),
-                false,
-            ),
-            ConversationMessage::tool_result(
-                "team-1-replay",
-                "runtime_orchestrate",
-                verified,
-                false,
-            ),
-            ConversationMessage::tool_result("team-2", "runtime_orchestrate", failed, true),
-        ];
-
-        assert_eq!(completed_program_team_ids(&messages).len(), 1);
     }

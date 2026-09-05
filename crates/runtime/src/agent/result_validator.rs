@@ -35,21 +35,21 @@ impl TeamEvidencePolicy {
 /// verifier applies to the same frozen packet.
 #[must_use]
 pub(crate) fn team_evidence_policy(
-    requirements: &[harness_contract::team::TeamAcceptanceRequirement],
+    requirements: &[harness_contract::agent::OutputAcceptanceRequirement],
 ) -> TeamEvidencePolicy {
     let consumes_upstream = requirements.iter().any(|requirement| {
         matches!(
             &requirement.check,
-            harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence
+            harness_contract::agent::OutputAcceptanceCheck::UpstreamEvidence
         )
     });
     let requires_new_tool_evidence = requirements.iter().any(|requirement| {
         matches!(
             &requirement.check,
-            harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
-                | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { .. }
-                | harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. }
-                | harness_contract::team::TeamAcceptanceCheck::UpstreamReview
+            harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence { .. }
+                | harness_contract::agent::OutputAcceptanceCheck::WorkspaceChange { .. }
+                | harness_contract::agent::OutputAcceptanceCheck::SourceVerification { .. }
+                | harness_contract::agent::OutputAcceptanceCheck::UpstreamReview
         )
     });
     TeamEvidencePolicy {
@@ -216,11 +216,14 @@ fn upstream_only_outcome_requests_tool(outcome: &str) -> bool {
         "tool_search",
         "context_retrieve",
         "evidence_retrieve",
-        "runtime_orchestrate",
-        "submit_collaboration_decision",
-        "request_collaboration_escalation",
-    ];
-    simulated_runtime_tools.iter().any(|tool| {
+    ]
+    .into_iter()
+    .chain(
+        harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+            .iter()
+            .copied(),
+    );
+    simulated_runtime_tools.into_iter().any(|tool| {
         compact.contains(&format!(r#""name":"{tool}""#))
             || compact.contains(&format!("<tool_call>{tool}"))
             || compact.contains(&format!("<function_call>{tool}"))
@@ -263,16 +266,14 @@ mod tests {
             policy_revision: 1,
             objective: "inspect".to_string(),
             required_acceptance: Default::default(),
-            output_acceptance: vec![harness_contract::team::TeamAcceptanceRequirement {
+            output_acceptance: vec![harness_contract::agent::OutputAcceptanceRequirement {
                 criterion: "evidence".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                check: harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence {
                     scopes: vec!["read:src".to_string()],
                 },
             }],
             requires_managed_collaboration_escalation: false,
             acceptance: vec!["evidence".to_string()],
-            team_role_identity: None,
-            team_role: None,
             cohort_prompt_package: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -469,9 +470,9 @@ mod tests {
     #[test]
     fn upstream_synthesis_allows_zero_tools_but_never_missing_predecessor_evidence() {
         let mut task = team_task();
-        task.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+        task.output_acceptance = vec![harness_contract::agent::OutputAcceptanceRequirement {
             criterion: "evidence".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
+            check: harness_contract::agent::OutputAcceptanceCheck::UpstreamEvidence,
         }];
         let upstream = EvidenceAccessRef::durable(
             EvidenceRef::observed("tool", "upstream"),
@@ -499,15 +500,15 @@ mod tests {
         let mut task = team_task();
         task.acceptance = vec!["artifact:runtime_findings".to_string()];
         task.output_acceptance = vec![
-            harness_contract::team::TeamAcceptanceRequirement {
+            harness_contract::agent::OutputAcceptanceRequirement {
                 criterion: "artifact:runtime_findings".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
                     name: "runtime_findings".to_string(),
                 },
             },
-            harness_contract::team::TeamAcceptanceRequirement {
+            harness_contract::agent::OutputAcceptanceRequirement {
                 criterion: "evidence".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                check: harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence {
                     scopes: vec!["read:src".to_string()],
                 },
             },
@@ -523,9 +524,9 @@ mod tests {
             Err(AgentResultValidationError::MissingToolExecution)
         );
 
-        task.output_acceptance[1] = harness_contract::team::TeamAcceptanceRequirement {
+        task.output_acceptance[1] = harness_contract::agent::OutputAcceptanceRequirement {
             criterion: "upstream:evidence".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
+            check: harness_contract::agent::OutputAcceptanceCheck::UpstreamEvidence,
         };
         task.acceptance[1] = "upstream:evidence".to_string();
         let upstream = EvidenceAccessRef::durable(
@@ -549,16 +550,16 @@ mod tests {
         let mut task = team_task();
         task.acceptance = vec!["artifact:definitions".to_string(), "summary".to_string()];
         task.output_acceptance = vec![
-            harness_contract::team::TeamAcceptanceRequirement {
+            harness_contract::agent::OutputAcceptanceRequirement {
                 criterion: "artifact:definitions".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
                     name: "definitions".to_string(),
                 },
             },
-            harness_contract::team::TeamAcceptanceRequirement {
+            harness_contract::agent::OutputAcceptanceRequirement {
                 criterion: "summary".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::StructuredField {
-                    field: harness_contract::team::TeamStructuredOutputField::Summary,
+                check: harness_contract::agent::OutputAcceptanceCheck::StructuredField {
+                    field: harness_contract::agent::StructuredOutputField::Summary,
                 },
             },
         ];
@@ -593,9 +594,9 @@ mod tests {
     #[test]
     fn upstream_only_synthesis_rejects_simulated_runtime_tool_payloads() {
         let mut task = team_task();
-        task.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+        task.output_acceptance = vec![harness_contract::agent::OutputAcceptanceRequirement {
             criterion: "evidence".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence,
+            check: harness_contract::agent::OutputAcceptanceCheck::UpstreamEvidence,
         }];
         task.constraints = vec!["upstream_evidence_only:no_tool_reacquisition".to_string()];
         let upstream = EvidenceAccessRef::durable(

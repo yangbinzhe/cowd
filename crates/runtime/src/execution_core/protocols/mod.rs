@@ -151,8 +151,6 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 edges: Vec::new(),
                 node_statuses: BTreeMap::new(),
                 node_results: BTreeMap::new(),
-                work_states: BTreeMap::new(),
-                autonomous_work: BTreeMap::new(),
                 recovery_cursor: ExecutionRecoveryCursor::default(),
             },
             role_nodes: BTreeMap::new(),
@@ -211,8 +209,8 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 .map(|scope| format!("resource:{scope}")),
         );
         let idempotency_key = format!("{node_id}:attempt");
-        // A protocol graph owns collaboration topology. `runtime_orchestrate`
-        // is never available to a role worker, but evidence access follows the
+        // A legacy fixed protocol graph owns its topology, so Agent Actions
+        // are not available to a role worker. Evidence access follows the
         // declared role contract rather than whether the role happens to be a
         // frontier node. Incident evidence collectors and JPS solutions are
         // intentionally dependent on triage/frame output *and* allowed to
@@ -221,7 +219,11 @@ impl<'a> ProtocolGraphBuilder<'a> {
             self.request
                 .allowed_tools
                 .iter()
-                .filter(|tool| !tool.eq_ignore_ascii_case("runtime_orchestrate"))
+                .filter(|tool| {
+                    !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                        .iter()
+                        .any(|action| tool.eq_ignore_ascii_case(action))
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         } else {
@@ -261,7 +263,6 @@ impl<'a> ProtocolGraphBuilder<'a> {
                 role_evidence_instruction(role.evidence_mode),
                 role_slot_focus(role, slot),
             ),
-            team_role_identity: None,
             required_acceptance: harness_contract::context::RequiredAcceptance {
                 criteria: acceptance.clone(),
                 evidence_obligations: Vec::new(),

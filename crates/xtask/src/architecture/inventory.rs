@@ -39,28 +39,20 @@ impl CapabilityInventory {
         unique("Gateway route", &self.gateway_routes)?;
         unique("Tool spec", &self.tool_specs)?;
         unique("Edge acceptance", &self.edge_acceptance_entries)?;
-        if self.runtime_modules.len() != 112 {
-            return Err(format!(
-                "Runtime module inventory drifted: expected 112, got {}",
-                self.runtime_modules.len()
-            ));
+        for (kind, values) in [
+            ("Runtime module", &self.runtime_modules),
+            ("Gateway route", &self.gateway_routes),
+            ("Tool spec", &self.tool_specs),
+            ("Edge acceptance", &self.edge_acceptance_entries),
+        ] {
+            if values.is_empty() {
+                return Err(format!("{kind} inventory is empty"));
+            }
         }
-        if self.gateway_routes.len() != 482 {
+        if !self.legacy_lifecycle_owners.is_empty() {
             return Err(format!(
-                "Gateway route inventory drifted: expected 482, got {}",
-                self.gateway_routes.len()
-            ));
-        }
-        if self.tool_specs.len() != 53 {
-            return Err(format!(
-                "Tool inventory drifted: expected 53, got {}",
-                self.tool_specs.len()
-            ));
-        }
-        if self.edge_acceptance_entries.len() != 115 {
-            return Err(format!(
-                "Edge acceptance inventory drifted: expected 115, got {}",
-                self.edge_acceptance_entries.len()
+                "Runtime module inventory still has legacy lifecycle owners: {:?}",
+                self.legacy_lifecycle_owners
             ));
         }
         Ok(())

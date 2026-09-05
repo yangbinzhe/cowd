@@ -3,7 +3,7 @@
 //! Before a multi-agent/team collaboration starts, operators (and the
 //! strategy layer) need a prediction of how much model context each role will
 //! occupy: its base prompt, its own evidence, and the coordination content it
-//! consumes (team_board revisions etc.). This module is a pure estimator; it
+//! consumes (durable Agentic topic revisions etc.). This module is a pure estimator; it
 //! never admits or rejects execution.
 
 /// Approximate token footprint for UTF-8 text (~0.75 tokens/char for mixed

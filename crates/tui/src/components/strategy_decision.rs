@@ -222,41 +222,12 @@ pub fn strategy_summary_lines(
         )));
     }
 
-    let scope_refs = strategy
-        .evidence_scopes
-        .iter()
-        .map(|scope| {
-            scope
-                .capability_cropped_refs
-                .iter()
-                .filter(|reference| public_strategy_reference(reference).is_some())
-                .count()
-        })
-        .sum::<usize>();
-    let overlap = strategy
-        .actual
-        .as_ref()
-        .filter(|actual| actual.evidence_overlap_observed)
-        .map(|actual| format!("{}bp observed", actual.evidence_overlap_bp))
-        .unwrap_or_else(|| "unknown".to_string());
     lines.push(Line::from(format!(
-        "Scope: {} lanes / {} cropped refs · overlap {overlap}",
-        strategy.evidence_scopes.len(),
-        scope_refs
+        "Collaboration: candidate {:?} · decisions {} downgrade / {} early stop",
+        strategy.selected_candidate,
+        strategy.downgrades.len(),
+        strategy.early_stops.len()
     )));
-    for scope in strategy.evidence_scopes.iter().take(3) {
-        lines.push(labelled_line(
-            "Lane: ",
-            &format!(
-                "{} / {} · {}",
-                public_strategy_text(&scope.role_id),
-                public_strategy_text(&scope.focus_id),
-                public_strategy_text(&scope.responsibility_summary)
-            ),
-            Color::LightCyan,
-            width,
-        ));
-    }
 
     if !strategy.downgrades.is_empty() || !strategy.early_stops.is_empty() {
         lines.push(Line::from(format!(
@@ -554,7 +525,9 @@ mod tests {
         assert!(rendered.contains("calibrated · paired proof"));
         assert!(rendered.contains("Estimate: 62000ms effective / 48000ms critical"));
         assert!(rendered.contains("Actual: 51000ms"));
-        assert!(rendered.contains("2 lanes / 2 cropped refs"));
+        assert!(rendered.contains(
+            "Collaboration: candidate Some(Team) · decisions 1 downgrade / 1 early stop"
+        ));
         assert!(rendered.contains("Team: team-547 · execution execution-547"));
         assert!(rendered.contains("Agents: agent-547"));
         assert!(rendered.contains("Downgrade: r2"));
@@ -641,9 +614,6 @@ mod tests {
             "..\\windows-secret".to_string(),
             "evidence-safe".to_string(),
         ];
-        strategy.evidence_scopes[0].responsibility_summary = "C:\\secrets\\operator".to_string();
-        strategy.evidence_scopes[0].capability_cropped_refs =
-            vec!["/etc/passwd".to_string(), "scope-evidence-safe".to_string()];
 
         let rendered = rendered_text(&strategy);
         for secret in [
@@ -659,7 +629,9 @@ mod tests {
         }
         assert!(rendered.contains("redacted by strategy surface policy"));
         assert!(rendered.contains("evidence-safe"));
-        assert!(rendered.contains("2 cropped refs"));
+        assert!(rendered.contains(
+            "Collaboration: candidate Some(Team) · decisions 1 downgrade / 1 early stop"
+        ));
     }
 
     #[test]

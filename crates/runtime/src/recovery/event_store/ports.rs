@@ -23,6 +23,10 @@ pub enum RuntimeEventScope {
     /// registration starts at revision zero while the live reducer may emit
     /// progress before the graph itself is committed.
     ExecutionLive,
+    /// Agent-first collaboration Program journal. Program events are the
+    /// canonical source for Team roster, work-market, topic and completion
+    /// projections; model-authored execution graphs never write this scope.
+    Program,
     Goal,
     Mission,
     Session,
@@ -59,6 +63,7 @@ impl RuntimeEventScope {
             Self::ExecutionGraph => "execution_graph",
             Self::ExecutionNode => "execution_node",
             Self::ExecutionLive => "execution_live",
+            Self::Program => "program",
             Self::Goal => "goal",
             Self::Mission => "mission",
             Self::Session => "session",
@@ -89,6 +94,7 @@ impl RuntimeEventScope {
             "execution_graph" => Ok(Self::ExecutionGraph),
             "execution_node" => Ok(Self::ExecutionNode),
             "execution_live" => Ok(Self::ExecutionLive),
+            "program" => Ok(Self::Program),
             "goal" => Ok(Self::Goal),
             "mission" => Ok(Self::Mission),
             "session" => Ok(Self::Session),

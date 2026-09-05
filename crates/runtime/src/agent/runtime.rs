@@ -1311,10 +1311,7 @@ impl AgentRuntime {
                     predecessor.id
                 )
             })?;
-            let role = predecessor_packet
-                .team_role_assignment()
-                .map(|assignment| assignment.identity.role_id.as_str())
-                .unwrap_or(&predecessor_packet.assignment.role_id);
+            let role = predecessor_packet.assignment.role_id.as_str();
             let upstream_outcome = if result.status == ExecutionNodeStatus::Completed {
                 result.summary.clone().unwrap_or_else(|| {
                     format!("completed upstream result {}", predecessor_packet.run_id())
@@ -2191,8 +2188,6 @@ fn verify_binding_against_definition(
         .read_scopes
         .iter()
         .any(|scope| !manifest.cognitive_policy.read_scopes.contains(scope))
-        || (binding.data_lease.team_working_state_visible
-            && !manifest.cognitive_policy.team_working_state_visible)
         || binding.data_lease.write_mode
             == harness_contract::agent::CognitiveWriteMode::CandidateOnly
             && manifest.cognitive_policy.write_mode
@@ -2482,7 +2477,6 @@ mod tests {
                 team_id: None,
                 read_scopes: vec![harness_contract::agent::CognitiveReadScope::Session],
                 write_mode: harness_contract::agent::CognitiveWriteMode::CandidateOnly,
-                team_working_state_visible: false,
                 fact_boundaries: Vec::new(),
                 fact_refs: Vec::new(),
                 matrix_snapshot_refs: Vec::new(),
@@ -2518,8 +2512,6 @@ mod tests {
             output_acceptance: Vec::new(),
             requires_managed_collaboration_escalation: false,
             acceptance: vec!["verified".into()],
-            team_role_identity: None,
-            team_role: None,
             cohort_prompt_package: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -2560,7 +2552,6 @@ mod tests {
         );
         if let Some(binding) = packet.binding.as_mut() {
             binding.data_lease.team_id = Some(team_run_id.to_string());
-            binding.data_lease.team_working_state_visible = true;
         }
         packet
     }
@@ -2633,9 +2624,9 @@ mod tests {
         runtime.register_observation_authority_backend(Arc::new(CompletedBackend));
         let mut packet = team_task("invalid-acceptance", "team-1");
         packet.acceptance = vec!["evidence".to_string()];
-        packet.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+        packet.output_acceptance = vec![harness_contract::agent::OutputAcceptanceRequirement {
             criterion: "evidence".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+            check: harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence {
                 scopes: vec!["read:src".to_string()],
             },
         }];

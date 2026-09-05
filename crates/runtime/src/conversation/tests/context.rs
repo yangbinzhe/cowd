@@ -673,6 +673,30 @@
         }
     }
 
+    struct AgentActionExposureToolExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::ToolExecutor for AgentActionExposureToolExecutor {
+        async fn execute_output(
+            &self,
+            _name: &str,
+            _input: &str,
+        ) -> Result<harness_contract::context::ToolOutputDraft, crate::ToolError> {
+            Err(crate::ToolError::new("test executor must not run"))
+        }
+
+        fn available_tool_names(&self) -> Vec<String> {
+            harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect()
+        }
+
+        fn collaboration_runtime_available(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn capability_receipt_projects_current_schema_separately_from_catalog() {
         let runtime = ConversationRuntime::new(
@@ -697,7 +721,7 @@
             ]
             .into_iter()
             .collect(),
-            deferred: ["read_many".to_string(), "runtime_orchestrate".to_string()]
+            deferred: ["read_many".to_string(), "team_create".to_string()]
                 .into_iter()
                 .collect(),
             reason: "bootstrap tools exposed".to_string(),
@@ -707,40 +731,23 @@
 
         let projected = runtime.project_runtime_capabilities_for_model(
             &serde_json::json!({
-                "available_tool_names": ["tool_search", "runtime_capabilities", "read_many", "runtime_orchestrate"],
-                "runtime_orchestrate": {"available": true, "blocked_reasons": []},
+                "available_tool_names": ["tool_search", "runtime_capabilities", "read_many", "team_create"],
+                "team_create": {"available": true, "blocked_reasons": []},
                 "action_plane": {"can_execute_now": true},
-                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "read_many", "runtime_orchestrate"]}
+                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "read_many", "team_create"]}
             })
             .to_string(),
         );
         let value: serde_json::Value =
             serde_json::from_str(&projected).expect("projected capability JSON");
 
-        assert_eq!(
-            value["catalog_tool_names"],
-            serde_json::json!([
-                "tool_search",
-                "runtime_capabilities",
-                "read_many",
-                "runtime_orchestrate"
-            ])
-        );
+        assert!(value.get("catalog_tool_names").is_none());
         assert_eq!(
             value["tool_visibility"]["active_function_schemas"],
             serde_json::json!(["runtime_capabilities", "tool_search"])
         );
-        assert_eq!(
-            value["strategy"]["model_callable_tools"],
-            serde_json::json!(["runtime_capabilities", "tool_search"])
-        );
-        assert_eq!(value["runtime_orchestrate"]["available"], false);
-        assert_eq!(value["runtime_orchestrate"]["schema_active"], false);
-        assert_eq!(value["action_plane"]["can_execute_now"], false);
-        assert_eq!(
-            value["action_plane"]["recommended_next_tool"],
-            "tool_search"
-        );
+        assert_eq!(value["actions"], serde_json::json!([]));
+        assert_eq!(value["available"], false);
     }
 
     #[test]
@@ -758,14 +765,14 @@
             bootstrap: [
                 "tool_search".to_string(),
                 "runtime_capabilities".to_string(),
-                "runtime_orchestrate".to_string(),
+                "team_create".to_string(),
             ]
             .into_iter()
             .collect(),
             active: [
                 "tool_search".to_string(),
                 "runtime_capabilities".to_string(),
-                "runtime_orchestrate".to_string(),
+                "team_create".to_string(),
             ]
             .into_iter()
             .collect(),
@@ -777,8 +784,8 @@
 
         let rejected = runtime.project_runtime_capabilities_for_model(
             &serde_json::json!({
-                "available_tool_names": ["tool_search", "runtime_capabilities", "runtime_orchestrate"],
-                "runtime_orchestrate": {"available": false, "blocked_reasons": ["model_proposal_conflicts_with_strategy_lease"]},
+                "available_tool_names": ["tool_search", "runtime_capabilities", "team_create"],
+                "team_create": {"available": false, "blocked_reasons": ["model_proposal_conflicts_with_strategy_lease"]},
                 "action_plane": {
                     "can_execute_now": false,
                     "preflight": {
@@ -789,7 +796,7 @@
                         "lease_locked_pattern": "collaborate"
                     }
                 },
-                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "runtime_orchestrate"]}
+                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "team_create"]}
             })
             .to_string(),
         );
@@ -803,8 +810,8 @@
 
         let accepted = runtime.project_runtime_capabilities_for_model(
             &serde_json::json!({
-                "available_tool_names": ["tool_search", "runtime_capabilities", "runtime_orchestrate"],
-                "runtime_orchestrate": {"available": true, "blocked_reasons": []},
+                "available_tool_names": ["tool_search", "runtime_capabilities", "team_create"],
+                "team_create": {"available": true, "blocked_reasons": []},
                 "action_plane": {
                     "can_execute_now": true,
                     "preflight": {
@@ -814,7 +821,7 @@
                         "lease_locked_pattern": "collaborate"
                     }
                 },
-                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "runtime_orchestrate"]}
+                "strategy": {"model_callable_tools": ["tool_search", "runtime_capabilities", "team_create"]}
             })
             .to_string(),
         );
@@ -1446,7 +1453,7 @@
     }
 
     #[tokio::test]
-    async fn orchestration_phase_gate_exposes_only_control_plane_tools() {
+    async fn agentic_phase_gate_exposes_the_complete_action_vocabulary() {
         let projections = Arc::new(std::sync::Mutex::new(Vec::new()));
         let required_tool_choices = Arc::new(std::sync::Mutex::new(Vec::new()));
         let reasoning_efforts = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1457,7 +1464,7 @@
                 required_tool_choices: Arc::clone(&required_tool_choices),
                 reasoning_efforts: Arc::clone(&reasoning_efforts),
             },
-            ExposureToolExecutor,
+            AgentActionExposureToolExecutor,
             PermissionPolicy::new(PermissionMode::DangerFullAccess),
             vec!["system".to_string()],
         )
@@ -1469,9 +1476,9 @@
             .begin_turn_strategy("orchestration-gate-turn", "必须实际启动协作团队完成分析")
             .expect("turn strategy admission");
         runtime
-            .set_turn_strategy_focus_partitions(Vec::new(), 1)
+            .set_turn_strategy_collaboration_obligation(1)
             .expect("freeze root collaboration obligation");
-        runtime.require_next_model_orchestration_only();
+        runtime.require_next_agent_action();
         runtime
             .execute_model_step("必须实际启动协作团队完成分析", true)
             .await
@@ -1484,41 +1491,32 @@
             .chain(projection.bootstrap_ids.iter())
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(
-            active.contains(harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID)
-        );
-        assert_eq!(
-            active.len(),
-            2,
-            "root admission may expose only the control-plane tools: {active:?}"
-        );
-        assert!(
-            active.contains("runtime_capabilities"),
-            "the model must be able to inspect exact template role ids before proposing: {active:?}"
-        );
+        assert!(harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+            .iter()
+            .all(|tool| active.contains(*tool)), "missing Agent Action from {active:?}");
         assert_eq!(
             required_tool_choices
                 .lock()
                 .expect("required choices")
                 .as_slice(),
             &[true],
-            "root admission must propagate a required native tool choice to the provider adapter"
+            "Agent-first admission must propagate a required native tool choice to the provider adapter"
         );
         assert_eq!(
             reasoning_efforts
                 .lock()
                 .expect("reasoning efforts")
                 .as_slice(),
-            &[Some("none".to_string())],
-            "the forced Qwen-compatible proposal request disables thinking only for this call"
+            &[None],
+            "the Agent Action gate must not silently reduce the model's configured reasoning effort"
         );
         assert!(
             !active.contains("grep_search"),
-            "orchestration-phase gate must hide general tools: {active:?}"
+            "the action phase gate must hide general tools: {active:?}"
         );
         assert!(
             !active.contains("tool_search"),
-            "orchestration-phase gate must hide discovery tools: {active:?}"
+            "the action phase gate must hide discovery tools: {active:?}"
         );
     }
 
@@ -2560,7 +2558,6 @@
                 team_id: None,
                 read_scopes: vec![CognitiveReadScope::Session],
                 write_mode: CognitiveWriteMode::CandidateOnly,
-                team_working_state_visible: false,
                 fact_boundaries: Vec::new(),
                 fact_refs: vec!["fact:primary-turn-fact".to_string()],
                 matrix_snapshot_refs: Vec::new(),

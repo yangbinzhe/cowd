@@ -674,13 +674,13 @@ mod tests {
             },
         };
         let catalog = ToolCatalog::builtin()
-            .with_runtime_tools(vec![definition("runtime_orchestrate")])
+            .with_runtime_tools(vec![definition("team_create")])
             .expect("core runtime tool")
             .extend_runtime_tools(vec![definition("mcp__alpha__echo")])
             .expect("MCP runtime tool");
 
         assert_eq!(
-            catalog.required_permission("runtime_orchestrate"),
+            catalog.required_permission("team_create"),
             Some(KernelToolPermissionMode::ReadOnly)
         );
         assert_eq!(

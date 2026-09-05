@@ -666,7 +666,7 @@ fn classify_model_step_intent(text: String, calls: Vec<ModelToolCall>) -> ModelS
         ModelStepIntent::FinalAnswer { text }
     } else {
         // Function identity is owned by the exposed tool catalog and the
-        // tool's typed input contract. Names such as `team_board` or
+        // tool's typed input contract. Names such as
         // `permission_status` are ordinary tools; they must never create an
         // Agent, Team, approval, or replan merely because of a substring.
         // Stateful orchestration remains the responsibility of Runtime's
@@ -765,165 +765,14 @@ fn apply_explicit_team_requirement(
     }
 }
 
-fn is_runtime_team_orchestration_call(call: &ModelToolCall) -> bool {
-    if call.name.eq_ignore_ascii_case(
-        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-    ) {
-        return serde_json::from_str::<
-            harness_contract::orchestration::ModelCollaborationControlDecisionV2,
-        >(&call.input)
-        .ok()
-        .is_some_and(|decision| !decision.workstreams.is_empty());
-    }
-    if !is_runtime_team_orchestration_call_name(&call.name) {
-        return false;
-    }
-    serde_json::from_str::<serde_json::Value>(&call.input)
-        .ok()
-        .is_some_and(|input| {
-            input.get("operation").and_then(serde_json::Value::as_str) == Some("propose")
-                && input
-                    .pointer("/proposal/nodes")
-                    .and_then(serde_json::Value::as_array)
-                    .is_some_and(|nodes| {
-                        nodes.iter().any(|node| {
-                            node.get("recipe").and_then(serde_json::Value::as_str) == Some("team")
-                        })
-                    })
-        })
-}
-
-#[cfg(test)]
-fn runtime_team_orchestration_count(call: &ModelToolCall) -> usize {
-    if !is_runtime_team_orchestration_call_name(&call.name) {
-        return 0;
-    }
-    serde_json::from_str::<serde_json::Value>(&call.input)
-        .ok()
-        .and_then(|input| {
-            input
-                .pointer("/proposal/nodes")
-                .and_then(serde_json::Value::as_array)
-                .map(|nodes| {
-                    nodes
-                        .iter()
-                        .filter(|node| {
-                            node.get("recipe").and_then(serde_json::Value::as_str) == Some("team")
-                        })
-                        .map(|node| {
-                            node.get("multiplicity")
-                                .and_then(serde_json::Value::as_u64)
-                                .and_then(|value| usize::try_from(value).ok())
-                                .unwrap_or(1)
-                        })
-                        .sum()
-                })
-        })
-        .unwrap_or_default()
-}
-
-fn is_runtime_team_orchestration_call_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("runtime_orchestrate")
-        || name.eq_ignore_ascii_case(
-            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-        )
-}
-
-#[cfg(test)]
-pub(crate) fn required_team_orchestration_call_with_understanding(
-    objective: &str,
-    understanding: &harness_contract::strategy::TaskUnderstanding,
-) -> ModelToolCall {
-    let requires_external_facts = understanding.requires_external_facts;
-    let requires_write = understanding.requires_write;
-    let team_owns_write = requires_write
-        && harness_contract::strategy::explicit_team_owns_persisted_artifact(objective);
-    let team_count = usize::from(understanding.required_team_count.max(1));
-    let node_ids = (0..team_count)
-        .map(|index| {
-            if team_count == 1 {
-                "explicit-team".to_string()
-            } else {
-                format!("explicit-team-{}", index + 1)
-            }
-        })
-        .collect::<Vec<_>>();
-    let nodes = node_ids
+fn is_agent_collaboration_action_name(name: &str) -> bool {
+    harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
         .iter()
-        .enumerate()
-        .map(|(index, node_id)| {
-            // A compound request such as "one Team researches, another Team
-            // writes the report" is not N copies of one template. Research
-            // Teams may run independently, while the final writer consumes
-            // every preceding result and owns the workspace artifact.
-            let is_followup_writer = team_owns_write && index + 1 == team_count;
-            let contract = crate::orchestration::team_authority::explicit_team_node_contract(
-                index,
-                team_count,
-                team_owns_write,
-                requires_external_facts,
-            );
-            let node_requires_write = is_followup_writer;
-            serde_json::json!({
-                "node_id": node_id,
-                "recipe": "team",
-                "objective": objective,
-                "depends_on": if node_requires_write && index > 0 {
-                    node_ids[..index].to_vec()
-                } else {
-                    Vec::<String>::new()
-                },
-                "template": contract.template,
-                "output_artifacts": contract.output_artifacts,
-                "evidence_contract": contract.evidence_contract,
-                "required": true
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut mutation_digest = Sha256::new();
-    mutation_digest.update(b"cowd:explicit-team:v1\0");
-    mutation_digest.update(objective.trim().as_bytes());
-    mutation_digest.update(b"\0");
-    mutation_digest.update(team_count.to_string().as_bytes());
-    mutation_digest.update([u8::from(team_owns_write)]);
-    mutation_digest.update([u8::from(requires_external_facts)]);
-    let mutation_digest = mutation_digest.finalize();
-    let mutation_id = format!("explicit-team-{mutation_digest:x}");
-    ModelToolCall {
-        id: "runtime-required-team".to_string(),
-        name: "runtime_orchestrate".to_string(),
-        input: serde_json::json!({
-            "intent": objective,
-            "operation": "propose",
-            "proposal": {
-                "mutation_id": mutation_id,
-                "reason": "the user explicitly requires an actually started collaboration team",
-                "nodes": nodes,
-                "completion": {
-                    "required_node_ids": node_ids,
-                    "required_artifact_kinds": if team_owns_write {
-                        serde_json::json!(["workspace_change", "terminal_synthesis"])
-                    } else {
-                        serde_json::json!(["terminal_synthesis"])
-                    },
-                    "allow_unresolved_conflicts": false
-                }
-            },
-            "constraints": {
-                "risk": "low",
-                "requires_write": team_owns_write,
-                "surface_latency_sensitive": false,
-            }
-        })
-        .to_string(),
-        depends_on: Vec::new(),
-    }
+        .any(|action| name.eq_ignore_ascii_case(action))
 }
 
-#[cfg(test)]
-fn required_team_orchestration_call(objective: &str) -> ModelToolCall {
-    let understanding = understand(&StrategyInput::from_prompt(objective));
-    required_team_orchestration_call_with_understanding(objective, &understanding)
+fn is_agent_collaboration_action(call: &ModelToolCall) -> bool {
+    is_agent_collaboration_action_name(&call.name)
 }
 
 /// Fully assembled request payload sent to the upstream model client.
@@ -1135,10 +984,9 @@ impl ModelStepToolPlan {
             }
         }
         for call_id in &self.order {
-            let appended = self
-                .calls
-                .get(call_id)
-                .expect("model step append order references a missing call");
+            let appended = self.calls.get(call_id).ok_or_else(|| {
+                format!("model step append order references missing call `{call_id}`")
+            })?;
             let Some(sealed) = finalized.get(call_id) else {
                 return Err(format!(
                     "completed tool call `{call_id}` disappeared before model step seal"
@@ -2042,7 +1890,7 @@ fn rate_per_second(count: u64, duration_ms: u64) -> Option<f64> {
 }
 
 fn bootstrap_tool_ids(
-    maximum_permission: harness_contract::tool::ToolPermissionMode,
+    _maximum_permission: harness_contract::tool::ToolPermissionMode,
 ) -> Vec<String> {
     let mut bootstrap = vec![
         "tool_search".to_string(),
@@ -2055,28 +1903,15 @@ fn bootstrap_tool_ids(
         "glob_search".to_string(),
         "grep_search".to_string(),
         "read_file".to_string(),
-        // A managed Agent may carry a Runtime-issued, terminal escalation
-        // obligation.  Deferred discovery is unsafe for that contract: the
-        // first native request otherwise ends the model step with an
-        // exposure-miss before the Agent can retry.  Gateway still verifies
-        // the Agent binding and parent Program before executing this tool, so
-        // schema visibility grants no standalone escalation authority.
-        "request_collaboration_escalation".to_string(),
     ];
-    // Stateful orchestration is a runtime-native capability. When the current
-    // policy already permits workspace writes, exposing it up front lets the
-    // model intentionally start a real team or execution graph instead of
-    // repeatedly querying a catalog that it cannot act on. Read-only turns
-    // never expose it and still retain explicit discovery for evidence tools.
-    if !matches!(
-        maximum_permission,
-        harness_contract::tool::ToolPermissionMode::ReadOnly
-    ) {
-        bootstrap.push("runtime_orchestrate".to_string());
-        bootstrap.push(
-            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID.to_string(),
-        );
-    }
+    // The stable Agent action prefix is always available. These actions write
+    // only Runtime collaboration facts; concrete workspace/external effects
+    // keep their independent permission gates.
+    bootstrap.extend(
+        harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+            .iter()
+            .map(|tool| (*tool).to_string()),
+    );
     bootstrap
 }
 
@@ -2287,33 +2122,18 @@ mod tool_exposure_contract_tests {
     use harness_contract::tool::ToolPermissionMode;
 
     #[test]
-    fn required_runtime_control_tools_are_bootstrapped_while_orchestration_stays_write_gated() {
-        assert_eq!(
-            bootstrap_tool_ids(ToolPermissionMode::ReadOnly),
-            vec![
-                "tool_search",
-                "context_retrieve",
-                "runtime_capabilities",
-                "glob_search",
-                "grep_search",
-                "read_file",
-                "request_collaboration_escalation"
-            ]
-        );
-        assert_eq!(
-            bootstrap_tool_ids(ToolPermissionMode::WorkspaceWrite),
-            vec![
-                "tool_search",
-                "context_retrieve",
-                "runtime_capabilities",
-                "glob_search",
-                "grep_search",
-                "read_file",
-                "request_collaboration_escalation",
-                "runtime_orchestrate",
-                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID
-            ]
-        );
+    fn agent_action_loop_is_bootstrapped_independent_of_business_write_ceiling() {
+        for ceiling in [
+            ToolPermissionMode::ReadOnly,
+            ToolPermissionMode::WorkspaceWrite,
+        ] {
+            let tools = bootstrap_tool_ids(ceiling);
+            assert!(harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                .iter()
+                .all(|required| tools.iter().any(|tool| tool == required)));
+            assert!(tools.iter().any(|tool| tool == "runtime_capabilities"));
+            assert!(tools.iter().any(|tool| tool == "context_retrieve"));
+        }
     }
 }
 
@@ -3358,7 +3178,6 @@ struct RecoveredTurnStrategyIdentity {
     candidate_estimates: Vec<harness_contract::strategy::ExecutionCandidateEstimate>,
     collaboration_receipt: Option<serde_json::Value>,
     collaboration_obligation: Option<harness_contract::strategy::CollaborationExecutionObligation>,
-    focus_partition_plans: Vec<harness_contract::team::FocusPartitionPlan>,
     pattern: harness_contract::core::ExecutionPattern,
 }
 

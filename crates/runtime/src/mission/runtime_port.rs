@@ -10,15 +10,12 @@ use std::{
     sync::Arc,
 };
 
-use harness_contract::execution_graph::{
-    ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage,
-};
+use harness_contract::execution_graph::ExecutionGraphLineage;
 use harness_contract::mission::{
     MissionCommand, MissionCommandSagaRecord, MissionControlProjection, MissionControlSessionNode,
 };
 use harness_contract::reality::EvidenceRef;
 use harness_contract::task::{TaskOrigin, TaskRouteHint};
-use harness_contract::team::TeamInstantiationRequest;
 use serde_json::{json, Value};
 
 use crate::{
@@ -26,7 +23,7 @@ use crate::{
     MissionCommandInterpretation, MissionCommandInterpreter, MissionControlRuntime,
     MissionProjection, MissionRuntime, MissionScheduleDispatchReport, MissionSchedulePolicy,
     RuntimeServices, SessionProxy, SessionRelationGraph, SubmitGlobalApprovalRequest,
-    TeamProjection, UpdateMissionScheduleRequest,
+    UpdateMissionScheduleRequest,
 };
 
 /// Runtime's sole surface-facing Mission boundary.
@@ -65,7 +62,6 @@ impl MissionRuntimePort {
         self.mission().projection(
             self.relations(),
             self.services.agent_runtime(),
-            self.services.team_runtime(),
             self.services.approval_queue(),
             self.services.conflict_resolver(),
             self.services.mission_evidence(),
@@ -128,6 +124,25 @@ impl MissionRuntimePort {
         session_ids.sort();
         session_ids.dedup();
         session_ids
+    }
+
+    /// Count the canonical Agentic Program teams and agents visible in each
+    /// Session. The counts are derived from the Program journal and never
+    /// persisted as a second Mission-owned collaboration registry.
+    #[must_use]
+    pub fn agentic_session_counts(&self) -> BTreeMap<String, (usize, usize)> {
+        let mut counts = BTreeMap::<String, (usize, usize)>::new();
+        for program in self
+            .services
+            .agent_action_service()
+            .list_programs()
+            .unwrap_or_default()
+        {
+            let entry = counts.entry(program.session_id).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(program.teams.len());
+            entry.1 = entry.1.saturating_add(program.agents.len());
+        }
+        counts
     }
 
     /// Derive Session participation from canonical Task/Turn bindings.
@@ -360,95 +375,11 @@ impl MissionRuntimePort {
         )
     }
 
-    pub fn team_projection(&self, team_id: &str) -> Result<TeamProjection, String> {
-        let projection = self
-            .services
-            .team_runtime()
-            .project(&format!("team-graph:{team_id}"))?;
-        (projection.team_id == team_id)
-            .then_some(projection)
-            .ok_or_else(|| format!("team identity mismatch: {team_id}"))
-    }
-
-    pub fn team_graph(&self, team_id: &str) -> Result<ExecutionGraph, String> {
-        let team = self.team_projection(team_id)?;
-        self.services
-            .graph_state_store()
-            .load(&team.graph_id)
-            .map_err(|error| error.to_string())
-    }
-
-    #[must_use]
-    pub fn team_projection_json(&self) -> Value {
-        self.services.team_runtime().projection_json()
-    }
-
-    /// Bounded aggregate used by Mission Session summary nodes. Avoids the
-    /// legacy JSON projection, which also materializes every Team working
-    /// state and turns a simple count into an O(history × graph-read) query.
-    #[must_use]
-    pub fn team_session_counts(&self) -> BTreeMap<String, (usize, usize)> {
-        let mut counts = BTreeMap::<String, (usize, usize)>::new();
-        for team in self.services.team_runtime().list().unwrap_or_default() {
-            let entry = counts.entry(team.session_id).or_default();
-            entry.0 = entry.0.saturating_add(1);
-            entry.1 = entry.1.saturating_add(team.tasks.len());
-        }
-        counts
-    }
-
-    pub async fn cancel_team(&self, team_id: &str) -> Result<Value, String> {
-        let team = self.team_projection(team_id)?;
-        let projection = self
-            .services
-            .execution_supervisor()
-            .graph_projection(&team.graph_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let receipt = self
-            .services
-            .execution_supervisor()
-            .command_graph(
-                &projection.graph_id,
-                ExecutionGraphCommand::Cancel {
-                    expected_revision: projection.revision,
-                    reason: "team cancellation requested through a surface command".to_string(),
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(serde_json::to_value(receipt).unwrap_or_default())
-    }
-
     #[must_use]
     pub fn agent_events(&self, agent_id: &str) -> Value {
         json!({
             "events": self.services.agent_runtime().events(agent_id),
             "run": self.services.agent_runtime().get(agent_id),
-        })
-    }
-
-    #[must_use]
-    pub fn team_evidence(&self, team_id: &str) -> Value {
-        let team = self.team_projection(team_id).ok();
-        let events = team
-            .as_ref()
-            .map(|team| {
-                team.tasks
-                    .iter()
-                    .flat_map(|task| self.services.agent_runtime().events(&task.agent_id))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let tasks = team
-            .as_ref()
-            .map(|team| team.tasks.clone())
-            .unwrap_or_default();
-        json!({
-            "events": events,
-            "tasks": tasks,
-            "team": team,
-            "evidence": self.services.mission_evidence().list_for_team(team_id),
         })
     }
 
@@ -531,13 +462,6 @@ impl MissionRuntimePort {
             .mission_schedules()
             .update(schedule_id, request, now_ms())
             .map(|schedule| serde_json::to_value(schedule).unwrap_or_default())
-    }
-
-    pub async fn instantiate_team(
-        &self,
-        request: TeamInstantiationRequest,
-    ) -> Result<TeamProjection, String> {
-        self.services.team_runtime().instantiate(request).await
     }
 
     pub fn submit_approval(

@@ -48,7 +48,7 @@ impl SafetyFusePolicy {
             complexity,
             explicit_user_limit,
             reason: format!(
-                "hard safety ceiling derived from policy complexity={complexity:?}, explicit_user_limit={explicit_user_limit:?}; context_window={context_window} is context-budget telemetry only"
+                "consecutive unverified-progress threshold derived from policy complexity={complexity:?}, explicit_user_limit={explicit_user_limit:?}; context_window={context_window} and total model steps are telemetry only"
             ),
         }
     }
@@ -56,10 +56,10 @@ impl SafetyFusePolicy {
     #[must_use]
     pub fn evaluate(
         lease: &ExecutionBudgetLease,
-        model_steps: usize,
+        consecutive_unverified_steps: usize,
         made_progress: bool,
     ) -> SafetyFuseDecision {
-        if model_steps < lease.max_model_steps {
+        if consecutive_unverified_steps < lease.max_model_steps {
             return SafetyFuseDecision::Continue;
         }
         if made_progress {
@@ -70,7 +70,7 @@ impl SafetyFusePolicy {
         }
         SafetyFuseDecision::Block {
             reason: format!(
-                "safety fuse fired after {model_steps} model steps without verified progress (possible loop/stall); {}",
+                "safety fuse fired after {consecutive_unverified_steps} consecutive model steps without verified progress (possible loop/stall); {}",
                 lease.reason
             ),
         }
@@ -97,10 +97,12 @@ mod tests {
     }
 
     #[test]
-    fn hard_ceiling_is_fixed_for_the_lifetime_of_the_lease() {
+    fn stall_streak_threshold_is_fixed_for_the_lifetime_of_the_lease() {
         let lease = SafetyFusePolicy::derive(1_000_000, TaskComplexity::Moderate, Some(20));
         assert_eq!(lease.max_model_steps, 14);
-        assert!(lease.reason.contains("context-budget telemetry only"));
+        assert!(lease
+            .reason
+            .contains("total model steps are telemetry only"));
     }
 
     #[test]
@@ -122,6 +124,21 @@ mod tests {
             SafetyFuseDecision::Continue
         );
         // A loop/stall without progress still fires the fuse.
+        assert!(matches!(
+            SafetyFusePolicy::evaluate(&lease, 3, false),
+            SafetyFuseDecision::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn an_isolated_stalled_step_after_long_verified_progress_does_not_block() {
+        let lease = SafetyFusePolicy::derive(128_000, TaskComplexity::Complex, Some(3));
+        // The host supplies the consecutive unverified streak, so a high total
+        // iteration count cannot turn one isolated miss into a false loop.
+        assert_eq!(
+            SafetyFusePolicy::evaluate(&lease, 1, false),
+            SafetyFuseDecision::Continue
+        );
         assert!(matches!(
             SafetyFusePolicy::evaluate(&lease, 3, false),
             SafetyFuseDecision::Block { .. }

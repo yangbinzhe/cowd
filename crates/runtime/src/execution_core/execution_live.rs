@@ -224,6 +224,7 @@ impl LiveExecutionRecord {
         {
             &mut self.live.output_parts[index]
         } else {
+            let index = self.live.output_parts.len();
             self.live.output_parts.push(ExecutionLiveOutputPart {
                 model_step_id: identity.model_step_id.clone(),
                 item_id: identity.item_id.clone(),
@@ -234,10 +235,7 @@ impl LiveExecutionRecord {
                 preview_start_bytes: 0,
                 bytes: 0,
             });
-            self.live
-                .output_parts
-                .last_mut()
-                .expect("new output part exists")
+            &mut self.live.output_parts[index]
         };
         part.bytes = part
             .bytes

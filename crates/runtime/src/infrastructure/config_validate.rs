@@ -633,22 +633,6 @@ const RUNTIME_CONTROL_CAPACITY_FIELDS: &[FieldSpec] = &[
         expected: FieldType::Number,
     },
     FieldSpec {
-        name: "max_program_teams",
-        expected: FieldType::Number,
-    },
-    FieldSpec {
-        name: "max_team_roles",
-        expected: FieldType::Number,
-    },
-    FieldSpec {
-        name: "max_role_instances_per_team",
-        expected: FieldType::Number,
-    },
-    FieldSpec {
-        name: "max_agent_nodes_per_team",
-        expected: FieldType::Number,
-    },
-    FieldSpec {
         name: "max_pending_instance",
         expected: FieldType::Number,
     },
@@ -662,14 +646,6 @@ const RUNTIME_CONTROL_CAPACITY_FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         name: "admission_aging_interval_ms",
-        expected: FieldType::Number,
-    },
-    FieldSpec {
-        name: "user_team_veto_window_ms",
-        expected: FieldType::Number,
-    },
-    FieldSpec {
-        name: "max_semantic_revisions_per_turn",
         expected: FieldType::Number,
     },
 ];

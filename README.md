@@ -315,8 +315,8 @@ Edge 负责把用户、消息平台和数据源接入 Gateway；业务 App 以�
   ├─ solo 任务 → Conversation 直接执行
   ├─ team 任务 → Team Template → immutable AgentTask graph
   │               ├─ Agent A/B 并行（受并发阶梯约束）
-  │               ├─ Team WorkingState / team_board → evidence/conflict/unresolved
-  │               └─ dependency → convergence/arbiter → synthesis → verify gate
+  │               ├─ Agentic Topic / Artifact / Task → evidence/conflict/unresolved
+  │               └─ dependency → synthesis/review → ObjectiveSupervisor verdict
   └─ steward 任务 → 持久调度: tick → autonomy_profile → 托管执行
                     └─ steward_agent → decision_ledger → handoff
 ```
@@ -334,7 +334,7 @@ Edge 负责把用户、消息平台和数据源接入 Gateway；业务 App 以�
 | **5 层记忆系统** | L0身份→L1核心→L2项目→L3深度→L4共享 + 有界压缩 + 向量/FTS 检索 | ✅ 生产就绪 | `memory` · `fact-kernel` |
 | **进化记忆** | 确定性规则 + 模型候选双层治理，候选校验/提升/审计闭环 | ✅ 生产就绪 | `evolution` · `GrowthService` |
 | **结构化事实引擎** | 实体/关系/证据/Metrics/Ontology + 后端中立持久化 + 质量门控 | ✅ 生产就绪 | `matrix-core` · `matrix-repository` · `MatrixDataPlane` |
-| **多 Agent 协作** | Team 模板 → AgentTask DAG → 并发阶梯（8/16/64/256）→ WorkingState/team_board → 仲裁收敛 → synthesis/verify | ✅ 核心闭环 | `orchestration` · `ExecutionGraphRunner` · `team_runtime` |
+| **多 Agent 协作** | Agentic Program → AgentTask DAG → 并发阶梯（8/16/64/256）→ Topic/Artifact/Task 交换 → synthesis/review → Supervisor 终态 | ✅ 核心闭环 | `agentic` · `ExecutionGraphRunner` · `ObjectiveSupervisor` |
 | **团队收敛仲裁** | 多角色 evidence/conflict 汇总、仲裁理由、终态 JSON/产物合同 | ✅ 生产就绪 | `convergence` · `result_reducer` · Team Template |
 | **权限与审批** | 五档审批矩阵（cautious/supervised/stewarded/autonomous/yolo）× 五域统一 ApprovalRouter；YOLO 全信任直连宿主机 | ✅ 生产就绪 | `permissions` · `approval::router` · `approval_queue` |
 | **Linux 沙箱** | Landlock/seccomp/rlimit/cgroup 强隔离、Mutation Preview、bash 审计；完全信任档位直连宿主机 | ✅ 生产就绪 | `sandbox` · `sandbox_exec` · `policy_engine` |
@@ -679,15 +679,15 @@ received ──→ processing ──→ processed     queued ──→ sending �
                    └───────────────┼───────────────┘
                                    │
                     ┌──────────────▼──────────────┐
-                    │  WorkingState / team_board  │
-                    │  evidence / conflict /      │
-                    │  unresolved / artifact      │
+                    │ Agentic Topic / Artifact /  │
+                    │ Task: evidence / conflict / │
+                    │ unresolved                  │
                     └──────────────┬──────────────┘
                                    │
                     ┌──────────────▼──────────────┐
-                    │  convergence / arbiter      │  仲裁理由 → key_decisions
-                    │  → synthesis                │
-                    │  → review gate              │
+                    │ synthesis / review          │  受管产物 → key_decisions
+                    │ → ObjectiveSupervisor      │
+                    │ → terminal verdict         │
                     └──────────────┬──────────────┘
                                    ▼
                           ┌──────────────┐

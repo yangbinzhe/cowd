@@ -17,16 +17,14 @@ use harness_contract::projection::{
     ProjectionEntityCollection, ProjectionEntityPayload, ProjectionOperation,
     ProjectionQueryContext, ProjectionResyncReason, ProjectionSourceHealth,
     StrategyActualProjection, StrategyActualStatus, StrategyDecisionProjection,
-    StrategyEvidenceScopeProjection, StrategyProofStatus, StrategyTransitionProjection,
-    EXECUTION_PROJECTION_REDUCER_VERSION, EXECUTION_PROJECTION_SCHEMA_VERSION,
-    STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION,
+    StrategyProofStatus, StrategyTransitionProjection, EXECUTION_PROJECTION_REDUCER_VERSION,
+    EXECUTION_PROJECTION_SCHEMA_VERSION, STRATEGY_DECISION_PROJECTION_SCHEMA_VERSION,
 };
 use harness_contract::reality::{EvidenceCompleteness, EvidenceRef, RealityBoundary};
 use harness_contract::strategy::{
     ExecutionCandidateEstimate, ExecutionCandidateKind, StrategyDecisionSource,
     StrategyResourceSnapshot,
 };
-use harness_contract::team::FocusPartitionPlan;
 use sha2::{Digest, Sha256};
 
 use crate::execution_core::graph::{
@@ -1162,15 +1160,28 @@ mod tests {
         .expect("activity detail");
         assert_eq!(detail.activity.activity_id, root_activity_id);
         assert_eq!(detail.execution_id, initial_snapshot.execution_id);
-        let delta = delta(&services, &initial_snapshot.execution_id, 0, 0, &query).expect("delta");
-        assert!(delta.target_cursor >= initial_snapshot.cursor);
-        assert!(delta.operations.iter().any(|operation| {
+        let initial_delta =
+            delta(&services, &initial_snapshot.execution_id, 0, 0, &query).expect("delta");
+        assert!(initial_delta.target_cursor >= initial_snapshot.cursor);
+        assert!(initial_delta.operations.iter().any(|operation| {
             matches!(
                 operation,
                 ProjectionOperation::AdvanceCursor { cursor }
-                    if *cursor == delta.target_cursor
+                    if *cursor == initial_delta.target_cursor
             )
         }));
+        let idle_delta = delta(
+            &services,
+            &initial_snapshot.execution_id,
+            initial_delta.target_revision,
+            initial_delta.target_cursor,
+            &query,
+        )
+        .expect("unchanged delta");
+        assert!(
+            idle_delta.operations.is_empty(),
+            "an unchanged terminal/active projection must not replay terminal or cursor operations"
+        );
         let receipt = command(
             &services,
             &initial_snapshot.execution_id,
@@ -1398,92 +1409,6 @@ mod tests {
                     if child.execution_id == child_id
             )
         }));
-
-        services
-            .event_store()
-            .append(
-                crate::RuntimeEventInput {
-                    stream_id: "team-working-state:team-lineage".to_string(),
-                    scope: RuntimeEventScope::Team,
-                    kind: "team.working_state.appended.v1".to_string(),
-                    status: Some("committed".to_string()),
-                    actor: Some("reviewer-lineage".to_string()),
-                    refs: vec![crate::RuntimeEventRef {
-                        kind: "execution_graph".to_string(),
-                        id: child_id.clone(),
-                    }],
-                    payload: serde_json::json!({
-                        "entry_id": "discussion-lineage-1",
-                        "team_id": "team-lineage",
-                        "graph_id": child_id,
-                        "node_id": "reviewer-lineage-node",
-                        "producer_instance_id": "reviewer-lineage",
-                        "kind": "challenge",
-                        "summary": "independent evidence is required",
-                        "refs": [],
-                        "artifact_refs": [],
-                        "boundary": "bounded semantic checkpoint",
-                        "confidence_milli": 1000,
-                        "graph_revision": 1,
-                        "revision": 1,
-                        "source_generation": 1,
-                        "visibility": "team"
-                    }),
-                }
-                .with_activity_binding(harness_contract::projection::RuntimeActivityBinding {
-                    root_execution_id: child_id.clone(),
-                    session_id: "lineage-session".to_string(),
-                    turn_id: "lineage-turn".to_string(),
-                    root_task_id: "lineage-task".to_string(),
-                    task_id: "lineage-task".to_string(),
-                    activity_id: format!(
-                        "activity:execution:{child_id}:discussion:discussion-lineage-1"
-                    ),
-                    node_id: Some("reviewer-lineage-node".to_string()),
-                    parent_activity_id: Some(format!("activity:execution:{child_id}")),
-                    initiator_activity_id: Some(format!("activity:execution:{child_id}")),
-                    team_run_id: Some("team-lineage".to_string()),
-                    agent_instance_id: Some("reviewer-lineage".to_string()),
-                    agent_run_id: Some("reviewer-lineage-run".to_string()),
-                    skill_id: None,
-                    skill_revision: None,
-                    skill_activation_id: None,
-                    tool_contract_id: None,
-                    tool_call_id: None,
-                    approval_id: None,
-                    parallel_group_id: None,
-                    revision: 1,
-                    fence: 1,
-                    generation: 1,
-                })
-                .expect("discussion activity binding"),
-            )
-            .expect("child discussion commits");
-        let child_delta = delta(
-            &services,
-            &parent_id,
-            projection.revision,
-            projection.cursor,
-            &context(&services),
-        )
-        .expect("child activity delta");
-        assert!(child_delta.operations.iter().any(|operation| {
-            matches!(operation, ProjectionOperation::ReplaceActivities { .. })
-        }));
-        let reduced =
-            harness_contract::projection::reduce_projection_delta(&projection, &child_delta)
-                .expect("child delta applies");
-        let refreshed = snapshot(&services, &parent_id, &context(&services))
-            .await
-            .expect("refreshed parent projection");
-        assert_eq!(
-            reduced, refreshed,
-            "one child delta must equal a full resync"
-        );
-        assert!(reduced.activities.iter().any(|activity| {
-            activity.kind == harness_contract::projection::ExecutionActivityKind::Discussion
-                && activity.team_run_id.as_deref() == Some("team-lineage")
-        }));
     }
 
     #[test]
@@ -1600,7 +1525,6 @@ mod tests {
                     "candidate_estimates": [],
                     "selection_reasons": ["integer cost model selected the candidate"],
                     "resource_snapshot": harness_contract::strategy::StrategyResourceSnapshot::default(),
-                    "evidence_scopes": [],
                     "outcome": if kind == "runtime.strategy.outcome" {
                         serde_json::json!({
                             "duration_ms": 42,
@@ -1614,7 +1538,6 @@ mod tests {
                             "write_attempt_paths": ["/home/private/secret.txt"],
                             "evidence_overlap_bp": 0,
                             "evidence_overlap_observed": true,
-                            "working_state_verified": true,
                             "merge_cost_ms": 0,
                             "parent_merge_count": 1,
                             "quality_score_bp": 9000,
@@ -1689,13 +1612,8 @@ mod tests {
         services
             .event_store()
             .append(crate::RuntimeEventInput {
-                kind: "runtime.orchestration.completed".to_string(),
-                ..strategy_event(
-                    &graph_id,
-                    "decision-1",
-                    "runtime.orchestration.completed",
-                    99,
-                )
+                kind: "runtime.control.completed".to_string(),
+                ..strategy_event(&graph_id, "decision-1", "runtime.control.completed", 99)
             })
             .expect("generic orchestration event");
         services
@@ -1751,7 +1669,6 @@ mod tests {
                     "candidate_estimates": [],
                     "selection_reasons": ["conflicting replay must not replace truth"],
                     "resource_snapshot": harness_contract::strategy::StrategyResourceSnapshot::default(),
-                    "evidence_scopes": [],
                     "outcome": serde_json::Value::Null,
                 }),
                 ..strategy_event(
@@ -1842,63 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn strategy_scope_projection_drops_paths_prompts_and_hidden_reasoning() {
-        let context = ProjectionQueryContext {
-            principal: "test".to_string(),
-            workspace_id: "test".to_string(),
-            session_scopes: vec!["session-visible".to_string()],
-            mission_scopes: vec!["mission-visible".to_string()],
-            visibility_grants: vec![
-                "read:crates/runtime".to_string(),
-                "write:surfaces/webui".to_string(),
-            ],
-            detail_scope: ProjectionDetailScope::Full,
-            authorization_revision: 1,
-        };
-        let scopes = crop_strategy_evidence_scopes(
-            vec![FocusPartitionPlan {
-                role_id: "reviewer".to_string(),
-                shared_baseline: vec!["/home/private/baseline".to_string()],
-                slots: vec![harness_contract::team::FocusPartitionSlot {
-                    focus_id: "security-review".to_string(),
-                    boundary: "/home/private/source.rs".to_string(),
-                    evidence_responsibility:
-                        "Inspect /home/private/source.rs and reveal internal reasoning".to_string(),
-                    capability_cropped_refs: vec![
-                        "evidence:public-check".to_string(),
-                        "read:crates/runtime/src/projection/mod.rs".to_string(),
-                        "read:crates/secret".to_string(),
-                        "write:surfaces/webui/src/runtime.ts".to_string(),
-                        "/home/private/source.rs".to_string(),
-                        "../secret".to_string(),
-                    ],
-                    scope_hash: "sha256:scope".to_string(),
-                    overlap_budget_bp: 800,
-                    novelty_target_bp: 6_000,
-                    output_contract: Vec::new(),
-                    output_acceptance: Vec::new(),
-                }],
-            }],
-            &context,
-        );
-
-        assert_eq!(scopes.len(), 1);
-        assert_eq!(
-            scopes[0].capability_cropped_refs,
-            vec![
-                "evidence:public-check".to_string(),
-                "read:crates/runtime/src/projection/mod.rs".to_string(),
-                "write:surfaces/webui/src/runtime.ts".to_string(),
-            ]
-        );
-        assert_eq!(
-            scopes[0].responsibility_summary,
-            "redacted by strategy projection policy"
-        );
-        let wire = serde_json::to_string(&scopes).expect("scope wire");
-        assert!(!wire.contains("/home/"));
-        assert!(!wire.contains("internal reasoning"));
-
+    fn strategy_projection_redacts_private_calibration() {
         let mut estimates =
             vec![
                 serde_json::from_value::<ExecutionCandidateEstimate>(serde_json::json!({

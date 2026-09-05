@@ -640,18 +640,26 @@ where
             return output.to_string();
         };
 
-        let catalog_tool_names = object
-            .remove("available_tool_names")
-            .unwrap_or_else(|| serde_json::json!([]));
         let active_function_schemas = exposure.active_ids.clone();
-        let runtime_orchestrate_active = active_function_schemas
-            .iter()
-            .any(|name| name == "runtime_orchestrate");
         let tool_search_active = active_function_schemas
             .iter()
             .any(|name| name == "tool_search");
+        let active_actions = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+            .iter()
+            .filter(|action| {
+                active_function_schemas
+                    .iter()
+                    .any(|active| active == **action)
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        let actions_available = !active_actions.is_empty();
 
-        object.insert("catalog_tool_names".to_string(), catalog_tool_names);
+        object.insert("actions".to_string(), serde_json::json!(active_actions));
+        object.insert(
+            "available".to_string(),
+            serde_json::Value::Bool(actions_available),
+        );
         object.insert(
             "tool_visibility".to_string(),
             serde_json::json!({
@@ -666,76 +674,6 @@ where
                 }
             }),
         );
-
-        if let Some(strategy) = object
-            .get_mut("strategy")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            strategy.insert(
-                "model_callable_tools".to_string(),
-                serde_json::json!(exposure.active_ids),
-            );
-        }
-
-        let orchestration_backend_available = object
-            .get("runtime_orchestrate")
-            .and_then(|value| value.get("available"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if let Some(orchestration) = object
-            .get_mut("runtime_orchestrate")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            orchestration.insert(
-                "schema_active".to_string(),
-                serde_json::Value::Bool(runtime_orchestrate_active),
-            );
-            orchestration.insert(
-                "available".to_string(),
-                serde_json::Value::Bool(
-                    orchestration_backend_available && runtime_orchestrate_active,
-                ),
-            );
-            if !runtime_orchestrate_active {
-                let reasons = orchestration
-                    .entry("blocked_reasons")
-                    .or_insert_with(|| serde_json::json!([]));
-                if let Some(reasons) = reasons.as_array_mut() {
-                    if !reasons
-                        .iter()
-                        .any(|reason| reason == "runtime_orchestrate_not_active_in_current_schema")
-                    {
-                        reasons.push(serde_json::json!(
-                            "runtime_orchestrate_not_active_in_current_schema"
-                        ));
-                    }
-                }
-            }
-        }
-        let base_can_execute_now = object
-            .get("action_plane")
-            .and_then(|value| value.get("can_execute_now"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if let Some(action_plane) = object
-            .get_mut("action_plane")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            action_plane.insert(
-                "can_execute_now".to_string(),
-                serde_json::Value::Bool(base_can_execute_now && runtime_orchestrate_active),
-            );
-            if !runtime_orchestrate_active {
-                action_plane.insert(
-                    "recommended_next_tool".to_string(),
-                    serde_json::Value::String(if tool_search_active {
-                        "tool_search".to_string()
-                    } else {
-                        "none".to_string()
-                    }),
-                );
-            }
-        }
 
         serde_json::to_string(&response).unwrap_or_else(|error| {
             tracing::warn!(%error, "failed to serialize projected runtime capabilities");

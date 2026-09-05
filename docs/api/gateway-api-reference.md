@@ -195,7 +195,6 @@ Mission Runtime 的全局控制、跨 session 命令、team runtime、steward、
 | `POST` | `/api/mission/control/sessions/bridge` | Mission Runtime 协同 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `bridge_mission_session_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/control/summary` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `mission_control_summary_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/control/teams` | Mission Runtime 协同 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `collaboration_runs_handler` | `mission_routes.rs` | P1 |
-| `POST` | `/api/mission/control/teams/:team_id/cancel` | Mission Runtime 协同 创建/动作接口 | team_id | - | JSON 或 Multipart，详见对应 Request struct | `cancel_team_runtime_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/control/teams/:team_id/evidence` | Mission Runtime 协同 查询接口 | team_id | 可选 Query 视具体 handler 而定 | - | `team_mission_evidence_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/control/teams/:team_id/execution` | Mission Runtime 协同 查询接口 | team_id | 可选 Query 视具体 handler 而定 | - | `team_execution_plan_handler` | `mission_routes.rs` | P1 |
 | `GET` | `/api/mission/control/teams/:team_id/run` | Mission Runtime 协同 查询接口 | team_id | 可选 Query 视具体 handler 而定 | - | `collaboration_run_handler` | `mission_routes.rs` | P1 |
@@ -237,7 +236,6 @@ Runtime-owned Agent Definition、Team Template、自动发现、组队、信誉�
 | `POST` | `/api/runtime/agents/:id/input` | Runtime 执行核心 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `runtime_agent_input_handler` | `agent_routes.rs` | P1 |
 | `POST` | `/api/runtime/agents/:id/interrupt` | Runtime 执行核心 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `runtime_agent_interrupt_handler` | `agent_routes.rs` | P1 |
 | `POST` | `/api/runtime/agents/:id/shutdown` | Runtime 执行核心 创建/动作接口 | id | - | JSON 或 Multipart，详见对应 Request struct | `runtime_agent_shutdown_handler` | `agent_routes.rs` | P1 |
-| `GET` | `/api/runtime/teams/:id/working-state` | Runtime 执行核心 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `team_working_state_handler` | `agent_routes.rs` | P1 |
 | `GET` | `/api/tasks/:id/execution-graph` | Agent 目录、组队与运行 查询接口 | id | 可选 Query 视具体 handler 而定 | - | `task_execution_graph_handler` | `agent_routes.rs` | P2 |
 | `GET` | `/api/team-templates` | Agent 目录、组队与运行 查询接口 | - | 可选 Query 视具体 handler 而定 | - | `team_templates_handler` | `agent_routes.rs` | P2 |
 | `POST` | `/api/team-templates/instantiate` | Agent 目录、组队与运行 创建/动作接口 | - | - | JSON 或 Multipart，详见对应 Request struct | `team_template_instantiate_handler` | `agent_routes.rs` | P2 |

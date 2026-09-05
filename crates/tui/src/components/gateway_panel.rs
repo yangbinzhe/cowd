@@ -2984,7 +2984,7 @@ mod tests {
             organization_failed_count: 0,
             control_actions: vec![
                 crate::runtime_control_store::MissionControlActionSummary {
-                    action: "team.create".to_string(),
+                    action: "agentic.team.create".to_string(),
                     available: true,
                     reason: "canonical Session is available for a Team".to_string(),
                     requires_approval: false,
@@ -3036,7 +3036,7 @@ mod tests {
             "Should show live Agent and recovery state, got: {joined}"
         );
         assert!(
-            joined.contains("team.create")
+            joined.contains("agentic.team.create")
                 && joined.contains("canonical Session is available")
                 && joined.contains("approval.decide")
                 && joined.contains("no pending approval request"),

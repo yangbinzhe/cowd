@@ -173,23 +173,6 @@ pub struct EvidenceProjection {
     pub projector_lag_commits: Option<u64>,
 }
 
-/// Public, capability-cropped responsibility assigned to one strategy lane.
-///
-/// Runtime deliberately omits workspace paths, prompts, hidden content and
-/// internal reasoning. `capability_cropped_refs` contains only opaque public
-/// evidence references admitted by the projection reducer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct StrategyEvidenceScopeProjection {
-    pub role_id: String,
-    pub focus_id: String,
-    pub responsibility_summary: String,
-    #[serde(default)]
-    pub capability_cropped_refs: Vec<String>,
-    pub scope_hash: String,
-    pub overlap_budget_bp: u16,
-    pub novelty_target_bp: u16,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StrategyTransitionProjection {
     pub revision: u64,
@@ -226,7 +209,6 @@ pub struct StrategyActualProjection {
     pub write_attempt_refs: Vec<String>,
     pub evidence_overlap_bp: u16,
     pub evidence_overlap_observed: bool,
-    pub working_state_verified: bool,
     pub merge_cost_ms: u64,
     pub parent_merge_count: u8,
     #[serde(default)]
@@ -289,8 +271,6 @@ pub struct StrategyDecisionProjection {
     pub benefit_reasons: Vec<String>,
     #[serde(default, rename = "cost_reason", alias = "cost_reasons")]
     pub cost_reasons: Vec<String>,
-    #[serde(default)]
-    pub evidence_scopes: Vec<StrategyEvidenceScopeProjection>,
     #[serde(default, rename = "downgrade", alias = "downgrades")]
     pub downgrades: Vec<StrategyTransitionProjection>,
     #[serde(default, rename = "early_stop", alias = "early_stops")]
@@ -933,7 +913,6 @@ mod tests {
             "candidate_estimates": [],
             "benefit_reasons": [],
             "cost_reasons": [],
-            "evidence_scopes": [],
             "downgrades": [],
             "early_stops": [],
             "proof_status": "not_proven",

@@ -447,6 +447,7 @@ async fn invoke_operation(
     proxy_unary(
         &platform,
         &state.workspace_root,
+        Some(&state.services.core_platform_bindings),
         &principal,
         &headers,
         &app_id,
@@ -469,6 +470,7 @@ async fn stream_operation(
     proxy_stream(
         &platform,
         &state.workspace_root,
+        Some(&state.services.core_platform_bindings),
         &principal,
         &headers,
         &app_id,
@@ -515,6 +517,7 @@ async fn tui_open(
     proxy_unary(
         &platform,
         &state.workspace_root,
+        Some(&state.services.core_platform_bindings),
         &principal,
         &headers,
         &app_id,
@@ -576,6 +579,7 @@ async fn tui_action(
     proxy_unary(
         &platform,
         &state.workspace_root,
+        Some(&state.services.core_platform_bindings),
         &principal,
         &headers,
         &app_id,
@@ -631,6 +635,7 @@ async fn tui_stream(
     proxy_stream(
         &platform,
         &state.workspace_root,
+        Some(&state.services.core_platform_bindings),
         &principal,
         &headers,
         &app_id,
@@ -678,6 +683,7 @@ fn tui_operation(
 async fn proxy_unary(
     platform: &GatewayAppPlatform,
     workspace_root: &Path,
+    core_bindings: Option<&crate::services::core_platform_operations::CorePlatformBindings>,
     principal: &super::AuthenticatedPrincipal,
     headers: &HeaderMap,
     app_id: &str,
@@ -710,6 +716,23 @@ async fn proxy_unary(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Some(core_bindings) = core_bindings {
+        let Some(admitted) = platform.catalog().get(&AppId(app_id.to_owned())) else {
+            return proxy_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted");
+        };
+        if let Err(error) = core_bindings.bind_verified_app_request(
+            &principal.0,
+            &envelope,
+            app_id,
+            &admitted.manifest,
+        ) {
+            return proxy_error(
+                StatusCode::BAD_GATEWAY,
+                "core_bridge_binding_failed",
+                &error,
+            );
+        }
+    }
     let path = worker_path
         .unwrap_or_else(|| format!("/_cowd/v1/operations/{}/invoke", encode(operation_id)));
     let effective_deadline = envelope.effective_deadline_unix_ms();
@@ -874,6 +897,7 @@ struct ProxyStreamState {
 async fn proxy_stream(
     platform: &GatewayAppPlatform,
     workspace_root: &Path,
+    core_bindings: Option<&crate::services::core_platform_operations::CorePlatformBindings>,
     principal: &super::AuthenticatedPrincipal,
     headers: &HeaderMap,
     app_id: &str,
@@ -906,6 +930,23 @@ async fn proxy_stream(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Some(core_bindings) = core_bindings {
+        let Some(admitted) = platform.catalog().get(&AppId(app_id.to_owned())) else {
+            return proxy_error(StatusCode::NOT_FOUND, "app_not_found", "APP is not mounted");
+        };
+        if let Err(error) = core_bindings.bind_verified_app_request(
+            &principal.0,
+            &envelope,
+            app_id,
+            &admitted.manifest,
+        ) {
+            return proxy_error(
+                StatusCode::BAD_GATEWAY,
+                "core_bridge_binding_failed",
+                &error,
+            );
+        }
+    }
     let path = worker_path
         .unwrap_or_else(|| format!("/_cowd/v1/operations/{}/stream", encode(operation_id)));
     let effective_deadline = envelope.effective_deadline_unix_ms();
@@ -1788,10 +1829,9 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 fn response(status: StatusCode, body: Body) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .body(body)
-        .expect("static response")
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response
 }
 fn typed_error(
     status: StatusCode,
@@ -2227,6 +2267,7 @@ mod tests {
         let unauthorized_invoke = proxy_unary(
             &platform,
             root.path(),
+            None,
             &unauthorized,
             &HeaderMap::new(),
             "reference-app",
@@ -2274,6 +2315,7 @@ mod tests {
         let query = proxy_unary(
             &platform,
             &workspace,
+            None,
             &principal,
             &HeaderMap::new(),
             "reference-app",
@@ -2295,6 +2337,7 @@ mod tests {
         let malformed_business_payload = proxy_unary(
             &platform,
             &workspace,
+            None,
             &principal,
             &HeaderMap::new(),
             "reference-app",
@@ -2316,6 +2359,7 @@ mod tests {
         let invalid_deadline = proxy_unary(
             &platform,
             &workspace,
+            None,
             &principal,
             &HeaderMap::new(),
             "reference-app",
@@ -2334,6 +2378,7 @@ mod tests {
         let oversized = proxy_unary(
             &platform,
             &workspace,
+            None,
             &principal,
             &HeaderMap::new(),
             "reference-app",
@@ -2352,6 +2397,7 @@ mod tests {
         let invalid_query_idempotency = proxy_unary(
             &platform,
             &workspace,
+            None,
             &principal,
             &HeaderMap::new(),
             "reference-app",
@@ -2371,6 +2417,7 @@ mod tests {
         let command = proxy_unary(
             &platform,
             &workspace,
+            None,
             &principal,
             &HeaderMap::new(),
             "reference-app",
@@ -2390,6 +2437,7 @@ mod tests {
         let missing_command_idempotency = proxy_unary(
             &platform,
             &workspace,
+            None,
             &principal,
             &HeaderMap::new(),
             "reference-app",
@@ -2416,6 +2464,7 @@ mod tests {
         let stream = proxy_stream(
             &platform,
             &workspace,
+            None,
             &principal,
             &HeaderMap::new(),
             "reference-app",
@@ -2628,6 +2677,7 @@ mod tests {
             let response = proxy_unary(
                 &platform,
                 &workspace,
+                None,
                 &principal,
                 &headers,
                 "reference-app",
@@ -2662,6 +2712,7 @@ mod tests {
         let warm = proxy_unary(
             &platform,
             &workspace,
+            None,
             &principal,
             &headers,
             "reference-app",
@@ -2834,6 +2885,7 @@ mod tests {
         let gateway_stream = proxy_stream(
             &platform,
             &workspace,
+            None,
             &principal,
             &headers,
             "reference-app",
@@ -2980,6 +3032,7 @@ mod tests {
             let response = proxy_unary(
                 platform,
                 workspace,
+                None,
                 principal,
                 headers,
                 "reference-app",

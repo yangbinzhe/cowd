@@ -1407,7 +1407,11 @@ fn validate_reconciliation_source_projection(
                     "created_at": source_string(payload, "created_at")?,
                 }))
             }
-            _ => unreachable!(),
+            _ => {
+                return Err(invalid(
+                    "reconciliation source table has no projection implementation",
+                ));
+            }
         };
         if let Some(projection) = projection {
             let stable = projection["stable_ref"]

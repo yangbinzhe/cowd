@@ -166,9 +166,9 @@ impl OutcomeProjector {
         }
     }
 
-    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> Result<RuntimeProjectionLane, String> {
         let projector = Arc::clone(self);
-        RuntimeProjectionLane::blocking(
+        Ok(RuntimeProjectionLane::blocking(
             RuntimeProjectionDescriptor::new(
                 PROJECTOR_ID,
                 RuntimeProjectionInterest::new(
@@ -182,13 +182,12 @@ impl OutcomeProjector {
                 ),
                 PROJECTOR_BATCH,
                 Duration::from_secs(30),
-            )
-            .expect("outcome projection descriptor is static and valid"),
+            )?,
             move |batch_size| {
                 let processed = projector.project_available(batch_size)?;
                 Ok(RuntimeProjectionPass::scanned(processed, batch_size))
             },
-        )
+        ))
     }
 
     #[must_use]
@@ -740,7 +739,9 @@ fn recompute_paired_lift(snapshot: &mut OutcomeReadSnapshot, changed_key: &Strat
             // Multiple baselines for one pair are treated conservatively:
             // Team must prove lift against every valid Direct/Parallel sample.
             Some(baselines.iter().all(|baseline| {
-                let baseline_quality = baseline.quality_bp.expect("validated above");
+                let Some(baseline_quality) = baseline.quality_bp else {
+                    return false;
+                };
                 let quality_delta = i32::from(team_quality) - i32::from(baseline_quality);
                 let speed_channel = sample.duration_ms.saturating_mul(100)
                     <= baseline.duration_ms.saturating_mul(80)

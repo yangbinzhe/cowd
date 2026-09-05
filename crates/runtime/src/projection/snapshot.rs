@@ -134,9 +134,7 @@ async fn snapshot_with_graph(
 
 const SUMMARY_OBJECTIVE_CHARS: usize = 1_024;
 const SUMMARY_NODE_CHARS: usize = 1_024;
-const SUMMARY_WORK_CHARS: usize = 512;
 const SUMMARY_FAILURE_CHARS: usize = 512;
-const SUMMARY_STATE_ENTRIES: usize = 64;
 pub(super) const SUMMARY_EVIDENCE_REFS: usize = 32;
 const SUMMARY_ENTITY_LIMIT: usize = 128;
 
@@ -148,8 +146,7 @@ const SUMMARY_ENTITY_LIMIT: usize = 128;
 /// same response still omitted the public Agent identities an operator needs.
 /// Full semantic outputs remain addressable through their durable result and
 /// evidence references; Summary retains identities, topology, lifecycle,
-/// numeric usage and the bounded collaboration-market receipts used by live
-/// control surfaces.
+/// numeric usage and bounded scheduling metadata used by live control surfaces.
 pub(super) fn summary_graph_projection(
     mut graph: harness_contract::execution_graph::ExecutionGraphProjection,
 ) -> harness_contract::execution_graph::ExecutionGraphProjection {
@@ -174,59 +171,13 @@ pub(super) fn summary_graph_projection(
         if let Some(work) = node.work.as_mut() {
             bound_work_projection(work);
         }
-        if let Some(state) = node.work_state.as_mut() {
-            bound_work_state(state);
-        }
-    }
-    for item in &mut graph.autonomous_work {
-        bound_work_projection(&mut item.work);
-        bound_work_state(&mut item.state);
     }
     graph
 }
 
 fn bound_work_projection(work: &mut harness_contract::execution_graph::ExecutionWorkProjection) {
-    work.objective = work
-        .objective
-        .as_deref()
-        .map(|value| bounded_summary_text(value, SUMMARY_WORK_CHARS));
-    work.proposal_evidence_refs.truncate(SUMMARY_EVIDENCE_REFS);
     work.input_artifact_refs.truncate(SUMMARY_EVIDENCE_REFS);
     work.output_artifact_kinds.truncate(SUMMARY_EVIDENCE_REFS);
-    work.eligibility
-        .allowed_agent_instance_ids
-        .truncate(SUMMARY_STATE_ENTRIES);
-    work.eligibility
-        .allowed_role_ids
-        .truncate(SUMMARY_STATE_ENTRIES);
-    work.eligibility
-        .required_capabilities
-        .truncate(SUMMARY_STATE_ENTRIES);
-    if let harness_contract::execution_graph::ExecutionWorkReviewPolicy::Peer {
-        eligible_role_ids,
-        ..
-    } = &mut work.review_policy
-    {
-        eligible_role_ids.truncate(SUMMARY_STATE_ENTRIES);
-    }
-}
-
-fn bound_work_state(state: &mut harness_contract::execution_graph::ExecutionWorkRuntimeState) {
-    state.review_findings.truncate(SUMMARY_STATE_ENTRIES);
-    for finding in &mut state.review_findings {
-        *finding = bounded_summary_text(finding, SUMMARY_WORK_CHARS);
-    }
-    state.reviews.truncate(SUMMARY_STATE_ENTRIES);
-    for review in &mut state.reviews {
-        review.finding = review
-            .finding
-            .as_deref()
-            .map(|value| bounded_summary_text(value, SUMMARY_WORK_CHARS));
-    }
-    state.bids.truncate(SUMMARY_STATE_ENTRIES);
-    for bid in &mut state.bids {
-        bid.rationale = bounded_summary_text(&bid.rationale, SUMMARY_WORK_CHARS);
-    }
 }
 
 fn bounded_summary_text(value: &str, max_chars: usize) -> String {
@@ -292,7 +243,7 @@ fn bound_summary_entity(entity: &mut ProjectionEntity) {
     entity.summary = entity
         .summary
         .as_deref()
-        .map(|value| bounded_summary_text(value, SUMMARY_WORK_CHARS));
+        .map(|value| bounded_summary_text(value, SUMMARY_NODE_CHARS));
     entity.evidence_refs.truncate(SUMMARY_EVIDENCE_REFS);
     for reference in &mut entity.evidence_refs {
         *reference = bounded_summary_text(reference, 512);
@@ -380,7 +331,9 @@ fn accumulate_concurrency_counts(
             }
             ExecutionNodeStatus::Failed
             | ExecutionNodeStatus::Completed
-            | ExecutionNodeStatus::Cancelled => unreachable!("terminal status matched above"),
+            | ExecutionNodeStatus::Cancelled => {
+                counts.terminal = counts.terminal.saturating_add(1);
+            }
         }
     }
 }
@@ -548,21 +501,10 @@ pub(super) fn strategy_entity(
         estimated.as_ref(),
         &candidate_estimates,
     );
-    let evidence_scopes = decision_events
-        .iter()
-        .rev()
-        .find_map(|event| {
-            payload_value::<Vec<FocusPartitionPlan>>(event, "evidence_scopes")
-                .filter(|plans| !plans.is_empty())
-        })
-        .map(|plans| crop_strategy_evidence_scopes(plans, context))
-        .unwrap_or_default();
-    let mut evidence_refs = evidence_scopes
-        .iter()
-        .flat_map(|scope| scope.capability_cropped_refs.iter().cloned())
-        .collect::<Vec<_>>();
-    evidence_refs.sort();
-    evidence_refs.dedup();
+    // Strategy owns collaboration necessity and minimum cardinality only.
+    // Agent Actions choose their actual work decomposition; no synthetic
+    // focus lanes are persisted or projected from strategy state.
+    let evidence_refs = Vec::new();
     let downgrades = strategy_transitions(&decision_events, "runtime.strategy.downgraded");
     let early_stops = strategy_transitions(&decision_events, "runtime.strategy.early_stopped");
     let actual = decision_events
@@ -674,7 +616,6 @@ pub(super) fn strategy_entity(
         candidate_estimates,
         benefit_reasons,
         cost_reasons,
-        evidence_scopes,
         downgrades,
         early_stops,
         estimated,
@@ -930,44 +871,6 @@ pub(super) fn strategy_reason_is_cost_warning(reason: &str) -> bool {
         || normalized.contains("surface must show the cost warning")
 }
 
-pub(super) fn crop_strategy_evidence_scopes(
-    plans: Vec<FocusPartitionPlan>,
-    context: &ProjectionQueryContext,
-) -> Vec<StrategyEvidenceScopeProjection> {
-    let mut scopes = plans
-        .into_iter()
-        .flat_map(|plan| {
-            plan.slots.into_iter().map(move |slot| {
-                let mut refs = slot
-                    .capability_cropped_refs
-                    .iter()
-                    .filter_map(|reference| {
-                        safe_public_ref(reference)
-                            .filter(|reference| strategy_ref_visible(reference, context, None))
-                    })
-                    .collect::<Vec<_>>();
-                refs.sort();
-                refs.dedup();
-                StrategyEvidenceScopeProjection {
-                    role_id: safe_public_text(&plan.role_id, 96),
-                    focus_id: safe_public_text(&slot.focus_id, 96),
-                    responsibility_summary: safe_public_text(&slot.evidence_responsibility, 200),
-                    capability_cropped_refs: refs,
-                    scope_hash: safe_public_text(&slot.scope_hash, 96),
-                    overlap_budget_bp: slot.overlap_budget_bp.min(10_000),
-                    novelty_target_bp: slot.novelty_target_bp.min(10_000),
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-    scopes.sort_by(|left, right| {
-        left.role_id
-            .cmp(&right.role_id)
-            .then_with(|| left.focus_id.cmp(&right.focus_id))
-    });
-    scopes
-}
-
 pub(super) fn strategy_transitions(
     events: &[&crate::DurableRuntimeEvent],
     kind: &str,
@@ -1015,7 +918,6 @@ pub(super) fn strategy_actual_projection(
             .collect(),
         evidence_overlap_bp: outcome.evidence_overlap_bp.min(10_000),
         evidence_overlap_observed: outcome.evidence_overlap_observed,
-        working_state_verified: outcome.working_state_verified,
         merge_cost_ms: outcome.merge_cost_ms,
         parent_merge_count: outcome.parent_merge_count,
         evaluation_token_limit: outcome.evaluation_token_limit,

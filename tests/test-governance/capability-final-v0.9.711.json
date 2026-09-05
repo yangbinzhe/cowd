@@ -71,7 +71,6 @@
     "team_profile_migration",
     "team_result_reducer",
     "team_runtime",
-    "team_working_state",
     "conflict_arbiter",
     "steward_agent",
     "approval",

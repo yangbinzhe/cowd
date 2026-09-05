@@ -404,7 +404,7 @@ fn turn_requests_tools_or_orchestration(intent: &str) -> bool {
         intent,
         &[
             "runtime_capabilities",
-            "runtime_orchestrate",
+            "team_create",
             "调用工具",
             "使用工具",
             "工具调用",

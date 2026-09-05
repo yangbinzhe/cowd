@@ -11,11 +11,6 @@ use crate::execution_core::{
     ExecutionCompileRequest, ExecutionGraphCompiler, ExecutionGraphReplan, NodeExecutionOutcome,
     NodeExecutionTicket, NodeExecutorError,
 };
-use crate::orchestration::team_authority::derive_team_focus_partition_plans;
-#[cfg(test)]
-use crate::orchestration::team_authority::{
-    bounded_workspace_focus_scopes, write_focus_partition_plan,
-};
 use crate::{
     model_context_window_with_overrides, permissions::SharedPrompter, AutoCompactionEvent,
     ContentBlock, ContextAuthority, ContextEnvelope, ContextItem, ContextProfile, ContextRole,
@@ -66,11 +61,6 @@ const STRUCTURED_OUTPUT_RECOVERY_BUDGET: u8 = 2;
 /// while this one repairs a valid-but-unproductive delegated work path.
 const DELEGATED_TOOL_FAILURE_REPLAN_BUDGET: u8 = 1;
 const DELEGATED_TOOL_FAILURE_REPLAN_MARKER: &str = "delegated_tool_failure_replan:v1";
-/// A provider can legally return prose despite a named-tool wire constraint.
-/// Permit three bounded root admission repairs before reporting a durable
-/// incomplete result. This budget applies only before any Team Program exists;
-/// it never expands follow-up Team authority after a collaboration starts.
-const ROOT_CONTROL_PLANE_REPAIR_BUDGET: usize = 3;
 
 fn next_consecutive_tool_failure_batches(
     current: usize,
@@ -94,41 +84,9 @@ fn delegated_tool_failure_replan_available(
         && consumed_replans < DELEGATED_TOOL_FAILURE_REPLAN_BUDGET
 }
 
-/// The root collaboration contract has a deliberately small, durable control
-/// plane. Capability discovery is useful, but it must not satisfy the action
-/// obligation that admits a Program. Keeping this as Runtime state prevents a
-/// provider from looping on a harmless catalog lookup while the user-required
-/// Team proposal never happens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum RootControlPlanePhase {
-    /// Historical recovery marker for an admission that had not yet submitted
-    /// a semantic proposal. New explicit-Team turns still use the same typed
-    /// submission requirement as `ProposalOnly`: a catalog inspection cannot
-    /// satisfy a user-required Team execution.
-    #[default]
-    CapabilityOrProposal,
-    /// A successful catalog inspection committed; the next request must
-    /// submit the typed orchestration proposal.
-    ProposalOnly,
-    /// A successful Team proposal receipt committed. Team execution evidence,
-    /// rather than this phase marker, still decides terminal satisfaction.
-    ProposalSubmitted,
-}
-
 #[cfg(test)]
 #[path = "tests/host.rs"]
 mod tests;
-
-impl RootControlPlanePhase {
-    const fn required_tool_choice(self) -> &'static str {
-        match self {
-            Self::CapabilityOrProposal | Self::ProposalOnly | Self::ProposalSubmitted => {
-                "submit_collaboration_decision"
-            }
-        }
-    }
-}
 
 /// Select the one Runtime-owned control plane that may constrain the next
 /// provider request.
@@ -161,40 +119,6 @@ fn next_model_control_plane_priority(
     }
 }
 
-/// Render the one-shot, Runtime-owned root-admission instruction.
-///
-/// A workstream is the unit that compiles to one Team. Named roles belong in
-/// its semantic `team.roles` array; Runtime derives the turn-scoped template.
-fn root_collaboration_decision_instruction(
-    required_team_count: u8,
-    required_workspace_evidence_scopes: &[String],
-    permission_ceiling: harness_contract::policy::PermissionMode,
-) -> String {
-    let required_scope_clause = if required_workspace_evidence_scopes.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " The user explicitly named these immutable evidence targets: {}. Include every one exactly as a typed `{{\"kind\":\"evidence_scope\",\"operation\":...,\"resource\":...}}` criterion across the proposed Team workstreams and their evidence-producing roles; its operation/resource pair must reproduce the exact named scope. Do not substitute a log, directory, or similarly named file.",
-            required_workspace_evidence_scopes.join(", ")
-        )
-    };
-    let allowed_capabilities =
-        harness_contract::orchestration::model_collaboration_capabilities_for_permission(
-            permission_ceiling,
-        )
-        .join(", ");
-    format!(
-        "Root collaboration admission is pending. Call `{}` exactly once in this provider turn; do not write prose, inspect capabilities again, or call any workspace tool. Submit exactly {required_team_count} `workstreams`: one workstream is one proposed Team. Give every workstream a distinct `workstream_id`, `objective`, and a nonempty `team.team_key` (a stable lowercase slug). Preserve user-provided Team and role names in `team.display_name` and role `display_name`; use `role_id` only as a distinct machine key. The active permission ceiling is `{}`; each role's `required_capabilities` may contain only [{}]. Express cross-Team ordering only with consumer-workstream `depends_on`. Express local role handoffs only with `team.dependencies`; every dependency names two roles within that one Team and carries artifacts produced by `from` and consumed by `to`. Do not split roles from one requested Team into multiple workstreams. {} {} {} If the tool returns a retryable structured compile diagnostic, submit one complete corrected semantic decision on the next required provider turn; never retry unchanged. This is not `runtime_orchestrate`.",
-        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-        permission_ceiling.as_str(),
-        allowed_capabilities,
-        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE,
-        harness_contract::orchestration::EXACT_FILE_EVIDENCE_GUIDANCE,
-        harness_contract::orchestration::INDEPENDENT_REVIEW_GUIDANCE,
-    )
-    + &required_scope_clause
-}
-
 /// Runtime-owned host for the standard provider-backed conversation engine.
 ///
 /// Gateway supplies service adapters such as tool executors and stream callbacks, but
@@ -221,6 +145,7 @@ where
     /// Durable ToolHost receipts recovered for this delegated attempt. They
     /// fence a resumed turn to one text-only evidence synthesis.
     recovered_tool_receipt_count: usize,
+    recovered_tool_receipts_require_text_only: bool,
 }
 
 /// Immutable semantic role for one provider-backed conversation graph.
@@ -320,6 +245,11 @@ where
     /// Exact ToolHost receipts reloaded for a delegated Agent attempt. A
     /// non-zero value forbids a new tool-planning cycle for that attempt.
     pub recovered_tool_receipt_count: usize,
+    /// Recovery receipts fence effect replay. This separate flag says whether
+    /// the semantic protocol is also terminal and therefore permits a
+    /// presentation-only recovery. Agent-first tasks with a committed
+    /// artifact but no submit/review keep this false.
+    pub recovered_tool_receipts_require_text_only: bool,
 }
 
 /// Host construction is the final common boundary before any production
@@ -398,6 +328,7 @@ where
         Some(lineage),
         TurnExecutionRole::RootTurn,
         0,
+        false,
     )
     .await
 }
@@ -427,7 +358,7 @@ fn resolve_turn_continuation_binding(
             ));
         };
         let Some((candidate, candidate_revision)) =
-            crate::orchestration::collaboration_continuation::accepted_cross_session_candidate(
+            crate::session_continuation::accepted_cross_session_candidate(
                 services.event_store(),
                 session_id,
                 handoff_id,
@@ -442,7 +373,7 @@ fn resolve_turn_continuation_binding(
             || format!("session:{session_id}:turn:{turn_ref}"),
             |ingress| ingress.request_id.clone(),
         );
-        let binding = crate::compile_continuation_binding(
+        let binding = crate::session_continuation::compile_continuation_binding(
             &candidate,
             &current_ingress,
             candidate_revision,
@@ -450,8 +381,13 @@ fn resolve_turn_continuation_binding(
             policy.revision,
         )
         .map_err(RuntimeError::new)?;
-        crate::ensure_reauthorized(&binding, session_id, true, policy.revision)
-            .map_err(RuntimeError::new)?;
+        crate::session_continuation::ensure_reauthorized(
+            &binding,
+            session_id,
+            true,
+            policy.revision,
+        )
+        .map_err(RuntimeError::new)?;
         return Ok(Some(binding));
     }
     match reference {
@@ -464,7 +400,7 @@ fn resolve_turn_continuation_binding(
                 return Ok(None);
             };
             let policy_revision = policy.revision;
-            let Some((candidate, candidate_revision)) = crate::orchestration::collaboration_continuation::latest_same_session_candidate(
+            let Some((candidate, candidate_revision)) = crate::session_continuation::latest_same_session_candidate(
                 services.event_store(),
                 session_id,
                 turn_ref,
@@ -480,7 +416,7 @@ fn resolve_turn_continuation_binding(
                 || format!("session:{session_id}:turn:{turn_ref}"),
                 |ingress| ingress.request_id.clone(),
             );
-            let binding = crate::compile_continuation_binding(
+            let binding = crate::session_continuation::compile_continuation_binding(
                 &candidate,
                 &current_ingress,
                 candidate_revision,
@@ -488,7 +424,7 @@ fn resolve_turn_continuation_binding(
                 policy_revision,
             )
             .map_err(RuntimeError::new)?;
-            crate::ensure_reauthorized(&binding, session_id, false, policy_revision)
+            crate::session_continuation::ensure_reauthorized(&binding, session_id, false, policy_revision)
                 .map_err(RuntimeError::new)?;
             Ok(Some(binding))
         }
@@ -530,6 +466,7 @@ async fn submit_owned_conversation_turn_with_ingress<C, T>(
     execution_lineage: Option<harness_contract::execution_graph::ExecutionGraphLineage>,
     execution_role: TurnExecutionRole,
     recovered_tool_receipt_count: usize,
+    recovered_tool_receipts_require_text_only: bool,
 ) -> (
     crate::ConversationRuntime<C, T>,
     Result<TurnSummary, RuntimeError>,
@@ -614,7 +551,6 @@ where
         .unwrap_or_else(|| TurnId::new().to_string());
     let runtime = Arc::new(tokio::sync::Mutex::new(runtime));
     let parent_merge_started_at = Arc::new(std::sync::Mutex::new(None::<std::time::Instant>));
-    let parent_merge_timer = Arc::clone(&parent_merge_started_at);
     if let Some(bus) = runtime.lock().await.cowd_bus().cloned() {
         bus.emit(CowdEvent::ExecutionPhase {
             status: harness_contract::projection::ExecutionLiveStatus::PreparingContext,
@@ -665,15 +601,19 @@ where
             committed_terminal_answer: None,
             committed_terminal_completion: None,
             last_verified_progress: false,
+            consecutive_unverified_model_steps: 0,
             reasoning_only_attempts: 0,
             force_text_only_next_model: evaluation_control
                 .as_ref()
                 .is_some_and(|control| control.provider_constraint == "judge")
-                || recovered_tool_receipt_count > 0,
+                || (recovered_tool_receipt_count > 0
+                    && recovered_tool_receipts_require_text_only),
             force_tool_allowlist_next_model: None,
             force_reasoning_effort_next_model: None,
             terminal_recovery_attempts: 0,
             provider_protocol_recovery_attempts: 0,
+            agentic_protocol_recovery_attempts: 0,
+            agentic_program_context_revision: None,
             execution_role,
             bounded_evidence_role: false,
             focus_novelty_target_bp: 0,
@@ -715,22 +655,13 @@ where
             evaluation_judge_only: evaluation_control
                 .as_ref()
                 .is_some_and(|control| control.provider_constraint == "judge"),
-            team_orchestration_requests: 0,
             collaboration_started: false,
-            collaboration_committed_write: false,
-            pending_root_control_plane_receipt: None,
             pending_root_control_plane_requirement: None,
-            root_control_plane_phase: RootControlPlanePhase::default(),
-            pending_root_control_plane_phase: None,
-            root_evidence_scope_repairs: 0,
             root_write_replans: 0,
             root_language_replan_attempted: false,
-            nested_orchestration_forbidden: execution_parent.is_some()
-                || (evaluation_control.is_some() && evaluation_topology_forbids_team()),
             pending_terminal_artifact: None,
             pending_controlled_recovery_claim_fingerprints: Vec::new(),
             pending_disposition_inputs: Vec::new(),
-            input_disposition_repairs: 0,
         }));
 
         let provider_profile_fingerprint = {
@@ -776,23 +707,20 @@ where
             )?;
         }
         if strategy.selected_candidate == harness_contract::strategy::ExecutionCandidateKind::Team {
-            let automatic_minimum_team_count = u8::try_from(selected_strategy_focus_count(&strategy))
-                .unwrap_or(u8::MAX);
-            let evaluation_focus_scopes = evaluation_control
-                .as_ref()
-                .map(evaluation_semantic_focus_scopes)
-                .unwrap_or_default();
-            let plans =
-                selected_strategy_focus_plans(
-                    &strategy,
-                    &resolved_objective,
-                    services.workspace_root(),
-                    &evaluation_focus_scopes,
-                );
+            let automatic_minimum_team_count = u8::try_from(
+                strategy
+                    .decision
+                    .strategy
+                    .understanding
+                    .required_team_count
+                    .max(strategy.decision.strategy.understanding.independent_workstreams)
+                    .max(1),
+            )
+            .unwrap_or(u8::MAX);
             strategy = runtime
                 .lock()
                 .await
-                .set_turn_strategy_focus_partitions(plans, automatic_minimum_team_count)?;
+                .set_turn_strategy_collaboration_obligation(automatic_minimum_team_count)?;
         }
         if evaluation_control.is_some() && evaluation_topology_forbids_team() {
             let mut item = ContextItem::new(
@@ -982,22 +910,9 @@ where
                 user_sequence: 1,
             })
             .map_err(RuntimeError::new)?;
-        // A retryable Objective gap is recovered by Runtime from the frozen
-        // Team terminal contract before the next model round.  This preserves
-        // the original Program authority and avoids making a continuation
-        // prompt the only recovery mechanism.
-        let recovery_graph_id = continuation_binding
-            .as_ref()
-            .map(|binding| binding.source_root_id.clone())
-            .unwrap_or_else(|| graph.id.clone());
-        let recovery_goal_id = format!("goal:{recovery_graph_id}");
-        crate::orchestration::collaboration_coordinator::execute_pending_objective_replan(
-            &recovery_graph_id,
-            &recovery_goal_id,
-            services.as_ref(),
-        )
-        .await
-        .map_err(RuntimeError::new)?;
+        // Objective recovery now belongs to the Agentic Program supervisor.
+        // A new turn may consume a prior typed continuation, but it must not
+        // reactivate the retired graph/template coordinator.
         {
             let mut turn_state = state.lock().await;
             turn_state.goal_id = goal_id.clone();
@@ -1150,15 +1065,6 @@ where
             .recover(&graph_id)
             .await
             .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let collaboration_started =
-                submit_selected_program_intent(&state, services.as_ref(), &strategy).await?;
-            state.lock().await.collaboration_started |= collaboration_started;
-            if collaboration_started {
-                *parent_merge_timer
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(std::time::Instant::now());
-            }
             let revised_strategy = runtime
                 .lock()
                 .await
@@ -1241,15 +1147,6 @@ where
                         complementarity_score: None,
                     },
                 });
-            }
-            let collaboration_started =
-                submit_selected_program_intent(&state, services.as_ref(), &strategy).await?;
-            state.lock().await.collaboration_started |= collaboration_started;
-            if collaboration_started {
-                *parent_merge_timer
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(std::time::Instant::now());
             }
             let revised_strategy = runtime
                 .lock()
@@ -1475,7 +1372,6 @@ where
                     write_attempt_paths: summary.write_attempt_paths.clone(),
                     evidence_overlap_bp: 0,
                     evidence_overlap_observed: false,
-                    working_state_verified: false,
                     merge_cost_ms: parent_merge_cost_ms,
                     parent_merge_count,
                     evaluation_token_limit: evaluation_budget
@@ -1564,27 +1460,6 @@ struct EvaluationTurnControl {
     budget_lease_id: String,
     max_total_tokens: u64,
     prompt: String,
-}
-
-fn evaluation_semantic_focus_scopes(control: &EvaluationTurnControl) -> Vec<String> {
-    control
-        .resource_scopes
-        .iter()
-        .filter(|scope| {
-            [
-                "read:",
-                "write:",
-                "workspace:",
-                "network:",
-                "session:",
-                "worktree:",
-                "system:",
-            ]
-            .iter()
-            .any(|prefix| scope.starts_with(prefix))
-        })
-        .cloned()
-        .collect()
 }
 
 fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl>, RuntimeError> {
@@ -1833,289 +1708,12 @@ fn collaboration_team_slots(provider_available: usize, agent_available: usize) -
     provider_available.min(agent_available)
 }
 
-fn structured_team_count(strategy: &crate::execution_core::TurnStrategyDecisionState) -> usize {
-    strategy
-        .decision
-        .collaboration_obligation
-        .as_ref()
-        .map_or(0, |obligation| {
-            usize::from(obligation.required_team_count())
-        })
-}
-
-/// Submit the admitted Team strategy as a Coordinator-owned Program intent
-/// before the parent graph asks the provider for its first step. The Host
-/// consumes the resulting receipt but never constructs or drives its graph.
-async fn submit_selected_program_intent(
-    turn_state: &Arc<tokio::sync::Mutex<TurnGraphState>>,
-    services: &crate::RuntimeServices,
-    strategy: &crate::execution_core::TurnStrategyDecisionState,
-) -> Result<bool, RuntimeError> {
-    if strategy.selected_candidate != harness_contract::strategy::ExecutionCandidateKind::Team {
-        return Ok(false);
-    }
-    // A strategy classifier may identify a user hard requirement, but it is
-    // not permitted to manufacture the Program that satisfies it.  The root
-    // model must first submit a typed `runtime_orchestrate` proposal; only
-    // its durable receipt may be consumed here during recovery.  This closes
-    // the historical TaskUnderstanding-to-Program bypass that could create
-    // Teams even when the model never entered the control plane.
-    if strategy.collaboration_receipt.is_none() {
-        tracing::debug!(
-            decision_id = %strategy.decision_id,
-            "selected Team strategy awaits a durable root control-plane receipt"
-        );
-        return Ok(false);
-    }
-    if let Some(receipt) = strategy.collaboration_receipt.as_ref() {
-        let recovered_team_ids = completed_program_team_ids_from_receipt(receipt);
-        let recovered_committed_write = receipt
-            .get("committed_write")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let recovered_write_scopes = team_receipt_write_scopes(receipt);
-        let recovered_observed_evidence = team_receipt_observed_evidence(receipt);
-        let mut item = ContextItem::new(
-            format!("runtime-team-recovered:{}", strategy.decision_id),
-            ContextSourceKind::Task,
-            ContextRole::Evidence,
-            format!(
-                "Runtime recovered the already executed Team receipt. Keep this checked collaboration result available throughout the current parent Turn and do not start another Team for the same decision lease.\n{}",
-                serde_json::to_string(receipt).unwrap_or_else(|_| "{}".to_string())
-            ),
-        );
-        item.authority = ContextAuthority::Tool;
-        item.visibility = ContextVisibility::Private;
-        item.evidence = vec![format!("strategy_decision:{}", strategy.decision_id)];
-        let (parent_requires_write, required_write_scopes) = {
-            let state = turn_state.lock().await;
-            (
-                state.required_write_for_completion,
-                state.required_workspace_write_scopes.clone(),
-            )
-        };
-        let parent_write_satisfied = write_obligation_satisfied(
-            parent_requires_write,
-            &required_write_scopes,
-            &recovered_observed_evidence,
-            recovered_committed_write,
-            services.path_identity_resolver(),
-        );
-        let parent_goal_satisfied = team_phase_satisfies_parent_goal(
-            structured_team_count(strategy),
-            parent_requires_write,
-            parent_write_satisfied,
-            recovered_team_ids.len(),
-        );
-        {
-            let mut state = turn_state.lock().await;
-            state.collaboration_committed_write |= recovered_committed_write;
-            for evidence in recovered_observed_evidence {
-                if !state
-                    .committed_workspace_observed_evidence
-                    .contains(&evidence)
-                {
-                    state.committed_workspace_observed_evidence.push(evidence);
-                }
-            }
-            state
-                .committed_workspace_write_scopes
-                .extend(recovered_write_scopes);
-            // This is not a second lifecycle cache: it only records that the
-            // current parent turn has already consumed a durable Program
-            // projection.  Program terminal state remains in the receipt and
-            // graph, never in a host-maintained Team-id set.
-            state.collaboration_started |= receipt.get("collaboration_program").is_some();
-            state.persistent_collaboration_context.push(item);
-        }
-        if parent_goal_satisfied {
-            if let Some(terminal_summary) = verified_team_terminal_summary(receipt) {
-                turn_state.lock().await.terminal_override =
-                    Some((GoalCompletion::Satisfied, terminal_summary));
-            }
-        }
-        return Ok(true);
-    }
-    return Ok(false);
-}
-
 #[cfg(test)]
 fn selected_team_failure_must_block_parent_replay(child_executed: bool) -> bool {
     child_executed
 }
 
-fn verified_team_terminal_summary(receipt: &serde_json::Value) -> Option<String> {
-    let working_state_verified = receipt
-        .get("working_state_verified")
-        .and_then(serde_json::Value::as_bool)
-        .or_else(|| {
-            receipt
-                .pointer("/evidence/working_state_verified")
-                .and_then(serde_json::Value::as_bool)
-        })
-        .unwrap_or(false);
-    let envelope = receipt.get("delivery_envelope").cloned().and_then(|value| {
-        serde_json::from_value::<harness_contract::outcome::DeliveryEnvelope>(value).ok()
-    });
-    let presentation = receipt
-        .get("terminal_presentation")
-        .cloned()
-        .and_then(|value| {
-            serde_json::from_value::<harness_contract::outcome::TerminalPresentation>(value).ok()
-        });
-    let typed_candidate_verified =
-        envelope
-            .as_ref()
-            .zip(presentation.as_ref())
-            .is_some_and(|(envelope, presentation)| {
-                presentation.answer_origin
-                    == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
-                    && presentation.envelope_id == envelope.envelope_id
-                    && presentation.envelope_revision == envelope.revision
-                    && matches!(
-                        presentation.state,
-                        harness_contract::outcome::TerminalPresentationState::Validating
-                            | harness_contract::outcome::TerminalPresentationState::Committed
-                    )
-            });
-    let typed_team_summaries = receipt
-        .get("team_terminals")
-        .and_then(serde_json::Value::as_array)
-        .filter(|entries| !entries.is_empty())
-        .and_then(|entries| {
-            entries
-                .iter()
-                .map(|entry| {
-                    let envelope = serde_json::from_value::<
-                        harness_contract::outcome::DeliveryEnvelope,
-                    >(entry.get("delivery_envelope")?.clone())
-                    .ok()?;
-                    let presentation =
-                        serde_json::from_value::<harness_contract::outcome::TerminalPresentation>(
-                            entry.get("terminal_presentation")?.clone(),
-                        )
-                        .ok()?;
-                    let summary = entry
-                        .get("terminal_summary")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|summary| !summary.is_empty())?;
-                    let team_id = entry
-                        .get("team_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("team");
-                    (entry
-                        .get("working_state_verified")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        && envelope.pipeline_status
-                            == harness_contract::outcome::PipelineStatus::Completed
-                        && envelope.delivery_status
-                            == harness_contract::outcome::DeliveryStatus::Satisfied
-                        && envelope.unresolved.is_empty()
-                        && envelope.coverage.required_obligation_ids
-                            == envelope.coverage.satisfied_obligation_ids
-                        && presentation.answer_origin
-                            == harness_contract::outcome::AnswerOrigin::TeamSynthesizer
-                        && presentation.envelope_id == envelope.envelope_id
-                        && presentation.envelope_revision == envelope.revision
-                        && matches!(
-                            presentation.state,
-                            harness_contract::outcome::TerminalPresentationState::Validating
-                                | harness_contract::outcome::TerminalPresentationState::Committed
-                        ))
-                    .then(|| format!("{team_id}: {summary}"))
-                })
-                .collect::<Option<Vec<_>>>()
-        });
-    let verified_evidence_bundle_summaries = receipt
-        .get("team_terminals")
-        .and_then(serde_json::Value::as_array)
-        .filter(|entries| !entries.is_empty())
-        .and_then(|entries| {
-            entries
-                .iter()
-                .map(|entry| {
-                    let envelope = serde_json::from_value::<
-                        harness_contract::outcome::DeliveryEnvelope,
-                    >(entry.get("delivery_envelope")?.clone())
-                    .ok()?;
-                    let summary = entry
-                        .get("terminal_summary")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::trim)
-                        .filter(|summary| !summary.is_empty())?;
-                    let team_id = entry
-                        .get("team_id")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("team");
-                    (entry
-                        .get("working_state_verified")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true)
-                        && entry
-                            .get("terminal_summary_kind")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("verified_team_evidence_bundle")
-                        && envelope.pipeline_status
-                            == harness_contract::outcome::PipelineStatus::Completed
-                        && envelope.delivery_status
-                            == harness_contract::outcome::DeliveryStatus::Satisfied
-                        && envelope.unresolved.is_empty()
-                        && envelope.coverage.required_obligation_ids
-                            == envelope.coverage.satisfied_obligation_ids)
-                        .then(|| format!("{team_id}: {summary}"))
-                })
-                .collect::<Option<Vec<_>>>()
-        });
-    let typed_team_carrier_verified = typed_team_summaries.is_some();
-    let evidence_bundle_verified = verified_evidence_bundle_summaries.is_some();
-    let terminal_summary = if typed_candidate_verified {
-        receipt
-            .get("terminal_summary")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|summary| !summary.is_empty())
-            .map(str::to_string)
-    } else {
-        typed_team_summaries
-            .or(verified_evidence_bundle_summaries)
-            .map(collaboration_evidence_carrier)
-    };
-    let verified_terminal_carrier = working_state_verified
-        && (typed_candidate_verified || typed_team_carrier_verified || evidence_bundle_verified);
-    (receipt.get("status").and_then(serde_json::Value::as_str) == Some("completed")
-        && verified_terminal_carrier
-        && terminal_summary.is_some()
-        && receipt
-            .pointer("/execution/terminal_result_available")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false))
-    .then_some(terminal_summary)
-    .flatten()
-}
-
 const COLLABORATION_EVIDENCE_CARRIER_KIND: &str = "cowd.runtime.collaboration_evidence.v1";
-
-fn collaboration_evidence_carrier(team_results: Vec<String>) -> String {
-    let verified_terminal_count = team_results.len();
-    serde_json::json!({
-        "kind": COLLABORATION_EVIDENCE_CARRIER_KIND,
-        "team_count": verified_terminal_count,
-        "team_results": team_results,
-        "root_runtime_attestation": {
-            "status": "verified",
-            "authority": "parent_runtime_projection",
-            "working_state_verified": true,
-            "verified_terminal_count": verified_terminal_count,
-            "all_carried_team_terminals_verified": true,
-            "scope": "aggregate_execution_and_receipt_satisfaction_only",
-            "role_local_visibility_gaps_do_not_negate_aggregate_attestation": true
-        },
-        "presentation_contract": "root_model_synthesis_required"
-    })
-    .to_string()
-}
 
 fn is_collaboration_evidence_carrier(value: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(value)
@@ -2183,62 +1781,17 @@ fn collaboration_synthesis_layer(results: Vec<String>, level: usize) -> String {
 }
 
 fn completed_orchestration_terminal_summary(
-    calls: &[ModelToolCall],
-    messages: &[ConversationMessage],
-    workspace_root: &std::path::Path,
+    _calls: &[ModelToolCall],
+    _messages: &[ConversationMessage],
+    _workspace_root: &std::path::Path,
     _require_source_path_evidence: bool,
 ) -> Option<String> {
-    let orchestration_ids = calls
-        .iter()
-        .filter(|call| {
-            call.name.eq_ignore_ascii_case("runtime_orchestrate")
-                || call.name.eq_ignore_ascii_case(
-                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-                )
-        })
-        .map(|call| call.id.as_str())
-        .collect::<BTreeSet<_>>();
-    messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_use_id,
-                tool_name,
-                output,
-                is_error: false,
-            } if (tool_name.eq_ignore_ascii_case("runtime_orchestrate")
-                || tool_name.eq_ignore_ascii_case(
-                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-                ))
-                && orchestration_ids.contains(tool_use_id.as_str()) =>
-            {
-                Some(output.as_str())
-            }
-            _ => None,
-        })
-        .filter_map(orchestration_receipt_json)
-        .find_map(|receipt| {
-            verified_team_terminal_summary(&receipt)
-                .filter(|summary| final_answer_recovery_reason(summary, workspace_root).is_none())
-        })
+    // Agent-first completion is projected from Program events and enforced by
+    // ObjectiveSupervisor. A tool response can never manufacture terminality.
+    None
 }
 
-fn objective_requests_followup_team(objective: &str) -> bool {
-    let normalized = objective.to_ascii_lowercase();
-    [
-        "另一个团队",
-        "另外一个团队",
-        "第二个团队",
-        "下一团队",
-        "another team",
-        "second team",
-        "next team",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term))
-}
-
+#[cfg(test)]
 fn team_phase_satisfies_parent_goal(
     required_team_executions: usize,
     parent_requires_write: bool,
@@ -2247,126 +1800,6 @@ fn team_phase_satisfies_parent_goal(
 ) -> bool {
     (!parent_requires_write || parent_write_satisfied)
         && verified_team_executions >= required_team_executions.max(1)
-}
-
-/// A read-only view over the canonical Program instances.  The graph retains
-/// all lifecycle and result truth; this compact carrier is only used to make
-/// a root receipt and Surface answer the precise question “which required
-/// Teams completed?” without parsing labels, model JSON or child summaries.
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize)]
-struct CollaborationProgramProgress {
-    program_id: String,
-    program_revision: u64,
-    required_team_count: usize,
-    completed_required_team_count: usize,
-    completed_required_instance_ids: Vec<String>,
-    instances: Vec<CollaborationProgramInstanceProgress>,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Serialize)]
-struct CollaborationProgramInstanceProgress {
-    instance_id: String,
-    semantic_node_id: String,
-    physical_node_id: String,
-    required: bool,
-    status: ExecutionNodeStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    failure_kind: Option<String>,
-}
-
-#[cfg(test)]
-fn collaboration_program_progress_from_graph(
-    graph: &harness_contract::execution_graph::ExecutionGraph,
-) -> Result<Option<CollaborationProgramProgress>, RuntimeError> {
-    let Some(program) = graph
-        .orchestration
-        .as_ref()
-        .and_then(|metadata| metadata.collaboration_program.as_ref())
-    else {
-        return Ok(None);
-    };
-    program.validate().map_err(|error| {
-        RuntimeError::new(format!("invalid durable collaboration program: {error}"))
-    })?;
-
-    let mut semantic_positions = BTreeMap::<&str, usize>::new();
-    let mut instances = Vec::with_capacity(program.team_instances.len());
-    let mut completed_required_instance_ids = Vec::new();
-    for instance in &program.team_instances {
-        let position = semantic_positions
-            .entry(instance.semantic_node_id.as_str())
-            .or_default();
-        let physical_node_id = program
-            .semantic_node_instances
-            .get(&instance.semantic_node_id)
-            .and_then(|nodes| nodes.get(*position))
-            .ok_or_else(|| {
-                RuntimeError::new(format!(
-                    "collaboration Program instance `{}` has no physical graph node",
-                    instance.instance_id
-                ))
-            })?
-            .clone();
-        *position = position.saturating_add(1);
-        let node = graph
-            .nodes
-            .iter()
-            .find(|node| node.id == physical_node_id)
-            .ok_or_else(|| {
-                RuntimeError::new(format!(
-                    "collaboration Program node `{physical_node_id}` is absent from graph `{}`",
-                    graph.id
-                ))
-            })?;
-        if node.kind != ExecutionNodeKind::Subgraph
-            || node.executor_kind != crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR
-        {
-            return Err(RuntimeError::new(format!(
-                "collaboration Program node `{physical_node_id}` is not a Team subgraph"
-            )));
-        }
-        let status = graph
-            .node_statuses
-            .get(&physical_node_id)
-            .copied()
-            .unwrap_or(ExecutionNodeStatus::Planned);
-        if instance.required && status == ExecutionNodeStatus::Completed {
-            completed_required_instance_ids.push(instance.instance_id.clone());
-        }
-        instances.push(CollaborationProgramInstanceProgress {
-            instance_id: instance.instance_id.clone(),
-            semantic_node_id: instance.semantic_node_id.clone(),
-            physical_node_id: physical_node_id.clone(),
-            required: instance.required,
-            status,
-            failure_kind: graph
-                .node_results
-                .get(&physical_node_id)
-                .and_then(|result| result.failure.as_ref())
-                .map(|failure| failure.kind.clone()),
-        });
-    }
-    Ok(Some(CollaborationProgramProgress {
-        program_id: program.program_id.clone(),
-        program_revision: program.revision,
-        required_team_count: usize::from(program.required_team_count),
-        completed_required_team_count: completed_required_instance_ids.len(),
-        completed_required_instance_ids,
-        instances,
-    }))
-}
-
-fn team_orchestration_request_available(
-    objective: &str,
-    collaboration_started: bool,
-    team_orchestration_requests: usize,
-) -> bool {
-    if !collaboration_started {
-        return team_orchestration_requests < ROOT_CONTROL_PLANE_REPAIR_BUDGET;
-    }
-    team_orchestration_requests == 0 && objective_requests_followup_team(objective)
 }
 
 fn required_team_execution_count_for_execution_context(
@@ -2385,6 +1818,157 @@ fn required_team_execution_count_for_execution_context(
     } else {
         obligation.map_or(0, |value| usize::from(value.required_team_count()))
     }
+}
+
+fn root_agentic_program_projection(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+) -> Option<crate::AgenticProgramProjection> {
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    services.agent_action_service().project(&program_id).ok()
+}
+
+/// Decide whether the Agent-first Objective supervisor exclusively owns the
+/// root Goal terminal. Presence alone is not sufficient: the durable Program
+/// must attest the exact Session, Turn, Objective, and root execution. A
+/// malformed partial binding fails closed instead of falling through to the
+/// generic presentation writer and creating a conflicting terminal fence.
+fn agentic_program_owns_root_terminal(
+    services: &crate::RuntimeServices,
+    session_id: &str,
+    turn_id: &str,
+    root_execution_id: &str,
+) -> Result<bool, String> {
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    let Some(program) = services
+        .agent_action_service()
+        .project_if_exists(&program_id)
+        .map_err(|error| format!("load Agent-first terminal owner: {error}"))?
+    else {
+        return Ok(false);
+    };
+    if program.objective_id != objective_id
+        || program.session_id != session_id
+        || program.turn_id != turn_id
+        || program.root_execution_id.as_deref() != Some(root_execution_id)
+    {
+        return Err(format!(
+            "Agent-first Program `{program_id}` has an invalid root terminal binding"
+        ));
+    }
+    Ok(true)
+}
+
+fn compact_agentic_program_checkpoint(program: &crate::AgenticProgramProjection) -> String {
+    let teams = program
+        .teams
+        .values()
+        .map(|team| {
+            serde_json::json!({
+                "team_ref": team.team_id,
+                "name": team.name,
+                "mission": team.mission,
+                "member_refs": team.member_ids,
+                "task_refs": team.task_ids,
+            })
+        })
+        .collect::<Vec<_>>();
+    let agents = program
+        .agents
+        .values()
+        .map(|agent| {
+            serde_json::json!({
+                "agent_ref": agent.agent_id,
+                "team_ref": agent.team_id,
+                "role": agent.role,
+                "mission": agent.mission,
+            })
+        })
+        .collect::<Vec<_>>();
+    let tasks = program
+        .tasks
+        .values()
+        .map(|task| {
+            serde_json::json!({
+                "task_ref": task.task_id,
+                "team_ref": task.team_id,
+                "title": task.title,
+                "status": task.status,
+                "claimant": task.claimant,
+                "artifact_refs": task.artifact_refs,
+                "evidence_refs": task.evidence_refs,
+                "unresolved": task.unresolved,
+                "review_reason": task.review_reason,
+                "failed_attempts": task.failed_attempts,
+                "failed_review_attempts": task.failed_review_attempts,
+                "last_failure": task.last_failure,
+                "replacement_task_refs": task.replacement_task_refs,
+                "supersede_evidence_refs": task.supersede_evidence_refs,
+                "superseded_reason": task.superseded_reason,
+                "superseded_by": task.superseded_by,
+            })
+        })
+        .collect::<Vec<_>>();
+    let artifacts = program
+        .artifacts
+        .values()
+        .map(|artifact| {
+            serde_json::json!({
+                "artifact_ref": artifact.artifact_ref,
+                "content_ref": artifact.content_ref,
+                "title": artifact.title,
+                "kind": artifact.kind,
+                "relates_to": artifact.relates_to,
+                "committed_by": artifact.committed_by,
+            })
+        })
+        .collect::<Vec<_>>();
+    let next_actions = if program.status == crate::AgenticProgramStatus::Verified {
+        vec!["synthesize_user_delivery"]
+    } else if program.status == crate::AgenticProgramStatus::Blocked {
+        vec!["explain_blocker_or_replan"]
+    } else if program.status == crate::AgenticProgramStatus::CompletionRequested {
+        vec!["await_objective_supervisor_verdict"]
+    } else if !program.tasks.is_empty()
+        && program
+            .tasks
+            .values()
+            .any(|task| task.status != crate::AgenticTaskStatus::Superseded)
+        && program
+            .tasks
+            .values()
+            .filter(|task| task.status != crate::AgenticTaskStatus::Superseded)
+            .all(|task| task.status == crate::AgenticTaskStatus::Accepted)
+    {
+        vec!["objective_complete_request"]
+    } else if program.tasks.values().any(|task| {
+        matches!(
+            task.status,
+            crate::AgenticTaskStatus::Claimed | crate::AgenticTaskStatus::Submitted
+        )
+    }) {
+        vec!["wait_for_active_agents"]
+    } else {
+        vec!["publish_or_replan_ready_work"]
+    };
+    serde_json::json!({
+        "kind": "agentic_program_checkpoint",
+        "program_id": program.program_id,
+        "revision": program.revision,
+        "status": program.status,
+        "required_team_count": program.required_team_count,
+        "teams": teams,
+        "agents": agents,
+        "tasks": tasks,
+        "artifacts": artifacts,
+        "unresolved": program.unresolved,
+        "next_actions": next_actions,
+        "instruction": "Use this Runtime projection as current truth. Decide the next semantic action; do not poll unchanged state or recreate committed entities.",
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -2420,12 +2004,14 @@ enum RootAcceptanceDisposition {
     BlockMissingWrite,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExhaustedTeamLeaseDisposition {
     CompleteRemainingWrite,
     CleanSynthesis,
 }
 
+#[cfg(test)]
 fn exhausted_team_lease_disposition(
     required_write_for_completion: bool,
     write_obligation_satisfied: bool,
@@ -2543,7 +2129,7 @@ mod write_obligation_probe {
             "必须先调用 write_file 把统一 HTML 决策报告写入 {}/cross-team-decision-report.html（覆盖 summary/evidence/key_decisions/unresolved_or_risks），写盘成功收据后再输出终态 JSON。",
             canonical.display()
         );
-        let scopes = crate::orchestration::team_authority::explicit_workspace_resource_scopes(
+        let scopes = crate::workspace_scopes::explicit_workspace_resource_scopes(
             root.path(),
             &objective,
             true,
@@ -2553,37 +2139,6 @@ mod write_obligation_probe {
             .iter()
             .any(|scope| scope == "write:cross-team-decision-report.html"));
     }
-}
-
-fn team_receipt_write_scopes(receipt: &serde_json::Value) -> BTreeSet<String> {
-    receipt
-        .get("write_attempt_paths")
-        .or_else(|| receipt.pointer("/evidence/write_attempt_paths"))
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flat_map(|paths| paths.iter())
-        .filter_map(serde_json::Value::as_str)
-        .filter_map(normalized_workspace_write_scope)
-        .collect()
-}
-
-fn team_receipt_observed_evidence(
-    receipt: &serde_json::Value,
-) -> Vec<harness_contract::context::ObservedEvidence> {
-    receipt
-        .get("observed_acceptance")
-        .or_else(|| receipt.pointer("/evidence/observed_acceptance"))
-        .cloned()
-        .and_then(|value| {
-            serde_json::from_value::<harness_contract::context::ObservedAcceptance>(value).ok()
-        })
-        .map(|acceptance| acceptance.observed_evidence)
-        .unwrap_or_default()
-}
-
-fn normalized_workspace_write_scope(path: &str) -> Option<String> {
-    let scope = format!("write:{path}");
-    normalize_workspace_scope(&scope).map(|(_, path)| format!("write:{path}"))
 }
 
 fn root_acceptance_disposition(
@@ -2620,26 +2175,8 @@ fn is_cjk_character(character: char) -> bool {
 /// Team summaries: those are presentation/transport details and must never
 /// become the host's lifecycle authority.
 fn completed_program_team_ids(messages: &[ConversationMessage]) -> BTreeSet<String> {
-    messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_name,
-                output,
-                is_error: false,
-                ..
-            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
-                || tool_name.eq_ignore_ascii_case(
-                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-                ) =>
-            {
-                orchestration_receipt_json(output)
-            }
-            _ => None,
-        })
-        .flat_map(|receipt| completed_program_team_ids_from_receipt(&receipt))
-        .collect()
+    let _ = messages;
+    BTreeSet::new()
 }
 
 fn has_completed_program_terminal(messages: &[ConversationMessage]) -> bool {
@@ -2651,64 +2188,8 @@ fn has_completed_program_terminal(messages: &[ConversationMessage]) -> bool {
 /// authority; tool-result success is not. Once true, this root turn must not
 /// expose a second admission port for the same objective.
 fn has_admitted_program_receipt(messages: &[ConversationMessage]) -> bool {
-    messages
-        .iter()
-        .flat_map(|message| message.blocks.iter())
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult {
-                tool_name, output, ..
-            } if tool_name.eq_ignore_ascii_case("runtime_orchestrate")
-                || tool_name.eq_ignore_ascii_case(
-                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-                ) =>
-            {
-                orchestration_receipt_json(output)
-            }
-            _ => None,
-        })
-        .any(|receipt| {
-            receipt
-                .get("collaboration_program")
-                .and_then(serde_json::Value::as_object)
-                .and_then(|program| program.get("program_id"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|program_id| !program_id.trim().is_empty())
-        })
-}
-
-fn completed_program_team_ids_from_receipt(receipt: &serde_json::Value) -> BTreeSet<String> {
-    let Some(program) = receipt.get("collaboration_program") else {
-        return BTreeSet::new();
-    };
-    let lifecycle = program.get("lifecycle").and_then(serde_json::Value::as_str);
-    if !matches!(lifecycle, Some("completed") | Some("partial")) {
-        return BTreeSet::new();
-    }
-    if program
-        .get("terminal_diagnostics")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|diagnostics| !diagnostics.is_empty())
-    {
-        return BTreeSet::new();
-    }
-    let ids = program
-        .get("completed_required_instance_ids")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flat_map(|ids| ids.iter())
-        .filter_map(serde_json::Value::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .map(str::to_string)
-        .collect::<BTreeSet<_>>();
-    let required_count = program
-        .get("required_team_count")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|count| usize::try_from(count).ok());
-    if required_count.is_none_or(|count| ids.len() >= count.max(1)) {
-        ids
-    } else {
-        BTreeSet::new()
-    }
+    let _ = messages;
+    false
 }
 
 fn parent_merge_actuals(
@@ -2726,53 +2207,6 @@ fn parent_merge_actuals(
         merge_cost_ms,
         u8::from(started_at.is_some() && parent_succeeded),
     )
-}
-
-fn selected_strategy_focus_count(
-    strategy: &crate::execution_core::TurnStrategyDecisionState,
-) -> usize {
-    semantic_team_focus_count(&strategy.decision.strategy.understanding)
-}
-
-fn semantic_team_focus_count(
-    understanding: &harness_contract::strategy::TaskUnderstanding,
-) -> usize {
-    usize::from(
-        understanding
-            .required_team_count
-            .max(understanding.independent_workstreams)
-            .max(1),
-    )
-}
-
-fn selected_strategy_focus_plans(
-    strategy: &crate::execution_core::TurnStrategyDecisionState,
-    objective: &str,
-    workspace_root: &std::path::Path,
-    forced_scopes: &[String],
-) -> Vec<harness_contract::team::FocusPartitionPlan> {
-    let understanding = &strategy.decision.strategy.understanding;
-    derive_team_focus_partition_plans(
-        objective,
-        workspace_root,
-        forced_scopes,
-        selected_strategy_focus_count(strategy),
-        understanding.requires_write,
-        understanding.requests_multi_agent,
-        understanding.requires_external_facts,
-    )
-}
-
-#[cfg(test)]
-fn focus_partition_plans_use_external_transport(
-    plans: &[harness_contract::team::FocusPartitionPlan],
-) -> bool {
-    let scopes = plans
-        .iter()
-        .flat_map(|plan| &plan.slots)
-        .flat_map(|slot| &slot.capability_cropped_refs)
-        .collect::<Vec<_>>();
-    !scopes.is_empty() && scopes.iter().all(|scope| scope.starts_with("network:"))
 }
 
 fn best_non_team_strategy(
@@ -2955,6 +2389,9 @@ struct TurnGraphState {
     committed_terminal_answer: Option<String>,
     committed_terminal_completion: Option<GoalCompletion>,
     last_verified_progress: bool,
+    /// Consecutive model steps with no new Runtime-verified evidence or state
+    /// transition. Total iterations remain observability telemetry only.
+    consecutive_unverified_model_steps: usize,
     reasoning_only_attempts: u8,
     force_text_only_next_model: bool,
     force_tool_allowlist_next_model: Option<BTreeSet<String>>,
@@ -2963,6 +2400,15 @@ struct TurnGraphState {
     force_reasoning_effort_next_model: Option<String>,
     terminal_recovery_attempts: u8,
     provider_protocol_recovery_attempts: u8,
+    /// Bounded extra provider steps reserved only for closing the durable
+    /// Agent-first artifact/submit/review transaction after generic safety
+    /// heuristics would otherwise withdraw its required action tool.
+    agentic_protocol_recovery_attempts: u8,
+    /// Last Agent-first Program revision injected into this root model loop.
+    /// The Program journal remains truth; this cursor prevents redundant
+    /// prompt growth while allowing every real state change to wake the model
+    /// with a compact actionable checkpoint.
+    agentic_program_context_revision: Option<u64>,
     execution_role: TurnExecutionRole,
     bounded_evidence_role: bool,
     focus_novelty_target_bp: u16,
@@ -3019,38 +2465,17 @@ struct TurnGraphState {
     evaluation_resource_scopes: Vec<String>,
     evaluation_scope_rejections: u8,
     evaluation_judge_only: bool,
-    team_orchestration_requests: usize,
     collaboration_started: bool,
-    collaboration_committed_write: bool,
-    /// A root Turn that was explicitly required to collaborate but exhausted
-    /// its bounded root control-plane repairs records this durable receipt only after
-    /// the model node itself commits. It is intentionally distinct from a
-    /// collaboration Program receipt: no Program was admitted.
-    pending_root_control_plane_receipt: Option<String>,
     /// A root collaboration requirement becomes durable with the next model
     /// node commit, before any proposal receipt can be consumed.
     pending_root_control_plane_requirement: Option<u8>,
-    /// The committed root control-plane phase. This is also mirrored to the
-    /// Session event stream after every ToolBatch transition so recovery can
-    /// restore the same provider restriction without replaying model prose.
-    root_control_plane_phase: RootControlPlanePhase,
-    /// A ToolBatch stages its phase advance here; `after_commit` publishes it
-    /// and only then makes it visible to the following model node.
-    pending_root_control_plane_phase: Option<RootControlPlanePhase>,
-    /// A root collaboration proposal that substitutes an explicitly named
-    /// source is retried once with the immutable source contract made
-    /// explicit. This is separate from a Team lease: an invalid proposal
-    /// never starts a Team and must not consume the Team execution budget.
-    root_evidence_scope_repairs: u8,
     root_write_replans: u8,
     root_language_replan_attempted: bool,
-    nested_orchestration_forbidden: bool,
     pending_terminal_artifact: Option<PendingTerminalArtifact>,
     /// Claims are staged by Synthesize and released only from `after_commit`,
     /// after the graph/terminal transaction has become durable.
     pending_controlled_recovery_claim_fingerprints: Vec<String>,
     pending_disposition_inputs: Vec<crate::session_input::SessionInputRecord>,
-    input_disposition_repairs: u8,
 }
 
 #[derive(Clone)]
@@ -3077,14 +2502,10 @@ fn required_workspace_write_scopes_for_turn(
     resolved_objective: &str,
 ) -> Vec<String> {
     let extract = |objective: &str| {
-        crate::orchestration::team_authority::explicit_workspace_resource_scopes(
-            workspace_root,
-            objective,
-            true,
-        )
-        .into_iter()
-        .filter(|scope| scope.starts_with("write:"))
-        .collect::<Vec<_>>()
+        crate::workspace_scopes::explicit_workspace_resource_scopes(workspace_root, objective, true)
+            .into_iter()
+            .filter(|scope| scope.starts_with("write:"))
+            .collect::<Vec<_>>()
     };
     let current = extract(current_input);
     if current.is_empty() {
@@ -3573,128 +2994,9 @@ fn root_team_terminal_requires_text_only(
 /// that is responsible for reading it, so both declarations are accepted.
 /// `None` means this batch does not contain the typed root-admission transport
 /// (or the user did not name source paths); it must not affect ordinary tools.
-fn missing_root_collaboration_evidence_scopes(
-    calls: &[ModelToolCall],
-    required_workspace_evidence_scopes: &[String],
-) -> Option<Vec<String>> {
-    if required_workspace_evidence_scopes.is_empty() {
-        return None;
-    }
-    let call = calls.iter().find(|call| {
-        call.name.eq_ignore_ascii_case(
-            harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-        )
-    })?;
-    let decision = serde_json::from_str::<
-        harness_contract::orchestration::ModelCollaborationControlDecisionV2,
-    >(&call.input)
-    .ok()?;
-    let declared = harness_contract::orchestration::model_collaboration_evidence_scopes(&decision)
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let missing = required_workspace_evidence_scopes
-        .iter()
-        .filter(|scope| {
-            let scope = scope.trim();
-            !declared.contains(scope)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    // `Some` is the rejection signal for the caller. Returning `Some([])`
-    // therefore turns a complete proposal into a false missing-evidence
-    // rejection and prevents any Team from being admitted.
-    (!missing.is_empty()).then_some(missing)
-}
-
-fn requests_team_orchestration(calls: &[ModelToolCall]) -> bool {
-    calls.iter().any(is_team_orchestration_call)
-}
-
 fn is_team_orchestration_call(call: &ModelToolCall) -> bool {
-    if call.name.eq_ignore_ascii_case(
-        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-    ) {
-        return serde_json::from_str::<
-            harness_contract::orchestration::ModelCollaborationControlDecisionV2,
-        >(&call.input)
-        .ok()
-        .is_some_and(|decision| !decision.workstreams.is_empty());
-    }
     call.name
-        .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
-        && serde_json::from_str::<serde_json::Value>(&call.input)
-            .ok()
-            .is_some_and(|input| {
-                input.get("operation").and_then(serde_json::Value::as_str) == Some("propose")
-                    && input
-                        .pointer("/proposal/nodes")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|nodes| {
-                            nodes.iter().any(|node| {
-                                node.get("recipe").and_then(serde_json::Value::as_str)
-                                    == Some("team")
-                            })
-                        })
-            })
-}
-
-fn root_control_plane_phase_after_tool_batch(
-    current: RootControlPlanePhase,
-    calls: &[ModelToolCall],
-    successful_call_ids: &BTreeSet<String>,
-) -> RootControlPlanePhase {
-    if calls
-        .iter()
-        .any(|call| successful_call_ids.contains(&call.id) && is_team_orchestration_call(call))
-    {
-        return RootControlPlanePhase::ProposalSubmitted;
-    }
-    let inspected_capabilities = calls.iter().any(|call| {
-        successful_call_ids.contains(&call.id)
-            && call.name.eq_ignore_ascii_case("runtime_capabilities")
-    });
-    if inspected_capabilities && current == RootControlPlanePhase::CapabilityOrProposal {
-        RootControlPlanePhase::ProposalOnly
-    } else {
-        current
-    }
-}
-
-fn recovered_root_control_plane_phase(
-    services: &crate::RuntimeServices,
-    session_id: &str,
-    turn_id: &str,
-) -> Result<Option<RootControlPlanePhase>, String> {
-    services
-        .event_store()
-        .list_stream(&format!("session:{session_id}"))?
-        .into_iter()
-        .rev()
-        .find(|event| {
-            event.kind == "runtime.control_plane.phase"
-                && event
-                    .refs
-                    .iter()
-                    .any(|reference| reference.kind == "turn" && reference.id == turn_id)
-        })
-        .and_then(|event| {
-            event
-                .payload
-                .get("phase")
-                .cloned()
-                .and_then(|value| serde_json::from_value(value).ok())
-        })
-        .map_or(Ok(None), |phase| Ok(Some(phase)))
-}
-
-fn requests_runtime_orchestration(calls: &[ModelToolCall]) -> bool {
-    calls.iter().any(|call| {
-        call.name
-            .eq_ignore_ascii_case(harness_contract::orchestration::RUNTIME_ORCHESTRATE_TOOL_ID)
-            || call.name.eq_ignore_ascii_case(
-                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-            )
-    })
+        .eq_ignore_ascii_case(harness_contract::agent_action::TEAM_CREATE_TOOL_ID)
 }
 
 fn evaluation_topology_forbids_team() -> bool {
@@ -3785,14 +3087,6 @@ struct TurnToolBatchBackend<C: ApiClient, T: ToolExecutor> {
     runtime: Arc<tokio::sync::Mutex<crate::ConversationRuntime<C, T>>>,
     state: Arc<tokio::sync::Mutex<TurnGraphState>>,
     services: Arc<crate::RuntimeServices>,
-}
-
-fn orchestration_receipt_json(output: &str) -> Option<serde_json::Value> {
-    serde_json::from_str(output).ok().or_else(|| {
-        output
-            .find('{')
-            .and_then(|start| serde_json::from_str(&output[start..]).ok())
-    })
 }
 
 async fn compact_governed_tool_messages<C, T>(

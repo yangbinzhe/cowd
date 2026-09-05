@@ -72,7 +72,7 @@ mod reality_routes;
 mod resource_routes;
 pub(crate) mod route_manifest;
 mod route_registry;
-mod runtime_routes;
+pub(crate) mod runtime_routes;
 mod session_routes;
 mod skill_routes;
 mod slash_routes;

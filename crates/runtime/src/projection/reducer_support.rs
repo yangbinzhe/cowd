@@ -257,33 +257,12 @@ impl ExecutionProjectionScope {
                 )));
             }
         }
-        let agent_ids = agent_snapshots
-            .iter()
-            .flat_map(|agent| [agent.agent_id.clone(), agent.run_id.clone()])
-            .collect::<BTreeSet<_>>();
-        let agents = entities_from_details(
-            "agent",
-            agent_snapshots
-                .into_iter()
-                .filter_map(|agent| serde_json::to_value(agent).ok()),
-            full,
-        );
-
-        let team_snapshots = execution_ids
-            .iter()
-            .filter_map(|graph_id| services.team_runtime().project(graph_id).ok())
-            .collect::<Vec<_>>();
-        let team_ids = team_snapshots
-            .iter()
-            .map(|team| team.team_id.clone())
-            .collect::<BTreeSet<_>>();
-        let teams = entities_from_details(
-            "team",
-            team_snapshots
-                .into_iter()
-                .filter_map(|team| serde_json::to_value(team).ok()),
-            full,
-        );
+        let agentic_programs = agentic_programs_for_executions(services, &execution_ids);
+        let collaboration = collaboration_entities(agent_snapshots, &agentic_programs, full);
+        let agents = collaboration.agents;
+        let teams = collaboration.teams;
+        let agent_ids = collaboration.agent_ids;
+        let team_ids = collaboration.team_ids;
 
         let goal_projections = goals_for_executions(services, &execution_ids);
         let goal_ids = goal_projections
@@ -403,6 +382,128 @@ impl ExecutionProjectionScope {
                 .filter_map(|prefix| event.stream_id.strip_prefix(prefix))
                 .any(|id| self.entity_ids.contains(id))
     }
+}
+
+struct CollaborationEntities {
+    agents: Vec<ProjectionEntity>,
+    teams: Vec<ProjectionEntity>,
+    agent_ids: BTreeSet<String>,
+    team_ids: BTreeSet<String>,
+}
+
+fn collaboration_entities(
+    agent_snapshots: Vec<crate::AgentRunSnapshot>,
+    programs: &[crate::AgenticProgramProjection],
+    full: bool,
+) -> CollaborationEntities {
+    let physical_agent_ids = agent_snapshots
+        .iter()
+        .flat_map(|agent| [agent.agent_id.clone(), agent.run_id.clone()])
+        .collect::<BTreeSet<_>>();
+    let mut agent_ids = physical_agent_ids.clone();
+    agent_ids.extend(
+        programs
+            .iter()
+            .flat_map(|program| program.agents.keys().cloned()),
+    );
+    let agents = entities_from_details(
+        "agent",
+        agent_snapshots
+            .into_iter()
+            .filter_map(|agent| serde_json::to_value(agent).ok())
+            .chain(programs.iter().flat_map(|program| {
+                program
+                    .agents
+                    .values()
+                    .filter(|member| !physical_agent_ids.contains(&member.agent_id))
+                    .map(|member| {
+                        let task = program.tasks.values().find(|task| {
+                            task.claimant.as_deref() == Some(member.agent_id.as_str())
+                        });
+                        serde_json::json!({
+                            "agent_id": member.agent_id,
+                            "team_id": member.team_id,
+                            "role": member.role,
+                            "mission": member.mission,
+                            "required_capabilities": member.required_capabilities,
+                            "invited_by": member.invited_by,
+                            "program_id": program.program_id,
+                            "program_revision": program.revision,
+                            "task_id": task.map(|task| task.task_id.as_str()),
+                            "execution_id": task.and_then(|task| task.claim_execution_id.as_deref()),
+                            "status": task.map_or("invited", |task| match task.status {
+                                crate::AgenticTaskStatus::Published => "planned",
+                                crate::AgenticTaskStatus::Claimed => "running",
+                                crate::AgenticTaskStatus::Submitted => "submitted",
+                                crate::AgenticTaskStatus::Accepted => "completed",
+                                crate::AgenticTaskStatus::Rework => "rework",
+                                crate::AgenticTaskStatus::Blocked => "blocked",
+                                crate::AgenticTaskStatus::Superseded => "superseded",
+                            }),
+                        })
+                    })
+            })),
+        full,
+    );
+    let team_ids = programs
+        .iter()
+        .flat_map(|program| program.teams.keys().cloned())
+        .collect::<BTreeSet<_>>();
+    let teams = entities_from_details(
+        "team",
+        programs.iter().flat_map(|program| {
+            program.teams.values().map(|team| {
+                serde_json::json!({
+                    "team_id": team.team_id,
+                    "name": team.name,
+                    "mission": team.mission,
+                    "objective": team.objective,
+                    "topic_ref": team.topic_ref,
+                    "created_by": team.created_by,
+                    "member_ids": team.member_ids,
+                    "task_ids": team.task_ids,
+                    "program_id": program.program_id,
+                    "program_revision": program.revision,
+                    "status": program.status,
+                    "root_execution_id": program.root_execution_id,
+                })
+            })
+        }),
+        full,
+    );
+    CollaborationEntities {
+        agents,
+        teams,
+        agent_ids,
+        team_ids,
+    }
+}
+
+fn agentic_programs_for_executions(
+    services: &RuntimeServices,
+    execution_ids: &BTreeSet<String>,
+) -> Vec<crate::AgenticProgramProjection> {
+    let action_service = services.agent_action_service();
+    let mut programs = services
+        .event_store()
+        .stream_ids_for_scope(RuntimeEventScope::Program)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|stream| {
+            stream
+                .strip_prefix("agentic-program:")
+                .map(ToOwned::to_owned)
+        })
+        .filter_map(|program_id| action_service.project_if_exists(&program_id).ok().flatten())
+        .filter(|program| {
+            program
+                .root_execution_id
+                .as_ref()
+                .is_some_and(|execution_id| execution_ids.contains(execution_id))
+        })
+        .collect::<Vec<_>>();
+    programs.sort_by(|left, right| left.program_id.cmp(&right.program_id));
+    programs
 }
 
 fn agent_task_matches_projection_scope(

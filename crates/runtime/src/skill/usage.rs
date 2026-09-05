@@ -57,7 +57,7 @@ impl RuntimeSkillUsageRecorder {
         let worker_persisted = Arc::clone(&persisted);
         let worker_failures = Arc::clone(&persistence_failures);
         let worker_store = Arc::clone(&store);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("cowd-runtime-skill-usage".to_string())
             .spawn(move || {
                 while let Ok(first) = receiver.recv() {
@@ -87,8 +87,11 @@ impl RuntimeSkillUsageRecorder {
                         }
                     }
                 }
-            })
-            .expect("Runtime Skill usage writer thread must start");
+            });
+        if let Err(error) = worker {
+            persistence_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(%error, "Runtime Skill usage writer thread failed to start");
+        }
         Self {
             store,
             pointer_cache,

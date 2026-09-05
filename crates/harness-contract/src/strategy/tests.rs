@@ -118,19 +118,6 @@ fn explicit_team_cardinality_is_distinct_from_agent_cardinality() {
 }
 
 #[test]
-fn native_managed_escalation_contract_is_not_a_model_optional_field() {
-    let required = understand(&StrategyInput::from_prompt(
-            "必须让 Team A 的 Agent 实际调用 request_collaboration_escalation；完成后创建后续 Team，并保留 Runtime-attested receipt。",
-        ));
-    assert!(required.requires_managed_collaboration_escalation);
-
-    let catalog_only = understand(&StrategyInput::from_prompt(
-        "只展示 request_collaboration_escalation 的 schema，不要启动 Team。",
-    ));
-    assert!(!catalog_only.requires_managed_collaboration_escalation);
-}
-
-#[test]
 fn observed_network_tool_batch_recomputes_the_complete_strategy_contract() {
     let mut decision = decide_strategy(&StrategyInput::from_prompt("继续处理"));
     decision

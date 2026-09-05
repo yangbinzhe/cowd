@@ -256,10 +256,10 @@ fn reviewer_evidence_summary(report: &Value) -> Value {
             "failed": report.pointer("/reality_context_eval/failed"),
             "total": report.pointer("/reality_context_eval/total"),
         },
-        "mission_runtime_collaboration": {
-            "status": report.pointer("/mission_runtime_collaboration/status"),
-            "selected_strategy": report.pointer("/mission_runtime_collaboration/selected_strategy"),
-            "terminal_evidence": report.pointer("/mission_runtime_collaboration/terminal_evidence"),
+        "agentic_program_closure": {
+            "status": report.pointer("/agentic_program_closure/status"),
+            "facts": report.pointer("/agentic_program_closure/facts"),
+            "checks": report.pointer("/agentic_program_closure/checks"),
         },
         "next_gen_harness_closure": {
             "status": report.pointer("/next_gen_harness_closure/status"),

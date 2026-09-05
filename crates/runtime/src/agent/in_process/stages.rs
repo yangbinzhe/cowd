@@ -13,14 +13,6 @@ pub(super) fn delegated_child_session(
     session
 }
 
-pub(super) fn packet_focus_novelty_target_bp(packet: &AgentTaskPacket) -> u16 {
-    packet
-        .team_role_assignment()
-        .map(|assignment| assignment.identity.novelty_target_bp)
-        .unwrap_or(0)
-        .min(10_000)
-}
-
 pub(super) fn packet_focus_acceptance_scopes(packet: &AgentTaskPacket) -> Vec<String> {
     let mut scopes = packet
         .required_acceptance
@@ -37,23 +29,25 @@ pub(super) fn packet_required_output_fields(packet: &AgentTaskPacket) -> Vec<Str
     let mut fields = packet_acceptance_contract(packet)
         .into_iter()
         .filter_map(|requirement| match requirement.check {
-            harness_contract::team::TeamAcceptanceCheck::StructuredField { field }
-            | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
+            harness_contract::agent::OutputAcceptanceCheck::StructuredField { field }
+            | harness_contract::agent::OutputAcceptanceCheck::WorkspaceChange { field, .. } => {
                 Some(field.as_str().to_string())
             }
-            harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { name } => Some(name),
-            harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => Some(
-                harness_contract::team::TeamStructuredOutputField::SourceVerification
+            harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact { name } => {
+                Some(name)
+            }
+            harness_contract::agent::OutputAcceptanceCheck::SourceVerification { .. } => Some(
+                harness_contract::agent::StructuredOutputField::SourceVerification
                     .as_str()
                     .to_string(),
             ),
-            harness_contract::team::TeamAcceptanceCheck::UpstreamReview => Some(
-                harness_contract::team::TeamStructuredOutputField::Review
+            harness_contract::agent::OutputAcceptanceCheck::UpstreamReview => Some(
+                harness_contract::agent::StructuredOutputField::Review
                     .as_str()
                     .to_string(),
             ),
-            harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
-            | harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
+            harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence { .. }
+            | harness_contract::agent::OutputAcceptanceCheck::UpstreamEvidence => None,
         })
         .collect::<Vec<_>>();
     fields.sort();

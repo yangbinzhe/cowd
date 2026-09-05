@@ -541,15 +541,6 @@ where
         }
     }
 
-    #[must_use]
-    pub(crate) fn active_model_lease(&self) -> String {
-        self.model
-            .as_deref()
-            .filter(|model| !model.trim().is_empty())
-            .unwrap_or("default")
-            .to_string()
-    }
-
     /// Set a tool callback for real-time execution visualization (P0-2).
     ///
     /// # Safety

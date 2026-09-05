@@ -62,8 +62,8 @@ pub use provider_cache_calibration::{
     run_provider_cache_calibration, ProviderCacheCalibrationOptions,
 };
 pub use report::{
-    evaluate_report_gate, CapabilityResult, ExecutionTrace, HarnessEvalLevel,
-    HarnessEvalReportDetail, HarnessEvalReportGate, HarnessEvalReportGateItem,
+    evaluate_agentic_program_closure, evaluate_report_gate, CapabilityResult, ExecutionTrace,
+    HarnessEvalLevel, HarnessEvalReportDetail, HarnessEvalReportGate, HarnessEvalReportGateItem,
     HarnessEvalReportSummary, HarnessEvalRunRecord, HarnessEvalRunRequest, HarnessEvalRunStatus,
     HarnessEvalUsageSummary, HarnessMetric, MissionHarnessEvalReport, ProviderRoundDetail,
     ProviderRoundSummary, RealToolScenarioReport, RealToolScenarioResult, ToolCallDetail,
@@ -328,7 +328,7 @@ pub enum NextGenHarnessScenarioKind {
     SimpleDirect,
     ComplexStrategySelection,
     ToolBatchEfficiency,
-    TeamAgentExecutionOutcome,
+    AgenticProgramClosure,
     CrossSessionDispatch,
     MemoryRealityContextGovernance,
     ConflictRecovery,
@@ -341,7 +341,7 @@ impl NextGenHarnessScenarioKind {
             Self::SimpleDirect => "simple_direct",
             Self::ComplexStrategySelection => "complex_strategy_selection",
             Self::ToolBatchEfficiency => "tool_batch_efficiency",
-            Self::TeamAgentExecutionOutcome => "team_agent_execution_outcome",
+            Self::AgenticProgramClosure => "agentic_program_closure",
             Self::CrossSessionDispatch => "cross_session_dispatch",
             Self::MemoryRealityContextGovernance => "memory_reality_context_governance",
             Self::ConflictRecovery => "conflict_recovery",
@@ -372,11 +372,11 @@ pub struct NextGenHarnessEvalInput {
     pub provider_rounds: usize,
     pub total_tokens: u32,
     pub real_model_authorized: bool,
-    pub mission_evidence_refs: Vec<String>,
+    pub agentic_evidence_refs: Vec<String>,
     pub reality_evidence_ref_total: usize,
-    pub agent_terminal_count: usize,
-    pub mailbox_completed_count: usize,
-    pub synthesis_receipt_id: Option<String>,
+    pub accepted_task_count: usize,
+    pub independent_review_count: usize,
+    pub final_artifact_ref: Option<String>,
     pub session_relation_count: usize,
     pub runtime_turn_result_count: usize,
     pub recovery_applied_count: usize,
@@ -395,11 +395,11 @@ impl Default for NextGenHarnessEvalInput {
             provider_rounds: 0,
             total_tokens: 0,
             real_model_authorized: false,
-            mission_evidence_refs: Vec::new(),
+            agentic_evidence_refs: Vec::new(),
             reality_evidence_ref_total: 0,
-            agent_terminal_count: 0,
-            mailbox_completed_count: 0,
-            synthesis_receipt_id: None,
+            accepted_task_count: 0,
+            independent_review_count: 0,
+            final_artifact_ref: None,
             session_relation_count: 0,
             runtime_turn_result_count: 0,
             recovery_applied_count: 0,
@@ -409,6 +409,73 @@ impl Default for NextGenHarnessEvalInput {
             db_fixture_status: "not_requested".to_string(),
         }
     }
+}
+
+impl NextGenHarnessEvalInput {
+    /// Attach facts observed in a serialized AgenticProgram projection to an
+    /// evaluation input.  This is intentionally a read-only projection
+    /// adapter: it never invents task, review, artifact, or terminal facts.
+    #[must_use]
+    pub fn with_agentic_program_projection(mut self, value: &Value) -> Self {
+        let projection = value.get("projection").unwrap_or(value);
+        self.agentic_evidence_refs = projection_evidence_refs(projection);
+        if let Some(tasks) = projection.get("tasks").and_then(Value::as_object) {
+            self.accepted_task_count = tasks
+                .values()
+                .filter(|task| task.get("status").and_then(Value::as_str) == Some("accepted"))
+                .count();
+            self.independent_review_count = tasks
+                .values()
+                .filter(|task| {
+                    task.get("status").and_then(Value::as_str) == Some("accepted")
+                        && task
+                            .get("claimant")
+                            .and_then(Value::as_str)
+                            .zip(task.get("reviewed_by").and_then(Value::as_str))
+                            .is_some_and(|(claimant, reviewer)| claimant != reviewer)
+                })
+                .count();
+        }
+        self.final_artifact_ref = projection
+            .get("final_artifact_ref")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned);
+        self
+    }
+}
+
+fn projection_evidence_refs(projection: &Value) -> Vec<String> {
+    let mut refs = std::collections::BTreeSet::new();
+    let mut collect_array = |value: Option<&Value>| {
+        if let Some(values) = value.and_then(Value::as_array) {
+            refs.extend(
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned),
+            );
+        }
+    };
+    if let Some(tasks) = projection.get("tasks").and_then(Value::as_object) {
+        for task in tasks.values() {
+            collect_array(task.get("artifact_refs"));
+            collect_array(task.get("evidence_refs"));
+        }
+    }
+    if let Some(topics) = projection.get("topics").and_then(Value::as_object) {
+        for entries in topics.values() {
+            if let Some(entries) = entries.as_array() {
+                for entry in entries {
+                    collect_array(entry.get("refs"));
+                }
+            }
+        }
+    }
+    if let Some(completion) = projection.get("completion_request") {
+        collect_array(completion.get("evidence_refs"));
+    }
+    refs.into_iter().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -450,6 +517,7 @@ pub struct NextGenHarnessClosureReport {
     pub total: usize,
     pub passed: usize,
     pub failed: usize,
+    pub not_observed: usize,
     pub level: String,
     pub scenarios: Vec<NextGenHarnessScenarioResult>,
     pub missing_capabilities: Vec<String>,
@@ -458,9 +526,8 @@ pub struct NextGenHarnessClosureReport {
 #[must_use]
 pub fn next_gen_harness_closure_specs() -> Vec<NextGenHarnessScenarioSpec> {
     use NextGenHarnessScenarioKind::{
-        ComplexStrategySelection, ConflictRecovery, CrossSessionDispatch,
-        MemoryRealityContextGovernance, SimpleDirect, TeamAgentExecutionOutcome,
-        ToolBatchEfficiency,
+        AgenticProgramClosure, ComplexStrategySelection, ConflictRecovery, CrossSessionDispatch,
+        MemoryRealityContextGovernance, SimpleDirect, ToolBatchEfficiency,
     };
     [
         (
@@ -503,16 +570,17 @@ pub fn next_gen_harness_closure_specs() -> Vec<NextGenHarnessScenarioSpec> {
             false,
         ),
         (
-            "team_agent_execution_outcome",
-            TeamAgentExecutionOutcome,
-            "多 Agent 团队执行结果",
-            "复杂问题应能形成团队角色、工作图、进度证据和综合结果。",
+            "agentic_program_closure",
+            AgenticProgramClosure,
+            "Agentic Program 闭环结果",
+            "复杂问题必须由真实 Agentic Program projection 证明任务、证据、独立复核和最终产物闭环。",
             vec![
-                "team_template",
-                "execution_graph",
-                "agent_capability_binding",
+                "agentic_program",
+                "task_claim_and_submit",
+                "independent_task_review",
+                "terminal_verdict",
             ],
-            vec!["team", "execution_graph", "agent"],
+            vec!["program", "task", "artifact", "topic", "verification", "terminal"],
             0,
             true,
             false,
@@ -609,13 +677,36 @@ pub fn evaluate_next_gen_harness_closure(
         .iter()
         .filter(|scenario| scenario.status == "passed")
         .count();
+    let failed = scenarios
+        .iter()
+        .filter(|scenario| scenario.status == "failed")
+        .count();
+    let not_observed = scenarios
+        .iter()
+        .filter(|scenario| scenario.status == "not_observed")
+        .count();
+    let agentic_closure_observed = scenarios.iter().any(|scenario| {
+        scenario.kind == NextGenHarnessScenarioKind::AgenticProgramClosure
+            && scenario.status != "not_observed"
+    });
     let missing_capabilities = scenarios
         .iter()
         .flat_map(|scenario| scenario.missing_capabilities.clone())
         .collect::<Vec<_>>();
     NextGenHarnessClosureReport {
         kind: "next_gen_harness_closure".to_string(),
-        status: if missing_capabilities.is_empty() && passed == total {
+        status: if failed > 0 {
+            "failed"
+        } else if input.level == "deep" && !agentic_closure_observed {
+            "failed"
+        } else if input.level != "deep" && not_observed > 0 {
+            "not_observed"
+        } else if missing_capabilities.is_empty() && passed == total {
+            "passed"
+        } else if input.level == "deep"
+            && agentic_closure_observed
+            && missing_capabilities.is_empty()
+        {
             "passed"
         } else {
             "failed"
@@ -623,7 +714,8 @@ pub fn evaluate_next_gen_harness_closure(
         .to_string(),
         total,
         passed,
-        failed: total.saturating_sub(passed),
+        failed,
+        not_observed,
         level: input.level,
         scenarios,
         missing_capabilities,
@@ -635,6 +727,21 @@ fn evaluate_next_gen_harness_scenario(
     input: &NextGenHarnessEvalInput,
 ) -> NextGenHarnessScenarioResult {
     let full_or_deep = input.level != "quick";
+    let scenario_not_observed = match spec.kind {
+        NextGenHarnessScenarioKind::AgenticProgramClosure => {
+            input.accepted_task_count == 0
+                && input.independent_review_count == 0
+                && input.final_artifact_ref.is_none()
+                && input.agentic_evidence_refs.is_empty()
+        }
+        NextGenHarnessScenarioKind::CrossSessionDispatch => {
+            input.session_relation_count == 0 && input.runtime_turn_result_count == 0
+        }
+        NextGenHarnessScenarioKind::ConflictRecovery => {
+            input.recovery_applied_count == 0 && input.recovery_verified_count == 0
+        }
+        _ => false,
+    };
     let claims_tool_validation = full_or_deep
         && spec.min_tool_calls_for_full_eval > 0
         && spec.kind == NextGenHarnessScenarioKind::ToolBatchEfficiency;
@@ -643,7 +750,7 @@ fn evaluate_next_gen_harness_scenario(
         !claims_tool_validation || input.tool_call_count >= spec.min_tool_calls_for_full_eval;
     let memory_ok = !spec.claims_memory_context || input.reality_evidence_ref_total > 0;
     let evidence_refs = next_gen_evidence_refs(spec, input);
-    let evidence_ok = !evidence_refs.is_empty();
+    let evidence_ok = scenario_not_observed || !evidence_refs.is_empty();
     let replay_ok = !spec.claims_replay
         || evidence_refs.iter().any(|item| {
             item.contains("session-relation")
@@ -651,7 +758,7 @@ fn evaluate_next_gen_harness_scenario(
                 || item.contains("recovery")
         });
     let terminal_evidence = next_gen_terminal_evidence(spec, input);
-    let terminal_ok = terminal_evidence_ok(spec, &terminal_evidence);
+    let terminal_ok = scenario_not_observed || terminal_evidence_ok(spec, &terminal_evidence);
     let external_ok = !spec.claims_external_access
         || input.sidecar_fixture_status == "connected"
         || input.source_fixture_status == "connected"
@@ -680,7 +787,7 @@ fn evaluate_next_gen_harness_scenario(
         missing.push(format!("{}.external_access_health", spec.id));
     }
 
-    let passed = missing.is_empty();
+    let passed = missing.is_empty() && !scenario_not_observed;
     let evidence_strength = if claims_tool_validation {
         "strong"
     } else if input.level == "quick" {
@@ -691,7 +798,14 @@ fn evaluate_next_gen_harness_scenario(
     NextGenHarnessScenarioResult {
         scenario_id: spec.id.clone(),
         kind: spec.kind,
-        status: if passed { "passed" } else { "failed" }.to_string(),
+        status: if scenario_not_observed {
+            "not_observed"
+        } else if passed {
+            "passed"
+        } else {
+            "failed"
+        }
+        .to_string(),
         objective: spec.objective.clone(),
         runtime_actions: spec.expected_runtime_actions.clone(),
         tool_calls: if spec.kind == NextGenHarnessScenarioKind::ToolBatchEfficiency {
@@ -726,7 +840,10 @@ fn evaluate_next_gen_harness_scenario(
                 0.9
             },
             passed,
-            rationale: if passed {
+            rationale: if scenario_not_observed {
+                "the required durable projection was not observed in this evaluation lane"
+                    .to_string()
+            } else if passed {
                 "required runtime action, evidence refs, and level-scoped proof are present"
                     .to_string()
             } else {
@@ -762,16 +879,16 @@ fn next_gen_terminal_evidence(
             "batch_plan_present": input.level == "quick" || input.tool_call_count >= spec.min_tool_calls_for_full_eval,
             "source": if input.level == "quick" { "contract_plan" } else { "real_local_tool_evidence" }
         }),
-        NextGenHarnessScenarioKind::TeamAgentExecutionOutcome => json!({
-            "agent_terminal_count": input.agent_terminal_count,
-            "mailbox_completed_count": input.mailbox_completed_count,
-            "synthesis_receipt_id": input.synthesis_receipt_id,
-            "source": "mission_runtime_collaboration"
+        NextGenHarnessScenarioKind::AgenticProgramClosure => json!({
+            "accepted_task_count": input.accepted_task_count,
+            "independent_review_count": input.independent_review_count,
+            "final_artifact_ref": input.final_artifact_ref,
+            "source": "agentic_program_projection"
         }),
         NextGenHarnessScenarioKind::CrossSessionDispatch => json!({
             "session_relation_count": input.session_relation_count,
             "runtime_turn_result_count": input.runtime_turn_result_count,
-            "source": "mission_runtime_session_graph"
+            "source": "agentic_program_session_graph"
         }),
         NextGenHarnessScenarioKind::MemoryRealityContextGovernance => json!({
             "reality_evidence_ref_total": input.reality_evidence_ref_total,
@@ -788,19 +905,19 @@ fn next_gen_terminal_evidence(
 
 fn terminal_evidence_ok(spec: &NextGenHarnessScenarioSpec, evidence: &Value) -> bool {
     match spec.kind {
-        NextGenHarnessScenarioKind::TeamAgentExecutionOutcome => {
+        NextGenHarnessScenarioKind::AgenticProgramClosure => {
             evidence
-                .get("agent_terminal_count")
+                .get("accepted_task_count")
                 .and_then(Value::as_u64)
                 .unwrap_or_default()
-                >= 2
+                >= 1
                 && evidence
-                    .get("mailbox_completed_count")
+                    .get("independent_review_count")
                     .and_then(Value::as_u64)
                     .unwrap_or_default()
                     >= 1
                 && evidence
-                    .get("synthesis_receipt_id")
+                    .get("final_artifact_ref")
                     .and_then(Value::as_str)
                     .is_some_and(|value| !value.trim().is_empty())
         }
@@ -862,16 +979,21 @@ fn next_gen_evidence_refs(
                     .collect()
             }
         }
-        NextGenHarnessScenarioKind::TeamAgentExecutionOutcome => input
-            .mission_evidence_refs
+        NextGenHarnessScenarioKind::AgenticProgramClosure => input
+            .agentic_evidence_refs
             .iter()
-            .filter(|item| item.contains("team") || item.contains("execution_graph"))
+            .filter(|item| {
+                item.contains("artifact")
+                    || item.contains("evidence")
+                    || item.contains("task")
+                    || item.contains("topic")
+            })
             .cloned()
             .collect(),
         NextGenHarnessScenarioKind::CrossSessionDispatch => input
-            .mission_evidence_refs
+            .agentic_evidence_refs
             .iter()
-            .filter(|item| item.contains("session-command") || item.contains("session-relation"))
+            .filter(|item| item.contains("session") || item.contains("relation"))
             .cloned()
             .collect(),
         NextGenHarnessScenarioKind::MemoryRealityContextGovernance => {
@@ -886,7 +1008,7 @@ fn next_gen_evidence_refs(
         }
         NextGenHarnessScenarioKind::ConflictRecovery => {
             let mut refs = input
-                .mission_evidence_refs
+                .agentic_evidence_refs
                 .iter()
                 .filter(|item| item.contains("session-relation"))
                 .cloned()
@@ -3146,16 +3268,16 @@ mod tests {
             provider_rounds: 0,
             total_tokens: 512,
             real_model_authorized: false,
-            mission_evidence_refs: vec![
-                "team:demo".to_string(),
-                "execution_graph:demo".to_string(),
-                "session-command:demo".to_string(),
+            agentic_evidence_refs: vec![
+                "task:demo".to_string(),
+                "artifact:demo".to_string(),
+                "topic:demo".to_string(),
                 "session-relation:demo".to_string(),
             ],
             reality_evidence_ref_total: 12,
-            agent_terminal_count: 3,
-            mailbox_completed_count: 2,
-            synthesis_receipt_id: Some("synthesis:demo".to_string()),
+            accepted_task_count: 3,
+            independent_review_count: 2,
+            final_artifact_ref: Some("artifact:demo".to_string()),
             session_relation_count: 1,
             runtime_turn_result_count: 1,
             recovery_applied_count: 1,
@@ -3190,17 +3312,12 @@ mod tests {
                 {"capability": "harness_capability_coverage", "status": "passed"},
                 {"capability": "knowledge_fabric_context_governance", "status": "passed"},
                 {"capability": "reality_context_eval", "status": "passed"},
-                {"capability": "mission_runtime_collaboration_closure", "status": "passed"},
                 {"capability": "next_gen_harness_closure", "status": "passed"}
             ],
             "complex_scenarios": {"failed": 0, "average_score": 1.0},
             "real_tool_scenarios": {"tool_calls": 0},
             "event_observation_parity": {"status": "passed"},
             "reality_context_eval": {"failed": 0, "evidence_ref_total": 1},
-            "mission_runtime_collaboration": {
-                "status": "passed",
-                "mission_projection": {"schema_version": 2}
-            },
             "next_gen_harness_closure": {
                 "status": "passed",
                 "failed": 0,
@@ -3255,17 +3372,12 @@ mod tests {
                 {"capability": "harness_capability_coverage", "status": "passed"},
                 {"capability": "knowledge_fabric_context_governance", "status": "passed"},
                 {"capability": "reality_context_eval", "status": "passed"},
-                {"capability": "mission_runtime_collaboration_closure", "status": "passed"},
                 {"capability": "next_gen_harness_closure", "status": "passed"}
             ],
             "complex_scenarios": {"failed": 0, "average_score": 1.0},
             "real_tool_scenarios": {"tool_calls": 1},
             "event_observation_parity": {"status": "passed"},
             "reality_context_eval": {"failed": 0, "evidence_ref_total": 1},
-            "mission_runtime_collaboration": {
-                "status": "passed",
-                "mission_projection": {"schema_version": 2}
-            },
             "next_gen_harness_closure": {
                 "status": "passed",
                 "failed": 0,

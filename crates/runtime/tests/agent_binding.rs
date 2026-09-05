@@ -4,7 +4,6 @@ use harness_contract::agent::{
     AgentCapability, AgentDefinitionId, AgentTaskIntent, DefinitionScope, RevisionSelector,
 };
 use harness_contract::context::ChildExecutionBudgetReservation;
-use harness_contract::team::TeamRoleIdentity;
 use runtime::{AgentBindingRequest, RuntimeServices};
 
 #[test]
@@ -17,13 +16,11 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
         "session:binding-test",
         "task:binding-test",
     );
-    request.role_slot_id = Some("researcher:1".to_string());
     request.team_id = Some("team:binding-test".to_string());
     request.granted_capabilities = vec![AgentCapability::Read, AgentCapability::Search];
     request.fact_boundaries = vec!["observed".to_string()];
     request.fact_refs = vec!["fact:shipment-delay".to_string()];
     request.matrix_snapshot_refs = vec!["matrix:source_snapshot:orders-v7".to_string()];
-    request.team_working_state_visible = true;
 
     let compiled = services
         .compile_agent_binding(request)
@@ -34,10 +31,7 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
         "builtin/cowd/explore"
     );
     assert_eq!(snapshot.instance.instance_id, "instance:binding-test");
-    assert_eq!(
-        snapshot.instance.role_slot_id.as_deref(),
-        Some("researcher:1")
-    );
+    assert!(snapshot.instance.role_slot_id.is_none());
     assert_eq!(snapshot.data_lease.fact_refs, vec!["fact:shipment-delay"]);
     assert_eq!(
         snapshot.data_lease.matrix_snapshot_refs,
@@ -65,17 +59,6 @@ fn binding_compiler_intersects_capabilities_and_freezes_data_leases_into_a_snaps
                 session_id: "session:binding-test".to_string(),
                 mission_id: "mission:binding-test".to_string(),
                 team_id: Some("team:binding-test".to_string()),
-                team_role_identity: Some(TeamRoleIdentity {
-                    role_id: "researcher".to_string(),
-                    slot: 1,
-                    focus_id: "focus:shipment-delay".to_string(),
-                    focus_boundary: "leased shipment-delay facts".to_string(),
-                    evidence_responsibility: "collect bounded evidence".to_string(),
-                    focus_scope_hash: "scope:shipment-delay".to_string(),
-                    overlap_budget_bp: 0,
-                    novelty_target_bp: 10_000,
-                    output_acceptance: vec!["evidence".to_string()],
-                }),
                 graph_id: "graph:binding-test".to_string(),
                 node_id: "node:binding-test".to_string(),
                 attempt: 1,

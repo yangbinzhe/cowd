@@ -2,18 +2,6 @@ use std::collections::BTreeSet;
 
 use super::*;
 
-#[test]
-fn managed_escalation_recovery_input_contains_only_semantic_delta() {
-    let input = managed_escalation_recovery_input(&test_agent_packet(Vec::new()));
-    let value: serde_json::Value = serde_json::from_str(&input).expect("recovery input");
-    assert!(value.get("base_revision").is_none());
-    assert!(value.get("digest").is_none());
-    assert!(value.get("reason").is_some());
-    assert!(value
-        .pointer("/requested_add_team/semantic_node_id")
-        .is_some());
-    assert!(value.pointer("/requested_add_team/objective").is_some());
-}
 use harness_contract::agent::AgentCommand;
 use harness_contract::turn::TurnId;
 use sha2::{Digest, Sha256};
@@ -129,8 +117,6 @@ fn test_agent_packet(
         output_acceptance: Vec::new(),
         requires_managed_collaboration_escalation: false,
         acceptance: Vec::new(),
-        team_role_identity: None,
-        team_role: None,
         cohort_prompt_package: None,
         constraints: Vec::new(),
         context_refs: Vec::new(),
@@ -475,18 +461,18 @@ fn upstream_change_receipt_uses_the_final_digest_after_repeated_writes() {
 
 #[test]
 fn explicit_empty_risk_list_is_a_materialized_review_result() {
-    use harness_contract::team::TeamStructuredOutputField;
+    use harness_contract::agent::StructuredOutputField;
 
     assert!(structured_field_materialized(
-        TeamStructuredOutputField::Risks,
+        StructuredOutputField::Risks,
         Some(&serde_json::json!([])),
     ));
     assert!(!structured_field_materialized(
-        TeamStructuredOutputField::Risks,
+        StructuredOutputField::Risks,
         None,
     ));
     assert!(!structured_field_materialized(
-        TeamStructuredOutputField::Review,
+        StructuredOutputField::Review,
         Some(&serde_json::json!([])),
     ));
 }
@@ -707,126 +693,6 @@ async fn delegated_leaf_effects_serialize_conflicts_and_parallelize_unrelated_pa
     assert_eq!(host.max_active.load(Ordering::SeqCst), 2);
 }
 
-struct ManagedEscalationRecoveryHost {
-    received_bound_recovery: std::sync::atomic::AtomicBool,
-}
-
-#[async_trait::async_trait]
-impl crate::RuntimeExecutionHost for ManagedEscalationRecoveryHost {
-    async fn execute_runtime_tool(
-        &self,
-        request: &crate::RuntimeToolExecutionRequest,
-    ) -> crate::RuntimeToolExecutionOutcome {
-        let accepted = request.tool_name == "request_collaboration_escalation"
-            && request.authorization.is_none()
-            && request
-                .parent_execution
-                .as_ref()
-                .is_some_and(|parent| parent.execution_id == "graph" && parent.node_id == "node")
-            && request.parent_execution_attempt == Some(1)
-            && request.managed_invocation.is_none();
-        self.received_bound_recovery
-            .store(accepted, Ordering::SeqCst);
-        crate::RuntimeToolExecutionOutcome {
-            tool_use_id: request.tool_use_id.clone(),
-            tool_name: request.tool_name.clone(),
-            status: if accepted {
-                crate::RuntimeToolExecutionStatus::Executed
-            } else {
-                crate::RuntimeToolExecutionStatus::BlockedPermission
-            },
-            category: request.category,
-            output: accepted.then(|| "escalation accepted".to_string()),
-            error: (!accepted).then(|| "invalid escalation recovery request".to_string()),
-            evidence_ref: format!("agent-tool:{}", request.tool_use_id),
-            observed_evidence: Vec::new(),
-        }
-    }
-
-    fn delegated_tool_effect_descriptor(
-        &self,
-        tool_name: &str,
-        input: &serde_json::Value,
-    ) -> Option<harness_contract::tool::ToolEffectDescriptor> {
-        test_tool_descriptor_for_input(tool_name, input)
-    }
-}
-
-#[tokio::test]
-async fn managed_escalation_recovery_is_bound_and_durably_receipted() {
-    let root = tempfile::tempdir().expect("workspace");
-    std::fs::create_dir_all(root.path().join("crates/runtime/src")).expect("source scope");
-    std::fs::write(
-        root.path().join("crates/runtime/src/lib.rs"),
-        "source evidence",
-    )
-    .expect("source file");
-    let resolver = Arc::new(
-        crate::path_identity::WorkspacePathIdentityResolver::discover(root.path())
-            .expect("path identities"),
-    );
-    let source_evidence = resolver
-        .observe_tool_scope(
-            "read_file",
-            "read:crates/runtime/src/lib.rs",
-            Some("sha256:source-evidence"),
-            1,
-        )
-        .expect("source evidence receipt");
-    let host = Arc::new(ManagedEscalationRecoveryHost {
-        received_bound_recovery: std::sync::atomic::AtomicBool::new(false),
-    });
-    let executor = ScopedRuntimeToolExecutor {
-        host: host.clone(),
-        allowed_tools: BTreeSet::from(["request_collaboration_escalation".to_string()]),
-        session_id: "session".to_string(),
-        sandbox_posture: harness_contract::policy::SandboxPosture::ReadOnlySandbox,
-        policy_revision: 1,
-        memory_context: memory::MemoryTurnContext::new("session", "agent"),
-        model_lease: "model".to_string(),
-        execution_id: "graph".to_string(),
-        node_id: "node".to_string(),
-        attempt: 1,
-        workspace_root: root.path().to_path_buf(),
-        path_identity_resolver: resolver,
-        scope_locks: Arc::new(ScopeLockManager::new()),
-        commit_service: None,
-        resource_scopes: Some(vec!["read:crates/runtime".to_string()]),
-        managed_invocation: None,
-        next_receipt_sequence: AtomicU64::new(1),
-        receipts: Mutex::new(vec![ScopedToolExecutionReceipt {
-            sequence: 1,
-            provider_invocation_id: None,
-            tool_name: "read_file".to_string(),
-            effect_kind: harness_contract::tool::ToolEffectKind::Read,
-            resource_scopes: vec!["read:crates/runtime/src/lib.rs".to_string()],
-            paths: vec!["crates/runtime/src/lib.rs".to_string()],
-            prior_states: BTreeMap::new(),
-            after_digests: BTreeMap::new(),
-            observed_bytes: BTreeMap::new(),
-            observed_evidence: vec![source_evidence],
-        }]),
-        provider_model_obligations: Vec::new(),
-    };
-
-    executor
-            .execute_managed_escalation_recovery(
-                r#"{"reason":"need a second team","requested_add_team":{"semantic_node_id":"follow-up","objective":"verify"}}"#,
-            )
-            .await
-            .expect("Runtime-owned recovery succeeds");
-
-    assert!(host.received_bound_recovery.load(Ordering::SeqCst));
-    let receipts = executor
-        .receipts
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert!(receipts.iter().any(|receipt| {
-        receipt.tool_name == "request_collaboration_escalation"
-            && receipt.resource_scopes == ["runtime:collaboration_escalation"]
-    }));
-}
-
 struct InputSensitiveRuntimeExecutionHost;
 
 impl InputSensitiveRuntimeExecutionHost {
@@ -927,7 +793,7 @@ fn test_tool_descriptor_for_input(
             ToolPermissionMode::ReadOnly,
             PermissionResource::File,
         ),
-        "request_collaboration_escalation" => (
+        "team_create" => (
             ToolEffectKind::Read,
             PermissionOperation::Read,
             ToolPermissionMode::ReadOnly,
@@ -1104,20 +970,20 @@ fn network_evidence_scope_preserves_its_resource_kind() {
 fn acceptance_contract_projects_materialized_output_fields_to_the_host() {
     let mut packet = test_agent_packet(Vec::new());
     packet.output_acceptance = vec![
-        harness_contract::team::TeamAcceptanceRequirement {
+        harness_contract::agent::OutputAcceptanceRequirement {
             criterion: "evidence".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+            check: harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence {
                 scopes: vec!["read:fixtures/target.txt".to_string()],
             },
         },
-        harness_contract::team::TeamAcceptanceRequirement {
+        harness_contract::agent::OutputAcceptanceRequirement {
             criterion: "review".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::UpstreamReview,
+            check: harness_contract::agent::OutputAcceptanceCheck::UpstreamReview,
         },
-        harness_contract::team::TeamAcceptanceRequirement {
+        harness_contract::agent::OutputAcceptanceRequirement {
             criterion: "risks".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::StructuredField {
-                field: harness_contract::team::TeamStructuredOutputField::Risks,
+            check: harness_contract::agent::OutputAcceptanceCheck::StructuredField {
+                field: harness_contract::agent::StructuredOutputField::Risks,
             },
         },
     ];
@@ -1394,7 +1260,6 @@ fn sandboxed_process_requires_and_accepts_only_a_whole_workspace_read_lease() {
 
     let whole_workspace = build(vec!["read:.".to_string()]);
     assert!(whole_workspace.owns_durable_tool_effect("execute_code"));
-    assert!(!whole_workspace.owns_durable_tool_effect("team_board"));
     whole_workspace
         .enforce_resource_ceiling("execute_code", input)
         .expect("whole-workspace read lease admits the read-only sandbox");
@@ -1996,11 +1861,11 @@ fn declared_custom_artifact_accepts_exact_json_or_markdown_only() {
 
 #[test]
 fn verified_narrative_terminal_accepts_prose_without_accepting_tool_markup() {
-    use harness_contract::team::TeamStructuredOutputField;
+    use harness_contract::agent::StructuredOutputField;
 
     let prose = normalized_narrative_terminal_body(
         "Cargo.toml declares the workspace package metadata.",
-        &[TeamStructuredOutputField::Findings],
+        &[StructuredOutputField::Findings],
     )
     .expect("verified bounded prose should be a findings carrier");
     assert_eq!(
@@ -2011,8 +1876,8 @@ fn verified_narrative_terminal_accepts_prose_without_accepting_tool_markup() {
         normalized_narrative_terminal_body(
             "Both researchers confirmed the workspace metadata.",
             &[
-                TeamStructuredOutputField::Summary,
-                TeamStructuredOutputField::Unresolved,
+                StructuredOutputField::Summary,
+                StructuredOutputField::Unresolved,
             ],
         )
         .is_none(),
@@ -2021,8 +1886,8 @@ fn verified_narrative_terminal_accepts_prose_without_accepting_tool_markup() {
     let mixed_contract = normalized_narrative_terminal_body(
         "Terminal review completed from three fresh source receipts.\n\n{\"unresolved\":[]}",
         &[
-            TeamStructuredOutputField::Review,
-            TeamStructuredOutputField::Unresolved,
+            StructuredOutputField::Review,
+            StructuredOutputField::Unresolved,
         ],
     )
     .expect("an explicit unresolved declaration may coexist with a Runtime-normalized review");
@@ -2030,7 +1895,7 @@ fn verified_narrative_terminal_accepts_prose_without_accepting_tool_markup() {
         serde_json::from_str::<serde_json::Value>(&mixed_contract).expect("normalized JSON");
     assert_eq!(mixed_output["unresolved"], serde_json::json!([]));
     assert!(structured_field_materialized(
-        TeamStructuredOutputField::Unresolved,
+        StructuredOutputField::Unresolved,
         mixed_output.get("unresolved"),
     ));
     assert!(mixed_output["review"]
@@ -2038,32 +1903,31 @@ fn verified_narrative_terminal_accepts_prose_without_accepting_tool_markup() {
         .is_some_and(|review| review.contains("Terminal review completed")));
     assert!(normalized_narrative_terminal_body(
         "<synthesized_terminal evidence_committed=1 />",
-        &[TeamStructuredOutputField::Findings],
+        &[StructuredOutputField::Findings],
     )
     .is_none());
     assert!(normalized_narrative_terminal_body(
         "<tool_call>read_file</tool_call>",
-        &[TeamStructuredOutputField::Findings],
+        &[StructuredOutputField::Findings],
     )
     .is_none());
     assert!(
-        normalized_narrative_terminal_body("reviewed", &[TeamStructuredOutputField::Review],)
-            .is_some(),
+        normalized_narrative_terminal_body("reviewed", &[StructuredOutputField::Review],).is_some(),
         "a verified review may use ordinary terminal prose"
     );
 }
 
 #[test]
 fn verified_narrative_terminal_accepts_technical_prose_but_not_risk_declarations() {
-    use harness_contract::team::TeamStructuredOutputField;
+    use harness_contract::agent::StructuredOutputField;
 
     let prose = "Updated the parser and verified the changed file with a fresh read.";
     let normalized = normalized_narrative_terminal_body(
         prose,
         &[
-            TeamStructuredOutputField::Implementation,
-            TeamStructuredOutputField::SourceVerification,
-            TeamStructuredOutputField::Review,
+            StructuredOutputField::Implementation,
+            StructuredOutputField::SourceVerification,
+            StructuredOutputField::Review,
         ],
     )
     .expect("receipt-verified technical prose should not require JSON syntax");
@@ -2073,11 +1937,11 @@ fn verified_narrative_terminal_accepts_technical_prose_but_not_risk_declarations
     assert_eq!(output["review"], prose);
 
     assert!(
-        normalized_narrative_terminal_body(prose, &[TeamStructuredOutputField::Risks],).is_none(),
+        normalized_narrative_terminal_body(prose, &[StructuredOutputField::Risks],).is_none(),
         "Runtime must not infer that risks were considered"
     );
     assert!(
-        normalized_narrative_terminal_body(prose, &[TeamStructuredOutputField::UnresolvedOrRisks],)
+        normalized_narrative_terminal_body(prose, &[StructuredOutputField::UnresolvedOrRisks],)
             .is_none(),
         "Runtime must not infer unresolved work from generic prose"
     );
@@ -2172,8 +2036,6 @@ fn durable_audits_are_promoted_to_agent_evidence_refs() {
         output_acceptance: Vec::new(),
         requires_managed_collaboration_escalation: false,
         acceptance: Vec::new(),
-        team_role_identity: None,
-        team_role: None,
         cohort_prompt_package: None,
         constraints: Vec::new(),
         context_refs: Vec::new(),
@@ -2503,8 +2365,6 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
         output_acceptance: Vec::new(),
         requires_managed_collaboration_escalation: false,
         acceptance: Vec::new(),
-        team_role_identity: None,
-        team_role: None,
         cohort_prompt_package: None,
         constraints: Vec::new(),
         context_refs: Vec::new(),
@@ -2554,10 +2414,10 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
     assert!(scoped_prompt.contains("never bare Cargo.toml"));
 
     packet.objective = "update fixtures/target.txt".into();
-    packet.output_acceptance = vec![harness_contract::team::TeamAcceptanceRequirement {
+    packet.output_acceptance = vec![harness_contract::agent::OutputAcceptanceRequirement {
         criterion: "implementation".to_string(),
-        check: harness_contract::team::TeamAcceptanceCheck::WorkspaceChange {
-            field: harness_contract::team::TeamStructuredOutputField::Implementation,
+        check: harness_contract::agent::OutputAcceptanceCheck::WorkspaceChange {
+            field: harness_contract::agent::StructuredOutputField::Implementation,
             scopes: vec!["write:fixtures/target.txt".to_string()],
         },
     }];
@@ -2572,36 +2432,6 @@ fn delegated_prompt_rejects_simulated_tool_markup() {
     assert!(mutation_prompt.contains("Repeated reads"));
     assert!(mutation_prompt.contains("Native structured output"));
     assert!(!mutation_prompt.contains("Return exactly one JSON object"));
-}
-
-#[test]
-fn team_markdown_fragment_cache_is_digest_bound_and_counts_metrics() {
-    let worker = InProcessAgentWorker::new(std::sync::Weak::new());
-    let first = worker.cached_team_markdown_fragment("team-a", "# Team\n\nReview.");
-    assert!(first[0].contains("binding digest team-a"));
-    assert_eq!(worker.team_prompt_cache_stats().0, 0);
-    assert_eq!(worker.team_prompt_cache_stats().1, 1);
-    assert!(
-        worker.team_prompt_cache_stats().2 > 0,
-        "token increment is recorded"
-    );
-
-    let second = worker.cached_team_markdown_fragment("team-a", "# Team\n\nReview.");
-    assert_eq!(first, second);
-    assert_eq!(
-        worker.team_prompt_cache_stats().0,
-        1,
-        "same Team binding and instructions are a cache hit"
-    );
-    assert_eq!(worker.team_prompt_cache_stats().1, 1);
-
-    worker.cached_team_markdown_fragment("team-b", "# Team\n\nReview.");
-    worker.cached_team_markdown_fragment("team-a", "# Team\n\nChanged.");
-    assert_eq!(
-        worker.team_prompt_cache_stats().1,
-        3,
-        "Team binding or normalized instruction changes rebuild; Agent binding does not split reuse"
-    );
 }
 
 #[test]
@@ -2654,7 +2484,7 @@ fn recovered_receipt_context_is_bounded_and_explicitly_fences_tools() {
         },
     };
 
-    let prompt = recovered_agent_tool_receipt_prompt(&[receipt]).expect("recovery prompt");
+    let prompt = recovered_agent_tool_receipt_prompt(&[receipt], false).expect("recovery prompt");
     assert!(prompt.contains("committed output"));
     assert!(prompt.contains("Do not call tools"));
     assert!(prompt.contains("ToolHost receipts"));
@@ -2665,8 +2495,8 @@ fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
     let mut packet = test_agent_packet(Vec::new());
     packet.allowed_tools = vec![
         "tool_search".to_string(),
-        "collaboration_control".to_string(),
-        "team_board".to_string(),
+        "task_claim".to_string(),
+        "message_publish".to_string(),
         "read_file".to_string(),
         "write_file".to_string(),
     ];
@@ -2674,14 +2504,14 @@ fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
     assert!(autonomy_checkpoint_tool_plan(&packet, false, false).is_empty());
     assert_eq!(
         autonomy_checkpoint_tool_plan(&packet, true, false),
-        vec!["collaboration_control".to_string()]
+        vec!["task_claim".to_string(), "message_publish".to_string()]
     );
     let execution = autonomy_checkpoint_tool_plan(&packet, true, true);
     assert_eq!(
         execution,
         vec![
-            "collaboration_control".to_string(),
-            "team_board".to_string(),
+            "task_claim".to_string(),
+            "message_publish".to_string(),
             "read_file".to_string(),
             "write_file".to_string(),
         ]
@@ -2690,9 +2520,21 @@ fn autonomous_checkpoint_tool_overlay_is_minimal_and_action_specific() {
 }
 
 #[test]
+fn generic_team_packet_has_no_retired_graph_work_market_checkpoint() {
+    let services = RuntimeServices::in_memory().expect("runtime");
+    let packet = test_agent_packet(Vec::new());
+    assert!(
+        agent_autonomy_checkpoint(&services, &packet)
+            .expect("generic packet is not an Agent-first protocol error")
+            .is_none(),
+        "generic ExecutionGraph/Team packets must not revive a second task ownership plane"
+    );
+}
+
+#[test]
 fn autonomous_checkpoint_progress_digest_ignores_projection_revision_only() {
-    let first = "Runtime safe checkpoint committed.\n\n{\"kind\":\"runtime_agent_autonomy_checkpoint\",\"graph_revision\":7,\"required_actions\":[{\"action\":\"claim\",\"work_revision\":3}],\"unread_team_entries\":[]}";
-    let second = first.replace("\"graph_revision\":7", "\"graph_revision\":42");
+    let first = "Runtime safe checkpoint committed.\n\n{\"kind\":\"runtime_agent_autonomy_checkpoint\",\"program_revision\":7,\"required_actions\":[{\"action\":\"decide_claim_or_decline\",\"task_ref\":\"task:1\"}],\"unread_agentic_topic_entries\":[]}";
+    let second = first.replace("\"program_revision\":7", "\"program_revision\":42");
     assert_eq!(
         autonomy_checkpoint_progress_digest(first),
         autonomy_checkpoint_progress_digest(&second),

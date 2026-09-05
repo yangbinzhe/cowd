@@ -88,7 +88,6 @@ impl AgentRunEvaluation {
             "fact_boundaries": binding.data_lease.fact_boundaries,
             "fact_refs": binding.data_lease.fact_refs,
             "matrix_snapshot_refs": binding.data_lease.matrix_snapshot_refs,
-            "team_working_state_visible": binding.data_lease.team_working_state_visible,
         }));
         let environment_fingerprint = digest_json(&serde_json::json!({
             "provider": returned.provider,
@@ -190,9 +189,9 @@ pub(crate) fn required_acceptance_for_packet(
     // different evaluator after restart or after a template edit.
     let requirements = packet.output_acceptance.clone();
     for requirement in requirements {
-        use harness_contract::team::TeamAcceptanceCheck;
+        use harness_contract::agent::OutputAcceptanceCheck;
         match requirement.check {
-            TeamAcceptanceCheck::ScopedEvidence { scopes: required } => {
+            OutputAcceptanceCheck::ScopedEvidence { scopes: required } => {
                 scopes.extend(required.into_iter().map(|scope| {
                     if scope == "network:*" || scope.contains(':') {
                         scope
@@ -201,7 +200,7 @@ pub(crate) fn required_acceptance_for_packet(
                     }
                 }))
             }
-            TeamAcceptanceCheck::WorkspaceChange {
+            OutputAcceptanceCheck::WorkspaceChange {
                 scopes: required, ..
             } => scopes.extend(required.into_iter().map(|scope| {
                 if scope.contains(':') {
@@ -210,17 +209,17 @@ pub(crate) fn required_acceptance_for_packet(
                     format!("write:{scope}")
                 }
             })),
-            TeamAcceptanceCheck::SourceVerification { scopes: required } => {
+            OutputAcceptanceCheck::SourceVerification { scopes: required } => {
                 for scope in required {
                     let path = scope.strip_prefix("write:").unwrap_or(&scope).to_string();
                     scopes.push(format!("write:{path}"));
                     scopes.push(format!("verify_after_write:{path}"));
                 }
             }
-            TeamAcceptanceCheck::UpstreamReview => {}
-            TeamAcceptanceCheck::StructuredField { .. }
-            | TeamAcceptanceCheck::StructuredArtifact { .. }
-            | TeamAcceptanceCheck::UpstreamEvidence => {}
+            OutputAcceptanceCheck::UpstreamReview => {}
+            OutputAcceptanceCheck::StructuredField { .. }
+            | OutputAcceptanceCheck::StructuredArtifact { .. }
+            | OutputAcceptanceCheck::UpstreamEvidence => {}
         }
     }
     scopes.sort();

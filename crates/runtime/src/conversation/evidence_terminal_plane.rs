@@ -218,6 +218,9 @@ where
                 ctx.agent_id.clone(),
                 source_range,
             )
+            .map_err(|error| {
+                RuntimeError::new(format!("semantic checkpoint context is invalid: {error}"))
+            })?
             .with_checkpoint_id(checkpoint_id)
             .with_execution_identity(execution_identity)
             .with_project_id(ctx.project_id.clone())
@@ -1284,8 +1287,8 @@ where
             self.session_id().to_string(),
             turn_ref,
         );
-        // Capability discovery and the later `runtime_orchestrate` proposal
-        // may be separate provider/tool batches. Bind the just-admitted
+        // Capability discovery and later Agent Actions may span provider/tool
+        // batches. Bind the just-admitted
         // decision before either one can run so both observe the same
         // turn-owned lease. The executor is a transport cache only: the
         // ConversationRuntime remains the sole decision owner.
@@ -1303,45 +1306,6 @@ where
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
-    }
-
-    /// Pin an explicit root collaboration contract to the admitted turn
-    /// before exposing the model control plane. This intentionally fixes a
-    /// runtime invariant rather than deriving any Team topology: the model
-    /// still owns the typed proposal and the durable receipt remains required
-    /// before a Program can materialize.
-    pub(crate) fn require_active_turn_collaboration_control_plane(
-        &self,
-        required_team_count: u8,
-    ) -> Result<crate::execution_core::RuntimeExecutionDecision, RuntimeError> {
-        if required_team_count == 0 {
-            return Err(RuntimeError::new(
-                "root collaboration control plane requires at least one Team",
-            ));
-        }
-        let frozen_required_team_count = self
-            .active_turn_strategy()
-            .and_then(|state| state.decision.collaboration_obligation)
-            .map(|obligation| obligation.required_team_count())
-            .ok_or_else(|| {
-                RuntimeError::new(
-                    "root collaboration control plane requires a frozen execution obligation",
-                )
-            })?;
-        if frozen_required_team_count != required_team_count {
-            return Err(RuntimeError::new(format!(
-                "root collaboration cardinality diverged from frozen obligation: expected {frozen_required_team_count}, observed {required_team_count}"
-            )));
-        }
-        let decision = self.revise_active_turn_strategy(
-            harness_contract::strategy::ExecutionCandidateKind::Team,
-            harness_contract::core::ExecutionPattern::Collaborate,
-            crate::execution_core::TurnStrategyDecisionStatus::Running,
-            "explicit root collaboration contract pinned the turn strategy lease before model control-plane exposure",
-            Some("runtime.strategy.selected"),
-        )?;
-        self.tool_executor.bind_execution_decision(decision.clone());
-        Ok(decision)
     }
 
     pub(crate) fn bind_turn_strategy_execution(
@@ -1374,7 +1338,6 @@ where
                 if recovered.collaboration_obligation.is_some() {
                     state.decision.collaboration_obligation = recovered.collaboration_obligation;
                 }
-                state.focus_partition_plans = recovered.focus_partition_plans;
                 state.decision.decision_id = recovered.decision_id;
                 state.decision.decision_revision = recovered.revision;
                 state.decision.lease.lease_id = recovered.decision_lease;
@@ -1516,11 +1479,6 @@ where
                         .and_then(|obligation: harness_contract::strategy::CollaborationExecutionObligation| {
                             obligation.validate().ok().map(|()| obligation)
                         }),
-                    focus_partition_plans: payload
-                        .get("evidence_scopes")
-                        .cloned()
-                        .and_then(|value| serde_json::from_value(value).ok())
-                        .unwrap_or_default(),
                     pattern,
                 })
             })
@@ -1649,12 +1607,12 @@ where
             .active_turn_strategy()
             .map(|state| state.decision)
             .ok_or_else(|| RuntimeError::new("tool batch has no admitted turn strategy"))?;
-        let requests_team = calls.iter().any(is_runtime_team_orchestration_call);
+        let requests_team = calls.iter().any(is_agent_collaboration_action);
         let has_network = plan.tasks.iter().any(|task| {
             task.safety_category == crate::tool_orchestrator::ToolSafetyCategory::Network
         });
         let has_mutation = plan.tasks.iter().any(|task| {
-            !is_runtime_team_orchestration_call_name(&task.tool_name)
+            !is_agent_collaboration_action_name(&task.tool_name)
                 && matches!(
                     task.safety_category,
                     crate::tool_orchestrator::ToolSafetyCategory::WriteLocal
@@ -1761,9 +1719,8 @@ where
         Ok(())
     }
 
-    pub(crate) fn set_turn_strategy_focus_partitions(
+    pub(crate) fn set_turn_strategy_collaboration_obligation(
         &self,
-        plans: Vec<harness_contract::team::FocusPartitionPlan>,
         automatic_minimum_team_count: u8,
     ) -> Result<crate::execution_core::TurnStrategyDecisionState, RuntimeError> {
         let (updated, previous, already_bound) = {
@@ -1775,23 +1732,17 @@ where
                 .as_mut()
                 .ok_or_else(|| RuntimeError::new("focus partitions have no turn strategy owner"))?;
             let previous = state.clone();
-            let focus_ids = plans
-                .iter()
-                .flat_map(|plan| plan.slots.iter())
-                .map(|slot| slot.focus_id.clone())
-                .collect::<Vec<_>>();
             let obligation = (state.selected_candidate
                 == harness_contract::strategy::ExecutionCandidateKind::Team)
                 .then(|| {
                     harness_contract::strategy::CollaborationExecutionObligation::for_selected_team(
                         &state.decision.strategy.understanding,
                         automatic_minimum_team_count,
-                        focus_ids,
+                        Vec::new(),
                     )
                     .map_err(RuntimeError::new)
                 })
                 .transpose()?;
-            state.focus_partition_plans = plans;
             state.decision.collaboration_obligation = obligation;
             (state.clone(), previous, state.execution_graph_ref.is_some())
         };
@@ -1801,7 +1752,7 @@ where
             if let Err(error) = self.append_turn_strategy_event(
                 "runtime.strategy.selected",
                 &updated,
-                "focus partitions and collaboration execution obligation frozen",
+                "collaboration execution obligation frozen",
             ) {
                 *self
                     .active_turn_strategy
@@ -1983,7 +1934,6 @@ where
                 "reason": reason,
                 "collaboration_receipt": state.collaboration_receipt,
                 "collaboration_obligation": state.decision.collaboration_obligation,
-                "evidence_scopes": state.focus_partition_plans,
                 "outcome": state.outcome,
                 "provider_selection": self.provider_selection_receipt
                     .lock()
@@ -2157,8 +2107,7 @@ where
             },
             strategy_feedback: harness_contract::outcome::OutcomeStrategyFeedback {
                 workload: strategy_workload,
-                verification_blocked: !outcome.working_state_verified
-                    || outcome.evaluation_budget_breached,
+                verification_blocked: outcome.evaluation_budget_breached,
                 context_pressure: outcome.input_tokens.saturating_mul(100)
                     >= u64::from(self.model_context_window).saturating_mul(80),
                 coordination_cost_ms: outcome.merge_cost_ms,
@@ -2169,9 +2118,7 @@ where
                 },
             },
             evidence_refs: Vec::new(),
-            evidence_completeness: if outcome.working_state_verified {
-                harness_contract::reality::EvidenceCompleteness::Sufficient
-            } else if outcome.evidence_overlap_observed {
+            evidence_completeness: if outcome.evidence_overlap_observed {
                 harness_contract::reality::EvidenceCompleteness::Partial
             } else {
                 harness_contract::reality::EvidenceCompleteness::None

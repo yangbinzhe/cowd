@@ -20,7 +20,11 @@ pub(crate) fn render_route(path: GatewayPathKey, values: &[String]) -> String {
         .map(|(name, value)| (*name, value.as_str()))
         .collect::<Vec<_>>();
     path.render(&parameters)
-        .expect("catalog-derived route parameters must render")
+        // Route-parity tests prove this branch unreachable for the generated
+        // catalog. If an independently shipped catalog is corrupt, degrade to
+        // a non-rendered route (and an ordinary HTTP failure) instead of
+        // crashing the entire TUI process.
+        .unwrap_or_else(|_| path.template().to_owned())
 }
 
 pub(crate) fn route_with_query(path: GatewayPathKey, values: &[String], query: &str) -> String {

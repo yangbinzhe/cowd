@@ -120,16 +120,15 @@ impl EvolutionSignalProjector {
         }
     }
 
-    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> Result<RuntimeProjectionLane, String> {
         let projector = Arc::clone(self);
-        RuntimeProjectionLane::blocking(
+        Ok(RuntimeProjectionLane::blocking(
             RuntimeProjectionDescriptor::new(
                 PROJECTOR_ID,
                 projection_interest(),
                 PROJECTOR_WORKER_BATCH,
                 PROJECTOR_IDLE_POLL,
-            )
-            .expect("evolution projection descriptor is static and valid")
+            )?
             .with_latency_class(RuntimeProjectionLatencyClass::Maintenance),
             move |batch_size| {
                 let before = projector.cursor()?;
@@ -138,7 +137,7 @@ impl EvolutionSignalProjector {
                 let scanned = usize::try_from(after.saturating_sub(before)).unwrap_or(usize::MAX);
                 Ok(RuntimeProjectionPass::scanned(scanned, batch_size).with_matches(processed))
             },
-        )
+        ))
     }
 
     #[cfg(test)]
@@ -1422,8 +1421,11 @@ mod tests {
             discovery,
         ));
         let reactor = Arc::new(
-            crate::RuntimeEventReactor::sealed(Arc::clone(&events), [projector.projection_lane()])
-                .unwrap(),
+            crate::RuntimeEventReactor::sealed(
+                Arc::clone(&events),
+                [projector.projection_lane().unwrap()],
+            )
+            .unwrap(),
         );
         reactor.start().unwrap();
         // Start the paired foreground measurement only after the maintenance

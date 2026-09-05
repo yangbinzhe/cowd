@@ -592,36 +592,10 @@ impl MissionService {
                     command.evidence_refs.clone(),
                 ))
             }
-            (MissionCommandTarget::Team { team_id }, MissionCommandAction::Create) => {
-                let mut request: harness_contract::team::TeamInstantiationRequest =
-                    serde_json::from_value(command.payload.clone())
-                        .map_err(|error| format!("Team create payload is invalid: {error}"))?;
-                request.request_id = command.command_id.clone();
-                request.validate().map_err(|error| error.to_string())?;
-                if request.team_id != *team_id {
-                    return Err(format!(
-                        "Team command target {team_id} does not match payload {}",
-                        request.team_id
-                    ));
-                }
-                if !self
-                    .sessions()
-                    .session_exists(&request.lineage.session_id)
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    return Err(format!("session {} not found", request.lineage.session_id));
-                }
-                let team = self.runtime().instantiate_team(request).await?;
-                Ok((
-                    serde_json::to_value(team).map_err(|error| error.to_string())?,
-                    command.evidence_refs.clone(),
-                ))
-            }
-            (MissionCommandTarget::Team { team_id }, MissionCommandAction::Cancel) => {
-                let receipt = self.runtime().cancel_team(team_id).await?;
-                Ok((receipt, command.evidence_refs.clone()))
-            }
+            (MissionCommandTarget::Team { .. }, _) => Err(
+                "legacy Team commands are retired; use Agent actions and execution commands"
+                    .to_string(),
+            ),
             (MissionCommandTarget::Approval { .. }, _) => Err(
                 "Approval commands require the authenticated approval decision endpoint"
                     .to_string(),
@@ -840,7 +814,7 @@ impl MissionService {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let team_session_counts = self.runtime().team_session_counts();
+        let team_session_counts = self.runtime().agentic_session_counts();
         let active = self
             .sessions()
             .list_active_session_ids()
@@ -938,56 +912,6 @@ impl MissionService {
         Ok(nodes)
     }
 
-    pub(crate) fn team_execution_plan(&self, team_id: &str) -> Result<serde_json::Value, String> {
-        let team = self.runtime().team_projection(team_id)?;
-        let graph = self.runtime().team_graph(team_id)?;
-        Ok(serde_json::json!({
-            "envelope": self.session_control_contract(),
-            "kind": "mission_control.team_execution_plan",
-            "ok": true,
-            "team": team,
-            "graph": graph,
-        }))
-    }
-
-    pub(crate) fn collaboration_runs(&self) -> serde_json::Value {
-        serde_json::json!({
-            "envelope": self.session_control_contract(),
-            "kind": "mission_control.collaboration_runs",
-            "ok": true,
-            "projection": self.runtime().team_projection_json(),
-        })
-    }
-
-    pub(crate) fn collaboration_run(&self, team_id: &str) -> Result<serde_json::Value, String> {
-        let run = self.runtime().team_projection(team_id)?;
-        Ok(serde_json::json!({
-            "envelope": self.session_control_contract(),
-            "kind": "mission_control.collaboration_run",
-            "ok": true,
-            "run": run,
-        }))
-    }
-
-    pub(crate) async fn cancel_team_runtime(
-        &self,
-        team_id: &str,
-    ) -> Result<serde_json::Value, String> {
-        self.execute_mission_control_command(MissionCommand {
-            command_id: format!("mission-team-cancel-{}", uuid::Uuid::new_v4()),
-            action: MissionCommandAction::Cancel,
-            target: MissionCommandTarget::Team {
-                team_id: team_id.to_string(),
-            },
-            actor: "gateway_mission_team_route".to_string(),
-            expected_revision: None,
-            correlation_id: String::new(),
-            payload: serde_json::Value::Null,
-            evidence_refs: Vec::new(),
-        })
-        .await
-    }
-
     pub(crate) fn agent_mission_events(&self, agent_id: &str) -> serde_json::Value {
         let data = self.runtime().agent_events(agent_id);
         serde_json::json!({
@@ -997,20 +921,6 @@ impl MissionService {
             "agent_id": agent_id,
             "events": data["events"],
             "run": data["run"],
-        })
-    }
-
-    pub(crate) fn team_mission_evidence(&self, team_id: &str) -> serde_json::Value {
-        let data = self.runtime().team_evidence(team_id);
-        serde_json::json!({
-            "envelope": self.session_control_contract(),
-            "kind": "mission_control.team_evidence",
-            "ok": true,
-            "team_id": team_id,
-            "events": data["events"],
-            "tasks": data["tasks"],
-            "team": data["team"],
-            "evidence": data["evidence"],
         })
     }
 
@@ -1629,7 +1539,7 @@ mod tests {
         );
         assert_eq!(
             projection["mission"]["capability_projection"]["name"],
-            "cowd-runtime-capability-catalog"
+            "cowd-agent-first-capability-catalog"
         );
         assert_eq!(
             service.approvals()["approvals"]["kind"],

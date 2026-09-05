@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 use crate::{
     AgentRuntime, ApprovalQueue, ConflictArbiter, MissionEvidenceBus, RuntimeCapabilityCatalog,
     RuntimeEventInput, RuntimeEventRef, RuntimeEventScope, RuntimeEventStore, SessionRelationGraph,
-    TeamRuntime,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -24,7 +23,6 @@ pub struct MissionProjection {
     pub schema_version: u32,
     pub mission_id: Option<String>,
     pub aggregate: Option<MissionAggregate>,
-    pub team_projection: serde_json::Value,
     pub agent_projection: serde_json::Value,
     pub approval_projection: serde_json::Value,
     pub relation_projection: serde_json::Value,
@@ -231,7 +229,6 @@ impl MissionRuntime {
         &self,
         relations: &SessionRelationGraph,
         agent_runtime: &AgentRuntime,
-        team_runtime: &TeamRuntime,
         approval_queue: &ApprovalQueue,
         conflict_resolver: &ConflictArbiter,
         mission_evidence: &MissionEvidenceBus,
@@ -241,7 +238,6 @@ impl MissionRuntime {
             self.default_mission_id(),
             relations,
             agent_runtime,
-            team_runtime,
             approval_queue,
             conflict_resolver,
             mission_evidence,
@@ -256,7 +252,6 @@ impl MissionRuntime {
         mission_id: &str,
         relations: &SessionRelationGraph,
         agent_runtime: &AgentRuntime,
-        team_runtime: &TeamRuntime,
         approval_queue: &ApprovalQueue,
         conflict_resolver: &ConflictArbiter,
         mission_evidence: &MissionEvidenceBus,
@@ -267,10 +262,6 @@ impl MissionRuntime {
         // Control. This shallow runtime projection only selects entities that
         // already carry an explicit mission identity; it never maintains a
         // second writable member list on MissionAggregate.
-        let team_projection =
-            filter_projection_array(team_runtime.projection_json(), "teams", |team| {
-                value_has_mission(team, mission_id)
-            });
         let agent_projection = filter_projection_array(
             serde_json::json!({
                 "kind": "runtime.agents",
@@ -318,7 +309,6 @@ impl MissionRuntime {
                 .as_ref()
                 .map(|aggregate| aggregate.mission_id.clone()),
             aggregate,
-            team_projection,
             agent_projection,
             approval_projection,
             relation_projection,

@@ -17,6 +17,7 @@
 
 pub mod acceptance;
 pub mod agent;
+pub mod agent_action;
 pub mod behavior;
 pub mod context;
 pub mod core;
@@ -33,7 +34,6 @@ pub mod knowledge;
 pub mod live;
 pub mod managed_agent;
 pub mod mission;
-pub mod orchestration;
 pub mod outcome;
 pub mod policy;
 pub mod projection;

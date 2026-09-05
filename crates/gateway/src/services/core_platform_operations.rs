@@ -51,8 +51,12 @@ pub(crate) const WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID:
     "core.work_context.application_execution_summary.append";
 pub(crate) const PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID: &str =
     "core.platform.governance.snapshot";
+pub(crate) const RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID: &str =
+    "core.runtime.execution_projection.snapshot";
+pub(crate) const RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID: &str =
+    "core.runtime.execution_projection.changes";
 
-pub(crate) const PLATFORM_OPERATION_IDS: [&str; 16] = [
+pub(crate) const PLATFORM_OPERATION_IDS: [&str; 18] = [
     ACTION_PLAN_OPERATION_ID,
     SURFACE_OUTBOX_LIST_OPERATION_ID,
     RUNTIME_START_GOAL_OPERATION_ID,
@@ -69,6 +73,8 @@ pub(crate) const PLATFORM_OPERATION_IDS: [&str; 16] = [
     WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
     WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
     PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
+    RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+    RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
 ];
 
 pub(crate) const BUSINESS_OPERATION_IDS: [&str; 14] = [
@@ -101,7 +107,14 @@ struct CoreBoundPrincipal {
     producer_id: String,
     workspace_id: String,
     surface: String,
+    allowed_core_operations: BTreeMap<(String, String), CoreBoundOperation>,
     bound_at: Instant,
+}
+
+#[derive(Clone)]
+struct CoreBoundOperation {
+    input_schema_digest: cowd_app_protocol::Sha256Digest,
+    granted_capabilities: Vec<String>,
 }
 
 #[derive(Clone, Default)]
@@ -119,6 +132,116 @@ impl CorePlatformBindings {
         workspace_id: &str,
         surface: &str,
         producer_id: String,
+        originating_app_operation_id: String,
+        core_operation_id: String,
+        input_schema_digest: cowd_app_protocol::Sha256Digest,
+        granted_capabilities: Vec<String>,
+    ) {
+        let allowed_core_operations = BTreeMap::from([(
+            (originating_app_operation_id, core_operation_id),
+            CoreBoundOperation {
+                input_schema_digest,
+                granted_capabilities,
+            },
+        )]);
+        let now = Instant::now();
+        let mut principals = self
+            .request_principals
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        principals.retain(|_, bound| now.duration_since(bound.bound_at) <= REQUEST_PRINCIPAL_TTL);
+        while principals.len() >= REQUEST_PRINCIPAL_LIMIT {
+            let Some(key) = principals.keys().next().cloned() else {
+                break;
+            };
+            principals.remove(&key);
+        }
+        principals.insert(
+            request_id.to_owned(),
+            CoreBoundPrincipal {
+                principal: principal.clone(),
+                producer_id,
+                workspace_id: workspace_id.to_owned(),
+                surface: surface.to_owned(),
+                allowed_core_operations,
+                bound_at: now,
+            },
+        );
+    }
+
+    pub(crate) fn bind_verified_app_request(
+        &self,
+        principal: &runtime::VerifiedPrincipal,
+        envelope: &AppInvocationEnvelopeV1,
+        app_id: &str,
+        manifest: &cowd_app_protocol::AppManifestV1,
+    ) -> Result<(), String> {
+        let authority = crate::services::core_matrix_catalog::definitions()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|definition| {
+                (
+                    definition.descriptor.operation_id.clone(),
+                    definition.descriptor,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut allowed_core_operations = BTreeMap::new();
+        for edge in manifest
+            .core_bridge_requirements
+            .iter()
+            .filter(|edge| edge.app_operation_id == envelope.operation_id)
+        {
+            let descriptor = authority.get(&edge.core_operation_id).ok_or_else(|| {
+                format!(
+                    "signed Core operation is absent from Gateway authority: {}",
+                    edge.core_operation_id
+                )
+            })?;
+            if descriptor.input_schema_digest != edge.accepted_input_schema_digest
+                || descriptor.output_schema_digest != edge.accepted_output_schema_digest
+                || descriptor.kind != edge.kind
+                || descriptor.streaming != edge.streaming
+            {
+                return Err(format!(
+                    "signed APP→Core edge differs from Gateway authority: {} -> {}",
+                    edge.app_operation_id, edge.core_operation_id
+                ));
+            }
+            let mut granted_capabilities = edge.required_app_capabilities.clone();
+            granted_capabilities.extend(descriptor.required_capabilities.iter().cloned());
+            granted_capabilities.sort();
+            granted_capabilities.dedup();
+            allowed_core_operations.insert(
+                (
+                    edge.app_operation_id.clone(),
+                    edge.core_operation_id.clone(),
+                ),
+                CoreBoundOperation {
+                    input_schema_digest: descriptor.input_schema_digest.clone(),
+                    granted_capabilities,
+                },
+            );
+        }
+        self.insert_bound_principal(
+            principal,
+            &envelope.request_id,
+            &envelope.principal.workspace_id,
+            &envelope.execution.surface,
+            format!("app:{app_id}"),
+            allowed_core_operations,
+        );
+        Ok(())
+    }
+
+    fn insert_bound_principal(
+        &self,
+        principal: &runtime::VerifiedPrincipal,
+        request_id: &str,
+        workspace_id: &str,
+        surface: &str,
+        producer_id: String,
+        allowed_core_operations: BTreeMap<(String, String), CoreBoundOperation>,
     ) {
         let now = Instant::now();
         let mut principals = self
@@ -139,6 +262,7 @@ impl CorePlatformBindings {
                 producer_id,
                 workspace_id: workspace_id.to_owned(),
                 surface: surface.to_owned(),
+                allowed_core_operations,
                 bound_at: now,
             },
         );
@@ -148,6 +272,8 @@ impl CorePlatformBindings {
         &self,
         envelope: &AppInvocationEnvelopeV1,
         app_id: &str,
+        originating_app_operation_id: &str,
+        core_operation_id: &str,
     ) -> Result<CoreBoundPrincipal, String> {
         let now = Instant::now();
         let mut principals = self
@@ -161,6 +287,12 @@ impl CorePlatformBindings {
         if bound.workspace_id != envelope.principal.workspace_id
             || bound.surface != envelope.execution.surface
             || bound.principal.claims().principal_id != envelope.principal.subject
+            || bound.principal.claims().tenant_id != envelope.principal.tenant_id
+            || bound.principal.claims().grant_id != envelope.principal.grant_id
+            || bound.principal.claims().credential_epoch != envelope.principal.credential_epoch
+            || bound.principal.claims().profile_revision
+                != envelope.principal.authorization_revision
+            || bound.principal.claims().scopes != envelope.principal.granted_scopes
             || bound.producer_id != format!("app:{app_id}")
         {
             return Err(
@@ -168,6 +300,31 @@ impl CorePlatformBindings {
                     .to_owned(),
             );
         }
+        let operation = bound
+            .allowed_core_operations
+            .get(&(
+                originating_app_operation_id.to_owned(),
+                core_operation_id.to_owned(),
+            ))
+            .ok_or_else(|| {
+                "Core invocation is outside the verified Gateway APP→Core grant".to_owned()
+            })?;
+        if operation.input_schema_digest != envelope.input_schema_digest
+            || operation.granted_capabilities != envelope.principal.granted_capabilities
+        {
+            return Err(
+                "Core invocation schema or capabilities differ from the verified Gateway grant"
+                    .to_owned(),
+            );
+        }
+        // A streaming APP may issue a sequence of bounded long-poll Core calls for the
+        // lifetime of one already-authenticated Gateway request. Renew only after the
+        // complete principal, edge, schema and capability binding has matched. Invalid
+        // traffic therefore cannot keep a grant alive or widen it.
+        let bound = principals.get_mut(&envelope.request_id).ok_or_else(|| {
+            "verified request binding disappeared under the write lock".to_owned()
+        })?;
+        bound.bound_at = now;
         Ok(bound.clone())
     }
 }
@@ -208,6 +365,53 @@ pub(crate) struct RuntimeStartStructuredTaskInput {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RuntimeCancelStructuredTaskInput {
     pub(crate) task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeExecutionProjectionSnapshotInput {
+    pub(crate) execution_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeExecutionProjectionSnapshotOutput {
+    pub(crate) available: bool,
+    pub(crate) execution_id: String,
+    pub(crate) revision: u64,
+    pub(crate) cursor: u64,
+    pub(crate) snapshot: harness_contract::projection::ExecutionProjection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeExecutionProjectionChangesInput {
+    pub(crate) execution_id: String,
+    pub(crate) after_revision: u64,
+    pub(crate) after_cursor: u64,
+    #[serde(default = "default_projection_wait_ms")]
+    pub(crate) wait_ms: u64,
+}
+
+fn default_projection_wait_ms() -> u64 {
+    20_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RuntimeExecutionProjectionChangesOutput {
+    Delta {
+        delta: harness_contract::projection::ProjectionDelta,
+    },
+    Resync {
+        reason: harness_contract::projection::ProjectionResyncReason,
+        snapshot: harness_contract::projection::ExecutionProjection,
+    },
+    Heartbeat {
+        execution_id: String,
+        revision: u64,
+        cursor: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -739,6 +943,7 @@ pub(crate) async fn dispatch(
     state: &AppState,
     envelope: &AppInvocationEnvelopeV1,
     app_id: &str,
+    originating_app_operation_id: &str,
     operation_id: &str,
     payload: &Value,
 ) -> Result<Value, String> {
@@ -761,7 +966,15 @@ pub(crate) async fn dispatch(
                 .and_then(|output| serde_json::to_value(output).map_err(|error| error.to_string()))
         }
         operation_id if PLATFORM_OPERATION_IDS[2..].contains(&operation_id) => {
-            dispatch_bound_host_operation(state, envelope, app_id, operation_id, payload).await
+            dispatch_bound_host_operation(
+                state,
+                envelope,
+                app_id,
+                originating_app_operation_id,
+                operation_id,
+                payload,
+            )
+            .await
         }
         _ => Err(format!("unknown Core platform operation `{operation_id}`")),
     }
@@ -804,6 +1017,12 @@ fn validate_typed_input(operation_id: &str, payload: &Value) -> Result<Value, St
                 .map_err(|error| format!("invalid `{operation_id}` input: {error}"))?;
             Ok(Value::Null)
         }
+        RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID => {
+            typed!(RuntimeExecutionProjectionSnapshotInput)
+        }
+        RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID => {
+            typed!(RuntimeExecutionProjectionChangesInput)
+        }
         _ => Err(format!("unknown Core platform operation `{operation_id}`")),
     }
 }
@@ -812,13 +1031,16 @@ async fn dispatch_bound_host_operation(
     state: &AppState,
     envelope: &AppInvocationEnvelopeV1,
     app_id: &str,
+    originating_app_operation_id: &str,
     operation_id: &str,
     payload: &Value,
 ) -> Result<Value, String> {
-    let binding = state
-        .services
-        .core_platform_bindings
-        .resolve(envelope, app_id)?;
+    let binding = state.services.core_platform_bindings.resolve(
+        envelope,
+        app_id,
+        originating_app_operation_id,
+        operation_id,
+    )?;
     let payload = validate_typed_input(operation_id, payload)?;
     if operation_id != RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID
         && envelope.expected_revision.is_some()
@@ -915,7 +1137,135 @@ async fn dispatch_bound_host_operation(
             .await?,
         ),
         PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID => encode(governance_snapshot(state)),
+        RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID => encode(
+            runtime_execution_projection_snapshot(
+                state,
+                &binding,
+                serde_json::from_value(payload).map_err(json_error)?,
+            )
+            .await?,
+        ),
+        RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID => encode(
+            runtime_execution_projection_changes(
+                state,
+                &binding,
+                serde_json::from_value(payload).map_err(json_error)?,
+            )
+            .await?,
+        ),
         _ => Err(format!("unknown Core platform operation `{operation_id}`")),
+    }
+}
+
+async fn runtime_execution_projection_snapshot(
+    state: &AppState,
+    binding: &CoreBoundPrincipal,
+    input: RuntimeExecutionProjectionSnapshotInput,
+) -> Result<RuntimeExecutionProjectionSnapshotOutput, String> {
+    let execution_id = input.execution_id.trim();
+    if execution_id.is_empty()
+        || execution_id.len() > 256
+        || execution_id.chars().any(char::is_control)
+    {
+        return Err("runtime execution_id is invalid".to_string());
+    }
+    let principal = crate::api_routes::AuthenticatedPrincipal(binding.principal.clone());
+    let context = crate::api_routes::runtime_routes::execution_projection_context(
+        state,
+        &principal,
+        execution_id,
+        harness_contract::projection::ProjectionDetailScope::Full,
+    )
+    .await
+    .map_err(|(status, _)| format!("execution projection authorization failed ({status})"))?;
+    let runtime = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| "runtime service unavailable".to_string())?
+        .runtime_services();
+    let projection = runtime::execution_projection::snapshot(&runtime, execution_id, &context)
+        .await
+        .map_err(|error| error.to_string())?;
+    let revision = projection.revision;
+    let cursor = projection.cursor;
+    Ok(RuntimeExecutionProjectionSnapshotOutput {
+        available: true,
+        execution_id: execution_id.to_string(),
+        revision,
+        cursor,
+        snapshot: projection,
+    })
+}
+
+async fn runtime_execution_projection_changes(
+    state: &AppState,
+    binding: &CoreBoundPrincipal,
+    input: RuntimeExecutionProjectionChangesInput,
+) -> Result<RuntimeExecutionProjectionChangesOutput, String> {
+    let execution_id = input.execution_id.trim();
+    if execution_id.is_empty()
+        || execution_id.len() > 256
+        || execution_id.chars().any(char::is_control)
+    {
+        return Err("runtime execution_id is invalid".to_string());
+    }
+    if input.wait_ms == 0 || input.wait_ms > 25_000 {
+        return Err("runtime projection wait_ms must be within 1..=25000".to_string());
+    }
+    let principal = crate::api_routes::AuthenticatedPrincipal(binding.principal.clone());
+    let context = crate::api_routes::runtime_routes::execution_projection_context(
+        state,
+        &principal,
+        execution_id,
+        harness_contract::projection::ProjectionDetailScope::Full,
+    )
+    .await
+    .map_err(|(status, _)| format!("execution projection authorization failed ({status})"))?;
+    let runtime = state
+        .services
+        .runtime
+        .as_ref()
+        .ok_or_else(|| "runtime service unavailable".to_string())?
+        .runtime_services();
+    let mut commits = runtime.event_reader().subscribe_commits();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(input.wait_ms);
+    loop {
+        let delta = runtime::execution_projection::delta(
+            &runtime,
+            execution_id,
+            input.after_revision,
+            input.after_cursor,
+            &context,
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(reason) = delta.resync_reason.clone() {
+            let snapshot =
+                runtime::execution_projection::snapshot(&runtime, execution_id, &context)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            return Ok(RuntimeExecutionProjectionChangesOutput::Resync { reason, snapshot });
+        }
+        if delta.target_cursor > input.after_cursor
+            || delta.target_revision > input.after_revision
+            || !delta.operations.is_empty()
+        {
+            return Ok(RuntimeExecutionProjectionChangesOutput::Delta { delta });
+        }
+        if tokio::time::timeout_at(deadline, commits.changed())
+            .await
+            .is_err()
+        {
+            return Ok(RuntimeExecutionProjectionChangesOutput::Heartbeat {
+                execution_id: execution_id.to_string(),
+                revision: delta.target_revision,
+                cursor: delta.target_cursor,
+            });
+        }
+        if commits.has_changed().is_err() {
+            return Err("runtime projection commit stream closed".to_string());
+        }
+        let _ = commits.borrow_and_update();
     }
 }
 
@@ -2331,7 +2681,7 @@ mod tests {
                 tenant_id: envelope.principal.tenant_id.clone(),
                 grant_id: envelope.principal.grant_id.clone(),
                 kind: harness_contract::security::PrincipalKind::Service,
-                scopes: Vec::new(),
+                scopes: envelope.principal.granted_scopes.clone(),
                 capabilities: envelope.principal.granted_capabilities.clone(),
                 assurance: harness_contract::security::PrincipalAssurance::Normal,
                 issuer: "test.core-platform".to_owned(),
@@ -2352,6 +2702,10 @@ mod tests {
                 &envelope.principal.workspace_id,
                 &envelope.execution.surface,
                 "app:fixture".to_owned(),
+                "fixture.operation".to_owned(),
+                envelope.operation_id.clone(),
+                envelope.input_schema_digest.clone(),
+                envelope.principal.granted_capabilities.clone(),
             );
     }
 
@@ -2360,7 +2714,7 @@ mod tests {
         let ids = PLATFORM_OPERATION_IDS
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(ids.len(), 16);
+        assert_eq!(ids.len(), 18);
         assert!(supports(ACTION_PLAN_OPERATION_ID));
         assert!(supports(SURFACE_OUTBOX_LIST_OPERATION_ID));
         assert!(!supports("core.matrix.health"));
@@ -2407,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn all_fourteen_business_operation_inputs_are_closed_and_dispatchable() {
+    fn all_business_operation_inputs_are_closed_and_dispatchable() {
         let evidence = serde_json::to_value(MatrixEvidencePacket::new("typed Core evidence"))
             .expect("evidence packet");
         let fixtures = vec![
@@ -2467,8 +2821,16 @@ mod tests {
                 PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
                 serde_json::json!({}),
             ),
+            (
+                RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+                serde_json::json!({"execution_id":"execution-1"}),
+            ),
+            (
+                RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+                serde_json::json!({"execution_id":"execution-1","after_revision":0,"after_cursor":0,"wait_ms":1}),
+            ),
         ];
-        assert_eq!(fixtures.len(), 14);
+        assert_eq!(fixtures.len(), PLATFORM_OPERATION_IDS.len() - 2);
         for (operation_id, payload) in fixtures {
             validate_typed_input(operation_id, &payload)
                 .unwrap_or_else(|error| panic!("{operation_id} fixture rejected: {error}"));
@@ -2482,6 +2844,147 @@ mod tests {
                 "{operation_id} accepted an unknown field"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_projection_changes_returns_delta_then_heartbeat_without_polling() {
+        use harness_contract::execution_graph::{
+            ExecutionGraph, ExecutionGraphCommand, ExecutionGraphLineage, ExecutionNodeKind,
+            ExecutionNodeSpec, ExecutionNodeStatus,
+        };
+        use runtime::ExecutionGraphHost;
+
+        let state = crate::api_routes::tests::test_state();
+        let session_id = format!("core-projection-{}", uuid::Uuid::new_v4());
+        let mut graph = ExecutionGraph::new("Core projection long-poll contract").with_lineage(
+            ExecutionGraphLineage {
+                session_id: session_id.clone(),
+                turn_id: "core-projection-turn".to_owned(),
+                root_task_id: "core-projection-task".to_owned(),
+                task_id: "core-projection-task".to_owned(),
+                generation: 1,
+            },
+        );
+        let node = ExecutionNodeSpec::new(
+            ExecutionNodeKind::InlineModel,
+            "inline_model",
+            serde_json::json!({"kind":"core_projection_contract"}).to_string(),
+        );
+        graph
+            .node_statuses
+            .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+        graph.nodes.push(node);
+        let execution_id = graph.id.clone();
+        let runtime = state
+            .services
+            .runtime
+            .as_ref()
+            .expect("runtime service")
+            .runtime_services();
+        runtime
+            .execution_supervisor()
+            .submit_graph(
+                graph,
+                ExecutionGraphCommand::Start {
+                    expected_revision: 0,
+                },
+            )
+            .await
+            .expect("register projection graph");
+        runtime
+            .execution_supervisor()
+            .wait_for_quiescence(&execution_id)
+            .await
+            .expect("projection graph quiesces");
+
+        let snapshot_payload = serde_json::json!({"execution_id":execution_id});
+        let mut snapshot_request = envelope(
+            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+            snapshot_payload.clone(),
+        );
+        snapshot_request.principal.granted_scopes = vec![format!("session:{session_id}")];
+        bind_fixture_request(&state, &snapshot_request);
+        let snapshot = dispatch(
+            &state,
+            &snapshot_request,
+            "fixture",
+            "fixture.operation",
+            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+            &snapshot_payload,
+        )
+        .await
+        .expect("Core projection snapshot");
+        let revision = snapshot["revision"].as_u64().expect("snapshot revision");
+        let cursor = snapshot["cursor"].as_u64().expect("snapshot cursor");
+
+        let delta_payload = serde_json::json!({
+            "execution_id":execution_id,
+            "after_revision":0,
+            "after_cursor":0,
+            "wait_ms":1
+        });
+        let mut delta_request = envelope(
+            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+            delta_payload.clone(),
+        );
+        delta_request.principal.granted_scopes = vec![format!("session:{session_id}")];
+        bind_fixture_request(&state, &delta_request);
+        let delta = dispatch(
+            &state,
+            &delta_request,
+            "fixture",
+            "fixture.operation",
+            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+            &delta_payload,
+        )
+        .await
+        .expect("Core projection delta");
+        assert_eq!(delta["kind"], "delta");
+
+        let mut observed_revision = revision;
+        let mut observed_cursor = cursor;
+        let mut heartbeat = None;
+        // Projection materialization can publish a final commit immediately after the
+        // first snapshot. Advance through that real delta, then require the observer
+        // lane to settle on a bounded heartbeat instead of assuming a race-free test.
+        for _ in 0..8 {
+            let heartbeat_payload = serde_json::json!({
+                "execution_id":execution_id,
+                "after_revision":observed_revision,
+                "after_cursor":observed_cursor,
+                "wait_ms":5
+            });
+            let mut heartbeat_request = envelope(
+                RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+                heartbeat_payload.clone(),
+            );
+            heartbeat_request.principal.granted_scopes = vec![format!("session:{session_id}")];
+            bind_fixture_request(&state, &heartbeat_request);
+            let change = dispatch(
+                &state,
+                &heartbeat_request,
+                "fixture",
+                "fixture.operation",
+                RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+                &heartbeat_payload,
+            )
+            .await
+            .expect("Core projection heartbeat");
+            if change["kind"] == "heartbeat" {
+                heartbeat = Some(change);
+                break;
+            }
+            assert_eq!(change["kind"], "delta");
+            observed_revision = change["delta"]["target_revision"]
+                .as_u64()
+                .expect("delta target revision");
+            observed_cursor = change["delta"]["target_cursor"]
+                .as_u64()
+                .expect("delta target cursor");
+        }
+        let heartbeat = heartbeat.expect("observer lane settles on a heartbeat");
+        assert_eq!(heartbeat["revision"], observed_revision);
+        assert_eq!(heartbeat["cursor"], observed_cursor);
     }
 
     #[tokio::test]
@@ -2505,6 +3008,7 @@ mod tests {
             &state,
             &plan_envelope,
             "fixture",
+            "fixture.operation",
             ACTION_PLAN_OPERATION_ID,
             &plan_payload,
         )
@@ -2529,6 +3033,7 @@ mod tests {
             &state,
             &outbox_envelope,
             "fixture",
+            "fixture.operation",
             SURFACE_OUTBOX_LIST_OPERATION_ID,
             &outbox_payload,
         )
@@ -2556,6 +3061,7 @@ mod tests {
             &state,
             &start,
             "fixture",
+            "fixture.operation",
             RUNTIME_START_GOAL_OPERATION_ID,
             &start_payload,
         )
@@ -2574,6 +3080,7 @@ mod tests {
             &state,
             &exists,
             "fixture",
+            "fixture.operation",
             WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
             &exists_payload,
         )
@@ -2594,6 +3101,7 @@ mod tests {
             &state,
             &governance,
             "fixture",
+            "fixture.operation",
             PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
             &governance_payload,
         )
@@ -2613,6 +3121,7 @@ mod tests {
             &state,
             &request,
             "fixture",
+            "fixture.operation",
             WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
             &payload
         )
@@ -2625,12 +3134,62 @@ mod tests {
             &state,
             &request,
             "reference-app",
+            "fixture.operation",
             WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
             &valid
         )
         .await
         .unwrap_err()
         .contains("APP identity"));
+    }
+
+    #[tokio::test]
+    async fn core_effect_requires_the_exact_gateway_bound_app_edge_and_capabilities() {
+        let state = crate::api_routes::tests::test_state();
+        let payload = serde_json::json!({"task_ref":"task:any"});
+        let request = envelope(WORK_CONTEXT_TASK_EXISTS_OPERATION_ID, payload.clone());
+
+        assert!(dispatch(
+            &state,
+            &request,
+            "fixture",
+            "fixture.operation",
+            WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
+            &payload,
+        )
+        .await
+        .unwrap_err()
+        .contains("not bound"));
+
+        bind_fixture_request(&state, &request);
+        assert!(dispatch(
+            &state,
+            &request,
+            "fixture",
+            "another.operation",
+            WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
+            &payload,
+        )
+        .await
+        .unwrap_err()
+        .contains("outside the verified Gateway APP→Core grant"));
+
+        let mut widened = request.clone();
+        widened
+            .principal
+            .granted_capabilities
+            .push("runtime.admin".to_owned());
+        assert!(dispatch(
+            &state,
+            &widened,
+            "fixture",
+            "fixture.operation",
+            WORK_CONTEXT_TASK_EXISTS_OPERATION_ID,
+            &payload,
+        )
+        .await
+        .unwrap_err()
+        .contains("schema or capabilities differ"));
     }
 
     #[tokio::test]
@@ -2648,6 +3207,7 @@ mod tests {
             &state,
             &terminal,
             "fixture",
+            "fixture.operation",
             WORK_CONTEXT_INSPECT_TASK_TERMINAL_OPERATION_ID,
             &terminal_payload,
         )
@@ -2666,6 +3226,7 @@ mod tests {
             &state,
             &evidence,
             "fixture",
+            "fixture.operation",
             WORK_CONTEXT_STRUCTURED_EVIDENCE_ITEM_OPERATION_ID,
             &evidence_payload,
         )
@@ -2686,6 +3247,7 @@ mod tests {
             &state,
             &cross,
             "fixture",
+            "fixture.operation",
             CROSS_PLANE_DISPATCH_OPERATION_ID,
             &cross_payload,
         )
@@ -2708,6 +3270,7 @@ mod tests {
             &state,
             &surface,
             "fixture",
+            "fixture.operation",
             CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
             &surface_payload,
         )

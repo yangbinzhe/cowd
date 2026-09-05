@@ -2870,11 +2870,11 @@ pub(crate) fn runtime_capability_context_item(
     } else {
         "runtime_capabilities=not_registered"
     };
-    let runtime_orchestration = if has_tool("runtime_orchestrate") {
-        "runtime_orchestrate=registered"
-    } else {
-        "runtime_orchestrate=not_registered"
-    };
+    let agent_actions = harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+        .iter()
+        .filter(|name| has_tool(name))
+        .copied()
+        .collect::<Vec<_>>();
     let context_retrieval = if has_tool("context_retrieve") {
         "context_retrieve=registered; use it when automatic context is incomplete, uncertain, or appears unrelated; discover authorized prior Sessions through source=session_catalog before requesting explicit Session history"
     } else {
@@ -2890,12 +2890,17 @@ model_context_window={model_ctx}\n\
 registered_tool_count={}\n\
 {allowed_state}\n\
 {runtime_query}\n\
-{runtime_orchestration}\n\
+registered_agent_actions={}\n\
 {context_retrieval}\n\
 registered_batch_readonly_tools={}\n\
 registered_prepared_readonly_tools={}\n\
-Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use tool_search to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. Distinguish model-callable tools from runtime-owned collaboration/subagent affordances; for complex work, use active runtime orchestration when present. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",
+Important: this is a filtered backend catalog, not the current provider function schema set. Runtime injects the authoritative per-request function-call contract separately. Call only functions in that contract; use tool_search to activate eligible deferred candidates. For independent read-only evidence, request multiple active calls together. For collaborative work, use the registered small Agent actions incrementally. When a path repeats, re-plan from retained evidence rather than querying the same capability catalog again.",
         tool_definitions.len(),
+        if agent_actions.is_empty() {
+            "none".to_string()
+        } else {
+            agent_actions.join(",")
+        },
         if batch_tools.is_empty() {
             "none".to_string()
         } else {

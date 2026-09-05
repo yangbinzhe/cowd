@@ -17,13 +17,22 @@ use harness_contract::mission::ScheduleTrigger;
 use harness_contract::skill::{
     SkillAdapterKind, SkillCapabilityProfile, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
 };
-use harness_contract::team::{
-    RoleCardinalityPolicy, TeamInstantiationRequest, TeamRoleCardinalityOverride,
-    TeamSelectionMode, TeamTemplateDefinitionId, TeamTemplateSelector,
-};
 use session::SessionRecord;
 
 struct ReadinessOnlyEvolutionEvalRunner;
+
+fn publish_agent_test_policy(services: &RuntimeServices, session_id: &str) {
+    services.publish_session_execution_policy(
+        session_id,
+        crate::permissions::SessionExecutionPolicyControl::from_policy(
+            harness_contract::policy::SessionExecutionPolicy::from_profile(
+                harness_contract::policy::AutonomyProfileId::Supervised,
+                1,
+                harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
+            ),
+        ),
+    );
+}
 
 #[async_trait::async_trait]
 impl crate::EvolutionEvalRunner for ReadinessOnlyEvolutionEvalRunner {
@@ -289,7 +298,7 @@ fn startup_recovers_task_outbox_without_mutating_mission_membership() {
     let first = RuntimeServices::builder(&home, &workspace)
         .build()
         .expect("first runtime");
-    publish_team_test_policy(&first, "session-startup-recovery");
+    publish_agent_test_policy(&first, "session-startup-recovery");
     let task_spec = first
         .task_runtime_port()
         .bind_task_spec(
@@ -593,7 +602,7 @@ async fn maintenance_supervisor_aborts_timed_out_work() {
 #[test]
 fn task_terminal_observation_is_idempotent_without_becoming_a_task_writer() {
     let services = RuntimeServices::in_memory().expect("in-memory runtime services");
-    publish_team_test_policy(&services, "session-completion-1");
+    publish_agent_test_policy(&services, "session-completion-1");
     let task_spec = services
         .task_runtime_port()
         .bind_task_spec(
@@ -662,7 +671,7 @@ fn task_terminal_observation_is_idempotent_without_becoming_a_task_writer() {
 fn concurrent_task_terminal_observation_replays_the_committed_receipt() {
     let services =
         std::sync::Arc::new(RuntimeServices::in_memory().expect("in-memory runtime services"));
-    publish_team_test_policy(&services, "session-completion-race");
+    publish_agent_test_policy(&services, "session-completion-race");
     let task_spec = services
         .task_runtime_port()
         .bind_task_spec(
@@ -1161,7 +1170,6 @@ fn definition_catalog_refresh_only_exposes_active_stable_revisions() {
                     context_profile: "team".to_string(),
                     read_scopes: vec![CognitiveReadScope::Session],
                     write_mode: CognitiveWriteMode::CandidateOnly,
-                    team_working_state_visible: true,
                 },
                 capability_contract: AgentCapabilityContract {
                     capability_ceiling: vec![AgentCapability::Read],
@@ -1270,7 +1278,6 @@ fn active_canary_routes_new_bindings_and_stop_reverts_to_stable() {
             context_profile: "sub_agent".to_string(),
             read_scopes: vec![CognitiveReadScope::Session],
             write_mode: CognitiveWriteMode::CandidateOnly,
-            team_working_state_visible: false,
         },
         capability_contract: AgentCapabilityContract {
             capability_ceiling: vec![AgentCapability::Read],
@@ -2022,7 +2029,7 @@ async fn canonical_agent_task_flows_through_runner_and_commits_once() {
         .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
         .build()
         .unwrap();
-    publish_team_test_policy(&services, "agent-runtime-session");
+    publish_agent_test_policy(&services, "agent-runtime-session");
     services
         .agent_runtime()
         .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
@@ -2064,7 +2071,6 @@ async fn canonical_agent_task_flows_through_runner_and_commits_once() {
         attempt: 1,
         expected_graph_revision: 0,
         objective: "complete one graph-owned agent task".into(),
-        team_role_identity: None,
         required_acceptance: harness_contract::context::RequiredAcceptance {
             criteria: vec!["completed".into()],
             evidence_obligations: Vec::new(),
@@ -2164,7 +2170,7 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
         ))
         .build()
         .expect("runtime services");
-    publish_team_test_policy(&services, "binding-session");
+    publish_agent_test_policy(&services, "binding-session");
     let root_spec = services
         .task_runtime_port()
         .bind_task_spec(
@@ -2233,14 +2239,13 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
             attempt: 1,
             expected_graph_revision: 0,
             objective: format!("research isolated domain {index}"),
-            team_role_identity: None,
             required_acceptance: harness_contract::context::RequiredAcceptance {
                 criteria: vec!["evidence".to_string()],
                 evidence_obligations: Vec::new(),
             },
-            output_acceptance: vec![harness_contract::team::TeamAcceptanceRequirement {
+            output_acceptance: vec![harness_contract::agent::OutputAcceptanceRequirement {
                 criterion: "evidence".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                check: harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence {
                     scopes: vec![format!("read:binding-domain-{index}")],
                 },
             }],
@@ -2292,7 +2297,7 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
         let typed_acceptance_matches_lease = packet.output_acceptance.iter().any(|requirement| {
             matches!(
                 &requirement.check,
-                harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { scopes }
+                harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence { scopes }
                     if scopes == &packet.resource_scopes
             )
         });
@@ -2348,7 +2353,7 @@ async fn one_definition_can_drive_eight_isolated_runtime_instances() {
 #[tokio::test]
 async fn policy_drain_tracks_and_terminalizes_an_admitted_pre_graph_task() {
     let services = RuntimeServices::in_memory().expect("runtime services");
-    publish_team_test_policy(&services, "policy-drain-session");
+    publish_agent_test_policy(&services, "policy-drain-session");
     let spec = services
         .task_runtime_port()
         .bind_task_spec(
@@ -2413,7 +2418,7 @@ async fn policy_drain_tracks_and_terminalizes_an_admitted_pre_graph_task() {
 #[tokio::test]
 async fn policy_drain_terminalizes_graph_and_its_owning_task_from_one_snapshot() {
     let services = RuntimeServices::in_memory().expect("runtime services");
-    publish_team_test_policy(&services, "policy-drain-graph-session");
+    publish_agent_test_policy(&services, "policy-drain-graph-session");
     let spec = services
         .task_runtime_port()
         .bind_task_spec(
@@ -2518,8 +2523,7 @@ async fn session_cancellation_terminalizes_descendants_of_an_already_terminal_ro
     };
     let mut parent = ExecutionGraph::new("cancelled Session root").with_lineage(lineage.clone());
     parent.id = "session-cancel-root".to_string();
-    let mut parent_node =
-        ExecutionNodeSpec::new(ExecutionNodeKind::Subgraph, "team_subgraph", "{}");
+    let mut parent_node = ExecutionNodeSpec::new(ExecutionNodeKind::AgentTask, "agent_task", "{}");
     parent_node.id = "team-node".to_string();
     parent_node.idempotency_key = "team-node".to_string();
     parent.nodes.push(parent_node);
@@ -2576,645 +2580,6 @@ async fn session_cancellation_terminalizes_descendants_of_an_already_terminal_ro
         .node_statuses
         .values()
         .all(|status| *status == ExecutionNodeStatus::Cancelled));
-}
-
-#[tokio::test]
-async fn team_runtime_compiles_parallel_agents_and_emits_one_verified_terminal_result() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::create_dir_all(workspace.join("crates")).unwrap();
-    std::fs::write(workspace.join("crates/runtime"), "fixture before\n").unwrap();
-    let providers = crate::config::ProvidersConfig {
-        providers: std::collections::HashMap::from([(
-            "test".into(),
-            crate::config::ProviderConfig {
-                name: "test".into(),
-                base_url: "https://example.test/v1".into(),
-                api_key: "test".into(),
-                models: vec!["fast".into()],
-                protocol: Some("responses".into()),
-                parallel_tool_calls: Default::default(),
-                early_tool_start: Default::default(),
-            },
-        )]),
-    };
-    let services = RuntimeServices::builder(temp.path(), &workspace)
-        .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
-        .build()
-        .unwrap();
-    publish_team_test_policy(&services, "team-runtime-session");
-    services
-        .agent_runtime()
-        .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
-
-    let projection = services
-        .team_runtime()
-        .instantiate(team_request(
-            "team-runtime-integration",
-            "team-runtime-session",
-            "cowd/execute-review",
-            "independently analyse and review the runtime boundary",
-            "fast",
-            services.mission_runtime().default_mission_id(),
-        ))
-        .await
-        .expect("team execution");
-
-    assert_eq!(projection.status, "completed");
-    assert_eq!(projection.tasks.len(), 2);
-    let terminal = projection.terminal_result.expect("one terminal result");
-    assert!(
-            terminal.result_ref.starts_with("delivery-envelope: "),
-            "a backend without an explicit validated AnswerCandidate must use the mechanical delivery envelope: {terminal:?}"
-        );
-    assert!(!terminal.evidence_refs.is_empty());
-    let graph = services
-        .graph_state_store()
-        .load(&projection.graph_id)
-        .expect("canonical graph");
-    assert!(
-        graph
-            .node_statuses
-            .values()
-            .all(|status| *status == ExecutionNodeStatus::Completed),
-        "deterministic Team backend must terminalize every node: statuses={:?}; results={:?}",
-        graph.node_statuses,
-        graph.node_results
-    );
-    let team_bindings = graph
-        .nodes
-        .iter()
-        .filter(|node| node.kind == ExecutionNodeKind::AgentTask)
-        .map(|node| {
-            serde_json::from_str::<AgentTaskPacket>(&node.payload_ref)
-                .expect("canonical AgentTaskPacket")
-                .binding
-                .expect("Team graph payload contains exact Binding")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(team_bindings.len(), 2);
-    assert_eq!(
-        team_bindings
-            .iter()
-            .map(|binding| binding.definition_ref.definition_id.as_str())
-            .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from(["builtin/cowd/direct", "builtin/cowd/execute"])
-    );
-    assert!(team_bindings.iter().all(|binding| {
-        binding.data_lease.team_id.as_deref() == Some("team-runtime-integration")
-    }));
-    assert!(services.team_runtime().projection_json()["teams"]
-        .as_array()
-        .is_some_and(|teams| teams.len() == 1));
-    let binding = crate::team_binding::load_binding(services.event_store(), &projection.graph_id)
-        .expect("binding read")
-        .expect("normal Team admission persists its frozen Binding");
-    assert_eq!(binding.roles.len(), 2);
-    assert!(
-        crate::team_binding::has_ready_marker(services.event_store(), &projection.graph_id)
-            .expect("ready marker read"),
-        "normal Team admission closes the exact link set with a Ready marker"
-    );
-}
-
-#[tokio::test]
-async fn team_admission_recovers_incomplete_task_links_before_drive() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let providers = crate::config::ProvidersConfig {
-        providers: std::collections::HashMap::from([(
-            "test".into(),
-            crate::config::ProviderConfig {
-                name: "test".into(),
-                base_url: "https://example.test/v1".into(),
-                api_key: "test".into(),
-                models: vec!["fast".into()],
-                protocol: Some("responses".into()),
-                parallel_tool_calls: Default::default(),
-                early_tool_start: Default::default(),
-            },
-        )]),
-    };
-    let services = RuntimeServices::builder(temp.path(), &workspace)
-        .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
-        .build()
-        .unwrap();
-    publish_team_test_policy(&services, "team-crash-session");
-    services
-        .agent_runtime()
-        .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
-    let request = team_request(
-        "team-crash-recovery",
-        "team-crash-session",
-        "cowd/execute-review",
-        "recover the exact link set after a crash between graph registration and Task admission",
-        "fast",
-        services.mission_runtime().default_mission_id(),
-    );
-    let mut instantiated = services
-        .team_runtime()
-        .plan(request.clone())
-        .expect("team plan");
-    services
-        .team_runtime()
-        .ensure_root_task(&request)
-        .expect("root task exists before the crash window");
-    assert!(
-        services
-            .task_runtime_port()
-            .get(&request.lineage.root_task_id)
-            .expect("root lookup")
-            .is_some(),
-        "root task must be durable before the crash window"
-    );
-    services
-        .team_runtime()
-        .bind_instantiated_task_policies(&mut instantiated)
-        .expect("freeze inherited Task policy before durable Preparing marker");
-    let registered = services
-        .commit_service()
-        .register_graph(instantiated.graph.clone())
-        .expect("graph registered in crash window");
-    crate::team_binding::persist_preparing_with_task_commands(
-        services.event_store(),
-        &registered.graph.id,
-        instantiated
-            .binding
-            .as_ref()
-            .expect("compiled Team Binding"),
-        &instantiated.task_commands,
-    )
-    .expect("preparing marker persisted");
-    assert!(
-        !crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
-            .expect("ready marker read"),
-        "crash window has Preparing but no Ready marker"
-    );
-    assert_eq!(
-        services
-            .team_runtime()
-            .reconcile_preparing_bindings_on_startup(256)
-            .expect("startup reconciliation closes the frozen Task link set"),
-        1,
-        "recovery must repair exactly this unready Team before any graph is driven"
-    );
-
-    let projection = services
-        .team_runtime()
-        .instantiate_or_resume(request.clone())
-        .await
-        .expect("resume reconciles links and executes once");
-    assert_eq!(projection.status, "unavailable");
-    assert_eq!(projection.tasks.len(), 2);
-    assert!(
-        crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
-            .expect("ready marker read"),
-        "Ready marker must close the exact link set"
-    );
-    let binding = crate::team_binding::load_binding(services.event_store(), &registered.graph.id)
-        .expect("binding read")
-        .expect("binding persisted");
-    assert_eq!(binding.roles.len(), 2);
-
-    let again = services
-        .team_runtime()
-        .instantiate_or_resume(request)
-        .await
-        .expect("second resume is idempotent");
-    assert_eq!(again.tasks.len(), 2);
-}
-
-#[tokio::test]
-async fn team_admission_recovers_crash_after_the_first_task_link() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let providers = crate::config::ProvidersConfig {
-        providers: std::collections::HashMap::from([(
-            "test".into(),
-            crate::config::ProviderConfig {
-                name: "test".into(),
-                base_url: "https://example.test/v1".into(),
-                api_key: "test".into(),
-                models: vec!["fast".into()],
-                protocol: Some("responses".into()),
-                parallel_tool_calls: Default::default(),
-                early_tool_start: Default::default(),
-            },
-        )]),
-    };
-    let services = RuntimeServices::builder(temp.path(), &workspace)
-        .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
-        .build()
-        .unwrap();
-    publish_team_test_policy(&services, "team-crash-second-link-session");
-    services
-        .agent_runtime()
-        .register_observation_authority_backend(Arc::new(CompletedAgentBackend));
-    let request = team_request(
-        "team-crash-second-link",
-        "team-crash-second-link-session",
-        "cowd/execute-review",
-        "recover a crash that happened after the first Task link",
-        "fast",
-        services.mission_runtime().default_mission_id(),
-    );
-    let mut instantiated = services
-        .team_runtime()
-        .plan(request.clone())
-        .expect("team plan");
-    assert_eq!(instantiated.task_commands.len(), 2);
-    services
-        .team_runtime()
-        .ensure_root_task(&request)
-        .expect("root task exists before the crash window");
-    assert!(
-        services
-            .task_runtime_port()
-            .get(&request.lineage.root_task_id)
-            .expect("root lookup")
-            .is_some(),
-        "root task must be durable before the crash window"
-    );
-    services
-        .team_runtime()
-        .bind_instantiated_task_policies(&mut instantiated)
-        .expect("freeze inherited Task policy before durable Preparing marker");
-    let registered = services
-        .commit_service()
-        .register_graph(instantiated.graph.clone())
-        .expect("graph registered");
-    crate::team_binding::persist_preparing_with_task_commands(
-        services.event_store(),
-        &registered.graph.id,
-        instantiated
-            .binding
-            .as_ref()
-            .expect("compiled Team Binding"),
-        &instantiated.task_commands,
-    )
-    .expect("preparing marker persisted");
-    // Simulate a crash after exactly the first Task link was committed.
-    let first = instantiated.task_commands[0].clone();
-    assert_eq!(
-        first.parent_task_id.as_deref(),
-        Some(request.lineage.root_task_id.as_str()),
-        "first command parent is the root task"
-    );
-    let bound_spec = services
-        .task_runtime_port()
-        .bind_inherited_task_spec(
-            request.lineage.root_task_id.as_str(),
-            instantiated.task_permission_ceiling,
-            first.spec.clone(),
-        )
-        .expect("bind inherited task policy");
-    let mut bound_first = first.clone();
-    bound_first.spec = bound_spec;
-    services
-        .task_aggregate_service()
-        .create(bound_first)
-        .expect("first Task committed in the crash window");
-    services
-        .task_runtime_port()
-        .link_existing_graph(
-            &first.task_id,
-            &registered.graph.id,
-            registered.graph.revision,
-            vec![harness_contract::reality::EvidenceRef::observed(
-                "execution_graph",
-                format!(
-                    "execution-graph://{}?revision={}",
-                    registered.graph.id, registered.graph.revision
-                ),
-            )],
-        )
-        .expect("first link committed");
-
-    let projection = services
-        .team_runtime()
-        .instantiate_or_resume(request)
-        .await
-        .expect("resume completes the exact link set");
-    assert_eq!(projection.status, "unavailable");
-    assert_eq!(projection.tasks.len(), 2);
-    assert!(
-        crate::team_binding::has_ready_marker(services.event_store(), &registered.graph.id)
-            .expect("ready marker read"),
-        "resume must close the remaining link and mark Ready"
-    );
-    let linked = services
-        .task_aggregate_service()
-        .for_graphs(&[registered.graph.id.clone()])
-        .expect("durable Task link set");
-    assert_eq!(
-        linked.len(),
-        2,
-        "final link set must be exact: no duplicate, no missing link"
-    );
-}
-
-#[tokio::test]
-async fn same_team_ingress_claim_never_creates_a_second_root() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let services = RuntimeServices::in_memory().unwrap();
-    publish_team_test_policy(&services, "team-cas-session");
-    let request = team_request(
-        "team-cas-root",
-        "team-cas-session",
-        "cowd/execute-review",
-        "claim exactly one Team root",
-        "fast",
-        services.mission_runtime().default_mission_id(),
-    );
-    services
-        .team_runtime()
-        .admit(request.clone())
-        .await
-        .expect("first admission claims the root");
-    let second = services
-        .team_runtime()
-        .admit(request)
-        .await
-        .expect_err("same ingress+team tuple must not claim a second root");
-    assert!(second.contains("already claimed"));
-}
-
-#[tokio::test]
-async fn fanout_team_uses_runner_parallelism_without_a_team_scheduler() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir_all(&workspace).unwrap();
-    let providers = crate::config::ProvidersConfig {
-        providers: std::collections::HashMap::from([(
-            "test".into(),
-            crate::config::ProviderConfig {
-                name: "test".into(),
-                base_url: "https://example.test/v1".into(),
-                api_key: "test".into(),
-                models: vec!["fast".into()],
-                protocol: Some("responses".into()),
-                parallel_tool_calls: Default::default(),
-                early_tool_start: Default::default(),
-            },
-        )]),
-    };
-    let services = RuntimeServices::builder(temp.path(), &workspace)
-        .provider_registry(Arc::new(crate::ProviderRegistry::new(providers).unwrap()))
-        .build()
-        .unwrap();
-    publish_team_test_policy(&services, "team-runtime-session");
-    let active = Arc::new(AtomicUsize::new(0));
-    let max_active = Arc::new(AtomicUsize::new(0));
-    services
-        .agent_runtime()
-        .register_observation_authority_backend(Arc::new(ParallelTrackingAgentBackend {
-            active: Arc::clone(&active),
-            max_active: Arc::clone(&max_active),
-        }));
-    let projection = services
-        .team_runtime()
-        .instantiate(TeamInstantiationRequest {
-            cardinality_overrides: vec![TeamRoleCardinalityOverride {
-                role_id: "researcher".to_string(),
-                cardinality: RoleCardinalityPolicy::Fixed { count: 3 },
-            }],
-            focus_partition_plans: vec![harness_contract::team::FocusPartitionPlan {
-                role_id: "researcher".to_string(),
-                shared_baseline: vec!["compare the same architecture constraints".to_string()],
-                slots: vec![
-                    harness_contract::team::FocusPartitionSlot {
-                        focus_id: "architecture-a".to_string(),
-                        boundary: "only architecture-a".to_string(),
-                        evidence_responsibility: "source evidence for architecture-a".to_string(),
-                        capability_cropped_refs: vec!["read:architecture-a".to_string()],
-                        scope_hash: harness_contract::team::focus_scope_hash(
-                            "researcher",
-                            "only architecture-a",
-                            &["read:architecture-a".to_string()],
-                        ),
-                        overlap_budget_bp: 0,
-                        novelty_target_bp: 2_500,
-                        output_contract: vec!["findings".to_string(), "evidence".to_string()],
-                        output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
-                    },
-                    harness_contract::team::FocusPartitionSlot {
-                        focus_id: "architecture-b".to_string(),
-                        boundary: "only architecture-b".to_string(),
-                        evidence_responsibility: "source evidence for architecture-b".to_string(),
-                        capability_cropped_refs: vec!["read:architecture-b".to_string()],
-                        scope_hash: harness_contract::team::focus_scope_hash(
-                            "researcher",
-                            "only architecture-b",
-                            &["read:architecture-b".to_string()],
-                        ),
-                        overlap_budget_bp: 0,
-                        novelty_target_bp: 2_500,
-                        output_contract: vec!["findings".to_string(), "evidence".to_string()],
-                        output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
-                    },
-                    harness_contract::team::FocusPartitionSlot {
-                        focus_id: "architecture-c".to_string(),
-                        boundary: "only architecture-c".to_string(),
-                        evidence_responsibility: "source evidence for architecture-c".to_string(),
-                        capability_cropped_refs: vec!["read:architecture-c".to_string()],
-                        scope_hash: harness_contract::team::focus_scope_hash(
-                            "researcher",
-                            "only architecture-c",
-                            &["read:architecture-c".to_string()],
-                        ),
-                        overlap_budget_bp: 0,
-                        novelty_target_bp: 2_500,
-                        output_contract: vec!["findings".to_string(), "evidence".to_string()],
-                        output_acceptance: vec!["findings".to_string(), "evidence".to_string()],
-                    },
-                ],
-            }],
-            resource_scopes: vec![
-                "read:architecture-a".to_string(),
-                "read:architecture-b".to_string(),
-                "read:architecture-c".to_string(),
-            ],
-            ..team_request(
-                "team-runtime-fanout",
-                "team-runtime-session",
-                "cowd/parallel-research-synthesis",
-                "compare three independent architecture choices",
-                "fast",
-                services.mission_runtime().default_mission_id(),
-            )
-        })
-        .await
-        .expect("fanout team execution");
-    assert_eq!(projection.status, "unavailable");
-    assert!(max_active.load(Ordering::SeqCst) >= 2);
-    assert!(max_active.load(Ordering::SeqCst) <= 3);
-}
-
-#[test]
-fn ephemeral_team_snapshot_compiles_without_catalog_publication() {
-    let services = RuntimeServices::in_memory().expect("runtime services");
-    let mut request = team_request(
-        "ephemeral-template",
-        "ephemeral-session",
-        "cowd/parallel-research-synthesis",
-        "independently assess the bounded evidence",
-        "test-model",
-        services.mission_runtime().default_mission_id(),
-    );
-    let snapshot = crate::orchestration::compile_ephemeral_team_template_snapshot(
-        serde_json::json!({
-            "template_id": "cowd/ephemeral-independent-assessment",
-            "name": "独立证据评估团队",
-            "team_display_name": "独立评估",
-            "roles": [{
-                "role_id": "evidence_assessor",
-                "display_name": "证据评估师",
-                "responsibility": "独立检查已授权证据并报告不确定性",
-                "agent_definition_ref": "builtin/cowd/explore@1",
-                "grant_ceiling": ["read"],
-                "fixed_count": 1,
-                "acceptance": ["summary", "evidence"],
-                "behavior": [{"kind": "reacquire_evidence", "required": true}]
-            }],
-            "result_fields": ["summary", "evidence"],
-            "evidence_required": true,
-            "instructions": "# 独立评估\n\n只使用已授权证据，清楚列出不确定性。"
-        }),
-        &request.lineage,
-        harness_contract::policy::PermissionMode::ReadOnly,
-        "session-policy:ephemeral-session:1".to_string(),
-        u64::MAX,
-        &services,
-    )
-    .expect("custom snapshot compiles without catalog publication");
-    snapshot.validate().expect("snapshot is self-consistent");
-    let ephemeral_id = snapshot.revision.revision_ref.template_id.clone();
-    request.template_selector = TeamTemplateSelector::Ephemeral {
-        snapshot: Box::new(snapshot),
-    };
-    let planned = services
-        .team_runtime()
-        .plan(request)
-        .expect("ephemeral Team compiles without a published catalog revision");
-    assert_eq!(planned.template_ref.template_id, ephemeral_id);
-    assert!(services
-        .definition_registry()
-        .resolve_team(&ephemeral_id, RevisionSelector::LatestApprovedStable)
-        .is_err());
-}
-
-fn team_request(
-    team_id: &str,
-    session_id: &str,
-    template_id: &str,
-    objective: &str,
-    model_lease: &str,
-    mission_id: &str,
-) -> TeamInstantiationRequest {
-    TeamInstantiationRequest {
-        request_id: format!("test-request-{team_id}"),
-        team_id: team_id.to_string(),
-        mission_id: mission_id.to_string(),
-        lineage: harness_contract::execution_graph::ExecutionGraphLineage {
-            session_id: session_id.to_string(),
-            turn_id: format!("turn-{team_id}"),
-            root_task_id: format!("task-root-{team_id}"),
-            task_id: format!("task-root-{team_id}"),
-            generation: 1,
-        },
-        parent_execution: None,
-        selection_mode: TeamSelectionMode::Explicit,
-        strategy_binding: None,
-        template_selector: TeamTemplateSelector::LatestStable {
-            template_id: TeamTemplateDefinitionId::new(DefinitionScope::Builtin, template_id)
-                .expect("builtin Team template id"),
-        },
-        objective: objective.to_string(),
-        acceptance: vec!["summary".to_string(), "evidence".to_string()],
-        risk: None,
-        role_binding_overrides: Vec::new(),
-        display_name: None,
-        role_display_overrides: Vec::new(),
-        cardinality_overrides: Vec::new(),
-        focus_partition_plans: Vec::new(),
-        requires_managed_collaboration_escalation: false,
-        permission_ceiling: if template_id == "cowd/execute-review" {
-            harness_contract::policy::PermissionMode::WorkspaceWrite
-        } else {
-            harness_contract::policy::PermissionMode::ReadOnly
-        },
-        model_lease: model_lease.to_string(),
-        execution_budget: harness_contract::context::ParentExecutionBudget::new(
-            format!("service-team-budget:{team_id}"),
-            65_536,
-            u64::MAX,
-            32,
-            1,
-        ),
-        deadline_at_ms: u64::MAX,
-        managed_invocation: None,
-        resource_scopes: vec![if template_id == "cowd/execute-review" {
-            "write:crates/runtime".to_string()
-        } else {
-            "read:crates/runtime".to_string()
-        }],
-        allow_whole_workspace_scope: false,
-        upstream_evidence_refs: Vec::new(),
-        upstream_artifact_refs: Vec::new(),
-        upstream_result_context: Vec::new(),
-        execution_capacity: None,
-    }
-}
-
-fn publish_team_test_policy(services: &RuntimeServices, session_id: &str) {
-    services.publish_session_execution_policy(
-        session_id,
-        crate::permissions::SessionExecutionPolicyControl::from_policy(
-            harness_contract::policy::SessionExecutionPolicy::from_profile(
-                harness_contract::policy::AutonomyProfileId::Supervised,
-                1,
-                harness_contract::policy::SessionExecutionPolicyOrigin::SessionExplicit,
-            ),
-        ),
-    );
-}
-
-#[test]
-fn services_builder_imports_and_retires_unbound_legacy_team_state() {
-    let temp = tempfile::tempdir().unwrap();
-    let workspace = temp.path().join("workspace");
-    let legacy_path = temp
-        .path()
-        .join("agents")
-        .join("team-runtime")
-        .join("state.json");
-    std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::write(
-        &legacy_path,
-        r#"{"runs":{"legacy":{"snapshot":{"team_id":"legacy","status":"running"}}}}"#,
-    )
-    .unwrap();
-
-    let services = RuntimeServices::builder(temp.path(), &workspace)
-        .build()
-        .unwrap();
-    assert!(!legacy_path.exists());
-    let imported = services
-        .event_store()
-        .all_events(20)
-        .unwrap()
-        .into_iter()
-        .find(|event| event.kind == "team.legacy_imported")
-        .expect("legacy team audit event");
-    assert_eq!(imported.status.as_deref(), Some("blocked"));
-    assert_eq!(imported.payload["team_id"], "legacy");
-    assert_eq!(imported.payload["disposition"], "blocked_unbound");
 }
 
 #[test]

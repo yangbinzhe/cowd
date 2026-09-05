@@ -805,26 +805,6 @@ pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
         handler: "mission_control_summary_handler",
     },
     GatewayRouteBinding {
-        route: routes::GET_API_MISSION_CONTROL_TEAMS,
-        source: "mission_routes.rs",
-        handler: "collaboration_runs_handler",
-    },
-    GatewayRouteBinding {
-        route: routes::GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EVIDENCE,
-        source: "mission_routes.rs",
-        handler: "team_mission_evidence_handler",
-    },
-    GatewayRouteBinding {
-        route: routes::GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EXECUTION,
-        source: "mission_routes.rs",
-        handler: "team_execution_plan_handler",
-    },
-    GatewayRouteBinding {
-        route: routes::GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_RUN,
-        source: "mission_routes.rs",
-        handler: "collaboration_run_handler",
-    },
-    GatewayRouteBinding {
         route: routes::GET_API_MISSION_PROJECTION,
         source: "mission_routes.rs",
         handler: "mission_projection_handler",
@@ -975,6 +955,11 @@ pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
         handler: "get_runtime_events_replay_report",
     },
     GatewayRouteBinding {
+        route: routes::GET_API_RUNTIME_AGENTIC_PROGRAMS_ROOT,
+        source: "route_registry.rs",
+        handler: "get_root_agentic_program",
+    },
+    GatewayRouteBinding {
         route: routes::GET_API_RUNTIME_EXECUTIONS_BY_ID,
         source: "route_registry.rs",
         handler: "get_execution_projection",
@@ -1033,11 +1018,6 @@ pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
         route: routes::GET_API_RUNTIME_STATUS,
         source: "runtime_routes.rs",
         handler: "get_runtime_status",
-    },
-    GatewayRouteBinding {
-        route: routes::GET_API_RUNTIME_TEAMS_BY_ID_WORKING_STATE,
-        source: "agent_routes.rs",
-        handler: "team_working_state_handler",
     },
     GatewayRouteBinding {
         route: routes::GET_API_RUNTIME_TIMELINE,
@@ -1870,11 +1850,6 @@ pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
         handler: "bridge_mission_session_handler",
     },
     GatewayRouteBinding {
-        route: routes::POST_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_CANCEL,
-        source: "mission_routes.rs",
-        handler: "cancel_team_runtime_handler",
-    },
-    GatewayRouteBinding {
         route: routes::POST_API_MISSION_PROXIES,
         source: "mission_routes.rs",
         handler: "upsert_mission_proxy_handler",
@@ -2318,11 +2293,6 @@ pub(crate) const GATEWAY_ROUTE_BINDINGS: &[GatewayRouteBinding] = &[
         route: routes::POST_API_TASKS_START,
         source: "task_routes.rs",
         handler: "start_task_handler",
-    },
-    GatewayRouteBinding {
-        route: routes::POST_API_TEAM_TEMPLATES_INSTANTIATE,
-        source: "agent_routes.rs",
-        handler: "team_template_instantiate_handler",
     },
     GatewayRouteBinding {
         route: routes::POST_API_TOOLS_BATCH_READONLY,

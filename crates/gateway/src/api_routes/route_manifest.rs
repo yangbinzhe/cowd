@@ -211,7 +211,7 @@ mod tests {
                 && entry.handler == "route_manifest_handler"
                 && entry.source == "public_routes.rs"
         }));
-        assert_eq!(GATEWAY_ROUTE_BINDINGS.len(), 482);
+        assert_eq!(GATEWAY_ROUTE_BINDINGS.len(), 476);
     }
 
     #[test]

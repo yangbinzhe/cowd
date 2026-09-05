@@ -751,7 +751,7 @@ where
                                     }
                                     if matches!(
                                         tname.as_str(),
-                                        "tool_search" | "runtime_capabilities" | "team_board"
+                                        "tool_search" | "runtime_capabilities"
                                     ) {
                                         tool_exec
                                             .execute_invocation_output(
@@ -1281,32 +1281,6 @@ where
             raw_ref.clone(),
             granted.max(24),
         );
-        // Runtime collaboration commands already return a deliberately bounded model
-        // receipt. Preserve a completed terminal summary as valid JSON so the
-        // parent graph can consume it directly even on embedded/legacy hosts;
-        // generic head-tail evidence compaction can otherwise split the JSON
-        // and force an unnecessary parent model round.
-        if !is_error
-            && (tool_name.eq_ignore_ascii_case("runtime_orchestrate")
-                || tool_name.eq_ignore_ascii_case(
-                    harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID,
-                ))
-            && output.len() <= 24_000
-            && serde_json::from_str::<serde_json::Value>(output)
-                .ok()
-                .is_some_and(|value| {
-                    value.get("status").and_then(serde_json::Value::as_str) == Some("completed")
-                        && value
-                            .get("terminal_summary")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|summary| !summary.trim().is_empty())
-                })
-        {
-            receipt.summary = output.to_string();
-            receipt.receipt_tokens = raw_tokens;
-            receipt.omitted_tokens = 0;
-            receipt.truncated = false;
-        }
         if access.is_none() {
             if receipt.summary.starts_with("Tool `") {
                 receipt.summary = receipt.summary.replacen(

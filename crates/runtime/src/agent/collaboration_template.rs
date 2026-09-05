@@ -1,8 +1,8 @@
 //! Strategy-facing template selection.
 //!
-//! This is deliberately only a semantic matcher. Role topology, scheduling,
-//! memory writes, and execution belong respectively to the versioned protocol
-//! registry, RuntimeExecutionSupervisor, and Memory maintenance pipeline.
+//! This is deliberately only a semantic hint matcher. Dynamic topology and
+//! work decomposition belong to the model through Agent Actions; scheduling,
+//! effects and durable truth belong to Runtime services.
 
 use harness_contract::core::{ExecutionModifier, ExecutionPattern, TaskComplexity, TaskRisk};
 use harness_contract::strategy::{
@@ -14,9 +14,9 @@ use crate::definition_registry::RuntimeTeamTemplateCatalogEntry;
 
 /// Strategy-level reference to one durable Team Template family.
 ///
-/// This is only a recommendation vocabulary. It never constructs a graph or
-/// carries role definitions; Runtime turns it into a versioned
-/// `TeamTemplateSelector` before execution.
+/// This is only recommendation vocabulary. It never constructs a graph,
+/// freezes a role roster, or owns execution. The model may use the hint while
+/// freely composing a dynamic Agentic Program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollaborationTemplateId {
@@ -167,7 +167,7 @@ impl CollaborationTemplateMatcher {
         {
             (
                 CollaborationTemplateId::ParallelResearchSynthesis,
-                "independent evidence work can use the V5 fanout Team graph",
+                "independent evidence work benefits from parallel Agentic workstreams",
             )
         } else if matches!(strategy.understanding.domain, TaskDomain::Architecture)
             && !strategy.understanding.requires_write
@@ -213,7 +213,7 @@ impl CollaborationTemplateMatcher {
         {
             (
                 CollaborationTemplateId::PlannerExecutorVerifier,
-                "bounded work can use the V5 execute-review Team graph",
+                "bounded implementation benefits from independent Agentic review",
             )
         } else {
             (

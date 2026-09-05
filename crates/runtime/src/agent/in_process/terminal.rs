@@ -32,34 +32,6 @@ pub(super) fn agent_terminal_outcome(
     }
 }
 
-pub(super) fn needs_managed_escalation_recovery(
-    requires_escalation: bool,
-    has_successful_escalation: bool,
-    has_source_evidence: bool,
-) -> bool {
-    requires_escalation && !has_successful_escalation && has_source_evidence
-}
-
-pub(super) fn managed_escalation_recovery_input(packet: &AgentTaskPacket) -> String {
-    let focus = packet
-        .team_role_identity
-        .as_ref()
-        .map(|identity| identity.focus_id.as_str())
-        .filter(|focus| !focus.trim().is_empty())
-        .unwrap_or("the bounded source-evidence focus");
-    let node_digest = format!("{:x}", Sha256::digest(packet.node_id().as_bytes()));
-    serde_json::json!({
-        "reason": format!(
-            "Runtime requires an independent follow-up verification of {focus} after the managed Agent's durable source-evidence pass."
-        ),
-        "requested_add_team": {
-            "semantic_node_id": format!("managed-follow-up-{}", &node_digest[..16]),
-            "objective": format!("Independently verify the bounded evidence for {focus}."),
-        }
-    })
-    .to_string()
-}
-
 pub(super) fn agent_input_text(input: &AgentInput) -> String {
     match input {
         AgentInput::UserSupplement(text) => text.clone(),
@@ -122,22 +94,22 @@ pub(super) fn normalize_verified_narrative_terminal(
 /// write/change checks require receipts, source verification requires the
 /// pre/post read chain, and reviews require durable upstream evidence.
 pub(super) fn narrative_field_for_requirement(
-    requirement: &harness_contract::team::TeamAcceptanceRequirement,
-) -> Option<harness_contract::team::TeamStructuredOutputField> {
+    requirement: &harness_contract::agent::OutputAcceptanceRequirement,
+) -> Option<harness_contract::agent::StructuredOutputField> {
     match &requirement.check {
-        harness_contract::team::TeamAcceptanceCheck::StructuredField { field }
-        | harness_contract::team::TeamAcceptanceCheck::WorkspaceChange { field, .. } => {
+        harness_contract::agent::OutputAcceptanceCheck::StructuredField { field }
+        | harness_contract::agent::OutputAcceptanceCheck::WorkspaceChange { field, .. } => {
             Some(*field)
         }
-        harness_contract::team::TeamAcceptanceCheck::StructuredArtifact { .. } => None,
-        harness_contract::team::TeamAcceptanceCheck::SourceVerification { .. } => {
-            Some(harness_contract::team::TeamStructuredOutputField::SourceVerification)
+        harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact { .. } => None,
+        harness_contract::agent::OutputAcceptanceCheck::SourceVerification { .. } => {
+            Some(harness_contract::agent::StructuredOutputField::SourceVerification)
         }
-        harness_contract::team::TeamAcceptanceCheck::UpstreamReview => {
-            Some(harness_contract::team::TeamStructuredOutputField::Review)
+        harness_contract::agent::OutputAcceptanceCheck::UpstreamReview => {
+            Some(harness_contract::agent::StructuredOutputField::Review)
         }
-        harness_contract::team::TeamAcceptanceCheck::ScopedEvidence { .. }
-        | harness_contract::team::TeamAcceptanceCheck::UpstreamEvidence => None,
+        harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence { .. }
+        | harness_contract::agent::OutputAcceptanceCheck::UpstreamEvidence => None,
     }
 }
 
@@ -148,26 +120,26 @@ pub(super) fn narrative_field_for_requirement(
 /// A mixed contract may therefore preserve an explicit declaration while
 /// Runtime supplies only a missing presentation field such as `review`.
 const fn narrative_field_can_be_normalized(
-    field: harness_contract::team::TeamStructuredOutputField,
+    field: harness_contract::agent::StructuredOutputField,
 ) -> bool {
     matches!(
         field,
-        harness_contract::team::TeamStructuredOutputField::Findings
-            | harness_contract::team::TeamStructuredOutputField::Summary
-            | harness_contract::team::TeamStructuredOutputField::Plan
-            | harness_contract::team::TeamStructuredOutputField::Implementation
-            | harness_contract::team::TeamStructuredOutputField::SourceVerification
-            | harness_contract::team::TeamStructuredOutputField::Review
-            | harness_contract::team::TeamStructuredOutputField::Proposal
-            | harness_contract::team::TeamStructuredOutputField::Critique
-            | harness_contract::team::TeamStructuredOutputField::Mitigation
-            | harness_contract::team::TeamStructuredOutputField::Checkpoint
+        harness_contract::agent::StructuredOutputField::Findings
+            | harness_contract::agent::StructuredOutputField::Summary
+            | harness_contract::agent::StructuredOutputField::Plan
+            | harness_contract::agent::StructuredOutputField::Implementation
+            | harness_contract::agent::StructuredOutputField::SourceVerification
+            | harness_contract::agent::StructuredOutputField::Review
+            | harness_contract::agent::StructuredOutputField::Proposal
+            | harness_contract::agent::StructuredOutputField::Critique
+            | harness_contract::agent::StructuredOutputField::Mitigation
+            | harness_contract::agent::StructuredOutputField::Checkpoint
     )
 }
 
 pub(super) fn normalized_narrative_terminal_body(
     candidate: &str,
-    fields: &[harness_contract::team::TeamStructuredOutputField],
+    fields: &[harness_contract::agent::StructuredOutputField],
 ) -> Option<String> {
     if fields.is_empty() {
         return None;
@@ -194,12 +166,12 @@ pub(super) fn normalized_narrative_terminal_body(
             return None;
         }
         let value = match field {
-            harness_contract::team::TeamStructuredOutputField::Findings => output
+            harness_contract::agent::StructuredOutputField::Findings => output
                 .get("summary")
                 .filter(|value| materialized_json_value(value))
                 .cloned()
                 .unwrap_or_else(|| serde_json::Value::String(body.to_string())),
-            harness_contract::team::TeamStructuredOutputField::Summary => output
+            harness_contract::agent::StructuredOutputField::Summary => output
                 .get("findings")
                 .filter(|value| materialized_json_value(value))
                 .cloned()
@@ -208,21 +180,21 @@ pub(super) fn normalized_narrative_terminal_body(
             // acceptance facts.  Copying the Agent's own terminal wording is
             // safe only because callers have already established the
             // corresponding receipt/upstream evidence chain.
-            harness_contract::team::TeamStructuredOutputField::Plan
-            | harness_contract::team::TeamStructuredOutputField::Implementation
-            | harness_contract::team::TeamStructuredOutputField::SourceVerification
-            | harness_contract::team::TeamStructuredOutputField::Review
-            | harness_contract::team::TeamStructuredOutputField::Proposal
-            | harness_contract::team::TeamStructuredOutputField::Critique
-            | harness_contract::team::TeamStructuredOutputField::Mitigation
-            | harness_contract::team::TeamStructuredOutputField::Checkpoint => {
+            harness_contract::agent::StructuredOutputField::Plan
+            | harness_contract::agent::StructuredOutputField::Implementation
+            | harness_contract::agent::StructuredOutputField::SourceVerification
+            | harness_contract::agent::StructuredOutputField::Review
+            | harness_contract::agent::StructuredOutputField::Proposal
+            | harness_contract::agent::StructuredOutputField::Critique
+            | harness_contract::agent::StructuredOutputField::Mitigation
+            | harness_contract::agent::StructuredOutputField::Checkpoint => {
                 serde_json::Value::String(body.to_string())
             }
-            harness_contract::team::TeamStructuredOutputField::Risks
-            | harness_contract::team::TeamStructuredOutputField::Unresolved
-            | harness_contract::team::TeamStructuredOutputField::KeyDecisions
-            | harness_contract::team::TeamStructuredOutputField::UnresolvedOrRisks => {
-                unreachable!("non-presentation terminal fields are rejected before normalization")
+            harness_contract::agent::StructuredOutputField::Risks
+            | harness_contract::agent::StructuredOutputField::Unresolved
+            | harness_contract::agent::StructuredOutputField::KeyDecisions
+            | harness_contract::agent::StructuredOutputField::UnresolvedOrRisks => {
+                return None;
             }
         };
         output.insert(field.as_str().to_string(), value);
@@ -233,14 +205,6 @@ pub(super) fn normalized_narrative_terminal_body(
 #[cfg(test)]
 mod structured_output_probe {
     use super::*;
-
-    #[test]
-    fn mandatory_escalation_recovery_requires_evidence_and_an_unsatisfied_contract() {
-        assert!(needs_managed_escalation_recovery(true, false, true));
-        assert!(!needs_managed_escalation_recovery(false, false, true));
-        assert!(!needs_managed_escalation_recovery(true, true, true));
-        assert!(!needs_managed_escalation_recovery(true, false, false));
-    }
 
     #[test]
     fn arbiter_terminal_text_extracts_key_decisions() {

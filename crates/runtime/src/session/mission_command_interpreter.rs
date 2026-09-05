@@ -119,7 +119,7 @@ impl MissionCommandInterpreter {
                 MissionCommandTargetKind::Team => blocked(
                     command_text,
                     Some(target_ref),
-                    "team commands require the scoped TeamRuntime command adapter",
+                    "team collaboration is controlled by Agent Actions inside the active Program",
                 ),
                 MissionCommandTargetKind::Dispatch | MissionCommandTargetKind::Unknown => blocked(
                     command_text,

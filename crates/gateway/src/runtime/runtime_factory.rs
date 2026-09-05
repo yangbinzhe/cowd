@@ -162,6 +162,7 @@ pub(crate) fn create_runtime_entry_with_bootstrap_state(
         execution_parent: None,
         execution_role: runtime::TurnExecutionRole::RootTurn,
         recovered_tool_receipt_count: 0,
+        recovered_tool_receipts_require_text_only: true,
         runtime_services,
     })
     .map_err(std::io::Error::other)?;

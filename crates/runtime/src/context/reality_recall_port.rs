@@ -662,7 +662,6 @@ mod tests {
                 team_id: None,
                 read_scopes: vec![CognitiveReadScope::Session],
                 write_mode: CognitiveWriteMode::CandidateOnly,
-                team_working_state_visible: false,
                 fact_boundaries: Vec::new(),
                 fact_refs: Vec::new(),
                 matrix_snapshot_refs: snapshot_ref.into_iter().collect(),

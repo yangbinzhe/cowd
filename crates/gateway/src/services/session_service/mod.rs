@@ -246,9 +246,9 @@ impl SessionService {
         supervisor: Arc<crate::session_runtime_bridge::SessionWorkerSupervisor>,
     ) -> Self {
         let service = Self::new_unbound(runtime, coordinator);
-        service
-            .install_supervisor(supervisor)
-            .expect("new SessionService has no installed supervisor");
+        if let Err(error) = service.install_supervisor(supervisor) {
+            tracing::error!(%error, "new SessionService rejected its initial supervisor");
+        }
         service
     }
 
@@ -3027,7 +3027,7 @@ impl SessionService {
             (true, true) => SessionFocusMutation::FocusInvalidated,
             (true, false) => SessionFocusMutation::TaskInvalidated,
             (false, true) => SessionFocusMutation::MissionInvalidated,
-            (false, false) => unreachable!(),
+            (false, false) => return Ok(focus),
         };
         self.mutate_routing_focus(
             &record.session_id,

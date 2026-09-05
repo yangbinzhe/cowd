@@ -65,13 +65,6 @@ impl EvolutionCapabilityGoal {
                 "skill",
                 vec!["skill package contains instructions, manifest, and rollback metadata"],
             ),
-            EvolutionCandidateKind::TeamTemplate => (
-                "complex_task_success",
-                "Complex task success",
-                vec!["parallel_efficiency", "conflict_resolution"],
-                "runtime",
-                vec!["team template maps roles, boundaries, evidence, and intervention"],
-            ),
             EvolutionCandidateKind::SessionPolicy => (
                 "task_continuity",
                 "Task continuity",

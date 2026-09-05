@@ -478,7 +478,11 @@ fn validate_intent_node(
         request
             .allowed_tools
             .iter()
-            .filter(|tool| !tool.eq_ignore_ascii_case("runtime_orchestrate"))
+            .filter(|tool| {
+                !harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+                    .iter()
+                    .any(|action| tool.eq_ignore_ascii_case(action))
+            })
             .cloned()
             .collect::<Vec<_>>()
     } else {

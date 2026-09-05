@@ -622,7 +622,17 @@ impl AuthorizationNegotiator {
                     )
                 }
             }
-            PermissionPolicyRoute::HardDeny { .. } => unreachable!("handled before lease lookup"),
+            PermissionPolicyRoute::HardDeny { reason } => denied_assessment(
+                request,
+                effective,
+                required_mode,
+                active_ceiling,
+                risk,
+                fingerprint,
+                CapabilityGapKind::HardDenied,
+                &reason,
+                false,
+            ),
         }
     }
 
@@ -934,14 +944,13 @@ impl AuthorizationNegotiator {
                 .front()
                 .is_some_and(|transition| selected.contains(transition.transition_id.as_str()))
         {
-            let transition = registry
-                .transitions_awaiting_persistence
-                .pop_front()
-                .expect("front transition was present");
-            if transition_ends_hot_lease(&transition) {
-                release_terminal_lease(&mut registry, &transition.lease.lease_id);
+            if let Some(transition) = registry.transitions_awaiting_persistence.pop_front() {
+                if transition_ends_hot_lease(&transition) {
+                    release_terminal_lease(&mut registry, &transition.lease.lease_id);
+                }
+                return 1;
             }
-            return 1;
+            return 0;
         }
         if selected.len() == 1 {
             return 0;
@@ -1775,9 +1784,9 @@ mod tests {
     #[test]
     fn full_trust_session_lease_carries_the_session_ceiling_not_the_effect_floor() {
         let mut descriptor = effect(PermissionMode::WorkspaceWrite, EffectExternality::Workspace);
-        descriptor.tool_id = "runtime_orchestrate".to_string();
+        descriptor.tool_id = "task_publish".to_string();
         let mut request = request(descriptor);
-        request.capability = "runtime_orchestrate".to_string();
+        request.capability = "task_publish".to_string();
         let assessment = AuthorizationNegotiator::new().assess(
             &PermissionPolicy::new(PermissionMode::DangerFullAccess),
             &request,
@@ -1793,7 +1802,7 @@ mod tests {
             PermissionMode::WorkspaceWrite,
             "the effect floor must remain visible on the assessment"
         );
-        assert!(lease.permits("runtime_orchestrate", PermissionMode::WorkspaceWrite));
+        assert!(lease.permits("task_publish", PermissionMode::WorkspaceWrite));
     }
 
     #[test]

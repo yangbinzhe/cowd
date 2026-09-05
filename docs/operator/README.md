@@ -55,7 +55,7 @@ cowd apps restart <app-id>
 | 会话显示“受限会话” | 浏览器会话 credential epoch 过期 | 刷新/重登一次；新版会自动识别并恢复 |
 | `live subscription count exceeded` | 旧订阅未释放 | 刷新页面；已提升默认上限 |
 | `live subscription count exceeded`（多标签） | 标签共享实例额度 | 升级到 v0.9.675：surface_instance 已加入 tab nonce，每标签独立计数 |
-| 团队任务无终态 | 必需节点未完成（工具适配缺失/超时） | 已修复 team_board/evidence_retrieve 委托；查看执行图错误 |
+| 团队任务无终态 | 必需 Agentic Task/Artifact 未提交或 Supervisor 尚未裁决 | 查看 Program 中的 Task claim/submit、Artifact commit 与 Supervisor diagnostic |
 | 审批不弹出 | 旧前端版本 | 更新到 v0.9.673+，任意页面自动弹出 |
 | 记忆 L0 为空 | 未配置 identity | 配置 `memory.identity.role/language` 后重启 |
 | Windows 沙箱 | 平台能力未实现 | v0.9.675 明确不支持；生产环境请使用 Linux |

@@ -272,7 +272,121 @@ pub(super) struct ExecutionActivityQuery {
     activity_id: String,
 }
 
-pub(super) async fn execution_projection_context(
+/// Stable lookup key for the root Agent-first Program of one conversational
+/// turn. The caller cannot choose a Program id: Gateway derives it from the
+/// same Runtime-owned Session/Turn lineage used by the conversation host.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AgenticProgramRootQuery {
+    pub(super) session_id: String,
+    pub(super) turn_id: String,
+}
+
+fn validated_agentic_program_identity(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '-' | '_' | '.')))
+    .then_some(value)
+}
+
+async fn session_projection_read_authorized(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    session_id: &str,
+) -> Result<bool, (StatusCode, Json<ErrorResponse>)> {
+    let claims = principal.0.claims();
+    let explicit_session = claims
+        .scopes
+        .iter()
+        .any(|claim| claim == &format!("session:{session_id}"));
+    let owns_session = state
+        .services
+        .session
+        .stored_session(session_id)
+        .await
+        .map_err(|error| {
+            runtime_event_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to resolve Agent-first Program session owner: {error}"),
+            )
+        })?
+        .and_then(|record| {
+            record
+                .metadata_json
+                .as_deref()
+                .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+                .and_then(|metadata| {
+                    metadata
+                        .get("owner_principal_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+        })
+        .is_some_and(|owner| owner == claims.principal_id);
+    Ok(projection_read_authorized(
+        principal,
+        owns_session,
+        explicit_session,
+        false,
+    ))
+}
+
+pub(super) async fn get_root_agentic_program(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Query(query): Query<AgenticProgramRootQuery>,
+) -> Result<Json<runtime::AgenticProgramProjection>, (StatusCode, Json<ErrorResponse>)> {
+    let session_id = validated_agentic_program_identity(&query.session_id).ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::BAD_REQUEST,
+            "session_id must be 1..=128 safe identifier characters",
+        )
+    })?;
+    let turn_id = validated_agentic_program_identity(&query.turn_id).ok_or_else(|| {
+        runtime_event_error(
+            StatusCode::BAD_REQUEST,
+            "turn_id must be 1..=128 safe identifier characters",
+        )
+    })?;
+    if !session_projection_read_authorized(&state, &principal, session_id).await? {
+        return Err(runtime_event_error(
+            StatusCode::FORBIDDEN,
+            "Agent-first Program is outside the authenticated principal scope",
+        ));
+    }
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let program_id = harness_contract::agent_action::program_id_for_objective(&objective_id);
+    let runtime = execution_runtime(&state)?;
+    let projection = runtime
+        .agent_action_service()
+        .project(&program_id)
+        .map_err(|error| match &error {
+            runtime::AgentActionServiceError::Corrupt(message)
+                if message == "program_not_found" =>
+            {
+                runtime_event_error(StatusCode::NOT_FOUND, "Agent-first Program not found")
+            }
+            _ => runtime_event_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to project Agent-first Program: {error}"),
+            ),
+        })?;
+    if projection.session_id != session_id
+        || projection.turn_id != turn_id
+        || projection.objective_id != objective_id
+    {
+        return Err(runtime_event_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Agent-first Program root binding is corrupt",
+        ));
+    }
+    Ok(Json(projection))
+}
+
+pub(crate) async fn execution_projection_context(
     state: &AppState,
     principal: &AuthenticatedPrincipal,
     execution_id: &str,
@@ -946,12 +1060,10 @@ async fn record_upgrade_disposition(
                     None => Err(format!("agent not found: {}", request.carrier_id)),
                 }
             }
-            "team" => state
-                .services
-                .mission
-                .cancel_team_runtime(&request.carrier_id)
-                .await
-                .map(|_| ()),
+            "team" => Err(
+                "legacy Team carriers are retired; cancel the owning Agent-first execution"
+                    .to_string(),
+            ),
             "mission_session" => {
                 // Maintenance is a surface-originated control action too. It
                 // must use the same durable Mission command boundary as TUI,

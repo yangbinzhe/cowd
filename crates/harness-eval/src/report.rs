@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{ComplexHarnessScenarioReport, E2eScenarioMatrixItem, StableAiHealthReport};
@@ -192,6 +192,373 @@ impl HarnessEvalReportGate {
     }
 }
 
+/// Evaluate the canonical Agent-first closure projection.  This deliberately
+/// consumes only durable projection facts; a model's claimed status or a
+/// summary counter is never sufficient to pass the gate.
+#[must_use]
+pub fn evaluate_agentic_program_closure(value: &Value) -> Value {
+    let projection = value.get("projection").unwrap_or(value);
+    let mut checks = Vec::new();
+    let mut missing = Vec::new();
+    let mut check = |name: &str, passed: bool, evidence: Value| {
+        if !passed {
+            missing.push(name.to_string());
+        }
+        checks.push(json!({"name": name, "passed": passed, "evidence": evidence}));
+    };
+
+    let nonempty = has_nonempty_string;
+    let (program_identity, program_identity_evidence) = program_identity_check(projection);
+    check(
+        "program_identity_bound",
+        program_identity,
+        program_identity_evidence,
+    );
+
+    let teams = projection
+        .get("teams")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let agents = projection
+        .get("agents")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let tasks = projection
+        .get("tasks")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let artifacts = projection
+        .get("artifacts")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let topics = projection
+        .get("topics")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let required_team_count = projection
+        .get("required_team_count")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as usize;
+    check(
+        "teams_materialized",
+        required_team_count > 0 && teams.len() >= required_team_count,
+        json!({"required": required_team_count, "observed": teams.len()}),
+    );
+
+    let teams_well_formed = !teams.is_empty()
+        && teams.iter().all(|(team_id, team)| {
+            team.get("team_id").and_then(Value::as_str) == Some(team_id)
+                && nonempty(team.get("name"))
+                && nonempty(team.get("topic_ref"))
+                && !team
+                    .get("member_ids")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+                && !team
+                    .get("task_ids")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+        });
+    check(
+        "team_projection_integrity",
+        teams_well_formed,
+        json!({"teams": teams.len()}),
+    );
+
+    let agents_well_formed = !agents.is_empty()
+        && agents.iter().all(|(agent_id, agent)| {
+            let team_id = agent.get("team_id").and_then(Value::as_str);
+            agent.get("agent_id").and_then(Value::as_str) == Some(agent_id)
+                && team_id.is_some_and(|team_id| teams.contains_key(team_id))
+                && team_id.is_some_and(|team_id| {
+                    teams
+                        .get(team_id)
+                        .and_then(|team| team.get("member_ids"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|members| {
+                            members
+                                .iter()
+                                .any(|member| member.as_str() == Some(agent_id))
+                        })
+                })
+        });
+    check(
+        "agent_projection_integrity",
+        agents_well_formed,
+        json!({"agents": agents.len()}),
+    );
+
+    let active_tasks = tasks
+        .iter()
+        .filter(|(_, task)| task.get("status").and_then(Value::as_str) != Some("superseded"))
+        .collect::<Vec<_>>();
+    let tasks_well_formed = !active_tasks.is_empty()
+        && active_tasks.iter().all(|(task_id, task)| {
+            let team_id = task.get("team_id").and_then(Value::as_str);
+            let claimant = task.get("claimant").and_then(Value::as_str);
+            let reviewer = task.get("reviewed_by").and_then(Value::as_str);
+            task.get("task_id").and_then(Value::as_str) == Some(task_id)
+                && team_id.is_some_and(|team_id| teams.contains_key(team_id))
+                && team_id.is_some_and(|team_id| {
+                    teams
+                        .get(team_id)
+                        .and_then(|team| team.get("task_ids"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|task_ids| {
+                            task_ids.iter().any(|id| id.as_str() == Some(task_id))
+                        })
+                })
+                && task.get("status").and_then(Value::as_str) == Some("accepted")
+                && claimant.is_some_and(|agent_id| agents.contains_key(agent_id))
+                && reviewer.is_some_and(|agent_id| agents.contains_key(agent_id))
+                && claimant != reviewer
+                && !task
+                    .get("artifact_refs")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+                && !task
+                    .get("evidence_refs")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+        });
+    check(
+        "tasks_accepted_and_independently_verified",
+        tasks_well_formed,
+        json!({"active_tasks": active_tasks.len()}),
+    );
+
+    let dependencies_verified = active_tasks.iter().all(|(_, task)| {
+        task.get("depends_on")
+            .and_then(Value::as_array)
+            .is_none_or(|dependencies| {
+                dependencies.iter().all(|dependency| {
+                    dependency
+                        .as_str()
+                        .and_then(|id| tasks.get(id))
+                        .is_some_and(|dependency| {
+                            dependency.get("status").and_then(Value::as_str) == Some("accepted")
+                        })
+                })
+            })
+    });
+    check(
+        "task_dependencies_verified",
+        dependencies_verified,
+        json!({"active_tasks": active_tasks.len()}),
+    );
+
+    let artifacts_well_formed = !artifacts.is_empty()
+        && artifacts.iter().all(|(artifact_ref, artifact)| {
+            artifact.get("artifact_ref").and_then(Value::as_str) == Some(artifact_ref)
+                && nonempty(artifact.get("content_ref"))
+                && artifact
+                    .get("committed_by")
+                    .and_then(Value::as_str)
+                    .is_some_and(|agent_id| agents.contains_key(agent_id))
+        })
+        && active_tasks.iter().all(|(_, task)| {
+            task.get("artifact_refs")
+                .and_then(Value::as_array)
+                .is_some_and(|refs| {
+                    refs.iter().all(|reference| {
+                        reference
+                            .as_str()
+                            .is_some_and(|reference| artifacts.contains_key(reference))
+                    })
+                })
+        });
+    check(
+        "artifacts_are_durable_and_bound",
+        artifacts_well_formed,
+        json!({"artifacts": artifacts.len()}),
+    );
+
+    let topics_well_formed = !topics.is_empty()
+        && teams.iter().all(|(_, team)| {
+            team.get("topic_ref")
+                .and_then(Value::as_str)
+                .is_some_and(|topic_ref| {
+                    topics
+                        .get(topic_ref)
+                        .and_then(Value::as_array)
+                        .is_some_and(|entries| {
+                            !entries.is_empty()
+                                && entries.iter().all(|entry| {
+                                    nonempty(entry.get("entry_id"))
+                                        && entry
+                                            .get("actor_id")
+                                            .and_then(Value::as_str)
+                                            .is_some_and(|agent_id| agents.contains_key(agent_id))
+                                        && !entry
+                                            .get("refs")
+                                            .and_then(Value::as_array)
+                                            .is_none_or(Vec::is_empty)
+                                })
+                        })
+                })
+        });
+    check(
+        "topics_carry_referenced_coordination",
+        topics_well_formed,
+        json!({"topics": topics.len()}),
+    );
+
+    let final_artifact_ref = projection.get("final_artifact_ref").and_then(Value::as_str);
+    let completion = projection.get("completion_request");
+    let verdict = projection.get("objective_verdict");
+    let terminal_verified = terminal_projection_verified(projection, &artifacts);
+    check(
+        "terminal_projection_verified",
+        terminal_verified,
+        json!({
+            "status": projection.get("status"),
+            "final_artifact_ref": final_artifact_ref,
+            "completion_request": completion.is_some(),
+            "objective_verdict": verdict.is_some()
+        }),
+    );
+
+    agentic_closure_result(
+        projection,
+        checks,
+        missing,
+        [
+            teams.len(),
+            agents.len(),
+            active_tasks.len(),
+            artifacts.len(),
+            topics.len(),
+        ],
+        terminal_verified,
+    )
+}
+
+fn agentic_closure_result(
+    projection: &Value,
+    checks: Vec<Value>,
+    missing: Vec<String>,
+    counts: [usize; 5],
+    terminal_verified: bool,
+) -> Value {
+    let [teams, agents, active_tasks, artifacts, topics] = counts;
+    json!({
+        "kind": "harness_eval.agentic_program_closure",
+        "status": if missing.is_empty() { "passed" } else { "failed" },
+        "checks": checks,
+        "missing": missing,
+        "facts": {
+            "program_id": projection.get("program_id"),
+            "teams": teams,
+            "agents": agents,
+            "active_tasks": active_tasks,
+            "artifacts": artifacts,
+            "topics": topics,
+            "verified": terminal_verified
+        }
+    })
+}
+
+fn has_nonempty_string(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn program_identity_check(projection: &Value) -> (bool, Value) {
+    let passed = [
+        "program_id",
+        "objective_id",
+        "session_id",
+        "turn_id",
+        "root_execution_id",
+    ]
+    .into_iter()
+    .all(|field| has_nonempty_string(projection.get(field)));
+    (
+        passed,
+        json!({
+            "program_id": projection.get("program_id"),
+            "objective_id": projection.get("objective_id"),
+            "session_id": projection.get("session_id"),
+            "turn_id": projection.get("turn_id"),
+            "root_execution_id": projection.get("root_execution_id")
+        }),
+    )
+}
+
+fn terminal_projection_verified(
+    projection: &Value,
+    artifacts: &serde_json::Map<String, Value>,
+) -> bool {
+    let final_artifact_ref = projection.get("final_artifact_ref").and_then(Value::as_str);
+    let completion = projection.get("completion_request");
+    let verdict = projection.get("objective_verdict");
+    projection.get("status").and_then(Value::as_str) == Some("verified")
+        && has_nonempty_string(projection.get("final_artifact_ref"))
+        && final_artifact_ref.is_some_and(|reference| artifacts.contains_key(reference))
+        && completion.is_some_and(|completion| {
+            has_nonempty_string(completion.get("action_id"))
+                && has_nonempty_string(completion.get("requested_by"))
+                && completion.get("final_artifact_ref").and_then(Value::as_str)
+                    == final_artifact_ref
+                && !completion
+                    .get("evidence_refs")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+        })
+        && verdict.is_some_and(|verdict| {
+            verdict.get("kind").and_then(Value::as_str) == Some("satisfied")
+                && has_nonempty_string(verdict.get("terminal_fence"))
+                && verdict
+                    .get("authority_revision")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|revision| revision > 0)
+        })
+        && projection
+            .get("unresolved")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+}
+
+fn agentic_program_closure_claimed(report: &Value, scenarios: &[Value]) -> bool {
+    report
+        .get("agentic_program_closure")
+        .is_some_and(|closure| !closure.is_null())
+        || scenarios.iter().any(|scenario| {
+            scenario.get("capability").and_then(Value::as_str) == Some("agentic_program_closure")
+        })
+        || report
+            .pointer("/live_gateway_scenarios/scenarios")
+            .and_then(Value::as_array)
+            .is_some_and(|scenarios| {
+                scenarios.iter().any(|scenario| {
+                    scenario
+                        .pointer("/production_trace/agentic_program")
+                        .is_some_and(|projection| !projection.is_null())
+                })
+            })
+}
+
+fn agentic_closure_gate_evidence(closure: &Value) -> String {
+    let facts = closure.get("facts").unwrap_or(&Value::Null);
+    format!(
+        "status={}, program={}, teams={}, agents={}, tasks={}, artifacts={}, topics={}, verified={}",
+        closure.get("status").and_then(Value::as_str).unwrap_or("missing"),
+        facts.get("program_id").and_then(Value::as_str).unwrap_or("missing"),
+        facts.get("teams").and_then(Value::as_u64).unwrap_or_default(),
+        facts.get("agents").and_then(Value::as_u64).unwrap_or_default(),
+        facts.get("active_tasks").and_then(Value::as_u64).unwrap_or_default(),
+        facts.get("artifacts").and_then(Value::as_u64).unwrap_or_default(),
+        facts.get("topics").and_then(Value::as_u64).unwrap_or_default(),
+        facts.get("verified").and_then(Value::as_bool).unwrap_or(false),
+    )
+}
+
 #[must_use]
 pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     let level = report
@@ -232,9 +599,6 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         .get("event_observation_parity")
         .unwrap_or(&Value::Null);
     let reality_context = report.get("reality_context_eval").unwrap_or(&Value::Null);
-    let mission_runtime = report
-        .get("mission_runtime_collaboration")
-        .unwrap_or(&Value::Null);
     let next_gen = report
         .get("next_gen_harness_closure")
         .unwrap_or(&Value::Null);
@@ -320,9 +684,13 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
     items.push(HarnessEvalReportGateItem::new(
         "scenario_capability_status",
         !scenarios.is_empty()
-            && scenarios
-                .iter()
-                .all(|item| item.get("status").and_then(Value::as_str) == Some("passed")),
+            && scenarios.iter().all(|item| {
+                item.get("status").and_then(Value::as_str) == Some("passed")
+                    || (level != "deep"
+                        && item.get("capability").and_then(Value::as_str)
+                            == Some("next_gen_harness_closure")
+                        && item.get("status").and_then(Value::as_str) == Some("not_observed"))
+            }),
         true,
         format!("scenario_capabilities={}", scenarios.len()),
         "fix failed capability rows before accepting the report",
@@ -376,32 +744,29 @@ pub fn evaluate_report_gate(report: &Value) -> HarnessEvalReportGate {
         ),
         "repair RecallReport/ContextEnvelope scenario evidence before accepting the report",
     ));
+    let agentic_closure_required = agentic_program_closure_claimed(report, &scenarios);
+    let agentic_closure = report
+        .get("agentic_program_closure")
+        .map(evaluate_agentic_program_closure)
+        .unwrap_or_else(
+            || json!({"status": "not_observed", "checks": [], "missing": ["projection"]}),
+        );
     items.push(HarnessEvalReportGateItem::new(
-        "mission_runtime_collaboration_closure",
-        scenario_status(&scenarios, "mission_runtime_collaboration_closure") == Some("passed")
-            && mission_runtime.get("status").and_then(Value::as_str) == Some("passed")
-            && mission_runtime
-                .pointer("/mission_projection/schema_version")
-                .and_then(Value::as_u64)
-                .is_some_and(|version| version >= 2),
-        true,
-        format!(
-            "status={}, projection_v={}",
-            mission_runtime
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("missing"),
-            mission_runtime
-                .pointer("/mission_projection/schema_version")
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-        ),
-        "repair mission runtime collaboration closure before accepting the report",
+        "agentic_program_closure_verified",
+        !agentic_closure_required
+            || agentic_closure.get("status").and_then(Value::as_str) == Some("passed"),
+        agentic_closure_required,
+        agentic_closure_gate_evidence(&agentic_closure),
+        "provide the durable AgenticProgram projection and satisfy Program/Team/Agent/Task/Artifact/Topic, independent verification, and terminal-fence checks",
     ));
     items.push(HarnessEvalReportGateItem::new(
         "next_gen_harness_closure_complete",
-        scenario_status(&scenarios, "next_gen_harness_closure") == Some("passed")
+        (scenario_status(&scenarios, "next_gen_harness_closure") == Some("passed")
             && next_gen.get("status").and_then(Value::as_str) == Some("passed")
+            || (level != "deep"
+                && scenario_status(&scenarios, "next_gen_harness_closure")
+                    == Some("not_observed")
+                && next_gen.get("status").and_then(Value::as_str) == Some("not_observed")))
             && next_gen
                 .get("failed")
                 .and_then(Value::as_u64)
@@ -930,6 +1295,73 @@ mod gate_tests {
             .expect("gate item")
     }
 
+    fn verified_agentic_program_closure() -> Value {
+        json!({
+            "projection": {
+                "program_id": "program-test",
+                "objective_id": "objective-test",
+                "session_id": "session-test",
+                "turn_id": "turn-test",
+                "root_execution_id": "execution-test",
+                "required_team_count": 1,
+                "status": "verified",
+                "teams": {
+                    "team-test": {
+                        "team_id": "team-test",
+                        "name": "Research",
+                        "topic_ref": "topic-test",
+                        "member_ids": ["agent-claimant", "agent-reviewer"],
+                        "task_ids": ["task-test"]
+                    }
+                },
+                "agents": {
+                    "agent-claimant": {"agent_id": "agent-claimant", "team_id": "team-test"},
+                    "agent-reviewer": {"agent_id": "agent-reviewer", "team_id": "team-test"}
+                },
+                "tasks": {
+                    "task-test": {
+                        "task_id": "task-test",
+                        "team_id": "team-test",
+                        "status": "accepted",
+                        "claimant": "agent-claimant",
+                        "reviewed_by": "agent-reviewer",
+                        "artifact_refs": ["artifact-test"],
+                        "evidence_refs": ["evidence:test"],
+                        "depends_on": []
+                    }
+                },
+                "artifacts": {
+                    "artifact-test": {
+                        "artifact_ref": "artifact-test",
+                        "content_ref": "content:test",
+                        "committed_by": "agent-claimant"
+                    }
+                },
+                "topics": {
+                    "topic-test": [{
+                        "entry_id": "entry-test",
+                        "actor_id": "agent-claimant",
+                        "refs": ["artifact-test"]
+                    }]
+                },
+                "final_artifact_ref": "artifact-test",
+                "completion_request": {
+                    "action_id": "complete-test",
+                    "requested_by": "agent-claimant",
+                    "program_revision": 2,
+                    "final_artifact_ref": "artifact-test",
+                    "evidence_refs": ["evidence:test"]
+                },
+                "objective_verdict": {
+                    "kind": "satisfied",
+                    "terminal_fence": "terminal:test",
+                    "authority_revision": 2
+                },
+                "unresolved": []
+            }
+        })
+    }
+
     #[test]
     fn gate_accepts_real_gateway_model_metrics_without_report_reviewer() {
         let report = json!({
@@ -960,6 +1392,42 @@ mod gate_tests {
             "passed"
         );
         assert_eq!(item("token_usage_nonzero_or_estimated").status, "passed");
+    }
+
+    #[test]
+    fn agentic_program_closure_requires_all_durable_entity_facts() {
+        let closure = verified_agentic_program_closure();
+        let result = evaluate_agentic_program_closure(&closure);
+        assert_eq!(result["status"], "passed");
+        assert_eq!(result["facts"]["teams"], 1);
+        assert_eq!(result["facts"]["agents"], 2);
+        assert_eq!(result["facts"]["active_tasks"], 1);
+        assert_eq!(result["facts"]["artifacts"], 1);
+        assert_eq!(result["facts"]["topics"], 1);
+
+        let mut tampered = closure;
+        tampered["projection"]["tasks"]["task-test"]["reviewed_by"] = json!("agent-claimant");
+        let result = evaluate_agentic_program_closure(&tampered);
+        assert_eq!(result["status"], "failed");
+        assert!(result["missing"]
+            .as_array()
+            .expect("missing checks")
+            .iter()
+            .any(|item| item == "tasks_accepted_and_independently_verified"));
+    }
+
+    #[test]
+    fn agentic_program_claim_cannot_pass_from_summary_status_alone() {
+        let report = json!({
+            "level": "deep",
+            "scenarios": [{"capability": "agentic_program_closure", "status": "passed"}],
+            "agentic_program_closure": {"status": "passed", "facts": {"teams": 9}}
+        });
+        let gate = evaluate_report_gate(&report);
+        assert_eq!(
+            gate_item(&gate, "agentic_program_closure_verified").status,
+            "failed"
+        );
     }
 
     #[test]

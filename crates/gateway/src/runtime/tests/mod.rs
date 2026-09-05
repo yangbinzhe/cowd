@@ -1629,7 +1629,7 @@ fn upgrade_status_mapping_preserves_active_and_terminal_boundaries() {
         runtime::UpgradeCarrierStatus::Completed
     );
     assert_eq!(
-        upgrade_team_status("review_required"),
+        upgrade_agentic_program_status(runtime::AgenticProgramStatus::CompletionRequested),
         runtime::UpgradeCarrierStatus::Waiting
     );
 }

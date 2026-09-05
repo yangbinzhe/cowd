@@ -135,22 +135,21 @@ impl SkillMaintenanceProjector {
         }
     }
 
-    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> Result<RuntimeProjectionLane, String> {
         let projector = Arc::clone(self);
-        RuntimeProjectionLane::blocking(
+        Ok(RuntimeProjectionLane::blocking(
             RuntimeProjectionDescriptor::new(
                 PROJECTOR_ID,
                 projection_interest(),
                 PROJECTOR_WORKER_BATCH,
                 IDLE_POLL,
-            )
-            .expect("Skill maintenance projection descriptor is static and valid")
+            )?
             .with_latency_class(RuntimeProjectionLatencyClass::Maintenance),
             move |batch_size| {
                 let processed = projector.project_available(batch_size)?;
                 Ok(RuntimeProjectionPass::scanned(processed, batch_size))
             },
-        )
+        ))
     }
 
     #[must_use]
@@ -358,9 +357,9 @@ fn reduce_receipt(snapshot: &mut SkillMaintenanceSnapshot, receipt: SkillUsageRe
     if receipts.len() > MAX_RECEIPTS_PER_SCOPE {
         receipts.drain(..receipts.len() - MAX_RECEIPTS_PER_SCOPE);
     }
-    if let Some(outcome) = snapshot
-        .outcomes
-        .get(&receipts.last().expect("receipt").execution_id)
+    if let Some(outcome) = receipts
+        .last()
+        .and_then(|receipt| snapshot.outcomes.get(&receipt.execution_id))
     {
         scoped
             .outcomes
@@ -397,11 +396,13 @@ fn reduce_outcome(snapshot: &mut SkillMaintenanceSnapshot, outcome: ExecutionOut
     snapshot
         .outcomes
         .insert(evidence.execution_id.clone(), evidence);
-    let evidence = snapshot
+    let Some(evidence) = snapshot
         .outcomes
         .get(&outcome.identity.execution_id)
         .cloned()
-        .expect("inserted Outcome evidence");
+    else {
+        return;
+    };
     for scoped in snapshot.receipts.values_mut() {
         if scoped
             .receipts

@@ -353,7 +353,6 @@ fn config_runtime_control_merges_scenario_and_policy_overrides() {
                   "capacity": {
                     "profile_id": "research-narrow",
                     "revision": 3,
-                    "max_agent_nodes_per_team": 12,
                     "max_pending_per_key": 128
                   }
                 }
@@ -376,7 +375,6 @@ fn config_runtime_control_merges_scenario_and_policy_overrides() {
     assert_eq!(runtime.policy.memory.max_candidates_per_turn, 3);
     assert_eq!(runtime.policy.capacity.profile_id, "research-narrow");
     assert_eq!(runtime.policy.capacity.revision, 3);
-    assert_eq!(runtime.policy.capacity.max_agent_nodes_per_team, 12);
     assert_eq!(runtime.policy.capacity.max_pending_per_key, 128);
     assert_eq!(runtime.policy.mission_schedule.tick_interval_ms, 1_500);
     assert_eq!(runtime.policy.mission_schedule.grace_ms, 120_000);

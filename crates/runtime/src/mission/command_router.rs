@@ -34,7 +34,7 @@ pub fn reserve_mission_command(
         }
         return Ok(existing);
     }
-    let target_revision = target_revision(services, &command.target, command.action)?;
+    let target_revision = target_revision(services, &command.target)?;
     if let Some(expected_revision) = command.expected_revision {
         if expected_revision != target_revision {
             return Err(format!(
@@ -317,7 +317,7 @@ async fn execute_runtime_effect(
                 MissionCommandAction::Cancel | MissionCommandAction::Close => {
                     MissionStatus::Cancelled
                 }
-                _ => unreachable!(),
+                _ => return Err("unsupported Mission lifecycle transition".to_string()),
             };
             let receipt = services.mission_runtime().transition(
                 mission_id,
@@ -403,7 +403,6 @@ async fn command_agent(
 fn target_revision(
     services: &RuntimeServices,
     target: &MissionCommandTarget,
-    action: MissionCommandAction,
 ) -> Result<u64, String> {
     match target {
         MissionCommandTarget::Mission { mission_id } => services
@@ -421,18 +420,9 @@ fn target_revision(
             .projection(graph_id)
             .map(|projection| projection.revision)
             .map_err(|error| error.to_string()),
-        MissionCommandTarget::Team { team_id } => {
-            let team = services
-                .team_runtime()
-                .list()?
-                .into_iter()
-                .find(|team| team.team_id == *team_id);
-            match (team, action) {
-                (Some(team), _) => Ok(team.graph_revision),
-                (None, MissionCommandAction::Create) => Ok(0),
-                (None, _) => Err(format!("team not found: {team_id}")),
-            }
-        }
+        MissionCommandTarget::Team { team_id } => Err(format!(
+            "Team target `{team_id}` is not a Mission-owned command target"
+        )),
         MissionCommandTarget::Agent { agent_id } => services
             .agent_runtime()
             .get(agent_id)

@@ -122,6 +122,15 @@ fn execution_projection_snapshot_spec(
     )
 }
 
+fn agentic_program_root_spec(
+) -> TypedRouteSpec<(), runtime_routes::AgenticProgramRootQuery, runtime::AgenticProgramProjection>
+{
+    TypedRouteSpec::new(
+        surface::gateway_api::routes::GET_API_RUNTIME_AGENTIC_PROGRAMS_ROOT,
+        "runtime_agentic_program_root_get",
+    )
+}
+
 fn execution_projection_command_spec(
 ) -> TypedRouteSpec<ExecutionCommandRequest, (), ExecutionCommandReceipt> {
     TypedRouteSpec::new(
@@ -346,6 +355,7 @@ fn mission_control_delta_spec() -> TypedRouteSpec<(), (), MissionProjectionDelta
 
 pub(crate) fn typed_route_metadata() -> Vec<StableRouteMetadata> {
     vec![
+        agentic_program_root_spec().metadata(None, "AgenticProgramProjection", false),
         execution_projection_snapshot_spec().metadata(None, "ExecutionProjection", false),
         execution_activity_detail_spec().metadata(None, "ExecutionActivityDetailProjection", false),
         execution_projection_command_spec()
@@ -581,9 +591,14 @@ pub(super) fn register_execution_projection_routes(
     router: Router<Arc<AppState>>,
 ) -> Router<Arc<AppState>> {
     let snapshot = execution_projection_snapshot_spec();
+    let agentic_program = agentic_program_root_spec();
     let activity = execution_activity_detail_spec();
     let command = execution_projection_command_spec();
     router
+        .route(
+            agentic_program.path,
+            get(runtime_routes::get_root_agentic_program),
+        )
         .route(snapshot.path, get(runtime_routes::get_execution_projection))
         .route(activity.path, get(runtime_routes::get_execution_activity))
         .route(

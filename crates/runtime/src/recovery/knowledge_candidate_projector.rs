@@ -44,9 +44,9 @@ impl KnowledgeCandidateProjector {
         }
     }
 
-    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> Result<RuntimeProjectionLane, String> {
         let projector = Arc::clone(self);
-        RuntimeProjectionLane::asynchronous(
+        Ok(RuntimeProjectionLane::asynchronous(
             RuntimeProjectionDescriptor::new(
                 PROJECTOR_ID,
                 RuntimeProjectionInterest::new([RuntimeProjectionEventInterest::new(
@@ -55,8 +55,7 @@ impl KnowledgeCandidateProjector {
                 )]),
                 PROJECTOR_BATCH,
                 Duration::from_secs(30),
-            )
-            .expect("knowledge projection descriptor is static and valid"),
+            )?,
             move |batch_size| {
                 let projector = Arc::clone(&projector);
                 Box::pin(async move {
@@ -64,7 +63,7 @@ impl KnowledgeCandidateProjector {
                     Ok(RuntimeProjectionPass::scanned(processed, batch_size))
                 })
             },
-        )
+        ))
     }
 
     /// Consume at most `max_commits` source commits and persist a durable

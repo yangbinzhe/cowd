@@ -24,7 +24,7 @@ scenario-run/
 - Scenario objective and expected execution pattern.
 - Model-visible capability context.
 - Whether `runtime_capabilities` was called.
-- Whether `runtime_orchestrate` was called.
+- Which Agent-first actions were called and which durable receipts they produced.
 - Selected execution pattern, modifiers, gates, and template.
 - Runtime decision: accepted, planned, rejected, needs approval, running, completed, or failed.
 - Tool DAG / ReWOO / team / deliberation / reflexion evidence.

@@ -658,24 +658,6 @@ pub mod paths {
         "api_mission_control_summary",
         "/api/mission/control/summary",
     );
-    pub const API_MISSION_CONTROL_TEAMS: GatewayPathKey =
-        GatewayPathKey::new("api_mission_control_teams", "/api/mission/control/teams");
-    pub const API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_CANCEL: GatewayPathKey = GatewayPathKey::new(
-        "api_mission_control_teams_by_team_id_cancel",
-        "/api/mission/control/teams/:team_id/cancel",
-    );
-    pub const API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EVIDENCE: GatewayPathKey = GatewayPathKey::new(
-        "api_mission_control_teams_by_team_id_evidence",
-        "/api/mission/control/teams/:team_id/evidence",
-    );
-    pub const API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EXECUTION: GatewayPathKey = GatewayPathKey::new(
-        "api_mission_control_teams_by_team_id_execution",
-        "/api/mission/control/teams/:team_id/execution",
-    );
-    pub const API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_RUN: GatewayPathKey = GatewayPathKey::new(
-        "api_mission_control_teams_by_team_id_run",
-        "/api/mission/control/teams/:team_id/run",
-    );
     pub const API_MISSION_PROJECTION: GatewayPathKey =
         GatewayPathKey::new("api_mission_projection", "/api/mission/projection");
     pub const API_MISSION_PROXIES: GatewayPathKey =
@@ -807,6 +789,10 @@ pub mod paths {
         "api_runtime_events_replay_report",
         "/api/runtime/events/replay-report",
     );
+    pub const API_RUNTIME_AGENTIC_PROGRAMS_ROOT: GatewayPathKey = GatewayPathKey::new(
+        "api_runtime_agentic_programs_root",
+        "/api/runtime/agentic/programs/root",
+    );
     pub const API_RUNTIME_EXECUTIONS_BY_ID: GatewayPathKey = GatewayPathKey::new(
         "api_runtime_executions_by_id",
         "/api/runtime/executions/:id",
@@ -889,10 +875,6 @@ pub mod paths {
     );
     pub const API_RUNTIME_STATUS: GatewayPathKey =
         GatewayPathKey::new("api_runtime_status", "/api/runtime/status");
-    pub const API_RUNTIME_TEAMS_BY_ID_WORKING_STATE: GatewayPathKey = GatewayPathKey::new(
-        "api_runtime_teams_by_id_working_state",
-        "/api/runtime/teams/:id/working-state",
-    );
     pub const API_RUNTIME_TIMELINE: GatewayPathKey =
         GatewayPathKey::new("api_runtime_timeline", "/api/runtime/timeline");
     pub const API_RUNTIME_TURNS: GatewayPathKey =
@@ -1223,10 +1205,6 @@ pub mod paths {
         GatewayPathKey::new("api_tasks_start", "/api/tasks/start");
     pub const API_TEAM_TEMPLATES: GatewayPathKey =
         GatewayPathKey::new("api_team_templates", "/api/team-templates");
-    pub const API_TEAM_TEMPLATES_INSTANTIATE: GatewayPathKey = GatewayPathKey::new(
-        "api_team_templates_instantiate",
-        "/api/team-templates/instantiate",
-    );
     pub const API_TOOLS: GatewayPathKey = GatewayPathKey::new("api_tools", "/api/tools");
     pub const API_TOOLS_BATCH_READONLY: GatewayPathKey =
         GatewayPathKey::new("api_tools_batch_readonly", "/api/tools/batch-readonly");
@@ -2085,29 +2063,6 @@ pub mod routes {
         GatewayHttpMethod::Get,
         paths::API_MISSION_CONTROL_SUMMARY,
     );
-    pub const GET_API_MISSION_CONTROL_TEAMS: GatewayRouteSpec = GatewayRouteSpec::new(
-        "get_api_mission_control_teams",
-        GatewayHttpMethod::Get,
-        paths::API_MISSION_CONTROL_TEAMS,
-    );
-    pub const GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EVIDENCE: GatewayRouteSpec =
-        GatewayRouteSpec::new(
-            "get_api_mission_control_teams_by_team_id_evidence",
-            GatewayHttpMethod::Get,
-            paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EVIDENCE,
-        );
-    pub const GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EXECUTION: GatewayRouteSpec =
-        GatewayRouteSpec::new(
-            "get_api_mission_control_teams_by_team_id_execution",
-            GatewayHttpMethod::Get,
-            paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EXECUTION,
-        );
-    pub const GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_RUN: GatewayRouteSpec =
-        GatewayRouteSpec::new(
-            "get_api_mission_control_teams_by_team_id_run",
-            GatewayHttpMethod::Get,
-            paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_RUN,
-        );
     pub const GET_API_MISSION_PROJECTION: GatewayRouteSpec = GatewayRouteSpec::new(
         "get_api_mission_projection",
         GatewayHttpMethod::Get,
@@ -2258,6 +2213,11 @@ pub mod routes {
         GatewayHttpMethod::Get,
         paths::API_RUNTIME_EVENTS_REPLAY_REPORT,
     );
+    pub const GET_API_RUNTIME_AGENTIC_PROGRAMS_ROOT: GatewayRouteSpec = GatewayRouteSpec::new(
+        "get_api_runtime_agentic_programs_root",
+        GatewayHttpMethod::Get,
+        paths::API_RUNTIME_AGENTIC_PROGRAMS_ROOT,
+    );
     pub const GET_API_RUNTIME_EXECUTIONS_BY_ID: GatewayRouteSpec = GatewayRouteSpec::new(
         "get_api_runtime_executions_by_id",
         GatewayHttpMethod::Get,
@@ -2317,11 +2277,6 @@ pub mod routes {
         "get_api_runtime_status",
         GatewayHttpMethod::Get,
         paths::API_RUNTIME_STATUS,
-    );
-    pub const GET_API_RUNTIME_TEAMS_BY_ID_WORKING_STATE: GatewayRouteSpec = GatewayRouteSpec::new(
-        "get_api_runtime_teams_by_id_working_state",
-        GatewayHttpMethod::Get,
-        paths::API_RUNTIME_TEAMS_BY_ID_WORKING_STATE,
     );
     pub const GET_API_RUNTIME_TIMELINE: GatewayRouteSpec = GatewayRouteSpec::new(
         "get_api_runtime_timeline",
@@ -3163,12 +3118,6 @@ pub mod routes {
         GatewayHttpMethod::Post,
         paths::API_MISSION_CONTROL_SESSIONS_BRIDGE,
     );
-    pub const POST_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_CANCEL: GatewayRouteSpec =
-        GatewayRouteSpec::new(
-            "post_api_mission_control_teams_by_team_id_cancel",
-            GatewayHttpMethod::Post,
-            paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_CANCEL,
-        );
     pub const POST_API_MISSION_PROXIES: GatewayRouteSpec = GatewayRouteSpec::new(
         "post_api_mission_proxies",
         GatewayHttpMethod::Post,
@@ -3629,11 +3578,6 @@ pub mod routes {
         GatewayHttpMethod::Post,
         paths::API_TASKS_START,
     );
-    pub const POST_API_TEAM_TEMPLATES_INSTANTIATE: GatewayRouteSpec = GatewayRouteSpec::new(
-        "post_api_team_templates_instantiate",
-        GatewayHttpMethod::Post,
-        paths::API_TEAM_TEMPLATES_INSTANTIATE,
-    );
     pub const POST_API_TOOLS_BATCH_READONLY: GatewayRouteSpec = GatewayRouteSpec::new(
         "post_api_tools_batch_readonly",
         GatewayHttpMethod::Post,
@@ -3946,11 +3890,6 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
     paths::API_MISSION_CONTROL_INTERPRET,
     paths::API_MISSION_CONTROL_SESSIONS_BRIDGE,
     paths::API_MISSION_CONTROL_SUMMARY,
-    paths::API_MISSION_CONTROL_TEAMS,
-    paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_CANCEL,
-    paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EVIDENCE,
-    paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EXECUTION,
-    paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_RUN,
     paths::API_MISSION_PROJECTION,
     paths::API_MISSION_PROXIES,
     paths::API_MISSION_RELATIONS,
@@ -3992,6 +3931,7 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
     paths::API_RUNTIME_AGENTS_BY_ID_INPUT,
     paths::API_RUNTIME_AGENTS_BY_ID_INTERRUPT,
     paths::API_RUNTIME_AGENTS_BY_ID_SHUTDOWN,
+    paths::API_RUNTIME_AGENTIC_PROGRAMS_ROOT,
     paths::API_RUNTIME_CAPABILITIES,
     paths::API_RUNTIME_CONFIG_EFFECTIVE,
     paths::API_RUNTIME_CONFIG_RELOAD,
@@ -4024,7 +3964,6 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
     paths::API_RUNTIME_SOURCE_AUDIT,
     paths::API_RUNTIME_SOURCE_REPAIR_PLAN,
     paths::API_RUNTIME_STATUS,
-    paths::API_RUNTIME_TEAMS_BY_ID_WORKING_STATE,
     paths::API_RUNTIME_TIMELINE,
     paths::API_RUNTIME_TURNS,
     paths::API_RUNTIME_TURNS_BY_ID,
@@ -4142,7 +4081,6 @@ pub const GATEWAY_PATHS: &[GatewayPathKey] = &[
     paths::API_TASKS_MISSION_PREVIEW,
     paths::API_TASKS_START,
     paths::API_TEAM_TEMPLATES,
-    paths::API_TEAM_TEMPLATES_INSTANTIATE,
     paths::API_TOOLS,
     paths::API_TOOLS_BATCH_READONLY,
     paths::API_TOOLS_CACHE,
@@ -4333,10 +4271,6 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::GET_API_MISSION_CONTROL_AGENTS_BY_AGENT_ID_EVENTS,
     routes::GET_API_MISSION_CONTROL_DELTA,
     routes::GET_API_MISSION_CONTROL_SUMMARY,
-    routes::GET_API_MISSION_CONTROL_TEAMS,
-    routes::GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EVIDENCE,
-    routes::GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EXECUTION,
-    routes::GET_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_RUN,
     routes::GET_API_MISSION_PROJECTION,
     routes::GET_API_MISSION_RELATIONS,
     routes::GET_API_MISSION_SCHEDULES,
@@ -4361,6 +4295,7 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::GET_API_RUNTIME_AGENTS,
     routes::GET_API_RUNTIME_AGENTS_BY_ID,
     routes::GET_API_RUNTIME_AGENTS_BY_ID_EVENTS,
+    routes::GET_API_RUNTIME_AGENTIC_PROGRAMS_ROOT,
     routes::GET_API_RUNTIME_CAPABILITIES,
     routes::GET_API_RUNTIME_CONFIG_EFFECTIVE,
     routes::GET_API_RUNTIME_CONFIG_RELOAD_STATUS,
@@ -4379,7 +4314,6 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::GET_API_RUNTIME_SOURCE_AUDIT,
     routes::GET_API_RUNTIME_SOURCE_REPAIR_PLAN,
     routes::GET_API_RUNTIME_STATUS,
-    routes::GET_API_RUNTIME_TEAMS_BY_ID_WORKING_STATE,
     routes::GET_API_RUNTIME_TIMELINE,
     routes::GET_API_RUNTIME_TURNS,
     routes::GET_API_RUNTIME_TURNS_BY_ID,
@@ -4546,7 +4480,6 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::POST_API_MISSION_CONTROL,
     routes::POST_API_MISSION_CONTROL_INTERPRET,
     routes::POST_API_MISSION_CONTROL_SESSIONS_BRIDGE,
-    routes::POST_API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_CANCEL,
     routes::POST_API_MISSION_PROXIES,
     routes::POST_API_MISSION_SCHEDULES,
     routes::POST_API_MISSION_SCHEDULES_BY_ID_PAUSE,
@@ -4636,7 +4569,6 @@ pub const GATEWAY_ROUTES: &[GatewayRouteSpec] = &[
     routes::POST_API_TASKS_MISSION_COMMIT,
     routes::POST_API_TASKS_MISSION_PREVIEW,
     routes::POST_API_TASKS_START,
-    routes::POST_API_TEAM_TEMPLATES_INSTANTIATE,
     routes::POST_API_TOOLS_BATCH_READONLY,
     routes::POST_API_TOOLS_CHECKPOINTS,
     routes::POST_API_TOOLS_CHECKPOINTS_BY_ID_RESTORE,
@@ -4699,6 +4631,6 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(paths.len(), GATEWAY_PATHS.len());
         assert_eq!(routes.len(), GATEWAY_ROUTES.len());
-        assert_eq!(routes.len(), 482);
+        assert_eq!(routes.len(), 476);
     }
 }

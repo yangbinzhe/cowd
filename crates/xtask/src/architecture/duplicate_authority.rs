@@ -199,7 +199,10 @@ pub(super) fn validate_duplicate_policy(roots: &Roots) -> Result<usize, String> 
         }
         if candidate.classification == "adapter_with_duplicated_semantics" {
             let Some((first, rest)) = function_sets.split_first() else {
-                unreachable!("candidate source count was validated")
+                return Err(format!(
+                    "candidate {} has no readable source function set",
+                    candidate.id
+                ));
             };
             let common = first
                 .iter()

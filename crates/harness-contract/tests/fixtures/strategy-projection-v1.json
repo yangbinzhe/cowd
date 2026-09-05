@@ -181,7 +181,6 @@
     ],
     "evidence_overlap_bp": 700,
     "evidence_overlap_observed": true,
-    "working_state_verified": true,
     "merge_cost_ms": 6200,
     "parent_merge_count": 1,
     "evaluation_token_limit": 16000,

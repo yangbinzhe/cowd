@@ -454,12 +454,12 @@ impl EvolutionDiscoveryService {
         let stream = case_stream(&seed.case_id);
         for _ in 0..CASE_CAS_RETRIES {
             let current = self.case(&seed.case_id)?;
-            if current.as_ref().is_some_and(|case| {
+            if let Some(current) = current.as_ref().filter(|case| {
                 case.signal_ids
                     .iter()
                     .any(|signal_id| signal_id == &signal.signal_id)
             }) {
-                return Ok(current.expect("checked above"));
+                return Ok(current.clone());
             }
             let mut next = current.clone().unwrap_or_else(|| seed.clone());
             if current.is_some() {
@@ -595,8 +595,8 @@ impl EvolutionDiscoveryService {
                 Err(crate::RuntimeEventStoreError::StaleRevision { .. }) => continue,
                 Err(error) => {
                     let latest = self.case(&case_id)?;
-                    if latest.as_ref().is_some_and(|case| case.state == state) {
-                        return Ok(latest.expect("checked above"));
+                    if let Some(latest) = latest.filter(|case| case.state == state) {
+                        return Ok(latest);
                     }
                     return Err(error.to_string());
                 }

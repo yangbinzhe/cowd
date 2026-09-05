@@ -474,6 +474,26 @@ mod tests {
     }
 
     #[test]
+    fn capacity_prediction_never_blocks_or_truncates_a_provider_request() {
+        let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
+        let parent = parent();
+        let ledger = ParentExecutionBudgetLedger::new(store, parent.clone()).unwrap();
+        let requested_output_tokens = parent.max_tokens.saturating_mul(3);
+        let reservation = ledger
+            .reserve_provider(
+                &child(&parent, 0),
+                "prediction-overrun",
+                "capable-model",
+                100,
+                requested_output_tokens,
+            )
+            .expect("capacity prediction is telemetry, not an execution gate");
+
+        assert_eq!(reservation.granted_output_tokens, requested_output_tokens);
+        assert!(reservation.reserved_tokens > parent.max_tokens);
+    }
+
+    #[test]
     fn crash_restart_replays_the_full_unsettled_capacity_reservation() {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let parent = parent();

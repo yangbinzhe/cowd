@@ -112,7 +112,7 @@ impl DerivedMaterializer {
                     }
                 }
             })
-            .expect("derived materializer worker must start");
+            .ok();
         Self {
             capacity,
             sender: Mutex::new(Some(sender)),
@@ -120,7 +120,7 @@ impl DerivedMaterializer {
             materialized,
             pending,
             latest_commit_cursor,
-            worker: Mutex::new(Some(worker)),
+            worker: Mutex::new(worker),
             metrics,
         }
     }

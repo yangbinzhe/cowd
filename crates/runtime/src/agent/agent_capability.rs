@@ -85,18 +85,11 @@ pub fn resolve_agent_capability(request: AgentCapabilityRequest) -> ResolvedAgen
     // entry point. The tool itself enforces the exact Agent/Session/Project/
     // Team Binding, so this does not grant broad Memory or Session access.
     allowed_tools.insert("context_retrieve".to_string());
-    // The board is an internal, binding-scoped semantic exchange. Runtime
-    // rejects callers that are not Team Agent nodes.
-    allowed_tools.insert("team_board".to_string());
-    // Bounded graph work discovery and mutation are attested by the current
-    // immutable Agent Binding; no identity field is accepted from the model.
-    allowed_tools.insert("collaboration_control".to_string());
-    // A managed Team Agent may request (but never create) one bounded
-    // escalation through its already-bound parent Collaboration Program.
-    // The tool attests the caller and derives all runtime fences, so exposing
-    // this read-only control plane entry point does not grant recursive graph
-    // creation, broader permissions, or a lifecycle control to leaf Agents.
-    allowed_tools.insert("request_collaboration_escalation".to_string());
+    // Agent-first actions are injected only by the dynamic Program dispatcher
+    // after it binds an immutable roster identity. Generic/legacy Agent
+    // capability resolution must not advertise those actions without an
+    // `agentic_program` context, because the host would correctly reject them
+    // as unbound tool inventory drift.
     // Durable raw tool outputs are read-only evidence references resolved by
     // the Runtime ArtifactStore; the tool itself enforces ref authorization.
     allowed_tools.insert("evidence_retrieve".to_string());
@@ -176,7 +169,7 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             required_mode: PermissionMode::ReadOnly,
         },
         "write" => CapabilityMapping {
-            tools: &["write_file", "edit_file"],
+            tools: &["write_file", "edit_file", "apply_patch_transaction", "bash"],
             required_mode: PermissionMode::WorkspaceWrite,
         },
         "test" | "status" | "logs" => CapabilityMapping {
@@ -191,6 +184,18 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             tools: &["tool_search"],
             required_mode: PermissionMode::ReadOnly,
         },
+        "connector_action" => CapabilityMapping {
+            tools: &["tool_search", "mcp_tool"],
+            required_mode: PermissionMode::DangerFullAccess,
+        },
+        // Matrix mutations are deliberately supplied by an immutable Skill
+        // tool contract. `tool_search` is the bounded discovery entry point;
+        // admission additionally requires the selected Skill's concrete
+        // matrix tool to exist in the active ToolHost.
+        "matrix_write" => CapabilityMapping {
+            tools: &["tool_search"],
+            required_mode: PermissionMode::WorkspaceWrite,
+        },
         _ => CapabilityMapping {
             tools: &["read_file", "grep_search", "glob_search"],
             required_mode: PermissionMode::ReadOnly,
@@ -204,6 +209,7 @@ fn required_host_tool_alternatives(capability: &str) -> &'static [&'static str] 
         "write" => &["write_file", "edit_file"],
         "test" => &["bash", "execute_code"],
         "rollback" => &["bash", "checkpoint_restore"],
+        "connector_action" => &["mcp_tool"],
         _ => &[],
     }
 }
@@ -251,9 +257,8 @@ mod tests {
         assert!(resolved.allowed_tools.contains("glob_many"));
         assert!(resolved.allowed_tools.contains("tool_search"));
         assert!(resolved.allowed_tools.contains("context_retrieve"));
-        assert!(resolved
-            .allowed_tools
-            .contains("request_collaboration_escalation"));
+        assert!(!resolved.allowed_tools.contains("task_claim"));
+        assert!(!resolved.allowed_tools.contains("message_publish"));
         assert_eq!(resolved.evidence_duties, vec!["source_notes"]);
     }
 

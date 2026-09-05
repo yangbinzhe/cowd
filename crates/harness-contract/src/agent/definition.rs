@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::AgentDisplayIdentity;
 use super::{AgentOutputContract, AgentTaskIntent, AgentTaskPacket};
-use crate::team::AgentDisplayIdentity;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -397,7 +397,6 @@ pub struct AgentCognitivePolicy {
     #[serde(default)]
     pub read_scopes: Vec<CognitiveReadScope>,
     pub write_mode: CognitiveWriteMode,
-    pub team_working_state_visible: bool,
 }
 
 impl AgentCognitivePolicy {
@@ -570,7 +569,6 @@ pub struct AgentDataLease {
     pub team_id: Option<String>,
     pub read_scopes: Vec<CognitiveReadScope>,
     pub write_mode: CognitiveWriteMode,
-    pub team_working_state_visible: bool,
     #[serde(default)]
     pub fact_boundaries: Vec<String>,
     /// Exact durable Fact references granted to this Binding. A blank list
@@ -712,6 +710,9 @@ impl AgentBindingSnapshot {
         if let Some(evaluation) = &self.evaluation {
             evaluation.validate()?;
         }
+        if let Some(display) = &self.display {
+            display.validate()?;
+        }
         validate_digest("binding.binding_digest", &self.binding_digest)
     }
 
@@ -750,17 +751,6 @@ impl AgentBindingSnapshot {
                     .to_string(),
             });
         }
-        if let Some(team_role_identity) = &intent.team_role_identity {
-            team_role_identity
-                .validate()
-                .map_err(|message| ValidationError::InvalidContract {
-                    message: message.to_string(),
-                })?;
-        } else if intent.team_id.is_some() {
-            return Err(ValidationError::InvalidContract {
-                message: "Team Agent intent requires a typed Team role identity".to_string(),
-            });
-        }
         if let Some(managed_invocation) = &intent.managed_invocation {
             managed_invocation.validate()?;
         }
@@ -778,16 +768,15 @@ impl AgentBindingSnapshot {
             }
             intent.required_acceptance.clone()
         };
-        let team_role_identity = intent.team_role_identity.clone();
         let assignment = super::AgentAssignment {
             execution_identity,
             definition_ref: self.definition_ref.clone(),
             instance_id: self.instance.instance_id.clone(),
             run_id: intent.run_id,
-            role_id: team_role_identity
-                .as_ref()
-                .map(|identity| identity.role_id.clone())
-                .or_else(|| self.instance.role_slot_id.clone())
+            role_id: self
+                .instance
+                .role_slot_id
+                .clone()
                 .unwrap_or_else(|| "agent".to_string()),
             task_id: intent.task_id,
             root_task_id: intent.root_task_id,
@@ -809,8 +798,6 @@ impl AgentBindingSnapshot {
             output_acceptance: intent.output_acceptance,
             requires_managed_collaboration_escalation: intent
                 .requires_managed_collaboration_escalation,
-            team_role_identity,
-            team_role: None,
             cohort_prompt_package: None,
             acceptance: intent.acceptance,
             constraints: intent.constraints,
@@ -1008,7 +995,6 @@ mod tests {
                 context_profile: "sub_agent".to_string(),
                 read_scopes: vec![CognitiveReadScope::Session, CognitiveReadScope::Team],
                 write_mode: CognitiveWriteMode::CandidateOnly,
-                team_working_state_visible: true,
             },
             capability_contract: AgentCapabilityContract {
                 capability_ceiling: vec![AgentCapability::Read, AgentCapability::Search],

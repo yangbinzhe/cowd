@@ -5,10 +5,9 @@
         consume_provider_stream_with_activity, conversation_message_text,
         current_turn_messages, deterministic_checkpoint_id, enforce_explicit_team_requirement,
         eval_override_selection, image_user_message_from_path, is_append_only_projection,
-        is_runtime_team_orchestration_call, memory_project_id_for_session, prepared_vision_payload,
+        is_agent_collaboration_action, memory_project_id_for_session, prepared_vision_payload,
         preview_chars, provider_retry_is_fenced, provider_transport_policy, rate_per_second,
-        required_team_orchestration_call, revalidate_context_binding,
-        runtime_team_orchestration_count, turn_strategy_event_kind_allowed,
+        revalidate_context_binding, turn_strategy_event_kind_allowed,
         unexposed_model_tool_names, vision_tool_model_receipt, vision_user_message, ApiClient,
         ApiRequest, AssistantEvent, AssistantItemKind, CancellationToken, CognitiveContextManager,
         ConversationRuntime, EarlyToolCandidate, EarlyToolDispatchFuture, EarlyToolDispatchResult,
@@ -45,7 +44,6 @@
         SkillEntrypoint, SkillKind, SkillLifecycleStatus, SkillRiskLevel,
     };
     use harness_contract::strategy::{understand, StrategyInput};
-    use harness_contract::team::{FocusPartitionPlan, FocusPartitionSlot};
     use model_protocol::usage::TokenUsage;
     use std::collections::BTreeSet;
     use std::fs;
@@ -109,7 +107,7 @@
         fn available_tool_names(&self) -> Vec<String> {
             vec![
                 "runtime_capabilities".to_string(),
-                harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_TOOL_ID.to_string(),
+                harness_contract::agent_action::TEAM_CREATE_TOOL_ID.to_string(),
             ]
         }
 
@@ -779,31 +777,6 @@
     }
 
     #[test]
-    fn research_teams_leave_explicit_agent_report_delivery_to_parent() {
-        let objective = "请启动2个研究团队，开展各个层面的今年AI发展趋势调研，然后使用一个智能体进行信息的统一收集、整理，形成一个专业研究报告（html版），放到独立个文件夹下。";
-        let call = required_team_orchestration_call(objective);
-        let input: serde_json::Value = serde_json::from_str(&call.input).unwrap();
-
-        assert_eq!(input["proposal"]["nodes"].as_array().unwrap().len(), 2);
-        assert!(input["proposal"]["nodes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|node| node["template"] == "cowd/external-research-synthesis"));
-        assert_eq!(input["constraints"]["requires_write"], false);
-        assert_eq!(
-            input["proposal"]["completion"]["required_artifact_kinds"],
-            serde_json::json!(["terminal_synthesis"])
-        );
-        assert!(
-            build_runtime_execution_decision(objective, None)
-                .strategy
-                .understanding
-                .requires_write
-        );
-    }
-
-    #[test]
     fn model_tool_calls_are_bounded_by_the_current_exposure_lease() {
         let calls = vec![
             ModelToolCall {
@@ -904,12 +877,6 @@
     }
 
     #[test]
-    fn model_team_proposal_is_visible_to_runtime_retargeting() {
-        let call = required_team_orchestration_call("review");
-        assert!(is_runtime_team_orchestration_call(&call));
-    }
-
-    #[test]
     fn explicit_team_requirement_overrides_a_non_collaboration_strategy_hint() {
         let objective = "先自主选择并实际启动合适的协作团队，分别完成三个独立审查。";
         let decision = build_runtime_execution_decision(objective, None);
@@ -948,13 +915,12 @@
         };
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "agent_helper");
-        assert!(!calls.iter().any(is_runtime_team_orchestration_call));
+        assert!(!calls.iter().any(is_agent_collaboration_action));
     }
 
     #[test]
     fn ordinary_tool_names_never_create_runtime_control_intents() {
         for name in [
-            "team_board",
             "agent_status",
             "permission_report",
             "replan_index",
@@ -976,80 +942,6 @@
     }
 
     #[test]
-    fn team_orchestration_tool_batch_keeps_the_collaboration_strategy() {
-        let calls = vec![required_team_orchestration_call("必须实际启动团队")];
-        assert!(calls.iter().any(is_runtime_team_orchestration_call));
-    }
-
-    #[test]
-    fn required_team_orchestration_uses_a_published_builtin_template() {
-        let call = required_team_orchestration_call("必须实际启动团队");
-        let replay = required_team_orchestration_call("必须实际启动团队");
-        assert_eq!(call.name, "runtime_orchestrate");
-        let input = serde_json::from_str::<serde_json::Value>(&call.input)
-            .expect("runtime orchestration input is JSON");
-        let replay_input = serde_json::from_str::<serde_json::Value>(&replay.input)
-            .expect("replayed runtime orchestration input is JSON");
-        assert_eq!(
-            input["proposal"]["mutation_id"], replay_input["proposal"]["mutation_id"],
-            "the same semantic requirement must retry with one mutation identity"
-        );
-        assert_eq!(
-            input["proposal"]["nodes"][0]["template"],
-            serde_json::json!("cowd/parallel-research-synthesis")
-        );
-    }
-
-    #[test]
-    fn explicit_two_team_requirement_compiles_two_independent_read_teams() {
-        let call = required_team_orchestration_call("启动两个研究团队并行调研本地文件并用中文汇报");
-        let input = serde_json::from_str::<serde_json::Value>(&call.input)
-            .expect("runtime orchestration input is JSON");
-        let nodes = input["proposal"]["nodes"]
-            .as_array()
-            .expect("semantic Team nodes");
-        assert_eq!(nodes.len(), 2);
-        assert!(nodes.iter().all(|node| {
-            node["recipe"] == "team" && node["depends_on"].as_array().is_some_and(Vec::is_empty)
-        }));
-        assert!(nodes
-            .iter()
-            .all(|node| node["template"] == "cowd/parallel-research-synthesis"));
-        assert!(nodes.iter().all(|node| {
-            node["evidence_contract"] == serde_json::json!(["summary", "evidence", "unresolved"])
-        }));
-        assert_eq!(
-            input["proposal"]["completion"]["required_node_ids"]
-                .as_array()
-                .map(Vec::len),
-            Some(2)
-        );
-        assert_eq!(runtime_team_orchestration_count(&call), 2);
-    }
-
-    #[test]
-    fn two_domain_teams_remain_parallel_when_parent_owns_the_final_html() {
-        let call = required_team_orchestration_call(
-            "请启动两个团队，一个业务团队和一个技术团队，两个团队研讨后形成统一的 HTML 方案并落盘",
-        );
-        let input = serde_json::from_str::<serde_json::Value>(&call.input)
-            .expect("runtime orchestration input is JSON");
-        let nodes = input["proposal"]["nodes"]
-            .as_array()
-            .expect("semantic Team nodes");
-        assert_eq!(nodes.len(), 2);
-        assert!(nodes.iter().all(|node| {
-            node["template"] == "cowd/parallel-research-synthesis"
-                && node["depends_on"].as_array().is_some_and(Vec::is_empty)
-        }));
-        assert_eq!(input["constraints"]["requires_write"], false);
-        assert_eq!(
-            input["proposal"]["completion"]["required_artifact_kinds"],
-            serde_json::json!(["terminal_synthesis"]),
-        );
-    }
-
-    #[test]
     fn ordinal_group_constraint_materializes_exactly_three_teams() {
         let objective = "第一组研究 Runtime，第二组审查 Gateway，第三组汇总结论";
         let decision = build_runtime_execution_decision(objective, None);
@@ -1064,53 +956,6 @@
         let ModelStepIntent::FinalAnswer { .. } = intent else {
             panic!("first-step final answers stay model-owned; the gate re-prompts later");
         };
-    }
-
-    #[test]
-    fn mixed_language_three_team_requirement_compiles_parallel_research_then_writer() {
-        let call = required_team_orchestration_call(
-            "请使用恰好3个Team完成任务，前两个并行研究，第三个生成并写入HTML报告文件",
-        );
-        let input = serde_json::from_str::<serde_json::Value>(&call.input)
-            .expect("runtime orchestration input is JSON");
-        let nodes = input["proposal"]["nodes"]
-            .as_array()
-            .expect("semantic Team nodes");
-        assert_eq!(nodes.len(), 3);
-        assert!(nodes[..2]
-            .iter()
-            .all(|node| node["depends_on"].as_array().is_some_and(Vec::is_empty)));
-        assert_eq!(
-            nodes[2]["depends_on"],
-            serde_json::json!(["explicit-team-1", "explicit-team-2"]),
-        );
-        assert_eq!(
-            nodes[2]["output_artifacts"],
-            serde_json::json!(["workspace_change", "terminal_synthesis"]),
-        );
-        assert!(nodes[..2]
-            .iter()
-            .all(|node| node["template"] == "cowd/parallel-research-synthesis"));
-        assert!(nodes[..2].iter().all(|node| {
-            node["evidence_contract"] == serde_json::json!(["summary", "evidence", "unresolved"])
-        }));
-        assert_eq!(nodes[2]["template"], "cowd/execute-review");
-        assert_eq!(
-            nodes[2]["evidence_contract"],
-            serde_json::json!(["implementation", "source_verification", "evidence", "risks"])
-        );
-        assert!(nodes[2]["evidence_contract"]
-            .as_array()
-            .is_some_and(|criteria| criteria.iter().all(|criterion| criterion != "plan")));
-        assert_eq!(runtime_team_orchestration_count(&call), 3);
-    }
-
-    #[test]
-    fn sequential_followup_team_language_also_compiles_two_team_entities() {
-        let call = required_team_orchestration_call(
-            "一个团队负责调研，另一个团队负责独立复核，最后给出结论",
-        );
-        assert_eq!(runtime_team_orchestration_count(&call), 2);
     }
 
     #[test]
@@ -2844,65 +2689,6 @@
     }
 
     #[test]
-    fn explicit_root_collaboration_contract_pins_the_admitted_lease_before_control_plane() {
-        let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
-        let runtime = ConversationRuntime::new(
-            Session::new(),
-            MockApi,
-            CollaborationAvailableExecutor,
-            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
-            vec!["system".to_string()],
-        )
-        .without_memory()
-        .with_runtime_event_store(Arc::clone(&store));
-        let admitted = runtime
-            .begin_turn_strategy(
-                "root-collaboration-contract",
-                "启动两个协作团队分析并解决这个问题",
-            )
-            .expect("admit strategy");
-        runtime
-            .set_turn_strategy_focus_partitions(Vec::new(), 2)
-            .expect("freeze explicit collaboration obligation");
-        runtime
-            .bind_turn_strategy_execution("root-collaboration-contract", "root-graph")
-            .expect("bind strategy graph");
-
-        let pinned = runtime
-            .require_active_turn_collaboration_control_plane(2)
-            .expect("pin root collaboration contract");
-
-        assert_eq!(pinned.lease.lease_id, admitted.decision_lease);
-        assert_eq!(
-            pinned.pattern(),
-            harness_contract::core::ExecutionPattern::Collaborate
-        );
-        assert_eq!(
-            runtime
-                .active_turn_strategy()
-                .expect("active strategy")
-                .selected_candidate,
-            harness_contract::strategy::ExecutionCandidateKind::Team
-        );
-        let selected_events = store
-            .list_stream(&format!("session:{}", runtime.session_id()))
-            .expect("strategy events")
-            .into_iter()
-            .filter(|event| event.kind == "runtime.strategy.selected")
-            .collect::<Vec<_>>();
-        assert!(
-            selected_events.iter().any(|event| {
-                event
-                    .payload
-                    .get("reason")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|reason| reason.contains("explicit root collaboration contract"))
-            }),
-            "the forced runtime invariant must be durable"
-        );
-    }
-
-    #[test]
     fn evidence_strategy_revises_to_explicitly_approved_delivery_without_changing_lease() {
         let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let runtime = ConversationRuntime::new(
@@ -3329,7 +3115,7 @@
     }
 
     #[test]
-    fn provider_constraint_publishes_monotonic_downgrade_and_retains_scope() {
+    fn provider_constraint_publishes_monotonic_downgrade_and_retains_obligation() {
         let store = Arc::new(RuntimeEventStore::open_in_memory().expect("event store"));
         let runtime = ConversationRuntime::new(
             Session::new(),
@@ -3347,22 +3133,8 @@
             .bind_turn_strategy_execution("provider-turn", "provider-graph")
             .expect("bind strategy graph");
         runtime
-            .set_turn_strategy_focus_partitions(vec![FocusPartitionPlan {
-                role_id: "reviewer".to_string(),
-                shared_baseline: vec!["evidence:baseline".to_string()],
-                slots: vec![FocusPartitionSlot {
-                    focus_id: "runtime".to_string(),
-                    boundary: "crates/runtime".to_string(),
-                    evidence_responsibility: "Review the runtime boundary".to_string(),
-                    capability_cropped_refs: vec!["read:crates/runtime".to_string()],
-                    scope_hash: "sha256:provider-constraint-scope".to_string(),
-                    overlap_budget_bp: 800,
-                    novelty_target_bp: 6_000,
-                    output_contract: Vec::new(),
-                    output_acceptance: Vec::new(),
-                }],
-            }], 1)
-            .expect("set evidence scope");
+            .set_turn_strategy_collaboration_obligation(1)
+            .expect("set collaboration obligation");
         let selected = runtime.active_turn_strategy().expect("selected state");
         let frozen_events = store
             .list_stream(&format!("session:{}", runtime.session_id()))
@@ -3417,10 +3189,6 @@
         assert_eq!(
             downgraded.payload["resource_snapshot"]["provider_concurrency_penalty_bp"],
             9_000
-        );
-        assert_eq!(
-            downgraded.payload["evidence_scopes"][0]["slots"][0]["capability_cropped_refs"][0],
-            "read:crates/runtime"
         );
     }
 

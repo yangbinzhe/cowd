@@ -293,15 +293,18 @@ impl SessionExecutionFence {
                 .claim_expires_at_ms
                 .is_some_and(|deadline| deadline > now_ms());
         if claim_is_current {
+            let claim_fence_epoch = record.claim_fence_epoch.ok_or_else(|| {
+                format!(
+                    "Session execution fence rejected {phase:?}: current claim has no fence epoch"
+                )
+            })?;
             Ok(SessionExecutionFenceSnapshot {
                 request_id: self.request_id.clone(),
                 session_id: self.session_id.clone(),
                 session_generation: self.generation,
                 claim_owner: self.claim_owner.clone(),
                 claim_token: self.claim_token.clone(),
-                claim_fence_epoch: record
-                    .claim_fence_epoch
-                    .expect("current claim checked for immutable fence epoch"),
+                claim_fence_epoch,
             })
         } else {
             Err(format!(
@@ -1594,7 +1597,11 @@ mod tests {
             wake: Arc::new(tokio::sync::Notify::new()),
             test_store: Some(Arc::clone(&store)),
             worker_id: "worker-b".into(),
-            lease_ms: 20,
+            // Only router A is the injected ack-loss owner. Give the recovery
+            // worker enough time to acknowledge even under a fully parallel
+            // workspace test run, otherwise scheduler load can create a
+            // second accidental lease expiry and make this test nondeterministic.
+            lease_ms: 1_000,
             max_attempts: 3,
         };
         router_a

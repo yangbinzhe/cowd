@@ -2714,7 +2714,7 @@ fn dispatch_pending_app_transport_effects(
                 let client = gateway_client.clone();
                 let tx = event_tx.clone();
                 runtime.spawn(async move {
-                    let path = app_view_endpoint(&app_id, &view_id, "open");
+                    let path = app_view_endpoint(&app_id, &view_id, AppViewOperation::Open);
                     let event = match app_json_request_with_transient_retry(
                         &client,
                         "POST",
@@ -2761,7 +2761,7 @@ fn dispatch_pending_app_transport_effects(
                 let client = gateway_client.clone();
                 let tx = event_tx.clone();
                 runtime.spawn(async move {
-                    let path = app_view_endpoint(&app_id, &view_id, "actions");
+                    let path = app_view_endpoint(&app_id, &view_id, AppViewOperation::Actions);
                     let body = serde_json::to_value(action).unwrap_or(serde_json::Value::Null);
                     let event = match app_json_request_with_transient_retry(
                         &client,
@@ -2849,12 +2849,20 @@ fn dispatch_pending_app_transport_effects(
     }
 }
 
-fn app_view_endpoint(app_id: &str, view_id: &str, operation: &str) -> String {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppViewOperation {
+    Actions,
+    Open,
+}
+
+fn app_view_endpoint(app_id: &str, view_id: &str, operation: AppViewOperation) -> String {
     let path = match operation {
-        "actions" => surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_ACTIONS,
-        "open" => surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_OPEN,
-        "stream" => surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_STREAM,
-        unsupported => panic!("unsupported APP view operation `{unsupported}`"),
+        AppViewOperation::Actions => {
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_ACTIONS
+        }
+        AppViewOperation::Open => {
+            surface::gateway_api::paths::API_APPS_BY_APP_ID_TUI_VIEWS_BY_VIEW_ID_OPEN
+        }
     };
     crate::gateway_client_routes::render_route(path, &[app_id.to_owned(), view_id.to_owned()])
 }
@@ -4531,11 +4539,11 @@ mod tests {
     #[test]
     fn declarative_app_operations_use_the_single_gateway_view_namespace() {
         assert_eq!(
-            app_view_endpoint("reference", "detail:42", "open"),
+            app_view_endpoint("reference", "detail:42", AppViewOperation::Open),
             "/api/apps/reference/tui/views/detail:42/open"
         );
         assert_eq!(
-            app_view_endpoint("reference", "detail:42", "actions"),
+            app_view_endpoint("reference", "detail:42", AppViewOperation::Actions),
             "/api/apps/reference/tui/views/detail:42/actions"
         );
     }

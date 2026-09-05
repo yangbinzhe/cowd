@@ -3,7 +3,7 @@
 //! # Role in Multi-Agent Architecture
 //!
 //! L4 is not a live cross-agent message bus.  ExecutionGraph and
-//! TeamWorkingState carry current-run collaboration; L4 contains only
+//! Agentic topics and artifacts carry current-run collaboration; L4 contains only
 //! evidence-backed, promoted long-term knowledge from completed governance.
 //!
 //! ## Key Use Cases

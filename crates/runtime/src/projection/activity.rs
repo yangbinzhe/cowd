@@ -406,26 +406,13 @@ fn project_single_execution_activities_from_events(
                 evidence_ready: (!node.evidence_refs.is_empty()).then_some(true),
                 effect_summary: effect_summary(node),
                 acceptance_summary: acceptance_summary(node),
-                work_status: node
-                    .work_state
-                    .as_ref()
-                    .map(|state| format!("{:?}", state.status).to_ascii_lowercase()),
-                work_revision: node.work_state.as_ref().map(|state| state.revision),
-                claimant_instance_id: node
-                    .work_state
-                    .as_ref()
-                    .and_then(|state| state.claim.as_ref())
-                    .map(|claim| claim.claimant_instance_id.clone()),
-                claimant_role_id: node
-                    .work_state
-                    .as_ref()
-                    .and_then(|state| state.claim.as_ref())
-                    .and_then(|claim| claim.claimant_role_id.clone()),
-                claim_lease_expires_at_ms: node
-                    .work_state
-                    .as_ref()
-                    .and_then(|state| state.claim.as_ref())
-                    .map(|claim| claim.lease_expires_at_ms),
+                // Dynamic ownership belongs exclusively to AgenticTask.  An
+                // ExecutionGraph node carries scheduling metadata only.
+                work_status: None,
+                work_revision: None,
+                claimant_instance_id: None,
+                claimant_role_id: None,
+                claim_lease_expires_at_ms: None,
                 input_artifact_refs: node
                     .work
                     .as_ref()
@@ -474,141 +461,6 @@ fn project_single_execution_activities_from_events(
         );
     }
 
-    for (index, item) in graph.autonomous_work.iter().enumerate() {
-        let activity_id = format!(
-            "activity:execution:{}:work:{}",
-            graph.graph_id, item.work_id
-        );
-        let status = match item.state.status {
-            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Offered => "ready",
-            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Claimed => "running",
-            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Submitted => "waiting",
-            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted => "completed",
-            harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged => "blocked",
-        };
-        let public_summary = format!(
-            "{} · proposed_by={} · bids={} · reviews={}",
-            item.work
-                .objective
-                .as_deref()
-                .unwrap_or("Agent-proposed work"),
-            item.work
-                .proposed_by
-                .as_deref()
-                .unwrap_or("runtime-attested"),
-            item.state.bids.len(),
-            item.state.reviews.len(),
-        );
-        activities.insert(
-            activity_id.clone(),
-            ExecutionActivityProjection {
-                schema_version: EXECUTION_ACTIVITY_SCHEMA_VERSION,
-                activity_id,
-                scope: root_scope.clone(),
-                kind: ExecutionActivityKind::Artifact,
-                node_id: Some(item.work_id.clone()),
-                display_label: item.work.objective.clone(),
-                display_role_label: None,
-                display_focus_label: None,
-                display_provenance: None,
-                display_digest: None,
-                phase: Some("autonomous_work".to_string()),
-                visibility: vec![ActivityVisibility::Operational, ActivityVisibility::Audit],
-                parent_activity_id: Some(root_id.clone()),
-                initiator_activity_id: Some(root_id.clone()),
-                causal_parent_ids: Vec::new(),
-                dependency_ids: Vec::new(),
-                parallel_group_id: None,
-                team_run_id: graph
-                    .graph_id
-                    .strip_prefix("team-graph:")
-                    .map(str::to_string),
-                agent_instance_id: item
-                    .state
-                    .claim
-                    .as_ref()
-                    .map(|claim| claim.claimant_instance_id.clone()),
-                agent_run_id: None,
-                skill_id: None,
-                skill_revision: None,
-                skill_activation_id: None,
-                tool_contract_id: Some("collaboration_control".to_string()),
-                tool_call_id: None,
-                approval_id: None,
-                status: status.to_string(),
-                status_reason_kind: None,
-                blocked_by_activity_ids: Vec::new(),
-                evidence_ready: (!item.work.proposal_evidence_refs.is_empty()).then_some(true),
-                effect_summary: None,
-                acceptance_summary: (!item.state.reviews.is_empty()).then(|| {
-                    let satisfied = item
-                        .state
-                        .reviews
-                        .iter()
-                        .filter(|review| {
-                            review.verdict
-                                == harness_contract::execution_graph::ExecutionWorkReviewVerdict::Accept
-                        })
-                        .count() as u32;
-                    let required = match &item.work.review_policy {
-                        harness_contract::execution_graph::ExecutionWorkReviewPolicy::None => 0,
-                        harness_contract::execution_graph::ExecutionWorkReviewPolicy::Peer {
-                            minimum_reviewers,
-                            ..
-                        } => u32::from(*minimum_reviewers),
-                    };
-                    AcceptanceSummaryProjection {
-                        satisfied,
-                        unsatisfied: required.saturating_sub(satisfied),
-                        framework_invalid: false,
-                        unresolved: u32::from(
-                            item.state.status
-                                == harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged,
-                        ),
-                    }
-                }),
-                work_status: Some(format!("{:?}", item.state.status).to_ascii_lowercase()),
-                work_revision: Some(item.state.revision),
-                claimant_instance_id: item
-                    .state
-                    .claim
-                    .as_ref()
-                    .map(|claim| claim.claimant_instance_id.clone()),
-                claimant_role_id: item
-                    .state
-                    .claim
-                    .as_ref()
-                    .and_then(|claim| claim.claimant_role_id.clone()),
-                claim_lease_expires_at_ms: item
-                    .state
-                    .claim
-                    .as_ref()
-                    .map(|claim| claim.lease_expires_at_ms),
-                input_artifact_refs: item.work.input_artifact_refs.clone(),
-                output_artifact_kinds: item.work.output_artifact_kinds.clone(),
-                status_reason: (item.state.status
-                    == harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Challenged)
-                    .then(|| item.state.review_findings.last().cloned())
-                    .flatten(),
-                required: item.work.required,
-                started_at_ms: item.state.claim.as_ref().map(|claim| claim.claimed_at_ms),
-                completed_at_ms: (item.state.status
-                    == harness_contract::execution_graph::ExecutionWorkRuntimeStatus::Accepted)
-                    .then(|| item.state.claim.as_ref().map(|claim| claim.heartbeat_at_ms))
-                    .flatten(),
-                duration_ms: None,
-                sequence: graph.nodes.len() as u64 + index as u64 + 1,
-                commit_cursor: graph.commit_cursor,
-                public_summary: Some(public_summary),
-                result_summary: item.state.submission_ref.clone(),
-                artifact_refs: item.work.input_artifact_refs.clone(),
-                evidence_refs: item.work.proposal_evidence_refs.clone(),
-                definition_refs: Vec::new(),
-                detail_capability: Some(activity_detail_capability(&graph.graph_id)),
-            },
-        );
-    }
-
     insert_descendant_graph_activities(&mut activities, scope, &root_scope);
 
     let team_activity_by_run = activities
@@ -643,6 +495,7 @@ fn project_single_execution_activities_from_events(
                 | RuntimeEventScope::Skill
                 | RuntimeEventScope::Agent
                 | RuntimeEventScope::Team
+                | RuntimeEventScope::Program
                 | RuntimeEventScope::Approval
                 | RuntimeEventScope::Recovery
                 | RuntimeEventScope::Session
@@ -657,20 +510,27 @@ fn project_single_execution_activities_from_events(
             |binding| binding.activity_id.clone(),
         );
         let (kind, mut visibility) = event_kind(event);
-        if binding.is_none() {
+        // Agent-first Program events are intentionally bound through their
+        // trusted execution ref rather than the legacy activity-binding
+        // envelope. They are first-class narrative facts, not audit-only
+        // leftovers; hiding them here is what reduced the browser graph to a
+        // single root node even while Teams were actually running.
+        if binding.is_none() && event.scope != RuntimeEventScope::Program {
             visibility.retain(|item| *item != ActivityVisibility::Narrative);
         }
         let team_run_id = binding
             .as_ref()
             .and_then(|binding| binding.team_run_id.clone())
-            .or_else(|| value_string(&event.payload, "team_id"));
+            .or_else(|| value_string(&event.payload, "team_id"))
+            .or_else(|| agentic_team_id(event));
         let agent_run_id = binding
             .as_ref()
             .and_then(|binding| binding.agent_run_id.clone());
         let agent_instance_id = binding
             .as_ref()
             .and_then(|binding| binding.agent_instance_id.clone())
-            .or_else(|| value_string(&event.payload, "producer_instance_id"));
+            .or_else(|| value_string(&event.payload, "producer_instance_id"))
+            .or_else(|| agentic_agent_id(event));
         let tool_call_id = binding
             .as_ref()
             .and_then(|binding| binding.tool_call_id.clone());
@@ -796,6 +656,7 @@ fn project_single_execution_activities_from_events(
         }
     }
 
+    canonicalize_agentic_activity_parents(&mut activities);
     canonicalize_owned_activity_parents(&mut activities);
 
     if !include_audit_only {
@@ -884,6 +745,45 @@ fn project_single_execution_activities_from_events(
         )
     });
     (activities, relations.into_values().collect())
+}
+
+/// Program actions arrive as journal events after the physical root graph was
+/// projected, so their Team activities are not present in the early
+/// `team_activity_by_run` index. Re-parent the entire Agent-first working set
+/// once all events are materialized. This makes Team → Agent/Task/Discussion
+/// ownership stable on the first frame and after resync without inventing a
+/// second frontend graph.
+fn canonicalize_agentic_activity_parents(
+    activities: &mut BTreeMap<String, ExecutionActivityProjection>,
+) {
+    let teams = activities
+        .values()
+        .filter(|activity| activity.kind == ExecutionActivityKind::Team)
+        .filter_map(|activity| {
+            activity
+                .team_run_id
+                .as_ref()
+                .map(|team_id| (team_id.clone(), activity.activity_id.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for activity in activities.values_mut().filter(|activity| {
+        matches!(
+            activity.kind,
+            ExecutionActivityKind::Agent
+                | ExecutionActivityKind::Execution
+                | ExecutionActivityKind::Discussion
+        )
+    }) {
+        let Some(team_activity_id) = activity
+            .team_run_id
+            .as_ref()
+            .and_then(|team_id| teams.get(team_id))
+        else {
+            continue;
+        };
+        activity.parent_activity_id = Some(team_activity_id.clone());
+        activity.initiator_activity_id = Some(team_activity_id.clone());
+    }
 }
 
 fn canonicalize_owned_activity_parents(
@@ -1106,7 +1006,7 @@ fn node_activity_id(execution_id: &str, node_id: &str) -> String {
     format!("activity:execution:{execution_id}:node:{node_id}")
 }
 
-fn activity_kind(kind: ExecutionNodeKind, executor_kind: &str) -> ExecutionActivityKind {
+fn activity_kind(kind: ExecutionNodeKind, _executor_kind: &str) -> ExecutionActivityKind {
     match kind {
         ExecutionNodeKind::InlineModel | ExecutionNodeKind::Synthesize => {
             ExecutionActivityKind::Model
@@ -1115,12 +1015,6 @@ fn activity_kind(kind: ExecutionNodeKind, executor_kind: &str) -> ExecutionActiv
             ExecutionActivityKind::ToolBatch
         }
         ExecutionNodeKind::AgentTask => ExecutionActivityKind::Agent,
-        ExecutionNodeKind::Subgraph
-            if executor_kind == crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR =>
-        {
-            ExecutionActivityKind::Team
-        }
-        ExecutionNodeKind::Subgraph => ExecutionActivityKind::Execution,
         ExecutionNodeKind::Verify => ExecutionActivityKind::Verify,
         ExecutionNodeKind::Approval => ExecutionActivityKind::Approval,
         ExecutionNodeKind::SessionDispatch | ExecutionNodeKind::Timer => {
@@ -1232,10 +1126,6 @@ fn insert_descendant_graph_activities(
         for (node_index, node) in graph.nodes.iter().enumerate() {
             let activity_id = node_activity_id(&graph.graph_id, &node.node_id);
             let identity = graph_node_identity(node);
-            let claim = node
-                .work_state
-                .as_ref()
-                .and_then(|state| state.claim.as_ref());
             let dependencies = dependency_map
                 .get(&node.node_id)
                 .cloned()
@@ -1289,14 +1179,11 @@ fn insert_descendant_graph_activities(
                     evidence_ready: (!node.evidence_refs.is_empty()).then_some(true),
                     effect_summary: effect_summary(node),
                     acceptance_summary: acceptance_summary(node),
-                    work_status: node
-                        .work_state
-                        .as_ref()
-                        .map(|state| format!("{:?}", state.status).to_ascii_lowercase()),
-                    work_revision: node.work_state.as_ref().map(|state| state.revision),
-                    claimant_instance_id: claim.map(|claim| claim.claimant_instance_id.clone()),
-                    claimant_role_id: claim.and_then(|claim| claim.claimant_role_id.clone()),
-                    claim_lease_expires_at_ms: claim.map(|claim| claim.lease_expires_at_ms),
+                    work_status: None,
+                    work_revision: None,
+                    claimant_instance_id: None,
+                    claimant_role_id: None,
+                    claim_lease_expires_at_ms: None,
                     input_artifact_refs: node
                         .work
                         .as_ref()
@@ -1383,10 +1270,19 @@ fn event_kind(event: &DurableRuntimeEvent) -> (ExecutionActivityKind, Vec<Activi
             ExecutionActivityKind::Agent
         }
         RuntimeEventScope::Agent => ExecutionActivityKind::Runtime,
-        RuntimeEventScope::Team if event.kind == "team.working_state.appended.v1" => {
-            ExecutionActivityKind::Discussion
-        }
         RuntimeEventScope::Team => ExecutionActivityKind::Team,
+        RuntimeEventScope::Program => match agentic_action_kind(event) {
+            Some("team_create") => ExecutionActivityKind::Team,
+            Some("agent_invite") => ExecutionActivityKind::Agent,
+            Some("message_publish") => ExecutionActivityKind::Discussion,
+            Some("artifact_commit") => ExecutionActivityKind::Artifact,
+            Some("objective_complete_request") => ExecutionActivityKind::Verify,
+            Some(
+                "task_publish" | "task_claim" | "task_release" | "task_supersede" | "task_submit"
+                | "task_review",
+            ) => ExecutionActivityKind::Execution,
+            _ => ExecutionActivityKind::Runtime,
+        },
         RuntimeEventScope::Approval => ExecutionActivityKind::Approval,
         RuntimeEventScope::Recovery => ExecutionActivityKind::Recovery,
         RuntimeEventScope::Session if is_public_reasoning_event(event) => {
@@ -1402,15 +1298,9 @@ fn event_kind(event: &DurableRuntimeEvent) -> (ExecutionActivityKind, Vec<Activi
         RuntimeEventScope::Skill => event.kind == "skill.activation.selected",
         RuntimeEventScope::Agent => is_agent_activity_event(&event.kind),
         RuntimeEventScope::Team => {
-            event.kind.starts_with("team.lifecycle.")
-                || event.kind.starts_with("team.execution.")
-                || (event.kind == "team.working_state.appended.v1"
-                    && event
-                        .payload
-                        .get("visibility")
-                        .and_then(serde_json::Value::as_str)
-                        != Some("private"))
+            event.kind.starts_with("team.lifecycle.") || event.kind.starts_with("team.execution.")
         }
+        RuntimeEventScope::Program => true,
         RuntimeEventScope::Approval => true,
         RuntimeEventScope::Recovery => event
             .refs
@@ -1474,6 +1364,30 @@ fn is_agent_activity_event(kind: &str) -> bool {
             | "agent.provider.first_output"
             | "agent.acceptance.evaluated"
     )
+}
+
+fn agentic_action_kind(event: &DurableRuntimeEvent) -> Option<&str> {
+    (event.scope == RuntimeEventScope::Program && event.kind == "agentic.action_applied")
+        .then(|| event.payload.pointer("/envelope/action/kind")?.as_str())
+        .flatten()
+}
+
+fn agentic_team_id(event: &DurableRuntimeEvent) -> Option<String> {
+    pointer_string(&event.payload, "/envelope/actor/team_id")
+        .or_else(|| pointer_string(&event.payload, "/envelope/action/input/team_ref"))
+        .or_else(|| {
+            (agentic_action_kind(event) == Some("team_create"))
+                .then(|| value_string(&event.payload, "entity_ref"))
+                .flatten()
+        })
+}
+
+fn agentic_agent_id(event: &DurableRuntimeEvent) -> Option<String> {
+    pointer_string(&event.payload, "/envelope/actor/agent_id").or_else(|| {
+        (agentic_action_kind(event) == Some("agent_invite"))
+            .then(|| value_string(&event.payload, "entity_ref"))
+            .flatten()
+    })
 }
 
 fn relation_kind_for(kind: ExecutionActivityKind) -> ActivityRelationKind {
@@ -1685,7 +1599,6 @@ fn node_phase(kind: ExecutionNodeKind) -> &'static str {
         ExecutionNodeKind::InlineModel => "model",
         ExecutionNodeKind::ToolBatch => "tools",
         ExecutionNodeKind::AgentTask => "agent",
-        ExecutionNodeKind::Subgraph => "delegation",
         ExecutionNodeKind::Verify => "verification",
         ExecutionNodeKind::Materialize => "materialization",
         ExecutionNodeKind::Synthesize => "synthesis",
@@ -1761,6 +1674,27 @@ fn usable_agent_display_label(value: &str) -> bool {
 }
 
 fn event_display_label(event: &DurableRuntimeEvent, kind: ExecutionActivityKind) -> Option<String> {
+    if event.scope == RuntimeEventScope::Program {
+        let label = match agentic_action_kind(event) {
+            Some("team_create") => pointer_string(&event.payload, "/envelope/action/input/name"),
+            Some("agent_invite") => pointer_string(&event.payload, "/envelope/action/input/role"),
+            Some("task_publish") => pointer_string(&event.payload, "/envelope/action/input/title"),
+            Some("task_supersede") => {
+                pointer_string(&event.payload, "/envelope/action/input/reason")
+            }
+            Some("artifact_commit") => {
+                pointer_string(&event.payload, "/envelope/action/input/title")
+            }
+            Some("message_publish") => {
+                pointer_string(&event.payload, "/envelope/action/input/summary")
+            }
+            Some(action) => Some(action.replace('_', " ")),
+            None => None,
+        };
+        if label.is_some() {
+            return label;
+        }
+    }
     if kind == ExecutionActivityKind::Agent {
         if let Some(display) = agent_binding_display_label(std::slice::from_ref(&event)) {
             return Some(display);
@@ -2026,6 +1960,7 @@ fn event_kind_is_point_fact(kind: &str) -> bool {
         "capability_assessed",
         "lease_transition",
         "recorded",
+        "action_applied",
         "replanned",
         "intervention",
     ]
@@ -2050,6 +1985,19 @@ fn event_duration(event: &DurableRuntimeEvent) -> Option<u64> {
 
 fn event_artifact_refs(event: &DurableRuntimeEvent) -> Vec<String> {
     let mut refs = payload_refs(&event.payload, "artifact_refs");
+    refs.extend(
+        event
+            .payload
+            .pointer("/envelope/action/input/artifact_refs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned),
+    );
+    if agentic_action_kind(event) == Some("artifact_commit") {
+        refs.extend(value_string(&event.payload, "entity_ref"));
+    }
     refs.extend(
         [
             pointer_string(&event.payload, "/output_ref/ref_id"),
@@ -2083,6 +2031,16 @@ fn event_evidence_refs(event: &DurableRuntimeEvent) -> Vec<String> {
         .map(|reference| reference.id.clone())
         .chain(payload_refs(&event.payload, "evidence_refs"))
         .collect::<Vec<_>>();
+    refs.extend(
+        event
+            .payload
+            .pointer("/envelope/action/input/evidence_refs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned),
+    );
     if let Some(evidence) = event
         .payload
         .pointer("/returned/evidence_refs")
@@ -2527,7 +2485,6 @@ mod tests {
                 ..ExecutionUsage::default()
             },
             work: None,
-            work_state: None,
         };
         let effect = effect_summary(&node).expect("effect summary");
         assert_eq!(effect.applied, 1);
@@ -2569,24 +2526,17 @@ mod tests {
             evidence_refs: Vec::new(),
             usage: Default::default(),
             work: Some(harness_contract::execution_graph::ExecutionWorkProjection {
-                collaboration_work_id: None,
-                objective: None,
-                proposed_by: None,
-                proposal_evidence_refs: Vec::new(),
                 role: harness_contract::execution_graph::ExecutionWorkRole::Verify,
                 required,
                 dependency: Default::default(),
                 cancellation_group: None,
-                eligibility: Default::default(),
                 input_artifact_refs: Vec::new(),
                 output_artifact_kinds: Vec::new(),
-                review_policy: Default::default(),
                 expected_input_tokens: 0,
                 expected_output_tokens: 0,
                 expected_duration_ms: 0,
                 scheduling_priority: 0,
             }),
-            work_state: Some(Default::default()),
         }
     }
 
@@ -2602,7 +2552,6 @@ mod tests {
             lineage: None,
             orchestration: None,
             nodes,
-            autonomous_work: Vec::new(),
             edges: Vec::new(),
             commit_cursor: 1,
             terminal_result_ref: None,
@@ -2613,42 +2562,52 @@ mod tests {
     }
 
     #[test]
-    fn root_first_frame_materializes_all_admitted_descendant_teams_and_blockers() {
+    fn agent_first_program_events_are_visible_and_parented_on_the_normal_surface() {
         let services = RuntimeServices::in_memory().expect("runtime services");
         let root = graph_with_nodes(Vec::new());
-        let mut first = graph_node("team-a", ExecutionNodeStatus::Running, true);
-        first.kind = ExecutionNodeKind::Subgraph;
-        first.executor_kind = crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR.to_string();
-        first.team_run_id = Some("team-run-a".to_string());
-        first.display_label = Some("Theory team".to_string());
-        first.work = None;
-        first.work_state = None;
-        let mut second = graph_node("team-b", ExecutionNodeStatus::WaitingExternal, true);
-        second.kind = ExecutionNodeKind::Subgraph;
-        second.executor_kind = crate::orchestration::compiler::TEAM_SUBGRAPH_EXECUTOR.to_string();
-        second.team_run_id = Some("team-run-b".to_string());
-        second.display_label = Some("Experiment team".to_string());
-        second.work.as_mut().expect("work").input_artifact_refs =
-            vec!["artifact://theory/baseline".to_string()];
-        let mut descendant = graph_with_nodes(vec![first, second]);
-        descendant.graph_id = "program-child".to_string();
-        descendant.parent_execution =
-            Some(harness_contract::execution_graph::ExecutionParentBinding {
-                execution_id: root.graph_id.clone(),
-                node_id: "program-node".to_string(),
-            });
-        descendant.edges = vec![harness_contract::execution_graph::ExecutionEdgeProjection {
-            from: "team-a".to_string(),
-            to: "team-b".to_string(),
-            kind: ExecutionEdgeKind::ArtifactRequires,
-        }];
+        let execution_ref = crate::RuntimeEventRef {
+            kind: "execution_graph".to_string(),
+            id: root.graph_id.clone(),
+        };
+        let team = scoped_event(
+            RuntimeEventScope::Program,
+            "program-team",
+            "agentic.action_applied",
+            "applied",
+            2,
+            vec![execution_ref.clone()],
+            serde_json::json!({
+                "entity_ref": "team:research",
+                "envelope": {
+                    "actor": {"team_id": null, "agent_id": null},
+                    "action": {"kind": "team_create", "input": {"name": "Research Team"}}
+                }
+            }),
+        );
+        let agent = scoped_event(
+            RuntimeEventScope::Program,
+            "program-agent",
+            "agentic.action_applied",
+            "applied",
+            3,
+            vec![execution_ref],
+            serde_json::json!({
+                "entity_ref": "agent:analyst",
+                "envelope": {
+                    "actor": {"team_id": null, "agent_id": null},
+                    "action": {"kind": "agent_invite", "input": {
+                        "team_ref": "team:research", "role": "Evidence Analyst"
+                    }}
+                }
+            }),
+        );
         let scope = ExecutionProjectionScope {
             session_id: Some("session-1".to_string()),
-            mission_id: Some("mission-1".to_string()),
+            mission_id: None,
             task_id: Some("task-1".to_string()),
             turn_id: Some("turn-1".to_string()),
-            execution_ids: BTreeSet::from([root.graph_id.clone(), descendant.graph_id.clone()]),
-            node_ids: BTreeSet::from(["team-a".to_string(), "team-b".to_string()]),
+            execution_ids: BTreeSet::from([root.graph_id.clone()]),
+            node_ids: BTreeSet::new(),
             entity_ids: BTreeSet::new(),
             goals: Vec::new(),
             agents: Vec::new(),
@@ -2657,33 +2616,35 @@ mod tests {
             approvals: Vec::new(),
             interventions: Vec::new(),
             child_executions: Vec::new(),
-            descendant_graphs: vec![descendant],
+            descendant_graphs: Vec::new(),
         };
 
-        let (activities, relations) =
-            project_execution_activities_from_events(&services, &scope, &root, Vec::new(), false);
-        let teams = activities
-            .iter()
-            .filter(|activity| activity.kind == ExecutionActivityKind::Team)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            teams.len(),
-            2,
-            "both admitted Teams must exist on frame one"
+        let (activities, relations) = project_execution_activities_from_events(
+            &services,
+            &scope,
+            &root,
+            vec![team, agent],
+            false,
         );
-        let waiting = teams
+        let team = activities
             .iter()
-            .find(|activity| activity.team_run_id.as_deref() == Some("team-run-b"))
-            .expect("waiting Team");
-        assert_eq!(waiting.status, "waiting_external");
+            .find(|activity| activity.kind == ExecutionActivityKind::Team)
+            .expect("Team is visible");
+        let agent = activities
+            .iter()
+            .find(|activity| activity.kind == ExecutionActivityKind::Agent)
+            .expect("Agent is visible");
+        assert_eq!(team.display_label.as_deref(), Some("Research Team"));
+        assert_eq!(agent.display_label.as_deref(), Some("Evidence Analyst"));
+        assert_eq!(team.status, "completed");
+        assert_eq!(agent.status, "completed");
         assert_eq!(
-            waiting.input_artifact_refs,
-            vec!["artifact://theory/baseline"]
+            agent.parent_activity_id.as_deref(),
+            Some(team.activity_id.as_str())
         );
-        assert_eq!(waiting.blocked_by_activity_ids.len(), 1);
         assert!(relations.iter().any(|relation| {
-            relation.kind == ActivityRelationKind::DependsOn
-                && relation.to_activity_id == waiting.activity_id
+            relation.from_activity_id == team.activity_id
+                && relation.to_activity_id == agent.activity_id
         }));
     }
 
@@ -2918,44 +2879,6 @@ mod tests {
 
         assert_eq!(event_activity_status(&capability), "completed");
         assert_eq!(event_activity_status(&lifecycle), "running");
-    }
-
-    #[test]
-    fn bounded_team_working_state_is_a_public_discussion_without_private_leakage() {
-        let visible = scoped_event(
-            RuntimeEventScope::Team,
-            "discussion-visible",
-            "team.working_state.appended.v1",
-            "committed",
-            1,
-            Vec::new(),
-            serde_json::json!({
-                "team_id": "team-run-1",
-                "producer_instance_id": "reviewer-1",
-                "kind": "challenge",
-                "summary": "The baseline needs an independent check.",
-                "visibility": "team"
-            }),
-        );
-        let private = scoped_event(
-            RuntimeEventScope::Team,
-            "discussion-private",
-            "team.working_state.appended.v1",
-            "committed",
-            2,
-            Vec::new(),
-            serde_json::json!({
-                "kind": "finding",
-                "summary": "bounded private note",
-                "visibility": "private"
-            }),
-        );
-
-        let (kind, visibility) = event_kind(&visible);
-        assert_eq!(kind, ExecutionActivityKind::Discussion);
-        assert!(visibility.contains(&ActivityVisibility::Narrative));
-        let (_, private_visibility) = event_kind(&private);
-        assert!(!private_visibility.contains(&ActivityVisibility::Narrative));
     }
 
     #[test]

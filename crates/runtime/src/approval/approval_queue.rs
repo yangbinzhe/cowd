@@ -1995,53 +1995,6 @@ mod tests {
         assert_eq!(events[1].event.payload["grant"]["scope"], "once");
     }
 
-    #[test]
-    fn trust_all_policy_actor_can_decide_global_template_publish() {
-        let queue = queue();
-        let approval_id = "approval:template:trust-all";
-        queue
-            .submit_scoped_with_policy(
-                approval_id,
-                SubmitGlobalApprovalRequest {
-                    source: session_source(),
-                    context: approval_context(),
-                    domain: ApprovalDomain::System,
-                    blocks_execution: false,
-                    summary: "publish template".to_string(),
-                    action: "definition.template.publish".to_string(),
-                    risk: TaskRisk::Medium,
-                    evidence_refs: Vec::new(),
-                    timeout_policy: ApprovalTimeoutPolicy::Pending,
-                },
-                None,
-                false,
-                vec![ApprovalGrantScope::Once, ApprovalGrantScope::Global],
-            )
-            .expect("pending template approval");
-        let decision = ApprovalDecisionCommand {
-            approval_id: approval_id.to_string(),
-            approved: true,
-            skip: false,
-            reason: "yolo trust-all audit only".to_string(),
-            scope: ApprovalGrantScope::Global,
-            actor: ApprovalDecisionActor {
-                kind: ApprovalDecisionActorKind::Policy,
-                actor_id: "some-other-policy".to_string(),
-            },
-            evidence_refs: vec!["approval.yolo_trust_all".to_string()],
-        };
-        assert_eq!(
-            queue.decide_internal(decision.clone()).unwrap_err(),
-            "global_approval_requires_human_actor"
-        );
-        let mut trust_all = decision;
-        trust_all.actor.actor_id = "yolo-trust-all".to_string();
-        let receipt = queue
-            .decide_internal(trust_all)
-            .expect("trust-all policy actor may decide a Global approval");
-        assert_eq!(receipt.status, GlobalApprovalStatus::Approved);
-    }
-
     #[tokio::test]
     async fn one_deadline_worker_resolves_without_a_second_node_poll() {
         let queue = Arc::new(queue());

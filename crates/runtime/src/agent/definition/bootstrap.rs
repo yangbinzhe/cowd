@@ -202,7 +202,6 @@ fn builtin(
                 context_profile: "default".to_string(),
                 read_scopes,
                 write_mode: CognitiveWriteMode::CandidateOnly,
-                team_working_state_visible: true,
             },
             capability_contract: AgentCapabilityContract {
                 approval_required_for: capabilities

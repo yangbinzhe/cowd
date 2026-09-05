@@ -357,9 +357,6 @@ fn subject_revision(candidate: &runtime::EvolutionGovernanceCandidate) -> Result
         runtime::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
             Ok(revision_ref.revision)
         }
-        runtime::EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
-            Ok(revision_ref.revision)
-        }
     }
 }
 

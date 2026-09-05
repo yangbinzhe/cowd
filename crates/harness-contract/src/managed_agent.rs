@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{AgentCapability, AgentDefinitionId, RevisionSelector, ValidationError};
 use crate::mission::ScheduleTrigger;
 use crate::policy::PermissionMode;
-use crate::team::{TeamTemplateDefinitionId, TeamTemplateSelector};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -20,10 +19,6 @@ pub enum ManagedAgentTarget {
     Agent {
         definition_id: AgentDefinitionId,
         selector: RevisionSelector,
-    },
-    Team {
-        template_id: TeamTemplateDefinitionId,
-        selector: TeamTemplateSelector,
     },
 }
 
@@ -268,23 +263,10 @@ impl ManagedAgentDefinition {
                 }
             }
         }
-        match self.target {
-            ManagedAgentTarget::Agent { .. } if self.granted_capabilities.is_empty() => {
-                return Err(ValidationError::MissingField {
-                    field: "managed_agent.granted_capabilities".to_string(),
-                });
-            }
-            ManagedAgentTarget::Team { .. }
-                if !self.granted_capabilities.is_empty()
-                    || !self.allowed_tool_contract_refs.is_empty()
-                    || !self.allowed_skill_refs.is_empty() =>
-            {
-                return Err(ValidationError::InvalidContract {
-                    message: "managed Team targets must use Template role grants rather than direct Agent grants"
-                        .to_string(),
-                });
-            }
-            _ => {}
+        if self.granted_capabilities.is_empty() {
+            return Err(ValidationError::MissingField {
+                field: "managed_agent.granted_capabilities".to_string(),
+            });
         }
         match &self.trigger {
             ManagedAgentTrigger::Manual => {}

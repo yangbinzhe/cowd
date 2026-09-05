@@ -55,7 +55,10 @@ impl RuntimeService {
                 .ok_or_else(|| {
                     format!("pending approval `{id}` does not belong to this Session")
                 })?,
-            None if pending.len() == 1 => pending.into_iter().next().expect("length checked"),
+            None if pending.len() == 1 => pending
+                .into_iter()
+                .next()
+                .ok_or_else(|| "pending approval disappeared during selection".to_string())?,
             None if pending.is_empty() => {
                 return Err("this Session has no pending approval".to_string())
             }

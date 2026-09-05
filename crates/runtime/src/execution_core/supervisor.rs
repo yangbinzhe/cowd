@@ -326,17 +326,6 @@ pub struct RuntimeExecutionSupervisor {
 }
 
 impl RuntimeExecutionSupervisor {
-    pub(crate) fn load_delegated_agent_tool_receipts(
-        &self,
-        graph_id: &str,
-        node_id: &str,
-        attempt: u32,
-    ) -> Result<Vec<super::graph::DurableAgentToolReceipt>, String> {
-        self.runner
-            .load_delegated_agent_tool_receipts(graph_id, node_id, attempt)
-            .map_err(|error| error.to_string())
-    }
-
     #[must_use]
     pub(crate) fn submission_capacity_snapshot(&self) -> ExecutionSubmissionCapacitySnapshot {
         let slots = self
@@ -700,17 +689,6 @@ impl RuntimeExecutionSupervisor {
         Ok(receipt)
     }
 
-    /// Foreground wait for a graph that was registered by a durable command
-    /// before scheduler admission (for example CollaborationProgram setup).
-    pub(crate) async fn admit_registered_and_wait_terminal(
-        &self,
-        graph_id: &str,
-    ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
-        let receipt = self.admit_registered(graph_id).await?;
-        let report = self.wait_for_terminal(graph_id).await?;
-        Ok((receipt, report))
-    }
-
     pub(crate) async fn notify_graph(&self, graph_id: &str) -> Result<(), ExecutionRunnerError> {
         let _ = self.enqueue(graph_id).await?;
         Ok(())
@@ -725,20 +703,6 @@ impl RuntimeExecutionSupervisor {
         command: ExecutionGraphCommand,
     ) -> Result<ExecutionGraph, ExecutionRunnerError> {
         self.runner.command(graph_id, command).await
-    }
-
-    pub(crate) async fn wake_parent_for_settled_child(
-        &self,
-        child_graph_id: &str,
-    ) -> Result<(), ExecutionRunnerError> {
-        if let Some(parent_graph_id) = self
-            .runner
-            .resolve_parent_for_settled_child(child_graph_id)
-            .await?
-        {
-            self.notify_graph(&parent_graph_id).await?;
-        }
-        Ok(())
     }
 
     fn receipt(
@@ -801,6 +765,18 @@ impl RuntimeExecutionSupervisor {
         let (receipt, slot, generation) = self.admit(graph, command).await?;
         let report = self.await_slot(&receipt.graph_id, slot, generation).await?;
         Ok((receipt, report))
+    }
+
+    /// Admit a graph and let its durable driver continue independently.
+    /// The returned receipt proves admission; callers that need the result can
+    /// later use `wait_for_terminal`. Dropping the receipt never cancels work.
+    pub async fn submit(
+        &self,
+        graph: ExecutionGraph,
+        command: ExecutionGraphCommand,
+    ) -> Result<ExecutionGraphHostReceipt, ExecutionRunnerError> {
+        let (receipt, _slot, _generation) = self.admit(graph, command).await?;
+        Ok(receipt)
     }
 
     /// Admit a graph, release its graph-level concurrency permit whenever it
@@ -870,42 +846,6 @@ impl RuntimeExecutionSupervisor {
     ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
         let receipt = self.command_graph(graph_id, command).await?;
         let report = self.wait_for_quiescence(graph_id).await?;
-        Ok((receipt, report))
-    }
-
-    pub async fn revise_semantic_graph(
-        &self,
-        graph_id: &str,
-        expected_revision: u64,
-        nodes: Vec<harness_contract::execution_graph::ExecutionNodeSpec>,
-        edges: Vec<harness_contract::execution_graph::ExecutionEdge>,
-        reason: String,
-        mutation_id: String,
-        completion: harness_contract::execution_graph::ExecutionCompletionContract,
-        collaboration_program: Option<harness_contract::execution_graph::CollaborationProgram>,
-        collaboration_escalation: Option<
-            harness_contract::execution_graph::CollaborationEscalationReceipt,
-        >,
-        retired_instance_ids: Vec<String>,
-    ) -> Result<(ExecutionGraphHostReceipt, ExecutionRunReport), ExecutionRunnerError> {
-        let graph = self
-            .runner
-            .revise_semantic_graph(
-                graph_id,
-                expected_revision,
-                nodes,
-                edges,
-                reason,
-                mutation_id,
-                completion,
-                collaboration_program,
-                collaboration_escalation,
-                retired_instance_ids,
-            )
-            .await?;
-        let receipt = self.receipt(&graph, "semantic-mutation", now_ms());
-        let (slot, generation) = self.enqueue(graph_id).await?;
-        let report = self.await_slot(graph_id, slot, generation).await?;
         Ok((receipt, report))
     }
 
@@ -1691,8 +1631,7 @@ fn command_advances(command: &ExecutionGraphCommand) -> bool {
         ExecutionGraphCommand::SubmitApproval { decision, .. } => decision.approved,
         ExecutionGraphCommand::Resume { .. }
         | ExecutionGraphCommand::Advance { .. }
-        | ExecutionGraphCommand::ResolveExternal { .. }
-        | ExecutionGraphCommand::ResolveChildExecution { .. } => true,
+        | ExecutionGraphCommand::ResolveExternal { .. } => true,
         _ => false,
     }
 }

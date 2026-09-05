@@ -526,10 +526,14 @@ fn terminal_runtime_change_evidence(
                 "conflicting terminal Runtime changes for upstream path `{path}`"
             ));
         }
-        let (_, evidence) = terminal_candidates
+        let Some((_, evidence)) = terminal_candidates
             .into_iter()
             .max_by_key(|(change, _)| change.write_sequence)
-            .expect("terminal digest was present");
+        else {
+            return Err(format!(
+                "upstream path `{path}` has no terminal Runtime change"
+            ));
+        };
         terminal.push(evidence.clone());
     }
     terminal.sort_by(|left, right| left.evidence_ref.id.cmp(&right.evidence_ref.id));
@@ -634,9 +638,6 @@ fn validate_packet(packet: &AgentTaskPacket) -> Result<(), String> {
     if packet.deadline_at_ms == 0 {
         return Err("AgentTaskPacket has no Runtime-issued absolute deadline".into());
     }
-    packet
-        .validate_team_role_binding()
-        .map_err(str::to_string)?;
     packet.validate_cohort_prompt_package()?;
     packet.budget_lease.validate().map_err(str::to_string)?;
     if packet.budget_lease.deadline_at_ms != packet.deadline_at_ms {
@@ -648,7 +649,6 @@ fn validate_packet(packet: &AgentTaskPacket) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use harness_contract::context::ChildExecutionBudgetReservation;
-    use harness_contract::team::{TeamRoleAssignment, TeamRoleIdentity};
 
     use super::*;
 
@@ -673,8 +673,6 @@ mod tests {
             output_acceptance: Vec::new(),
             requires_managed_collaboration_escalation: false,
             acceptance: vec!["reviewed".into()],
-            team_role_identity: None,
-            team_role: None,
             cohort_prompt_package: None,
             constraints: Vec::new(),
             context_refs: Vec::new(),
@@ -745,37 +743,6 @@ mod tests {
             runtime_observed_resource_scopes: Vec::new(),
             failure: None,
         }
-    }
-
-    #[test]
-    fn team_packet_requires_an_exact_frozen_role_assignment() {
-        let mut packet = task();
-        packet.assignment.team_run_id = Some("team-fixture".to_string());
-        assert!(validate_packet(&packet).is_err());
-
-        let identity = TeamRoleIdentity {
-            role_id: "reviewer".to_string(),
-            slot: 1,
-            focus_id: "review-source".to_string(),
-            focus_boundary: "review only the committed source".to_string(),
-            evidence_responsibility: "independent review evidence".to_string(),
-            focus_scope_hash: "a".repeat(64),
-            overlap_budget_bp: 0,
-            novelty_target_bp: 0,
-            output_acceptance: Vec::new(),
-        };
-        packet.assignment.role_id = identity.role_id.clone();
-        packet.team_role_identity = Some(identity.clone());
-        packet.team_role = Some(TeamRoleAssignment {
-            team_binding_id: "team-binding:fixture".to_string(),
-            team_binding_digest: "b".repeat(64),
-            identity,
-            behavior: Vec::new(),
-        });
-        validate_packet(&packet).expect("exact frozen Team role is executable");
-
-        packet.team_role.as_mut().unwrap().identity.slot = 2;
-        assert!(validate_packet(&packet).is_err());
     }
 
     #[test]

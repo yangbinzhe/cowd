@@ -29,9 +29,8 @@ use crate::agent::definition::{
 };
 use crate::team_definition::{
     bootstrap_builtin_teams, BuiltinTeamTrust, ExactAgentRevisionResolver,
-    RegisteredTeamTemplateLayout, ResolvedTeamTemplate, TeamDefaultPointer,
-    TeamDefinitionStoreError, TeamReleaseAssignment, TeamTemplateDefinitionResolver,
-    TeamTemplateDefinitionStore,
+    RegisteredTeamTemplateLayout, ResolvedTeamTemplate, TeamDefinitionStoreError,
+    TeamTemplateDefinitionResolver, TeamTemplateDefinitionStore,
 };
 use crate::{
     AgentCatalogEntry, EvolutionCandidateSubject, EvolutionReleaseAssignment, ReleaseChangeAction,
@@ -47,7 +46,7 @@ pub enum DefinitionRegistryError {
 }
 
 /// Read-only projection of a runnable Team Template revision. It deliberately
-/// contains no mutable TeamWorkingState or execution graph data.
+/// contains no mutable collaboration or execution graph data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeTeamTemplateCatalogEntry {
     pub revision_ref: TeamTemplateRevisionRef,
@@ -304,45 +303,6 @@ impl RuntimeDefinitionRegistry {
         Ok(resolved)
     }
 
-    /// Resolve an immutable Team revision that has already been selected by
-    /// the Runtime evolution ledger for a Canary instantiation. Like the
-    /// Agent equivalent, this is crate-visible so it cannot become a generic
-    /// bypass around Stable/default resolution.
-    pub(crate) fn resolve_team_canary(
-        &self,
-        revision_ref: &TeamTemplateRevisionRef,
-    ) -> Result<ResolvedTeamTemplate, DefinitionRegistryError> {
-        let stored = self.teams().read_revision(revision_ref)?;
-        if !stored.revision.manifest.lifecycle.can_create_new_binding() {
-            return Err(DefinitionRegistryError::Team(
-                TeamDefinitionStoreError::UnresolvablePointer(
-                    revision_ref.template_id.clone(),
-                    "Canary assignment must reference a published Team Template revision"
-                        .to_string(),
-                ),
-            ));
-        }
-        for role in &stored.revision.manifest.roles {
-            let RevisionSelector::ExactApprovedRevision { revision } = &role.agent_selector else {
-                return Err(DefinitionRegistryError::Team(
-                    TeamDefinitionStoreError::UnresolvablePointer(
-                        revision_ref.template_id.clone(),
-                        "Canary Team Template role must pin an approved Agent revision".to_string(),
-                    ),
-                ));
-            };
-            self.agents
-                .ensure_eligible_revision(&role.agent_definition_id, *revision)?;
-        }
-        Ok(ResolvedTeamTemplate {
-            revision: stored.revision,
-            team_markdown: stored.team_markdown,
-            selected_by: RevisionSelector::ExactApprovedRevision {
-                revision: revision_ref.revision,
-            },
-        })
-    }
-
     /// Rebuild the Runtime's runnable Agent catalog from immutable Definition
     /// revisions. Draft, revoked, stopped, quarantined, and corrupted
     /// Definitions never appear in this projection.
@@ -382,8 +342,8 @@ impl RuntimeDefinitionRegistry {
         Ok(entries)
     }
 
-    /// Rebuild the runnable Team Template projection from the same exact
-    /// Definition resolver used at instantiation time.
+    /// Rebuild the read-only Team Template hint catalog from exact published
+    /// definitions. Templates never instantiate or own execution.
     pub fn runnable_team_catalog(
         &self,
     ) -> Result<Vec<RuntimeTeamTemplateCatalogEntry>, DefinitionRegistryError> {
@@ -461,151 +421,70 @@ impl RuntimeDefinitionRegistry {
         // exact caches before applying a release transition so partial durable
         // success can never leave a stale runnable definition in memory.
         self.invalidate_definition_caches();
-        match &assignment.subject {
-            EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
-                let stored = self.agents.read_revision(revision_ref)?;
-                let authorization = ReleaseAuthorization::HumanApproval {
-                    approval_ref: assignment.approval_ref.clone(),
-                };
-                match assignment.action {
-                    ReleaseChangeAction::PromoteCanary => {
-                        self.agents.record_release_assignment(&ReleaseAssignment {
-                            scope: revision_ref.definition_id.scope(),
-                            revision_ref: revision_ref.clone(),
-                            channel: ReleaseChannel::Canary,
-                            status: ReleaseAssignmentStatus::Active,
-                            authorization,
-                            content_digest: stored.revision.content_digest,
-                        })?
-                    }
-                    ReleaseChangeAction::PromoteStable => {
-                        self.agents.record_release_assignment(&ReleaseAssignment {
-                            scope: revision_ref.definition_id.scope(),
-                            revision_ref: revision_ref.clone(),
-                            channel: ReleaseChannel::Stable,
-                            status: ReleaseAssignmentStatus::Active,
-                            authorization: authorization.clone(),
-                            content_digest: stored.revision.content_digest,
-                        })?;
-                        if let Err(error) =
-                            self.agents.set_default_pointer(&DefaultPointer::latest(
-                                revision_ref.definition_id.scope(),
-                                revision_ref.definition_id.clone(),
-                                authorization,
-                            ))
-                        {
-                            if !matches!(error, DefinitionStoreError::ManualPinProtected) {
-                                return Err(error.into());
-                            }
-                        }
-                    }
-                    ReleaseChangeAction::StopCanary => {
-                        self.agents.record_release_assignment(&ReleaseAssignment {
-                            scope: revision_ref.definition_id.scope(),
-                            revision_ref: revision_ref.clone(),
-                            channel: ReleaseChannel::Canary,
-                            status: ReleaseAssignmentStatus::Stopped,
-                            authorization,
-                            content_digest: stored.revision.content_digest,
-                        })?
-                    }
-                    ReleaseChangeAction::SetDefaultLatest => {
-                        self.agents.set_default_pointer(&DefaultPointer::latest(
-                            revision_ref.definition_id.scope(),
-                            revision_ref.definition_id.clone(),
-                            authorization,
-                        ))?
-                    }
-                    ReleaseChangeAction::SetDefaultExact | ReleaseChangeAction::Rollback => {
-                        self.agents.set_default_pointer(&DefaultPointer {
-                            scope: revision_ref.definition_id.scope(),
-                            definition_id: revision_ref.definition_id.clone(),
-                            selector: assignment.selector.clone().ok_or_else(|| {
-                                DefinitionRegistryError::Agent(
-                                    DefinitionStoreError::UnresolvablePointer(
-                                        revision_ref.definition_id.clone(),
-                                        "release assignment requires an exact selector".to_string(),
-                                    ),
-                                )
-                            })?,
-                            authorization,
-                        })?
+        let EvolutionCandidateSubject::AgentDefinition { revision_ref } = &assignment.subject;
+        let stored = self.agents.read_revision(revision_ref)?;
+        let authorization = ReleaseAuthorization::HumanApproval {
+            approval_ref: assignment.approval_ref.clone(),
+        };
+        match assignment.action {
+            ReleaseChangeAction::PromoteCanary => {
+                self.agents.record_release_assignment(&ReleaseAssignment {
+                    scope: revision_ref.definition_id.scope(),
+                    revision_ref: revision_ref.clone(),
+                    channel: ReleaseChannel::Canary,
+                    status: ReleaseAssignmentStatus::Active,
+                    authorization,
+                    content_digest: stored.revision.content_digest,
+                })?
+            }
+            ReleaseChangeAction::PromoteStable => {
+                self.agents.record_release_assignment(&ReleaseAssignment {
+                    scope: revision_ref.definition_id.scope(),
+                    revision_ref: revision_ref.clone(),
+                    channel: ReleaseChannel::Stable,
+                    status: ReleaseAssignmentStatus::Active,
+                    authorization: authorization.clone(),
+                    content_digest: stored.revision.content_digest,
+                })?;
+                if let Err(error) = self.agents.set_default_pointer(&DefaultPointer::latest(
+                    revision_ref.definition_id.scope(),
+                    revision_ref.definition_id.clone(),
+                    authorization,
+                )) {
+                    if !matches!(error, DefinitionStoreError::ManualPinProtected) {
+                        return Err(error.into());
                     }
                 }
             }
-            EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
-                let stored = self.teams.read_revision(revision_ref)?;
-                let authorization = ReleaseAuthorization::HumanApproval {
-                    approval_ref: assignment.approval_ref.clone(),
-                };
-                match assignment.action {
-                    ReleaseChangeAction::PromoteCanary => {
-                        self.teams
-                            .record_release_assignment(&TeamReleaseAssignment {
-                                scope: revision_ref.template_id.scope(),
-                                revision_ref: revision_ref.clone(),
-                                channel: ReleaseChannel::Canary,
-                                status: ReleaseAssignmentStatus::Active,
-                                authorization,
-                                content_digest: stored.revision.content_digest,
-                            })?
-                    }
-                    ReleaseChangeAction::PromoteStable => {
-                        self.teams
-                            .record_release_assignment(&TeamReleaseAssignment {
-                                scope: revision_ref.template_id.scope(),
-                                revision_ref: revision_ref.clone(),
-                                channel: ReleaseChannel::Stable,
-                                status: ReleaseAssignmentStatus::Active,
-                                authorization: authorization.clone(),
-                                content_digest: stored.revision.content_digest,
-                            })?;
-                        if let Err(error) =
-                            self.teams.set_default_pointer(&TeamDefaultPointer::latest(
-                                revision_ref.template_id.scope(),
-                                revision_ref.template_id.clone(),
-                                authorization,
-                            ))
-                        {
-                            if !matches!(error, TeamDefinitionStoreError::ManualPinProtected) {
-                                return Err(error.into());
-                            }
-                        }
-                    }
-                    ReleaseChangeAction::StopCanary => {
-                        self.teams
-                            .record_release_assignment(&TeamReleaseAssignment {
-                                scope: revision_ref.template_id.scope(),
-                                revision_ref: revision_ref.clone(),
-                                channel: ReleaseChannel::Canary,
-                                status: ReleaseAssignmentStatus::Stopped,
-                                authorization,
-                                content_digest: stored.revision.content_digest,
-                            })?
-                    }
-                    ReleaseChangeAction::SetDefaultLatest => {
-                        self.teams.set_default_pointer(&TeamDefaultPointer::latest(
-                            revision_ref.template_id.scope(),
-                            revision_ref.template_id.clone(),
-                            authorization,
-                        ))?
-                    }
-                    ReleaseChangeAction::SetDefaultExact | ReleaseChangeAction::Rollback => {
-                        self.teams.set_default_pointer(&TeamDefaultPointer {
-                            scope: revision_ref.template_id.scope(),
-                            template_id: revision_ref.template_id.clone(),
-                            selector: assignment.selector.clone().ok_or_else(|| {
-                                DefinitionRegistryError::Team(
-                                    TeamDefinitionStoreError::UnresolvablePointer(
-                                        revision_ref.template_id.clone(),
-                                        "release assignment requires an exact selector".to_string(),
-                                    ),
-                                )
-                            })?,
-                            authorization,
-                        })?
-                    }
-                }
+            ReleaseChangeAction::StopCanary => {
+                self.agents.record_release_assignment(&ReleaseAssignment {
+                    scope: revision_ref.definition_id.scope(),
+                    revision_ref: revision_ref.clone(),
+                    channel: ReleaseChannel::Canary,
+                    status: ReleaseAssignmentStatus::Stopped,
+                    authorization,
+                    content_digest: stored.revision.content_digest,
+                })?
+            }
+            ReleaseChangeAction::SetDefaultLatest => {
+                self.agents.set_default_pointer(&DefaultPointer::latest(
+                    revision_ref.definition_id.scope(),
+                    revision_ref.definition_id.clone(),
+                    authorization,
+                ))?
+            }
+            ReleaseChangeAction::SetDefaultExact | ReleaseChangeAction::Rollback => {
+                self.agents.set_default_pointer(&DefaultPointer {
+                    scope: revision_ref.definition_id.scope(),
+                    definition_id: revision_ref.definition_id.clone(),
+                    selector: assignment.selector.clone().ok_or_else(|| {
+                        DefinitionRegistryError::Agent(DefinitionStoreError::UnresolvablePointer(
+                            revision_ref.definition_id.clone(),
+                            "release assignment requires an exact selector".to_string(),
+                        ))
+                    })?,
+                    authorization,
+                })?
             }
         }
         Ok(())
@@ -734,7 +613,6 @@ mod tests {
                         context_profile: "team".to_string(),
                         read_scopes: vec![CognitiveReadScope::Session],
                         write_mode: CognitiveWriteMode::CandidateOnly,
-                        team_working_state_visible: true,
                     },
                     capability_contract: AgentCapabilityContract {
                         capability_ceiling: vec![AgentCapability::Read],

@@ -404,18 +404,41 @@ fn materialize_delta_operations(
             entity: execution_health_entity(execution_id, graph, full),
         });
     }
-    if graph.terminal_result_ref.is_some()
-        || graph.nodes.iter().all(|node| node.status.is_terminal())
+    append_terminal_and_cursor(
+        &mut operations,
+        services,
+        execution_id,
+        graph,
+        graph_changed || !events.is_empty(),
+        _base_cursor,
+        target_cursor,
+    );
+    Ok(operations)
+}
+
+fn append_terminal_and_cursor(
+    operations: &mut Vec<ProjectionOperation>,
+    services: &RuntimeServices,
+    execution_id: &str,
+    graph: &harness_contract::execution_graph::ExecutionGraphProjection,
+    changed: bool,
+    base_cursor: u64,
+    target_cursor: u64,
+) {
+    if changed
+        && (graph.terminal_result_ref.is_some()
+            || graph.nodes.iter().all(|node| node.status.is_terminal()))
     {
         operations.push(ProjectionOperation::SetTerminal {
             terminal_result_ref: graph.terminal_result_ref.clone(),
             live: services.execution_live(execution_id),
         });
     }
-    operations.push(ProjectionOperation::AdvanceCursor {
-        cursor: target_cursor,
-    });
-    Ok(operations)
+    if target_cursor != base_cursor {
+        operations.push(ProjectionOperation::AdvanceCursor {
+            cursor: target_cursor,
+        });
+    }
 }
 
 fn project_activity_changes(

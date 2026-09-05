@@ -29,7 +29,7 @@ use crate::{
         CompactionResult, MemoryCategory, MemoryEntry, MemoryLayer, MemorySource, Message,
         MessageRole, Priority,
     },
-    MemoryScope,
+    MemoryError, MemoryScope,
 };
 
 /// Preamble for LLM summarization prompts (hermes-agent inspired).
@@ -195,7 +195,7 @@ impl SessionCheckpointBuildContext {
         session_id: impl Into<String>,
         agent_id: impl Into<String>,
         source_range: CompactionSourceRange,
-    ) -> Self {
+    ) -> Result<Self> {
         let session_id = session_id.into();
         let agent_id = agent_id.into();
         let identity_session = if session_id.trim().is_empty() {
@@ -214,10 +214,12 @@ impl SessionCheckpointBuildContext {
             identity_session,
             "standalone-checkpoint",
         )
-        .unwrap_or_else(|error| {
-            unreachable!("sanitized standalone checkpoint identity must be valid: {error}")
-        });
-        Self {
+        .map_err(|error| {
+            MemoryError::InvalidArgument(format!(
+                "standalone checkpoint identity is invalid: {error}"
+            ))
+        })?;
+        Ok(Self {
             checkpoint_id: format!("checkpoint-{}", uuid::Uuid::new_v4()),
             execution_identity,
             session_id,
@@ -226,7 +228,7 @@ impl SessionCheckpointBuildContext {
             task_id: None,
             team_id: None,
             source_range,
-        }
+        })
     }
 
     #[must_use]
@@ -1561,7 +1563,8 @@ mod tests {
                 event_end_exclusive: Some(8),
                 raw_refs: vec![raw_ref.clone()],
             },
-        );
+        )
+        .expect("valid checkpoint context");
 
         let checkpoint = SessionCompactor::new()
             .build_checkpoint(&messages, None, context)
@@ -1605,7 +1608,8 @@ mod tests {
                 event_end_exclusive: Some(2),
                 raw_refs: vec![EvidenceRef::durable("raw-bounded")],
             },
-        );
+        )
+        .expect("valid bounded checkpoint context");
         let checkpoint = SessionCompactor::new()
             .with_max_summary_tokens(128)
             .build_checkpoint(&messages, None, context)

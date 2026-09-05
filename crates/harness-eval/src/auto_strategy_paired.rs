@@ -151,7 +151,6 @@ struct Sample {
     evidence_overlap_observed: bool,
     merge_cost_ms: u64,
     team_materialized: bool,
-    working_state_verified: bool,
     team_child_count: usize,
     team_agent_count: usize,
     parent_merge_count: u64,
@@ -822,7 +821,6 @@ fn sample_shell(
         evidence_overlap_observed: false,
         merge_cost_ms: 0,
         team_materialized: false,
-        working_state_verified: false,
         team_child_count: 0,
         team_agent_count: 0,
         parent_merge_count: 0,
@@ -1508,7 +1506,7 @@ fn projection_is_successful_sample(
         && projection.graph.nodes.iter().all(|node| {
             node.status == harness_contract::execution_graph::ExecutionNodeStatus::Completed
         })
-        && (sample.selected_candidate.as_deref() != Some("team") || sample.working_state_verified)
+        && (sample.selected_candidate.as_deref() != Some("team") || sample.team_materialized)
 }
 
 fn should_wait_for_terminal_response(
@@ -1571,7 +1569,6 @@ fn apply_projection_metrics(
     sample.parallel_tool_batches = outcome.parallel_tool_batches;
     sample.evidence_overlap_bp = outcome.evidence_overlap_bp;
     sample.evidence_overlap_observed = outcome.evidence_overlap_observed;
-    sample.working_state_verified = outcome.working_state_verified;
     sample.merge_cost_ms = outcome.merge_cost_ms;
     sample.critical_path_ms = outcome.duration_ms;
     let strategy_input_tokens = outcome.input_tokens;
@@ -2155,7 +2152,6 @@ fn evaluate_samples(
             automatic.len() == repetitions
                 && automatic.into_iter().all(|sample| {
                     sample.team_materialized
-                        && sample.working_state_verified
                         && (task.mutation_fixture.is_some() || sample.evidence_overlap_observed)
                 })
         });
@@ -2198,7 +2194,6 @@ fn evaluate_samples(
     let baseline_topology_isolation_gate = scored.iter().all(|sample| match sample.condition {
         Condition::Direct | Condition::ParallelTools => {
             !sample.team_materialized
-                && !sample.working_state_verified
                 && sample.parent_merge_count == 0
                 && sample.team_child_count == 0
                 && sample.team_agent_count == 0

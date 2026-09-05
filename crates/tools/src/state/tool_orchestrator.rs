@@ -210,6 +210,36 @@ fn resolve_effect_properties(
             mutates_packages: false,
             mutates_system: false,
         },
+        "runtime.agent_action" => {
+            if tool_id == harness_contract::agent_action::STATE_INSPECT_TOOL_ID {
+                EffectProperties {
+                    effect_kind: ToolEffectKind::Read,
+                    idempotency: ToolIdempotency::Idempotent,
+                    scopes: vec![read_scope()],
+                    required_permission: ToolPermissionMode::ReadOnly,
+                    approval_class: ToolApprovalClass::None,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }
+            } else {
+                // Agent Actions mutate only Runtime-owned collaboration
+                // facts. They neither grant nor perform workspace/external
+                // effects; those remain separately authorized ToolHost calls.
+                EffectProperties {
+                    effect_kind: ToolEffectKind::Write,
+                    idempotency: ToolIdempotency::IdempotentWithKey,
+                    scopes: vec![control_scope()],
+                    required_permission: ToolPermissionMode::ReadOnly,
+                    approval_class: ToolApprovalClass::None,
+                    uses_network: false,
+                    spawns_process: false,
+                    mutates_packages: false,
+                    mutates_system: false,
+                }
+            }
+        }
         "builtin.readonly_process" => EffectProperties {
             effect_kind: ToolEffectKind::Read,
             idempotency: ToolIdempotency::Idempotent,
@@ -227,108 +257,6 @@ fn resolve_effect_properties(
             scopes: vec![write_scope()],
             required_permission: ToolPermissionMode::WorkspaceWrite,
             approval_class: ToolApprovalClass::Policy,
-            uses_network: false,
-            spawns_process: false,
-            mutates_packages: false,
-            mutates_system: false,
-        },
-        "runtime.orchestration" => {
-            let operation = input
-                .get("operation")
-                .and_then(Value::as_str)
-                .unwrap_or("inspect");
-            if operation == "inspect" {
-                EffectProperties {
-                    effect_kind: ToolEffectKind::Read,
-                    idempotency: ToolIdempotency::Idempotent,
-                    scopes: vec![read_scope()],
-                    required_permission: ToolPermissionMode::ReadOnly,
-                    approval_class: ToolApprovalClass::None,
-                    uses_network: false,
-                    spawns_process: false,
-                    mutates_packages: false,
-                    mutates_system: false,
-                }
-            } else if operation == "propose_template" {
-                // Publishing a reusable shared definition is a durable
-                // workspace/catalog mutation and retains the write gate.
-                EffectProperties {
-                    effect_kind: ToolEffectKind::Write,
-                    idempotency: ToolIdempotency::IdempotentWithKey,
-                    scopes: vec![write_scope()],
-                    required_permission: ToolPermissionMode::WorkspaceWrite,
-                    approval_class: ToolApprovalClass::Policy,
-                    uses_network: false,
-                    spawns_process: false,
-                    mutates_packages: false,
-                    mutates_system: false,
-                }
-            } else {
-                // propose/revise/control/route_input mutate only the bounded
-                // Runtime execution state already owned by this Session.
-                // Runtime independently validates every graph, resource and
-                // permission edge; these operations cannot grant file or
-                // external authority. Classifying them as workspace writes
-                // prevented read-only collaboration from recovering its own
-                // graph and broke the autonomous control loop.
-                EffectProperties {
-                    effect_kind: ToolEffectKind::Read,
-                    idempotency: ToolIdempotency::IdempotentWithKey,
-                    scopes: vec![control_scope()],
-                    required_permission: ToolPermissionMode::ReadOnly,
-                    approval_class: ToolApprovalClass::None,
-                    uses_network: false,
-                    spawns_process: false,
-                    mutates_packages: false,
-                    mutates_system: false,
-                }
-            }
-        }
-        "runtime.team_board" => {
-            let operation = input
-                .get("operation")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if operation == "publish" {
-                // Team-board publication is an internal, binding-scoped
-                // collaboration checkpoint. It never mutates workspace or
-                // external state, and the executor enforces Team identity,
-                // revision CAS and visibility independently.
-                EffectProperties {
-                    effect_kind: ToolEffectKind::Read,
-                    idempotency: ToolIdempotency::IdempotentWithKey,
-                    scopes: vec![control_scope()],
-                    required_permission: ToolPermissionMode::ReadOnly,
-                    approval_class: ToolApprovalClass::None,
-                    uses_network: false,
-                    spawns_process: false,
-                    mutates_packages: false,
-                    mutates_system: false,
-                }
-            } else {
-                EffectProperties {
-                    effect_kind: ToolEffectKind::Read,
-                    idempotency: ToolIdempotency::Idempotent,
-                    scopes: vec![read_scope()],
-                    required_permission: ToolPermissionMode::ReadOnly,
-                    approval_class: ToolApprovalClass::None,
-                    uses_network: false,
-                    spawns_process: false,
-                    mutates_packages: false,
-                    mutates_system: false,
-                }
-            }
-        }
-        // A managed Agent can only request an escalation. Runtime attests the
-        // immutable parent/attempt fences and independently decides whether
-        // to append a Program revision, so this tool has no direct workspace
-        // or external mutation authority of its own.
-        "runtime.collaboration_escalation" => EffectProperties {
-            effect_kind: ToolEffectKind::Read,
-            idempotency: ToolIdempotency::Idempotent,
-            scopes: vec![read_scope()],
-            required_permission: ToolPermissionMode::ReadOnly,
-            approval_class: ToolApprovalClass::None,
             uses_network: false,
             spawns_process: false,
             mutates_packages: false,
@@ -1002,95 +930,6 @@ mod tests {
         );
         assert!(descriptor.uses_network);
         assert!(descriptor.spawns_process);
-    }
-
-    #[test]
-    fn runtime_orchestration_effect_depends_on_typed_operation() {
-        let resolver = ToolEffectResolverSpec {
-            resolver_id: "runtime.orchestration".to_string(),
-            resolver_version: 1,
-        };
-        let inspect = resolve_registered_tool_effect(
-            &resolver,
-            "runtime_orchestrate",
-            &json!({"intent": "inspect", "operation": "inspect"}),
-            ToolPermissionMode::ReadOnly,
-        );
-        let propose = resolve_registered_tool_effect(
-            &resolver,
-            "runtime_orchestrate",
-            &json!({"intent": "propose", "operation": "propose"}),
-            ToolPermissionMode::ReadOnly,
-        );
-        let revise = resolve_registered_tool_effect(
-            &resolver,
-            "runtime_orchestrate",
-            &json!({"intent": "recover", "operation": "revise"}),
-            ToolPermissionMode::ReadOnly,
-        );
-        let publish_template = resolve_registered_tool_effect(
-            &resolver,
-            "runtime_orchestrate",
-            &json!({"intent": "publish", "operation": "propose_template"}),
-            ToolPermissionMode::ReadOnly,
-        );
-
-        assert_eq!(inspect.effect_kind, ToolEffectKind::Read);
-        assert_eq!(inspect.required_permission, ToolPermissionMode::ReadOnly);
-        assert_eq!(propose.effect_kind, ToolEffectKind::Read);
-        assert_eq!(propose.required_permission, ToolPermissionMode::ReadOnly);
-        assert_eq!(propose.idempotency, ToolIdempotency::IdempotentWithKey);
-        assert_eq!(revise.effect_kind, ToolEffectKind::Read);
-        assert_eq!(revise.required_permission, ToolPermissionMode::ReadOnly);
-        assert!(revise.scopes.iter().all(|scope| {
-            scope.resource == PermissionResource::Tool
-                && scope.operation == PermissionOperation::Control
-        }));
-        assert_eq!(publish_template.effect_kind, ToolEffectKind::Write);
-        assert_eq!(
-            publish_template.required_permission,
-            ToolPermissionMode::WorkspaceWrite
-        );
-    }
-
-    #[test]
-    fn team_board_publish_is_readonly_internal_control_state() {
-        let resolver = ToolEffectResolverSpec {
-            resolver_id: "runtime.team_board".to_string(),
-            resolver_version: 1,
-        };
-        let publish = resolve_registered_tool_effect(
-            &resolver,
-            "team_board",
-            &json!({"operation": "publish", "summary": "bounded finding"}),
-            ToolPermissionMode::ReadOnly,
-        );
-
-        assert_eq!(publish.effect_kind, ToolEffectKind::Read);
-        assert_eq!(publish.required_permission, ToolPermissionMode::ReadOnly);
-        assert_eq!(publish.approval_class, ToolApprovalClass::None);
-        assert!(publish.scopes.iter().all(|scope| {
-            scope.resource == PermissionResource::Tool
-                && scope.operation == PermissionOperation::Control
-        }));
-    }
-
-    #[test]
-    fn collaboration_escalation_is_a_readonly_program_request_effect() {
-        let resolver = ToolEffectResolverSpec {
-            resolver_id: "runtime.collaboration_escalation".to_string(),
-            resolver_version: 1,
-        };
-        let descriptor = resolve_registered_tool_effect(
-            &resolver,
-            "request_collaboration_escalation",
-            &json!({"base_revision": 7}),
-            ToolPermissionMode::ReadOnly,
-        );
-
-        assert_eq!(descriptor.effect_kind, ToolEffectKind::Read);
-        assert_eq!(descriptor.required_permission, ToolPermissionMode::ReadOnly);
-        assert_eq!(descriptor.approval_class, ToolApprovalClass::None);
     }
 
     #[test]

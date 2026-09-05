@@ -2276,30 +2276,6 @@ impl GatewayApiClient {
             .await
     }
 
-    /// Submit declarative Team intent. Gateway forwards it to Runtime, which
-    /// resolves template/Agent revisions and constructs the graph.
-    pub async fn instantiate_team_template(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.post_json(
-            surface::gateway_api::paths::API_TEAM_TEMPLATES_INSTANTIATE.template(),
-            body,
-        )
-        .await
-    }
-
-    pub async fn team_working_state(
-        &self,
-        team_id: &str,
-    ) -> Result<serde_json::Value, GatewayApiError> {
-        self.get_json(&crate::gateway_client_routes::render_route(
-            surface::gateway_api::paths::API_RUNTIME_TEAMS_BY_ID_WORKING_STATE,
-            &[(url_encode(team_id)).to_string()],
-        ))
-        .await
-    }
-
     pub async fn decide_mission_approval(
         &self,
         approval_id: &str,

@@ -83,13 +83,12 @@ fn build_projection(
         &selected_mission_id,
         services.session_relations(),
         services.agent_runtime(),
-        services.team_runtime(),
         services.approval_queue(),
         services.conflict_resolver(),
         services.mission_evidence(),
         services.mission_schedules().projection(),
     );
-    let team_projection = services.team_runtime().projection_json();
+    let agentic_programs = agentic_program_projections(services);
     let agent_projection = serde_json::json!({
         "kind": "runtime.agents",
         "agents": services.agent_runtime().list(),
@@ -111,12 +110,16 @@ fn build_projection(
         .into_iter()
         .filter(|task| task.mission_id == selected_mission_id)
         .collect::<Vec<_>>();
-    let teams = team_nodes(&team_projection, &graph_bindings)
-        .into_iter()
+    let all_teams = team_nodes(&agentic_programs, &graph_bindings);
+    let all_agents = agent_nodes(&agent_projection, &agentic_programs, &graph_bindings);
+    let teams = all_teams
+        .iter()
+        .cloned()
         .filter(|team| team.mission_id.as_deref() == Some(selected_mission_id.as_str()))
         .collect::<Vec<_>>();
-    let agents = agent_nodes(&agent_projection, &teams)
-        .into_iter()
+    let agents = all_agents
+        .iter()
+        .cloned()
         .filter(|agent| agent.mission_id.as_deref() == Some(selected_mission_id.as_str()))
         .collect::<Vec<_>>();
     let selected_session_ids = mission_session_ids(services, &all_tasks, &selected_mission_id);
@@ -242,7 +245,7 @@ fn build_projection(
         title: "Mission Control".to_string(),
         active_session_id,
         session_count: sessions.len(),
-        running_agent_count: agent_nodes(&agent_projection, &teams)
+        running_agent_count: all_agents
             .iter()
             .filter(|agent| agent.status.as_deref() == Some("running"))
             .count(),
@@ -262,15 +265,7 @@ fn build_projection(
     );
     let missions = mission_aggregates
         .iter()
-        .map(|aggregate| {
-            mission_summary(
-                services,
-                aggregate,
-                &all_tasks,
-                &team_projection,
-                &agent_projection,
-            )
-        })
+        .map(|aggregate| mission_summary(services, aggregate, &all_tasks, &all_teams, &all_agents))
         .collect();
     let mission_graph = mission_graph(
         services,
@@ -432,15 +427,15 @@ fn control_readiness(
     let critical_conflict_count = critical_conflict_count(conflicts);
     let mut actions = vec![
         readiness(
-            "team.create",
+            "agentic.team.create",
             dispatchable_sessions > 0,
             if dispatchable_sessions > 0 {
-                "canonical Session is available for a Team"
+                "canonical Session is available for an Agentic Program"
             } else {
                 "no active canonical Session is available"
             },
             false,
-            Some("runtime.team_instantiation"),
+            Some("runtime.agentic_program"),
             dispatchable_sessions,
         ),
         readiness(
@@ -492,7 +487,7 @@ fn control_readiness(
             high_conflict_count,
         ),
         readiness(
-            "team.observe",
+            "agentic.team.observe",
             runnable_teams > 0,
             if runnable_teams > 0 {
                 "Team and Graph progress is materialized"
@@ -639,106 +634,139 @@ fn mission_session_ids(
         .collect()
 }
 
+fn agentic_program_projections(services: &RuntimeServices) -> Vec<crate::AgenticProgramProjection> {
+    services
+        .agent_action_service()
+        .list_programs()
+        .unwrap_or_default()
+}
+
 fn team_nodes(
-    team_projection: &serde_json::Value,
+    programs: &[crate::AgenticProgramProjection],
     graph_bindings: &BTreeMap<String, (String, String)>,
 ) -> Vec<MissionControlTeamNode> {
-    team_projection["teams"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|team| {
-            let graph_id = value_string(team, "graph_id")?;
-            let binding = graph_bindings.get(&graph_id);
-            Some(MissionControlTeamNode {
-                team_id: value_string(team, "team_id")?,
-                graph_id,
-                display_label: value_string(team, "display_label"),
-                mission_id: binding.map(|(mission_id, _)| mission_id.clone()),
-                task_id: binding.map(|(_, task_id)| task_id.clone()),
-                session_id: value_string(team, "session_id"),
-                status: value_string(team, "status"),
-                agent_count: team["agents"].as_array().map_or(0, Vec::len),
-                detail: team.clone(),
-            })
+    programs
+        .iter()
+        .filter_map(|program| {
+            let graph_id = program.root_execution_id.as_ref()?;
+            let binding = graph_bindings.get(graph_id)?;
+            Some((program, graph_id, binding))
+        })
+        .flat_map(|(program, graph_id, binding)| {
+            program
+                .teams
+                .values()
+                .map(move |team| MissionControlTeamNode {
+                    team_id: team.team_id.clone(),
+                    graph_id: graph_id.clone(),
+                    display_label: Some(team.name.clone()),
+                    mission_id: Some(binding.0.clone()),
+                    task_id: Some(binding.1.clone()),
+                    session_id: Some(program.session_id.clone()),
+                    status: Some(agentic_team_status(program, &team.team_id).to_string()),
+                    agent_count: team.member_ids.len(),
+                    detail: serde_json::json!({
+                        "program_id": program.program_id,
+                        "program_revision": program.revision,
+                        "program_status": program.status,
+                        "team": team,
+                    }),
+                })
         })
         .collect()
 }
 
+fn agentic_team_status(program: &crate::AgenticProgramProjection, team_id: &str) -> &'static str {
+    use crate::{AgenticProgramStatus, AgenticTaskStatus};
+
+    match program.status {
+        AgenticProgramStatus::Verified => "completed",
+        AgenticProgramStatus::Blocked => "blocked",
+        AgenticProgramStatus::CompletionRequested => "verifying",
+        AgenticProgramStatus::Open => {
+            let statuses = program
+                .tasks
+                .values()
+                .filter(|task| task.team_id == team_id)
+                .map(|task| task.status)
+                .collect::<Vec<_>>();
+            if statuses
+                .iter()
+                .any(|status| *status == AgenticTaskStatus::Claimed)
+            {
+                "running"
+            } else if !statuses.is_empty()
+                && statuses
+                    .iter()
+                    .all(|status| *status == AgenticTaskStatus::Accepted)
+            {
+                "completed"
+            } else if statuses
+                .iter()
+                .any(|status| *status == AgenticTaskStatus::Rework)
+            {
+                "rework"
+            } else if statuses
+                .iter()
+                .any(|status| *status == AgenticTaskStatus::Blocked)
+            {
+                "blocked"
+            } else {
+                "planned"
+            }
+        }
+    }
+}
+
 fn agent_nodes(
     agent_projection: &serde_json::Value,
-    teams: &[MissionControlTeamNode],
+    programs: &[crate::AgenticProgramProjection],
+    graph_bindings: &BTreeMap<String, (String, String)>,
 ) -> Vec<MissionControlAgentNode> {
-    let displays = teams
-        .iter()
-        .flat_map(|team| {
-            team.detail["agent_displays"]
-                .as_array()
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|display| {
-            let agent_id = display.get("agent_id")?.as_str()?.to_string();
-            Some((
-                agent_id,
-                harness_contract::team::AgentDisplayIdentity {
-                    agent_id: display["agent_id"].as_str().unwrap_or_default().to_string(),
-                    role_id: display["role_id"].as_str().unwrap_or_default().to_string(),
-                    role_display_name: display["role_display_name"].as_str().map(str::to_owned),
-                    label: display["label"].as_str().unwrap_or_default().to_string(),
-                    role_label: display["role_label"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    focus_label: display["focus_label"].as_str().map(str::to_owned),
-                    locale: display["locale"].as_str().unwrap_or_default().to_string(),
-                    provenance: display["provenance"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    digest: display["digest"].as_str().unwrap_or_default().to_string(),
-                },
-            ))
-        })
-        .collect::<BTreeMap<_, _>>();
     let mut nodes = BTreeMap::<String, MissionControlAgentNode>::new();
-    for team in teams {
-        let Some(traces) = team.detail["agents"].as_array() else {
+    for program in programs {
+        let Some(root_execution_id) = program.root_execution_id.as_ref() else {
             continue;
         };
-        for trace in traces {
-            let Some(agent_id) = trace.get("agent_id").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let display = displays.get(agent_id);
+        let Some((mission_id, _)) = graph_bindings.get(root_execution_id) else {
+            continue;
+        };
+        for member in program.agents.values() {
+            let task = program
+                .tasks
+                .values()
+                .filter(|task| task.team_id == member.team_id)
+                .find(|task| task.claimant.as_deref() == Some(member.agent_id.as_str()));
+            let status = task
+                .map(|task| agentic_task_activity_status(task.status))
+                .unwrap_or("invited");
+            let digest = serde_json::to_vec(member)
+                .map(|value| format!("sha256:{:x}", Sha256::digest(value)))
+                .ok();
             nodes.insert(
-                agent_id.to_string(),
+                member.agent_id.clone(),
                 MissionControlAgentNode {
-                    agent_id: agent_id.to_string(),
-                    mission_id: team.mission_id.clone(),
-                    task_id: trace
-                        .get("task_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
-                    execution_id: Some(team.graph_id.clone()),
-                    team_id: Some(team.team_id.clone()),
-                    session_id: team.session_id.clone(),
-                    status: trace
-                        .get("status")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned),
+                    agent_id: member.agent_id.clone(),
+                    mission_id: Some(mission_id.clone()),
+                    task_id: task.map(|task| task.task_id.clone()),
+                    execution_id: task
+                        .and_then(|task| task.claim_execution_id.clone())
+                        .or_else(|| Some(root_execution_id.clone())),
+                    team_id: Some(member.team_id.clone()),
+                    session_id: Some(program.session_id.clone()),
+                    status: Some(status.to_string()),
                     backend: None,
-                    detail: trace.clone(),
-                    display_label: display.map(|display| display.label.clone()),
-                    display_role_label: display.map(|display| {
-                        display
-                            .role_display_name
-                            .clone()
-                            .unwrap_or_else(|| display.role_label.clone())
+                    detail: serde_json::json!({
+                        "program_id": program.program_id,
+                        "program_revision": program.revision,
+                        "member": member,
+                        "task": task,
                     }),
-                    display_focus_label: display.and_then(|display| display.focus_label.clone()),
-                    display_provenance: display.map(|display| display.provenance.clone()),
-                    display_digest: display.map(|display| display.digest.clone()),
+                    display_label: Some(member.role.clone()),
+                    display_role_label: Some(member.role.clone()),
+                    display_focus_label: Some(member.mission.clone()),
+                    display_provenance: Some("runtime.agentic_program_projection".to_string()),
+                    display_digest: digest,
                 },
             );
         }
@@ -747,10 +775,14 @@ fn agent_nodes(
         let Some(agent_id) = value_string(agent, "agent_id") else {
             continue;
         };
-        if nodes.contains_key(&agent_id) {
+        if let Some(node) = nodes.get_mut(&agent_id) {
+            node.backend = value_string(agent, "backend");
+            node.detail = serde_json::json!({
+                "agentic": node.detail.clone(),
+                "execution": agent,
+            });
             continue;
         }
-        let display = displays.get(&agent_id);
         nodes.insert(
             agent_id.clone(),
             MissionControlAgentNode {
@@ -766,28 +798,32 @@ fn agent_nodes(
                         .map(str::to_owned)
                 }),
                 execution_id: value_string(agent, "graph_id"),
-                team_id: agent
-                    .pointer("/execution_identity/team_run_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
+                team_id: None,
                 session_id: value_string(agent, "session_id"),
                 status: value_string(agent, "state").or_else(|| value_string(agent, "status")),
                 backend: value_string(agent, "backend"),
                 detail: agent.clone(),
-                display_label: display.map(|display| display.label.clone()),
-                display_role_label: display.map(|display| {
-                    display
-                        .role_display_name
-                        .clone()
-                        .unwrap_or_else(|| display.role_label.clone())
-                }),
-                display_focus_label: display.and_then(|display| display.focus_label.clone()),
-                display_provenance: display.map(|display| display.provenance.clone()),
-                display_digest: display.map(|display| display.digest.clone()),
+                display_label: None,
+                display_role_label: None,
+                display_focus_label: None,
+                display_provenance: None,
+                display_digest: None,
             },
         );
     }
     nodes.into_values().collect()
+}
+
+fn agentic_task_activity_status(status: crate::AgenticTaskStatus) -> &'static str {
+    match status {
+        crate::AgenticTaskStatus::Published => "planned",
+        crate::AgenticTaskStatus::Claimed => "running",
+        crate::AgenticTaskStatus::Submitted => "submitted",
+        crate::AgenticTaskStatus::Accepted => "completed",
+        crate::AgenticTaskStatus::Rework => "rework",
+        crate::AgenticTaskStatus::Blocked => "blocked",
+        crate::AgenticTaskStatus::Superseded => "superseded",
+    }
 }
 
 fn mission_graph(
@@ -1287,8 +1323,8 @@ fn mission_summary(
     services: &RuntimeServices,
     aggregate: &harness_contract::mission::MissionAggregate,
     tasks: &[harness_contract::task::TaskAggregate],
-    team_projection: &serde_json::Value,
-    agent_projection: &serde_json::Value,
+    teams: &[MissionControlTeamNode],
+    agents: &[MissionControlAgentNode],
 ) -> MissionControlMissionSummary {
     let mission_tasks = tasks
         .iter()
@@ -1305,25 +1341,13 @@ fn mission_summary(
         .flat_map(|task| task.graph_refs.iter().map(|reference| &reference.graph_id))
         .collect::<std::collections::BTreeSet<_>>()
         .len();
-    let team_count = team_projection["teams"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|team| {
-            team.get("mission_id").and_then(serde_json::Value::as_str)
-                == Some(aggregate.mission_id.as_str())
-        })
+    let team_count = teams
+        .iter()
+        .filter(|team| team.mission_id.as_deref() == Some(aggregate.mission_id.as_str()))
         .count();
-    let agent_count = agent_projection["agents"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|agent| {
-            agent
-                .pointer("/execution_identity/mission_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(aggregate.mission_id.as_str())
-        })
+    let agent_count = agents
+        .iter()
+        .filter(|agent| agent.mission_id.as_deref() == Some(aggregate.mission_id.as_str()))
         .count();
     MissionControlMissionSummary {
         mission_id: aggregate.mission_id.clone(),
@@ -1541,36 +1565,59 @@ mod tests {
     use super::*;
     use crate::RuntimeEventInput;
 
-    #[test]
-    fn agent_nodes_carry_frozen_display_identity_from_team_projection() {
-        let teams = vec![MissionControlTeamNode {
-            team_id: "team-1".to_string(),
-            graph_id: "team-graph:team-1".to_string(),
-            display_label: None,
-            mission_id: Some("mission-1".to_string()),
-            task_id: Some("task-team-1".to_string()),
-            session_id: Some("session-1".to_string()),
-            status: Some("running".to_string()),
-            agent_count: 2,
-            detail: serde_json::json!({
-                "agents": [
-                    {"task_id": "task-r1", "agent_id": "instance:agent:r1", "status": "running"},
-                    {"task_id": "task-s1", "agent_id": "instance:agent:s1", "status": "planned"}
+    fn agentic_program_fixture() -> crate::AgenticProgramProjection {
+        let mut program =
+            crate::AgenticProgramProjection::empty("program-1", "objective:session-1:turn-1");
+        program.session_id = "session-1".to_string();
+        program.turn_id = "turn-1".to_string();
+        program.root_execution_id = Some("root-execution-1".to_string());
+        program.teams.insert(
+            "team-1".to_string(),
+            crate::AgenticTeamProjection {
+                team_id: "team-1".to_string(),
+                name: "业务团队".to_string(),
+                mission: "Deliver the bounded objective".to_string(),
+                objective: None,
+                topic_ref: "topic:program-1".to_string(),
+                created_by: "root:session-1".to_string(),
+                member_ids: vec![
+                    "instance:agent:r1".to_string(),
+                    "instance:agent:s1".to_string(),
                 ],
-                "agent_displays": [
-                    {
-                        "agent_id": "instance:agent:r1",
-                        "label": "Explore",
-                        "role_label": "Investigate",
-                        "focus_label": "primary-sources",
-                        "locale": "auto",
-                        "provenance": "runtime.agent-binding:abc",
-                        "digest": "d1"
-                    }
-                ]
-            }),
-        }];
-        let nodes = agent_nodes(&serde_json::json!({ "agents": [] }), &teams);
+                task_ids: Vec::new(),
+            },
+        );
+        for (agent_id, role, mission) in [
+            ("instance:agent:r1", "Explore", "primary-sources"),
+            ("instance:agent:s1", "Synthesize", "final-report"),
+        ] {
+            program.agents.insert(
+                agent_id.to_string(),
+                crate::AgentMemberProjection {
+                    agent_id: agent_id.to_string(),
+                    team_id: "team-1".to_string(),
+                    role: role.to_string(),
+                    mission: mission.to_string(),
+                    required_capabilities: Vec::new(),
+                    invited_by: "root:session-1".to_string(),
+                },
+            );
+        }
+        program
+    }
+
+    #[test]
+    fn agent_nodes_carry_agentic_role_identity() {
+        let programs = vec![agentic_program_fixture()];
+        let graph_bindings = BTreeMap::from([(
+            "root-execution-1".to_string(),
+            ("mission-1".to_string(), "task-team-1".to_string()),
+        )]);
+        let nodes = agent_nodes(
+            &serde_json::json!({ "agents": [] }),
+            &programs,
+            &graph_bindings,
+        );
         assert_eq!(nodes.len(), 2);
         let researcher = nodes
             .iter()
@@ -1578,45 +1625,47 @@ mod tests {
             .expect("researcher node");
         assert_eq!(researcher.mission_id.as_deref(), Some("mission-1"));
         assert_eq!(researcher.team_id.as_deref(), Some("team-1"));
-        assert_eq!(researcher.status.as_deref(), Some("running"));
+        assert_eq!(researcher.status.as_deref(), Some("invited"));
         assert_eq!(researcher.display_label.as_deref(), Some("Explore"));
-        assert_eq!(
-            researcher.display_role_label.as_deref(),
-            Some("Investigate")
-        );
+        assert_eq!(researcher.display_role_label.as_deref(), Some("Explore"));
         assert_eq!(
             researcher.display_focus_label.as_deref(),
             Some("primary-sources")
         );
         assert_eq!(
             researcher.display_provenance.as_deref(),
-            Some("runtime.agent-binding:abc")
+            Some("runtime.agentic_program_projection")
         );
-        assert_eq!(researcher.display_digest.as_deref(), Some("d1"));
-        let synthesizer = nodes
-            .iter()
-            .find(|node| node.agent_id == "instance:agent:s1")
-            .expect("synthesizer node");
-        assert_eq!(synthesizer.display_label, None);
+        assert!(researcher
+            .display_digest
+            .as_deref()
+            .is_some_and(|digest| digest.starts_with("sha256:")));
     }
 
     #[test]
-    fn team_nodes_carry_display_label() {
-        let teams = team_nodes(
-            &serde_json::json!({
-                "teams": [{
-                    "team_id": "team-1",
-                    "graph_id": "team-graph:team-1",
-                    "session_id": "session-1",
-                    "status": "running",
-                    "display_label": "业务团队",
-                    "agents": []
-                }]
-            }),
-            &BTreeMap::new(),
-        );
+    fn team_nodes_carry_agentic_display_label() {
+        let programs = vec![agentic_program_fixture()];
+        let graph_bindings = BTreeMap::from([(
+            "root-execution-1".to_string(),
+            ("mission-1".to_string(), "task-team-1".to_string()),
+        )]);
+        let teams = team_nodes(&programs, &graph_bindings);
         assert_eq!(teams.len(), 1);
         assert_eq!(teams[0].display_label.as_deref(), Some("业务团队"));
+        assert_eq!(teams[0].mission_id.as_deref(), Some("mission-1"));
+        assert_eq!(teams[0].graph_id, "root-execution-1");
+    }
+
+    #[test]
+    fn agentic_team_without_canonical_task_graph_binding_is_not_assigned_to_a_mission() {
+        let programs = vec![agentic_program_fixture()];
+        assert!(team_nodes(&programs, &BTreeMap::new()).is_empty());
+        assert!(agent_nodes(
+            &serde_json::json!({ "agents": [] }),
+            &programs,
+            &BTreeMap::new(),
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1698,8 +1747,8 @@ mod tests {
             .control_readiness
             .actions
             .iter()
-            .find(|action| action.action == "team.create")
-            .expect("Team creation readiness");
+            .find(|action| action.action == "agentic.team.create")
+            .expect("Agentic Team creation readiness");
         assert!(team_create.available);
         assert_eq!(team_create.target_count, 1);
         assert!(!team_create.reason.is_empty());

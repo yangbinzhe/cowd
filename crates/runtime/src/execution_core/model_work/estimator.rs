@@ -81,7 +81,6 @@ impl ModelWorkGraphEstimator {
             matches!(
                 node.kind,
                 harness_contract::execution_graph::ExecutionNodeKind::AgentTask
-                    | harness_contract::execution_graph::ExecutionNodeKind::Subgraph
             )
         });
         let mut usable_width = projection

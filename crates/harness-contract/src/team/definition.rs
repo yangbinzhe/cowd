@@ -16,8 +16,44 @@ use crate::agent::{
     ValidationError,
 };
 
-use super::binding::RoleBehaviorFacet;
 use crate::evaluation::EvaluationContract;
+
+/// Typed behavior facet declared by a Team Template role.
+///
+/// This is definition/catalog metadata only. It is not an executable Agent
+/// role binding; Agentic Programs choose their own members and tasks through
+/// the action protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RoleBehaviorFacet {
+    Reducer { mode: String },
+    Verification { mode: String },
+    ReacquireEvidence { required: bool },
+    TerminalCandidate { required: bool },
+    UpstreamConsumption { required: bool },
+}
+
+impl RoleBehaviorFacet {
+    #[must_use]
+    pub fn kind_key(&self) -> &'static str {
+        match self {
+            Self::Reducer { .. } => "reducer",
+            Self::Verification { .. } => "verification",
+            Self::ReacquireEvidence { .. } => "reacquire_evidence",
+            Self::TerminalCandidate { .. } => "terminal_candidate",
+            Self::UpstreamConsumption { .. } => "upstream_consumption",
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Reducer { mode } | Self::Verification { mode } if mode.trim().is_empty() => {
+                Err("behavior facet mode must not be empty")
+            }
+            _ => Ok(()),
+        }
+    }
+}
 
 /// A scope-qualified durable Team Template identifier, for example
 /// `workspace/cowd/implementation-review`.
@@ -306,11 +342,11 @@ pub struct TeamRoleDefinition {
     pub partition: RolePartitionPolicy,
     /// Immutable, typed execution behavior declared by the Template author.
     ///
-    /// Runtime freezes these facets into `TeamBindingSnapshot` and never
-    /// derives them from a role id, localized display string, graph position,
-    /// result field name, or mutable template default.  A published role must
-    /// make its behavior explicit so custom Teams remain flexible without
-    /// hidden runtime heuristics.
+    /// Runtime preserves these facets in the published Template revision and
+    /// never derives them from a role id, localized display string, graph
+    /// position, result field name, or mutable template default. A published
+    /// role must make its behavior explicit so catalog consumers remain
+    /// flexible without hidden runtime heuristics.
     pub behavior: Vec<RoleBehaviorFacet>,
     pub grant_ceiling: Vec<AgentCapability>,
     pub task_contract: TeamRoleTaskContract,
@@ -514,12 +550,22 @@ fn validate_dependency_dataflow(
         .map(|role| (role.role_id.as_str(), role))
         .collect::<BTreeMap<_, _>>();
     for dependency in dependencies {
-        let producer = by_id
-            .get(dependency.from_role_id.as_str())
-            .expect("dependency endpoints were validated before dataflow");
-        let consumer = by_id
-            .get(dependency.to_role_id.as_str())
-            .expect("dependency endpoints were validated before dataflow");
+        let producer = by_id.get(dependency.from_role_id.as_str()).ok_or_else(|| {
+            ValidationError::InvalidContract {
+                message: format!(
+                    "role dependency has unknown producer `{}`",
+                    dependency.from_role_id
+                ),
+            }
+        })?;
+        let consumer = by_id.get(dependency.to_role_id.as_str()).ok_or_else(|| {
+            ValidationError::InvalidContract {
+                message: format!(
+                    "role dependency has unknown consumer `{}`",
+                    dependency.to_role_id
+                ),
+            }
+        })?;
         let outputs = &producer.task_contract.dataflow.outputs;
         let inputs = &consumer.task_contract.dataflow.inputs;
         // Published catalog revisions from before the dataflow contract have

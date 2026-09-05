@@ -3,6 +3,41 @@
 use super::*;
 
 impl RuntimeServices {
+    /// Reconcile durable Agentic Program root barriers after Program claims
+    /// and physical Agent graphs have been recovered. This ordering prevents
+    /// a pre-recovery orphan claim from waking a paid root model, while still
+    /// guaranteeing that a checkpoint committed before process exit cannot
+    /// strand `WaitingExternal` after restart.
+    pub async fn recover_agentic_program_waits_on_startup(
+        &self,
+    ) -> Result<usize, RuntimeServicesError> {
+        let streams = self
+            .event_store
+            .stream_ids_for_scope(RuntimeEventScope::Program)
+            .map_err(RuntimeServicesError::EventStore)?;
+        let actions = self.agent_action_service();
+        let mut resolved = 0usize;
+        for stream in streams {
+            let Some(program_id) = stream.strip_prefix("agentic-program:") else {
+                continue;
+            };
+            self.reconcile_agentic_completion_request(program_id)
+                .map_err(RuntimeServicesError::Invariant)?;
+            resolved = resolved.saturating_add(
+                crate::execution_core::graph::executors::resolve_agentic_program_wait(
+                    program_id,
+                    &actions,
+                    &self.graph_state_store,
+                    self.execution_supervisor.as_ref(),
+                    true,
+                )
+                .await
+                .map_err(RuntimeServicesError::Invariant)?,
+            );
+        }
+        Ok(resolved)
+    }
+
     /// Run one governed Provider analysis for a Ready Case. All rejection
     /// gates execute before Provider admission; the model can only create a
     /// typed Draft and has no Candidate, release, Skill activation, tool, or
@@ -547,52 +582,28 @@ impl RuntimeServices {
     /// Runtime review and human-decision boundary used by Canary and Stable.
     /// The referenced revision is validated before a pending review exists,
     /// preventing a surface from creating a pointer request for a missing
-    /// Definition or Template.
+    /// Definition.
     pub fn request_evolution_release_change(
         &self,
         request: crate::ReleaseChangeRequest,
     ) -> Result<crate::ReleaseChangeReview, RuntimeServicesError> {
-        match &request.subject {
-            crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
-                self.definition_registry
-                    .agents()
-                    .read_revision(revision_ref)
-                    .map_err(DefinitionRegistryError::Agent)?;
-                if let Some(harness_contract::agent::RevisionSelector::ExactApprovedRevision {
-                    revision,
-                }) = request.selector.as_ref()
-                {
-                    let target = harness_contract::agent::AgentDefinitionRevisionRef::new(
-                        revision_ref.definition_id.clone(),
-                        *revision,
-                    )
-                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-                    self.definition_registry
-                        .agents()
-                        .read_revision(&target)
-                        .map_err(DefinitionRegistryError::Agent)?;
-                }
-            }
-            crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
-                self.definition_registry
-                    .teams()
-                    .read_revision(revision_ref)
-                    .map_err(DefinitionRegistryError::Team)?;
-                if let Some(harness_contract::agent::RevisionSelector::ExactApprovedRevision {
-                    revision,
-                }) = request.selector.as_ref()
-                {
-                    let target = harness_contract::team::TeamTemplateRevisionRef::new(
-                        revision_ref.template_id.clone(),
-                        *revision,
-                    )
-                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-                    self.definition_registry
-                        .teams()
-                        .read_revision(&target)
-                        .map_err(DefinitionRegistryError::Team)?;
-                }
-            }
+        let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = &request.subject;
+        self.definition_registry
+            .agents()
+            .read_revision(revision_ref)
+            .map_err(DefinitionRegistryError::Agent)?;
+        if let Some(harness_contract::agent::RevisionSelector::ExactApprovedRevision { revision }) =
+            request.selector.as_ref()
+        {
+            let target = harness_contract::agent::AgentDefinitionRevisionRef::new(
+                revision_ref.definition_id.clone(),
+                *revision,
+            )
+            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+            self.definition_registry
+                .agents()
+                .read_revision(&target)
+                .map_err(DefinitionRegistryError::Agent)?;
         }
         self.evolution_governance
             .request_release_change(request)
@@ -653,22 +664,15 @@ impl RuntimeServices {
                 episode_ids,
                 aggregate_digest,
             } => {
-                let published_baseline_exists = match &intent.subject {
-                    crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => self
-                        .definition_registry
-                        .agents()
-                        .release_assignments(&revision_ref.definition_id)
-                        .map_err(DefinitionRegistryError::Agent)?
-                        .iter()
-                        .any(harness_contract::agent::ReleaseAssignment::is_active_stable),
-                    crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => self
-                        .definition_registry
-                        .teams()
-                        .release_assignments(&revision_ref.template_id)
-                        .map_err(DefinitionRegistryError::Team)?
-                        .iter()
-                        .any(crate::team_definition::TeamReleaseAssignment::is_active_stable),
-                };
+                let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } =
+                    &intent.subject;
+                let published_baseline_exists = self
+                    .definition_registry
+                    .agents()
+                    .release_assignments(&revision_ref.definition_id)
+                    .map_err(DefinitionRegistryError::Agent)?
+                    .iter()
+                    .any(harness_contract::agent::ReleaseAssignment::is_active_stable);
                 if published_baseline_exists {
                     return Err(RuntimeServicesError::Invariant(
                         "episode evaluation baseline is forbidden when an active Stable baseline exists"
@@ -745,87 +749,48 @@ impl RuntimeServices {
                 None
             }
         };
-        let evaluation_contract = match &intent.subject {
-            crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } => {
-                let candidate = self
+        let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = &intent.subject;
+        let evaluation_contract = {
+            let candidate = self
+                .definition_registry
+                .agents()
+                .read_revision(revision_ref)
+                .map_err(DefinitionRegistryError::Agent)?;
+            if let Some((baseline_revision, expected_digest)) = published_baseline_revision {
+                if baseline_revision >= revision_ref.revision {
+                    return Err(RuntimeServicesError::Invariant(
+                        "evolution candidate revision must be newer than its baseline".to_string(),
+                    ));
+                }
+                let baseline = harness_contract::agent::AgentDefinitionRevisionRef::new(
+                    revision_ref.definition_id.clone(),
+                    baseline_revision,
+                )
+                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
+                let baseline = self
                     .definition_registry
                     .agents()
-                    .read_revision(revision_ref)
+                    .read_revision(&baseline)
                     .map_err(DefinitionRegistryError::Agent)?;
-                if let Some((baseline_revision, expected_digest)) = published_baseline_revision {
-                    if baseline_revision >= revision_ref.revision {
-                        return Err(RuntimeServicesError::Invariant(
-                            "evolution candidate revision must be newer than its baseline"
-                                .to_string(),
-                        ));
-                    }
-                    let baseline = harness_contract::agent::AgentDefinitionRevisionRef::new(
-                        revision_ref.definition_id.clone(),
-                        baseline_revision,
-                    )
-                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-                    let baseline = self
-                        .definition_registry
-                        .agents()
-                        .read_revision(&baseline)
-                        .map_err(DefinitionRegistryError::Agent)?;
-                    if baseline.revision.content_digest != expected_digest {
-                        return Err(RuntimeServicesError::Invariant(
-                            "published evaluation baseline content digest changed".to_string(),
-                        ));
-                    }
-                    if !candidate
-                        .revision
-                        .manifest
-                        .evaluation
-                        .is_noninferior_to(&baseline.revision.manifest.evaluation)
-                    {
-                        return Err(RuntimeServicesError::Invariant(
+                if baseline.revision.content_digest != expected_digest {
+                    return Err(RuntimeServicesError::Invariant(
+                        "published evaluation baseline content digest changed".to_string(),
+                    ));
+                }
+                if !candidate
+                    .revision
+                    .manifest
+                    .evaluation
+                    .is_noninferior_to(&baseline.revision.manifest.evaluation)
+                {
+                    return Err(RuntimeServicesError::Invariant(
                             "candidate Agent Definition weakens the baseline evaluation contract; submit a separate policy review"
                                 .to_string(),
                         ));
-                    }
-                    baseline.revision.manifest.evaluation.clone()
-                } else {
-                    candidate.revision.manifest.evaluation.clone()
                 }
-            }
-            crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } => {
-                let candidate = self
-                    .definition_registry
-                    .teams()
-                    .read_revision(revision_ref)
-                    .map_err(DefinitionRegistryError::Team)?;
-                if let Some((baseline_revision, expected_digest)) = published_baseline_revision {
-                    if baseline_revision >= revision_ref.revision {
-                        return Err(RuntimeServicesError::Invariant(
-                            "evolution candidate revision must be newer than its baseline"
-                                .to_string(),
-                        ));
-                    }
-                    let baseline = harness_contract::team::TeamTemplateRevisionRef::new(
-                        revision_ref.template_id.clone(),
-                        baseline_revision,
-                    )
-                    .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-                    let baseline = self
-                        .definition_registry
-                        .teams()
-                        .read_revision(&baseline)
-                        .map_err(DefinitionRegistryError::Team)?;
-                    if baseline.revision.content_digest != expected_digest {
-                        return Err(RuntimeServicesError::Invariant(
-                            "published evaluation baseline content digest changed".to_string(),
-                        ));
-                    }
-                    ensure_team_evaluation_contract_noninferior(
-                        &baseline.revision.manifest,
-                        &candidate.revision.manifest,
-                    )?;
-                    baseline.revision.manifest.evaluation.clone()
-                } else {
-                    candidate.revision.manifest.evaluation.clone()
-                }
+                baseline.revision.manifest.evaluation.clone()
+            } else {
+                candidate.revision.manifest.evaluation.clone()
             }
         };
         let proposal_id = intent.proposal_id;
@@ -975,9 +940,8 @@ impl RuntimeServices {
             .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))
     }
 
-    /// Execute the correct concrete Runtime path for one immutable paired
-    /// evaluation scenario. The evaluator receives only this port; it cannot
-    /// choose an Agent shortcut for a Team candidate or obtain release
+    /// Execute one immutable paired Agent Definition evaluation scenario.
+    /// The evaluator receives only this port and never obtains release
     /// authority from an execution result.
     pub async fn execute_evolution_scenario(
         &self,
@@ -986,17 +950,8 @@ impl RuntimeServices {
         sample_index: u32,
     ) -> Result<(EvaluationScenarioObservation, EvaluationScenarioObservation), RuntimeServicesError>
     {
-        let candidate = self.evolution_candidate(candidate_id)?;
-        match &candidate.subject {
-            crate::EvolutionCandidateSubject::AgentDefinition { .. } => {
-                self.execute_evolution_agent_scenario(candidate_id, scenario, sample_index)
-                    .await
-            }
-            crate::EvolutionCandidateSubject::TeamTemplate { .. } => {
-                self.execute_evolution_team_scenario(candidate_id, scenario, sample_index)
-                    .await
-            }
-        }
+        self.execute_evolution_agent_scenario(candidate_id, scenario, sample_index)
+            .await
     }
 
     /// Execute one real paired Agent scenario through Runtime. Both packets
@@ -1017,13 +972,7 @@ impl RuntimeServices {
         validate_evolution_scenario_isolation(scenario, self.tool_execution_host.as_deref())?;
         self.ensure_evolution_execution_policy(&format!("evolution-eval:{candidate_id}"))?;
         let candidate = self.evolution_candidate(candidate_id)?;
-        let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject
-        else {
-            return Err(RuntimeServicesError::Invariant(
-                "paired Agent scenario execution requires an Agent Definition candidate"
-                    .to_string(),
-            ));
-        };
+        let crate::EvolutionCandidateSubject::AgentDefinition { revision_ref } = &candidate.subject;
         if !candidate
             .evaluation_contract
             .scenario_refs
@@ -1111,106 +1060,6 @@ impl RuntimeServices {
         ))
     }
 
-    /// Execute baseline and candidate Team Template revisions through the
-    /// canonical Team graph compiler. Candidate selection is evaluation-only
-    /// and never creates a rollout assignment, while every role still uses
-    /// its pinned approved Agent revision and normal graph lifecycle.
-    async fn execute_evolution_team_scenario(
-        &self,
-        candidate_id: &str,
-        scenario: &EvaluationScenarioSpec,
-        sample_index: u32,
-    ) -> Result<(EvaluationScenarioObservation, EvaluationScenarioObservation), RuntimeServicesError>
-    {
-        scenario
-            .validate()
-            .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        validate_evolution_scenario_isolation(scenario, self.tool_execution_host.as_deref())?;
-        self.ensure_evolution_execution_policy(&format!("evolution-eval:{candidate_id}"))?;
-        let candidate = self.evolution_candidate(candidate_id)?;
-        let crate::EvolutionCandidateSubject::TeamTemplate { revision_ref } = &candidate.subject
-        else {
-            return Err(RuntimeServicesError::Invariant(
-                "paired Team scenario execution requires a Team Template candidate".to_string(),
-            ));
-        };
-        if !candidate
-            .evaluation_contract
-            .scenario_refs
-            .iter()
-            .any(|configured| configured == &scenario.scenario_ref)
-        {
-            return Err(RuntimeServicesError::Invariant(
-                "scenario is absent from the candidate's immutable evaluation contract".to_string(),
-            ));
-        }
-        let baseline_revision = candidate
-            .evaluation_baseline
-            .as_ref()
-            .and_then(crate::EvolutionEvaluationBaseline::published_revision)
-            .ok_or_else(|| {
-                RuntimeServicesError::Invariant(
-                    "episode-set evolution baseline requires its dedicated outcome evaluator"
-                        .to_string(),
-                )
-            })?;
-        let baseline_ref =
-            TeamTemplateRevisionRef::new(revision_ref.template_id.clone(), baseline_revision)
-                .map_err(|error| RuntimeServicesError::Invariant(error.to_string()))?;
-        let baseline_request = evolution_team_request(
-            &candidate,
-            scenario,
-            &baseline_ref,
-            "baseline",
-            sample_index,
-            self.mission_runtime.default_mission_id(),
-            self.execution_capacity_profile().team_snapshot(),
-        );
-        let candidate_request = evolution_team_request(
-            &candidate,
-            scenario,
-            revision_ref,
-            "candidate",
-            sample_index,
-            self.mission_runtime.default_mission_id(),
-            self.execution_capacity_profile().team_snapshot(),
-        );
-        let started = Instant::now();
-        let baseline = self
-            .team_runtime
-            .instantiate_evaluation(baseline_request, None, &scenario.allowed_tools)
-            .await
-            .map_err(RuntimeServicesError::Invariant)?;
-        let baseline_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        let started = Instant::now();
-        let proposed = self
-            .team_runtime
-            .instantiate_evaluation(
-                candidate_request,
-                Some(revision_ref),
-                &scenario.allowed_tools,
-            )
-            .await
-            .map_err(RuntimeServicesError::Invariant)?;
-        let candidate_elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-        Ok((
-            team_scenario_observation(
-                &baseline,
-                &self.agent_runtime.evaluations(),
-                scenario,
-                baseline_ref.revision,
-                baseline_elapsed_ms,
-            ),
-            team_scenario_observation(
-                &proposed,
-                &self.agent_runtime.evaluations(),
-                scenario,
-                revision_ref.revision,
-                candidate_elapsed_ms,
-            ),
-        ))
-    }
-
     fn compile_evolution_scenario_packet(
         &self,
         candidate: &crate::EvolutionGovernanceCandidate,
@@ -1274,7 +1123,6 @@ impl RuntimeServices {
             attempt: 1,
             expected_graph_revision: 0,
             objective: scenario.objective.clone(),
-            team_role_identity: None,
             required_acceptance: harness_contract::context::RequiredAcceptance {
                 criteria: scenario.acceptance.clone(),
                 evidence_obligations: Vec::new(),
@@ -1350,19 +1198,6 @@ impl RuntimeServices {
         &self,
     ) -> Result<ExecutionStartupRecoveryReport, RuntimeServicesError> {
         self.ensure_mutation_allowed()?;
-        // A Team graph is not runnable until its frozen Binding and every
-        // inherited Task link are durably closed.  Finish that exact marker
-        // set before the ordinary graph recovery pump sees the graph; this
-        // closes the register→link crash window without adding a scheduler or
-        // rebuilding Team topology from mutable definitions.
-        self.team_runtime
-            .reconcile_preparing_bindings_on_startup(256)
-            .map_err(RuntimeServicesError::Mission)?;
-        crate::orchestration::collaboration_coordinator::reconcile_terminal_programs_on_startup(
-            self, 256,
-        )
-        .await
-        .map_err(RuntimeServicesError::Invariant)?;
         let mut managed_dispositions = BTreeMap::new();
         for invocation in self
             .managed_agents
@@ -1422,8 +1257,6 @@ impl RuntimeServices {
             .collect::<BTreeMap<_, _>>();
         let resolved_handoff_results = self.resolve_durable_handoff_results().await?;
         let graph_ids = self.graph_state_store.nonterminal_graph_ids_async().await?;
-        self.resolve_settled_child_executions_on_startup(&graph_ids)
-            .await?;
         let mut report = ExecutionStartupRecoveryReport {
             examined_graphs: graph_ids.len(),
             resolved_handoff_results,
@@ -1550,37 +1383,6 @@ impl RuntimeServices {
         }
 
         Ok(report)
-    }
-
-    /// Bounded recovery scan over live parent graphs. Durable lineage links
-    /// reconstruct child ownership, so a crash after child terminal commit
-    /// but before the resolver checkpoint cannot strand WaitingExternal.
-    async fn resolve_settled_child_executions_on_startup(
-        &self,
-        nonterminal_graph_ids: &[String],
-    ) -> Result<usize, RuntimeServicesError> {
-        let mut resolved = 0usize;
-        for parent_graph_id in nonterminal_graph_ids {
-            let parent = self.graph_state_store.load_async(parent_graph_id).await?;
-            let has_waiting_child = parent.nodes.iter().any(|node| {
-                node.kind == ExecutionNodeKind::Subgraph
-                    && parent.node_statuses.get(&node.id)
-                        == Some(&ExecutionNodeStatus::WaitingExternal)
-            });
-            if !has_waiting_child {
-                continue;
-            }
-            for link in self.graph_state_store.child_links(parent_graph_id)? {
-                let before = self.graph_state_store.load(parent_graph_id)?.revision;
-                self.execution_supervisor
-                    .wake_parent_for_settled_child(&link.child_execution_id)
-                    .await?;
-                if self.graph_state_store.load(parent_graph_id)?.revision > before {
-                    resolved = resolved.saturating_add(1);
-                }
-            }
-        }
-        Ok(resolved)
     }
 
     /// Resolve source graph nodes for target results that were durably
@@ -2425,13 +2227,6 @@ impl RuntimeServices {
                 let deadline_at_ms = now_ms().saturating_add(
                     harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS,
                 );
-                let acceptance_contract = crate::team_instantiation::team_acceptance_contract(
-                    &definition.acceptance,
-                    &definition.resource_scopes,
-                    true,
-                    false,
-                )
-                .map_err(RuntimeServicesError::Invariant)?;
                 let intent = AgentTaskIntent {
                     selected_agent_id: None,
                     definition_ref: Some(compiled.snapshot.definition_ref.clone()),
@@ -2456,12 +2251,29 @@ impl RuntimeServices {
                     attempt: u32::from(invocation.attempt_no),
                     expected_graph_revision: 0,
                     objective: definition.objective.clone(),
-                    team_role_identity: None,
                     required_acceptance: harness_contract::context::RequiredAcceptance {
                         criteria: definition.acceptance.clone(),
                         evidence_obligations: Vec::new(),
                     },
-                    output_acceptance: acceptance_contract,
+                    // Managed Agents have no Program review loop, so compile
+                    // their declared criteria into receipt-backed checks at
+                    // admission. The model still receives the free-form
+                    // criterion, while Runtime verifies actual observations
+                    // within the declared resource ceiling.
+                    output_acceptance: definition
+                        .acceptance
+                        .iter()
+                        .cloned()
+                        .map(
+                            |criterion| harness_contract::agent::OutputAcceptanceRequirement {
+                                criterion,
+                                check:
+                                    harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence {
+                                        scopes: definition.resource_scopes.clone(),
+                                    },
+                            },
+                        )
+                        .collect(),
                     requires_managed_collaboration_escalation: false,
                     acceptance: definition.acceptance.clone(),
                     constraints: vec![
@@ -2576,160 +2388,6 @@ impl RuntimeServices {
                     .map_err(RuntimeServicesError::Mission)?;
                 self.execution_supervisor
                     .admit_registered(&graph.id)
-                    .await
-                    .map_err(RuntimeServicesError::GraphRunner)?;
-                Ok(running)
-            }
-            harness_contract::managed_agent::ManagedAgentTarget::Team {
-                template_id,
-                selector,
-            } => {
-                let execution_ref = format!(
-                    "managed-team:{}:{}:fence:{}",
-                    invocation.invocation_id, invocation.attempt_no, invocation.fence_generation
-                );
-                let selector_template_id = match selector {
-                    harness_contract::team::TeamTemplateSelector::Exact { revision_ref } => {
-                        &revision_ref.template_id
-                    }
-                    harness_contract::team::TeamTemplateSelector::LatestStable { template_id }
-                    | harness_contract::team::TeamTemplateSelector::Default { template_id } => {
-                        template_id
-                    }
-                    harness_contract::team::TeamTemplateSelector::Automatic => {
-                        return Err(RuntimeServicesError::Invariant(
-                            "managed Team target cannot use automatic template selection"
-                                .to_string(),
-                        ));
-                    }
-                    harness_contract::team::TeamTemplateSelector::Ephemeral { .. } => {
-                        return Err(RuntimeServicesError::Invariant(
-                            "managed Team target cannot reuse an ephemeral template snapshot"
-                                .to_string(),
-                        ));
-                    }
-                };
-                if selector_template_id != template_id {
-                    return Err(RuntimeServicesError::Invariant(
-                        "managed Team target template_id must match its selector".to_string(),
-                    ));
-                }
-                let deadline_at_ms = now_ms().saturating_add(
-                    harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS,
-                );
-                let request = TeamInstantiationRequest {
-                    request_id: format!(
-                        "managed-team-request:{}:{}",
-                        invocation.invocation_id, invocation.attempt_no
-                    ),
-                    team_id: execution_ref.clone(),
-                    mission_id: self.mission_runtime.default_mission_id().to_string(),
-                    lineage: harness_contract::execution_graph::ExecutionGraphLineage {
-                        session_id: definition.session_id.clone(),
-                        turn_id: format!(
-                            "managed-turn:{}:{}",
-                            invocation.invocation_id, invocation.attempt_no
-                        ),
-                        root_task_id: format!("managed-root-task:{}", invocation.invocation_id),
-                        task_id: format!("managed-root-task:{}", invocation.invocation_id),
-                        generation: invocation.fence_generation.max(1),
-                    },
-                    parent_execution: None,
-                    selection_mode: TeamSelectionMode::Explicit,
-                    strategy_binding: None,
-                    template_selector: selector.clone(),
-                    objective: definition.objective.clone(),
-                    acceptance: definition.acceptance.clone(),
-                    risk: None,
-                    role_binding_overrides: Vec::new(),
-                    display_name: None,
-                    role_display_overrides: Vec::new(),
-                    cardinality_overrides: Vec::new(),
-                    focus_partition_plans: Vec::new(),
-                    requires_managed_collaboration_escalation: false,
-                    permission_ceiling: definition.permission_ceiling.clone(),
-                    model_lease: definition.model_lease.clone(),
-                    execution_budget: crate::team_instantiation::bounded_parent_execution_budget(
-                        format!(
-                            "managed-team-budget:{}:{}",
-                            invocation.invocation_id, invocation.attempt_no
-                        ),
-                        crate::team_instantiation::DEFAULT_PARENT_EXECUTION_TOKEN_BUDGET,
-                        deadline_at_ms,
-                        32,
-                    ),
-                    deadline_at_ms,
-                    managed_invocation: Some(
-                        harness_contract::managed_agent::ManagedAgentInvocationFence {
-                            managed_agent_id: definition.managed_agent_id.clone(),
-                            definition_revision: definition.revision,
-                            invocation_id: invocation.invocation_id.clone(),
-                            attempt_no: invocation.attempt_no,
-                            fence_generation: invocation.fence_generation,
-                            dispatcher_id: dispatcher_id.to_string(),
-                        },
-                    ),
-                    resource_scopes: definition.resource_scopes.clone(),
-                    allow_whole_workspace_scope: definition
-                        .permission_ceiling
-                        .permits(harness_contract::policy::PermissionMode::DangerFullAccess),
-                    upstream_evidence_refs: Vec::new(),
-                    upstream_artifact_refs: Vec::new(),
-                    upstream_result_context: Vec::new(),
-                    execution_capacity: Some(self.execution_capacity_profile().team_snapshot()),
-                };
-                self.team_runtime
-                    .ensure_root_task(&request)
-                    .map_err(RuntimeServicesError::Mission)?;
-                let mission_id = request.mission_id.clone();
-                let team_id = request.team_id.clone();
-                let instantiated = self
-                    .team_runtime
-                    .plan(request)
-                    .map_err(RuntimeServicesError::Mission)?;
-                let graph_id = instantiated.graph.id.clone();
-                let claim_token = invocation.claim_token.as_deref().ok_or_else(|| {
-                    RuntimeServicesError::Invariant(
-                        "claimed Managed Team invocation has no claim token".to_string(),
-                    )
-                })?;
-                self.managed_agents
-                    .begin_graph_registration(
-                        &invocation.invocation_id,
-                        dispatcher_id,
-                        invocation.fence_generation,
-                        claim_token,
-                        graph_id.clone(),
-                    )
-                    .map_err(RuntimeServicesError::Mission)?;
-                let graph_id = self
-                    .team_runtime
-                    .prepare_planned(&mission_id, &team_id, instantiated)
-                    .await
-                    .map_err(RuntimeServicesError::Mission)?;
-                self.managed_agents
-                    .materialize_invocation(
-                        &invocation.invocation_id,
-                        dispatcher_id,
-                        invocation.fence_generation,
-                        claim_token,
-                        graph_id.clone(),
-                        format!("graph-registration-receipt:{graph_id}"),
-                    )
-                    .map_err(RuntimeServicesError::Mission)?;
-                let running = self
-                    .managed_agents
-                    .start_invocation(
-                        &invocation.invocation_id,
-                        dispatcher_id,
-                        invocation.fence_generation,
-                        claim_token,
-                        graph_id.clone(),
-                        now_ms(),
-                    )
-                    .map_err(RuntimeServicesError::Mission)?;
-                self.execution_supervisor
-                    .admit_registered(&graph_id)
                     .await
                     .map_err(RuntimeServicesError::GraphRunner)?;
                 Ok(running)

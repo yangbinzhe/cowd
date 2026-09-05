@@ -765,10 +765,13 @@ impl StreamState {
                         },
                     }));
                 }
+                let Some(index) = self.public_reasoning_block_index else {
+                    return Err(ApiError::InvalidSseFrame(
+                        "public reasoning block started without an index",
+                    ));
+                };
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: self
-                        .public_reasoning_block_index
-                        .expect("started public reasoning has a block index"),
+                    index,
                     delta: ContentBlockDelta::ReasoningSummaryDelta { text: summary },
                 }));
             }
@@ -792,10 +795,13 @@ impl StreamState {
                         },
                     }));
                 }
+                let Some(index) = self.private_reasoning_block_index else {
+                    return Err(ApiError::InvalidSseFrame(
+                        "private reasoning block started without an index",
+                    ));
+                };
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: self
-                        .private_reasoning_block_index
-                        .expect("started private reasoning has a block index"),
+                    index,
                     delta: ContentBlockDelta::ThinkingDelta {
                         thinking: reasoning,
                     },
@@ -817,10 +823,13 @@ impl StreamState {
                         },
                     }));
                 }
+                let Some(index) = self.private_reasoning_block_index else {
+                    return Err(ApiError::InvalidSseFrame(
+                        "private reasoning signature started without an index",
+                    ));
+                };
                 events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-                    index: self
-                        .private_reasoning_block_index
-                        .expect("started private reasoning has a block index"),
+                    index,
                     delta: ContentBlockDelta::SignatureDelta { signature },
                 }));
             }
@@ -838,10 +847,11 @@ impl StreamState {
                         ToolCallState::new(provider_index, block_index),
                     );
                 }
-                let state = self
-                    .tool_calls
-                    .get_mut(&provider_index)
-                    .expect("tool state was inserted");
+                let Some(state) = self.tool_calls.get_mut(&provider_index) else {
+                    return Err(ApiError::InvalidSseFrame(
+                        "tool call state disappeared during stream assembly",
+                    ));
+                };
                 state.apply(tool_call);
                 let block_index = state.block_index();
                 if !state.started {
@@ -904,28 +914,37 @@ impl StreamState {
             self.emit_text_content(pending_text, &mut events);
         }
         if self.public_reasoning_started && !self.public_reasoning_finished {
+            let Some(index) = self.public_reasoning_block_index else {
+                return Err(ApiError::InvalidSseFrame(
+                    "public reasoning block ended without an index",
+                ));
+            };
             self.public_reasoning_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self
-                    .public_reasoning_block_index
-                    .expect("started public reasoning has a block index"),
+                index,
             }));
         }
         // Close private reasoning block if started but not yet finished.
         if self.reasoning_started && !self.reasoning_finished {
+            let Some(index) = self.private_reasoning_block_index else {
+                return Err(ApiError::InvalidSseFrame(
+                    "private reasoning block ended without an index",
+                ));
+            };
             self.reasoning_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self
-                    .private_reasoning_block_index
-                    .expect("started private reasoning has a block index"),
+                index,
             }));
         }
         if self.text_started && !self.text_finished {
+            let Some(index) = self.text_block_index else {
+                return Err(ApiError::InvalidSseFrame(
+                    "text block ended without an index",
+                ));
+            };
             self.text_finished = true;
             events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self
-                    .text_block_index
-                    .expect("started text has a block index"),
+                index,
             }));
         }
 
@@ -1044,48 +1063,48 @@ impl StreamState {
 
     fn close_visible_content(&mut self, events: &mut Vec<StreamEvent>) {
         if self.public_reasoning_started && !self.public_reasoning_finished {
-            self.public_reasoning_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self
-                    .public_reasoning_block_index
-                    .expect("started public reasoning has a block index"),
-            }));
+            if let Some(index) = self.public_reasoning_block_index {
+                self.public_reasoning_finished = true;
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index,
+                }));
+            }
         }
         if self.reasoning_started && !self.reasoning_finished {
-            self.reasoning_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self
-                    .private_reasoning_block_index
-                    .expect("started private reasoning has a block index"),
-            }));
+            if let Some(index) = self.private_reasoning_block_index {
+                self.reasoning_finished = true;
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index,
+                }));
+            }
         }
         if self.text_started && !self.text_finished {
-            self.text_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self
-                    .text_block_index
-                    .expect("started text has a block index"),
-            }));
+            if let Some(index) = self.text_block_index {
+                self.text_finished = true;
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index,
+                }));
+            }
         }
     }
 
     fn emit_text_content(&mut self, content: String, events: &mut Vec<StreamEvent>) {
         if self.public_reasoning_started && !self.public_reasoning_finished {
-            self.public_reasoning_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self
-                    .public_reasoning_block_index
-                    .expect("started public reasoning has a block index"),
-            }));
+            if let Some(index) = self.public_reasoning_block_index {
+                self.public_reasoning_finished = true;
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index,
+                }));
+            }
         }
         // Close the private reasoning block if it was started before visible content.
         if self.reasoning_started && !self.reasoning_finished {
-            self.reasoning_finished = true;
-            events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
-                index: self
-                    .private_reasoning_block_index
-                    .expect("started private reasoning has a block index"),
-            }));
+            if let Some(index) = self.private_reasoning_block_index {
+                self.reasoning_finished = true;
+                events.push(StreamEvent::ContentBlockStop(ContentBlockStopEvent {
+                    index,
+                }));
+            }
         }
         if !self.text_started {
             let block_index = self.allocate_block_index();
@@ -1098,12 +1117,12 @@ impl StreamState {
                 },
             }));
         }
-        events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
-            index: self
-                .text_block_index
-                .expect("started text has a block index"),
-            delta: ContentBlockDelta::TextDelta { text: content },
-        }));
+        if let Some(index) = self.text_block_index {
+            events.push(StreamEvent::ContentBlockDelta(ContentBlockDeltaEvent {
+                index,
+                delta: ContentBlockDelta::TextDelta { text: content },
+            }));
+        }
     }
 }
 

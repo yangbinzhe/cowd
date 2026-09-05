@@ -101,10 +101,7 @@ impl AppViewStreamState {
             .get_mut(subscription_id)
             .ok_or_else(|| AppViewStateError::InvalidDocument("unknown subscription".to_owned()))?;
         let sequence = frame.sequence();
-        if matches!(frame, AppStreamFrameV1::Open { .. }) {
-            let AppStreamFrameV1::Open { schema_digest, .. } = frame else {
-                unreachable!();
-            };
+        if let AppStreamFrameV1::Open { schema_digest, .. } = frame {
             let expected_schema = app_tui_view_patch_schema_digest_v1()
                 .map_err(|error| AppViewStateError::InvalidDocument(error.to_string()))?;
             if schema_digest != &expected_schema {

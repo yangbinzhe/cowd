@@ -36,7 +36,7 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
             "Acceptance requires grounded evidence. Do not claim a file, web, or workspace fact from prose alone: invoke the applicable read-only tool, retain its receipt/evidence ref, then synthesize from that result."
         }
         harness_contract::core::ExecutionPattern::Collaborate => {
-            "The task requests real collaboration. Invoke runtime orchestration to start the selected team/template and wait for its graph-backed Agent/Team receipts; a prose role split without a started team does not satisfy the task."
+            "The task requests real collaboration. Create Teams, invite Agents, and publish bounded Tasks through the small Agent actions. Continue from durable receipts until every Task is independently reviewed; a prose role split does not satisfy the task."
         }
         _ => {
             "Use the selected pattern directly, and escalate only when the retained evidence or task constraints require it."
@@ -96,7 +96,7 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
         );
     }
     format!(
-        "## Runtime execution decision\nrecommended_pattern={}; evidence_mode={:?}; complexity={:?}; risk={:?}\ntemplate_selection=runtime_resolved; runtime_never_falls_back\nrecommended_actions={}\naction_selection={}\nContract instruction: {}\n{}\nGuidance: simple work should be answered directly. When the right pattern is unclear, use `runtime_capabilities` once. Call `runtime_orchestrate` only through inspect/propose/propose_template/revise/control when its native schema is active. If the user expressly identifies a Team, role, responsibility, or organizational relationship and `submit_collaboration_decision` is active, use that tool only: preserve every user-provided identifier verbatim and follow this exact contract: {} {} {} Use a catalog template through `runtime_orchestrate` only when the user expressly selects that catalog template. Use `propose_template` only when the user expressly asks to publish/reuse a template. If a semantic requirement is absent or invalid, report the structured correction and retry; never replace it with a builtin template. Proposals contain semantic recipes and dependencies, never executors, leases, system paths, or physical graph ids. Prefer independent parallel nodes, semantic Teams, review and synthesis over repeated serial probing. During Team work, publish bounded findings or conflicts to `team_board` and read after the last observed revision at safe checkpoints. If progress is useful but slow, continue with staged synthesis; if evidence novelty falls, revise the graph instead of repeating an unchanged path.",
+        "## Runtime execution decision\nrecommended_pattern={}; evidence_mode={:?}; complexity={:?}; risk={:?}\nrecommended_actions={}\naction_selection={}\nContract instruction: {}\n{}\nGuidance: simple work should be answered directly. For collaboration, use the active small Agent actions incrementally: create semantic Teams, invite catalog-backed Agents, publish independent Tasks, let Agents claim work, exchange scoped messages, commit durable artifacts, submit evidence, and require independent review. The model decides structure and replanning; Runtime binds identities, permissions, revisions, leases, execution and terminal verification. Keep long content in normal output or files and pass only compact durable references through actions. Publish independent Tasks without artificial dependencies to maximize concurrency. Inspect current Program state after rejection or recovery and change the semantic action instead of repeating it. Request completion only after every required Team has members and accepted work, the final artifact is durable and reviewed, and no unresolved item remains.",
         decision.pattern().as_str(),
         decision.evidence_mode,
         decision.complexity(),
@@ -106,9 +106,6 @@ pub fn runtime_execution_guidance_prompt_with_tool_exposure_mode(
         .unwrap_or_else(|_| "{}".to_string()),
         contract_instruction,
         tool_contract,
-        harness_contract::orchestration::SUBMIT_COLLABORATION_DECISION_V2_GUIDANCE,
-        harness_contract::orchestration::EXACT_FILE_EVIDENCE_GUIDANCE,
-        harness_contract::orchestration::INDEPENDENT_REVIEW_GUIDANCE,
     )
 }
 
@@ -141,8 +138,8 @@ mod tests {
 
         let prompt = runtime_execution_guidance_prompt(&decision);
 
-        assert!(prompt.contains("start the selected team/template"));
-        assert!(prompt.contains("graph-backed Agent/Team receipts"));
+        assert!(prompt.contains("Create Teams, invite Agents"));
+        assert!(prompt.contains("independently reviewed"));
     }
 
     #[test]
@@ -158,7 +155,7 @@ mod tests {
                     "tool_search".to_string(),
                     "runtime_capabilities".to_string(),
                 ],
-                deferred_ids: vec!["read_many".to_string(), "runtime_orchestrate".to_string()],
+                deferred_ids: vec!["read_many".to_string(), "task_publish".to_string()],
                 fallback_full: false,
                 reason: "bootstrap tools exposed".to_string(),
                 schema_tokens: 0,
@@ -181,7 +178,7 @@ mod tests {
                 exposure_revision: 3,
                 bootstrap_ids: vec!["tool_search".to_string()],
                 active_ids: vec!["tool_search".to_string(), "read_file".to_string()],
-                deferred_ids: vec!["read_many".to_string(), "runtime_orchestrate".to_string()],
+                deferred_ids: vec!["read_many".to_string(), "task_publish".to_string()],
                 fallback_full: false,
                 reason: "bootstrap tools exposed".to_string(),
                 schema_tokens: 32,

@@ -15,11 +15,6 @@ name = "cowd_full_capability_eval"
 path = "tests/cowd_full_capability_eval.rs"
 required-features = ["test-fixtures"]
 
-[[test]]
-name = "mission_harness_e2e_eval"
-path = "tests/mission_harness_e2e_eval.rs"
-required-features = ["test-fixtures"]
-
 [dependencies]
 cowd-app-protocol = { path = "../app-protocol" }
 harness-contract = { path = "../harness-contract" }
@@ -49,6 +44,7 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
+schemars.workspace = true
 toml = "0.8"
 fs2 = "0.4"
 walkdir = "2"

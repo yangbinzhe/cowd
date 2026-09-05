@@ -350,9 +350,9 @@ impl WorkerBackendReporter {
             .states
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let observation = states
-            .get_mut(self.name)
-            .expect("supervised worker observation exists");
+        let Some(observation) = states.get_mut(self.name) else {
+            return;
+        };
         observation.last_backend_success_at_ms = Some(now_ms());
         observation.last_backend_error_at_ms = None;
         observation.last_backend_error = None;
@@ -365,9 +365,9 @@ impl WorkerBackendReporter {
             .states
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let observation = states
-            .get_mut(self.name)
-            .expect("supervised worker observation exists");
+        let Some(observation) = states.get_mut(self.name) else {
+            return true;
+        };
         let error = error.into();
         observation.last_backend_error_at_ms = Some(now_ms());
         observation.last_backend_error = Some(error);

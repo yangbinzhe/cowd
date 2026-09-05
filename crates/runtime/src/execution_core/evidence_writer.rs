@@ -108,12 +108,12 @@ impl ResourceEvidenceWriter {
                 {}
                 drain_coalesced(&store, &worker_pending, &worker_published, &worker_failures);
             })
-            .expect("resource evidence writer thread must start");
+            .ok();
         Arc::new(Self {
             wake: Mutex::new(Some(wake_tx)),
             priority: Mutex::new(Some(priority_tx)),
             pending,
-            worker: Mutex::new(Some(worker)),
+            worker: Mutex::new(worker),
             published,
             coalesced: AtomicU64::new(0),
             coalescible_dropped: AtomicU64::new(0),

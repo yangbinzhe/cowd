@@ -230,13 +230,6 @@ impl RuntimeServicesBuilder {
             (None, None, None, None) => None,
             _ => return Err(RuntimeServicesError::IncompleteSessionPorts),
         };
-        let legacy_team_state_path = self
-            .cowd_home
-            .join("agents")
-            .join("team-runtime")
-            .join("state.json");
-        let legacy_team_profile_path = self.cowd_home.join("agents").join("team-profiles.json");
-        let legacy_team_profile_archive_root = self.cowd_home.join("migrations").join("teams");
         let workspace_root = canonical_workspace_root(&self.workspace_root)?;
         let workspace_key = workspace_key(&workspace_root);
         let storage_registry = storage::StorageRegistry::default_for_config_home(&self.cowd_home)
@@ -369,17 +362,6 @@ impl RuntimeServicesBuilder {
             .event_reactor
             .start()
             .map_err(RuntimeServicesError::Invariant)?;
-        services
-            .team_runtime()
-            .import_legacy_state_file(&legacy_team_state_path)
-            .map_err(RuntimeServicesError::Mission)?;
-        services
-            .team_runtime()
-            .archive_legacy_profile_file(
-                &legacy_team_profile_path,
-                &legacy_team_profile_archive_root,
-            )
-            .map_err(RuntimeServicesError::Mission)?;
         if let Some((query, ingress, journal, application)) = session_ports {
             services.install_session_ports(query, ingress, journal, application)?;
         }

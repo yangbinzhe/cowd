@@ -208,7 +208,6 @@ impl NodeExecutor for VerifyNodeExecutor {
                         );
                     let evidence_satisfied =
                         evidence_policy.evidence_satisfied(produced_evidence, retained_upstream);
-                    let role = packet.team_role_assignment();
                     if requires_new_tool_evidence && result.usage.tool_calls == 0 {
                         invalid_team_slots.push(format!("{predecessor_id}:zero_tool_calls"));
                     }
@@ -225,10 +224,6 @@ impl NodeExecutor for VerifyNodeExecutor {
                         invalid_team_slots.push(format!(
                             "{predecessor_id}:missing_typed_acceptance_contract"
                         ));
-                    }
-                    if role.is_none() {
-                        invalid_team_slots
-                            .push(format!("{predecessor_id}:incomplete_role_focus_contract"));
                     }
                     if result
                         .summary
@@ -289,7 +284,7 @@ impl NodeExecutor for VerifyNodeExecutor {
         // use durable receipts rather than an optional free-form JSON field.
         if team_verification && has_durable_team_evidence && invalid_team_slots.is_empty() {
             for criterion in &node.acceptance.criteria {
-                if is_runtime_evidence_backed_team_criterion(criterion) {
+                if is_runtime_evidence_backed_output_criterion(criterion) {
                     satisfied_team_criteria.insert(criterion.to_ascii_lowercase());
                 }
             }
@@ -381,19 +376,19 @@ impl NodeExecutor for VerifyNodeExecutor {
     }
 }
 
-/// Return whether a Team delivery criterion is compiled as Runtime-backed
+/// Return whether an Agent output criterion is compiled as Runtime-backed
 /// evidence rather than a structured presentation field.
 ///
 /// This mirrors the explicit structured field set in
-/// `team::instantiation::team_acceptance_contract`. Unknown user-defined
+/// `agent::OutputAcceptanceRequirement`. Unknown user-defined
 /// labels and typed `evidence_scope:` declarations are both evidence-backed
 /// there. Requiring a matching JSON property (or a textual equality between
-/// a role-local path alias and the Team's workspace-canonical alias) would
+/// a model-local path alias and the Runtime workspace-canonical alias) would
 /// create a second, model-fragile acceptance language. The caller only uses
-/// this after every required role slot has a satisfied typed Runtime
-/// acceptance evaluation and durable Team evidence, so this cannot grant
-/// evidence that the role-level evaluator did not verify.
-fn is_runtime_evidence_backed_team_criterion(criterion: &str) -> bool {
+/// this after every required Agent output has a satisfied typed Runtime
+/// acceptance evaluation and durable execution evidence, so this cannot grant
+/// evidence that the output evaluator did not verify.
+fn is_runtime_evidence_backed_output_criterion(criterion: &str) -> bool {
     !matches!(
         criterion.trim().to_ascii_lowercase().as_str(),
         "summary"
@@ -430,7 +425,7 @@ fn structured_team_contract_field_materialized(criterion: &str, value: &serde_js
                 serde_json::Value::String(value) => !value.trim().is_empty(),
                 serde_json::Value::Object(values) => !values.is_empty(),
                 serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
-                serde_json::Value::Array(_) => unreachable!("arrays returned above"),
+                serde_json::Value::Array(_) => true,
             };
     }
     match value {
@@ -759,15 +754,15 @@ mod tests {
     #[test]
     fn team_verification_uses_agent_custom_artifact_evidence_policy() {
         let requirements = vec![
-            harness_contract::team::TeamAcceptanceRequirement {
+            harness_contract::agent::OutputAcceptanceRequirement {
                 criterion: "artifact:source_reads".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+                check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
                     name: "source_reads".to_string(),
                 },
             },
-            harness_contract::team::TeamAcceptanceRequirement {
+            harness_contract::agent::OutputAcceptanceRequirement {
                 criterion: "evidence".to_string(),
-                check: harness_contract::team::TeamAcceptanceCheck::ScopedEvidence {
+                check: harness_contract::agent::OutputAcceptanceCheck::ScopedEvidence {
                     scopes: vec!["read:src".to_string()],
                 },
             },
@@ -809,9 +804,9 @@ mod tests {
 
     #[test]
     fn team_verification_does_not_invent_evidence_debt_for_structured_only_contract() {
-        let requirements = vec![harness_contract::team::TeamAcceptanceRequirement {
+        let requirements = vec![harness_contract::agent::OutputAcceptanceRequirement {
             criterion: "artifact:definitions".to_string(),
-            check: harness_contract::team::TeamAcceptanceCheck::StructuredArtifact {
+            check: harness_contract::agent::OutputAcceptanceCheck::StructuredArtifact {
                 name: "definitions".to_string(),
             },
         }];
@@ -850,16 +845,18 @@ mod tests {
 
     #[test]
     fn custom_team_delivery_labels_are_evidence_backed_not_model_json_fields() {
-        assert!(is_runtime_evidence_backed_team_criterion("evidence_paths"));
-        assert!(is_runtime_evidence_backed_team_criterion(
+        assert!(is_runtime_evidence_backed_output_criterion(
+            "evidence_paths"
+        ));
+        assert!(is_runtime_evidence_backed_output_criterion(
             "findings_summary"
         ));
-        assert!(is_runtime_evidence_backed_team_criterion(
+        assert!(is_runtime_evidence_backed_output_criterion(
             "user_defined_delivery"
         ));
-        assert!(!is_runtime_evidence_backed_team_criterion("summary"));
-        assert!(!is_runtime_evidence_backed_team_criterion("evidence"));
-        assert!(is_runtime_evidence_backed_team_criterion(
+        assert!(!is_runtime_evidence_backed_output_criterion("summary"));
+        assert!(!is_runtime_evidence_backed_output_criterion("evidence"));
+        assert!(is_runtime_evidence_backed_output_criterion(
             "evidence_scope:read:src"
         ));
     }

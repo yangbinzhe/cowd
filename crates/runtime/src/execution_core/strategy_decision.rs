@@ -131,7 +131,6 @@ pub struct TurnStrategyActualOutcome {
     pub write_attempt_paths: Vec<String>,
     pub evidence_overlap_bp: u16,
     pub evidence_overlap_observed: bool,
-    pub working_state_verified: bool,
     pub merge_cost_ms: u64,
     pub parent_merge_count: u8,
     #[serde(default)]
@@ -164,8 +163,6 @@ pub struct TurnStrategyDecisionState {
     pub turn_ref: String,
     pub decision: RuntimeExecutionDecision,
     pub collaboration_receipt: Option<serde_json::Value>,
-    #[serde(default)]
-    pub focus_partition_plans: Vec<harness_contract::team::FocusPartitionPlan>,
     pub outcome: Option<TurnStrategyActualOutcome>,
 }
 
@@ -193,7 +190,6 @@ impl TurnStrategyDecisionState {
             turn_ref,
             decision,
             collaboration_receipt: None,
-            focus_partition_plans: Vec::new(),
             outcome: None,
         }
     }
@@ -651,7 +647,7 @@ fn fallback_action_for(action: &str) -> &'static str {
 fn expected_projection_for(action: &str) -> &'static [&'static str] {
     match action {
         "propose:team" => &[
-            "mission.team_projection",
+            "mission.agentic_team_projection",
             "mission.agent_projection",
             "mission.execution_graph_projection",
             "mission.evidence_projection",
@@ -759,7 +755,7 @@ mod tests {
     #[test]
     fn delegated_agent_is_a_local_tool_leaf_without_nested_orchestration_hints() {
         let decision = StrategyDecisionEngine.decide_with_input(
-            StrategyInput::from_prompt("分析三个输入文件并调用 team_board 汇总结果后写入目标文件"),
+            StrategyInput::from_prompt("分析三个输入文件并汇总结果后写入目标文件"),
             Some(ContextProfile::SubAgent),
             StrategyResourceHealth {
                 collaboration_available: false,

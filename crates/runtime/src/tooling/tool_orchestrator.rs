@@ -128,34 +128,11 @@ impl ToolSafetyCategory {
 
             "web_search" | "web_fetch" | "http_request" => Self::Network,
 
-            "bash"
-            | "powershell"
-            | "repl"
-            | "mcp"
-            | "mcp_auth"
-            | "remote_trigger"
-            | "agent"
-            | "runtime_orchestrate"
-            | "task_create"
-            | "run_task_packet"
-            | "task_stop"
-            | "task_update"
-            | "worker_create"
-            | "worker_send_prompt"
-            | "worker_restart"
-            | "worker_terminate"
-            | "team_create"
-            | "team_delete"
-            | "cron_create"
-            | "cron_delete"
-            | "config"
-            | "notebook_edit"
-            | "structured_output"
-            | "execute_code"
-            | "rm"
-            | "kill"
-            | "sudo"
-            | "truncate"
+            "bash" | "powershell" | "repl" | "mcp" | "mcp_auth" | "remote_trigger" | "agent"
+            | "task_create" | "run_task_packet" | "task_stop" | "task_update" | "worker_create"
+            | "worker_send_prompt" | "worker_restart" | "worker_terminate" | "team_create"
+            | "team_delete" | "cron_create" | "cron_delete" | "config" | "notebook_edit"
+            | "structured_output" | "execute_code" | "rm" | "kill" | "sudo" | "truncate"
             | "drop" => Self::Destructive,
 
             _ if normalized.starts_with("read")
@@ -250,7 +227,6 @@ fn normalize_tool_name_for_safety(name: &str) -> String {
         "toolsearch" => "tool_search".to_string(),
         "runtimecapabilities" => "runtime_capabilities".to_string(),
         "contextretrieve" => "context_retrieve".to_string(),
-        "runtimeorchestrate" => "runtime_orchestrate".to_string(),
         "listmcpresources" => "list_mcp_resources".to_string(),
         "readmcpresource" => "read_mcp_resource".to_string(),
         "mcpauth" => "mcp_auth".to_string(),
@@ -331,7 +307,7 @@ mod tests {
             ToolSafetyCategory::Network
         );
         assert_eq!(
-            ToolSafetyCategory::from_tool_name("RuntimeOrchestrate"),
+            ToolSafetyCategory::from_tool_name("team_create"),
             ToolSafetyCategory::Destructive
         );
         assert_eq!(

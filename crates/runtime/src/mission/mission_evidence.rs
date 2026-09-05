@@ -61,9 +61,9 @@ impl MissionEvidenceBus {
         }
     }
 
-    pub(crate) fn projection_lane(self: &Arc<Self>) -> RuntimeProjectionLane {
+    pub(crate) fn projection_lane(self: &Arc<Self>) -> Result<RuntimeProjectionLane, String> {
         let projector = Arc::clone(self);
-        RuntimeProjectionLane::blocking(
+        Ok(RuntimeProjectionLane::blocking(
             RuntimeProjectionDescriptor::new(
                 PROJECTOR_ID,
                 RuntimeProjectionInterest::new([RuntimeProjectionEventInterest::new(
@@ -72,13 +72,12 @@ impl MissionEvidenceBus {
                 )]),
                 128,
                 Duration::from_secs(30),
-            )
-            .expect("mission evidence projection descriptor is static and valid"),
+            )?,
             move |batch_size| {
                 let processed = projector.project_available(batch_size)?;
                 Ok(RuntimeProjectionPass::scanned(processed, batch_size))
             },
-        )
+        ))
     }
 
     pub fn record(&self, evidence: MissionEvidenceRef) -> Result<MissionEvidenceRef, String> {
@@ -619,8 +618,11 @@ mod tests {
         let store = Arc::new(RuntimeEventStore::try_open_in_memory().unwrap());
         let bus = Arc::new(MissionEvidenceBus::new(Arc::clone(&store)));
         let reactor = Arc::new(
-            crate::RuntimeEventReactor::sealed(Arc::clone(&store), [bus.projection_lane()])
-                .unwrap(),
+            crate::RuntimeEventReactor::sealed(
+                Arc::clone(&store),
+                [bus.projection_lane().unwrap()],
+            )
+            .unwrap(),
         );
         reactor.start().unwrap();
         bus.record(evidence("e1")).unwrap();

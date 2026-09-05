@@ -131,7 +131,6 @@ fn manifest(id: AgentDefinitionId, revision: u64) -> AgentDefinitionManifest {
             context_profile: "sub_agent".to_string(),
             read_scopes: vec![CognitiveReadScope::Session],
             write_mode: CognitiveWriteMode::CandidateOnly,
-            team_working_state_visible: false,
         },
         capability_contract: AgentCapabilityContract {
             capability_ceiling: vec![AgentCapability::Read],

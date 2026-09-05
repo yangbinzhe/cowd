@@ -826,7 +826,7 @@ fn analysis_context(report: &Value) -> Value {
         "scenario_capabilities": report.get("scenarios").cloned().unwrap_or(Value::Null),
         "next_gen_harness_closure": report.get("next_gen_harness_closure").cloned().unwrap_or(Value::Null),
         "reality_context_eval": report.get("reality_context_eval").cloned().unwrap_or(Value::Null),
-        "mission_runtime_collaboration": report.get("mission_runtime_collaboration").cloned().unwrap_or(Value::Null),
+        "agentic_program_closure": report.get("agentic_program_closure").cloned().unwrap_or(Value::Null),
         "real_tool_scenarios": report.get("real_tool_scenarios").cloned().unwrap_or(Value::Null),
         "live_gateway_scenarios": report.get("live_gateway_scenarios").cloned().unwrap_or(Value::Null),
         "instructions": [

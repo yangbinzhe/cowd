@@ -89,7 +89,7 @@ impl CoreBridgeRegistry {
         });
         self.bindings
             .write()
-            .expect("CoreBridge registry lock poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(app_id, binding);
         registration
     }
@@ -98,7 +98,7 @@ impl CoreBridgeRegistry {
         let mut bindings = self
             .bindings
             .write()
-            .expect("CoreBridge registry lock poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let matches = bindings.get(&registration.app_id).is_some_and(|binding| {
             binding.registration.generation == registration.generation
                 && binding.registration.pid == registration.pid
@@ -463,6 +463,7 @@ async fn route_request(
             Arc::clone(&dependencies.store),
             Arc::clone(&dependencies.app_state),
             binding.registration.app_id.0.clone(),
+            originating_app_operation_id.clone(),
             envelope,
             operation_for_dispatch,
             payload,
@@ -500,6 +501,7 @@ async fn route_request(
             Arc::clone(&dependencies.store),
             Arc::clone(&dependencies.app_state),
             binding.registration.app_id.0.clone(),
+            originating_app_operation_id.clone(),
             envelope,
             operation_for_dispatch,
             payload,
@@ -692,6 +694,7 @@ async fn dispatch_with_deadline(
     store: Arc<dyn MatrixStore>,
     app_state: Arc<OnceLock<Arc<AppState>>>,
     app_id: String,
+    originating_app_operation_id: String,
     envelope: &AppInvocationEnvelopeV1,
     operation_id: String,
     payload: serde_json::Value,
@@ -730,7 +733,14 @@ async fn dispatch_with_deadline(
         })?;
         tokio::time::timeout(
             Duration::from_millis(timeout_ms),
-            core_platform_operations::dispatch(&state, envelope, &app_id, &operation_id, &payload),
+            core_platform_operations::dispatch(
+                &state,
+                envelope,
+                &app_id,
+                &originating_app_operation_id,
+                &operation_id,
+                &payload,
+            ),
         )
         .await
         .map_err(|_| BridgeFailure::deadline())?
@@ -1052,10 +1062,9 @@ impl BridgeFailure {
             },
         };
         json_response(status, &response).unwrap_or_else(|_| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::new(Bytes::new()))
-                .expect("static response")
+            let mut response = Response::new(Full::new(Bytes::new()));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response
         })
     }
 }
@@ -1364,6 +1373,7 @@ mod tests {
     fn bind_business_principal(
         state: &AppState,
         envelope: &AppInvocationEnvelopeV1,
+        originating_app_operation_id: &str,
         is_human: bool,
     ) {
         let verified = runtime::VerifiedPrincipal::from_test_claims(
@@ -1401,6 +1411,10 @@ mod tests {
                 &envelope.principal.workspace_id,
                 &envelope.execution.surface,
                 "app:fixture".to_owned(),
+                originating_app_operation_id.to_owned(),
+                envelope.operation_id.clone(),
+                envelope.input_schema_digest.clone(),
+                envelope.principal.granted_capabilities.clone(),
             );
     }
 
@@ -1855,7 +1869,7 @@ mod tests {
                 },
                 payload,
             };
-            bind_business_principal(&state, &envelope, is_human);
+            bind_business_principal(&state, &envelope, &origin, is_human);
             if operation_id == core_platform_operations::PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID {
                 query_seed = Some((origin.clone(), envelope.clone()));
             }
@@ -1892,7 +1906,7 @@ mod tests {
         revision_conflict.correlation_id = "negative-revision-conflict".to_owned();
         revision_conflict.idempotency_key = Some("negative-revision-conflict".to_owned());
         revision_conflict.expected_revision = Some("18446744073709551615".to_owned());
-        bind_business_principal(&state, &revision_conflict, false);
+        bind_business_principal(&state, &revision_conflict, &cancellation_origin, false);
         let (status, body) = send_uds_bridge_invocation(
             &channel,
             &generation,
@@ -1917,7 +1931,7 @@ mod tests {
             .principal
             .granted_capabilities
             .retain(|capability| capability == "fixture.invoke");
-        bind_business_principal(&state, &missing_capability, false);
+        bind_business_principal(&state, &missing_capability, &query_origin, false);
         let (status, body) = send_uds_bridge_invocation(
             &channel,
             &generation,
@@ -2000,7 +2014,7 @@ mod tests {
         idempotency_conflict.correlation_id = "negative-idempotency-conflict".to_owned();
         idempotency_conflict.payload["requested_capability"] =
             Value::String("message.changed".to_owned());
-        bind_business_principal(&state, &idempotency_conflict, false);
+        bind_business_principal(&state, &idempotency_conflict, &command_origin, false);
         let (status, body) = send_uds_bridge_invocation(
             &channel,
             &generation,
@@ -2067,6 +2081,7 @@ mod tests {
             Arc::new(MatrixSqliteRepository::in_memory().expect("matrix")),
             Arc::new(OnceLock::new()),
             "fixture".to_owned(),
+            "fixture.operation".to_owned(),
             &envelope,
             envelope.operation_id.clone(),
             envelope.payload.clone(),

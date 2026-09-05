@@ -28,9 +28,9 @@ pub fn terminal_capability_matrix(evidence_dir: &Path) -> Vec<TerminalCapability
         row(
             "模型主动性",
             "Runtime",
-            "capability_manifest + orchestration",
+            "capability_manifest + agentic_program",
             "/api/runtime/control-plane",
-            "runtime.orchestration",
+            "agentic.program_opened",
             "WebUI/TUI capability surfaces",
             evidence(6),
         ),

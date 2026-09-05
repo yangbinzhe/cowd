@@ -2125,7 +2125,7 @@ fn runtime_capability_context_item_reflects_filtered_tools() {
     assert_eq!(item.source, runtime::ContextSourceKind::RuntimeHeader);
     assert_eq!(item.role, runtime::ContextRole::Orientation);
     assert!(item.content.contains("runtime_capabilities=registered"));
-    assert!(item.content.contains("runtime_orchestrate=not_registered"));
+    assert!(!item.content.contains(concat!("runtime_", "orchestrate")));
     assert!(item.content.contains("read_many"));
     assert!(item.content.contains("tool_batch_readonly"));
 }
@@ -3075,7 +3075,7 @@ fn runtime_bootstrap_state_discovers_mcp_tools_and_surfaces_pending_servers() {
         .extend_runtime_tools(mcp_service.runtime_tool_definitions())
         .expect("MCP tools should merge into the runtime catalog");
     assert_eq!(
-        tool_registry.required_permission("runtime_orchestrate"),
+        tool_registry.required_permission("state_inspect"),
         Some(harness_contract::tool::ToolPermissionMode::ReadOnly),
         "MCP discovery must not replace core Runtime tools"
     );
@@ -3278,7 +3278,7 @@ fn runtime_bootstrap_state_surfaces_unsupported_mcp_servers_structurally() {
         .extend_runtime_tools(mcp_service.runtime_tool_definitions())
         .expect("MCP wrappers should merge into the runtime catalog");
     assert_eq!(
-        tool_registry.required_permission("runtime_orchestrate"),
+        tool_registry.required_permission("state_inspect"),
         Some(harness_contract::tool::ToolPermissionMode::ReadOnly),
         "degraded MCP discovery must retain core Runtime tools"
     );

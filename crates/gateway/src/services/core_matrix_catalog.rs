@@ -35,7 +35,9 @@ use super::core_platform_operations::{
     ConnectorSurfaceDispatchBatchOutput, CrossPlaneActionPlanInput, CrossPlaneActionPlanOutput,
     CrossPlaneDispatchInput, CrossPlaneDispatchOutput, PlatformGovernanceSnapshotInput,
     PlatformGovernanceSnapshotOutput, RuntimeCancelStructuredTaskInput,
-    RuntimeCancelStructuredTaskOutput, RuntimeStartGoalInput, RuntimeStartGoalOutput,
+    RuntimeCancelStructuredTaskOutput, RuntimeExecutionProjectionChangesInput,
+    RuntimeExecutionProjectionChangesOutput, RuntimeExecutionProjectionSnapshotInput,
+    RuntimeExecutionProjectionSnapshotOutput, RuntimeStartGoalInput, RuntimeStartGoalOutput,
     RuntimeStartStructuredTaskInput, RuntimeStartStructuredTaskOutput, SurfaceOutboxListInput,
     SurfaceOutboxListOutput, WorkContextInspectStructuredTaskResultInput,
     WorkContextInspectStructuredTaskResultOutput, WorkContextInspectTaskTerminalInput,
@@ -45,7 +47,8 @@ use super::core_platform_operations::{
     WorkContextTaskExistsOutput, ACTION_PLAN_OPERATION_ID, APPROVAL_DECIDE_OPERATION_ID,
     APPROVAL_SUBMIT_OPERATION_ID, CONNECTOR_SURFACE_DISPATCH_BATCH_OPERATION_ID,
     CROSS_PLANE_DISPATCH_OPERATION_ID, PLATFORM_GOVERNANCE_SNAPSHOT_OPERATION_ID,
-    RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID, RUNTIME_START_GOAL_OPERATION_ID,
+    RUNTIME_CANCEL_STRUCTURED_TASK_OPERATION_ID, RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+    RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID, RUNTIME_START_GOAL_OPERATION_ID,
     RUNTIME_START_STRUCTURED_TASK_OPERATION_ID, SURFACE_OUTBOX_LIST_OPERATION_ID,
     WORK_CONTEXT_APPEND_APPLICATION_EXECUTION_SUMMARY_OPERATION_ID,
     WORK_CONTEXT_INSPECT_STRUCTURED_TASK_RESULT_OPERATION_ID,
@@ -404,6 +407,14 @@ pub(crate) fn definitions() -> Result<Vec<CoreMatrixOperationDefinition>, CoreMa
     ]
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
+    values.extend(runtime_projection_definitions()?);
+    sort_and_validate_definitions(&mut values)?;
+    Ok(values)
+}
+
+fn sort_and_validate_definitions(
+    values: &mut [CoreMatrixOperationDefinition],
+) -> Result<(), CoreMatrixCatalogError> {
     values.sort_by(|left, right| {
         left.descriptor
             .operation_id
@@ -413,12 +424,40 @@ pub(crate) fn definitions() -> Result<Vec<CoreMatrixOperationDefinition>, CoreMa
         .iter()
         .map(|value| value.descriptor.operation_id.as_str())
         .collect::<BTreeSet<_>>();
-    if values.len() != 58 || ids.len() != 58 {
+    if values.len() != 60 || ids.len() != 60 {
         return Err(CoreMatrixCatalogError::Invalid(
-            "authority must contain exactly 58 unique operations".to_string(),
+            "authority must contain exactly 60 unique operations".to_string(),
         ));
     }
-    Ok(values)
+    Ok(())
+}
+
+fn runtime_projection_definitions(
+) -> Result<Vec<CoreMatrixOperationDefinition>, CoreMatrixCatalogError> {
+    [
+        platform_definition::<
+            RuntimeExecutionProjectionSnapshotInput,
+            RuntimeExecutionProjectionSnapshotOutput,
+        >(
+            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+            "runtime.task.read",
+            "runtime.execution_projection.snapshot",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+        ),
+        platform_definition::<
+            RuntimeExecutionProjectionChangesInput,
+            RuntimeExecutionProjectionChangesOutput,
+        >(
+            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+            "runtime.task.read",
+            "runtime.execution_projection.changes",
+            OperationKindV1::Query,
+            OperationDelegationV1::Either,
+        ),
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn platform_definition<I: JsonSchema, O: JsonSchema>(
@@ -1106,7 +1145,7 @@ mod tests {
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
-        assert_eq!(authority.len(), 58);
+        assert_eq!(authority.len(), 60);
         assert_eq!(dispatcher_ids.len(), 42);
         assert_eq!(authority_ids, dispatcher_ids);
         let platform_authority_ids = authority
@@ -1118,7 +1157,7 @@ mod tests {
             super::super::core_platform_operations::PLATFORM_OPERATION_IDS
                 .into_iter()
                 .collect::<BTreeSet<_>>();
-        assert_eq!(platform_dispatcher_ids.len(), 16);
+        assert_eq!(platform_dispatcher_ids.len(), 18);
         assert_eq!(platform_authority_ids, platform_dispatcher_ids);
         assert!(platform_dispatcher_ids
             .iter()
@@ -1136,14 +1175,24 @@ mod tests {
                 core_capabilities.contains(definition.descriptor.required_capabilities[0].as_str())
             );
             if !definition.descriptor.operation_id.starts_with(CORE_PREFIX) {
-                assert_eq!(
-                    definition.input_schema.get("additionalProperties"),
-                    Some(&Value::Bool(false))
-                );
-                assert_eq!(
-                    definition.output_schema.get("additionalProperties"),
-                    Some(&Value::Bool(false))
-                );
+                for schema in [&definition.input_schema, &definition.output_schema] {
+                    let closed = schema.get("additionalProperties") == Some(&Value::Bool(false))
+                        || schema
+                            .get("oneOf")
+                            .and_then(Value::as_array)
+                            .is_some_and(|variants| {
+                                !variants.is_empty()
+                                    && variants.iter().all(|variant| {
+                                        variant.get("additionalProperties")
+                                            == Some(&Value::Bool(false))
+                                    })
+                            });
+                    assert!(
+                        closed,
+                        "{} exposes an open input/output object schema",
+                        definition.descriptor.operation_id
+                    );
+                }
             }
             if definition.descriptor.kind == OperationKindV1::Command {
                 assert_eq!(
@@ -1151,6 +1200,44 @@ mod tests {
                     IdempotencySemanticsV1::Required
                 );
                 assert!(!definition.descriptor.read_only);
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_projection_bridge_schemas_are_exportable_from_core_authority() {
+        let authority = definitions().expect("Core authority");
+        let export_root =
+            std::env::var_os("COWD_EXPORT_RUNTIME_PROJECTION_SCHEMAS").map(PathBuf::from);
+        if let Some(root) = export_root.as_ref() {
+            fs::create_dir_all(root).expect("create Runtime projection schema export root");
+        }
+        for operation_id in [
+            RUNTIME_EXECUTION_PROJECTION_SNAPSHOT_OPERATION_ID,
+            RUNTIME_EXECUTION_PROJECTION_CHANGES_OPERATION_ID,
+        ] {
+            let definition = authority
+                .iter()
+                .find(|definition| definition.descriptor.operation_id == operation_id)
+                .expect("Runtime projection Core operation");
+            eprintln!(
+                "{operation_id} input={} output={}",
+                definition.descriptor.input_schema_digest.0,
+                definition.descriptor.output_schema_digest.0,
+            );
+            assert!(definition.input_schema.is_object());
+            assert!(definition.output_schema.is_object());
+            if let Some(root) = export_root.as_ref() {
+                for (direction, schema) in [
+                    ("input", &definition.input_schema),
+                    ("output", &definition.output_schema),
+                ] {
+                    fs::write(
+                        root.join(format!("{operation_id}.{direction}.schema.json")),
+                        serde_json::to_vec(schema).expect("canonical Runtime projection schema"),
+                    )
+                    .expect("write Runtime projection schema");
+                }
             }
         }
     }

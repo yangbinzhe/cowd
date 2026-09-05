@@ -81,7 +81,7 @@ impl CognitiveContextManager {
                 tracing::debug!(
                     agent_role = %d.agent_role,
                     task = %truncate_summary(&d.task, 40),
-                    "delegation observation retained for Runtime TeamWorkingState; no direct L4 write"
+                    "delegation observation retained by Runtime Agentic state; no direct L4 write"
                 );
             }
         }

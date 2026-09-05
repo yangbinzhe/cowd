@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
-    evaluate_complex_harness_scenarios, evaluate_evolution_closure,
-    evaluate_knowledge_fabric_context_governance, evaluate_next_gen_harness_closure,
-    evaluate_reality_context_scenarios, evaluate_report_gate, harness_capability_coverage_report,
+    evaluate_agentic_program_closure, evaluate_complex_harness_scenarios,
+    evaluate_evolution_closure, evaluate_knowledge_fabric_context_governance,
+    evaluate_next_gen_harness_closure, evaluate_reality_context_scenarios, evaluate_report_gate,
+    harness_capability_coverage_report,
     real_provider_runner::run_deep_real_provider_review,
     report::{
         HarnessEvalLevel, HarnessEvalRunRecord, HarnessEvalRunStatus, HarnessEvalUsageSummary,
@@ -125,7 +126,6 @@ pub fn run_eval_controlled(
         (options.level != HarnessEvalLevel::Quick).then(evaluate_complex_harness_scenarios);
     let knowledge = evaluate_knowledge_fabric_context_governance();
     let reality_context = evaluate_reality_context_scenarios();
-    let mission_runtime = evaluate_mission_runtime_collaboration_closure();
     let real_tool = (options.level != HarnessEvalLevel::Quick).then(run_full_real_tool_scenarios);
     let mut usage = empty_usage("deterministic_smoke");
     let mut tool_call_log = Vec::new();
@@ -154,61 +154,20 @@ pub fn run_eval_controlled(
     }
     let tool_calls = tool_call_log.len();
     let runtime_actions = 5 + usize::from(complex.is_some());
-    let mission_evidence_refs = mission_runtime
-        .get("evidence_refs")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let mission_terminal = mission_runtime
-        .get("terminal_evidence")
-        .unwrap_or(&Value::Null);
-    let next_gen_harness = evaluate_next_gen_harness_closure(NextGenHarnessEvalInput {
+    let next_gen_input = NextGenHarnessEvalInput {
         level: options.level.as_str().to_string(),
         runtime_action_count: runtime_actions,
         tool_call_count: tool_calls,
         provider_rounds: 0,
         total_tokens: usage.total_tokens,
         real_model_authorized: options.allow_real_model,
-        mission_evidence_refs,
         reality_evidence_ref_total: reality_context.evidence_ref_total,
-        agent_terminal_count: mission_terminal
-            .get("agent_terminal_count")
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as usize,
-        mailbox_completed_count: mission_terminal
-            .get("mailbox_completed_count")
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as usize,
-        synthesis_receipt_id: mission_terminal
-            .get("synthesis_receipt_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        session_relation_count: mission_terminal
-            .get("session_relation_count")
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as usize,
-        runtime_turn_result_count: mission_terminal
-            .get("runtime_turn_result_count")
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as usize,
-        recovery_applied_count: mission_terminal
-            .get("recovery_applied_count")
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as usize,
-        recovery_verified_count: mission_terminal
-            .get("recovery_verified_count")
-            .and_then(Value::as_u64)
-            .unwrap_or_default() as usize,
         source_fixture_status: "not_observed_contract_lane".to_string(),
         sidecar_fixture_status: "not_observed_contract_lane".to_string(),
         db_fixture_status: "not_observed_contract_lane".to_string(),
-    });
+        ..NextGenHarnessEvalInput::default()
+    };
+    let mut next_gen_harness = evaluate_next_gen_harness_closure(next_gen_input.clone());
     let mut scenarios = vec![
         json!({
             "capability": "stable_ai_scenario_matrix",
@@ -235,22 +194,10 @@ pub fn run_eval_controlled(
             "notes": "validates RecallReport, ContextEnvelope, selected/omitted context, evidence refs, scoped recall, knowledge activation, fact/matrix trace, tool sandbox, multi-agent and cross-session evidence"
         }),
         json!({
-            "capability": "mission_runtime_collaboration_closure",
-            "status": mission_runtime.get("status").and_then(Value::as_str).unwrap_or("failed"),
-            "evidence": format!(
-                "template={}, execution_graph={}, conflicts={}, projection_schema={}",
-                mission_runtime.pointer("/selected_strategy/template").and_then(Value::as_str).unwrap_or("none"),
-                mission_runtime.pointer("/execution_graph/execution_graph_id").and_then(Value::as_str).unwrap_or("none"),
-                mission_runtime.pointer("/conflicts/count").and_then(Value::as_u64).unwrap_or_default(),
-                mission_runtime.pointer("/mission_projection/schema_version").and_then(Value::as_u64).unwrap_or_default(),
-            ),
-            "notes": "deterministic closure exercises Runtime capability catalog, team template, ExecutionGraph planning, agent capability binding, session command lifecycle, conflict arbitration, and MissionProjection"
-        }),
-        json!({
             "capability": "next_gen_harness_closure",
             "status": next_gen_harness.status.as_str(),
             "evidence": format!("{}/{} next-gen closure scenarios passed; missing={}", next_gen_harness.passed, next_gen_harness.total, next_gen_harness.missing_capabilities.len()),
-            "notes": "validates simple fast path, complex strategy, batch tool evidence, team/agent execution, cross-session dispatch, memory/reality governance, and conflict/recovery evidence gates"
+            "notes": "validates simple fast path, complex strategy, batch tool evidence, Agentic Program projection closure, cross-session dispatch, memory/reality governance, and conflict/recovery evidence gates"
         }),
     ];
     if let Some(complex) = &complex {
@@ -268,6 +215,17 @@ pub fn run_eval_controlled(
     let live_gateway_scenarios = live_gateway_scenario_details
         .as_ref()
         .map(live_gateway_scenario_summary);
+    let agentic_program_projection = live_gateway_scenario_details
+        .as_ref()
+        .and_then(first_agentic_program_projection);
+    let agentic_program_closure = agentic_program_projection
+        .as_ref()
+        .map(evaluate_agentic_program_closure);
+    if let Some(projection) = agentic_program_projection.as_ref() {
+        next_gen_harness = evaluate_next_gen_harness_closure(
+            next_gen_input.with_agentic_program_projection(projection),
+        );
+    }
     // The production Gateway owns model execution. Its per-scenario metrics
     // are therefore the canonical real-provider evidence for deep evaluation,
     // rather than a later report-writing model call.
@@ -308,8 +266,7 @@ pub fn run_eval_controlled(
         json!({"index": 2, "action": "harness_capability_coverage", "evidence": "runtime module map coverage"}),
         json!({"index": 3, "action": "knowledge_fabric.evaluate", "evidence": "context governance activated and blocked namespaces"}),
         json!({"index": 4, "action": "reality_context_eval.evaluate", "evidence": "RecallReport and ContextEnvelope scenario matrix generated"}),
-        json!({"index": 5, "action": "mission_runtime_collaboration_closure", "evidence": "team/execution_graph/session/conflict/projection closure generated"}),
-        json!({"index": 6, "action": "evolution_closure", "evidence": "signal/proposal/sandbox/skill draft closure generated"}),
+        json!({"index": 5, "action": "evolution_closure", "evidence": "signal/proposal/sandbox/skill draft closure generated"}),
     ];
     if complex.is_some() {
         runtime_action_log.push(json!({"index": 7, "action": "complex_harness_scenario_suite", "evidence": "full complex scenario suite generated"}));
@@ -336,8 +293,8 @@ pub fn run_eval_controlled(
         ],
         "complex_scenarios": complex,
         "reality_context_eval": reality_context,
-        "mission_runtime_collaboration": mission_runtime,
         "evolution_closure": evolution_closure,
+        "agentic_program_closure": agentic_program_closure,
         "next_gen_harness_closure": next_gen_harness,
         "real_tool_scenarios": real_tool_scenarios,
         "live_gateway_scenarios": live_gateway_scenarios,
@@ -522,6 +479,20 @@ fn live_gateway_scenario_summary(details: &Value) -> Value {
         }
     }
     summary
+}
+
+fn first_agentic_program_projection(details: &Value) -> Option<Value> {
+    details
+        .get("scenarios")
+        .and_then(Value::as_array)
+        .and_then(|scenarios| {
+            scenarios.iter().find_map(|scenario| {
+                scenario
+                    .pointer("/production_trace/agentic_program")
+                    .filter(|projection| !projection.is_null())
+                    .cloned()
+            })
+        })
 }
 
 #[derive(Default)]
@@ -809,356 +780,6 @@ fn nonempty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn mission_runtime_collaboration_failure(
-    started: Instant,
-    objective: &str,
-    stage: &str,
-    error: impl std::fmt::Display,
-) -> Value {
-    json!({
-        "kind": "harness_eval.mission_runtime_collaboration_closure",
-        "status": "failed",
-        "objective": objective,
-        "failure_degraded_reason": format!("{stage}: {error}"),
-        "selected_strategy": Value::Null,
-        "execution_graph": Value::Null,
-        "agents": Value::Null,
-        "sessions": Value::Null,
-        "conflicts": Value::Null,
-        "mission_projection": Value::Null,
-        "terminal_evidence": Value::Null,
-        "final_result_quality": {
-            "passed_checks": [],
-            "failed_checks": [stage],
-            "score": 0.0,
-        },
-        "latency": {"elapsed_ms": started.elapsed().as_millis(), "provider_rounds": 0},
-    })
-}
-
-fn evaluate_mission_runtime_collaboration_closure() -> Value {
-    let started = Instant::now();
-    let objective = "复杂代码重构需要多 Agent 并行审查、跨 Session 跟踪、冲突仲裁和证据化回归";
-    let simple_decision = runtime::build_runtime_execution_decision("解释 ping 的含义", None);
-    let capability_response = runtime::runtime_capabilities_response_with_detail(
-        objective,
-        Some("harness_eval"),
-        Some("DeepInvestigation"),
-        Some("runtime_action_contract"),
-    );
-    let strategy = harness_contract::strategy::decide_strategy(
-        &harness_contract::strategy::StrategyInput::from_prompt(objective),
-    );
-    let collaboration = runtime::CollaborationTemplateMatcher.decide(objective, &strategy);
-    let session_id = format!("mission-eval-session-{}", uuid::Uuid::new_v4());
-    let team_id = format!("harness-eval-team-{}", uuid::Uuid::new_v4());
-    let capability = runtime::resolve_agent_capability(runtime::AgentCapabilityRequest {
-        role_id: "executor".to_string(),
-        allowed_capabilities: vec![
-            "read".to_string(),
-            "search".to_string(),
-            "write".to_string(),
-            "test".to_string(),
-        ],
-        evidence_duties: vec!["changes".to_string(), "verification".to_string()],
-    });
-    let runtime_services = match runtime::RuntimeServices::in_memory() {
-        Ok(services) => services,
-        Err(error) => {
-            return mission_runtime_collaboration_failure(
-                started,
-                objective,
-                "initialize_runtime_services",
-                error,
-            );
-        }
-    };
-    let template_id = match harness_contract::team::TeamTemplateDefinitionId::new(
-        harness_contract::agent::DefinitionScope::Builtin,
-        "cowd/parallel-research-synthesis",
-    ) {
-        Ok(template_id) => template_id,
-        Err(error) => {
-            return mission_runtime_collaboration_failure(
-                started,
-                objective,
-                "resolve_team_template",
-                error,
-            );
-        }
-    };
-    let deadline_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u128::from(u64::MAX)) as u64
-        + harness_contract::agent::DEFAULT_DELEGATED_EXECUTION_TIMEOUT_MS;
-    let team_plan = match runtime_services.team_runtime().plan(
-        harness_contract::team::TeamInstantiationRequest {
-            request_id: format!("harness-eval-request-{team_id}"),
-            team_id: team_id.clone(),
-            mission_id: runtime_services
-                .mission_runtime()
-                .default_mission_id()
-                .to_string(),
-            lineage: harness_contract::execution_graph::ExecutionGraphLineage {
-                session_id: session_id.clone(),
-                turn_id: format!("harness-eval-turn-{team_id}"),
-                root_task_id: format!("harness-eval-root-task-{team_id}"),
-                task_id: format!("harness-eval-root-task-{team_id}"),
-                generation: 1,
-            },
-            parent_execution: None,
-            selection_mode: harness_contract::team::TeamSelectionMode::Explicit,
-            strategy_binding: None,
-            template_selector: harness_contract::team::TeamTemplateSelector::LatestStable {
-                template_id,
-            },
-            objective: objective.to_string(),
-            acceptance: vec!["summary".to_string(), "evidence".to_string()],
-            risk: None,
-            role_binding_overrides: Vec::new(),
-            display_name: None,
-            role_display_overrides: Vec::new(),
-            cardinality_overrides: Vec::new(),
-            focus_partition_plans: Vec::new(),
-            requires_managed_collaboration_escalation: false,
-            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
-            model_lease: "harness_eval".to_string(),
-            execution_budget: harness_contract::context::ParentExecutionBudget::new(
-                format!("harness-eval-budget:{team_id}"),
-                65_536,
-                deadline_at_ms,
-                32,
-                1,
-            ),
-            deadline_at_ms,
-            managed_invocation: None,
-            resource_scopes: vec!["read:crates/runtime".to_string()],
-            allow_whole_workspace_scope: false,
-            upstream_evidence_refs: Vec::new(),
-            upstream_artifact_refs: Vec::new(),
-            upstream_result_context: Vec::new(),
-            execution_capacity: Some(
-                runtime_services
-                    .execution_capacity_profile()
-                    .team_snapshot(),
-            ),
-        },
-    ) {
-        Ok(team_plan) => team_plan,
-        Err(error) => {
-            return mission_runtime_collaboration_failure(
-                started,
-                objective,
-                "plan_team_execution_graph",
-                error,
-            );
-        }
-    };
-    let relation = match runtime_services.session_relations().add_relation(
-        &session_id,
-        format!("{session_id}-review"),
-        runtime::SessionRelationKind::ConflictsWith,
-        "review lane disputes unbounded execution",
-        vec![format!("execution_graph:{}", team_plan.graph.id)],
-    ) {
-        Ok(relation) => relation,
-        Err(error) => {
-            return mission_runtime_collaboration_failure(
-                started,
-                objective,
-                "record_session_conflict_relation",
-                error,
-            );
-        }
-    };
-    if let Err(error) =
-        runtime_services
-            .conflict_resolver()
-            .resolve(runtime::ConflictResolutionRequest {
-                source: runtime::ConflictSourceKind::SessionRelation,
-                severity: runtime::ConflictSeverity::Medium,
-                summary: relation.summary.clone(),
-                evidence_refs: relation.evidence_refs.clone(),
-                affected_scope: vec![
-                    format!("session:{}", relation.from_session_id),
-                    format!("session:{}", relation.to_session_id),
-                ],
-            })
-    {
-        return mission_runtime_collaboration_failure(
-            started,
-            objective,
-            "record_session_conflict_evidence",
-            error,
-        );
-    }
-    let conflict_count = runtime_services.conflict_resolver().receipts().len() as u64;
-    let projection = runtime_services.mission_runtime().projection(
-        runtime_services.session_relations(),
-        runtime_services.agent_runtime(),
-        runtime_services.team_runtime(),
-        runtime_services.approval_queue(),
-        runtime_services.conflict_resolver(),
-        runtime_services.mission_evidence(),
-        runtime_services.mission_schedules().projection(),
-    );
-    let checks = [
-        (
-            "simple_question_direct",
-            simple_decision.pattern() == ExecutionPattern::Direct,
-        ),
-        (
-            "template_selected",
-            collaboration.template_id != runtime::CollaborationTemplateId::DirectExecutor,
-        ),
-        (
-            "execution_graph_quality",
-            harness_contract::execution_graph::validate_execution_graph(&team_plan.graph).is_ok()
-                && team_plan.graph.nodes.iter().any(|node| {
-                    node.kind == harness_contract::execution_graph::ExecutionNodeKind::Verify
-                })
-                && team_plan.graph.nodes.iter().any(|node| {
-                    node.kind == harness_contract::execution_graph::ExecutionNodeKind::Synthesize
-                }),
-        ),
-        (
-            "collaboration_graph_compiler",
-            team_plan.role_slots.len() >= 2,
-        ),
-        (
-            "capability_binding",
-            capability.allowed_tools.contains("write_file")
-                && capability.allowed_tools.contains("bash"),
-        ),
-        (
-            "conflict_arbitration",
-            conflict_count > 0 && relation.kind == runtime::SessionRelationKind::ConflictsWith,
-        ),
-        (
-            "mission_projection_semantics",
-            projection.conflict_projection["kind"] == "runtime.conflicts"
-                && projection.evidence_projection["kind"] == "runtime.mission_evidence"
-                && projection.capability_projection["name"] == "cowd-runtime-capability-catalog",
-        ),
-        (
-            "model_visible_actions",
-            capability_response["backend_capabilities"]["contracts"]
-                .as_array()
-                .is_some_and(|contracts| {
-                    contracts
-                        .iter()
-                        .any(|contract| contract["runtime_action"] == "use_team_template")
-                }),
-        ),
-    ];
-    let passed_checks = checks
-        .iter()
-        .filter(|&(_name, passed)| *passed)
-        .map(|(name, _passed)| (*name).to_string())
-        .collect::<Vec<_>>();
-    let failed_checks = checks
-        .iter()
-        .filter(|&(_name, passed)| !passed)
-        .map(|(name, _passed)| (*name).to_string())
-        .collect::<Vec<_>>();
-    let elapsed_ms = started.elapsed().as_millis();
-    json!({
-        "kind": "harness_eval.mission_runtime_collaboration_closure",
-        "status": if failed_checks.is_empty() { "passed" } else { "failed" },
-        "objective": objective,
-        "model_provider": "deterministic_runtime_contract",
-        "profile": "DeepInvestigation",
-        "selected_strategy": {
-            "simple_pattern": simple_decision.pattern().as_str(),
-            "complex_pattern": strategy.pattern.as_str(),
-            "template": collaboration.template_id.as_str(),
-            "runtime_actions": ["continue_single", "use_team_template", "build_execution_graph", "dispatch_session", "request_arbiter", "parallel_tool_batch"],
-        },
-        "execution_graph": {
-            "execution_graph_id": team_plan.graph.id,
-            "node_count": team_plan.graph.nodes.len(),
-            "edge_count": team_plan.graph.edges.len(),
-            "is_dag": harness_contract::execution_graph::validate_execution_graph(&team_plan.graph).is_ok(),
-            "has_verify_node": team_plan.graph.nodes.iter().any(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::Verify),
-            "has_synthesize_node": team_plan.graph.nodes.iter().any(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::Synthesize),
-            "ready_node_ids": team_plan.graph.nodes.iter().filter(|node| node.kind == harness_contract::execution_graph::ExecutionNodeKind::AgentTask).map(|node| node.id.clone()).collect::<Vec<_>>(),
-            "blocked_node_ids": Vec::<String>::new(),
-        },
-        "agents": {
-            "team_id": team_id,
-            "role_count": team_plan.role_slots.len(),
-            "capability_summary": capability.capability_summary,
-            "allowed_tools": capability.allowed_tools,
-            "permission_mode": format!("{:?}", capability.permission_mode),
-        },
-        "sessions": {
-            "session_id": session_id,
-            "dispatch_model": "execution_graph_session_handoff",
-            "dispatch_lifecycle_owner": "runtime.session_execution",
-            "relation_id": relation.relation_id,
-        },
-        "tool_calls": {
-            "count": 0,
-            "mode": "deterministic_contract_eval",
-            "note": "full real-tool lane is reported separately under real_tool_scenarios",
-        },
-        "conflicts": {
-            "count": conflict_count,
-            "relation_kind": format!("{:?}", relation.kind).to_ascii_lowercase(),
-        },
-        "approvals": {
-            "required": false,
-            "reason": "scenario is deterministic and does not execute external/destructive writes",
-        },
-        "evidence_refs": [
-            format!("team:{team_id}"),
-            format!("execution_graph:{}", team_plan.graph.id),
-            format!("session-relation:{}", relation.relation_id),
-            format!("synthesis:{}", team_plan.graph.id)
-        ],
-        "terminal_evidence": {
-            "agent_terminal_count": team_plan.role_slots.len(),
-            "mailbox_completed_count": 1,
-            "synthesis_receipt_id": format!("synthesis:{}", team_plan.graph.id),
-            "session_relation_count": 1,
-            "runtime_turn_result_count": 1,
-            "recovery_applied_count": usize::from(conflict_count > 0),
-            "recovery_verified_count": 1,
-            "session_handoff_owner": "runtime.session_execution",
-            "source": "mission_runtime_collaboration_closure"
-        },
-        "token_usage": {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "usage_source": "deterministic_runtime_contract"
-        },
-        "latency": {
-            "elapsed_ms": elapsed_ms,
-            "provider_rounds": 0
-        },
-        "final_result_quality": {
-            "passed_checks": passed_checks,
-            "failed_checks": failed_checks,
-            "score": if failed_checks.is_empty() { 1.0 } else { 0.0 },
-        },
-        "failure_degraded_reason": if failed_checks.is_empty() {
-            Value::Null
-        } else {
-            json!(failed_checks)
-        },
-        "mission_projection": {
-            "schema_version": projection.schema_version,
-            "execution_graph_kind": "harness.execution_graph",
-            "conflict_kind": projection.conflict_projection["kind"],
-            "evidence_kind": projection.evidence_projection["kind"],
-            "capability_name": projection.capability_projection["name"],
-        },
-    })
-}
-
 fn run_full_real_tool_scenarios() -> FullRealToolEval {
     let target_repo = std::env::current_dir()
         .map(|path| path.display().to_string())
@@ -1181,7 +802,7 @@ fn run_full_real_tool_scenarios() -> FullRealToolEval {
         "grep_many",
         json!({
             "searches": [
-                { "pattern": "runtime_orchestrate", "path": "crates", "glob": "*.rs" },
+                { "pattern": "team_create|task_publish", "path": "crates", "glob": "*.rs" },
                 { "pattern": "ToolStart|ToolComplete", "path": "crates", "glob": "*.rs" }
             ],
             "max_concurrency": 2
@@ -1530,12 +1151,8 @@ mod tests {
         assert_eq!(detail.summary.status, "passed");
         assert_eq!(detail.report["report_gate"]["status"], "passed");
         assert_eq!(
-            detail.report["mission_runtime_collaboration"]["status"],
-            "passed"
-        );
-        assert_eq!(
             detail.report["next_gen_harness_closure"]["status"],
-            "passed"
+            "not_observed"
         );
         assert_eq!(detail.report["next_gen_harness_closure"]["failed"], 0);
         assert_eq!(
@@ -1624,37 +1241,6 @@ mod tests {
     }
 
     #[test]
-    fn mission_runtime_collaboration_closure_exercises_runtime_projection() {
-        let report = evaluate_mission_runtime_collaboration_closure();
-
-        assert_eq!(report["status"], "passed", "{report:#}");
-        assert_eq!(
-            report["mission_projection"]["conflict_kind"],
-            "runtime.conflicts"
-        );
-        assert_eq!(
-            report["mission_projection"]["evidence_kind"],
-            "runtime.mission_evidence"
-        );
-        assert_eq!(
-            report["mission_projection"]["capability_name"],
-            "cowd-runtime-capability-catalog"
-        );
-        assert!(report["selected_strategy"]["runtime_actions"]
-            .as_array()
-            .expect("runtime actions")
-            .iter()
-            .any(|item| item == "use_team_template"));
-        assert!(report["execution_graph"]["is_dag"]
-            .as_bool()
-            .unwrap_or(false));
-        assert!(report["conflicts"]["count"].as_u64().unwrap_or_default() > 0);
-        assert!(report["final_result_quality"]["failed_checks"]
-            .as_array()
-            .is_some_and(Vec::is_empty));
-    }
-
-    #[test]
     fn next_gen_harness_quick_eval_declares_plan_only_tool_lane() {
         let root = std::env::temp_dir().join(format!(
             "cowd-harness-eval-nextgen-{}",
@@ -1677,7 +1263,7 @@ mod tests {
             .expect("report exists");
         assert_eq!(
             detail.report["next_gen_harness_closure"]["status"],
-            "passed"
+            "not_observed"
         );
         let tool_batch = detail.report["next_gen_harness_closure"]["scenarios"]
             .as_array()

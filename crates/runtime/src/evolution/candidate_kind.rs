@@ -13,7 +13,6 @@ pub enum EvolutionCandidateKind {
     RealityGovernance,
     ToolContract,
     SkillPackage,
-    TeamTemplate,
     SessionPolicy,
     ProviderProfile,
     EvalScenario,
@@ -30,14 +29,13 @@ pub enum EvolutionCandidateKind {
 #[serde(rename_all = "snake_case")]
 pub enum EvolutionPromotionRoute {
     AgentDefinitionGovernance,
-    TeamTemplateGovernance,
     SkillRevisionGovernance,
     KnowledgeCandidateOnly,
     PromotionAdapterUnavailable,
 }
 
 impl EvolutionCandidateKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::AgentDefinition,
         Self::RuntimePolicy,
         Self::ContextPolicy,
@@ -45,7 +43,6 @@ impl EvolutionCandidateKind {
         Self::RealityGovernance,
         Self::ToolContract,
         Self::SkillPackage,
-        Self::TeamTemplate,
         Self::SessionPolicy,
         Self::ProviderProfile,
         Self::EvalScenario,
@@ -64,7 +61,6 @@ impl EvolutionCandidateKind {
             Self::RealityGovernance => "reality_governance",
             Self::ToolContract => "tool_contract",
             Self::SkillPackage => "skill_package",
-            Self::TeamTemplate => "team_template",
             Self::SessionPolicy => "session_policy",
             Self::ProviderProfile => "provider_profile",
             Self::EvalScenario => "eval_scenario",
@@ -84,7 +80,6 @@ impl EvolutionCandidateKind {
             Self::RealityGovernance => "RealityGovernancePromotion",
             Self::ToolContract => "ToolContractPromotion",
             Self::SkillPackage => "SkillPackagePromotion",
-            Self::TeamTemplate => "TeamTemplatePromotion",
             Self::SessionPolicy => "SessionPolicyPromotion",
             Self::ProviderProfile => "ProviderProfilePromotion",
             Self::EvalScenario => "EvalScenarioPromotion",
@@ -98,7 +93,6 @@ impl EvolutionCandidateKind {
     pub const fn promotion_route(self) -> EvolutionPromotionRoute {
         match self {
             Self::AgentDefinition => EvolutionPromotionRoute::AgentDefinitionGovernance,
-            Self::TeamTemplate => EvolutionPromotionRoute::TeamTemplateGovernance,
             Self::SkillPackage => EvolutionPromotionRoute::SkillRevisionGovernance,
             Self::MemoryGovernance => EvolutionPromotionRoute::KnowledgeCandidateOnly,
             Self::RuntimePolicy
@@ -124,7 +118,6 @@ impl EvolutionCandidateKind {
             Self::RealityGovernance => &["fact_consistency", "relation_reasoning"],
             Self::ToolContract => &["tool_batch_efficiency", "tool_error_recovery"],
             Self::SkillPackage => &["workflow_reuse"],
-            Self::TeamTemplate => &["team_agent_execution_outcome"],
             Self::SessionPolicy => &["cross_session_control", "task_continuity"],
             Self::ProviderProfile => &["provider_rounds", "protocol_smoke"],
             Self::EvalScenario => &["scenario_self_validation"],
@@ -162,7 +155,7 @@ pub fn candidate_kinds_from_root_cause(
         EvolutionRootCauseKind::MemoryGovernanceGap => {
             vec![EvolutionCandidateKind::MemoryGovernance]
         }
-        EvolutionRootCauseKind::TeamLifecycleGap => vec![EvolutionCandidateKind::TeamTemplate],
+        EvolutionRootCauseKind::TeamLifecycleGap => vec![EvolutionCandidateKind::RuntimePolicy],
         EvolutionRootCauseKind::EvalCoverageGap => vec![EvolutionCandidateKind::EvalScenario],
         EvolutionRootCauseKind::SurfaceProjectionGap => {
             vec![EvolutionCandidateKind::SurfaceProjection]
@@ -182,7 +175,7 @@ pub fn candidate_kind_from_goal_id(goal_id: &str) -> Option<EvolutionCandidateKi
         "fact_consistency" => Some(EvolutionCandidateKind::RealityGovernance),
         "tool_success_rate" => Some(EvolutionCandidateKind::ToolContract),
         "workflow_reuse" => Some(EvolutionCandidateKind::SkillPackage),
-        "complex_task_success" => Some(EvolutionCandidateKind::TeamTemplate),
+        "complex_task_success" => Some(EvolutionCandidateKind::RuntimePolicy),
         "task_continuity" => Some(EvolutionCandidateKind::SessionPolicy),
         "model_fit" => Some(EvolutionCandidateKind::ProviderProfile),
         "regression_coverage" => Some(EvolutionCandidateKind::EvalScenario),
@@ -209,7 +202,6 @@ mod tests {
         for kind in EvolutionCandidateKind::ALL {
             match kind.promotion_route() {
                 EvolutionPromotionRoute::AgentDefinitionGovernance
-                | EvolutionPromotionRoute::TeamTemplateGovernance
                 | EvolutionPromotionRoute::SkillRevisionGovernance
                 | EvolutionPromotionRoute::KnowledgeCandidateOnly
                 | EvolutionPromotionRoute::PromotionAdapterUnavailable => {}

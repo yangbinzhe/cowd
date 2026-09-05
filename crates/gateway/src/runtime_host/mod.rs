@@ -1504,9 +1504,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         };
     let runtime_config = loaded.config;
     let config_diagnostics = loaded.diagnostics;
-    for diagnostic in &config_diagnostics {
-        tracing::warn!(code = %diagnostic.code, message = %diagnostic.message, "runtime config diagnostic");
-    }
+    emit_config_diagnostics(&config_diagnostics);
     let provider_registry = match runtime::ProviderRegistry::new(runtime_config.providers().clone())
     {
         Ok(registry) => Arc::new(registry),
@@ -1809,7 +1807,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
                 growth_projection_services.growth.clone(),
                 growth_projection_services.memory.clone(),
                 growth_projection_services.matrix.clone(),
-            ))
+            )?)
             .task_aggregate_service(Arc::clone(&selected_storage.task_service))
             .artifact_store(Arc::clone(&selected_storage.artifact_store))
             .reality_recall_port(Arc::new(
@@ -1939,6 +1937,7 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         "Runtime execution startup recovery completed"
     );
     emit_execution_startup_recovery(&startup_recovery);
+    reconcile_agentic_startup(&runtime_services).await?;
     let runtime_service = match RuntimeService::new_with_gateway_tasks(
         sessions.clone(),
         lease_registry.clone(),
@@ -2263,6 +2262,31 @@ pub async fn run_gateway_runtime(config: RuntimeHostConfig) -> Result<(), String
         Ok(())
     } else {
         Err(shutdown_report.failures.join("; "))
+    }
+}
+
+async fn reconcile_agentic_startup(services: &Arc<runtime::RuntimeServices>) -> Result<(), String> {
+    let dispatches = services
+        .recover_agentic_programs_on_startup()
+        .await
+        .map_err(|error| format!("failed to reconcile Agent-first Programs on startup: {error}"))?;
+    let waits = services
+        .recover_agentic_program_waits_on_startup()
+        .await
+        .map_err(|error| {
+            format!("failed to reconcile Agent-first Program waits on startup: {error}")
+        })?;
+    tracing::info!(
+        recovered_dispatches = dispatches.len(),
+        recovered_waits = waits,
+        "Agent-first Program startup reconciliation completed"
+    );
+    Ok(())
+}
+
+fn emit_config_diagnostics(diagnostics: &[runtime::RuntimeConfigDiagnostic]) {
+    for diagnostic in diagnostics {
+        tracing::warn!(code = %diagnostic.code, message = %diagnostic.message, "runtime config diagnostic");
     }
 }
 

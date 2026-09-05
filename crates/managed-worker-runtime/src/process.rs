@@ -574,18 +574,10 @@ impl ManagedWorkerHandle {
         self.inner.credential.path()
     }
 
+    /// Returns the launcher-verified worker identity. The optional carrier is
+    /// explicit because the test-support direct-process adapter has no
+    /// launcher attestation; callers must never manufacture one.
     #[must_use]
-    #[cfg(not(feature = "test-support"))]
-    pub fn identity(&self) -> &WorkerIdentityV1 {
-        let Some(identity) = self.inner.identity.as_ref() else {
-            unreachable!("normal builds create only launcher-verified worker handles");
-        };
-        identity
-    }
-
-    /// Returns no launcher identity for an explicitly selected direct test process.
-    #[must_use]
-    #[cfg(feature = "test-support")]
     pub fn identity(&self) -> Option<&WorkerIdentityV1> {
         self.inner.identity.as_ref()
     }

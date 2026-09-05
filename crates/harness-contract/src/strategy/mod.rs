@@ -3627,30 +3627,12 @@ pub fn explicit_team_execution_required(prompt: &str) -> bool {
     mentions_team && requires_execution && !explicitly_forbids_collaboration(&normalized)
 }
 
-/// Whether the user explicitly requires an Agent to use the native Runtime
-/// escalation tool to create a follow-up Team.  Keep this deliberately
-/// narrow: merely documenting the tool or mentioning collaboration must not
-/// grant Runtime authority to add an execution obligation.
+/// Legacy strategy bit retained only for serialized strategy compatibility.
+/// Agent-first Team creation is an ordinary small action and no longer needs
+/// a separate escalation obligation or tool-shaped prompt heuristic.
 #[must_use]
-pub fn explicit_managed_collaboration_escalation_required(prompt: &str) -> bool {
-    let normalized = prompt.to_ascii_lowercase();
-    let names_native_tool = normalized.contains("request_collaboration_escalation");
-    let requires_execution = ["必须", "必须要", "must", "required", "actual", "实际调用"]
-        .iter()
-        .any(|marker| normalized.contains(marker));
-    let names_escalation_outcome = [
-        "升级",
-        "escalation",
-        "follow-up team",
-        "follow up team",
-        "后续 team",
-        "后续团队",
-        "program revision",
-        "runtime-attested",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    names_native_tool && requires_execution && names_escalation_outcome
+pub const fn explicit_managed_collaboration_escalation_required(_prompt: &str) -> bool {
+    false
 }
 
 fn explicit_team_ordinal_count(normalized: &str) -> u8 {

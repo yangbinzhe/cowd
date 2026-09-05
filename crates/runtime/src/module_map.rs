@@ -206,15 +206,6 @@ fn conversation_execution_modules() -> Vec<RuntimeModuleDescriptor> {
             "runtime",
             &[projector("execution.projection", "runtime.execution.graph")],
         ),
-        RuntimeModuleDescriptor::public(
-            "orchestration",
-            ExecutionCore,
-            "runtime",
-            &[authority(
-                "collaboration.program",
-                "runtime.collaboration.program",
-            )],
-        ),
     ]
 }
 
@@ -387,6 +378,15 @@ fn mission_session_modules() -> Vec<RuntimeModuleDescriptor> {
 fn agent_team_modules() -> Vec<RuntimeModuleDescriptor> {
     vec![
         RuntimeModuleDescriptor::public(
+            "agentic_program",
+            Agent,
+            "runtime",
+            &[authority(
+                "agentic.program.actions",
+                "runtime.collaboration.program",
+            )],
+        ),
+        RuntimeModuleDescriptor::public(
             "agent",
             Agent,
             "runtime",
@@ -480,64 +480,10 @@ fn agent_team_modules() -> Vec<RuntimeModuleDescriptor> {
             &[authority("team.definition", "runtime.team.definition")],
         ),
         RuntimeModuleDescriptor::public(
-            "team_instantiation",
-            Team,
-            "runtime",
-            &[worker("team.instantiate", "runtime.team.definition")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "team_projection",
-            Team,
-            "runtime",
-            &[projector("team.projection", "runtime.team.execution")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "team_agent_selector",
-            Team,
-            "runtime",
-            &[worker("team.agent.select", "runtime.team.definition")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "team_agent_task",
-            Team,
-            "runtime",
-            &[worker("team.agent.task", "runtime.team.execution")],
-        ),
-        RuntimeModuleDescriptor::public(
             "team_l4_promotion",
             Team,
             "runtime",
             &[worker("team.l4.promote", "runtime.team.definition")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "team_legacy_import",
-            Team,
-            "runtime",
-            &[adapter("team.legacy.import", "runtime.team.definition")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "team_profile_migration",
-            Team,
-            "runtime",
-            &[adapter("team.profile.migrate", "runtime.team.definition")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "team_result_reducer",
-            Team,
-            "runtime",
-            &[worker("team.result.reduce", "runtime.team.execution")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "team_runtime",
-            Team,
-            "runtime",
-            &[authority("team.execution", "runtime.team.execution")],
-        ),
-        RuntimeModuleDescriptor::public(
-            "team_working_state",
-            Team,
-            "runtime",
-            &[projector("team.working", "runtime.team.execution")],
         ),
         RuntimeModuleDescriptor::public(
             "conflict_arbiter",

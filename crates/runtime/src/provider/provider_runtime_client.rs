@@ -2636,11 +2636,11 @@ mod tests {
                 true,
                 true,
                 CapabilityState::Supported,
-                Some("runtime_orchestrate"),
+                Some("task_publish"),
             )
             .expect("named native action must compile"),
             Some(ToolChoice::Tool {
-                name: "runtime_orchestrate".to_string(),
+                name: "task_publish".to_string(),
             })
         );
     }

@@ -122,8 +122,7 @@ struct AutonomousDeepseekTemplate {
     schema_version: u32,
     scenario_id: String,
     output_path: String,
-    prompt_16: String,
-    prompt_24: String,
+    prompt_template: String,
 }
 
 fn autonomous_deepseek_spec() -> Result<LiveScenarioSpec, String> {
@@ -131,22 +130,39 @@ fn autonomous_deepseek_spec() -> Result<LiveScenarioSpec, String> {
         "../templates/autonomous-collaboration-deepseek-v1.json"
     ))
     .map_err(|error| format!("invalid autonomous DeepSeek template: {error}"))?;
-    if template.schema_version != 1
+    if template.schema_version != 2
         || template.scenario_id != AUTONOMOUS_DEEPSEEK_SCENARIO_ID
         || template.output_path != AUTONOMOUS_DEEPSEEK_OUTPUT_PATH
     {
         return Err("autonomous DeepSeek template identity is invalid".to_string());
     }
-    let scale = std::env::var("COWD_EVAL_AUTONOMOUS_AGENT_SCALE")
-        .unwrap_or_else(|_| "16".to_string())
+    let minimum_agents = std::env::var("COWD_EVAL_AUTONOMOUS_AGENT_SCALE")
+        .unwrap_or_else(|_| "8".to_string())
         .parse::<usize>()
-        .map_err(|_| "COWD_EVAL_AUTONOMOUS_AGENT_SCALE must be 16 or 24".to_string())?;
-    let (prompt, minimum_work_items, minimum_proposals, minimum_claims, minimum_challenges) =
-        match scale {
-            16 => (template.prompt_16, 24, 8, 12, 3),
-            24 => (template.prompt_24, 32, 12, 18, 4),
-            _ => return Err("COWD_EVAL_AUTONOMOUS_AGENT_SCALE must be 16 or 24".to_string()),
-        };
+        .map_err(|_| "COWD_EVAL_AUTONOMOUS_AGENT_SCALE must be an integer".to_string())?;
+    if !(2..=64).contains(&minimum_agents) {
+        return Err("COWD_EVAL_AUTONOMOUS_AGENT_SCALE must be between 2 and 64".to_string());
+    }
+    let minimum_teams = std::env::var("COWD_EVAL_AUTONOMOUS_TEAM_MINIMUM")
+        .unwrap_or_else(|_| "3".to_string())
+        .parse::<usize>()
+        .map_err(|_| "COWD_EVAL_AUTONOMOUS_TEAM_MINIMUM must be an integer".to_string())?;
+    if !(2..=16).contains(&minimum_teams) || minimum_teams > minimum_agents {
+        return Err(
+            "COWD_EVAL_AUTONOMOUS_TEAM_MINIMUM must be between 2 and 16 and no greater than the Agent minimum"
+                .to_string(),
+        );
+    }
+    let minimum_tasks = minimum_agents;
+    let minimum_reviews = minimum_teams;
+    let minimum_topics = minimum_teams;
+    let minimum_cross_team_edges = minimum_teams.saturating_sub(1);
+    let prompt = template
+        .prompt_template
+        .replace("{minimum_teams}", &minimum_teams.to_string())
+        .replace("{minimum_agents}", &minimum_agents.to_string())
+        .replace("{minimum_tasks}", &minimum_tasks.to_string())
+        .replace("{output_path}", AUTONOMOUS_DEEPSEEK_OUTPUT_PATH);
     Ok(LiveScenarioSpec {
         id: AUTONOMOUS_DEEPSEEK_SCENARIO_ID,
         // The template is compiled into the evaluator binary and one spec is
@@ -155,52 +171,92 @@ fn autonomous_deepseek_spec() -> Result<LiveScenarioSpec, String> {
         // contract without introducing production state or an extra clone.
         prompt: Box::leak(prompt.into_boxed_str()),
         acceptance: LiveAcceptance::AutonomousCollaboration {
-            minimum_teams: 4,
-            minimum_agents: scale,
-            minimum_work_items,
-            minimum_proposals,
-            // Only Agent-proposed market work requires a bid. Assigned Team
-            // nodes are claimed by the scheduler and legitimately contribute
-            // to the broader claim count without a marketplace bid.
-            minimum_bids: minimum_proposals,
-            minimum_claims,
-            minimum_reviews: minimum_proposals,
-            minimum_challenges,
-            // With four Teams and A/B/C all required in the first wave, the
-            // truthful maximum acyclic cross-Team fan-in is exactly the
-            // three typed deliveries A->D, B->D and C->D. A threshold of
-            // five or six silently contradicted the concurrency contract.
-            minimum_cross_team_edges: 3,
-            minimum_discussions: if scale == 24 { 12 } else { 8 },
+            minimum_teams,
+            minimum_agents,
+            minimum_tasks,
+            minimum_reviews,
+            minimum_cross_team_edges,
+            minimum_topics,
             output_path: AUTONOMOUS_DEEPSEEK_OUTPUT_PATH,
         },
-        timeout: LiveScenarioTimeout::large_scale(scale),
+        timeout: LiveScenarioTimeout::large_scale(minimum_agents),
+    })
+}
+
+fn bounded_scenario_minimum(key: &str, default: usize, maximum: usize) -> Result<usize, String> {
+    let value = std::env::var(key)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<usize>()
+        .map_err(|_| format!("{key} must be an integer"))?;
+    if !(2..=maximum).contains(&value) {
+        return Err(format!("{key} must be between 2 and {maximum}"));
+    }
+    Ok(value)
+}
+
+fn group_theory_spec() -> Result<LiveScenarioSpec, String> {
+    let minimum_teams = bounded_scenario_minimum("COWD_EVAL_GROUP_THEORY_TEAM_MINIMUM", 3, 12)?;
+    let minimum_edges = minimum_teams.saturating_sub(1);
+    let prompt = format!(
+        "这是隔离环境中的 Agent-first 深度任务：调研群论在当前 AI 中的应用并形成可复核测评方案。根据目标自主设计 Team、Agent、Task 和依赖关系，不要套用固定名称或每队固定人数；至少创建 {minimum_teams} 个有真实 Task 的 Team，并让可独立的研究工作物理并发。工作必须覆盖数学定义与可证伪边界、当前应用证据、C4 对照实验设计、综合风险。每项有效 Task 都要由 Agent 领取，提交 artifact/evidence，再由不同 Agent 独立 review；综合 Task 必须通过 depends_on 消费上游 accepted Task。使用 Program/Team topic 交换有引用的摘要，最终 artifact 只能在依赖满足后提交。不得编造论文、链接、实验或工具输出；外部事实无法取得时保留 unresolved。最终结论包含 C4、至少三个实际读取的完整源码路径，并区分研究、调研、分析、处理、模拟的输入输出。只使用只读工具与 Agent Action，不用 bash 或写文件工具。"
+    );
+    Ok(LiveScenarioSpec {
+        id: GROUP_THEORY_SCENARIO_ID,
+        prompt: Box::leak(prompt.into_boxed_str()),
+        acceptance: LiveAcceptance::ArchitectureQuality {
+            minimum_teams,
+            minimum_claimed_cross_team_edges: minimum_edges,
+            evidence_profile: ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis,
+        },
+        timeout: LiveScenarioTimeout::large_scale(minimum_teams),
+    })
+}
+
+fn large_scale_spec() -> Result<LiveScenarioSpec, String> {
+    let minimum_teams = bounded_scenario_minimum("COWD_EVAL_LARGE_SCALE_TEAM_MINIMUM", 6, 16)?;
+    let minimum_edges = std::env::var("COWD_EVAL_LARGE_SCALE_CROSS_TEAM_MINIMUM")
+        .unwrap_or_else(|_| minimum_teams.saturating_sub(1).to_string())
+        .parse::<usize>()
+        .map_err(|_| "COWD_EVAL_LARGE_SCALE_CROSS_TEAM_MINIMUM must be an integer".to_string())?;
+    let paths = LARGE_SCALE_SOURCE_PATHS.join("`、`");
+    let prompt = format!(
+        "这是单 Program 的 Agent-first 大规模协同压力验收。根据源码责任和实际发现自主设计 Team/Agent/Task 拓扑，禁止套用固定 Team 名、固定每队人数或预先写死全部流程；至少创建 {minimum_teams} 个有真实 Task 的 Team，并最大化无依赖分支的物理并发。必须完整读取并覆盖 `{paths}`。每个目标源码必须由两个不同 Agent 身份完整读取到 EOF；每项 Task 通过 task_claim、artifact_commit、task_submit 和不同 Agent 的 task_review 收敛，跨 Team 综合必须使用 depends_on，topic 消息必须携带 artifact/evidence refs。最终 artifact 必须比较正常、过载、取消、恢复和维护追赶路径，给出并发波次、瓶颈、失效模式、容量边界及扩容判断。不能由根模型文本伪造 Team、Agent、证据或完成状态；无法证实时保留 unresolved，不得请求 Objective 完成。只使用只读源码工具和 Agent Action，不用 bash 或写文件工具。"
+    );
+    Ok(LiveScenarioSpec {
+        id: LARGE_SCALE_SCENARIO_ID,
+        prompt: Box::leak(prompt.into_boxed_str()),
+        acceptance: LiveAcceptance::ArchitectureQuality {
+            minimum_teams,
+            minimum_claimed_cross_team_edges: minimum_edges,
+            evidence_profile: ArchitectureEvidenceProfile::LargeScaleIndependentReview,
+        },
+        timeout: LiveScenarioTimeout::large_scale(minimum_teams),
     })
 }
 
 const LARGE_SCALE_SOURCE_PATHS: [&str; 12] = [
-    "crates/runtime/src/orchestration/mod.rs",
-    "crates/runtime/src/orchestration/compiler.rs",
-    "crates/runtime/src/orchestration/intent_compiler.rs",
-    "crates/runtime/src/team/instantiation.rs",
+    "crates/runtime/src/agentic/program.rs",
+    "crates/runtime/src/agentic/action_service.rs",
+    "crates/runtime/src/agentic/execution.rs",
+    "crates/runtime/src/agentic/work_market.rs",
+    "crates/runtime/src/agentic/topic.rs",
+    "crates/runtime/src/agentic/supervision.rs",
     "crates/runtime/src/agent/in_process_worker.rs",
-    "crates/runtime/src/agent/result_validator.rs",
-    "crates/gateway/src/runtime_host/task_set.rs",
-    "crates/gateway/src/infrastructure/gateway_health.rs",
+    "crates/gateway/src/runtime/gateway_tool_executor.rs",
+    "crates/gateway/src/api_routes/runtime_routes.rs",
     "crates/runtime/src/conversation/host.rs",
-    "crates/runtime/src/execution_core/graph/executors/verify.rs",
     "crates/runtime/src/execution_core/services.rs",
     "crates/runtime/src/recovery/runtime_event_reactor.rs",
 ];
 
 const GROUP_THEORY_SOURCE_PATHS: [&str; 3] = [
-    "crates/runtime/src/orchestration/mod.rs",
-    "crates/runtime/src/orchestration/intent_compiler.rs",
-    "crates/runtime/src/team/instantiation.rs",
+    "crates/runtime/src/agentic/program.rs",
+    "crates/runtime/src/agentic/action_service.rs",
+    "crates/runtime/src/agentic/execution.rs",
 ];
 
 const LARGE_SCALE_TERMINAL_COVERAGE_CLAUSE: &str =
-    "每个 Team 的 investigator→reviewer 本地依赖必须显式使用 `kind: review_of`；禁止用 `handoff`、`aggregate` 或普通先后关系替代独立复核语义。最终结论还必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”和独立复核声明“12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 EOF”；只有 Runtime 的完整读取收据确实证明 investigator 与 reviewer 分别覆盖全部 12 个目标时才允许输出，否则必须判定任务未完成。";
+    "最终结论必须原样包含结构化覆盖声明“12/12 目标源码已完整读取到 EOF”和独立复核声明“12/12 目标源码已由两个不同 Agent 身份独立完整读取到 EOF”；只有 Runtime 的完整读取收据证明全部目标满足时才允许输出，否则必须保留 unresolved 并拒绝请求 Objective 完成。";
 
 /// An operator may isolate named production-path scenarios without changing
 /// the default suite. This is useful for a costly, focused provider exercise
@@ -829,7 +885,7 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_team_projection",
-                prompt: "这是复杂架构审查：必须实际启动三个协作 Team，不可用一个 Team 或模型文本替代。Team A 独立审查 runtime，Team B 独立审查 memory 与 gateway；两者可并行。Team C 必须在收到 A 和 B 的经过授权的证据/摘要后，汇合并审查跨组件边界，再综合最终结论。不得在 A/B 的事实交接完成前启动 Team C 的实质审查。最终结论必须字面列出至少三个完整的 `crates/.../*.rs` 源码路径（不能只写文件名），只陈述各 Team 实际读取到源码所能验证的结论；不要加入“无法确认/无法判断/未确认/需要进一步检查”之类的保留项。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 这些只读工具；不要调用 bash 或任何写工具。",
+                prompt: "这是 Agent-first 复杂架构审查。根据 runtime、memory、gateway 的责任边界自主创建至少三个有真实 Task 的 Team；不要套用固定 Team 名、固定角色或每队固定人数。无依赖审查必须物理并发，跨组件综合 Task 必须 depends_on 至少两个已 accepted 的上游 Task，并通过 topic 的 artifact/evidence refs 消费其结果。每项 Task 都要由 Agent 领取、提交 artifact/evidence，并由不同 Agent 独立 review。最终 artifact 列出至少三个本次实际读取的完整 `crates/.../*.rs` 路径。只使用只读源码工具与 Agent Action，不用 bash 或写文件工具。",
                 acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
                     minimum_claimed_cross_team_edges: 2,
@@ -839,40 +895,33 @@ impl LiveScenarioRunner {
             },
             LiveScenarioSpec {
                 id: "live_agent_escalation",
-                prompt: "这是一次受控协作升级验收。初始 Program 合同**恰好只有两个** required Team obligation：Team A 审查 runtime 的 durable Program/edge 事实，Team B 审查 gateway 的受管 Agent 工具边界；两者可并行。初始 `runtime_orchestrate` proposal 绝不可包含额外 Team、reviewer、aggregator 或预先规划的 follow-up。每个 semantic node 都必须显式给出 `managed_agent_escalation` 枚举：仅 Team A 填 `required`，Team B 填 `none`；这是 Runtime 持久化的受管升级义务，不是目标文本提示。Team A 被 Runtime 选定的受管 Agent 在读取到第一批源码证据后的安全检查点，必须实际调用 `request_collaboration_escalation` 申请一个独立复核工作流；只有该 Runtime-attested 工具调用可以使 Program 增加后续 Team。不可用模型文本替代该调用；不要猜测或提供 Program revision/digest，Runtime 会从已绑定父 Program 派生它们。最终结论必须字面列出至少三个完整的 `crates/.../*.rs` 源码路径，只陈述实际读取到的证据。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 和 request_collaboration_escalation；不要调用 bash 或任何写工具。",
-                acceptance: LiveAcceptance::EscalatedTeam {
+                prompt: "这是 Agent-first 动态扩队验收。先让至少两个自主选择责任域的 Team 并发取得 Runtime 与 Gateway 的真实源码证据；不要固定 Team 名、角色名或人数。观察首批 artifact/evidence 后，根 Agent 必须基于实际交叉风险在运行中再创建至少一个复核 Team，并发布依赖前序 accepted Task 的新 Task。所有 Task 必须经过 claim、artifact/evidence submit 与不同 Agent review；新 Team 通过 topic refs 消费上游事实后提出质疑并综合。最终 artifact 列出至少三个实际读取的完整源码路径。只使用只读源码工具和 Agent Action，不用 bash 或写文件工具。",
+                acceptance: LiveAcceptance::ArchitectureQuality {
                     minimum_teams: 3,
-                    minimum_escalations: 1,
+                    minimum_claimed_cross_team_edges: 1,
+                    evidence_profile: ArchitectureEvidenceProfile::Basic,
                 },
                 timeout: LiveScenarioTimeout::team(),
             },
         ];
-        if group_theory_research_scenario_enabled() {
-            scenario_specs.push(LiveScenarioSpec {
-                id: GROUP_THEORY_SCENARIO_ID,
-                prompt: "这是一个必须在本次隔离执行环境中完成的深度任务：调研群论在当前 AI 中的应用，并形成可复核的测试测评方案。必须实际启动**恰好四个**协作 Team，不能把 Team 职责压缩成模型文本。每个 Team 恰好一个只读研究角色：该唯一终端角色必须在 `output_artifacts` 中声明本 Team 的 required result artifacts；不要添加自定义 acceptance 或无资源绑定的 `evidence` 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中以实际存在的完整源码路径的 `evidence_scope` 表达；禁止 `*`、`?` 或其他通配符。A、B、C 的 `evidence_contract` 必须为空；D 的 `evidence_contract` 必须恰好包含以下三个 `evidence_scope`，不能把它们提前分配给 A、B、C。可使用且必须由最终 Team D 自己独立完整读取并复核的真实路径是 `crates/runtime/src/orchestration/mod.rs`、`crates/runtime/src/orchestration/intent_compiler.rs`、`crates/runtime/src/team/instantiation.rs`。Team A（数学与方法审查）负责明确群、群作用、表示、invariance/equivariance 的可证伪定义；Team B（应用调研）负责分别评估视觉/3D、科学机器学习或分子材料、机器人或控制等应用，并区分已读取证据与推断；Team C（实验与评测）负责设计 C4 对称性保持/破坏对照的指标、预期、局限与可复现步骤（只读环境不得声称已写入或执行外部实验）；Team D（综合与风险）必须在收到 A、B、C 的经过授权的结构化证据交接之后，亲自完整读取上述三个路径，比较收益、失败模式、适用边界并输出最终建议。A、B、C 可以并行；不得在三份事实交接完成前开始 D 的实质综合。不得编造论文、链接、实验结果或工具输出；无法通过本次只读工具取得的外部事实必须标为待验证。最终结论需明确包含 `C4`、列出至少三个本工作区实际读取到的完整 `crates/.../*.rs` 源码路径，并说明研究、调研、分析、处理、模拟各环节的输入/输出。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；不要调用 bash 或任何写工具。",
-                acceptance: LiveAcceptance::ArchitectureQuality {
-                    minimum_teams: 4,
-                    minimum_claimed_cross_team_edges: 3,
-                    evidence_profile: ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis,
-                },
-                timeout: LiveScenarioTimeout::team(),
-            });
-        }
-        if large_scale_collaboration_scenario_enabled() {
-            scenario_specs.push(LiveScenarioSpec {
-                id: LARGE_SCALE_SCENARIO_ID,
-                prompt: "这是一次单 Program 大规模协同压力验收，必须由当前 Runtime 实际执行，禁止用根模型文本伪装 Team 或 Agent。必须创建**恰好六个**协作 Team；每个 Team 必须恰好包含两个只读角色：investigator 与 reviewer。investigator 先读取并分析本 Team 的源码范围；所有目标文件都明确要求全文件覆盖，必须使用 read_file/read_many 的 `complete: true` 读取到 EOF，不能把首个窗口当作完整文件。reviewer 必须依赖 investigator，独立复核其完整证据，并作为该 Team 唯一 terminal role。terminal reviewer 必须在 `output_artifacts` 中声明 required result artifacts：`findings`、`source_paths`、`evidence`、`summary`、`unresolved`。不要添加自定义 acceptance，也不要添加无资源绑定的 evidence 准则。证据义务只能在每个 workstream 的 `evidence_contract` 中用实际存在的完整源码路径作为 `evidence_scope`；禁止通配符。Team A（编排与 Program 真相）读取 `crates/runtime/src/orchestration/mod.rs` 和 `crates/runtime/src/orchestration/compiler.rs`；Team B（意图、模板与 Team 实例化）读取 `crates/runtime/src/orchestration/intent_compiler.rs` 和 `crates/runtime/src/team/instantiation.rs`；Team C（Agent 执行与结果验证）读取 `crates/runtime/src/agent/in_process_worker.rs` 和 `crates/runtime/src/agent/result_validator.rs`；Team D（Gateway 背压与语义健康）读取 `crates/gateway/src/runtime_host/task_set.rs` 和 `crates/gateway/src/infrastructure/gateway_health.rs`。A、B、C、D 必须作为第一波并行执行。Team E（对抗性交叉审查）读取 `crates/runtime/src/conversation/host.rs` 和 `crates/runtime/src/execution_core/graph/executors/verify.rs`，必须同时依赖并实际消费 A 与 B 的完整结构化交接，审查显式拓扑、证据资格和终态收敛，不能提前开始。Team F（容量、恢复与最终综合）读取 `crates/runtime/src/execution_core/services.rs` 和 `crates/runtime/src/recovery/runtime_event_reactor.rs`，必须同时依赖并实际消费 C、D、E 的完整结构化交接，比较正常、过载、取消、恢复和维护追赶路径，最后输出整体结论。Program 必须形成至少五条跨 Team 依赖：A→E、B→E、C→F、D→F、E→F。最终结论必须列出至少六个本次实际读取的完整源码路径，明确区分已验证事实、源码推断与未执行的模拟；给出并发波次、关键瓶颈、失效模式、容量边界和是否适合继续扩大规模的结论。若且仅若 E 与 F 都确实收到并使用了完整上游结果，最终结论必须原样给出验收声明“E/F 结构化交接已完整消费”；若事实不成立，禁止输出该声明且本任务不得判为完成。只能使用 read_file、read_many、glob_search、glob_many、grep_search、grep_many、workspace_snapshot 等只读工具；禁止 bash 和任何写工具。",
-                acceptance: LiveAcceptance::ArchitectureQuality {
-                    minimum_teams: 6,
-                    minimum_claimed_cross_team_edges: 5,
-                    evidence_profile: ArchitectureEvidenceProfile::LargeScaleIndependentReview,
-                },
-                timeout: LiveScenarioTimeout::large_scale(12),
-            });
-        }
-        if autonomous_deepseek_scenario_enabled() {
-            match autonomous_deepseek_spec() {
+        for (enabled, build_spec) in [
+            (
+                group_theory_research_scenario_enabled(),
+                group_theory_spec as fn() -> Result<LiveScenarioSpec, String>,
+            ),
+            (
+                large_scale_collaboration_scenario_enabled(),
+                large_scale_spec,
+            ),
+            (
+                autonomous_deepseek_scenario_enabled(),
+                autonomous_deepseek_spec,
+            ),
+        ] {
+            if !enabled {
+                continue;
+            }
+            match build_spec() {
                 Ok(spec) => scenario_specs.push(spec),
                 Err(error) => {
                     return json!({
@@ -1041,6 +1090,11 @@ impl LiveScenarioRunner {
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
             .map(ToString::to_string);
+        let turn_id = admission
+            .pointer("/execution/turn_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(ToString::to_string);
         let Some(execution_id_ref) = execution_id.as_deref() else {
             return failed_scenario_with_session(
                 spec,
@@ -1049,6 +1103,20 @@ impl LiveScenarioRunner {
                 session_id,
                 format!(
                     "message admission lacks canonical execution.graph_id: {}",
+                    summarize_json(&admission)
+                ),
+                Value::Null,
+            );
+        };
+        let Some(turn_id_ref) = turn_id.as_deref() else {
+            return failed_scenario_with_session_and_execution(
+                spec,
+                started,
+                trace,
+                session_id,
+                execution_id,
+                format!(
+                    "message admission lacks canonical execution.turn_id: {}",
                     summarize_json(&admission)
                 ),
                 Value::Null,
@@ -1092,6 +1160,7 @@ impl LiveScenarioRunner {
             spec.acceptance,
             &response_text,
             &session_id,
+            turn_id_ref,
             execution_id_ref,
             started,
             &timeout,
@@ -1100,6 +1169,7 @@ impl LiveScenarioRunner {
         );
         let timeline = descendant_wait.timeline;
         let projections = descendant_wait.projections;
+        let agentic_program = descendant_wait.agentic_program;
         let mut acceptance = descendant_wait.acceptance;
         let terminal_id = terminal_wait
             .message
@@ -1108,7 +1178,12 @@ impl LiveScenarioRunner {
             .and_then(Value::as_str)
             .map(ToString::to_string);
         let commit_cursor = find_u64_by_key(&timeline, &["commit_cursor", "runtime_commit_cursor"]);
-        let metrics = scenario_metrics(&timeline, &projections, started.elapsed());
+        let metrics = scenario_metrics(
+            &timeline,
+            &projections,
+            agentic_program.as_ref(),
+            started.elapsed(),
+        );
         let requested_model = self
             .model
             .as_deref()
@@ -1170,6 +1245,7 @@ impl LiveScenarioRunner {
             "acceptance": acceptance.to_value(),
             "session_id": session_id,
             "execution_id": execution_id,
+            "turn_id": turn_id,
             "terminal_id": terminal_id,
             "terminal_response_summary": summarize(&response_text, 320),
             "runtime_commit_cursor": commit_cursor,
@@ -1185,6 +1261,8 @@ impl LiveScenarioRunner {
             "production_trace": {
                 "session_id": session_id,
                 "execution_id": execution_id,
+                "turn_id": turn_id,
+                "agentic_program": agentic_program,
                 "terminal_id": terminal_id,
                 "runtime_commit_cursor": commit_cursor,
                 "message_materialized": true,
@@ -1553,6 +1631,7 @@ impl LiveScenarioRunner {
         acceptance: LiveAcceptance,
         response_text: &str,
         session_id: &str,
+        turn_id: &str,
         root_execution_id: &str,
         scenario_started: Instant,
         timeout: &LiveScenarioTimeout,
@@ -1577,8 +1656,18 @@ impl LiveScenarioRunner {
             // zero model rounds and zero token/tool usage for a real execution.
             let projections =
                 self.execution_lineage_projections(root_execution_id, trace, &mut projection_cache);
-            let mut result =
-                acceptance.evaluate(response_text, &timeline, &projections, root_execution_id);
+            let agentic_program = if acceptance.requires_descendant_team_closure() {
+                self.root_agentic_program(session_id, turn_id, trace).ok()
+            } else {
+                None
+            };
+            let mut result = acceptance.evaluate(
+                response_text,
+                &timeline,
+                &projections,
+                agentic_program.as_ref(),
+                root_execution_id,
+            );
             observations = observations.saturating_add(1);
 
             if let Some(error) = timeline_error {
@@ -1591,6 +1680,7 @@ impl LiveScenarioRunner {
                 return DescendantTeamWait {
                     timeline,
                     projections,
+                    agentic_program,
                     acceptance: result,
                     report: json!({
                         "required": acceptance.requires_descendant_team_closure(),
@@ -1606,6 +1696,7 @@ impl LiveScenarioRunner {
                 return DescendantTeamWait {
                     timeline,
                     projections,
+                    agentic_program,
                     acceptance: result,
                     report: json!({
                         "required": acceptance.requires_descendant_team_closure(),
@@ -1620,11 +1711,26 @@ impl LiveScenarioRunner {
                 };
             }
 
-            let health = projected_team_health(&projections);
+            let Some(program) = agentic_program.as_ref() else {
+                return DescendantTeamWait {
+                    timeline,
+                    projections,
+                    agentic_program,
+                    acceptance: result,
+                    report: json!({
+                        "required": true,
+                        "elapsed_ms": wait_started.elapsed().as_millis(),
+                        "observations": observations,
+                        "terminal_reason": "root_terminal_without_agentic_program",
+                    }),
+                };
+            };
+            let health = projected_team_health(program);
             if !health.has_pending_work() {
                 return DescendantTeamWait {
                     timeline,
                     projections,
+                    agentic_program,
                     acceptance: result,
                     report: json!({
                         "required": true,
@@ -1650,6 +1756,7 @@ impl LiveScenarioRunner {
                 return DescendantTeamWait {
                     timeline,
                     projections,
+                    agentic_program,
                     acceptance: result,
                     report: json!({
                         "required": true,
@@ -1726,6 +1833,21 @@ impl LiveScenarioRunner {
             .send()
             .map_err(|error| error.to_string())?;
         response_json(response)
+    }
+
+    fn root_agentic_program(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        trace: &mut Vec<Value>,
+    ) -> Result<runtime::AgenticProgramProjection, String> {
+        let path =
+            format!("/api/runtime/agentic/programs/root?session_id={session_id}&turn_id={turn_id}");
+        let response = self.get_json(&path);
+        trace.push(trace_json_entry("GET", path, Value::Null, &response));
+        serde_json::from_value(response?).map_err(|error| {
+            format!("invalid AgenticProgramProjection response from Gateway: {error}")
+        })
     }
 }
 
@@ -1816,7 +1938,12 @@ fn percentile(sorted: &[u64], percentile: usize) -> u64 {
     sorted[index]
 }
 
-fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) -> Value {
+fn scenario_metrics(
+    timeline: &Value,
+    projections: &[Value],
+    agentic_program: Option<&runtime::AgenticProgramProjection>,
+    elapsed: Duration,
+) -> Value {
     let provider_attempts = provider_attempt_metrics(timeline);
     let graph_usage = execution_graph_usage_metrics(projections);
     let timeline_usage = token_usage_metrics(timeline);
@@ -1871,11 +1998,9 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
                 }),
         );
     }
-    // Terminal Runtime projections intentionally expose no *currently active*
-    // Agents. Preserve the durable historical Team task population in metrics
-    // so a successfully completed collaboration does not collapse from N
-    // Agents to zero merely because collection happened after closure.
-    let projected_health = projected_team_health(projections);
+    let projected_health = agentic_program
+        .map(projected_team_health)
+        .unwrap_or_default();
     let timeline_model_rounds = timeline
         .pointer("/team_session/runtime_run_count")
         .and_then(Value::as_u64)
@@ -1909,7 +2034,27 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
     let elapsed_ms = elapsed.as_millis() as u64;
     let output_tokens_per_second =
         (elapsed_ms > 0).then(|| output_tokens.saturating_mul(1_000) as f64 / elapsed_ms as f64);
-    let autonomy = autonomy_metrics(projections, AUTONOMOUS_DEEPSEEK_OUTPUT_PATH);
+    let agentic_tasks = agentic_program
+        .map(|program| active_agentic_tasks(program).count())
+        .unwrap_or_default();
+    let accepted_tasks = agentic_program
+        .map(|program| {
+            active_agentic_tasks(program)
+                .filter(|task| task.status == runtime::AgenticTaskStatus::Accepted)
+                .count()
+        })
+        .unwrap_or_default();
+    let agentic_reviews = agentic_program
+        .map(|program| {
+            active_agentic_tasks(program)
+                .filter(|task| task.reviewed_by.is_some())
+                .count()
+        })
+        .unwrap_or_default();
+    let topic_entries = agentic_program
+        .map(|program| program.topics.values().map(Vec::len).sum::<usize>())
+        .unwrap_or_default();
+    let artifact_count = agentic_program.map_or(0, |program| program.artifacts.len());
     let mut metrics = json!({
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -1925,24 +2070,13 @@ fn scenario_metrics(timeline: &Value, projections: &[Value], elapsed: Duration) 
         "tool_calls": tool_calls,
         "agent_count": agents.len().max(projected_health.agent_count),
         "team_count": teams.len().max(projected_health.team_count),
-        "work_item_count": autonomy.work_items,
-        "proposed_work_item_count": autonomy.proposed_work_items,
-        "distinct_proposer_count": autonomy.distinct_proposers,
-        "work_bid_count": autonomy.bid_count,
-        "distinct_bidder_count": autonomy.distinct_bidders,
-        "accepted_work_item_count": autonomy.accepted_work_items,
-        "claimed_work_item_count": autonomy.claimed_work_items,
-        "autonomous_claimed_work_item_count": autonomy.autonomous_claimed_work_items,
-        "distinct_claimant_count": autonomy.distinct_claimants,
-        "work_review_count": autonomy.review_count,
-        "distinct_reviewer_count": autonomy.distinct_reviewers,
-        "challenge_finding_count": autonomy.challenge_findings,
-        "challenge_resolution_count": autonomy.challenge_resolutions,
-        "challenged_work_item_count": autonomy.challenged_work_items,
-        "unresolved_challenged_work_item_count": autonomy.unresolved_challenged_work_items,
-        "discussion_count": autonomy.discussions,
-        "output_artifact_kind_count": autonomy.output_artifact_kinds,
-        "output_materialization_count": autonomy.output_materializations,
+        "agentic_task_count": agentic_tasks,
+        "accepted_agentic_task_count": accepted_tasks,
+        "agentic_review_count": agentic_reviews,
+        "agentic_topic_entry_count": topic_entries,
+        "agentic_artifact_count": artifact_count,
+        "accepted_cross_team_dependency_count": agentic_program.map(accepted_cross_team_dependency_count).unwrap_or_default(),
+        "physical_parallel_overlap_count": physical_parallel_overlap_count(projections),
         "wall_ms": elapsed_ms,
         "first_token_latency_ms": first_token_latency_ms,
         "wall_tokens_per_second": wall_tokens_per_second.or(output_tokens_per_second),
@@ -2464,6 +2598,7 @@ struct TerminalWait {
 struct DescendantTeamWait {
     timeline: Value,
     projections: Vec<Value>,
+    agentic_program: Option<runtime::AgenticProgramProjection>,
     acceptance: LiveAcceptanceResult,
     report: Value,
 }
@@ -2480,21 +2615,13 @@ enum LiveAcceptance {
         minimum_claimed_cross_team_edges: usize,
         evidence_profile: ArchitectureEvidenceProfile,
     },
-    EscalatedTeam {
-        minimum_teams: usize,
-        minimum_escalations: usize,
-    },
     AutonomousCollaboration {
         minimum_teams: usize,
         minimum_agents: usize,
-        minimum_work_items: usize,
-        minimum_proposals: usize,
-        minimum_bids: usize,
-        minimum_claims: usize,
+        minimum_tasks: usize,
         minimum_reviews: usize,
-        minimum_challenges: usize,
         minimum_cross_team_edges: usize,
-        minimum_discussions: usize,
+        minimum_topics: usize,
         output_path: &'static str,
     },
 }
@@ -2502,12 +2629,12 @@ enum LiveAcceptance {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArchitectureEvidenceProfile {
     Basic,
-    /// Four one-role Teams with a single three-input sink. The sink Team must
-    /// itself reacquire all three exact sources; global lineage coverage is
-    /// insufficient because predecessor receipts prove handoff, not review.
+    /// The unique dependency sink must itself reacquire the exact sources;
+    /// global lineage coverage is insufficient because predecessor evidence
+    /// proves handoff, not synthesis review.
     GroupTheoryFinalSynthesis,
-    /// Six two-role Teams; every exact source must be independently acquired
-    /// by two distinct Agent identities.
+    /// Every exact source must be independently acquired by two distinct
+    /// Agent identities. Team/Agent topology remains model-selected.
     LargeScaleIndependentReview,
 }
 
@@ -2516,9 +2643,6 @@ impl LiveAcceptance {
         matches!(
             self,
             Self::ArchitectureQuality {
-                minimum_teams: 1..,
-                ..
-            } | Self::EscalatedTeam {
                 minimum_teams: 1..,
                 ..
             } | Self::AutonomousCollaboration {
@@ -2533,9 +2657,10 @@ impl LiveAcceptance {
         response: &str,
         timeline: &Value,
         projections: &[Value],
+        agentic_program: Option<&runtime::AgenticProgramProjection>,
         root_execution_id: &str,
     ) -> LiveAcceptanceResult {
-        let mut result = match self {
+        let result = match self {
             Self::Contains(expected) => LiveAcceptanceResult {
                 passed: response.contains(expected),
                 quality: None,
@@ -2563,28 +2688,30 @@ impl LiveAcceptance {
                 minimum_claimed_cross_team_edges,
                 evidence_profile,
             } => {
-                let team_health = projected_team_health(projections);
-                let claimed_cross_team_edges = claimed_cross_team_edge_count(projections);
-                let quality = architecture_quality(timeline, projections);
-                let team_projection = team_health.satisfies(minimum_teams)
-                    && match evidence_profile {
-                        ArchitectureEvidenceProfile::Basic => true,
-                        ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis => {
-                            team_health.team_count == 4 && team_health.agent_count == 4
-                        }
-                        ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
-                            team_health.team_count == 6 && team_health.agent_count == 12
-                        }
-                    };
-                let edges_satisfied = match evidence_profile {
-                    ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis => {
-                        claimed_cross_team_edges == 3
-                    }
-                    ArchitectureEvidenceProfile::Basic
-                    | ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
-                        claimed_cross_team_edges >= minimum_claimed_cross_team_edges
-                    }
-                };
+                let team_health = agentic_program
+                    .map(projected_team_health)
+                    .unwrap_or_default();
+                let accepted_cross_team_dependencies = agentic_program
+                    .map(accepted_cross_team_dependency_count)
+                    .unwrap_or_default();
+                let evidence_integrity = agentic_program
+                    .map(agentic_evidence_integrity)
+                    .unwrap_or_default();
+                let evidence_satisfied = minimum_teams == 0 || evidence_integrity.passed();
+                let program_verified = minimum_teams == 0
+                    || agentic_program.is_some_and(|program| {
+                        program.status == runtime::AgenticProgramStatus::Verified
+                            && program.root_execution_id.as_deref() == Some(root_execution_id)
+                            && program.objective_verdict.is_some()
+                            && program.unresolved.is_empty()
+                    });
+                let quality = architecture_quality(timeline, projections, agentic_program);
+                let team_projection = team_health.satisfies(minimum_teams);
+                let edges_satisfied =
+                    accepted_cross_team_dependencies >= minimum_claimed_cross_team_edges;
+                let parallel_overlaps = physical_parallel_overlap_count(projections);
+                let parallel_satisfied = minimum_teams <= 1 || parallel_overlaps > 0;
+                let physical_terminal = no_active_agent_waits(projections);
                 let presentation_checks = match evidence_profile {
                     ArchitectureEvidenceProfile::LargeScaleIndependentReview => {
                         large_scale_presentation_checks(response)
@@ -2628,7 +2755,9 @@ impl LiveAcceptance {
                     .collect::<Vec<_>>();
                 let independent_source_review =
                     missing_independently_reviewed_source_paths.is_empty();
-                let terminal_team_ids = terminal_semantic_team_ids(projections);
+                let terminal_team_ids = agentic_program
+                    .map(terminal_semantic_team_ids)
+                    .unwrap_or_default();
                 let terminal_team_source_paths =
                     complete_exact_source_receipt_paths_for_semantic_teams(
                         timeline,
@@ -2652,8 +2781,12 @@ impl LiveAcceptance {
                 let mut checks = vec![
                     json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
                     json!({"name": "architecture_quality", "passed": quality.score >= quality.required, "score": quality.score, "required": quality.required, "criteria": quality.criteria}),
-                    json!({"name": "completed_evidence_team", "required": minimum_teams, "passed": team_projection, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
-                    json!({"name": "claimed_cross_team_edges", "required": minimum_claimed_cross_team_edges, "observed": claimed_cross_team_edges, "passed": edges_satisfied}),
+                    json!({"name": "agentic_program_verified", "passed": program_verified}),
+                    json!({"name": "accepted_agent_first_teams", "required": minimum_teams, "passed": team_projection, "engaged_agents": team_health.agent_count, "accepted_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "accepted_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
+                    json!({"name": "durable_task_artifact_evidence", "required": minimum_teams > 0, "accepted_tasks": evidence_integrity.accepted_tasks, "missing_claimants": evidence_integrity.missing_claimants, "missing_independent_reviews": evidence_integrity.missing_independent_reviews, "missing_artifacts": evidence_integrity.missing_artifacts, "missing_evidence": evidence_integrity.missing_evidence, "dangling_artifact_refs": evidence_integrity.dangling_artifact_refs, "passed": evidence_satisfied}),
+                    json!({"name": "accepted_cross_team_dependencies", "required": minimum_claimed_cross_team_edges, "observed": accepted_cross_team_dependencies, "passed": edges_satisfied}),
+                    json!({"name": "physical_agent_concurrency", "required_overlaps": usize::from(minimum_teams > 1), "observed_overlaps": parallel_overlaps, "passed": parallel_satisfied}),
+                    json!({"name": "physical_agent_waits_resolved", "passed": physical_terminal}),
                     json!({"name": "runtime_attested_complete_source_coverage", "required": required_complete_source_paths.len(), "observed": complete_source_paths.len(), "missing": missing_complete_source_paths, "passed": complete_source_coverage}),
                     json!({"name": "runtime_attested_independent_source_review", "required": required_independent_source_paths.len(), "observed": independently_reviewed_source_paths.len(), "missing": missing_independently_reviewed_source_paths, "receipt_rule": "distinct exact-content receipts from two different Agent identities", "passed": independent_source_review}),
                     json!({"name": "runtime_attested_terminal_team_source_review", "required": if evidence_profile == ArchitectureEvidenceProfile::GroupTheoryFinalSynthesis { GROUP_THEORY_SOURCE_PATHS.len() } else { 0 }, "observed": terminal_team_source_paths.len(), "terminal_semantic_team_ids": terminal_team_ids, "missing": missing_terminal_team_source_paths, "receipt_rule": "exact-content read receipt must belong to the unique sink Team Agent identity", "passed": terminal_team_source_review}),
@@ -2663,7 +2796,11 @@ impl LiveAcceptance {
                     passed: !response.trim().is_empty()
                         && quality.score >= quality.required
                         && team_projection
+                        && program_verified
+                        && evidence_satisfied
                         && edges_satisfied
+                        && parallel_satisfied
+                        && physical_terminal
                         && complete_source_coverage
                         && independent_source_review
                         && terminal_team_source_review
@@ -2672,104 +2809,111 @@ impl LiveAcceptance {
                     checks,
                 }
             }
-            Self::EscalatedTeam {
-                minimum_teams,
-                minimum_escalations,
-            } => {
-                let team_health = projected_team_health(projections);
-                let escalation_count = applied_escalation_count(projections);
-                let teams_satisfied = team_health.satisfies(minimum_teams);
-                let escalations_satisfied = escalation_count >= minimum_escalations;
-                LiveAcceptanceResult {
-                    passed: !response.trim().is_empty() && teams_satisfied && escalations_satisfied,
-                    quality: None,
-                    checks: vec![
-                        json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
-                        json!({"name": "completed_escalated_teams", "required": minimum_teams, "passed": teams_satisfied, "agents": team_health.agent_count, "completed_agents": team_health.completed_agents, "failed_agents": team_health.failed_agents, "teams": team_health.team_count, "completed_teams": team_health.completed_teams, "failed_teams": team_health.failed_teams}),
-                        json!({"name": "runtime_attested_agent_escalation", "required": minimum_escalations, "observed": escalation_count, "passed": escalations_satisfied}),
-                    ],
-                }
-            }
             Self::AutonomousCollaboration {
                 minimum_teams,
                 minimum_agents,
-                minimum_work_items,
-                minimum_proposals,
-                minimum_bids,
-                minimum_claims,
+                minimum_tasks,
                 minimum_reviews,
-                minimum_challenges,
                 minimum_cross_team_edges,
-                minimum_discussions,
+                minimum_topics,
                 output_path,
             } => {
-                let team_health = projected_team_health(projections);
-                let autonomy = autonomy_metrics(projections, output_path);
-                let cross_team_edges = claimed_cross_team_edge_count(projections);
-                let teams_satisfied = team_health.team_count == minimum_teams
-                    && team_health.completed_teams == minimum_teams
-                    && team_health.failed_teams == 0;
-                let agents_satisfied = team_health.agent_count == minimum_agents
-                    && team_health.completed_agents == minimum_agents
-                    && team_health.failed_agents == 0;
-                let market_satisfied = autonomy.work_items >= minimum_work_items
-                    && autonomy.proposed_work_items >= minimum_proposals
-                    && autonomy.distinct_proposers >= minimum_proposals
-                    && autonomy.bid_count >= minimum_bids
-                    && autonomy.distinct_bidders >= minimum_agents / 2
-                    && autonomy.autonomous_claimed_work_items >= minimum_proposals;
-                let work_satisfied = market_satisfied
-                    && autonomy.accepted_work_items >= minimum_work_items
-                    && autonomy.claimed_work_items >= minimum_claims
-                    && autonomy.distinct_claimants >= minimum_agents / 2;
-                let review_satisfied = autonomy.challenge_findings >= minimum_challenges
-                    && autonomy.challenge_resolutions > 0
-                    && autonomy.review_count >= minimum_reviews
-                    && autonomy.distinct_reviewers >= minimum_agents / 4
-                    && autonomy.unresolved_challenged_work_items == 0;
-                let discussions_satisfied = autonomy.discussions >= minimum_discussions;
-                let artifacts_satisfied = autonomy.output_artifact_kinds >= 4;
+                let Some(program) = agentic_program else {
+                    return LiveAcceptanceResult {
+                        passed: false,
+                        quality: None,
+                        checks: vec![json!({"name": "agentic_program_present", "passed": false})],
+                    };
+                };
+                let health = projected_team_health(program);
+                let evidence = agentic_evidence_integrity(program);
+                let accepted_tasks = active_agentic_tasks(program)
+                    .filter(|task| task.status == runtime::AgenticTaskStatus::Accepted)
+                    .count();
+                let review_count = active_agentic_tasks(program)
+                    .filter(|task| task.reviewed_by.is_some())
+                    .count();
+                let topic_entries = program.topics.values().map(Vec::len).sum::<usize>();
+                let cross_team_edges = accepted_cross_team_dependency_count(program);
+                let overlaps = physical_parallel_overlap_count(projections);
+                let program_verified = program.status == runtime::AgenticProgramStatus::Verified
+                    && program.root_execution_id.as_deref() == Some(root_execution_id)
+                    && program.objective_verdict.is_some()
+                    && program.unresolved.is_empty();
+                let teams_satisfied = health.team_count >= minimum_teams
+                    && health.completed_teams == health.team_count
+                    && health.failed_teams == 0;
+                let agents_satisfied = health.agent_count >= minimum_agents
+                    && health.completed_agents == health.agent_count
+                    && health.failed_agents == 0;
+                let tasks_satisfied = accepted_tasks >= minimum_tasks;
+                let reviews_satisfied = review_count >= minimum_reviews;
+                let topics_satisfied = topic_entries >= minimum_topics;
                 let edges_satisfied = cross_team_edges >= minimum_cross_team_edges;
-                let presentation_satisfied = response.contains(output_path);
-                let materialization_satisfied = autonomy.output_materializations == 1;
+                let final_artifact = program
+                    .final_artifact_ref
+                    .as_ref()
+                    .and_then(|reference| program.artifacts.get(reference));
+                let final_artifact_satisfied = final_artifact.is_some_and(|artifact| {
+                    !artifact.content_ref.trim().is_empty()
+                        && active_agentic_tasks(program).any(|task| {
+                            task.status == runtime::AgenticTaskStatus::Accepted
+                                && task.artifact_refs.contains(&artifact.artifact_ref)
+                        })
+                        && (output_path.is_empty()
+                            || artifact.title.contains(output_path)
+                            || artifact.content_ref.contains(output_path))
+                });
                 LiveAcceptanceResult {
                     passed: !response.trim().is_empty()
+                        && program_verified
                         && teams_satisfied
                         && agents_satisfied
-                        && work_satisfied
-                        && review_satisfied
-                        && discussions_satisfied
-                        && artifacts_satisfied
+                        && tasks_satisfied
+                        && reviews_satisfied
+                        && topics_satisfied
+                        && evidence.passed()
                         && edges_satisfied
-                        && presentation_satisfied
-                        && materialization_satisfied,
+                        && overlaps > 0
+                        && no_active_agent_waits(projections)
+                        && final_artifact_satisfied,
                     quality: None,
                     checks: vec![
                         json!({"name": "durable_response", "passed": !response.trim().is_empty()}),
-                        json!({"name": "completed_autonomous_teams", "required": minimum_teams, "observed": team_health.team_count, "completed": team_health.completed_teams, "failed": team_health.failed_teams, "passed": teams_satisfied}),
-                        json!({"name": "completed_autonomous_agents", "required": minimum_agents, "observed": team_health.agent_count, "completed": team_health.completed_agents, "failed": team_health.failed_agents, "passed": agents_satisfied}),
-                        json!({"name": "runtime_work_market", "required_work_items": minimum_work_items, "observed_work_items": autonomy.work_items, "accepted_work_items": autonomy.accepted_work_items, "required_proposals": minimum_proposals, "observed_proposals": autonomy.proposed_work_items, "distinct_proposers": autonomy.distinct_proposers, "required_bids": minimum_bids, "observed_bids": autonomy.bid_count, "distinct_bidders": autonomy.distinct_bidders, "required_claims": minimum_claims, "observed_claims": autonomy.claimed_work_items, "autonomous_claimed_work_items": autonomy.autonomous_claimed_work_items, "distinct_claimants": autonomy.distinct_claimants, "passed": work_satisfied}),
-                        json!({"name": "durable_independent_review_cycle", "required_reviews": minimum_reviews, "observed_reviews": autonomy.review_count, "distinct_reviewers": autonomy.distinct_reviewers, "required_challenges": minimum_challenges, "challenge_findings": autonomy.challenge_findings, "challenge_resolutions": autonomy.challenge_resolutions, "challenged_work_items": autonomy.challenged_work_items, "unresolved_challenged_work_items": autonomy.unresolved_challenged_work_items, "passed": review_satisfied}),
-                        json!({"name": "bounded_team_discussions", "required": minimum_discussions, "observed": autonomy.discussions, "passed": discussions_satisfied}),
-                        json!({"name": "typed_output_artifacts", "required": 4, "observed": autonomy.output_artifact_kinds, "passed": artifacts_satisfied}),
-                        json!({"name": "claimed_cross_team_edges", "required": minimum_cross_team_edges, "observed": cross_team_edges, "passed": edges_satisfied}),
-                        json!({"name": "persisted_output_presented", "path": output_path, "passed": presentation_satisfied}),
-                        json!({"name": "runtime_attested_single_reread_materialization", "path": output_path, "observed": autonomy.output_materializations, "digests": autonomy.output_digests, "passed": materialization_satisfied}),
+                        json!({"name": "agentic_program_verified", "passed": program_verified}),
+                        json!({"name": "accepted_autonomous_teams", "required": minimum_teams, "observed": health.team_count, "accepted": health.completed_teams, "failed": health.failed_teams, "passed": teams_satisfied}),
+                        json!({"name": "engaged_autonomous_agents", "required": minimum_agents, "observed": health.agent_count, "accepted": health.completed_agents, "failed": health.failed_agents, "passed": agents_satisfied}),
+                        json!({"name": "accepted_agent_tasks", "required": minimum_tasks, "observed": accepted_tasks, "passed": tasks_satisfied}),
+                        json!({"name": "independent_task_reviews", "required": minimum_reviews, "observed": review_count, "passed": reviews_satisfied}),
+                        json!({"name": "durable_topic_observations", "required": minimum_topics, "observed": topic_entries, "passed": topics_satisfied}),
+                        json!({"name": "durable_task_artifact_evidence", "accepted_tasks": evidence.accepted_tasks, "missing_claimants": evidence.missing_claimants, "missing_independent_reviews": evidence.missing_independent_reviews, "missing_artifacts": evidence.missing_artifacts, "missing_evidence": evidence.missing_evidence, "dangling_artifact_refs": evidence.dangling_artifact_refs, "passed": evidence.passed()}),
+                        json!({"name": "accepted_cross_team_dependencies", "required": minimum_cross_team_edges, "observed": cross_team_edges, "passed": edges_satisfied}),
+                        json!({"name": "physical_agent_concurrency", "required_overlaps": 1, "observed_overlaps": overlaps, "passed": overlaps > 0}),
+                        json!({"name": "physical_agent_waits_resolved", "passed": no_active_agent_waits(projections)}),
+                        json!({"name": "durable_final_artifact", "expected_path": output_path, "final_artifact_ref": program.final_artifact_ref, "passed": final_artifact_satisfied}),
                     ],
                 }
             }
         };
-        let outcome = root_business_outcome(timeline, root_execution_id);
-        result.checks.push(json!({
-            "name": "root_business_outcome_succeeded",
-            "execution_graph_ref": root_execution_id,
-            "observed_event_status": outcome.event_status,
-            "observed_terminal_class": outcome.terminal_class,
-            "passed": outcome.passed,
-        }));
-        result.passed &= outcome.passed;
-        result
+        finalize_live_acceptance(result, timeline, root_execution_id)
     }
+}
+
+fn finalize_live_acceptance(
+    mut result: LiveAcceptanceResult,
+    timeline: &Value,
+    root_execution_id: &str,
+) -> LiveAcceptanceResult {
+    let outcome = root_business_outcome(timeline, root_execution_id);
+    result.checks.push(json!({
+        "name": "root_business_outcome_succeeded",
+        "execution_graph_ref": root_execution_id,
+        "observed_event_status": outcome.event_status,
+        "observed_terminal_class": outcome.terminal_class,
+        "passed": outcome.passed,
+    }));
+    result.passed &= outcome.passed;
+    result
 }
 
 fn group_theory_presentation_checks(response: &str) -> Vec<Value> {
@@ -2811,35 +2955,6 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         .last()
         .is_some_and(|character| !character.is_alphanumeric())
         && trimmed.matches("```").count() % 2 == 0;
-    let handoff_missing = [
-        "未能看到 team",
-        "没有显式的 team",
-        "缺少上游 team",
-        "未完成对 team",
-        "未能完整看到上游",
-        "f 未通过",
-        "f 未能",
-        "f 的上游消费未",
-        "完整消费没有发生",
-        "完整消费未发生",
-        "不能被确认",
-        "不能确认",
-        "无法得到正面证明",
-        "语义载荷内容未",
-        "内容级载荷未",
-        "输入不完整",
-        "missing upstream",
-        "did not receive upstream",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker));
-    let handoff_consumed = !handoff_missing
-        && [
-            "e/f 结构化交接已完整消费",
-            "teams e and f consumed the complete upstream",
-        ]
-        .iter()
-        .any(|marker| normalized.contains(marker));
     let source_coverage_contradicted = [
         "源码完整覆盖维度：未通过",
         "源码完整覆盖维度:未通过",
@@ -2874,7 +2989,7 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
     let source_coverage_declared =
         !source_coverage_contradicted && normalized.contains("12/12 目标源码已完整读取到 eof");
     let independent_source_review_declared = !source_coverage_contradicted
-        && normalized.contains("12/12 目标源码已由 investigator 与 reviewer 独立完整读取到 eof");
+        && normalized.contains("12/12 目标源码已由两个不同 agent 身份独立完整读取到 eof");
     let required_concepts = [
         ("verified_facts", &["已验证事实", "verified facts"][..]),
         (
@@ -2896,7 +3011,6 @@ fn large_scale_presentation_checks(response: &str) -> Vec<Value> {
         json!({"name": "presentation_source_paths", "required": 6, "observed": source_paths.len(), "passed": source_paths.len() >= 6}),
         json!({"name": "presentation_complete_source_coverage", "passed": source_coverage_declared}),
         json!({"name": "presentation_independent_source_review", "passed": independent_source_review_declared}),
-        json!({"name": "presentation_cross_team_handoff_consumed", "passed": handoff_consumed}),
     ];
     checks.extend(required_concepts.into_iter().map(|(name, markers)| {
         let passed = markers
@@ -3021,44 +3135,24 @@ fn independently_reviewed_complete_source_receipt_paths(
 /// A terminal Team is a required instance with incoming claimed edges and no
 /// outgoing edge. The group-theory gate additionally requires this set to
 /// contain exactly one sink.
-fn terminal_semantic_team_ids(projections: &[Value]) -> BTreeSet<String> {
-    let mut terminal = BTreeSet::new();
-    for projection in projections {
-        let Some(program) = projection.pointer("/graph/orchestration/collaboration_program") else {
-            continue;
-        };
-        let mut from = BTreeSet::new();
-        let mut to = BTreeSet::new();
-        for edge in program
-            .get("edges")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if let Some(instance_id) = edge.get("from").and_then(Value::as_str) {
-                from.insert(instance_id.to_string());
-            }
-            if let Some(instance_id) = edge.get("to").and_then(Value::as_str) {
-                to.insert(instance_id.to_string());
-            }
-        }
-        let sinks = to.difference(&from).collect::<BTreeSet<_>>();
-        for instance in program
-            .get("team_instances")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let instance_id = instance.get("instance_id").and_then(Value::as_str);
-            let semantic_node_id = instance.get("semantic_node_id").and_then(Value::as_str);
-            if let (Some(instance_id), Some(semantic_node_id)) = (instance_id, semantic_node_id) {
-                if sinks.iter().any(|sink| sink.as_str() == instance_id) {
-                    terminal.insert(semantic_node_id.to_string());
-                }
+fn terminal_semantic_team_ids(program: &runtime::AgenticProgramProjection) -> BTreeSet<String> {
+    let mut predecessor_teams = BTreeSet::new();
+    let mut consumer_teams = BTreeSet::new();
+    for task in active_agentic_tasks(program) {
+        for dependency_id in &task.depends_on {
+            let Some(dependency) = program.tasks.get(dependency_id) else {
+                continue;
+            };
+            if dependency.team_id != task.team_id {
+                predecessor_teams.insert(dependency.team_id.clone());
+                consumer_teams.insert(task.team_id.clone());
             }
         }
     }
-    terminal
+    consumer_teams
+        .difference(&predecessor_teams)
+        .cloned()
+        .collect()
 }
 
 fn complete_exact_source_receipt_paths_for_semantic_teams(
@@ -3289,21 +3383,20 @@ struct ArchitectureQuality {
 /// work in Chinese, another language, or a compact summary; requiring it to
 /// spell words such as "canonical" made the evaluator reject real successful
 /// runs for a presentation choice rather than a system defect.
-fn architecture_quality(timeline: &Value, projections: &[Value]) -> ArchitectureQuality {
+fn architecture_quality(
+    timeline: &Value,
+    projections: &[Value],
+    agentic_program: Option<&runtime::AgenticProgramProjection>,
+) -> ArchitectureQuality {
     let checked_source_receipts = checked_source_receipt_count(timeline, projections);
-    let canonical_program_projection = projections.iter().any(|projection| {
-        projection
-            .pointer("/graph/graph_id")
-            .and_then(Value::as_str)
-            .is_some_and(|graph_id| !graph_id.trim().is_empty())
-            && (projection
-                .pointer("/graph/orchestration/collaboration_program")
-                .is_some_and(Value::is_object)
-                || projection
-                    .pointer("/graph/nodes")
-                    .and_then(Value::as_array)
-                    .is_some_and(|nodes| !nodes.is_empty()))
-    });
+    let canonical_program_projection = agentic_program
+        .is_some_and(|program| !program.program_id.is_empty() && program.revision > 0)
+        || projections.iter().any(|projection| {
+            projection
+                .get("execution_id")
+                .and_then(Value::as_str)
+                .is_some_and(|execution_id| !execution_id.trim().is_empty())
+        });
     let durable_projection_lineage = projections.iter().any(|projection| {
         projection
             .get("revision")
@@ -3333,326 +3426,135 @@ fn architecture_quality(timeline: &Value, projections: &[Value]) -> Architecture
     }
 }
 
-#[derive(Default)]
-struct AutonomyMetrics {
-    work_items: usize,
-    proposed_work_items: usize,
-    distinct_proposers: usize,
-    bid_count: usize,
-    distinct_bidders: usize,
-    accepted_work_items: usize,
-    claimed_work_items: usize,
-    autonomous_claimed_work_items: usize,
-    distinct_claimants: usize,
-    review_count: usize,
-    distinct_reviewers: usize,
-    challenge_findings: usize,
-    challenge_resolutions: usize,
-    challenged_work_items: usize,
-    unresolved_challenged_work_items: usize,
-    discussions: usize,
-    output_artifact_kinds: usize,
-    output_materializations: usize,
-    output_digests: Vec<String>,
+fn active_agentic_tasks(
+    program: &runtime::AgenticProgramProjection,
+) -> impl Iterator<Item = &runtime::AgenticTaskProjection> {
+    program
+        .tasks
+        .values()
+        .filter(|task| task.status != runtime::AgenticTaskStatus::Superseded)
 }
 
-fn autonomy_metrics(projections: &[Value], output_path: &str) -> AutonomyMetrics {
-    let mut work_items = BTreeSet::new();
-    let mut proposed_work_items = BTreeSet::new();
-    let mut proposers = BTreeSet::new();
-    let mut bids = BTreeSet::new();
-    let mut bidders = BTreeSet::new();
-    let mut accepted_work_items = BTreeSet::new();
-    let mut claimed_work_items = BTreeSet::new();
-    let mut claimants = BTreeSet::new();
-    let mut reviews = BTreeSet::new();
-    let mut reviewers = BTreeSet::new();
-    let mut challenge_findings = BTreeSet::new();
-    let mut challenge_resolutions = BTreeSet::new();
-    let mut challenged_work_items = BTreeSet::new();
-    let mut unresolved_challenged_work_items = BTreeSet::new();
-    let mut discussions = BTreeSet::new();
-    let mut output_artifact_kinds = BTreeSet::new();
-    let mut materialization_receipts = BTreeSet::new();
-    let mut output_digests = BTreeSet::new();
+#[derive(Default)]
+struct AgenticEvidenceIntegrity {
+    accepted_tasks: usize,
+    missing_claimants: usize,
+    missing_independent_reviews: usize,
+    missing_artifacts: usize,
+    missing_evidence: usize,
+    dangling_artifact_refs: usize,
+}
 
-    for projection in projections {
-        let graph_id = projection
-            .pointer("/graph/graph_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unidentified-graph");
-        if is_collaboration_work_projection(projection) {
-            for node in projection
-                .pointer("/graph/nodes")
+impl AgenticEvidenceIntegrity {
+    fn passed(&self) -> bool {
+        self.accepted_tasks > 0
+            && self.missing_claimants == 0
+            && self.missing_independent_reviews == 0
+            && self.missing_artifacts == 0
+            && self.missing_evidence == 0
+            && self.dangling_artifact_refs == 0
+    }
+}
+
+fn agentic_evidence_integrity(
+    program: &runtime::AgenticProgramProjection,
+) -> AgenticEvidenceIntegrity {
+    let mut integrity = AgenticEvidenceIntegrity::default();
+    for task in active_agentic_tasks(program)
+        .filter(|task| task.status == runtime::AgenticTaskStatus::Accepted)
+    {
+        integrity.accepted_tasks = integrity.accepted_tasks.saturating_add(1);
+        let claimant = task
+            .claimant
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        let reviewer = task
+            .reviewed_by
+            .as_deref()
+            .filter(|value| !value.trim().is_empty());
+        integrity.missing_claimants = integrity
+            .missing_claimants
+            .saturating_add(usize::from(claimant.is_none()));
+        integrity.missing_independent_reviews = integrity
+            .missing_independent_reviews
+            .saturating_add(usize::from(reviewer.is_none() || reviewer == claimant));
+        integrity.missing_artifacts = integrity
+            .missing_artifacts
+            .saturating_add(usize::from(task.artifact_refs.is_empty()));
+        integrity.missing_evidence = integrity
+            .missing_evidence
+            .saturating_add(usize::from(task.evidence_refs.is_empty()));
+        integrity.dangling_artifact_refs = integrity.dangling_artifact_refs.saturating_add(
+            task.artifact_refs
+                .iter()
+                .filter(|reference| !program.artifacts.contains_key(*reference))
+                .count(),
+        );
+    }
+    integrity
+}
+
+fn physical_parallel_overlap_count(projections: &[Value]) -> usize {
+    let activities = projections
+        .iter()
+        .flat_map(|projection| {
+            projection
+                .get("activities")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
+        })
+        .filter_map(|activity| {
+            let agent_id = activity.get("agent_instance_id")?.as_str()?;
+            let start = activity.get("started_at_ms")?.as_u64()?;
+            let end = activity.get("completed_at_ms")?.as_u64()?;
+            (end > start).then(|| {
+                (
+                    agent_id,
+                    activity.get("team_run_id").and_then(Value::as_str),
+                    start,
+                    end,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut overlaps = 0_usize;
+    for (index, (agent, team, start, end)) in activities.iter().enumerate() {
+        for (other_agent, other_team, other_start, other_end) in &activities[index + 1..] {
+            if agent != other_agent
+                && team
+                    .zip(*other_team)
+                    .is_none_or(|(left, right)| left != right)
+                && *start < *other_end
+                && *other_start < *end
             {
-                let Some(work) = node.get("work").filter(|value| value.is_object()) else {
-                    continue;
-                };
-                let node_id = node
-                    .get("node_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unidentified-node");
-                let key = format!("{graph_id}:{node_id}");
-                work_items.insert(key.clone());
-                output_artifact_kinds.extend(
-                    work.get("output_artifact_kinds")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .filter(|kind| !kind.trim().is_empty())
-                        .map(ToString::to_string),
-                );
-                let state = node.get("work_state").unwrap_or(&Value::Null);
-                let status = state
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("offered");
-                if status == "accepted" {
-                    accepted_work_items.insert(key.clone());
-                }
-                if let Some(claimant) = state
-                    .pointer("/claim/claimant_instance_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    claimed_work_items.insert(key.clone());
-                    claimants.insert(claimant.to_string());
-                }
-                let findings = state
-                    .get("review_findings")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .filter(|finding| !finding.trim().is_empty())
-                    .collect::<Vec<_>>();
-                if !findings.is_empty() {
-                    challenged_work_items.insert(key.clone());
-                    if status != "accepted" {
-                        unresolved_challenged_work_items.insert(key.clone());
-                    }
-                }
-                for finding in findings {
-                    challenge_findings.insert(format!("{key}:{finding}"));
-                }
-                collect_work_reviews(state, &key, &mut reviews, &mut reviewers);
-            }
-            for item in projection
-                .pointer("/graph/autonomous_work")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let Some(work_id) = item
-                    .get("work_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                else {
-                    continue;
-                };
-                let key = format!("{graph_id}:{work_id}");
-                let work = item.get("work").unwrap_or(&Value::Null);
-                let state = item.get("state").unwrap_or(&Value::Null);
-                work_items.insert(key.clone());
-                proposed_work_items.insert(key.clone());
-                if let Some(proposer) = work
-                    .get("proposed_by")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    proposers.insert(proposer.to_string());
-                }
-                output_artifact_kinds.extend(
-                    work.get("output_artifact_kinds")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .filter(|kind| !kind.trim().is_empty())
-                        .map(ToString::to_string),
-                );
-                let status = state
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("offered");
-                if status == "accepted" {
-                    accepted_work_items.insert(key.clone());
-                }
-                if let Some(claimant) = state
-                    .pointer("/claim/claimant_instance_id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    claimed_work_items.insert(key.clone());
-                    claimants.insert(claimant.to_string());
-                }
-                for (index, bid) in state
-                    .get("bids")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .enumerate()
-                {
-                    if let Some(bidder) = bid
-                        .get("bidder_instance_id")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.trim().is_empty())
-                    {
-                        bidders.insert(bidder.to_string());
-                        bids.insert(format!("{key}:{bidder}:{index}"));
-                    }
-                }
-                let findings = state
-                    .get("review_findings")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .filter(|finding| !finding.trim().is_empty())
-                    .collect::<Vec<_>>();
-                if !findings.is_empty() {
-                    challenged_work_items.insert(key.clone());
-                    if status != "accepted" {
-                        unresolved_challenged_work_items.insert(key.clone());
-                    }
-                }
-                for finding in findings {
-                    challenge_findings.insert(format!("{key}:{finding}"));
-                }
-                collect_work_reviews(state, &key, &mut reviews, &mut reviewers);
+                overlaps = overlaps.saturating_add(1);
             }
         }
-        for activity in projection
+    }
+    overlaps
+}
+
+fn no_active_agent_waits(projections: &[Value]) -> bool {
+    projections.iter().all(|projection| {
+        projection
             .get("activities")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-        {
-            if activity.get("kind").and_then(Value::as_str) == Some("discussion") {
-                if let Some(activity_id) = activity.get("activity_id").and_then(Value::as_str) {
-                    discussions.insert(activity_id.to_string());
-                    match activity.get("display_label").and_then(Value::as_str) {
-                        Some("discussion · challenge") => {
-                            challenge_findings.insert(format!("discussion:{activity_id}"));
-                        }
-                        Some("discussion · resolution") => {
-                            challenge_resolutions.insert(activity_id.to_string());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        for receipt in projection
-            .pointer("/delivery_envelope/workspace_materializations")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if receipt.get("target_path").and_then(Value::as_str) != Some(output_path)
-                || receipt.get("reread_verified").and_then(Value::as_bool) != Some(true)
-                || receipt.get("bytes").and_then(Value::as_u64) == Some(0)
-            {
-                continue;
-            }
-            let digest = receipt
-                .get("sha256")
-                .and_then(Value::as_str)
-                .filter(|digest| {
-                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                });
-            let receipt_id = receipt
-                .get("receipt_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty());
-            if let (Some(receipt_id), Some(digest)) = (receipt_id, digest) {
-                materialization_receipts.insert(receipt_id.to_string());
-                output_digests.insert(digest.to_string());
-            }
-        }
-    }
-
-    AutonomyMetrics {
-        work_items: work_items.len(),
-        proposed_work_items: proposed_work_items.len(),
-        distinct_proposers: proposers.len(),
-        bid_count: bids.len(),
-        distinct_bidders: bidders.len(),
-        accepted_work_items: accepted_work_items.len(),
-        claimed_work_items: claimed_work_items.len(),
-        autonomous_claimed_work_items: claimed_work_items
-            .intersection(&proposed_work_items)
-            .count(),
-        distinct_claimants: claimants.len(),
-        review_count: reviews.len(),
-        distinct_reviewers: reviewers.len(),
-        challenge_findings: challenge_findings.len(),
-        challenge_resolutions: challenge_resolutions.len(),
-        challenged_work_items: challenged_work_items.len(),
-        unresolved_challenged_work_items: unresolved_challenged_work_items.len(),
-        discussions: discussions.len(),
-        output_artifact_kinds: output_artifact_kinds.len(),
-        output_materializations: materialization_receipts.len(),
-        output_digests: output_digests.into_iter().collect(),
-    }
-}
-
-/// Provider/model-turn graphs also expose generic ExecutionWork contracts,
-/// but they are implementation detail rather than Team collaboration work.
-/// Restrict autonomy accounting to typed Programs and Team-bound Agent graphs.
-fn is_collaboration_work_projection(projection: &Value) -> bool {
-    projection
-        .pointer("/graph/orchestration/collaboration_program")
-        .is_some_and(Value::is_object)
-        || projection
-            .pointer("/graph/nodes")
-            .and_then(Value::as_array)
-            .is_some_and(|nodes| {
-                nodes.iter().any(|node| {
-                    node.get("team_run_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| !id.trim().is_empty())
-                })
+            .filter(|activity| {
+                activity
+                    .get("agent_instance_id")
+                    .and_then(Value::as_str)
+                    .is_some()
             })
-}
-
-fn collect_work_reviews(
-    state: &Value,
-    work_key: &str,
-    reviews: &mut BTreeSet<String>,
-    reviewers: &mut BTreeSet<String>,
-) {
-    for review in state
-        .get("reviews")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(reviewer) = review
-            .get("reviewer_instance_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        else {
-            continue;
-        };
-        let Some(submission_ref) = review
-            .get("submission_ref")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-        else {
-            continue;
-        };
-        let verdict = review
-            .get("verdict")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        reviewers.insert(reviewer.to_string());
-        reviews.insert(format!("{work_key}:{submission_ref}:{reviewer}:{verdict}"));
-    }
+            .all(|activity| {
+                matches!(
+                    activity.get("status").and_then(Value::as_str),
+                    Some("completed" | "failed" | "cancelled" | "canceled" | "skipped")
+                )
+            })
+    })
 }
 
 #[derive(Default)]
@@ -3663,6 +3565,8 @@ struct ProjectedTeamHealth {
     team_count: usize,
     completed_teams: usize,
     failed_teams: usize,
+    pending_tasks: usize,
+    completion_verdict_pending: bool,
 }
 
 impl ProjectedTeamHealth {
@@ -3682,12 +3586,11 @@ impl ProjectedTeamHealth {
     }
 
     fn has_pending_work(&self) -> bool {
-        // A blocked/partial Team is a terminal outcome for evaluator waiting:
-        // it must make acceptance fail, but it must not keep the harness
-        // polling for an hour after every Agent has already retired. Team
-        // status is therefore evaluated by the acceptance checks, while the
-        // wait loop only considers non-terminal Agent work.
-        self.completed_agents.saturating_add(self.failed_agents) < self.agent_count
+        // Pending is a Task/Program fact, not an inferred difference between
+        // invited and terminal Agent counts. In particular, a Published Task
+        // has no claimant yet but the Runtime can still dispatch it, while an
+        // accepted Program awaiting its supervisor verdict can still close.
+        self.pending_tasks > 0 || self.completion_verdict_pending
     }
 
     fn to_value(&self) -> Value {
@@ -3698,225 +3601,118 @@ impl ProjectedTeamHealth {
             "teams": self.team_count,
             "completed_teams": self.completed_teams,
             "failed_teams": self.failed_teams,
+            "pending_tasks": self.pending_tasks,
+            "completion_verdict_pending": self.completion_verdict_pending,
             "has_pending_work": self.has_pending_work(),
         })
     }
 }
 
-fn projected_team_health(projections: &[Value]) -> ProjectedTeamHealth {
-    // A public root projection exposes the Team boundary while the child Team
-    // graph owns its Agent task displays. Assess the complete public lineage,
-    // rather than treating the root's intentionally agent-free projection as
-    // evidence that no managed Agents ran.
-    let mut teams = BTreeMap::<String, Value>::new();
-    let mut agents = BTreeMap::<String, String>::new();
-    for projection in projections {
-        for agent in projection
-            .get("agents")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let id = agent
-                .get("id")
-                .or_else(|| agent.get("agent_id"))
-                .or_else(|| agent.get("run_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("unidentified-agent");
-            let status = projected_status(agent).unwrap_or("unknown");
-            agents.insert(id.to_string(), status.to_string());
-        }
-        // Summary projections intentionally omit mutable Agent-store detail,
-        // but the canonical graph retains Runtime-derived public Agent
-        // identity and status on every AgentTask node. Terminal acceptance
-        // must not turn 16 completed managed Agents into zero merely because
-        // their process-local display snapshots have already retired.
-        for node in projection
-            .pointer("/graph/nodes")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|node| node.get("kind").and_then(Value::as_str) == Some("agent_task"))
-        {
-            let id = node
-                .get("agent_instance_id")
-                .or_else(|| node.get("agent_run_id"))
-                .or_else(|| node.get("node_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("unidentified-agent-node");
-            let status = node
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            agents.insert(id.to_string(), status.to_string());
-        }
-        for team in projection
-            .get("teams")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let id = team
-                .get("id")
-                .or_else(|| team.pointer("/detail/team_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("unidentified-team")
-                .to_string();
-            let candidate_task_count = team
-                .pointer("/detail/tasks")
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            let existing_task_count = teams
-                .get(&id)
-                .and_then(|existing| existing.pointer("/detail/tasks"))
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            if candidate_task_count >= existing_task_count {
-                teams.insert(id, team.clone());
+fn projected_team_health(program: &runtime::AgenticProgramProjection) -> ProjectedTeamHealth {
+    let mut accepted_agents = BTreeSet::new();
+    let mut failed_agents = BTreeSet::new();
+    let mut engaged_agent_ids = BTreeSet::new();
+    for task in active_agentic_tasks(program) {
+        let participants = task
+            .claimant
+            .iter()
+            .chain(task.reviewed_by.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        engaged_agent_ids.extend(participants.iter().cloned());
+        match task.status {
+            runtime::AgenticTaskStatus::Accepted => {
+                accepted_agents.extend(participants);
             }
+            runtime::AgenticTaskStatus::Blocked => {
+                failed_agents.extend(participants);
+            }
+            runtime::AgenticTaskStatus::Published
+            | runtime::AgenticTaskStatus::Claimed
+            | runtime::AgenticTaskStatus::Submitted
+            | runtime::AgenticTaskStatus::Rework
+            | runtime::AgenticTaskStatus::Superseded => {}
         }
     }
-    for team in teams.values() {
-        for task in team
-            .pointer("/detail/tasks")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let id = task
-                .get("run_id")
-                .or_else(|| task.get("node_id"))
-                .or_else(|| task.get("agent_id"))
-                .and_then(Value::as_str)
-                .unwrap_or("unidentified-team-task");
-            let status = projected_status(task).unwrap_or("unknown");
-            agents.insert(id.to_string(), status.to_string());
-        }
-    }
-    let completed_agents = agents
-        .values()
-        .filter(|status| status.as_str() == "completed")
+    let engaged_agents = engaged_agent_ids
+        .iter()
+        .filter(|agent_id| program.agents.contains_key(*agent_id))
         .count();
-    let failed_agents = agents
-        .values()
-        .filter(|status| projected_status_name_is_failure(status))
-        .count();
-    let completed_teams = teams
+    let completed_teams = program
+        .teams
         .values()
         .filter(|team| {
+            let tasks = team
+                .task_ids
+                .iter()
+                .filter_map(|task_id| program.tasks.get(task_id))
+                .filter(|task| task.status != runtime::AgenticTaskStatus::Superseded)
+                .collect::<Vec<_>>();
+            !tasks.is_empty()
+                && tasks
+                    .iter()
+                    .all(|task| task.status == runtime::AgenticTaskStatus::Accepted)
+        })
+        .count();
+    let failed_teams = program
+        .teams
+        .values()
+        .filter(|team| {
+            team.task_ids.iter().any(|task_id| {
+                program
+                    .tasks
+                    .get(task_id)
+                    .is_some_and(|task| task.status == runtime::AgenticTaskStatus::Blocked)
+            })
+        })
+        .count();
+    let pending_tasks = active_agentic_tasks(program)
+        .filter(|task| {
             matches!(
-                projected_status(team),
-                Some("completed" | "terminal" | "passed")
+                task.status,
+                runtime::AgenticTaskStatus::Published
+                    | runtime::AgenticTaskStatus::Claimed
+                    | runtime::AgenticTaskStatus::Submitted
+                    | runtime::AgenticTaskStatus::Rework
             )
         })
         .count();
-    let failed_teams = teams
-        .values()
-        .filter(|team| projected_status_is_failure(team))
-        .count();
     ProjectedTeamHealth {
-        agent_count: agents.len(),
-        completed_agents,
-        failed_agents,
-        team_count: teams.len(),
+        agent_count: engaged_agents,
+        completed_agents: accepted_agents
+            .iter()
+            .filter(|agent_id| program.agents.contains_key(*agent_id))
+            .count(),
+        failed_agents: failed_agents
+            .iter()
+            .filter(|agent_id| program.agents.contains_key(*agent_id))
+            .count(),
+        team_count: program.teams.len(),
         completed_teams,
         failed_teams,
+        pending_tasks,
+        completion_verdict_pending: program.status
+            == runtime::AgenticProgramStatus::CompletionRequested,
     }
 }
 
-/// Count only fully claimed typed Program edges. A delivered edge still leaves
-/// its consumer unauthorised to run, so it is not evidence of a real merge.
-/// The set key keeps repeated lineage projections from inflating the result.
-fn claimed_cross_team_edge_count(projections: &[Value]) -> usize {
-    let mut claimed = BTreeSet::new();
-    for projection in projections {
-        let graph_id = projection
-            .pointer("/graph/graph_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unidentified-graph");
-        for edge in projection
-            .pointer("/graph/orchestration/collaboration_program/edges")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if edge.get("state").and_then(Value::as_str) == Some("claimed")
-                && edge.get("delivery_receipt").is_some_and(Value::is_object)
-                && edge.get("claim_receipt").is_some_and(Value::is_object)
-            {
-                let edge_id = edge
-                    .get("edge_id")
-                    .or_else(|| edge.get("id"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unidentified-edge");
-                claimed.insert(format!("{graph_id}:{edge_id}"));
-            }
-        }
-    }
-    claimed.len()
-}
-
-/// Count only applied, Runtime-attested escalation receipts. A model's tool
-/// request or a generic patch is not sufficient: the receipt must be recorded
-/// on the durable root Program projection after the fenced graph revision wins.
-fn applied_escalation_count(projections: &[Value]) -> usize {
-    let mut escalations = BTreeSet::new();
-    for projection in projections {
-        let graph_id = projection
-            .pointer("/graph/graph_id")
-            .and_then(Value::as_str)
-            .unwrap_or("unidentified-graph");
-        for escalation in projection
-            .pointer("/graph/orchestration/collaboration_escalations")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(escalation_id) = escalation.get("escalation_id").and_then(Value::as_str)
-            else {
+fn accepted_cross_team_dependency_count(program: &runtime::AgenticProgramProjection) -> usize {
+    let mut dependencies = BTreeSet::new();
+    for task in active_agentic_tasks(program)
+        .filter(|task| task.status == runtime::AgenticTaskStatus::Accepted)
+    {
+        for dependency_id in &task.depends_on {
+            let Some(dependency) = program.tasks.get(dependency_id) else {
                 continue;
             };
-            if escalation
-                .get("applied_graph_revision")
-                .and_then(Value::as_u64)
-                .is_some_and(|revision| revision > 0)
+            if dependency.status == runtime::AgenticTaskStatus::Accepted
+                && dependency.team_id != task.team_id
             {
-                escalations.insert(format!("{graph_id}:{escalation_id}"));
+                dependencies.insert((dependency.task_id.clone(), task.task_id.clone()));
             }
         }
     }
-    escalations.len()
-}
-
-fn projected_status(value: &Value) -> Option<&str> {
-    value
-        .get("status")
-        .and_then(Value::as_str)
-        .or_else(|| value.pointer("/detail/status").and_then(Value::as_str))
-}
-
-fn projected_status_is_failure(value: &Value) -> bool {
-    projected_status(value).is_some_and(projected_status_name_is_failure)
-}
-
-/// `partial` is a durable terminal outcome, but it does not satisfy a Team's
-/// required completion contract. Treat it like every other unsuccessful
-/// terminal status so the evaluator reports the real contract gap promptly
-/// instead of polling a graph that can no longer make progress.
-fn projected_status_name_is_failure(status: &str) -> bool {
-    matches!(
-        status,
-        "partial"
-            | "blocked"
-            | "failed"
-            | "cancelled"
-            | "canceled"
-            | "skipped"
-            | "timed_out"
-            | "timeout"
-            | "unavailable"
-            | "error"
-    )
+    dependencies.len()
 }
 
 fn checked_source_receipt_count(timeline: &Value, projections: &[Value]) -> usize {
@@ -4048,9 +3844,8 @@ fn collaboration_comparison(scenarios: &[Value]) -> Value {
         .zip(team_wall)
         .is_some_and(|(single, team)| team <= single.saturating_mul(80) / 100)
         && quality_delta_pp.is_some_and(|delta| delta >= -2);
-    // Root scenario metrics intentionally describe the root graph only. Team
-    // work runs in child graphs, so the durable acceptance checks, rather than
-    // root metrics, are the source of truth for Team and merge evidence.
+    // Durable Agent-first facts, rather than transient root metrics, are the
+    // source of truth for Team participation and cross-Team dependencies.
     let team_capability_passed = team.is_some_and(|scenario| {
         scenario.get("status").and_then(Value::as_str) == Some("passed")
             && scenario
@@ -4058,12 +3853,13 @@ fn collaboration_comparison(scenarios: &[Value]) -> Value {
                 .and_then(Value::as_array)
                 .is_some_and(|checks| {
                     let teams_completed = checks.iter().any(|check| {
-                        check.get("name").and_then(Value::as_str) == Some("completed_evidence_team")
+                        check.get("name").and_then(Value::as_str)
+                            == Some("accepted_agent_first_teams")
                             && check.get("passed").and_then(Value::as_bool) == Some(true)
                             && check
-                                .get("agents")
+                                .get("engaged_agents")
                                 .and_then(Value::as_u64)
-                                .is_some_and(|agents| agents >= 6)
+                                .is_some_and(|agents| agents >= 3)
                             && check
                                 .get("teams")
                                 .and_then(Value::as_u64)
@@ -4071,7 +3867,7 @@ fn collaboration_comparison(scenarios: &[Value]) -> Value {
                     });
                     let merge_claimed = checks.iter().any(|check| {
                         check.get("name").and_then(Value::as_str)
-                            == Some("claimed_cross_team_edges")
+                            == Some("accepted_cross_team_dependencies")
                             && check.get("passed").and_then(Value::as_bool) == Some(true)
                             && check
                                 .get("observed")
@@ -4107,7 +3903,7 @@ fn collaboration_comparison(scenarios: &[Value]) -> Value {
         },
         "team_capability": {
             "passed": team_capability_passed,
-            "requirement": "the explicit-team scenario has three completed Teams, at least six completed Agents, and two claimed typed cross-Team edges into its merge"
+            "requirement": "the Agent-first scenario has at least three accepted Teams, three engaged Agents, and two accepted cross-Team Task dependencies"
         },
         "efficiency_proven": efficiency_proven,
         "efficiency_note": if efficiency_proven {

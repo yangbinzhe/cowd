@@ -65,33 +65,19 @@ pub struct ExecutionNodeProjection {
     pub usage: ExecutionUsage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<ExecutionWorkProjection>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub work_state: Option<super::ExecutionWorkRuntimeState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ExecutionWorkProjection {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub collaboration_work_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub objective: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proposed_by: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub proposal_evidence_refs: Vec<String>,
     pub role: ExecutionWorkRole,
     pub required: bool,
     pub dependency: ExecutionDependencyPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancellation_group: Option<String>,
-    #[serde(default)]
-    pub eligibility: super::ExecutionWorkEligibility,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_artifact_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_artifact_kinds: Vec<String>,
-    #[serde(default)]
-    pub review_policy: super::ExecutionWorkReviewPolicy,
     pub expected_input_tokens: u64,
     pub expected_output_tokens: u64,
     pub expected_duration_ms: u64,
@@ -101,18 +87,12 @@ pub struct ExecutionWorkProjection {
 impl From<&ExecutionWorkContract> for ExecutionWorkProjection {
     fn from(work: &ExecutionWorkContract) -> Self {
         Self {
-            collaboration_work_id: work.collaboration_work_id.clone(),
-            objective: work.objective.clone(),
-            proposed_by: work.proposed_by.clone(),
-            proposal_evidence_refs: work.proposal_evidence_refs.clone(),
             role: work.role,
             required: work.required,
             dependency: work.dependency.clone(),
             cancellation_group: work.cancellation_group.clone(),
-            eligibility: work.eligibility.clone(),
             input_artifact_refs: work.input_artifact_refs.clone(),
             output_artifact_kinds: work.output_artifact_kinds.clone(),
-            review_policy: work.review_policy.clone(),
             expected_input_tokens: work.expected_input_tokens,
             expected_output_tokens: work.expected_output_tokens,
             expected_duration_ms: work.expected_duration_ms,
@@ -145,10 +125,6 @@ pub struct ExecutionGraphProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<ExecutionOrchestrationMetadata>,
     pub nodes: Vec<ExecutionNodeProjection>,
-    /// Runtime-owned, Agent-proposed work that is executed by already active
-    /// managed Agents rather than scheduled as a second physical graph node.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub autonomous_work: Vec<AutonomousWorkProjection>,
     pub edges: Vec<ExecutionEdgeProjection>,
     pub commit_cursor: u64,
     pub terminal_result_ref: Option<String>,
@@ -158,13 +134,6 @@ pub struct ExecutionGraphProjection {
     pub terminal_presentation: Option<crate::outcome::TerminalPresentation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<ExecutionWorkGraphProjection>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct AutonomousWorkProjection {
-    pub work_id: String,
-    pub work: ExecutionWorkProjection,
-    pub state: super::ExecutionWorkRuntimeState,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -231,20 +200,7 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
                         .unwrap_or_default(),
                     usage: result.map(|value| value.usage.clone()).unwrap_or_default(),
                     work: node.work.as_ref().map(ExecutionWorkProjection::from),
-                    work_state: node
-                        .work
-                        .as_ref()
-                        .map(|_| public_work_state(graph.work_states.get(&node.id))),
                 }
-            })
-            .collect(),
-        autonomous_work: graph
-            .autonomous_work
-            .iter()
-            .map(|(work_id, work)| AutonomousWorkProjection {
-                work_id: work_id.clone(),
-                work: ExecutionWorkProjection::from(work),
-                state: public_work_state(graph.work_states.get(work_id)),
             })
             .collect(),
         edges: graph
@@ -270,18 +226,6 @@ pub fn project_execution_graph(graph: &ExecutionGraph) -> ExecutionGraphProjecti
     }
 }
 
-fn public_work_state(
-    state: Option<&super::ExecutionWorkRuntimeState>,
-) -> super::ExecutionWorkRuntimeState {
-    let mut state = state.cloned().unwrap_or_default();
-    if let Some(claim) = state.claim.as_mut() {
-        // A claim token is a write authority, not an observability field.
-        // The binding-scoped control response returns it only to its owner.
-        claim.claim_token = "<redacted>".to_string();
-    }
-    state
-}
-
 fn public_payload_ref(node_id: &str) -> String {
     format!("execution-payload:{node_id}")
 }
@@ -305,10 +249,6 @@ fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
         if let Ok(packet) = serde_json::from_str::<crate::agent::AgentTaskPacket>(&node.payload_ref)
         {
             let role_id = Some(packet.assignment.role_id.clone());
-            let focus_id = packet
-                .team_role_identity
-                .as_ref()
-                .map(|identity| identity.focus_id.clone());
             let display = packet
                 .binding
                 .as_ref()
@@ -337,7 +277,7 @@ fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
                 agent_instance_id: Some(packet.assignment.instance_id.clone()),
                 agent_run_id: Some(packet.assignment.run_id.clone()),
                 role_id,
-                focus_id,
+                focus_id: display_focus_label.clone(),
                 display_label,
                 display_role_label,
                 display_focus_label,
@@ -347,31 +287,12 @@ fn public_node_identity(node: &super::ExecutionNodeSpec) -> PublicNodeIdentity {
         }
         if let Ok(intent) = serde_json::from_str::<crate::agent::AgentTaskIntent>(&node.payload_ref)
         {
-            let role_id = intent
-                .team_role_identity
-                .as_ref()
-                .map(|identity| identity.role_id.clone());
-            let focus_id = intent
-                .team_role_identity
-                .as_ref()
-                .map(|identity| identity.focus_id.clone());
             return PublicNodeIdentity {
                 team_run_id: intent.team_id,
                 agent_run_id: Some(intent.run_id),
-                role_id: role_id.clone(),
-                focus_id: focus_id.clone(),
+                role_id: None,
+                focus_id: None,
                 display_label: Some("Agent".to_string()),
-                ..PublicNodeIdentity::default()
-            };
-        }
-    }
-    if node.kind == ExecutionNodeKind::Subgraph {
-        if let Ok(request) =
-            serde_json::from_str::<crate::team::TeamInstantiationRequest>(&node.payload_ref)
-        {
-            return PublicNodeIdentity {
-                team_run_id: Some(request.team_id),
-                display_label: request.display_name.or_else(|| Some(request.objective)),
                 ..PublicNodeIdentity::default()
             };
         }

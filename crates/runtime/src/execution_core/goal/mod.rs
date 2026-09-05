@@ -318,11 +318,10 @@ impl GoalStore {
                     let previous_goal = goal
                         .as_ref()
                         .ok_or_else(|| "goal revision precedes goal creation".to_string())?;
-                    GoalProgressReducer::reconcile_goal(
-                        progress.as_mut().expect("goal progress initialized"),
-                        previous_goal,
-                        &event_goal,
-                    );
+                    let goal_progress = progress
+                        .as_mut()
+                        .ok_or_else(|| "goal progress was not initialized".to_string())?;
+                    GoalProgressReducer::reconcile_goal(goal_progress, previous_goal, &event_goal);
                 }
                 goal = Some(event_goal);
             }
@@ -751,16 +750,14 @@ impl GoalStore {
         }
         let next_sequence = current.user_sequence.saturating_add(1);
         self.revise(goal_id, expected_revision, next_sequence, reason, |goal| {
-            let recovery = goal
-                .recovery
-                .as_mut()
-                .expect("recovery checked before transition");
-            recovery.status = status;
-            if mutation_id.is_some() {
-                recovery.mutation_id = mutation_id.clone();
-            }
-            if let Some(diagnostic) = diagnostic.clone() {
-                recovery.last_diagnostic = Some(diagnostic);
+            if let Some(recovery) = goal.recovery.as_mut() {
+                recovery.status = status;
+                if mutation_id.is_some() {
+                    recovery.mutation_id = mutation_id.clone();
+                }
+                if let Some(diagnostic) = diagnostic.clone() {
+                    recovery.last_diagnostic = Some(diagnostic);
+                }
             }
             vec!["recovery.status".to_string()]
         })
@@ -802,11 +799,9 @@ impl GoalStore {
             next_sequence,
             "objective_recovery_committed",
             |goal| {
-                let recovery = goal
-                    .recovery
-                    .as_mut()
-                    .expect("recovery checked before revision");
-                recovery.status = ObjectiveRecoveryStatus::Committed;
+                if let Some(recovery) = goal.recovery.as_mut() {
+                    recovery.status = ObjectiveRecoveryStatus::Committed;
+                }
                 vec!["recovery.status".to_string()]
             },
         )

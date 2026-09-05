@@ -454,7 +454,11 @@ fn visible_skill_refs(profile: &AgentSkillProfile) -> Vec<String> {
 }
 
 fn matches_skill_ref(skill: &SkillCapabilityProfile, reference: &str) -> bool {
-    skill.skill_id.eq_ignore_ascii_case(reference) || skill.name.eq_ignore_ascii_case(reference)
+    skill.skill_id.eq_ignore_ascii_case(reference)
+        || skill.name.eq_ignore_ascii_case(reference)
+        || skill.version.as_ref().is_some_and(|version| {
+            reference.eq_ignore_ascii_case(&format!("{}@{version}", skill.skill_id))
+        })
 }
 
 fn select_adapter(

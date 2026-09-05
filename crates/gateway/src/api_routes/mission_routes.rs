@@ -41,26 +41,6 @@ pub(super) fn router() -> Router<Arc<AppState>> {
             post(interpret_mission_command_handler),
         )
         .route(
-            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS.template(),
-            get(collaboration_runs_handler),
-        )
-        .route(
-            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_RUN.template(),
-            get(collaboration_run_handler),
-        )
-        .route(
-            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_CANCEL.template(),
-            post(cancel_team_runtime_handler),
-        )
-        .route(
-            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EXECUTION.template(),
-            get(team_execution_plan_handler),
-        )
-        .route(
-            surface::gateway_api::paths::API_MISSION_CONTROL_TEAMS_BY_TEAM_ID_EVIDENCE.template(),
-            get(team_mission_evidence_handler),
-        )
-        .route(
             surface::gateway_api::paths::API_MISSION_CONTROL_AGENTS_BY_AGENT_ID_EVENTS.template(),
             get(agent_mission_events_handler),
         )
@@ -337,61 +317,11 @@ async fn interpret_mission_command_handler(
     Json(state.services.mission.interpret_mission_command(body).await)
 }
 
-async fn collaboration_runs_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-) -> impl IntoResponse {
-    Json(state.services.mission.collaboration_runs())
-}
-
-async fn collaboration_run_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(team_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .mission
-        .collaboration_run(&team_id)
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
-}
-
-async fn cancel_team_runtime_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(team_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .mission
-        .cancel_team_runtime(&team_id)
-        .await
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
-}
-
-async fn team_execution_plan_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(team_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    state
-        .services
-        .mission
-        .team_execution_plan(&team_id)
-        .map(Json)
-        .map_err(|error| api_error(StatusCode::NOT_FOUND, error))
-}
-
 async fn agent_mission_events_handler(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(agent_id): Path<String>,
 ) -> impl IntoResponse {
     Json(state.services.mission.agent_mission_events(&agent_id))
-}
-
-async fn team_mission_evidence_handler(
-    AxumState(state): AxumState<Arc<AppState>>,
-    Path(team_id): Path<String>,
-) -> impl IntoResponse {
-    Json(state.services.mission.team_mission_evidence(&team_id))
 }
 
 async fn mission_approvals_handler(

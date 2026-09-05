@@ -4,33 +4,22 @@
 //! `execution_core::StrategyDecisionEngine`. This module only carries tunable
 //! resource, safety, memory, and observability policy.
 
-use harness_contract::team::TeamExecutionCapacitySnapshot;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Absolute allocation guard, deliberately distinct from a deployable
-/// collaboration limit.  Profiles above this value are rejected before any
-/// Team graph allocation can happen.
-pub const MAX_REPRESENTABLE_TEAM_AGENT_NODES: usize = 1_024;
-
-/// Operator-owned collaboration and admission policy.  It contains every
-/// normal execution bound that used to be scattered through compiler, Team,
-/// approval and ResourceManager defaults.
+/// Operator-owned collaboration admission policy. Queue dimensions and the
+/// aging interval are the only admission controls represented here; agent
+/// width is supplied by the agent control policy and enforced by the runtime
+/// scheduler.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollaborationCapacityPolicy {
     pub profile_id: String,
     pub revision: u64,
-    pub max_program_teams: usize,
-    pub max_team_roles: usize,
-    pub max_role_instances_per_team: usize,
-    pub max_agent_nodes_per_team: usize,
     pub max_pending_instance: usize,
     pub max_pending_per_class: usize,
     pub max_pending_per_key: usize,
     pub admission_aging_interval_ms: u64,
-    pub user_team_veto_window_ms: u64,
-    pub max_semantic_revisions_per_turn: usize,
 }
 
 impl Default for CollaborationCapacityPolicy {
@@ -38,16 +27,10 @@ impl Default for CollaborationCapacityPolicy {
         Self {
             profile_id: "default-balanced".to_string(),
             revision: 1,
-            max_program_teams: 32,
-            max_team_roles: 32,
-            max_role_instances_per_team: 32,
-            max_agent_nodes_per_team: 32,
             max_pending_instance: 4_096,
             max_pending_per_class: 2_048,
             max_pending_per_key: 512,
             admission_aging_interval_ms: 5_000,
-            user_team_veto_window_ms: 5_000,
-            max_semantic_revisions_per_turn: 2,
         }
     }
 }
@@ -56,51 +39,33 @@ impl CollaborationCapacityPolicy {
     pub fn validate(&self) -> Result<(), String> {
         if self.profile_id.trim().is_empty()
             || self.revision == 0
-            || self.max_program_teams == 0
-            || self.max_team_roles == 0
-            || self.max_role_instances_per_team == 0
-            || self.max_agent_nodes_per_team == 0
-            || self.max_agent_nodes_per_team > MAX_REPRESENTABLE_TEAM_AGENT_NODES
             || self.max_pending_instance == 0
             || self.max_pending_per_class == 0
             || self.max_pending_per_key == 0
             || self.max_pending_per_class > self.max_pending_instance
             || self.max_pending_per_key > self.max_pending_per_class
             || self.admission_aging_interval_ms == 0
-            || self.user_team_veto_window_ms == 0
-            || self.max_semantic_revisions_per_turn == 0
         {
             return Err("invalid collaboration capacity policy".to_string());
         }
-        // The concrete Team validator checks the sum of its declared role
-        // cardinalities against `max_agent_nodes_per_team`.  Multiplying two
-        // independent maxima here would reject the locked defaults (32 roles,
-        // each individually allowed up to 32) even though a real Team may use
-        // only one instance per role.
         Ok(())
     }
 }
 
 /// Fully resolved operator profile used by one Runtime process. The Agent
-/// width comes from the existing control policy, then every admission freezes
-/// this value into a contract-owned Team snapshot and Program ledger.
+/// width comes from the agent control policy and queue dimensions are frozen
+/// into this process profile. Runtime admission uses this profile directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionCapacityProfile {
     pub schema_version: u16,
     pub profile_id: String,
     pub revision: u64,
     pub digest: String,
-    pub max_program_teams: usize,
-    pub max_team_roles: usize,
-    pub max_role_instances_per_team: usize,
-    pub max_agent_nodes_per_team: usize,
     pub max_parallel_agents: usize,
     pub max_pending_instance: usize,
     pub max_pending_per_class: usize,
     pub max_pending_per_key: usize,
     pub admission_aging_interval_ms: u64,
-    pub user_team_veto_window_ms: u64,
-    pub max_semantic_revisions_per_turn: usize,
 }
 
 impl ExecutionCapacityProfile {
@@ -117,54 +82,27 @@ impl ExecutionCapacityProfile {
             profile_id: policy.profile_id.clone(),
             revision: policy.revision,
             digest: String::new(),
-            max_program_teams: policy.max_program_teams,
-            max_team_roles: policy.max_team_roles,
-            max_role_instances_per_team: policy.max_role_instances_per_team,
-            max_agent_nodes_per_team: policy.max_agent_nodes_per_team,
             max_parallel_agents,
             max_pending_instance: policy.max_pending_instance,
             max_pending_per_class: policy.max_pending_per_class,
             max_pending_per_key: policy.max_pending_per_key,
             admission_aging_interval_ms: policy.admission_aging_interval_ms,
-            user_team_veto_window_ms: policy.user_team_veto_window_ms,
-            max_semantic_revisions_per_turn: policy.max_semantic_revisions_per_turn,
         };
         profile.digest = profile.compute_digest();
         Ok(profile)
     }
 
-    #[must_use]
-    pub fn team_snapshot(&self) -> TeamExecutionCapacitySnapshot {
-        TeamExecutionCapacitySnapshot {
-            schema_version: self.schema_version,
-            profile_id: self.profile_id.clone(),
-            revision: self.revision,
-            digest: self.digest.clone(),
-            max_program_teams: self.max_program_teams,
-            max_team_roles: self.max_team_roles,
-            max_role_instances_per_team: self.max_role_instances_per_team,
-            max_agent_nodes_per_team: self.max_agent_nodes_per_team,
-            max_parallel_agents: self.max_parallel_agents,
-        }
-    }
-
     fn compute_digest(&self) -> String {
         let canonical = format!(
-            "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
+            "{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}\u{0}{}",
             self.schema_version,
             self.profile_id,
             self.revision,
-            self.max_program_teams,
-            self.max_team_roles,
-            self.max_role_instances_per_team,
-            self.max_agent_nodes_per_team,
             self.max_parallel_agents,
             self.max_pending_instance,
             self.max_pending_per_class,
             self.max_pending_per_key,
             self.admission_aging_interval_ms,
-            self.user_team_veto_window_ms,
-            self.max_semantic_revisions_per_turn,
         );
         format!("sha256:{:x}", Sha256::digest(canonical.as_bytes()))
     }
@@ -368,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_profile_binds_agent_width_into_a_stable_team_snapshot() {
+    fn resolved_profile_binds_agent_width_and_queue_into_a_stable_profile() {
         let policy = RuntimeControlPolicy::default();
         let profile = ExecutionCapacityProfile::resolve(&policy.capacity, 7)
             .expect("valid default capacity profile");
@@ -376,8 +314,8 @@ mod tests {
             .expect("same inputs resolve identically");
 
         assert_eq!(profile.digest, same_profile.digest);
-        assert_eq!(profile.team_snapshot().max_parallel_agents, 7);
-        assert_eq!(profile.team_snapshot().max_agent_nodes_per_team, 32);
+        assert_eq!(profile.max_parallel_agents, 7);
+        assert_eq!(profile.max_pending_instance, 4_096);
     }
 
     #[test]
