@@ -111,7 +111,11 @@ impl ExecutionPatternCatalog {
                         "implementation_review_fix",
                     ],
                     &["agentic_program", "agent_runtime", "evidence_ledger"],
-                    RuntimeCompileTarget::EvidenceGraph,
+                    // Collaboration is an ownership/topology choice, not a
+                    // read-only execution class. Teams may research only, or
+                    // may implement and verify under the same permission,
+                    // resource, risk, and approval gates used by Execute.
+                    RuntimeCompileTarget::ExecutionGraph,
                 ),
                 spec(
                     Supervise,
@@ -218,5 +222,24 @@ mod tests {
                 "{pattern:?}"
             );
         }
+    }
+
+    #[test]
+    fn collaboration_compiles_real_work_without_bypassing_execution_gates() {
+        let catalog = ExecutionPatternCatalog::current();
+        let specification = catalog
+            .find(ExecutionPattern::Collaborate)
+            .expect("collaboration pattern");
+        assert_eq!(
+            specification.compile_target,
+            RuntimeCompileTarget::ExecutionGraph,
+            "implementation-plus-review collaboration must admit bounded mutation work"
+        );
+        assert!(ExecutionPattern::Collaborate
+            .supported_gates()
+            .contains(&harness_contract::core::ExecutionPolicyGate::Permission));
+        assert!(ExecutionPattern::Collaborate
+            .supported_modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::WithGuardrails));
     }
 }

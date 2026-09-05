@@ -93,8 +93,13 @@ impl InterventionPolicy {
         let failed_tools = recent
             .iter()
             .copied()
-            .filter(|observation| {
-                observation.failed()
+            .take_while(|observation| {
+                // Failures are actionable only while they form the newest
+                // unresolved episode. Each observation is evaluated when it
+                // arrives, so later verified progress closes the old episode
+                // instead of inheriting its recovery pressure forever.
+                observation.kind == RuntimeObservationKind::ToolProgress
+                    && observation.failed()
                     && observation.failure_class == Some(ObservationFailureClass::Tool)
             })
             .collect::<Vec<_>>();
@@ -133,7 +138,7 @@ impl InterventionPolicy {
         let repeated_success = recent
             .iter()
             .copied()
-            .filter(|observation| {
+            .take_while(|observation| {
                 observation.kind == RuntimeObservationKind::ToolProgress
                     && !observation.failed()
                     && !observation.has_verified_gain()
@@ -194,8 +199,9 @@ impl InterventionPolicy {
         let failed_provider_steps = recent
             .iter()
             .copied()
-            .filter(|observation| {
-                observation.failed()
+            .take_while(|observation| {
+                observation.kind == RuntimeObservationKind::ProviderProgress
+                    && observation.failed()
                     && observation.failure_class == Some(ObservationFailureClass::Provider)
             })
             .count();
@@ -435,6 +441,54 @@ mod tests {
                 .unwrap()
                 .kind,
             RuntimeInterventionKind::Synthesize
+        );
+    }
+
+    #[test]
+    fn verified_tool_progress_closes_an_older_failure_episode() {
+        let mut failed = observation(1, RuntimeObservationKind::ToolProgress, "tool:failed");
+        failed.result_class = ObservationResultClass::Failed;
+        failed.failure_class = Some(ObservationFailureClass::Tool);
+        let mut recovered = observation(2, RuntimeObservationKind::ToolProgress, "tool:recovered");
+        recovered.result_class = ObservationResultClass::Succeeded;
+        recovered.information_gain = InformationGain {
+            distinguishing_evidence_refs: vec!["agentic_changed:team:recovered".to_string()],
+            resolved_unknown_refs: Vec::new(),
+            provenance: MeasureProvenance::Observed,
+        };
+        recovered.evidence_delta.added = vec!["agentic_changed:team:recovered".to_string()];
+
+        assert_eq!(
+            InterventionPolicy
+                .propose(&goal(), &progress(), &[failed, recovered])
+                .unwrap()
+                .kind,
+            RuntimeInterventionKind::Continue
+        );
+    }
+
+    #[test]
+    fn successful_provider_progress_closes_an_older_failure_episode() {
+        let mut failed = observation(
+            1,
+            RuntimeObservationKind::ProviderProgress,
+            "provider:failed",
+        );
+        failed.result_class = ObservationResultClass::Failed;
+        failed.failure_class = Some(ObservationFailureClass::Provider);
+        let mut recovered = observation(
+            2,
+            RuntimeObservationKind::ProviderProgress,
+            "provider:recovered",
+        );
+        recovered.result_class = ObservationResultClass::Succeeded;
+
+        assert_eq!(
+            InterventionPolicy
+                .propose(&goal(), &progress(), &[failed, recovered])
+                .unwrap()
+                .kind,
+            RuntimeInterventionKind::Continue
         );
     }
 

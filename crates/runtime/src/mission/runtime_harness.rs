@@ -718,8 +718,8 @@ mod tests {
             ),
             (
                 "使用多 Agent 并行审查 runtime gateway memory",
-                RuntimeCompileTarget::EvidenceGraph,
-                Some("gather-evidence"),
+                RuntimeCompileTarget::ExecutionGraph,
+                Some("execute"),
             ),
             (
                 "后台持续推进这项长期 mission 任务",
@@ -731,6 +731,12 @@ mod tests {
         for (prompt, target, expected_first_label) in prompts {
             let decision = StrategyDecisionEngine.decide(prompt, None);
             assert_eq!(decision.compile_target, target, "prompt: {prompt}");
+            if prompt.contains("多 Agent") {
+                assert!(!decision.strategy.understanding.requires_write);
+                assert!(!decision
+                    .modifiers()
+                    .contains(&harness_contract::core::ExecutionModifier::WithGuardrails));
+            }
             let lease_id = decision.lease.lease_id.clone();
             let kernel = RuntimeAiKernel::begin_turn_with_execution_decision(
                 "session-strategy-lease",

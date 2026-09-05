@@ -2843,6 +2843,96 @@
         );
     }
 
+    #[test]
+    fn collaboration_strategy_admits_agent_inspection_with_bounded_workspace_work() {
+        let runtime = ConversationRuntime::new(
+            Session::new(),
+            MockApi,
+            StaticToolExecutor::new()
+                .register(harness_contract::agent_action::STATE_INSPECT_TOOL_ID, |_| {
+                    Ok("inspected".to_string())
+                })
+                .register("write_file", |_| Ok("written".to_string())),
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system".to_string()],
+        )
+        .without_memory()
+        .with_runtime_event_store(Arc::new(
+            RuntimeEventStore::open_in_memory().expect("event store"),
+        ));
+        runtime
+            .begin_turn_strategy("turn-collaboration-work", "启动两个团队完成实现与复核")
+            .expect("admit collaboration strategy");
+        runtime
+            .bind_turn_strategy_execution("turn-collaboration-work", "graph-collaboration-work")
+            .expect("bind graph");
+
+        let calls = vec![
+            ModelToolCall {
+                id: "inspect".to_string(),
+                name: harness_contract::agent_action::STATE_INSPECT_TOOL_ID.to_string(),
+                input: "{}".to_string(),
+                depends_on: Vec::new(),
+            },
+            ModelToolCall {
+                id: "write".to_string(),
+                name: "write_file".to_string(),
+                input: r#"{"path":"target/report.md","content":"verified"}"#.to_string(),
+                depends_on: Vec::new(),
+            },
+        ];
+        let requests = calls
+            .iter()
+            .map(|call| crate::tool_dispatch::ToolRequest {
+                tool_use_id: call.id.clone(),
+                tool_name: call.name.clone(),
+                input: call.input.clone(),
+                depends_on: call.depends_on.clone(),
+            })
+            .collect::<Vec<_>>();
+        let prepared = runtime
+            .tool_executor()
+            .prepare_governed_invocations(&requests);
+        let plan = crate::GovernedToolCompiler
+            .compile(
+                &std::env::current_dir().expect("workspace"),
+                &requests,
+                |name, input| {
+                    prepared.iter().find_map(|invocation| {
+                        (invocation.intent.tool_name == name
+                            && invocation.intent.normalized_input == *input)
+                            .then(|| {
+                                (
+                                    invocation.effect.clone(),
+                                    invocation.catalog_revision,
+                                    invocation.descriptor_set_hash.clone(),
+                                )
+                            })
+                    })
+                },
+            )
+            .expect("governed mixed collaboration plan");
+        let decision = runtime
+            .retarget_active_turn_strategy_for_governed_plan(&plan, &calls)
+            .expect("retarget mixed collaboration work");
+
+        assert_eq!(
+            decision.pattern(),
+            harness_contract::core::ExecutionPattern::Collaborate
+        );
+        assert_eq!(
+            decision.compile_target,
+            crate::execution_core::RuntimeCompileTarget::ExecutionGraph
+        );
+        assert!(decision
+            .gates()
+            .contains(&harness_contract::core::ExecutionPolicyGate::Permission));
+        assert!(decision
+            .modifiers()
+            .contains(&harness_contract::core::ExecutionModifier::WithGuardrails));
+        assert!(plan.validate_against_execution_decision(&decision).allowed);
+    }
+
     #[tokio::test]
     async fn parallel_network_tool_batch_is_admitted_by_the_retargeted_strategy_lease() {
         let executions = Arc::new(AtomicUsize::new(0));

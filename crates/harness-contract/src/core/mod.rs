@@ -134,8 +134,11 @@ impl ExecutionPattern {
                 WithTrace,
             ],
             Self::Collaborate => &[
+                BoundedChange,
                 Parallel,
                 WithExternalResearch,
+                WithCheckpoint,
+                WithGuardrails,
                 WithReviewer,
                 WithTrace,
                 WithVerifier,
@@ -378,8 +381,11 @@ mod tests {
         assert_eq!(
             ExecutionPattern::Collaborate.supported_modifiers(),
             &[
+                BoundedChange,
                 Parallel,
                 WithExternalResearch,
+                WithCheckpoint,
+                WithGuardrails,
                 WithReviewer,
                 WithTrace,
                 WithVerifier,
