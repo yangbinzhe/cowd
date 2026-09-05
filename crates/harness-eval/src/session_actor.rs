@@ -114,13 +114,10 @@ impl<'a> SessionActor<'a> {
             return Ok(());
         }
         // Lease mutation is authorized against the exact attached writer
-        // Surface. Headers identify the caller, but the public command also
-        // requires the surface in its body; omitting it produced a misleading
-        // 403 during otherwise successful E2E cleanup.
-        let release_body = json!({
-            "session_id": self.session_id,
-            "surface": self.surface_id,
-        });
+        // Surface carried by the request headers. Keep the JSON body aligned
+        // with the public command contract instead of duplicating identity in
+        // two independently evolving fields.
+        let release_body = session_lease_release_body(&self.session_id);
         let release = send_json(
             self.writer_request(
                 self.client
@@ -257,5 +254,22 @@ fn result_summary(result: &Result<Value, String>) -> String {
     match result {
         Ok(_) => "ok".to_string(),
         Err(error) => error.clone(),
+    }
+}
+
+fn session_lease_release_body(session_id: &str) -> Value {
+    json!({"session_id": session_id})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lease_release_body_matches_the_gateway_contract() {
+        assert_eq!(
+            session_lease_release_body("session-1"),
+            json!({"session_id": "session-1"})
+        );
     }
 }

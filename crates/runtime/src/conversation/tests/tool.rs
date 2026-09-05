@@ -2650,6 +2650,10 @@
             "Give the final answer in English",
             "The task is complete."
         ));
+        assert!(!response_language_mismatch(
+            "只回答 7 乘以 8 的结果。",
+            "56"
+        ));
         assert!(!response_language_mismatch_for_role(
             "请调研并输出中文报告",
             "Internal evidence collected in English.",

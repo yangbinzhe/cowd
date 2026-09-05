@@ -1986,7 +1986,9 @@ fn test_collaboration_obligation(
 
 fn response_language_mismatch(objective: &str, response: &str) -> bool {
     let objective_uses_cjk = objective.chars().any(is_cjk_character);
-    objective_uses_cjk && !response.chars().any(is_cjk_character)
+    let response_uses_cjk = response.chars().any(is_cjk_character);
+    let response_uses_language_specific_text = response.chars().any(char::is_alphabetic);
+    objective_uses_cjk && response_uses_language_specific_text && !response_uses_cjk
 }
 
 fn response_language_mismatch_for_role(
