@@ -624,7 +624,13 @@ impl AgentRuntimeBackend for InProcessAgentWorker {
             let Some(checkpoint) = agent_autonomy_checkpoint(&services, &packet)? else {
                 break;
             };
-            let checkpoint_digest = autonomy_checkpoint_progress_digest(&checkpoint.prompt);
+            let checkpoint_digest = {
+                let receipts = tool_executor
+                    .receipts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                agent_autonomy_progress_digest(&checkpoint.prompt, &receipts)
+            };
             if previous_checkpoint_digest.as_deref() == Some(checkpoint_digest.as_str()) {
                 repeated_checkpoint_count = repeated_checkpoint_count.saturating_add(1);
             } else {

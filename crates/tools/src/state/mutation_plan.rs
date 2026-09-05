@@ -530,7 +530,11 @@ fn preview_text(value: &str) -> String {
     if value.len() <= LIMIT {
         value.to_string()
     } else {
-        format!("{}... [truncated]", &value[..LIMIT])
+        let boundary = (0..=LIMIT)
+            .rev()
+            .find(|index| value.is_char_boundary(*index))
+            .unwrap_or(0);
+        format!("{}... [truncated]", &value[..boundary])
     }
 }
 
@@ -546,6 +550,14 @@ mod tests {
         let path = root.join("file.txt");
         fs::write(&path, content).expect("write temp file");
         path
+    }
+
+    #[test]
+    fn preview_text_truncates_multibyte_content_on_a_utf8_boundary() {
+        let preview = preview_text(&"中".repeat(2_000));
+        assert!(preview.ends_with("... [truncated]"));
+        assert!(preview.is_char_boundary(preview.len()));
+        assert!(preview.len() <= 4000 + "... [truncated]".len());
     }
 
     #[test]

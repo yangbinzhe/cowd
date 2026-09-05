@@ -251,6 +251,45 @@ pub(super) fn autonomy_checkpoint_progress_digest(prompt: &str) -> String {
     format!("{:x}", Sha256::digest(canonical))
 }
 
+/// Bind the liveness fuse to semantic execution progress as well as Program
+/// state. Complex delegated work commonly needs several model turns to write,
+/// run and repair an artifact before it can be committed. Program state stays
+/// `Claimed` throughout that work, so a checkpoint-only digest incorrectly
+/// treats genuine file/test progress as a loop. Volatile receipt identities
+/// and sequence numbers are deliberately excluded: replaying the same read or
+/// command still converges, while a new target or content digest earns another
+/// bounded continuation.
+pub(super) fn agent_autonomy_progress_digest(
+    prompt: &str,
+    receipts: &[ScopedToolExecutionReceipt],
+) -> String {
+    let mut semantic_receipts = BTreeSet::new();
+    for receipt in receipts {
+        let targets = receipt
+            .observed_evidence
+            .iter()
+            .map(|evidence| format!("{:?}", evidence.target))
+            .collect::<BTreeSet<_>>();
+        semantic_receipts.insert(format!(
+            "{:?}|{}|{:?}|{:?}|{:?}|{:?}",
+            receipt.effect_kind,
+            receipt.tool_name,
+            receipt.resource_scopes,
+            receipt.paths,
+            receipt.after_digests,
+            targets,
+        ));
+    }
+    let stable_checkpoint = autonomy_checkpoint_progress_digest(prompt);
+    let mut hasher = Sha256::new();
+    hasher.update(stable_checkpoint.as_bytes());
+    for receipt in semantic_receipts {
+        hasher.update(b"\n");
+        hasher.update(receipt.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 pub(super) fn agent_autonomy_checkpoint(
     services: &Arc<RuntimeServices>,
     packet: &AgentTaskPacket,

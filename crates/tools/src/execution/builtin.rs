@@ -253,15 +253,7 @@ pub(super) fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, St
         Ok(response) => {
             let status = response.status().as_u16();
             let body = response.text().unwrap_or_default();
-            let truncated_body = if body.len() > 8192 {
-                format!(
-                    "{}\n\n[response truncated — {} bytes total]",
-                    &body[..8192],
-                    body.len()
-                )
-            } else {
-                body
-            };
+            let truncated_body = truncate_http_response_body(body, 8192);
             to_pretty_json(json!({
                 "url": input.url,
                 "method": method,
@@ -279,6 +271,21 @@ pub(super) fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, St
             "success": false
         })),
     }
+}
+
+fn truncate_http_response_body(body: String, max_bytes: usize) -> String {
+    if body.len() <= max_bytes {
+        return body;
+    }
+    let boundary = (0..=max_bytes)
+        .rev()
+        .find(|index| body.is_char_boundary(*index))
+        .unwrap_or(0);
+    format!(
+        "{}\n\n[response truncated — {} bytes total]",
+        &body[..boundary],
+        body.len()
+    )
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -384,4 +391,16 @@ pub(super) fn run_vision_analyze(lease: &ToolHostLease, input: &Value) -> Result
         "size_bytes": image_data.len(),
         "message": "Image prepared for multimodal LLM analysis. The conversation runtime will include this as a vision content block."
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_http_response_body;
+
+    #[test]
+    fn http_response_preview_is_utf8_boundary_safe() {
+        let preview = truncate_http_response_body("中".repeat(3_000), 8192);
+        assert!(preview.contains("response truncated"));
+        assert!(preview.is_char_boundary(preview.len()));
+    }
 }

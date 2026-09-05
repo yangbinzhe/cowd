@@ -937,7 +937,11 @@ pub(crate) fn truncate_content(content: &str, max_len: usize) -> String {
     if content.len() <= max_len {
         content.to_string()
     } else {
-        format!("{}...[truncated]", &content[..max_len])
+        let boundary = (0..=max_len)
+            .rev()
+            .find(|index| content.is_char_boundary(*index))
+            .unwrap_or(0);
+        format!("{}...[truncated]", &content[..boundary])
     }
 }
 
@@ -1033,5 +1037,6 @@ mod tests {
 
         let long = "a".repeat(100);
         assert!(truncate_content(&long, 50).contains("[truncated]"));
+        assert_eq!(truncate_content("中文内容", 4), "中...[truncated]");
     }
 }

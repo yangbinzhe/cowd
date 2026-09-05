@@ -2557,6 +2557,37 @@ fn autonomous_checkpoint_progress_digest_ignores_projection_revision_only() {
 }
 
 #[test]
+fn autonomy_progress_digest_advances_on_semantic_workspace_progress_not_receipt_replay() {
+    let prompt = "Runtime safe checkpoint committed.\n\n{\"kind\":\"runtime_agent_autonomy_checkpoint\",\"program_revision\":7,\"required_actions\":[{\"action\":\"execute_commit_submit\",\"task_ref\":\"task:1\"}]}";
+    let receipt = |sequence, digest: &str| ScopedToolExecutionReceipt {
+        sequence,
+        provider_invocation_id: Some(format!("provider:{sequence}")),
+        tool_name: "edit_file".to_string(),
+        effect_kind: harness_contract::tool::ToolEffectKind::Write,
+        resource_scopes: vec!["workspace:.".to_string()],
+        paths: vec!["result.md".to_string()],
+        prior_states: BTreeMap::new(),
+        after_digests: BTreeMap::from([("result.md".to_string(), Some(digest.to_string()))]),
+        observed_bytes: BTreeMap::new(),
+        observed_evidence: Vec::new(),
+    };
+    let first = receipt(1, "sha256:first");
+    let replay = receipt(2, "sha256:first");
+    let changed = receipt(3, "sha256:changed");
+
+    assert_eq!(
+        agent_autonomy_progress_digest(prompt, std::slice::from_ref(&first)),
+        agent_autonomy_progress_digest(prompt, &[first, replay]),
+        "volatile receipt identity must not defeat the liveness fuse"
+    );
+    assert_ne!(
+        agent_autonomy_progress_digest(prompt, &[]),
+        agent_autonomy_progress_digest(prompt, std::slice::from_ref(&changed)),
+        "new durable content must keep a complex task alive"
+    );
+}
+
+#[test]
 fn autonomous_checkpoint_never_repeats_after_non_satisfied_terminal() {
     use harness_contract::goal::GoalCompletion;
 

@@ -181,7 +181,7 @@ pub(super) fn render_skill_view_report(result: &SkillViewOutput) -> String {
         let preview = if result.content.len() > 500 {
             format!(
                 "{}...\n\n[Truncated - use /skill view {} --file <path> for full content]",
-                &result.content[..500],
+                utf8_prefix(&result.content, 500),
                 result.name
             )
         } else {
@@ -192,6 +192,27 @@ pub(super) fn render_skill_view_report(result: &SkillViewOutput) -> String {
         lines.push("  Result           not found".to_string());
     }
     lines.join("\n")
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let boundary = (0..=max_bytes)
+        .rev()
+        .find(|index| value.is_char_boundary(*index))
+        .unwrap_or(0);
+    &value[..boundary]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf8_prefix;
+
+    #[test]
+    fn skill_preview_prefix_is_utf8_boundary_safe() {
+        assert_eq!(utf8_prefix("中文内容", 4), "中");
+    }
 }
 
 pub(super) fn render_skills_usage(topic: Option<&str>) -> String {

@@ -3136,9 +3136,25 @@ pub(super) fn successful_tool_call_ids(messages: &[ConversationMessage]) -> BTre
         .filter_map(|block| match block {
             ContentBlock::ToolResult {
                 tool_use_id,
+                output,
                 is_error: false,
                 ..
-            } => Some(tool_use_id.clone()),
+            } => {
+                // Agent actions use a typed domain receipt: transport can succeed
+                // while the mutation itself is rejected (for example, an
+                // optimistic fence becoming stale because another Agent advanced
+                // the Program).  Such a receipt must remain visible to the model
+                // so it can inspect current state and retry, but it is not a
+                // successful call for protocol closure or novelty accounting.
+                let rejected_agent_action = serde_json::from_str::<
+                    harness_contract::agent_action::AgentActionObservation,
+                >(output)
+                .is_ok_and(|observation| {
+                    observation.status
+                        == harness_contract::agent_action::AgentActionStatus::Rejected
+                });
+                (!rejected_agent_action).then(|| tool_use_id.clone())
+            }
             _ => None,
         })
         .collect()

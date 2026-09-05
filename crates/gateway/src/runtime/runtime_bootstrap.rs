@@ -426,24 +426,16 @@ fn agent_action_definition<T: schemars::JsonSchema>(
     name: &str,
     description: &str,
 ) -> RuntimeToolDefinition {
-    let mut input_schema = serde_json::to_value(schemars::schema_for!(T))
+    let input_schema = serde_json::to_value(schemars::schema_for!(T))
         .unwrap_or_else(|_| json!({"type": "object", "additionalProperties": false}));
-    // Optimistic concurrency is part of every Agent action contract.  Keep
-    // the domain payload small while still letting a model fence a mutation
-    // against the revision returned by state_inspect.
-    if let Some(properties) = input_schema
-        .get_mut("properties")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        properties.insert(
-            "expected_revision".to_string(),
-            json!({
-                "type": "integer",
-                "minimum": 0,
-                "description": "Optional Program revision fence from the latest state_inspect receipt"
-            }),
-        );
-    }
+    // Program revisions are a global journal cursor, not a resource-local
+    // concurrency token. Exposing that volatile counter to autonomous Agents
+    // makes independent Team/Task mutations contend and turns harmless
+    // parallel progress into stale-revision retries. Runtime transition
+    // validation, attempt ownership and idempotency keys provide the actual
+    // mutation safety. The executor continues to accept an explicit fence for
+    // trusted non-model callers, but it is intentionally absent from the
+    // model-facing contract.
     RuntimeToolDefinition {
         name: name.to_string(),
         description: Some(description.to_string()),
@@ -661,10 +653,7 @@ mod tests {
             assert_eq!(action.required_permission, ToolPermissionMode::ReadOnly);
             assert_eq!(action.effect_resolver.resolver_id, "runtime.agent_action");
             assert_eq!(action.input_schema["additionalProperties"], false);
-            assert_eq!(
-                action.input_schema["properties"]["expected_revision"]["type"],
-                "integer"
-            );
+            assert!(action.input_schema["properties"]["expected_revision"].is_null());
         }
         assert_eq!(
             tools

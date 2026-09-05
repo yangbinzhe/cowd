@@ -687,6 +687,23 @@
 
     #[test]
     fn registered_network_effect_closes_focus_only_for_successful_calls() {
+        let rejected_action = harness_contract::agent_action::AgentActionObservation {
+            receipt_id: "rejection:stale".to_string(),
+            action_id: "action:stale".to_string(),
+            action: "task_review".to_string(),
+            program_id: "program:test".to_string(),
+            revision: 9,
+            status: harness_contract::agent_action::AgentActionStatus::Rejected,
+            duplicate: false,
+            changed_refs: Vec::new(),
+            actionable: vec!["inspect current state and retry".to_string()],
+            projection: None,
+            error: Some(harness_contract::agent_action::AgentActionErrorObservation {
+                code: "stale_revision".to_string(),
+                message: "expected Program revision 8, actual 9".to_string(),
+                recoverable: true,
+            }),
+        };
         let messages = vec![
             ConversationMessage {
                 role: crate::MessageRole::User,
@@ -708,6 +725,12 @@
                 }],
                 usage: None,
             },
+            ConversationMessage::tool_result(
+                "review-rejected",
+                "task_review",
+                serde_json::to_string(&rejected_action).expect("rejected action receipt"),
+                false,
+            ),
         ];
         let successful_ids = successful_tool_call_ids(&messages);
         assert_eq!(successful_ids, BTreeSet::from(["search-ok".to_string()]));
