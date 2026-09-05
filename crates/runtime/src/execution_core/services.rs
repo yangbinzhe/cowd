@@ -63,6 +63,25 @@ use composition::normalize_provider_fallbacks;
 #[path = "lifecycle_services.rs"]
 mod lifecycle_services;
 
+fn unique_agentic_packet_ref<'a>(
+    packet: &'a AgentTaskPacket,
+    prefix: &str,
+    field: &str,
+) -> Result<&'a str, String> {
+    let mut values = packet
+        .context_refs
+        .iter()
+        .filter_map(|reference| reference.strip_prefix(prefix))
+        .filter(|value| !value.trim().is_empty());
+    let value = values
+        .next()
+        .ok_or_else(|| format!("agent_actor_packet_has_no_{field}"))?;
+    if values.next().is_some() {
+        return Err(format!("agent_actor_packet_has_ambiguous_{field}"));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Error)]
 pub enum RuntimeServicesError {
     #[error(transparent)]
@@ -2182,53 +2201,112 @@ impl RuntimeServices {
         }
         let packet: AgentTaskPacket = serde_json::from_str(&node.payload_ref)
             .map_err(|error| format!("agent_actor_packet_invalid:{error}"))?;
-        let agentic_program_id = packet
-            .context_refs
-            .iter()
-            .find_map(|reference| reference.strip_prefix("agentic_program:"));
-        if let Some(program_id) = agentic_program_id {
-            let team_id = packet
-                .context_refs
-                .iter()
-                .find_map(|reference| reference.strip_prefix("agentic_team:"))
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| "agent_actor_packet_has_no_agentic_team".to_string())?;
-            let agent_id = packet
-                .context_refs
-                .iter()
-                .find_map(|reference| reference.strip_prefix("agentic_member:"))
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| "agent_actor_packet_has_no_agentic_member".to_string())?;
-            let projection = self
-                .agent_action_service()
-                .project(program_id)
-                .map_err(|error| format!("agent_actor_program_load_failed:{error}"))?;
-            let member = projection
-                .agents
-                .get(agent_id)
-                .ok_or_else(|| "agent_actor_is_not_in_program_roster".to_string())?;
-            if member.team_id != team_id {
-                return Err("agent_actor_agentic_team_mismatch".to_string());
-            }
-            return Ok(harness_contract::agent_action::AgentActorBinding {
-                objective_id: projection.objective_id,
-                program_id: program_id.to_string(),
-                session_id: projection.session_id,
-                turn_id: projection.turn_id,
-                root_execution_id: projection.root_execution_id,
-                required_team_count: projection.required_team_count,
-                objective_summary: projection.objective_summary,
-                model_lease: projection.model_lease,
-                permission_ceiling: Some(projection.permission_ceiling),
-                resource_scopes: projection.resource_scopes,
-                actor_id: agent_id.to_string(),
-                kind: harness_contract::agent_action::AgentActorKind::Agent,
-                execution_id: Some(parent.execution_id.clone()),
-                team_id: Some(team_id.to_string()),
-                agent_id: Some(agent_id.to_string()),
-            });
+        if graph.id != parent.execution_id
+            || packet.graph_id() != parent.execution_id
+            || packet.node_id() != parent.node_id
+        {
+            return Err("agent_actor_packet_parent_binding_mismatch".to_string());
         }
-        Err("agent_actor_packet_is_not_agent_first_bound".to_string())
+        let lineage = graph
+            .lineage
+            .as_ref()
+            .ok_or_else(|| "agent_actor_graph_has_no_lineage".to_string())?;
+        if packet.session_id() != lineage.session_id
+            || packet.task_id() != lineage.task_id
+            || packet.assignment.root_task_id != lineage.root_task_id
+            || packet.assignment.execution_identity.turn_id() != Some(lineage.turn_id.as_str())
+        {
+            return Err("agent_actor_packet_graph_lineage_mismatch".to_string());
+        }
+        let binding = packet
+            .binding
+            .as_ref()
+            .ok_or_else(|| "agent_actor_packet_has_no_runtime_binding".to_string())?;
+        binding
+            .validate()
+            .map_err(|error| format!("agent_actor_packet_binding_invalid:{error}"))?;
+        if packet.agent_id() != binding.instance.instance_id
+            || binding.data_lease.session_id != packet.session_id()
+            || binding.data_lease.task_id != packet.task_id()
+            || binding.data_lease.team_id.as_deref() != packet.team_id()
+            || crate::agent::binding::recompute_binding_digest(binding)
+                .map_err(|error| format!("agent_actor_packet_binding_invalid:{error}"))?
+                != binding.binding_digest
+        {
+            return Err("agent_actor_packet_binding_mismatch".to_string());
+        }
+        packet
+            .validate_cohort_prompt_package()
+            .map_err(|error| format!("agent_actor_packet_cohort_mismatch:{error}"))?;
+
+        let program_id = unique_agentic_packet_ref(&packet, "agentic_program:", "agentic_program")?;
+        let team_id = unique_agentic_packet_ref(&packet, "agentic_team:", "agentic_team")?;
+        let task_team_id =
+            unique_agentic_packet_ref(&packet, "agentic_task_team:", "agentic_task_team")?;
+        let agent_id = unique_agentic_packet_ref(&packet, "agentic_member:", "agentic_member")?;
+        let task_id = unique_agentic_packet_ref(&packet, "agentic_task:", "agentic_task")?;
+        let mode = unique_agentic_packet_ref(&packet, "agentic_mode:", "agentic_mode")?;
+        if !matches!(mode, "execute" | "review") {
+            return Err("agent_actor_packet_mode_invalid".to_string());
+        }
+
+        let projection = self
+            .agent_action_service()
+            .project(program_id)
+            .map_err(|error| format!("agent_actor_program_load_failed:{error}"))?;
+        let parent_execution_id = graph
+            .parent_execution
+            .as_ref()
+            .map(|binding| binding.execution_id.as_str());
+        if projection.session_id != lineage.session_id
+            || projection.turn_id != lineage.turn_id
+            || projection.root_execution_id.as_deref() != parent_execution_id
+        {
+            return Err("agent_actor_program_graph_lineage_mismatch".to_string());
+        }
+        let member = projection
+            .agents
+            .get(agent_id)
+            .ok_or_else(|| "agent_actor_is_not_in_program_roster".to_string())?;
+        if member.team_id != team_id {
+            return Err("agent_actor_agentic_team_mismatch".to_string());
+        }
+        let task = projection
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| "agent_actor_task_is_not_in_program".to_string())?;
+        if task.team_id != task_team_id
+            || packet.task_id() != task_id
+            || (mode == "execute" && member.team_id != task.team_id)
+        {
+            return Err("agent_actor_agentic_task_mismatch".to_string());
+        }
+        let display = binding
+            .display
+            .as_ref()
+            .ok_or_else(|| "agent_actor_packet_has_no_display_identity".to_string())?;
+        if display.agent_id != agent_id
+            || display.provenance != format!("runtime.agentic:{program_id}")
+        {
+            return Err("agent_actor_display_identity_mismatch".to_string());
+        }
+        return Ok(harness_contract::agent_action::AgentActorBinding {
+            objective_id: projection.objective_id,
+            program_id: program_id.to_string(),
+            session_id: projection.session_id,
+            turn_id: projection.turn_id,
+            root_execution_id: projection.root_execution_id,
+            required_team_count: projection.required_team_count,
+            objective_summary: projection.objective_summary,
+            model_lease: projection.model_lease,
+            permission_ceiling: Some(projection.permission_ceiling),
+            resource_scopes: projection.resource_scopes,
+            actor_id: agent_id.to_string(),
+            kind: harness_contract::agent_action::AgentActorKind::Agent,
+            execution_id: Some(parent.execution_id.clone()),
+            team_id: Some(team_id.to_string()),
+            agent_id: Some(agent_id.to_string()),
+        });
     }
 
     /// Bind the live bus owned by one root Session execution. Nested Agents

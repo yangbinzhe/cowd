@@ -413,6 +413,46 @@
         );
 
         let actor = root_agent_action_actor(binding);
+        let direct_artifact = harness_contract::agent_action::AgentAction::TaskSubmit(
+            harness_contract::agent_action::TaskSubmitInput {
+                task_ref: "task:any".to_string(),
+                artifact_refs: vec!["artifact:any".to_string()],
+                evidence_refs: vec![artifact.selector.clone()],
+                unresolved: Vec::new(),
+            },
+        );
+        executor
+            .validate_agent_action_evidence(&services, &actor, &direct_artifact)
+            .await
+            .expect("same-Session direct artifact evidence is readable");
+
+        let foreign_artifact = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/plain".to_string(),
+                    visibility_scope: "session:foreign-session".to_string(),
+                    expected_bytes: Some(16),
+                    original_name: Some("foreign.txt".to_string()),
+                },
+                b"foreign evidence",
+            )
+            .await
+            .expect("foreign artifact");
+        let foreign_evidence = harness_contract::agent_action::AgentAction::TaskSubmit(
+            harness_contract::agent_action::TaskSubmitInput {
+                task_ref: "task:any".to_string(),
+                artifact_refs: vec!["artifact:any".to_string()],
+                evidence_refs: vec![foreign_artifact.selector],
+                unresolved: Vec::new(),
+            },
+        );
+        let error = executor
+            .validate_agent_action_evidence(&services, &actor, &foreign_evidence)
+            .await
+            .expect_err("cross-Session private artifact evidence must fail closed");
+        assert!(error.to_string().contains("is not readable in Session"));
+
         let fake_evidence = harness_contract::agent_action::AgentAction::TaskSubmit(
             harness_contract::agent_action::TaskSubmitInput {
                 task_ref: "task:any".to_string(),

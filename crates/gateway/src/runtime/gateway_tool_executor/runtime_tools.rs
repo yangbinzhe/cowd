@@ -15,43 +15,81 @@ impl GatewayToolExecutor {
             _ => &[],
         };
         for evidence_ref in evidence_refs {
-            let Some(evidence_id) = evidence_ref.strip_prefix("tool://") else {
+            let artifact = if let Some(evidence_id) = evidence_ref.strip_prefix("tool://") {
+                let access = services
+                    .session_evidence_access(&actor.session_id, evidence_id)
+                    .await
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "{} could not resolve evidence `{evidence_ref}` through the authenticated Session journal: {error}",
+                            action.kind()
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        ToolError::new(format!(
+                            "{} evidence `{evidence_ref}` has no canonical durable receipt in Session `{}`; use a tool:// reference returned by a completed tool call in this Session",
+                            action.kind(), actor.session_id
+                        ))
+                    })?;
+                let artifact = services
+                    .artifact_store()
+                    .resolve(&access.retrieval_selector)
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "{} evidence `{evidence_ref}` points to missing durable content: {error}",
+                            action.kind()
+                        ))
+                    })?;
+                if artifact.sha256 != access.sha256
+                    || artifact.bytes != access.bytes
+                    || artifact.media_type != access.media_type
+                    || artifact.visibility_scope != access.visibility_scope
+                {
+                    return Err(ToolError::new(format!(
+                        "{} evidence `{evidence_ref}` failed durable receipt integrity validation",
+                        action.kind()
+                    )));
+                }
+                artifact
+            } else if evidence_ref.starts_with("artifact://") {
+                services
+                    .artifact_store()
+                    .resolve(evidence_ref)
+                    .map_err(|error| {
+                        ToolError::new(format!(
+                            "{} evidence `{evidence_ref}` points to missing durable content: {error}",
+                            action.kind()
+                        ))
+                    })?
+            } else {
                 continue;
             };
-            let access = services
-                .session_evidence_access(&actor.session_id, evidence_id)
+            let session_scope = format!("session:{}", actor.session_id);
+            if artifact.visibility_scope != "public"
+                && artifact.visibility_scope != session_scope
+                && !actor
+                    .resource_scopes
+                    .iter()
+                    .any(|scope| scope == &artifact.visibility_scope)
+            {
+                return Err(ToolError::new(format!(
+                    "{} evidence `{evidence_ref}` is not readable in Session `{}`",
+                    action.kind(), actor.session_id
+                )));
+            }
+            // Metadata resolution alone is not evidence availability: verify
+            // the backing object without materializing an arbitrarily large
+            // payload into the Action path.
+            services
+                .artifact_store()
+                .read(&artifact, &artifact.visibility_scope, Some(0..artifact.bytes.min(1)))
                 .await
                 .map_err(|error| {
                     ToolError::new(format!(
-                        "{} could not resolve evidence `{evidence_ref}` through the authenticated Session journal: {error}",
-                        action.kind()
-                    ))
-                })?
-                .ok_or_else(|| {
-                    ToolError::new(format!(
-                        "{} evidence `{evidence_ref}` has no canonical durable receipt in Session `{}`; use a tool:// reference returned by a completed tool call in this Session",
-                        action.kind(), actor.session_id
-                    ))
-                })?;
-            let artifact = services
-                .artifact_store()
-                .resolve(&access.retrieval_selector)
-                .map_err(|error| {
-                    ToolError::new(format!(
-                        "{} evidence `{evidence_ref}` points to missing durable content: {error}",
+                        "{} evidence `{evidence_ref}` is not readable: {error}",
                         action.kind()
                     ))
                 })?;
-            if artifact.sha256 != access.sha256
-                || artifact.bytes != access.bytes
-                || artifact.media_type != access.media_type
-                || artifact.visibility_scope != access.visibility_scope
-            {
-                return Err(ToolError::new(format!(
-                    "{} evidence `{evidence_ref}` failed durable receipt integrity validation",
-                    action.kind()
-                )));
-            }
         }
         Ok(())
     }

@@ -507,6 +507,25 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     assert_eq!(actor.agent_id.as_deref(), Some(agent_ref.as_str()));
     assert_eq!(actor.team_id.as_deref(), Some(team_ref.as_str()));
     assert_eq!(actor.execution_id.as_deref(), Some(graph.id.as_str()));
+
+    let mut rebound_graph = graph.clone();
+    rebound_graph.id = "agentic-graph:rebound-packet".to_string();
+    services
+        .commit_service()
+        .register_graph(rebound_graph.clone())
+        .expect("register corrupted recovery fixture");
+    let error = services
+        .resolve_agent_action_actor(
+            &ExecutionParentBinding {
+                execution_id: rebound_graph.id,
+                node_id: rebound_graph.nodes[0].id.clone(),
+            },
+            None,
+        )
+        .await
+        .expect_err("a packet cannot be rebound to a different parent graph");
+    assert_eq!(error, "agent_actor_packet_parent_binding_mismatch");
+
     action_service
         .apply(&AgentActionEnvelope {
             action_id: "model-agent-claim".to_string(),
