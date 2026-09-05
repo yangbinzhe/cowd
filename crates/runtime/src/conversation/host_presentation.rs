@@ -1638,6 +1638,7 @@ where
             state.terminal_commit_owner = None;
             state.committed_terminal_answer = None;
             state.committed_terminal_completion = None;
+            state.terminal_notify.notify_one();
         }
         Ok(())
     }

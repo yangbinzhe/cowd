@@ -2,6 +2,9 @@
 
 use std::collections::BTreeSet;
 
+use harness_contract::agent::AgentCapability;
+use harness_contract::agent_action::AGENT_ACTION_TOOL_IDS;
+
 use crate::{PermissionMode, PermissionPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +204,55 @@ fn capability_mapping(capability: &str) -> CapabilityMapping {
             required_mode: PermissionMode::ReadOnly,
         },
     }
+}
+
+/// Check a concrete tool contract against the same capability mapping that
+/// produced the Agent allowlist. A tool can legitimately serve more than one
+/// capability, so reducing this relationship to one name-derived capability
+/// rejects valid least-privilege Bindings.
+pub(crate) fn capability_mapping_authorizes_tool(
+    capability: AgentCapability,
+    tool_ref: &str,
+) -> bool {
+    let tool = tool_ref
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(tool_ref)
+        .to_ascii_lowercase();
+    if capability == AgentCapability::Read
+        && (AGENT_ACTION_TOOL_IDS.contains(&tool.as_str())
+            || matches!(tool.as_str(), "context_retrieve" | "evidence_retrieve"))
+    {
+        return true;
+    }
+    capability_mapping(capability.as_str())
+        .tools
+        .iter()
+        .any(|candidate| *candidate == tool)
+}
+
+pub(crate) fn runtime_capability_map_contains_tool(tool_ref: &str) -> bool {
+    let tool = tool_ref
+        .rsplit(['/', ':'])
+        .next()
+        .unwrap_or(tool_ref)
+        .to_ascii_lowercase();
+    if AGENT_ACTION_TOOL_IDS.contains(&tool.as_str())
+        || matches!(tool.as_str(), "context_retrieve" | "evidence_retrieve")
+    {
+        return true;
+    }
+    [
+        AgentCapability::Read,
+        AgentCapability::Search,
+        AgentCapability::Write,
+        AgentCapability::Test,
+        AgentCapability::Network,
+        AgentCapability::ConnectorAction,
+        AgentCapability::MatrixWrite,
+    ]
+    .into_iter()
+    .any(|capability| capability_mapping_authorizes_tool(capability, &tool))
 }
 
 fn required_host_tool_alternatives(capability: &str) -> &'static [&'static str] {

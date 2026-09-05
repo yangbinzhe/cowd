@@ -233,11 +233,9 @@ impl AgentBindingCompiler {
         tool_contract_refs.sort();
         tool_contract_refs.dedup();
         for tool_ref in &tool_contract_refs {
-            let required = capability_required_by_tool_contract(tool_ref);
-            if !effective_capabilities.contains(&required) {
+            if !tool_contract_is_authorized(tool_ref, &effective_capabilities) {
                 return Err(AgentBindingError::InvalidRequest(format!(
-                    "tool contract `{tool_ref}` requires capability `{}` outside the effective grant",
-                    required.as_str()
+                    "tool contract `{tool_ref}` is outside the effective capability grant"
                 )));
             }
         }
@@ -476,6 +474,21 @@ pub(crate) fn capability_required_by_tool_contract(tool_ref: &str) -> AgentCapab
     }
 }
 
+/// Validate a Tool against the Runtime-owned many-to-many capability map.
+/// Unknown Skill tools retain the conservative name-derived fallback; native
+/// tools use the exact map shared with admission.
+pub(crate) fn tool_contract_is_authorized(
+    tool_ref: &str,
+    capabilities: &[AgentCapability],
+) -> bool {
+    let mapped = capabilities.iter().copied().any(|capability| {
+        crate::agent_capability::capability_mapping_authorizes_tool(capability, tool_ref)
+    });
+    mapped
+        || (!crate::agent_capability::runtime_capability_map_contains_tool(tool_ref)
+            && capabilities.contains(&capability_required_by_tool_contract(tool_ref)))
+}
+
 fn capability_from_name(value: String) -> Option<AgentCapability> {
     match value.as_str() {
         "read" => Some(AgentCapability::Read),
@@ -550,6 +563,49 @@ mod tests {
         assert!(matches!(
             compiler.compile(request),
             Err(AgentBindingError::EmptyEffectiveCapability)
+        ));
+    }
+
+    #[test]
+    fn compiles_multi_purpose_tools_from_the_authoritative_capability_map() {
+        let temp = TempDir::new().expect("temporary root");
+        let compiler = AgentBindingCompiler::new(registry(&temp));
+        let definition_id =
+            AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/autonomous").expect("builtin");
+        let mut request = AgentBindingRequest::new(
+            definition_id,
+            RevisionSelector::LatestApprovedStable,
+            "instance-test",
+            "session-test",
+            "task-test",
+        );
+        request.granted_capabilities = vec![
+            AgentCapability::Read,
+            AgentCapability::Write,
+            AgentCapability::Test,
+        ];
+        request.allowed_tool_contract_refs = vec![
+            "bash".to_string(),
+            "execute_code".to_string(),
+            "grep_search".to_string(),
+            "task_claim".to_string(),
+        ];
+        compiler
+            .compile(request)
+            .expect("test capability authorizes its mapped inspection tools");
+
+        let mut read_only = AgentBindingRequest::new(
+            AgentDefinitionId::new(DefinitionScope::Builtin, "cowd/autonomous").expect("builtin"),
+            RevisionSelector::LatestApprovedStable,
+            "instance-read",
+            "session-read",
+            "task-read",
+        );
+        read_only.granted_capabilities = vec![AgentCapability::Read];
+        read_only.allowed_tool_contract_refs = vec!["execute_code".to_string()];
+        assert!(matches!(
+            compiler.compile(read_only),
+            Err(AgentBindingError::InvalidRequest(_))
         ));
     }
 }

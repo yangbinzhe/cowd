@@ -96,7 +96,11 @@ impl ScopedRuntimeToolExecutor {
         if let Some(scopes) = self.resource_scopes.as_deref() {
             let mut paths = scopes
                 .iter()
-                .filter_map(|scope| scope.strip_prefix("write:"))
+                .filter_map(|scope| {
+                    scope
+                        .strip_prefix("write:")
+                        .or_else(|| scope.strip_prefix("workspace:"))
+                })
                 .map(str::trim)
                 .filter(|path| !path.is_empty())
                 .map(str::to_string)

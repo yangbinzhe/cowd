@@ -582,6 +582,7 @@ where
             active_stream_duration_ms: 0,
             summary: None,
             failure: None,
+            terminal_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             pending_transcript: std::collections::BTreeMap::new(),
             ingress: ingress.clone(),
             turn_transcript_start,
@@ -1196,6 +1197,41 @@ where
                 .map(|(_, report)| report)
         };
         run_result.map_err(|error| RuntimeError::new(error.to_string()))?;
+        // Agent-first collaboration parks the root graph on a durable
+        // WaitingExternal barrier while child graphs run. Keep the ingress
+        // owner and turn backends alive until a resumed Synthesize node
+        // commits the terminal summary; returning here used to drop the weak
+        // backends, strand the Program, and requeue the same paid request.
+        loop {
+            let notify = {
+                let state = state.lock().await;
+                if state.summary.is_some() || state.failure.is_some() {
+                    break;
+                }
+                state.terminal_notify.clone()
+            };
+            let graph = services
+                .graph_state_store()
+                .load_async(&graph_id)
+                .await
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+            let has_program_barrier = graph.nodes.iter().any(|node| {
+                node.executor_kind
+                    == crate::execution_core::graph::executors::AgenticProgramWaitExecutor::KIND
+            });
+            let has_non_terminal_work = graph.nodes.iter().any(|node| {
+                !graph
+                    .node_statuses
+                    .get(&node.id)
+                    .copied()
+                    .unwrap_or(ExecutionNodeStatus::Planned)
+                    .is_terminal()
+            });
+            if !has_program_barrier || !has_non_terminal_work {
+                break;
+            }
+            notify.notified().await;
+        }
         let mut state = state.lock().await;
         if let Some(error) = state.failure.take() {
             return Err(RuntimeError::new(error));
@@ -2457,6 +2493,10 @@ struct TurnGraphState {
     active_stream_duration_ms: u64,
     summary: Option<TurnSummary>,
     failure: Option<String>,
+    /// Wakes the owned ingress future after an asynchronously resumed root
+    /// graph commits its terminal synthesis. `notify_one` retains a permit,
+    /// closing the summary-check/await race without polling.
+    terminal_notify: std::sync::Arc<tokio::sync::Notify>,
     pending_transcript: std::collections::BTreeMap<String, Vec<ConversationMessage>>,
     ingress: Option<TurnIngressRef>,
     /// First transcript offset owned by this graph turn. Gateway ingress

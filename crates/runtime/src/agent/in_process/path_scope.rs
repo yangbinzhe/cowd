@@ -45,7 +45,7 @@ pub(super) fn enforce_glob_scope(
         let Some((mode, raw_scope)) = scope.split_once(':') else {
             return false;
         };
-        if !matches!(mode, "read" | "write") {
+        if !matches!(mode, "read" | "write" | "workspace") {
             return false;
         }
         let scope_parts = match normalized_relative_parts(raw_scope) {
@@ -147,7 +147,7 @@ pub(super) fn normalize_delegated_resource_value(
         .iter()
         .filter_map(|scope| {
             let (mode, path) = scope.split_once(':')?;
-            matches!(mode, "read" | "write").then_some(path)
+            matches!(mode, "read" | "write" | "workspace").then_some(path)
         })
         .filter_map(|path| {
             let parts = normalized_relative_parts(path)?;
@@ -311,7 +311,7 @@ pub(super) fn normalize_single_scope_relative_read_value(
         .iter()
         .filter_map(|scope| {
             let (mode, path) = scope.split_once(':')?;
-            matches!(mode, "read" | "write").then_some(path.trim().replace('\\', "/"))
+            matches!(mode, "read" | "write" | "workspace").then_some(path.trim().replace('\\', "/"))
         })
         .filter(|path| !matches!(path.as_str(), "" | "." | "./"))
         .filter(|path| {
@@ -470,7 +470,9 @@ pub(super) fn resource_path_is_authorized(
     };
     allowed_scopes.iter().any(|scope| {
         let (mode, allowed_scope) = scope.split_once(':').unwrap_or(("", ""));
-        if (write && mode != "write") || (!write && mode != "read" && mode != "write") {
+        if (write && !matches!(mode, "write" | "workspace"))
+            || (!write && !matches!(mode, "read" | "write" | "workspace"))
+        {
             return false;
         }
         // `read:.` / `write:.` are whole-workspace leases issued only by the
@@ -479,7 +481,7 @@ pub(super) fn resource_path_is_authorized(
         // The workspace identity check below still bounds them to this
         // workspace and never to absolute or traversing paths.
         let allowed_existing = resolver.resolve_existing(allowed_scope).ok();
-        let allowed = if mode == "write" {
+        let allowed = if matches!(mode, "write" | "workspace") {
             resolver.resolve_planned_file(allowed_scope).ok()
         } else {
             allowed_existing.clone()

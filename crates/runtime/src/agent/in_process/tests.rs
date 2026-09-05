@@ -1121,6 +1121,20 @@ fn whole_workspace_lease_bounds_to_workspace_but_never_escapes() {
         &["write:.".to_string()],
         true,
     ));
+    // Root execution graphs express the same full-trust lease as
+    // `workspace:.`; delegated Agents must not lose that authority while the
+    // permission/capability ceilings continue to control concrete effects.
+    assert!(resource_path_is_authorized(
+        &resolver,
+        "evidence/new-report.html",
+        &["workspace:.".to_string()],
+        true,
+    ));
+    enforce_glob_scope(
+        &serde_json::json!({"path": ".", "pattern": "**/*.rs"}),
+        &["workspace:.".to_string()],
+    )
+    .expect("workspace root lease admits an in-workspace glob");
     // Traversal outside the workspace is never authorized, even under a
     // whole-workspace lease.
     assert!(!resource_path_is_authorized(
@@ -1678,7 +1692,7 @@ fn root_write_scope_compiles_to_the_checkpoint_whole_workspace_form() {
         ),
         scope_locks: Arc::new(ScopeLockManager::new()),
         commit_service: None,
-        resource_scopes: Some(vec!["write:.".to_string()]),
+        resource_scopes: Some(vec!["workspace:.".to_string()]),
         managed_invocation: None,
         next_receipt_sequence: AtomicU64::new(0),
         receipts: Mutex::new(Vec::new()),

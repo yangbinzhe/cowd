@@ -2174,9 +2174,10 @@ fn verify_binding_against_definition(
         return Err("AgentTaskPacket Binding exposes an undeclared Skill".to_string());
     }
     if binding.tool_contract_refs.iter().any(|tool_ref| {
-        !binding
-            .effective_capabilities
-            .contains(&crate::agent::binding::capability_required_by_tool_contract(tool_ref))
+        !crate::agent::binding::tool_contract_is_authorized(
+            tool_ref,
+            &binding.effective_capabilities,
+        )
     }) {
         return Err(
             "AgentTaskPacket Binding exposes a Tool outside its effective capability grant"
