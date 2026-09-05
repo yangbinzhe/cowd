@@ -343,7 +343,7 @@ impl GatewayToolExecutor {
             // survived a crash while its physical follow-up graph did not;
             // dispatch is deterministic and therefore safe to replay.
             if should_dispatch {
-                let dispatches = services
+                match services
                     .dispatch_agentic_followups(
                         &envelope,
                         runtime::AgenticDispatchContext {
@@ -355,12 +355,30 @@ impl GatewayToolExecutor {
                         },
                     )
                     .await
-                    .map_err(ToolError::new)?;
-                if !dispatches.is_empty() {
-                    observation.actionable.push(format!(
-                        "Runtime admitted {} real Agent execution graph(s)",
-                        dispatches.len()
-                    ));
+                {
+                    Ok(dispatches) if !dispatches.is_empty() => {
+                        observation.actionable.push(format!(
+                            "Runtime admitted {} real Agent execution graph(s)",
+                            dispatches.len()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        // The Agent Action is already durable. Reporting the
+                        // entire tool call as failed lies to the model and may
+                        // cause duplicate semantic work. Preserve the applied
+                        // receipt and expose physical dispatch as a retryable,
+                        // independently observable follow-up state.
+                        tracing::warn!(
+                            action_id = %envelope.action_id,
+                            program_id = %envelope.actor.program_id,
+                            %error,
+                            "Agent action committed while physical dispatch was deferred"
+                        );
+                        observation.actionable.push(format!(
+                            "Semantic action committed; physical Agent dispatch is deferred and remains recoverable: {error}"
+                        ));
+                    }
                 }
             }
             return serialize_agent_action_receipt(&observation, resolved_content_ref.as_deref())

@@ -266,6 +266,94 @@
         );
     }
 
+    #[tokio::test]
+    async fn committed_agent_action_is_not_relabelled_failed_when_dispatch_is_deferred() {
+        let services = runtime::RuntimeServices::in_memory().expect("runtime services");
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+            .expect("Agent action tools");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        executor
+            .bind_runtime_services(Arc::clone(&services))
+            .expect("bind runtime services");
+        let base = RuntimeToolExecutionBinding {
+            action_id: Some("deferred-team"),
+            session_id: Some("session-deferred-dispatch"),
+            authorized_scopes: &[],
+            memory_context: None,
+            model_lease: Some("deepseek-v4-flash"),
+            parent_execution: None,
+            execution_decision: None,
+            permission_ceiling: harness_contract::policy::PermissionMode::ReadOnly,
+        };
+        let team: harness_contract::agent_action::AgentActionObservation = serde_json::from_str(
+            &executor
+                .execute_runtime_tool_with_binding(
+                    harness_contract::agent_action::TEAM_CREATE_TOOL_ID,
+                    serde_json::json!({
+                        "name": "Deferred Team",
+                        "mission": "prove semantic and physical outcomes stay distinct"
+                    }),
+                    base,
+                )
+                .await
+                .expect("create Team"),
+        )
+        .expect("Team receipt");
+        let team_ref = team.changed_refs[0].clone();
+        executor
+            .execute_runtime_tool_with_binding(
+                harness_contract::agent_action::AGENT_INVITE_TOOL_ID,
+                serde_json::json!({
+                    "team_ref": team_ref,
+                    "role": "Domain Specialist",
+                    "mission": "requires an intentionally unavailable catalog capability",
+                    "required_capabilities": ["custom_domain_operation"]
+                }),
+                RuntimeToolExecutionBinding {
+                    action_id: Some("deferred-agent"),
+                    ..base
+                },
+            )
+            .await
+            .expect("invite remains a semantic action");
+        let published: harness_contract::agent_action::AgentActionObservation =
+            serde_json::from_str(
+                &executor
+                    .execute_runtime_tool_with_binding(
+                        harness_contract::agent_action::TASK_PUBLISH_TOOL_ID,
+                        serde_json::json!({
+                            "team_ref": team_ref,
+                            "title": "Unavailable physical work",
+                            "objective": "exercise deferred dispatch",
+                            "acceptance": "durable Task remains visible",
+                            "required_capabilities": ["custom_domain_operation"],
+                            "depends_on": []
+                        }),
+                        RuntimeToolExecutionBinding {
+                            action_id: Some("deferred-task"),
+                            ..base
+                        },
+                    )
+                    .await
+                    .expect("durable action must return an applied receipt"),
+            )
+            .expect("Task receipt");
+
+        assert_eq!(
+            published.status,
+            harness_contract::agent_action::AgentActionStatus::Applied
+        );
+        assert!(published.actionable.iter().any(|item| {
+            item.contains("Semantic action committed") && item.contains("dispatch is deferred")
+        }));
+        let projection = services
+            .agent_action_service()
+            .project(&published.program_id)
+            .expect("durable Program");
+        assert_eq!(projection.tasks.len(), 1);
+    }
+
     #[test]
     fn successful_gateway_file_fact_has_typed_identity_and_digest() {
         let services = runtime::RuntimeServices::in_memory().expect("runtime services");
@@ -502,4 +590,3 @@
     use serde_json::json;
     use tools::permissions::PermissionMode as ToolPermissionMode;
     use tools::RuntimeToolDefinition;
-

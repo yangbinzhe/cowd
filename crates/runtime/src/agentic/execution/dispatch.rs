@@ -184,10 +184,28 @@ impl RuntimeServices {
         requests.dedup();
 
         let mut receipts = Vec::new();
+        let mut deferred = Vec::new();
         for (task_ref, mode) in requests {
-            receipts.extend(
-                self.dispatch_agentic_task(&projection, &task_ref, mode, &context, envelope)
-                    .await?,
+            match self
+                .dispatch_agentic_task(&projection, &task_ref, mode, &context, envelope)
+                .await
+            {
+                Ok(dispatched) => receipts.extend(dispatched),
+                Err(error) => deferred.push(format!("{}:{}:{error}", mode.as_str(), task_ref)),
+            }
+        }
+        if receipts.is_empty() && !deferred.is_empty() {
+            return Err(format!(
+                "Agent execution dispatch deferred after durable action commit: {}",
+                deferred.join(" | ")
+            ));
+        }
+        if !deferred.is_empty() {
+            tracing::warn!(
+                program_id = %projection.program_id,
+                deferred = %deferred.join(" | "),
+                dispatched = receipts.len(),
+                "some Agent-first followups were deferred while independent work was admitted"
             );
         }
         Ok(receipts)
@@ -342,10 +360,19 @@ impl RuntimeServices {
             requests.sort();
             requests.dedup();
             for (task_ref, mode) in requests {
-                receipts.extend(
-                    self.dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger)
-                        .await?,
-                );
+                match self
+                    .dispatch_agentic_task(&projection, &task_ref, mode, &context, &trigger)
+                    .await
+                {
+                    Ok(dispatched) => receipts.extend(dispatched),
+                    Err(error) => tracing::warn!(
+                        program_id,
+                        task_ref,
+                        mode = mode.as_str(),
+                        %error,
+                        "startup recovery deferred one Agent-first followup"
+                    ),
+                }
             }
         }
         Ok(receipts)

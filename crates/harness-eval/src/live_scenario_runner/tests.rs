@@ -276,8 +276,8 @@ fn live_prompt_carries_an_explicit_shared_provider_token_lease() {
             "provider",
             "provider_account",
             "provider_token_pool",
-            "read:group-theory-ai-autonomous-evaluation.html",
-            "write:group-theory-ai-autonomous-evaluation.html"
+            "workspace:.",
+            "network:*"
         ])
     );
 }

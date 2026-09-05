@@ -218,6 +218,75 @@ fn agent(
 }
 
 #[tokio::test]
+async fn root_actor_inherits_the_immutable_graph_delegation_scope() {
+    let services = RuntimeServices::in_memory().expect("runtime");
+    let session_id = "session-root-scope";
+    let turn_id = "turn-root-scope";
+    let graph_id = "root-scope-execution";
+    let mut graph = ExecutionGraph::new("root scope authority");
+    graph.id = graph_id.to_string();
+    graph.lineage = Some(ExecutionGraphLineage {
+        session_id: session_id.to_string(),
+        turn_id: turn_id.to_string(),
+        root_task_id: "task-root-scope".to_string(),
+        task_id: "task-root-scope".to_string(),
+        generation: 1,
+    });
+    let mut model = ExecutionNodeSpec::new(
+        ExecutionNodeKind::InlineModel,
+        "inline_model",
+        "payload:root-scope",
+    );
+    model.id = format!("{graph_id}:model");
+    model.idempotency_key = format!("{graph_id}:model:1");
+    let model_id = model.id.clone();
+    let mut guard = ExecutionNodeSpec::new(
+        ExecutionNodeKind::Verify,
+        "compile_target_guard",
+        "payload:scope-guard",
+    );
+    guard.id = format!("{graph_id}:resource-constraint");
+    guard.idempotency_key = format!("{graph_id}:resource-constraint:1");
+    guard.resource_scopes = vec!["workspace:.".to_string(), "network:*".to_string()];
+    graph.nodes = vec![guard, model];
+    services
+        .commit_service()
+        .register_graph(graph)
+        .expect("register root graph");
+
+    let objective_id = harness_contract::agent_action::root_objective_id(session_id, turn_id);
+    let trusted = AgentActorBinding {
+        objective_id: objective_id.clone(),
+        program_id: harness_contract::agent_action::program_id_for_objective(&objective_id),
+        session_id: session_id.to_string(),
+        turn_id: turn_id.to_string(),
+        root_execution_id: Some(graph_id.to_string()),
+        required_team_count: 2,
+        objective_summary: "autonomous scoped work".to_string(),
+        model_lease: "model:test".to_string(),
+        permission_ceiling: Some(PermissionMode::DangerFullAccess),
+        resource_scopes: Vec::new(),
+        actor_id: format!("root:{session_id}"),
+        kind: AgentActorKind::Root,
+        execution_id: None,
+        team_id: None,
+        agent_id: None,
+    };
+    let resolved = services
+        .resolve_agent_action_actor(
+            &ExecutionParentBinding {
+                execution_id: graph_id.to_string(),
+                node_id: model_id,
+            },
+            Some(trusted),
+        )
+        .await
+        .expect("resolve root actor");
+
+    assert_eq!(resolved.resource_scopes, ["network:*", "workspace:."]);
+}
+
+#[tokio::test]
 async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
     let mut root_graph = ExecutionGraph::new("root Agent-first Program");

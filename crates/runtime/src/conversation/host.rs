@@ -773,12 +773,16 @@ where
             "idempotency_key": ingress.as_ref().map(|value| value.request_id.as_str()),
         })
         .to_string();
+        let delegation_resource_scopes = root_delegation_resource_scopes(
+            evaluation_control.as_ref(),
+            services.session_execution_policy(&session_id).as_ref(),
+        );
         let mut graph = ExecutionGraphCompiler
             .compile_conversation_turn(ExecutionCompileRequest {
                 objective: resolved_objective.clone(),
                 payload_ref: turn_payload,
                 target: compile_target,
-                resource_scopes: Vec::new(),
+                resource_scopes: delegation_resource_scopes,
             })
             .map_err(|error| RuntimeError::new(error.to_string()))?;
         graph.parent_execution = execution_parent;
@@ -1460,6 +1464,91 @@ struct EvaluationTurnControl {
     budget_lease_id: String,
     max_total_tokens: u64,
     prompt: String,
+}
+
+/// Freeze the capability boundary that a root turn may delegate to future
+/// Agents. Ordinary sessions inherit their explicit execution policy within
+/// the current workspace; controlled evaluations may narrow that boundary
+/// further through their pre-registered scope contract. This is intentionally
+/// independent from paths chosen later by the model, so autonomous planning
+/// does not lose the ability to create legitimate intermediate artifacts.
+fn root_delegation_resource_scopes(
+    evaluation: Option<&EvaluationTurnControl>,
+    policy: Option<&harness_contract::policy::SessionExecutionPolicy>,
+) -> Vec<String> {
+    if let Some(evaluation) = evaluation.filter(|control| !control.resource_scopes.is_empty()) {
+        let mut scopes = evaluation.resource_scopes.clone();
+        scopes.sort();
+        scopes.dedup();
+        return scopes;
+    }
+    let mut scopes = match policy.map(|policy| policy.permission_mode) {
+        Some(crate::PermissionMode::WorkspaceWrite) => vec!["workspace:.".to_string()],
+        Some(crate::PermissionMode::DangerFullAccess) => {
+            vec!["workspace:.".to_string(), "network:*".to_string()]
+        }
+        Some(crate::PermissionMode::ReadOnly) | None => vec!["read:.".to_string()],
+    };
+    scopes.sort();
+    scopes
+}
+
+#[cfg(test)]
+mod root_delegation_scope_tests {
+    use super::*;
+    use harness_contract::policy::ApprovalProfile;
+
+    fn policy(
+        permission_mode: crate::PermissionMode,
+    ) -> harness_contract::policy::SessionExecutionPolicy {
+        harness_contract::policy::SessionExecutionPolicy::from_defaults(
+            permission_mode,
+            ApprovalProfile::Autonomous,
+        )
+    }
+
+    #[test]
+    fn ordinary_agent_delegation_inherits_the_session_workspace_boundary() {
+        assert_eq!(
+            root_delegation_resource_scopes(None, Some(&policy(crate::PermissionMode::ReadOnly))),
+            ["read:."]
+        );
+        assert_eq!(
+            root_delegation_resource_scopes(
+                None,
+                Some(&policy(crate::PermissionMode::WorkspaceWrite))
+            ),
+            ["workspace:."]
+        );
+        assert_eq!(
+            root_delegation_resource_scopes(
+                None,
+                Some(&policy(crate::PermissionMode::DangerFullAccess))
+            ),
+            ["network:*", "workspace:."]
+        );
+    }
+
+    #[test]
+    fn evaluation_contract_remains_the_narrower_authority() {
+        let control = EvaluationTurnControl {
+            corpus_id: "live-scenarios-v1".to_string(),
+            workspace_fixture: "none".to_string(),
+            provider_constraint: "normal".to_string(),
+            temperature_milli: 0,
+            resource_scopes: vec!["write:report.html".to_string()],
+            budget_lease_id: "lease".to_string(),
+            max_total_tokens: 1,
+            prompt: "write report".to_string(),
+        };
+        assert_eq!(
+            root_delegation_resource_scopes(
+                Some(&control),
+                Some(&policy(crate::PermissionMode::DangerFullAccess))
+            ),
+            ["write:report.html"]
+        );
+    }
 }
 
 fn evaluation_turn_control(content: &str) -> Result<Option<EvaluationTurnControl>, RuntimeError> {

@@ -323,13 +323,13 @@ fn controlled_live_prompt(spec_id: &str, prompt: String, max_total_tokens: u64) 
         resource_scopes.push("read:Cargo.toml");
     }
     if spec_id == AUTONOMOUS_DEEPSEEK_SCENARIO_ID {
-        // The final publisher and the root terminal verifier share one exact
-        // artifact contract. Granting the child write indirectly while the
-        // root lacks the matching read made a successfully written artifact
-        // fail during the final reread. Keep the lease exact; do not broaden
-        // this isolated evaluation workspace to read/write `.`.
-        resource_scopes.push("read:group-theory-ai-autonomous-evaluation.html");
-        resource_scopes.push("write:group-theory-ai-autonomous-evaluation.html");
+        // The scenario asks the model to design its own files, experiments,
+        // evidence log and final artifact inside a disposable workspace. A
+        // final-file-only lease contradicts that autonomy contract and makes
+        // valid Agent missions physically impossible. The boundary remains
+        // exact: the isolated workspace plus network reads, never the host.
+        resource_scopes.push("workspace:.");
+        resource_scopes.push("network:*");
     }
     let control = json!({
         "corpus_id": "live-scenarios-v1",

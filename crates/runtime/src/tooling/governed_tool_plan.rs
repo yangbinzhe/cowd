@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
 use harness_contract::core::{ExecutionModifier, ExecutionPolicyGate, TaskRisk};
-use harness_contract::policy::PermissionOperation;
 #[cfg(test)]
-use harness_contract::policy::{PermissionResource, PermissionScope};
+use harness_contract::policy::PermissionScope;
+use harness_contract::policy::{PermissionOperation, PermissionResource};
 use harness_contract::tool::{
     GovernedToolInvocation, GovernedToolPlanProjection, ResourceAccess, ResourceDemand,
     ResourceScopeDemand, ToolDependency, ToolEffectDescriptor, ToolEffectKind, ToolIdempotency,
@@ -108,6 +108,15 @@ impl ToolResourceScope {
     fn runtime() -> Self {
         Self {
             kind: "runtime".to_string(),
+            paths: Vec::new(),
+            network: false,
+            unknown: false,
+        }
+    }
+
+    fn internal_transaction() -> Self {
+        Self {
+            kind: "internal_transaction".to_string(),
             paths: Vec::new(),
             network: false,
             unknown: false,
@@ -1202,6 +1211,26 @@ pub(crate) fn resource_scope_from_effect(effect: &ToolEffectDescriptor) -> ToolR
     if effect.uses_network {
         return ToolResourceScope::network();
     }
+    // Runtime-owned control actions commit through their own transactional
+    // aggregate. They do not mutate a workspace path, and the aggregate
+    // service already owns CAS/serialization. Treating a pathless Tool.Control
+    // scope as `workspace:.` creates false DAG dependencies: one rejected
+    // action then blocks otherwise independent sibling actions. The exact
+    // descriptor tuple below is the contract for an internally serialized,
+    // idempotent mutation; unknown/system effects remain conservative.
+    if effect.effect_kind == ToolEffectKind::Write
+        && effect.idempotency == ToolIdempotency::IdempotentWithKey
+        && !effect.spawns_process
+        && !effect.mutates_packages
+        && !effect.mutates_system
+        && !effect.scopes.is_empty()
+        && effect.scopes.iter().all(|scope| {
+            scope.resource == PermissionResource::Tool
+                && scope.operation == PermissionOperation::Control
+        })
+    {
+        return ToolResourceScope::internal_transaction();
+    }
     if matches!(
         effect.effect_kind,
         ToolEffectKind::Process
@@ -1503,13 +1532,38 @@ pub(crate) fn fixture_effect(tool_name: &str, input: &Value) -> ToolEffectDescri
         crate::classify_tool_request(tool_name, &serde_json::to_string(input).unwrap_or_default());
     let mut effect = unknown_effect(tool_name, input);
     let normalized = tool_name.trim().replace('-', "_").to_ascii_lowercase();
-    if matches!(
-        normalized.as_str(),
-        "todo_write" | "todowrite" | "runtime_capabilities"
-    ) || harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
+    if harness_contract::agent_action::AGENT_ACTION_TOOL_IDS
         .iter()
         .any(|action| *action == normalized)
     {
+        effect.effect_kind = if normalized == harness_contract::agent_action::STATE_INSPECT_TOOL_ID
+        {
+            ToolEffectKind::Read
+        } else {
+            ToolEffectKind::Write
+        };
+        effect.idempotency = if effect.effect_kind == ToolEffectKind::Read {
+            ToolIdempotency::Idempotent
+        } else {
+            ToolIdempotency::IdempotentWithKey
+        };
+        effect.uses_network = false;
+        effect.spawns_process = false;
+        effect.scopes = vec![PermissionScope {
+            resource: PermissionResource::Tool,
+            operation: if effect.effect_kind == ToolEffectKind::Read {
+                PermissionOperation::Read
+            } else {
+                PermissionOperation::Control
+            },
+            target: None,
+        }];
+        return effect;
+    }
+    if matches!(
+        normalized.as_str(),
+        "todo_write" | "todowrite" | "runtime_capabilities"
+    ) {
         effect.effect_kind = ToolEffectKind::System;
         effect.idempotency = ToolIdempotency::IdempotentWithKey;
         effect.uses_network = false;
@@ -2552,14 +2606,29 @@ mod tests {
             request("publish-1", "task_publish", Vec::new()),
         ]);
 
-        assert!(plan
-            .tasks
-            .iter()
-            .all(|task| task.resource_scope.kind == "runtime"));
+        assert_eq!(plan.tasks[0].resource_scope.kind, "runtime");
+        assert_eq!(plan.tasks[1].resource_scope.kind, "internal_transaction");
         assert!(plan
             .tasks
             .iter()
             .all(|task| task.resource_scope.paths.is_empty()));
+    }
+
+    #[test]
+    fn independent_agent_actions_remain_parallel_and_failure_isolated() {
+        let plan = GovernedToolPlan::from_requests(&[
+            request("publish-1", "task_publish", Vec::new()),
+            request("publish-2", "task_publish", Vec::new()),
+            request("publish-3", "task_publish", Vec::new()),
+        ]);
+
+        assert!(plan.tasks.iter().all(|task| {
+            task.resource_scope.kind == "internal_transaction"
+                && task.predecessors.is_empty()
+                && task.depends_on.is_empty()
+                && task.can_parallelize
+        }));
+        assert!(plan.tasks.iter().all(|task| task.conflicts.is_empty()));
     }
 
     #[test]

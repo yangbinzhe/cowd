@@ -2140,6 +2140,20 @@ impl RuntimeServices {
                 return Err("agent_actor_root_binding_mismatch".to_string());
             }
 
+            // The current Agent Action node is an internal Runtime mutation
+            // and therefore has no file scope of its own. Delegation authority
+            // belongs to the immutable root graph resource contract compiled
+            // at turn admission. Copy that trusted contract into the first
+            // Program action; later actions inherit the frozen Program below.
+            root.resource_scopes.extend(
+                graph
+                    .nodes
+                    .iter()
+                    .flat_map(|candidate| candidate.resource_scopes.iter().cloned()),
+            );
+            root.resource_scopes.sort();
+            root.resource_scopes.dedup();
+
             // The first accepted root action freezes the Program's semantic
             // and authorization binding. Dynamic model/replan nodes may carry
             // a refreshed decision snapshot, but they must never become a

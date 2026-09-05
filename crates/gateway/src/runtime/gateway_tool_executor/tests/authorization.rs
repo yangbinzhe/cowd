@@ -134,6 +134,59 @@
             .expect("valid no-argument tool");
     }
 
+    #[test]
+    fn production_agent_actions_compile_as_independent_internal_transactions() {
+        let registry = GatewayToolRegistry::builtin()
+            .with_runtime_tools(crate::runtime_bootstrap::runtime_capability_tool_definitions())
+            .expect("Agent action tools");
+        let executor = GatewayToolExecutor::new(None, false, registry);
+        let requests = [
+            runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "publish-a".to_string(),
+                tool_name: "task_publish".to_string(),
+                input: serde_json::json!({
+                    "team_ref": "team:a",
+                    "title": "A",
+                    "objective": "A",
+                    "acceptance": "A",
+                    "required_capabilities": [],
+                    "depends_on": []
+                })
+                .to_string(),
+                depends_on: Vec::new(),
+            },
+            runtime::tool_dispatch::ToolRequest {
+                tool_use_id: "publish-b".to_string(),
+                tool_name: "task_publish".to_string(),
+                input: serde_json::json!({
+                    "team_ref": "team:b",
+                    "title": "B",
+                    "objective": "B",
+                    "acceptance": "B",
+                    "required_capabilities": [],
+                    "depends_on": []
+                })
+                .to_string(),
+                depends_on: Vec::new(),
+            },
+        ];
+        let workspace = std::env::current_dir().expect("workspace");
+        let plan = runtime::GovernedToolCompiler
+            .compile(&workspace, &requests, |name, input| {
+                executor
+                    .registered_tool_effect(name, input)
+                    .map(|effect| (effect, 1, "gateway-production-tools".to_string()))
+            })
+            .expect("production Agent actions compile");
+
+        assert!(plan.tasks.iter().all(|task| {
+            task.resource_scope.kind == "internal_transaction"
+                && task.predecessors.is_empty()
+                && task.conflicts.is_empty()
+                && task.can_parallelize
+        }));
+    }
+
     #[tokio::test]
     async fn runtime_capabilities_executes_without_mcp_state() {
         let registry = GatewayToolRegistry::builtin()
@@ -344,4 +397,3 @@
                 .is_some_and(|error| error.contains("requires signed Runtime authorization")));
         }
     }
-
