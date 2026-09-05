@@ -3732,6 +3732,18 @@ impl RuntimeServices {
     pub fn artifact_store(&self) -> &Arc<crate::ArtifactStore> {
         &self.artifact_store
     }
+
+    /// Resolve a model-visible logical evidence id through the Session owner.
+    pub async fn session_evidence_access(
+        &self,
+        session_id: &str,
+        evidence_id: &str,
+    ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, session::SessionError> {
+        let Some(query) = self.session_query_port.get() else {
+            return Ok(None);
+        };
+        query.evidence_access(session_id, evidence_id).await
+    }
     pub fn tool_execution_host(&self) -> Option<&Arc<dyn crate::RuntimeExecutionHost>> {
         self.tool_execution_host.as_ref()
     }

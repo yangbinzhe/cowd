@@ -98,21 +98,53 @@ impl GatewayToolExecutor {
             .map_err(|error| ToolError::new(error.to_string()));
         }
         let store = services.artifact_store();
-        let store_selector = selector
-            .strip_prefix("tool://")
-            .map_or_else(|| selector.clone(), |id| format!("artifact://{id}"));
-        let artifact = store.resolve(&store_selector).map_err(|error| {
-            ToolError::new(format!("evidence_retrieve resolve failed: {error}"))
-        })?;
-        let fallback_scopes = session_id
-            .map(|session| vec![format!("session:{session}")])
-            .unwrap_or_default();
-        let effective_scopes: &[String] = if authorized_scopes.is_empty() {
-            &fallback_scopes
+        let artifact = if let Some(evidence_id) = selector.strip_prefix("tool://") {
+            let Some(session_id) = session_id else {
+                return serde_json::to_string_pretty(&serde_json::json!({
+                    "kind": "evidence_retrieve",
+                    "evidence_ref": input.evidence_ref,
+                    "available": false,
+                    "reason": "session_id_required",
+                    "hint": "tool:// evidence is resolved through the authenticated Session journal",
+                }))
+                .map_err(|error| ToolError::new(error.to_string()));
+            };
+            let access = services
+                .session_evidence_access(session_id, evidence_id)
+                .await
+                .map_err(|error| {
+                    ToolError::new(format!("evidence_retrieve Session resolve failed: {error}"))
+                })?;
+            let Some(access) = access else {
+                return serde_json::to_string_pretty(&serde_json::json!({
+                    "kind": "evidence_retrieve",
+                    "evidence_ref": input.evidence_ref,
+                    "available": false,
+                    "reason": "not_found",
+                    "hint": "No canonical durable receipt maps this logical evidence id to an Artifact",
+                }))
+                .map_err(|error| ToolError::new(error.to_string()));
+            };
+            harness_contract::context::ArtifactRef::durable(
+                access.retrieval_selector,
+                access.sha256,
+                access.bytes,
+                access.media_type,
+                access.visibility_scope,
+            )
         } else {
-            authorized_scopes
+            store.resolve(&selector).map_err(|error| {
+                ToolError::new(format!("evidence_retrieve resolve failed: {error}"))
+            })?
         };
-        if !evidence_scope_allowed(effective_scopes, &artifact.visibility_scope) {
+        let mut effective_scopes = authorized_scopes.to_vec();
+        if let Some(session) = session_id {
+            let session_scope = format!("session:{session}");
+            if !effective_scopes.contains(&session_scope) {
+                effective_scopes.push(session_scope);
+            }
+        }
+        if !evidence_scope_allowed(&effective_scopes, &artifact.visibility_scope) {
             return serde_json::to_string_pretty(&serde_json::json!({
                 "kind": "evidence_retrieve",
                 "evidence_ref": input.evidence_ref,

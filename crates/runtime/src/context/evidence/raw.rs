@@ -28,6 +28,30 @@ pub struct RawEvidenceRead {
     pub payload: Vec<u8>,
 }
 
+/// Rebuild the durable access receipt recorded by `evidence.raw.persisted`.
+///
+/// `tool://` is the stable logical identity exposed to models, while the
+/// ArtifactStore selector is deliberately opaque.  Every resolver must use
+/// this canonical mapping instead of guessing that both identifiers match.
+#[must_use]
+pub fn access_from_persisted_payload(
+    evidence_id: &str,
+    payload: &Value,
+) -> Option<EvidenceAccessRef> {
+    let recorded_id = payload.get("evidence_id")?.as_str()?;
+    if recorded_id != evidence_id {
+        return None;
+    }
+    Some(EvidenceAccessRef::durable(
+        EvidenceRef::observed("tool", evidence_id),
+        payload.get("content_hash")?.as_str()?,
+        payload.get("byte_count")?.as_u64()?,
+        payload.get("media_type")?.as_str()?,
+        payload.get("artifact_selector")?.as_str()?,
+        payload.get("visibility_scope")?.as_str()?,
+    ))
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RawEvidenceError {
     #[error("raw evidence persistence failed: {0}")]

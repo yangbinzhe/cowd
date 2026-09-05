@@ -19,6 +19,130 @@
     }
 
     #[tokio::test]
+    async fn logical_tool_evidence_resolves_through_session_receipt_to_opaque_artifact() {
+        let temporary = tempfile::tempdir().expect("temporary Runtime root");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let store = Arc::new(session::UnifiedSessionStore::open_in_memory().expect("Session store"));
+        let session_id = "session-logical-evidence";
+        store
+            .create_session(&session::SessionRecord {
+                session_id: session_id.to_string(),
+                platform: "test".to_string(),
+                chat_id: "logical-evidence".to_string(),
+                user_id: None,
+                model: None,
+                created_at: "2026-09-05T00:00:00Z".to_string(),
+                last_activity: "2026-09-05T00:00:00Z".to_string(),
+                message_count: 0,
+                reset_policy: "manual".to_string(),
+                metadata_json: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                status: "active".to_string(),
+            })
+            .await
+            .expect("create Session");
+        let repository = Arc::new(
+            crate::services::session_service::repository::SessionRepository::new(
+                Arc::new(crate::active_session::ActiveSessionDirectory::new()),
+                Some(Arc::clone(&store)),
+                crate::event_bus::SessionProjectionHub::new(),
+            ),
+        );
+        let presence = Arc::new(
+            crate::services::session_service::presence::SessionPresenceLedger::with_store(
+                Arc::clone(&store),
+            ),
+        );
+        let session_port =
+            crate::session_runtime_data_port::GatewaySessionRuntimePort::new_for_test(
+                repository, presence,
+            );
+        let services = runtime::RuntimeServices::builder(
+            temporary.path().join("home"),
+            &workspace,
+        )
+        .build()
+        .expect("Runtime services");
+        services
+            .install_session_ports(
+                session_port.clone(),
+                session_port.clone(),
+                session_port.clone(),
+                session_port,
+            )
+            .expect("Session ports");
+        let artifact = services
+            .artifact_store()
+            .write_bytes(
+                harness_contract::context::ArtifactWriteDescriptor {
+                    media_type: "text/plain".to_string(),
+                    visibility_scope: format!("session:{session_id}"),
+                    expected_bytes: Some(23),
+                    original_name: Some("logical-evidence.raw".to_string()),
+                },
+                b"durable mapped evidence",
+            )
+            .await
+            .expect("artifact");
+        let evidence_id = "tool-raw-logical-evidence";
+        for index in 0..129 {
+            store
+                .append_session_domain_event_allocating_sequence(
+                    &session::SessionDomainEvent::new(
+                        session_id,
+                        0,
+                        session::SessionDomainScope::Tool,
+                        runtime::RuntimeSessionEventKind::EvidenceRawPersisted.as_str(),
+                        serde_json::json!({"evidence_id": format!("unrelated-{index}")}),
+                        index,
+                    ),
+                )
+                .await
+                .expect("unrelated evidence receipt");
+        }
+        store
+            .append_session_domain_event_allocating_sequence(&session::SessionDomainEvent::new(
+                session_id,
+                0,
+                session::SessionDomainScope::Tool,
+                runtime::RuntimeSessionEventKind::EvidenceRawPersisted.as_str(),
+                serde_json::json!({
+                    "evidence_id": evidence_id,
+                    "content_hash": artifact.sha256,
+                    "byte_count": artifact.bytes,
+                    "media_type": artifact.media_type,
+                    "artifact_selector": artifact.selector,
+                    "visibility_scope": artifact.visibility_scope,
+                }),
+                1,
+            ))
+            .await
+            .expect("raw evidence receipt");
+        let executor = GatewayToolExecutor::new(None, false, GatewayToolRegistry::builtin());
+        executor
+            .bind_runtime_services(services)
+            .expect("bind Runtime services");
+
+        let output = executor
+            .execute_evidence_retrieve(
+                EvidenceRetrieveToolRequest {
+                    evidence_ref: format!("tool://{evidence_id}"),
+                    query: Some("mapped".to_string()),
+                    limit: Some(2),
+                },
+                Some(session_id),
+                &["workspace:.".to_string()],
+            )
+            .await
+            .expect("resolve logical tool evidence");
+
+        assert!(output.contains("durable mapped evidence"), "{output}");
+        assert!(output.contains("\"available\": true"), "{output}");
+    }
+
+    #[tokio::test]
     async fn bound_root_model_bootstraps_program_and_inherits_evidence_scope() {
         let services = runtime::RuntimeServices::in_memory().expect("runtime services");
         let mut graph =

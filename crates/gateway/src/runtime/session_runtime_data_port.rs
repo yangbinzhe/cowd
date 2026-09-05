@@ -140,6 +140,49 @@ impl runtime::SessionRuntimeQueryPort for GatewaySessionRuntimePort {
                 })
             })
     }
+
+    async fn evidence_access(
+        &self,
+        session_id: &str,
+        evidence_id: &str,
+    ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, session::SessionError> {
+        let service = self.service()?;
+        let mut from_sequence = 0;
+        loop {
+            let Some((_, events)) = service
+                .stored_domain_events_by_kind_page(
+                    session_id,
+                    runtime::RuntimeSessionEventKind::EvidenceRawPersisted.as_str(),
+                    from_sequence,
+                    128,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            if events.is_empty() {
+                return Ok(None);
+            }
+            let mut next_sequence = from_sequence;
+            for stored in events {
+                next_sequence = next_sequence.max(stored.sequence.saturating_add(1));
+                let event = session::SessionDomainEvent::from_session_event(&stored)
+                    .map_err(|error| session::SessionError::Store(error.to_string()))?;
+                if let Some(access) = runtime::context_evidence::raw::access_from_persisted_payload(
+                    evidence_id,
+                    &event.payload,
+                ) {
+                    return Ok(Some(access));
+                }
+            }
+            if next_sequence <= from_sequence {
+                return Err(session::SessionError::Store(
+                    "evidence event pagination did not advance".to_string(),
+                ));
+            }
+            from_sequence = next_sequence;
+        }
+    }
 }
 
 #[async_trait]

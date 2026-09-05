@@ -267,6 +267,13 @@ pub trait SessionRuntimeQueryPort: Send + Sync {
         &self,
         session_id: &str,
     ) -> Result<Option<RuntimeSessionInputAdmission>, SessionError>;
+
+    /// Resolve one stable logical evidence id to its opaque durable artifact.
+    async fn evidence_access(
+        &self,
+        session_id: &str,
+        evidence_id: &str,
+    ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, SessionError>;
 }
 
 #[async_trait]
@@ -380,6 +387,46 @@ impl SessionRuntimeQueryPort for TestSessionPortAdapter {
                     open: admission.open,
                 })
             })
+    }
+
+    async fn evidence_access(
+        &self,
+        session_id: &str,
+        evidence_id: &str,
+    ) -> Result<Option<harness_contract::context::EvidenceAccessRef>, SessionError> {
+        let mut from_sequence = 0;
+        loop {
+            let events = self
+                .store
+                .get_session_domain_events_by_kind_limited(
+                    session_id,
+                    RuntimeSessionEventKind::EvidenceRawPersisted.as_str(),
+                    from_sequence,
+                    128,
+                )
+                .await?;
+            if events.is_empty() {
+                return Ok(None);
+            }
+            let mut next_sequence = from_sequence;
+            for stored in events {
+                next_sequence = next_sequence.max(stored.sequence.saturating_add(1));
+                let event = session::SessionDomainEvent::from_session_event(&stored)
+                    .map_err(|error| SessionError::Store(error.to_string()))?;
+                if let Some(access) = crate::context_evidence::raw::access_from_persisted_payload(
+                    evidence_id,
+                    &event.payload,
+                ) {
+                    return Ok(Some(access));
+                }
+            }
+            if next_sequence <= from_sequence {
+                return Err(SessionError::Store(
+                    "evidence event pagination did not advance".to_string(),
+                ));
+            }
+            from_sequence = next_sequence;
+        }
     }
 }
 

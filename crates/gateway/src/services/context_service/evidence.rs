@@ -1,6 +1,5 @@
 use super::*;
 use harness_contract::context::{EvidenceAccessRef, EvidenceAuditProjection, EvidenceContentKind};
-use harness_contract::reality::EvidenceRef;
 
 const DEFAULT_EVIDENCE_SNIPPET_BYTES: usize = 4 * 1024;
 const MAX_EVIDENCE_SNIPPET_BYTES: usize = 16 * 1024;
@@ -482,14 +481,7 @@ fn evidence_access_from_raw_event(
     evidence_id: &str,
     payload: &serde_json::Value,
 ) -> Option<EvidenceAccessRef> {
-    Some(EvidenceAccessRef::durable(
-        EvidenceRef::observed("tool", evidence_id),
-        payload.get("content_hash")?.as_str()?,
-        payload.get("byte_count")?.as_u64()?,
-        payload.get("media_type")?.as_str()?,
-        payload.get("artifact_selector")?.as_str()?,
-        payload.get("visibility_scope")?.as_str()?,
-    ))
+    runtime::context_evidence::raw::access_from_persisted_payload(evidence_id, payload)
 }
 
 pub(super) fn workspace_file_unavailable(reference: &str, reason: &str) -> serde_json::Value {
