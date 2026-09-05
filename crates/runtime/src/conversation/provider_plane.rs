@@ -1480,6 +1480,8 @@ where
 
             canonicalize_model_tool_names(&mut calls, self.tool_executor.as_ref());
             let requested_tool_call_count = calls.len();
+            let transcript_calls = calls.clone();
+            let mut rejected_tool_calls = Vec::<(ModelToolCall, String)>::new();
             let unexposed_tool_names = unexposed_model_tool_names(&calls, &exposed_tool_ids);
             if !unexposed_tool_names.is_empty() {
                 let activation_candidates = unexposed_tool_names
@@ -1509,18 +1511,52 @@ where
                 // lease. Dropping that frame for a model retry causes managed
                 // Agents to exhaust protocol recovery after their first
                 // source receipt, before they can meet a required escalation.
-                // Unknown, unhealthy, or overlay-denied names still fail
-                // closed before any assistant transcript is published.
+                // Unknown, unhealthy, or overlay-denied names remain closed:
+                // they are never dispatched. If the same provider frame also
+                // contains valid independent calls, reject only the invalid
+                // members and preserve the useful work. Treating one invented
+                // name as an atomic failure for the whole batch discards
+                // valid Agent actions and can create a costly retry loop.
                 if denied_by_overlay.is_empty() && activated.len() == unexposed_tool_names.len() {
                     // Fall through and execute the parsed calls. Activation
                     // remains durable for subsequent provider requests.
                 } else {
-                    self.reconcile_provider_context_usage(usage);
-                    self.usage_tracker.record(usage);
-                    if let Some(callback) = &self.tool_callback {
-                        callback.on_usage(&usage);
-                    }
-                    return Err(
+                    let activated = activated.into_iter().collect::<BTreeSet<_>>();
+                    let rejected_names = unexposed_tool_names
+                        .iter()
+                        .filter(|name| !activated.contains(*name))
+                        .cloned()
+                        .collect::<BTreeSet<_>>();
+                    let has_executable_call = calls
+                        .iter()
+                        .any(|call| !rejected_names.contains(&call.name));
+                    if has_executable_call {
+                        let mut executable_calls = Vec::with_capacity(calls.len());
+                        for call in calls {
+                            if rejected_names.contains(&call.name) {
+                                let overlay = denied_by_overlay.contains(&call.name);
+                                rejected_tool_calls.push((
+                                    call,
+                                    if overlay {
+                                        "the action is outside this request's governed tool allowlist"
+                                            .to_string()
+                                    } else {
+                                        "the action is unknown, unavailable, or outside this request's exposure lease"
+                                            .to_string()
+                                    },
+                                ));
+                            } else {
+                                executable_calls.push(call);
+                            }
+                        }
+                        calls = executable_calls;
+                    } else {
+                        self.reconcile_provider_context_usage(usage);
+                        self.usage_tracker.record(usage);
+                        if let Some(callback) = &self.tool_callback {
+                            callback.on_usage(&usage);
+                        }
+                        return Err(
                         RuntimeError::with_provider_failure_metadata(
                             format!(
                                 "tool_protocol_violation: provider requested unknown, unavailable, or unauthorized tool names outside this request's exposure lease: [{}]{}",
@@ -1537,14 +1573,37 @@ where
                         .with_provider_usage(usage)
                         .with_effect_receipts(early_tool_receipts),
                     );
+                    }
                 }
             }
-            if let Some((call, error)) = calls.iter().find_map(|call| {
-                self.tool_executor
-                    .validate_tool_input(&call.name, &call.input)
-                    .err()
-                    .map(|error| (call, error))
-            }) {
+            let invalid_arguments = calls
+                .iter()
+                .filter_map(|call| {
+                    self.tool_executor
+                        .validate_tool_input(&call.name, &call.input)
+                        .err()
+                        .map(|error| (call.id.clone(), error.to_string()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if !invalid_arguments.is_empty() && invalid_arguments.len() < calls.len() {
+                let mut executable_calls = Vec::with_capacity(calls.len());
+                for call in calls {
+                    if let Some(error) = invalid_arguments.get(&call.id) {
+                        rejected_tool_calls.push((
+                            call,
+                            format!(
+                                "the arguments do not match the exposed tool contract: {error}"
+                            ),
+                        ));
+                    } else {
+                        executable_calls.push(call);
+                    }
+                }
+                calls = executable_calls;
+            } else if let Some((call, error)) = calls
+                .iter()
+                .find_map(|call| invalid_arguments.get(&call.id).map(|error| (call, error)))
+            {
                 // Tool arguments are provider protocol, not an executable
                 // request. Reject them before transcript publication and
                 // permission negotiation so malformed calls cannot create an
@@ -1587,7 +1646,7 @@ where
                 });
             }
             blocks.push(ContentBlock::Text { text: text.clone() });
-            for call in &calls {
+            for call in &transcript_calls {
                 blocks.push(ContentBlock::ToolUse {
                     id: call.id.clone(),
                     name: call.name.clone(),
@@ -1611,6 +1670,28 @@ where
                 &assistant_message,
                 self.session_head().await.message_count.wrapping_sub(1),
             );
+            for (call, reason) in rejected_tool_calls {
+                let tool_result = ConversationMessage::tool_result(
+                    &call.id,
+                    &call.name,
+                    format!(
+                        "Runtime rejected this individual tool call without executing it: {reason}. Other valid calls from the same response continue; use only the currently exposed tool definitions."
+                    ),
+                    true,
+                );
+                self.session
+                    .write()
+                    .await
+                    .push_message(tool_result.clone())
+                    .map_err(|error| {
+                        RuntimeError::new(error.to_string())
+                            .with_effect_receipts(early_tool_receipts.clone())
+                    })?;
+                self.record_message_event(
+                    &tool_result,
+                    self.session_head().await.message_count.wrapping_sub(1),
+                );
+            }
             self.reconcile_provider_context_usage(usage);
             self.usage_tracker.record(usage);
             if let Some(callback) = &self.tool_callback {

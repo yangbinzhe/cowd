@@ -1148,6 +1148,29 @@
         }
     }
 
+    struct MixedAllowedAndInventedToolApi;
+
+    impl ApiClient for MixedAllowedAndInventedToolApi {
+        fn stream(
+            &mut self,
+            _request: ApiRequest,
+        ) -> Pin<Box<dyn Stream<Item = Result<AssistantEvent, RuntimeError>> + Send + '_>> {
+            Box::pin(futures::stream::iter(vec![
+                Ok(AssistantEvent::ToolUse {
+                    id: "search-valid".to_string(),
+                    name: "tool_search".to_string(),
+                    input: r#"{"query":"read files"}"#.to_string(),
+                }),
+                Ok(AssistantEvent::ToolUse {
+                    id: "invented-invalid".to_string(),
+                    name: "agent_invoke".to_string(),
+                    input: "{}".to_string(),
+                }),
+                Ok(AssistantEvent::MessageStop),
+            ]))
+        }
+    }
+
     #[tokio::test]
     async fn known_deferred_tool_call_activates_and_executes_the_current_frame() {
         let mut runtime = ConversationRuntime::new(
@@ -1210,6 +1233,49 @@
             .unwrap()
             .as_ref()
             .is_some_and(|state| state.active.contains("custom_reader")));
+    }
+
+    #[tokio::test]
+    async fn mixed_tool_frame_preserves_valid_calls_and_rejects_only_invented_members() {
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            MixedAllowedAndInventedToolApi,
+            DynamicExposureToolExecutor,
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .without_memory();
+        runtime
+            .begin_turn_strategy("mixed-tool-turn", "inspect available tools")
+            .expect("turn strategy");
+        runtime.require_next_model_tools(["tool_search".to_string()]);
+
+        let executed = runtime
+            .execute_model_step("inspect available tools", true)
+            .await
+            .expect("one invented member must not discard an independent valid action");
+        let ModelStepIntent::ToolCalls { calls } = executed.intent else {
+            panic!("the valid call must remain executable");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "tool_search");
+
+        let transcript = runtime.session_snapshot().await.materialize_messages();
+        assert!(transcript.iter().any(|message| {
+            message.blocks.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        tool_name,
+                        output,
+                        is_error: true,
+                    } if tool_use_id == "invented-invalid"
+                        && tool_name == "agent_invoke"
+                        && output.contains("without executing it")
+                )
+            })
+        }));
     }
 
     #[tokio::test]
