@@ -125,6 +125,8 @@ pub(crate) fn completion_gap(
 /// Models should express synthesis as an ordinary Task dependency graph. The
 /// supervisor starts only from accepted Tasks that actually submitted the
 /// final Artifact, then follows accepted `depends_on` edges transitively.
+/// A dependency may have been durably superseded; in that case the walk follows
+/// its same-Team replacement lineage and counts only accepted successors.
 /// `Artifact.relates_to` is useful semantic metadata but is model-authored, so
 /// it can never prove cross-Team integration by itself.
 fn integrated_accepted_tasks(
@@ -132,6 +134,7 @@ fn integrated_accepted_tasks(
     final_artifact_ref: &str,
 ) -> BTreeSet<String> {
     let mut integrated = BTreeSet::new();
+    let mut visited = BTreeSet::new();
     let mut pending = projection
         .tasks
         .values()
@@ -146,17 +149,22 @@ fn integrated_accepted_tasks(
         .collect::<Vec<_>>();
 
     while let Some(task_ref) = pending.pop() {
-        if integrated.contains(&task_ref) {
+        if !visited.insert(task_ref.clone()) {
             continue;
         }
         let Some(task) = projection.tasks.get(&task_ref) else {
             continue;
         };
-        if task.status != AgenticTaskStatus::Accepted {
-            continue;
+        match task.status {
+            AgenticTaskStatus::Accepted => {
+                integrated.insert(task.task_id.clone());
+                pending.extend(task.depends_on.iter().cloned());
+            }
+            AgenticTaskStatus::Superseded => {
+                pending.extend(task.replacement_task_refs.iter().cloned());
+            }
+            _ => {}
         }
-        integrated.insert(task.task_id.clone());
-        pending.extend(task.depends_on.iter().cloned());
     }
 
     integrated
@@ -301,6 +309,170 @@ mod tests {
         assert_eq!(
             integrated_accepted_tasks(&projection, "artifact:final"),
             BTreeSet::from(["task:synthesis".to_string()])
+        );
+    }
+
+    #[test]
+    fn superseded_dependency_contributes_coverage_through_accepted_replacement() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.required_team_count = 2;
+        projection.teams.insert(
+            "team:research".to_string(),
+            crate::agentic::program::AgenticTeamProjection {
+                team_id: "team:research".to_string(),
+                name: "Research".to_string(),
+                mission: "Research".to_string(),
+                objective: Some("Research".to_string()),
+                topic_ref: "topic:research".to_string(),
+                created_by: "root".to_string(),
+                member_ids: vec!["agent:research".to_string()],
+                task_ids: vec!["task:source".to_string(), "task:replacement".to_string()],
+            },
+        );
+        projection.teams.insert(
+            "team:integration".to_string(),
+            crate::agentic::program::AgenticTeamProjection {
+                team_id: "team:integration".to_string(),
+                name: "Integration".to_string(),
+                mission: "Integration".to_string(),
+                objective: Some("Integration".to_string()),
+                topic_ref: "topic:integration".to_string(),
+                created_by: "root".to_string(),
+                member_ids: vec!["agent:integration".to_string()],
+                task_ids: vec!["task:synthesis".to_string()],
+            },
+        );
+        let mut superseded = accepted_task("task:source", "team:research", Vec::new(), Vec::new());
+        superseded.status = AgenticTaskStatus::Superseded;
+        superseded.claimant = None;
+        superseded.reviewed_by = None;
+        superseded.replacement_task_refs = vec!["task:replacement".to_string()];
+        projection
+            .tasks
+            .insert("task:source".to_string(), superseded);
+        projection.tasks.insert(
+            "task:replacement".to_string(),
+            accepted_task(
+                "task:replacement",
+                "team:research",
+                Vec::new(),
+                vec!["artifact:research"],
+            ),
+        );
+        projection.tasks.insert(
+            "task:synthesis".to_string(),
+            accepted_task(
+                "task:synthesis",
+                "team:integration",
+                vec!["task:source"],
+                vec!["artifact:final"],
+            ),
+        );
+        projection.artifacts.insert(
+            "artifact:final".to_string(),
+            AgenticArtifactProjection {
+                artifact_ref: "artifact:final".to_string(),
+                content_ref: "workspace://report.html".to_string(),
+                kind: "final-report".to_string(),
+                title: "Final report".to_string(),
+                relates_to: Vec::new(),
+                committed_by: "agent:integration".to_string(),
+            },
+        );
+        let request = ObjectiveCompleteRequestInput {
+            final_artifact_ref: "artifact:final".to_string(),
+            evidence_refs: vec!["tool://verified".to_string()],
+            unresolved: Vec::new(),
+        };
+
+        assert_eq!(completion_gap(&projection, &request), None);
+        assert_eq!(
+            integrated_accepted_tasks(&projection, "artifact:final"),
+            BTreeSet::from(["task:replacement".to_string(), "task:synthesis".to_string(),])
+        );
+    }
+
+    #[test]
+    fn superseded_replacement_cycle_cannot_hang_or_forge_coverage() {
+        let mut projection = AgenticProgramProjection::empty("program", "objective");
+        projection.required_team_count = 2;
+        projection.teams.insert(
+            "team:a".to_string(),
+            crate::agentic::program::AgenticTeamProjection {
+                team_id: "team:a".to_string(),
+                name: "A".to_string(),
+                mission: "A".to_string(),
+                objective: Some("A".to_string()),
+                topic_ref: "topic:a".to_string(),
+                created_by: "root".to_string(),
+                member_ids: vec!["agent:a".to_string()],
+                task_ids: vec![
+                    "task:first".to_string(),
+                    "task:second".to_string(),
+                    "task:other".to_string(),
+                ],
+            },
+        );
+        projection.teams.insert(
+            "team:integration".to_string(),
+            crate::agentic::program::AgenticTeamProjection {
+                team_id: "team:integration".to_string(),
+                name: "Integration".to_string(),
+                mission: "Integration".to_string(),
+                objective: Some("Integration".to_string()),
+                topic_ref: "topic:integration".to_string(),
+                created_by: "root".to_string(),
+                member_ids: vec!["agent:integration".to_string()],
+                task_ids: vec!["task:synthesis".to_string()],
+            },
+        );
+        let mut first = accepted_task("task:first", "team:a", Vec::new(), Vec::new());
+        first.status = AgenticTaskStatus::Superseded;
+        first.replacement_task_refs = vec!["task:second".to_string()];
+        let mut second = accepted_task("task:second", "team:a", Vec::new(), Vec::new());
+        second.status = AgenticTaskStatus::Superseded;
+        second.replacement_task_refs = vec!["task:first".to_string()];
+        projection.tasks.insert("task:first".to_string(), first);
+        projection.tasks.insert("task:second".to_string(), second);
+        projection.tasks.insert(
+            "task:other".to_string(),
+            accepted_task("task:other", "team:a", Vec::new(), vec!["artifact:other"]),
+        );
+        projection.tasks.insert(
+            "task:synthesis".to_string(),
+            accepted_task(
+                "task:synthesis",
+                "team:integration",
+                vec!["task:first"],
+                vec!["artifact:final"],
+            ),
+        );
+        projection.artifacts.insert(
+            "artifact:final".to_string(),
+            AgenticArtifactProjection {
+                artifact_ref: "artifact:final".to_string(),
+                content_ref: "workspace://report.html".to_string(),
+                kind: "final-report".to_string(),
+                title: "Final report".to_string(),
+                relates_to: Vec::new(),
+                committed_by: "agent:integration".to_string(),
+            },
+        );
+
+        assert_eq!(
+            integrated_accepted_tasks(&projection, "artifact:final"),
+            BTreeSet::from(["task:synthesis".to_string()])
+        );
+        assert_eq!(
+            completion_gap(
+                &projection,
+                &ObjectiveCompleteRequestInput {
+                    final_artifact_ref: "artifact:final".to_string(),
+                    evidence_refs: vec!["tool://verified".to_string()],
+                    unresolved: Vec::new(),
+                },
+            ),
+            Some("final_artifact_does_not_integrate_required_teams:team:a".to_string())
         );
     }
 

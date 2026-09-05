@@ -119,7 +119,7 @@ Published -> Claimed -> Submitted -> Accepted
 - author 负责 `task_submit`，不可自审；
 - reviewer 负责 `task_review`，accept/rework 必须引用实际检查证据；
 - accepted Task 的 `unresolved` 仍在报告中保留，但不被第二 owner 重新否决；
-- 最终 Artifact 通过“实际提交该 Artifact 的 accepted Task → Task depends_on”传递血缘证明跨 Team 集成；模型只需维护正常依赖 DAG，不必在最终 Artifact 重复枚举全部上游引用；模型可写的 `Artifact.relates_to` 只作语义导航，不能单独证明 Team 覆盖；Runtime 以循环安全的确定性图遍历验收，仅 accepted Task 可贡献覆盖；
+- 最终 Artifact 通过“实际提交该 Artifact 的 accepted Task → Task depends_on”传递血缘证明跨 Team 集成；依赖已被合法 supersede 时，遍历同 Team replacement lineage，并仍只让 accepted successor 贡献覆盖；模型只需维护正常依赖 DAG，不必在最终 Artifact 重复枚举全部上游引用；模型可写的 `Artifact.relates_to` 只作语义导航，不能单独证明 Team 覆盖；Runtime 以循环安全的确定性图遍历验收；
 - Objective 只有在依赖 Task 已接受、物理 Agent 图无失败、目标级 `unresolved` 为空、关键交付存在时才 Verified；
 - evaluator 同时检查语义 Program 和物理 Agent 图，禁止“任务看起来都 accepted、但 reviewer/worker graph 实际 failed”的假通过。
 

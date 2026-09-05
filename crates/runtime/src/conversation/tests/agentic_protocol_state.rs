@@ -470,10 +470,19 @@ async fn delegated_protocol_reads_real_parent_and_selects_all_runtime_bound_task
     assert_eq!(state.status, crate::AgenticTaskStatus::Claimed);
     assert!(state.owns_active_attempt);
     assert!(!state.is_terminal());
-    let mut expected_refs = vec![included_ref.clone(), auto_bound_ref.clone()];
-    expected_refs.sort();
-    let mut expected_evidence = vec![included_evidence.clone(), auto_bound_evidence.clone()];
-    expected_evidence.sort();
+    let mut expected_artifacts = vec![
+        (included_ref.clone(), included_evidence.clone()),
+        (auto_bound_ref.clone(), auto_bound_evidence.clone()),
+    ];
+    expected_artifacts.sort();
+    let expected_refs = expected_artifacts
+        .iter()
+        .map(|(artifact_ref, _)| artifact_ref.clone())
+        .collect::<Vec<_>>();
+    let expected_evidence = expected_artifacts
+        .iter()
+        .map(|(_, evidence_ref)| evidence_ref.clone())
+        .collect::<Vec<_>>();
     assert_eq!(state.artifact_refs, expected_refs);
     assert_eq!(state.artifact_evidence_refs, expected_evidence);
     assert!(state.artifact_refs.contains(&auto_bound_ref));
