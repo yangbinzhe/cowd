@@ -136,19 +136,11 @@ where
                 };
                 let mut state = self.state.lock().await;
                 if let Some(checkpoint) = checkpoint {
-                    let mut item = ContextItem::new(
-                        format!(
-                            "agentic-program-checkpoint:{}:{}",
-                            program.program_id, program.revision
-                        ),
-                        ContextSourceKind::ToolTrace,
-                        ContextRole::Evidence,
+                    retain_agentic_program_checkpoint(
+                        &mut state.persistent_collaboration_context,
+                        &program,
                         checkpoint,
                     );
-                    item.authority = ContextAuthority::Tool;
-                    item.visibility = ContextVisibility::Private;
-                    item.evidence = vec![format!("program_revision:{}", program.revision)];
-                    state.pending_next_model_context.push(item);
                     state.agentic_program_context_revision = Some(program.revision);
                 }
                 // Only a mechanically unique Program closure is narrowed.

@@ -2111,6 +2111,32 @@ fn agentic_program_owns_root_terminal(
     Ok(true)
 }
 
+fn retain_agentic_program_checkpoint(
+    context: &mut Vec<ContextItem>,
+    program: &crate::AgenticProgramProjection,
+    checkpoint: String,
+) {
+    let id = format!("agentic-program-checkpoint:{}", program.program_id);
+    let mut item = ContextItem::new(
+        id.clone(),
+        ContextSourceKind::Task,
+        ContextRole::TaskState,
+        checkpoint,
+    );
+    item.authority = ContextAuthority::Tool;
+    item.visibility = ContextVisibility::Private;
+    item.source_version = Some(program.revision.to_string());
+    item.evidence = vec![format!("program_revision:{}", program.revision)];
+    // Current task truth must survive subsequent model/tool steps, even when
+    // unrelated orientation context already meets the allocator's coverage
+    // threshold. Replace the projection in place; do not append its history.
+    if let Some(previous) = context.iter_mut().find(|previous| previous.id == id) {
+        *previous = item;
+    } else {
+        context.push(item);
+    }
+}
+
 fn compact_agentic_program_checkpoint(
     services: Option<&crate::RuntimeServices>,
     program: &crate::AgenticProgramProjection,
