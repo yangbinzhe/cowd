@@ -305,6 +305,11 @@ async fn root_actor_inherits_the_immutable_graph_delegation_scope() {
 #[tokio::test]
 async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     let services = Arc::new(RuntimeServices::in_memory().expect("runtime"));
+    let root_mission_id = "mission:auto:dispatch-regression";
+    services
+        .mission_runtime()
+        .create_mission(root_mission_id, "root Agent-first Program", Vec::new())
+        .expect("create non-default root mission");
     std::fs::create_dir_all(services.workspace_root().join("crates/runtime"))
         .expect("create bounded test workspace");
     std::fs::write(
@@ -359,7 +364,7 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
         .task_aggregate_service()
         .create(harness_contract::task::TaskCreateCommand {
             task_id: "task-root-dispatch".to_string(),
-            mission_id: services.mission_runtime().default_mission_id().to_string(),
+            mission_id: root_mission_id.to_string(),
             kind: harness_contract::task::TaskKind::Root,
             origin: harness_contract::task::TaskOrigin::User,
             origin_session_id: "session-dispatch".to_string(),
@@ -472,15 +477,9 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     assert!(packet.objective.contains("First call state_inspect"));
     assert!(packet.objective.contains("actively call task_claim"));
     assert!(packet.objective.contains("Never submit before claiming"));
-    assert_eq!(
-        packet
-            .required_acceptance
-            .evidence_obligations
-            .iter()
-            .map(crate::path_identity::obligation_scope_key)
-            .collect::<Vec<_>>(),
-        ["read:crates/runtime/Cargo.toml"]
-    );
+    assert!(packet.required_acceptance.evidence_obligations.is_empty());
+    assert!(packet.objective.contains("read:crates/runtime/Cargo.toml"));
+    assert!(packet.objective.contains("orientation only"));
     assert!(!packet
         .objective
         .contains("already committed this exact work"));
@@ -488,9 +487,15 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     assert_eq!(lineage.root_task_id, "task-root-dispatch");
     assert_eq!(lineage.task_id, receipts[0].task_ref);
     assert_eq!(packet.assignment.root_task_id, "task-root-dispatch");
+    assert_eq!(packet.assignment.mission_id, root_mission_id);
     assert_eq!(
-        packet.assignment.mission_id,
-        services.mission_runtime().default_mission_id()
+        services
+            .task_aggregate_service()
+            .get(&receipts[0].task_ref)
+            .expect("load dispatched task")
+            .expect("dispatched task")
+            .mission_id,
+        root_mission_id
     );
     assert_eq!(
         graph

@@ -49,13 +49,41 @@ async fn parent_checkpoint_receives_consumable_agent_artifact_content() {
         .await
         .expect("write agent result");
 
-    let content = agentic_checkpoint_artifact_content(services.as_ref(), &artifact.selector)
+    let content = agentic_checkpoint_artifact_content(services.as_ref(), &artifact.selector, "session:parent-checkpoint")
         .expect("checkpoint content");
     assert!(content.complete);
     assert_eq!(
         content.text,
         "Agent finding: the dependency direction is valid."
     );
+    assert!(agentic_checkpoint_artifact_content(
+        services.as_ref(), &artifact.selector, "session:unrelated"
+    ).is_none(), "an artifact's own scope is not authorization for another Session");
+}
+
+#[tokio::test]
+async fn parent_checkpoint_preview_preserves_full_artifact_retrieval() {
+    let services = crate::RuntimeServices::in_memory().expect("runtime services");
+    let body = format!("BEGIN{}END", "x".repeat(128 * 1024));
+    let artifact = services.artifact_store().write_bytes(
+        harness_contract::context::ArtifactWriteDescriptor {
+            media_type: "text/plain".into(),
+            visibility_scope: "session:preview".into(),
+            expected_bytes: None,
+            original_name: None,
+        }, body.as_bytes()
+    ).await.expect("write artifact");
+    let preview = agentic_checkpoint_artifact_content(
+        services.as_ref(), &artifact.selector, "session:preview"
+    ).expect("preview");
+    assert!(!preview.complete);
+    assert!(preview.text.starts_with("BEGIN"));
+    assert!(preview.text.ends_with("END"));
+    assert!(preview.text.contains(&artifact.selector));
+    assert!(preview.text.len() < 66 * 1024);
+    let full = services.artifact_store().read(&artifact, "session:preview", None)
+        .await.expect("retrieve complete original");
+    assert_eq!(full, body.as_bytes());
 }
 
 #[tokio::test]

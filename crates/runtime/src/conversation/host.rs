@@ -2112,7 +2112,7 @@ fn agentic_program_owns_root_terminal(
 }
 
 fn compact_agentic_program_checkpoint(
-    services: &crate::RuntimeServices,
+    services: Option<&crate::RuntimeServices>,
     program: &crate::AgenticProgramProjection,
 ) -> String {
     let teams = program
@@ -2168,7 +2168,13 @@ fn compact_agentic_program_checkpoint(
         .artifacts
         .values()
         .map(|artifact| {
-            let content = agentic_checkpoint_artifact_content(services, &artifact.content_ref);
+            let content = services.and_then(|services| {
+                agentic_checkpoint_artifact_content(
+                    services,
+                    &artifact.content_ref,
+                    &format!("session:{}", program.session_id),
+                )
+            });
             serde_json::json!({
                 "artifact_ref": artifact.artifact_ref,
                 "content_ref": artifact.content_ref,
@@ -2225,44 +2231,49 @@ struct AgenticCheckpointArtifactContent {
 
 /// Bring accepted Agent output back to the parent model as consumable
 /// evidence, not only as an opaque storage pointer. The ArtifactStore remains
-/// the authority and enforces the exact visibility scope. Large artifacts use
-/// an explicit head/tail window so one verbose child cannot evict the whole
-/// Program checkpoint while the conclusion at the end remains visible.
+/// the authority and enforces the receiving Session's visibility scope. This
+/// blocking helper runs outside the Turn lock. Large artifacts use byte-range
+/// previews; their complete content remains available through content_ref.
 fn agentic_checkpoint_artifact_content(
     services: &crate::RuntimeServices,
     content_ref: &str,
+    authorized_scope: &str,
 ) -> Option<AgenticCheckpointArtifactContent> {
-    const MAX_CHARS: usize = 64 * 1024;
-    const TAIL_CHARS: usize = 16 * 1024;
+    const PREVIEW_BYTES: u64 = 64 * 1024;
+    const TAIL_BYTES: u64 = 16 * 1024;
 
     let artifact = services.artifact_store().resolve(content_ref).ok()?;
+    let complete = artifact.bytes <= PREVIEW_BYTES;
+    let head_end = if complete {
+        artifact.bytes
+    } else {
+        PREVIEW_BYTES - TAIL_BYTES
+    };
     let bytes = services
         .artifact_store()
-        .read_blocking(&artifact, &artifact.visibility_scope, None)
+        .read_blocking(&artifact, authorized_scope, Some(0..head_end))
         .ok()?;
     let text = String::from_utf8_lossy(&bytes);
-    let char_count = text.chars().count();
-    if char_count <= MAX_CHARS {
+    if complete {
         return Some(AgenticCheckpointArtifactContent {
             text: text.into_owned(),
             complete: true,
         });
     }
 
-    let head_chars = MAX_CHARS - TAIL_CHARS;
-    let head = text.chars().take(head_chars).collect::<String>();
-    let tail = text
-        .chars()
-        .rev()
-        .take(TAIL_CHARS)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
+    let tail_start = artifact.bytes - TAIL_BYTES;
+    let tail = services
+        .artifact_store()
+        .read_blocking(
+            &artifact,
+            authorized_scope,
+            Some(tail_start..artifact.bytes),
+        )
+        .ok()?;
+    let tail = String::from_utf8_lossy(&tail);
     Some(AgenticCheckpointArtifactContent {
         text: format!(
-            "{head}\n\n[Runtime omitted {} middle characters from this large Artifact]\n\n{tail}",
-            char_count - MAX_CHARS
+            "{text}\n\n[Preview only: bytes {head_end}..{tail_start} are available through {content_ref}; retrieve them before drawing conclusions that require the full Artifact]\n\n{tail}"
         ),
         complete: false,
     })

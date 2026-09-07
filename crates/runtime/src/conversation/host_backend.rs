@@ -116,10 +116,26 @@ where
                 root_agentic_program_projection(self.services.as_ref(), &session_id, &turn_id)
             {
                 let terminal_action = root_agentic_terminal_action(&program);
+                let checkpoint = if self.state.lock().await.agentic_program_context_revision
+                    != Some(program.revision)
+                {
+                    let services = self.services.clone();
+                    let snapshot = program.clone();
+                    Some(
+                        tokio::task::spawn_blocking(move || {
+                            compact_agentic_program_checkpoint(Some(services.as_ref()), &snapshot)
+                        })
+                        .await
+                        .map_err(|error| NodeExecutorError::Poll {
+                            node_id: ticket.node_id.clone(),
+                            reason: format!("prepare Agentic checkpoint: {error}"),
+                        })?,
+                    )
+                } else {
+                    None
+                };
                 let mut state = self.state.lock().await;
-                if state.agentic_program_context_revision != Some(program.revision) {
-                    let checkpoint =
-                        compact_agentic_program_checkpoint(self.services.as_ref(), &program);
+                if let Some(checkpoint) = checkpoint {
                     let mut item = ContextItem::new(
                         format!(
                             "agentic-program-checkpoint:{}:{}",
@@ -1130,7 +1146,7 @@ where
                                     || "not_started".to_string(),
                                     |program| {
                                         compact_agentic_program_checkpoint(
-                                            self.services.as_ref(),
+                                            None,
                                             program,
                                         )
                                     }

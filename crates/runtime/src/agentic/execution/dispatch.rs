@@ -704,26 +704,23 @@ impl RuntimeServices {
             // Cancellation, provider/resource admission and the rolling claim
             // fence remain authoritative Runtime controls.
             let deadline_at_ms = u64::MAX;
-            let objective = task_objective(projection, task, member, mode);
-            // Natural-language acceptance remains a semantic review
-            // contract, but explicit workspace paths in an execution Task
-            // are mechanically knowable evidence obligations. Compile those
-            // exact paths so the delegated runtime can prefetch them once and
-            // stop the Agent from rediscovering the same files through
-            // repeated glob/search rounds. Reviewers intentionally retain an
-            // empty physical contract: they inspect the submitted Artifact
-            // and choose any genuinely independent evidence they need.
-            let required_acceptance = if mode == DispatchMode::Execute {
-                let scopes = crate::workspace_scopes::explicit_workspace_resource_scopes(
-                    self.workspace_root(),
-                    &objective,
-                    false,
-                );
-                self.path_identity_resolver()
-                    .compile_required_acceptance(&[], &scopes)
-            } else {
-                RequiredAcceptance::default()
-            };
+            let mut objective = task_objective(projection, task, member, mode);
+            // Resolved paths help the model orient itself, but mentioning a
+            // path (including in a prohibition or example) does not require
+            // reading it. Only the authored Task acceptance defines success;
+            // never turn path discovery into extra terminal obligations.
+            let path_hints = crate::workspace_scopes::explicit_workspace_resource_scopes(
+                self.workspace_root(),
+                &task.objective,
+                false,
+            );
+            if !path_hints.is_empty() {
+                objective.push_str(&format!(
+                    "\nResolved path references relative to workspace {} (orientation only; follow the Task intent and permissions): {}",
+                    self.workspace_root().display(),
+                    path_hints.join(", ")
+                ));
+            }
             let root_graph = projection
                 .root_execution_id
                 .as_deref()
@@ -780,7 +777,7 @@ impl RuntimeServices {
                 // Agent terminal field. Treating it as one makes every valid
                 // action-driven worker terminal fail because no Runtime
                 // receipt can literally satisfy arbitrary prose.
-                required_acceptance,
+                required_acceptance: RequiredAcceptance::default(),
                 output_acceptance: Vec::new(),
                 acceptance: Vec::new(),
                 constraints: vec![
