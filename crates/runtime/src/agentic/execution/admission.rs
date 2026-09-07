@@ -1,4 +1,4 @@
-use super::helpers::semantic_terms;
+use super::helpers::{semantic_terms, DispatchMode};
 use super::*;
 
 #[derive(Debug, Clone)]
@@ -20,8 +20,9 @@ pub(super) fn resolve_agentic_execution_admission(
     member: &AgentMemberProjection,
     task: &AgenticTaskProjection,
     context: &AgenticDispatchContext,
+    mode: DispatchMode,
 ) -> Result<AgenticExecutionAdmission, String> {
-    let required = required_capabilities(member, task);
+    let required = required_capabilities(member, task, mode);
     let catalog_entry = select_catalog_entry(
         &services.agent_runtime().catalog().all(),
         member,
@@ -95,14 +96,25 @@ pub(super) fn resolve_agentic_execution_admission(
 pub(super) fn required_capabilities(
     member: &AgentMemberProjection,
     task: &AgenticTaskProjection,
+    mode: DispatchMode,
 ) -> Vec<String> {
     let mut required = BTreeSet::from(["read".to_string()]);
     let hints = member
         .required_capabilities
         .iter()
-        .chain(task.required_capabilities.iter())
         .chain(member.execution_requirements.iter())
-        .chain(task.execution_requirements.iter())
+        // Review consumes the producer's evidence; it does not automatically
+        // repeat every producer effect. The reviewer declares its own needs.
+        .chain(
+            task.required_capabilities
+                .iter()
+                .filter(|_| mode == DispatchMode::Execute),
+        )
+        .chain(
+            task.execution_requirements
+                .iter()
+                .filter(|_| mode == DispatchMode::Execute),
+        )
         .map(|capability| normalize_capability(capability))
         .filter(|capability| !capability.is_empty())
         .collect::<Vec<_>>();

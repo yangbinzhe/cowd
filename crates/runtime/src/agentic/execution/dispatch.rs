@@ -631,7 +631,7 @@ impl RuntimeServices {
         Ok(receipts)
     }
 
-    async fn dispatch_agentic_task(
+    pub(super) async fn dispatch_agentic_task(
         self: &Arc<Self>,
         projection: &AgenticProgramProjection,
         task_ref: &str,
@@ -639,6 +639,22 @@ impl RuntimeServices {
         context: &AgenticDispatchContext,
         _trigger: &AgentActionEnvelope,
     ) -> Result<Vec<AgenticDispatchReceipt>, String> {
+        // Program status is business truth, not renewed execution authority.
+        // Late submissions and startup recovery must respect the owning root's
+        // terminal fence, even when its business objective remains unresolved.
+        let root_graph = if let Some(root_id) = projection.root_execution_id.as_deref() {
+            let graph = self
+                .graph_state_store()
+                .load_async(root_id)
+                .await
+                .map_err(|error| format!("agentic_dispatch_root_unavailable:{root_id}:{error}"))?;
+            if agentic_graph_is_terminal(&graph) {
+                return Ok(Vec::new());
+            }
+            Some(graph)
+        } else {
+            None
+        };
         let task = projection
             .tasks
             .get(task_ref)
@@ -684,7 +700,7 @@ impl RuntimeServices {
             // context. Cross-Team review keeps the source Team as a separate
             // task provenance ref and must not forge the reviewer's scope.
             let cohort_prompt_package = agentic_shared_prompt_package(projection, member_team_id)?;
-            let admission = resolve_agentic_execution_admission(self, member, task, context)?;
+            let admission = resolve_agentic_execution_admission(self, member, task, context, mode)?;
             let catalog_entry = &admission.catalog_entry;
             let graph_id = deterministic_graph_id(
                 &projection.program_id,
@@ -722,10 +738,6 @@ impl RuntimeServices {
                     path_hints.join(", ")
                 ));
             }
-            let root_graph = projection
-                .root_execution_id
-                .as_deref()
-                .and_then(|execution_id| self.graph_state_store().load(execution_id).ok());
             let root_lineage = root_graph.as_ref().and_then(|graph| graph.lineage.as_ref());
             let root_task_id = root_lineage
                 .map(|lineage| lineage.root_task_id.clone())

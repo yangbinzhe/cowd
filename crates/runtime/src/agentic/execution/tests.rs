@@ -1014,7 +1014,7 @@ fn semantic_capability_hints_translate_without_becoming_physical_authority() {
     let projection = actions.project("program-dispatch").expect("projection");
     let member = projection.agents.values().next().expect("member");
     let task = projection.tasks.get(&task_ref).expect("task");
-    let translated = super::admission::required_capabilities(member, task);
+    let translated = super::admission::required_capabilities(member, task, DispatchMode::Execute);
 
     assert_eq!(translated, ["network", "read", "search", "test", "write"]);
     assert!(!translated.contains(&"custom_domain_operation".to_string()));
@@ -1026,6 +1026,27 @@ fn semantic_capability_hints_translate_without_becoming_physical_authority() {
     )
     .expect("a general autonomous definition composes the standard physical effects");
     assert_eq!(selected.name, "Autonomous");
+
+    let mut reviewer = member.clone();
+    reviewer.required_capabilities = vec!["read".into()];
+    reviewer.execution_requirements = vec!["test".into()];
+    reviewer.definition_ref = Some("builtin/cowd/execute".into());
+    let mut producer_task = task.clone();
+    producer_task.required_capabilities = vec!["network".into(), "write".into()];
+    producer_task.execution_requirements = vec!["web-research".into()];
+    let review =
+        super::admission::required_capabilities(&reviewer, &producer_task, DispatchMode::Review);
+    assert_eq!(review, ["read", "test"]);
+    super::admission::select_catalog_entry(
+        &services.agent_runtime().catalog().all(),
+        &reviewer,
+        &producer_task,
+        &review,
+    )
+    .expect("reviewer need not reproduce network research to review its evidence");
+    let execute =
+        super::admission::required_capabilities(&reviewer, &producer_task, DispatchMode::Execute);
+    assert!(execute.contains(&"network".into()) && execute.contains(&"write".into()));
 }
 
 #[test]
@@ -1236,6 +1257,77 @@ async fn startup_reconcile_admits_committed_unstarted_work_once() {
         second.is_empty(),
         "active graph must suppress duplicate paid work"
     );
+
+    // An unresolved Program must not authorize new work after its root ended.
+    let mut projection = actions.project("program-dispatch").expect("projection");
+    projection.root_execution_id = Some("cancelled-dispatch-root".into());
+    let context = AgenticDispatchContext {
+        session_id: "session-dispatch".into(),
+        turn_id: "turn-dispatch".into(),
+        model_lease: "test".into(),
+        permission_ceiling: PermissionMode::ReadOnly,
+        resource_scopes: Vec::new(),
+    };
+    let trigger = root(
+        "root-fence-inspect",
+        AgentAction::StateInspect(harness_contract::agent_action::StateInspectInput {
+            scope_ref: None,
+            after_revision: None,
+            page_cursor: None,
+            entry_ref: None,
+            wait_for_workers: false,
+        }),
+    );
+    let missing = services
+        .dispatch_agentic_task(
+            &projection,
+            &first[0].task_ref,
+            DispatchMode::Review,
+            &context,
+            &trigger,
+        )
+        .await
+        .expect_err("a missing bound root must never fall back to unbound dispatch");
+    assert!(missing.contains("agentic_dispatch_root_unavailable"));
+    let mut root_graph = ExecutionGraph::new("cancelled root");
+    root_graph.id = "cancelled-dispatch-root".into();
+    crate::test_support::attach_execution_graph_lineage(&mut root_graph);
+    let mut node = ExecutionNodeSpec::new(
+        ExecutionNodeKind::AgentTask,
+        AgentTaskExecutor::KIND,
+        "test-packet",
+    );
+    node.id = "cancelled-root-node".into();
+    node.idempotency_key = "cancelled-root-node:1".into();
+    root_graph
+        .node_statuses
+        .insert(node.id.clone(), ExecutionNodeStatus::Planned);
+    root_graph.nodes.push(node);
+    services
+        .commit_service()
+        .register_graph(root_graph)
+        .expect("register root");
+    let root_graph = services
+        .graph_state_store()
+        .load("cancelled-dispatch-root")
+        .expect("root");
+    services
+        .commit_service()
+        .apply_command(
+            &root_graph,
+            &ExecutionGraphCommand::Cancel {
+                expected_revision: root_graph.revision,
+                reason: "user cancelled".into(),
+            },
+        )
+        .expect("cancel root");
+    for mode in [DispatchMode::Execute, DispatchMode::Review] {
+        assert!(services
+            .dispatch_agentic_task(&projection, &first[0].task_ref, mode, &context, &trigger,)
+            .await
+            .expect("terminal root is not an admission error")
+            .is_empty());
+    }
 }
 
 #[tokio::test]
@@ -1649,7 +1741,7 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
                 mission: "verify another team".to_string(),
                 required_capabilities: vec!["read".to_string()],
                 existing_agent_ref: None,
-                definition_ref: None,
+                definition_ref: Some("builtin/cowd/execute".into()),
                 model_profile_ref: None,
                 expertise_hints: Vec::new(),
                 execution_requirements: Vec::new(),
@@ -1666,7 +1758,7 @@ async fn cross_team_reviewer_resolves_own_identity_and_can_accept() {
                 title: "Cross-Team result".to_string(),
                 objective: "produce durable evidence".to_string(),
                 acceptance: "independent review".to_string(),
-                required_capabilities: vec!["read".to_string()],
+                required_capabilities: vec!["read".to_string(), "network".to_string()],
                 depends_on: Vec::new(),
 
                 obligation_refs: Vec::new(),
