@@ -489,6 +489,10 @@ async fn task_publish_admits_real_agent_graph_with_human_display_identity() {
     assert_eq!(lineage.task_id, receipts[0].task_ref);
     assert_eq!(packet.assignment.root_task_id, "task-root-dispatch");
     assert_eq!(
+        packet.assignment.mission_id,
+        services.mission_runtime().default_mission_id()
+    );
+    assert_eq!(
         graph
             .parent_execution
             .as_ref()

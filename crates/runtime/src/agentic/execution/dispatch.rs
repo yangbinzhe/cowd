@@ -733,6 +733,12 @@ impl RuntimeServices {
                 .map(|lineage| lineage.root_task_id.clone())
                 .unwrap_or_else(|| task_ref.to_string());
             let parent_task_id = root_lineage.map(|lineage| lineage.task_id.clone());
+            let mission_id = self
+                .task_aggregate_service()
+                .get(&root_task_id)
+                .map_err(|error| format!("load root Task mission for Agent dispatch: {error}"))?
+                .map(|task| task.mission_id)
+                .unwrap_or_else(|| self.mission_runtime().default_mission_id().to_string());
             let mut resource_scopes = context.resource_scopes.clone();
             for shared_scope in [
                 format!("session:{}", projection.session_id),
@@ -753,13 +759,12 @@ impl RuntimeServices {
                 root_task_id: root_task_id.clone(),
                 parent_task_id,
                 session_id: context.session_id.clone(),
-                // Mission is a physical Runtime execution scope. The dynamic
-                // Program remains the semantic collaboration scope carried in
-                // context_refs and must not be forged into the mission registry.
-                mission_id: self
-                    .mission_runtime()
-                    .default_mission_id()
-                    .to_string(),
+                // Mission is the physical execution-tree scope. Dynamic Team
+                // semantics remain in Program context, while every descendant
+                // Task must inherit the root Task's Mission so a canonical
+                // root projection can aggregate its lineage without crossing
+                // ownership scopes.
+                mission_id,
                 // Agent-first Teams are dynamic semantic scopes. They are not
                 // immutable Agent Definition executions.
                 team_id: None,
